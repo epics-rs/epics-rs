@@ -61,6 +61,7 @@ an inherent method, so the derive never has to assume a method exists.
 | `type = "..."` | Yes | DBR field type (see table below) |
 | `read_only` | No | Reject puts with `CaError::ReadOnlyField` |
 | `menu_choices = SOME_CONST` | No | the choice strings of a `DBR_ENUM` menu field, emitted as `menu_field_choices` |
+| `link` | No | a `DBF_INLINK`/`OUTLINK`/`FWDLINK` field of `type = "String"`, lent through `link_text_ref` |
 
 ## Supported Field Types
 

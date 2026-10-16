@@ -119,9 +119,12 @@ async fn r11_64_transform_channels_post_without_the_cycles_alarm_bits() {
     );
 
     let e = a_rx.try_recv().expect("A moved 1 -> 10, so C posts it");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(10.0));
     assert_eq!(
-        e.mask,
+        e.value().as_value().cloned().unwrap(),
+        EpicsValue::Double(10.0)
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE | EventMask::LOG,
         "transformRecord.c:794 overwrites the alarm mask with a literal \
          DBE_VALUE|DBE_LOG before the A..P post loop, so A carries no alarm bit"

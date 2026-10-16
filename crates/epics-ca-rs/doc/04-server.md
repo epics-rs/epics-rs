@@ -102,7 +102,7 @@ async fn handle_client(
 ```rust
 struct ClientState {
     channels:        HashMap<sid, ChannelEntry>,
-    subscriptions:   HashMap<sub_id, SubscriptionEntry>,
+    subscriptions:   HashMap<AttachId, SubscriptionEntry>,
     channel_access:  HashMap<sid, AccessLevel>,
     next_sid:        AtomicU32,
     hostname:        HostIdentity,  // Claimed(name) by default; Pinned(ip|cert) otherwise

@@ -21,3 +21,32 @@ fn every_ioc_spawning_binary_is_declared_in_a_test_group() {
         .expect("workspace root");
     ioc_spawn_gate::assert_every_ioc_spawner_is_declared(root);
 }
+
+/// These four reach `softIoc` only through epics-ca-rs's shared test helpers,
+/// which is the case the scan follows furthest: through `mod common;` while
+/// the helpers sat in `tests/common/`, through the dev-dependency once they
+/// moved into one. A scan that stops following either drops them silently,
+/// because nothing is left to demand their declaration.
+#[test]
+fn the_shared_helper_spawners_stay_in_the_census() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root");
+    let census: Vec<String> = ioc_spawn_gate::census(root)
+        .iter()
+        .map(ioc_spawn_gate::Spawner::label)
+        .collect();
+    for binary in [
+        "cli_monitor_separator",
+        "interop_c_client_rust_ioc",
+        "interop_rust_client_c_ioc",
+        "stress_load",
+    ] {
+        let label = format!("epics-ca-rs::{binary}");
+        assert!(
+            census.contains(&label),
+            "{label} left the census: {census:#?}"
+        );
+    }
+}

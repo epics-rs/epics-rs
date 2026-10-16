@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -23,19 +23,60 @@ impl Default for DbLoadConfig {
     }
 }
 
+/// Build the DB include config the way `dbReadCOM` does
+/// (`dbLexRoutines.c:245-253`): a non-empty `explicit_path` wins outright,
+/// otherwise `EPICS_DB_INCLUDE_PATH`, otherwise `"."`. Only
+/// `dbLoadDatabase` can supply the first arm — C hands `dbLoadRecords` a
+/// hard `0` — which is why `explicit_path` had no caller and the arm was
+/// missing until the command existed.
+///
+/// Resolving the list is also what INSTALLS it: C `dbPath` runs inside
+/// `dbReadCOM`, so the path a load resolved is the path `dbDumpPath`
+/// reports afterwards. This is the only routine that resolves one, so it
+/// is the only writer of [`set_loaded_path`].
+pub(crate) fn db_load_config(explicit_path: &str) -> DbLoadConfig {
+    let include_paths = if explicit_path.is_empty() {
+        crate::runtime::env::get("EPICS_DB_INCLUDE_PATH")
+            .map_or_else(|| vec![std::path::PathBuf::from(".")], |val| db_path(&val))
+    } else {
+        db_path(explicit_path)
+    };
+    set_loaded_path(&include_paths);
+    DbLoadConfig {
+        include_paths,
+        max_include_depth: 32,
+    }
+}
+
+/// Resolve a load's file name through C `dbOpenFile`: the path list is
+/// searched FIRST and the process CWD is never consulted for a bare name.
+/// `None` is C's NULL return, which `dbReadCOM` turns into `Can't open
+/// file` without ever reaching the parser.
+///
+/// `include_path` is `dbLoadDatabase`'s second argument, empty for every
+/// other caller — see [`db_load_config`].
+pub(crate) fn resolve_db_file(
+    path: &str,
+    include_path: &str,
+) -> (DbLoadConfig, Option<DbOpenedFile>) {
+    let config = db_load_config(include_path);
+    // The located form, not the bare `PathBuf`: every diagnostic the load
+    // raises names the file as the operator wrote it and the path entry it
+    // was found under, which is what C's `inputFile` keeps — see
+    // [`DbOpenedFile`].
+    let opened = db_open_file_located(path, &config.include_paths);
+    (config, opened)
+}
+
 /// File-based entry point: expand includes, substitute macros, parse
-/// records. Records-only, so an unresolved file-scope alias is reported
-/// and dropped — see [`super::parse_db`].
+/// records. Records-only, so a file-scope alias with no target above it is
+/// reported and dropped — see [`super::parse_db`].
 pub fn parse_db_file(
     path: &Path,
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
-    let parsed = parse_db_file_with_breaktables(path, macros, config)?;
-    for (target, alias) in &parsed.unresolved_aliases {
-        eprintln!("{}", super::unknown_alias_message(alias, target));
-    }
-    Ok(parsed.records)
+    Ok(parse_db_file_with_breaktables(path, macros, config)?.records_with_file_aliases())
 }
 
 /// Like [`parse_db_file`] but returns the whole [`super::ParsedDb`], for
@@ -60,6 +101,16 @@ pub fn parse_db_opened_with_breaktables(
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<super::ParsedDb> {
+    parse_db_opened_held(opened, macros, config)?.raise_abort()
+}
+
+/// [`parse_db_opened_with_breaktables`] for an installer: a parse abort is
+/// carried on the result, to be raised once the records above it are in.
+pub(crate) fn parse_db_opened_held(
+    opened: &DbOpenedFile,
+    macros: impl Into<MacroDefs>,
+    config: &DbLoadConfig,
+) -> CaResult<super::ParsedDb> {
     // The include layer and the record parser both report through the
     // same owner, so a recoverable failure in either reaches the caller
     // as one set — see [`DbFaults`].
@@ -79,25 +130,20 @@ pub fn parse_db_opened_with_breaktables(
         }
     };
     // Already through `db_read_lines` once, inside the expansion — see
-    // [`super::parse_db_expanded`].
-    //
-    // This is also why a load's read-time diagnostics (macLib's notices,
-    // the per-line `WARNING: … has undefined macros`) all come out
-    // before its first parse-time refusal, where C interleaves them per
-    // line: C's lexer reads one line and the parser consumes it, while
-    // the whole include tree is expanded here before the parser sees a
-    // character. Same lines, same bytes, different grouping — an
-    // intended consequence of flattening, not a defect to time away.
-    let mut parsed = super::parse_db_expanded(&expanded.text, expanded.source)?;
-    faults.absorb(parsed.faults);
-    parsed.faults = faults;
-    Ok(parsed)
+    // [`super::parse_db_expanded`]. The faults carry the read-time notices
+    // of every line, which the load releases as it reaches each one.
+    Ok(super::parse_db_expanded(
+        &expanded.text,
+        expanded.source,
+        faults,
+    ))
 }
 
 /// The flattened include tree: the text the parser reads, and the map
 /// that says which file and line each of its lines came from.
 pub struct DbExpandedText {
-    pub text: String,
+    /// Bytes, as C's lexer reads them: a `.db` need not be UTF-8.
+    pub text: Vec<u8>,
     pub source: super::DbSource,
 }
 
@@ -138,7 +184,8 @@ pub fn expand_includes_mapped(
 /// line of the flattened text, so the text and its map cannot drift.
 #[derive(Default)]
 struct Lines {
-    text: String,
+    text: Vec<u8>,
+    /// [`Self::text`] split for the diagnostics' echo, which prints it.
     lines: Vec<String>,
     frames: Vec<std::sync::Arc<[super::DbIncludeFrame]>>,
     /// C's `inputFileList` while the read is running: the files open at
@@ -152,9 +199,9 @@ impl Lines {
     /// at it. C prints that stack innermost-first (`dbIncludePrint`), so
     /// it is reversed here — once, where the frame is built, rather than
     /// at each of the places that read it.
-    fn push(&mut self, text: String) {
-        self.text.push_str(&text);
-        self.lines.push(text);
+    fn push(&mut self, text: Vec<u8>) {
+        self.text.extend_from_slice(&text);
+        self.lines.push(String::from_utf8_lossy(&text).into_owned());
         self.frames.push(std::sync::Arc::from(
             self.open.iter().rev().cloned().collect::<Vec<_>>(),
         ));
@@ -167,7 +214,7 @@ pub fn expand_includes(
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
     faults: &mut DbFaults,
-) -> CaResult<String> {
+) -> CaResult<Vec<u8>> {
     Ok(expand_includes_mapped(&DbOpenedFile::taken_outright(path), macros, config, faults)?.text)
 }
 
@@ -221,7 +268,9 @@ fn expand_includes_inner(
         });
     }
 
-    let content = std::fs::read_to_string(&identity).map_err(|e| CaError::DbParseError {
+    // Bytes, not text: C `fgets` hands its lexer whatever the file holds,
+    // and `dbLoadRecords` loads a record whose name is not UTF-8.
+    let content = std::fs::read(&identity).map_err(|e| CaError::DbParseError {
         line: 0,
         token: String::new(),
         message: format!("cannot read '{named}': {e}"),
@@ -258,15 +307,15 @@ fn expand_includes_inner(
     // one. C never has to do this — its directives ARE grammar
     // productions, so every source line reaches the lexer and its counter
     // never skips.
-    let emit = |out: &mut Lines, n: u32, text: String| {
+    let emit = |out: &mut Lines, n: u32, text: Vec<u8>| {
         if let Some(frame) = out.open.last_mut() {
             frame.line = n;
         }
         out.push(text);
     };
-    for (i, raw) in content.split_inclusive('\n').enumerate() {
+    for (i, raw) in content.split_inclusive(|&b| b == b'\n').enumerate() {
         let line_num = i as u32 + 1;
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
         if let Some(subst_str) = parse_substitute_directive(line) {
             // msi is the reference for this one: C's `.db` grammar has no
             // `substitute` directive at all. `makeSubstitutions` matches
@@ -277,7 +326,7 @@ fn expand_includes_inner(
             // `macInstallMacros` (`:256-275`) — so what is installed is
             // the RAW value. This port expanded it first, which froze a
             // reference C leaves live.
-            for (name, value) in parse_macro_defns(&subst_str) {
+            for (name, value) in parse_macro_defns(subst_str) {
                 match value {
                     Some(rawval) => table.define(&name, rawval),
                     // C `macPutValue( handle, name, NULL )`: a definition
@@ -285,7 +334,7 @@ fn expand_includes_inner(
                     None => table.undefine(&name),
                 }
             }
-            emit(out, line_num, String::from("\n"));
+            emit(out, line_num, b"\n".to_vec());
             continue;
         }
         // Every other line goes through the file's one table exactly
@@ -297,17 +346,20 @@ fn expand_includes_inner(
         // to match them on the raw line and expand only the argument,
         // which left an `include "$(NOPE)b.db"` line without the
         // `WARNING: … has undefined macros` C prints for it.
-        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num);
-        let line = expanded.strip_suffix('\n').unwrap_or(&expanded);
+        // The flattened line this one's output starts at, which is where
+        // C's lexer stands when it reads it.
+        let at = out.lines.len() as u32 + 1;
+        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num, at, faults);
+        let line = expanded.strip_suffix(b"\n").unwrap_or(&expanded);
         if let Some(dirs) = parse_path_directive(line, "path") {
             // `path "a:b:c"` — replace the search path. C separates
             // entries with the OS path separator.
-            local_paths = db_path(&dirs);
-            emit(out, line_num, String::from("\n"));
+            local_paths = db_path(dirs);
+            emit(out, line_num, b"\n".to_vec());
         } else if let Some(dirs) = parse_path_directive(line, "addpath") {
             // `addpath "a:b"` — append to the search path.
-            local_paths.extend(db_add_path(&dirs));
-            emit(out, line_num, String::from("\n"));
+            local_paths.extend(db_add_path(dirs));
+            emit(out, line_num, b"\n".to_vec());
         } else if let Some(expanded_filename) = parse_include_directive(line) {
             // C `dbIncludeNew` (`dbLexRoutines.c:450-456`) prints this
             // exact line and calls `yyerror(NULL)`, NOT `yyerrorAbort`:
@@ -321,10 +373,19 @@ fn expand_includes_inner(
             if let Some(frame) = out.open.last_mut() {
                 frame.line = line_num;
             }
+            // C opens the file while reading this line, and the open's own
+            // `macEnvExpand` prints at once.
+            faults.read_through(at);
             let Some(included) = db_open_file_located(&expanded_filename, &local_paths) else {
+                // `yyerror(NULL)` with the lexer on this line and `yytext`
+                // the quoted name. The line stays in the text, for the echo;
+                // the parser skips an `include` it meets.
+                faults.seek(at, &format!("\"{expanded_filename}\""));
                 faults.recoverable(format!(
                     "{ERL_ERROR}: Can't open include file '{expanded_filename}'"
                 ));
+                faults.seek_end();
+                emit(out, line_num, expanded);
                 continue;
             };
             expand_includes_inner(&included, table, config, stack, faults, out)?;
@@ -339,30 +400,34 @@ fn expand_includes_inner(
 }
 
 /// Parse an include directive line. Returns the filename if the line is an include directive.
-pub(crate) fn parse_include_directive(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    // Comment lines are not include directives
-    if trimmed.starts_with('#') {
+///
+/// The name comes back as text, because the file is opened through
+/// [`db_open_file_located`]'s `&str`: a non-UTF-8 byte in it shows as
+/// U+FFFD and names no file.
+pub(crate) fn parse_include_directive(line: impl AsRef<[u8]>) -> Option<String> {
+    directive_argument(line.as_ref(), b"include")
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+}
+
+/// The text between the first two `"` after `keyword` on a directive line,
+/// for `include`, `path` and `addpath`.
+fn directive_argument<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
+    let trimmed = line.trim_ascii();
+    // Comment lines are not directives.
+    if trimmed.starts_with(b"#") {
         return None;
     }
-    if !trimmed.starts_with("include") {
+    let rest = trimmed.strip_prefix(keyword)?;
+    // The keyword must be followed by whitespace or a quote, so
+    // `pathological` is not mistaken for `path`.
+    let &first = rest.first()?;
+    if !first.is_ascii_whitespace() && first != b'"' {
         return None;
     }
-    // Must have whitespace or quote after "include"
-    let rest = &trimmed["include".len()..];
-    if rest.is_empty() {
-        return None;
-    }
-    // SAFETY: `rest` is non-empty (checked by `is_empty()` above)
-    let first = rest.chars().next().unwrap();
-    if !first.is_whitespace() && first != '"' {
-        return None;
-    }
-    // Extract quoted filename
-    let quote_start = rest.find('"')?;
+    let quote_start = rest.iter().position(|&b| b == b'"')?;
     let after_quote = &rest[quote_start + 1..];
-    let quote_end = after_quote.find('"')?;
-    Some(after_quote[..quote_end].to_string())
+    let quote_end = after_quote.iter().position(|&b| b == b'"')?;
+    Some(&after_quote[..quote_end])
 }
 
 /// Parse a `substitute` directive line.
@@ -378,20 +443,20 @@ pub(crate) fn parse_include_directive(line: &str) -> Option<String> {
 /// After that quote msi allows only blanks before the end of the line;
 /// anything else and the line is not a command at all, and is expanded as
 /// ordinary text.
-pub(crate) fn parse_substitute_directive(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') {
+pub(crate) fn parse_substitute_directive(line: &[u8]) -> Option<&[u8]> {
+    let trimmed = line.trim_ascii();
+    if trimmed.starts_with(b"#") {
         return None;
     }
-    let rest = trimmed.strip_prefix("substitute")?;
-    let first = rest.chars().next()?;
-    if !first.is_whitespace() && first != '"' {
+    let rest = trimmed.strip_prefix(b"substitute")?;
+    let &first = rest.first()?;
+    if !first.is_ascii_whitespace() && first != b'"' {
         return None;
     }
-    let quote_start = rest.find('"')?;
+    let quote_start = rest.iter().position(|&b| b == b'"')?;
     let after_quote = &rest[quote_start + 1..];
     let mut end = 0;
-    let bytes = after_quote.as_bytes();
+    let bytes = after_quote;
     while end < bytes.len() && bytes[end] != b'"' {
         end += if bytes[end] == b'\\' && end + 1 < bytes.len() && bytes[end + 1] == b'"' {
             2
@@ -402,10 +467,10 @@ pub(crate) fn parse_substitute_directive(line: &str) -> Option<String> {
     if end >= bytes.len() {
         return None;
     }
-    if !after_quote[end + 1..].chars().all(|c| c == ' ') {
+    if !after_quote[end + 1..].iter().all(|&c| c == b' ') {
         return None;
     }
-    Some(after_quote[..end].to_string())
+    Some(&after_quote[..end])
 }
 
 /// Parse a `path "..."` / `addpath "..."` directive line. `keyword`
@@ -414,22 +479,13 @@ pub(crate) fn parse_substitute_directive(line: &str) -> Option<String> {
 ///
 /// Mirrors C dbStatic (`dbYacc.y:71-81`): `tokenPATH`/`tokenADDPATH`
 /// followed by a quoted string.
-pub(crate) fn parse_path_directive(line: &str, keyword: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') {
-        return None;
-    }
-    let rest = trimmed.strip_prefix(keyword)?;
-    // The keyword must be followed by whitespace or a quote, so
-    // `pathological` is not mistaken for `path`.
-    let first = rest.chars().next()?;
-    if !first.is_whitespace() && first != '"' {
-        return None;
-    }
-    let quote_start = rest.find('"')?;
-    let after_quote = &rest[quote_start + 1..];
-    let quote_end = after_quote.find('"')?;
-    Some(after_quote[..quote_end].to_string())
+pub(crate) fn parse_path_directive<'a>(line: &'a [u8], keyword: &str) -> Option<&'a OsStr> {
+    let dirs = directive_argument(line, keyword.as_bytes())?;
+    // SAFETY: `dirs` is cut from `line` at ASCII `"` bytes only. On Unix an
+    // `OsStr` is any bytes; elsewhere the platform encoding is a superset
+    // of UTF-8 and this text came from a file, so a non-UTF-8 byte cannot
+    // reach here on a platform that would mind — see `db_add_path`.
+    Some(unsafe { OsStr::from_encoded_bytes_unchecked(dirs) })
 }
 
 /// C `OSI_PATH_LIST_SEPARATOR` (`osiFileName.h:22-28`) — ONE separator
@@ -446,33 +502,43 @@ pub const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 /// the current directory, which C appends as a single `.` at the END
 /// of the list rather than at the empty element's position. A list
 /// that is entirely white space contributes nothing.
-pub fn db_add_path(list: &str) -> Vec<PathBuf> {
+pub fn db_add_path(list: impl AsRef<OsStr>) -> Vec<PathBuf> {
     use crate::runtime::stdlib::c_isspace;
+
+    // Split as bytes: the list may be `getenv`'s, and C splits it unchecked.
+    let space = |b: &u8| c_isspace(*b as char);
+    let sep = PATH_LIST_SEPARATOR as u8;
+    let dir = |d: &[u8]| {
+        let end = d.len() - d.iter().rev().take_while(|b| space(b)).count();
+        // SAFETY: `d` is cut from an `OsStr`'s encoded bytes only at ASCII
+        // bytes (the separator, white space), which keeps it valid.
+        PathBuf::from(unsafe { OsStr::from_encoded_bytes_unchecked(&d[..end]) })
+    };
 
     let mut out: Vec<PathBuf> = Vec::new();
     let mut expecting_path = false;
     let mut saw_missing_path = false;
-    let mut rest = list;
+    let mut rest = list.as_ref().as_encoded_bytes();
 
-    while let Some(c) = rest.chars().next() {
-        if c_isspace(c) {
-            rest = &rest[c.len_utf8()..];
+    while let Some(c) = rest.first() {
+        if space(c) {
+            rest = &rest[1..];
             continue;
         }
-        match rest.find(PATH_LIST_SEPARATOR) {
+        match rest.iter().position(|&b| b == sep) {
             Some(0) => {
                 saw_missing_path = true;
-                rest = &rest[PATH_LIST_SEPARATOR.len_utf8()..];
+                rest = &rest[1..];
             }
             Some(i) => {
                 expecting_path = true;
-                out.push(PathBuf::from(rest[..i].trim_end_matches(c_isspace)));
-                rest = &rest[i + PATH_LIST_SEPARATOR.len_utf8()..];
+                out.push(dir(&rest[..i]));
+                rest = &rest[i + 1..];
             }
             None => {
                 expecting_path = false;
-                out.push(PathBuf::from(rest.trim_end_matches(c_isspace)));
-                rest = "";
+                out.push(dir(rest));
+                rest = &[];
             }
         }
     }
@@ -487,7 +553,8 @@ pub fn db_add_path(list: &str) -> Vec<PathBuf> {
 /// REPLACES the search path, and an empty string means `.`. C tests
 /// `strlen(path)==0`, so a list that is blank rather than empty is
 /// still handed to `dbAddPath`, which contributes nothing.
-pub fn db_path(list: &str) -> Vec<PathBuf> {
+pub fn db_path(list: impl AsRef<OsStr>) -> Vec<PathBuf> {
+    let list = list.as_ref();
     if list.is_empty() {
         return vec![PathBuf::from(".")];
     }
@@ -550,7 +617,7 @@ pub fn loaded_path() -> Option<Vec<PathBuf>> {
 ///     `empty:[1]`.
 ///
 /// `None` is C's NULL value: delete the name rather than define it.
-pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
+pub(crate) fn parse_macro_defns(defns: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     /// C `macParseDefns`'s four states (`macUtil.c:57`), kept because the
     /// fall-through between them is what decides where a `,` with no `=`
     /// before it leaves the parse.
@@ -561,23 +628,24 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
         InValue,
     }
 
-    let chars: Vec<char> = defns.chars().collect();
+    let chars = defns;
+    let is_space = |c: u8| crate::runtime::stdlib::c_isspace(char::from(c));
     // C's `end[num]--` loop: trailing whitespace comes off the RAW field,
     // before any quote is removed from it.
-    let trimmed = |from: usize, to: usize| -> String {
+    let trimmed = |from: usize, to: usize| -> Vec<u8> {
         let mut end = to;
-        while end > from && chars[end - 1].is_whitespace() {
+        while end > from && is_space(chars[end - 1]) {
             end -= 1;
         }
-        chars[from..end].iter().collect()
+        chars[from..end].to_vec()
     };
 
-    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
-    let mut name = String::new();
+    let mut pairs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let mut name = Vec::new();
     let mut del = false;
     let mut start = 0;
     let mut state = St::PreName;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<u8> = None;
     let mut i = 0;
 
     while i < chars.len() {
@@ -588,41 +656,41 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
             if c == q {
                 quote = None;
             }
-        } else if c == '\'' || c == '"' {
+        } else if c == b'\'' || c == b'"' {
             quote = Some(c);
         }
         let quoted = quote.is_some();
-        let escape = c == '\\' && i + 1 < chars.len();
+        let escape = c == b'\\' && i + 1 < chars.len();
 
         loop {
             match state {
                 St::PreName => {
-                    if !quoted && !escape && (c.is_whitespace() || c == ',') {
+                    if !quoted && !escape && (is_space(c) || c == b',') {
                         break;
                     }
                     start = i;
                     state = St::InName;
                 }
                 St::InName => {
-                    if quoted || escape || (c != '=' && c != ',') {
+                    if quoted || escape || (c != b'=' && c != b',') {
                         break;
                     }
                     name = trimmed(start, i);
-                    del = c == ',';
+                    del = c == b',';
                     state = St::PreValue;
-                    if c != ',' {
+                    if c != b',' {
                         break;
                     }
                 }
                 St::PreValue => {
-                    if !quoted && !escape && c.is_whitespace() {
+                    if !quoted && !escape && is_space(c) {
                         break;
                     }
                     start = i;
                     state = St::InValue;
                 }
                 St::InValue => {
-                    if quoted || escape || c != ',' {
+                    if quoted || escape || c != b',' {
                         break;
                     }
                     let value = trimmed(start, i);
@@ -642,7 +710,7 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
     match state {
         St::PreName => {}
         St::InName => pairs.push((dequote(&trimmed(start, chars.len())), None)),
-        St::PreValue => pairs.push((dequote(&name), Some(String::new()))),
+        St::PreValue => pairs.push((dequote(&name), Some(Vec::new()))),
         St::InValue => {
             let value = trimmed(start, chars.len());
             pairs.push((dequote(&name), (!del).then_some(value)));
@@ -661,10 +729,10 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
 /// rather than opening a quoted region. That is why `substitute
 /// "\"A\"=1"` defines a macro whose name is `"A"`, quotes included, and
 /// `$(A)` stays undefined.
-fn dequote(name: &str) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    let mut out = String::with_capacity(name.len());
-    let mut quote: Option<char> = None;
+fn dequote(name: &[u8]) -> Vec<u8> {
+    let chars = name;
+    let mut out = Vec::with_capacity(name.len());
+    let mut quote: Option<u8> = None;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -674,12 +742,12 @@ fn dequote(name: &str) -> String {
                 i += 1;
                 continue;
             }
-        } else if c == '\'' || c == '"' {
+        } else if c == b'\'' || c == b'"' {
             quote = Some(c);
             i += 1;
             continue;
         }
-        if c == '\\' && i + 1 < chars.len() {
+        if c == b'\\' && i + 1 < chars.len() {
             i += 1;
         }
         out.push(chars[i]);
@@ -784,7 +852,7 @@ pub fn db_open_file_located(filename: &str, path_list: &[PathBuf]) -> Option<DbO
 pub fn db_expand_file_name(filename: &str) -> Option<String> {
     let expanded = super::expand_macros(
         filename,
-        &HashMap::new(),
+        MacroDefs::new(),
         super::MacroExpandOptions {
             env_fallback: true,
             ..Default::default()
@@ -795,16 +863,18 @@ pub fn db_expand_file_name(filename: &str) -> Option<String> {
 
 #[cfg(test)]
 mod macro_defns_tests {
-    use super::*;
+    fn parse_macro_defns(defns: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        super::parse_macro_defns(defns.as_bytes())
+    }
 
     /// `(name, Some(value))` written compactly.
-    fn def(name: &str, value: &str) -> (String, Option<String>) {
-        (name.to_string(), Some(value.to_string()))
+    fn def(name: &str, value: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+        (name.into(), Some(value.into()))
     }
 
     /// `(name, None)` — C's NULL value, which deletes.
-    fn del(name: &str) -> (String, Option<String>) {
-        (name.to_string(), None)
+    fn del(name: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+        (name.into(), None)
     }
 
     #[test]
@@ -918,7 +988,7 @@ mod db_add_path_tests {
     }
 
     fn p(list: &str) -> Vec<String> {
-        db_add_path(&sep(list))
+        db_add_path(sep(list))
             .iter()
             .map(|d| d.display().to_string())
             .collect()
@@ -968,13 +1038,24 @@ mod db_add_path_tests {
             "an empty list is the current directory"
         );
         assert!(db_path("   ").is_empty(), "a blank list is not empty");
-        assert_eq!(db_path(&sep("a:")), db_add_path(&sep("a:")));
+        assert_eq!(db_path(sep("a:")), db_add_path(sep("a:")));
     }
 }
 
 #[cfg(test)]
 mod db_open_file_tests {
     use super::*;
+
+    /// The tests read the expansion as text; every input here is ASCII.
+    fn expand_includes(
+        path: &std::path::Path,
+        macros: impl Into<MacroDefs>,
+        config: &DbLoadConfig,
+        faults: &mut DbFaults,
+    ) -> CaResult<String> {
+        super::expand_includes(path, macros, config, faults)
+            .map(|b| String::from_utf8(b).expect("ASCII test input"))
+    }
 
     /// I-R3-3 boundary matrix for C `dbOpenFile`
     /// (`dbLexRoutines.c:174-175`): {name carries a separator, it does
@@ -1022,6 +1103,22 @@ mod db_open_file_tests {
         assert_eq!(
             db_open_file("sub/x.db", &[on_list.path().to_path_buf()]),
             None
+        );
+    }
+
+    /// `EPICS_DB_INCLUDE_PATH` is `getenv`'s bytes; C opens a directory
+    /// whose name is not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn db_path_keeps_a_non_utf8_directory_s_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let list = OsStr::from_bytes(b" /a\xff :/b");
+        assert_eq!(
+            db_path(list),
+            vec![
+                PathBuf::from(OsStr::from_bytes(b"/a\xff")),
+                PathBuf::from("/b")
+            ]
         );
     }
 
@@ -1080,7 +1177,7 @@ mod db_open_file_tests {
 
         let out = expand_includes(
             &main,
-            &HashMap::new(),
+            MacroDefs::new(),
             &DbLoadConfig::default(),
             &mut DbFaults::default(),
         )

@@ -38,8 +38,8 @@ async fn add_simulated_ao(db: &PvDatabase, name: &str, siol: &str, val: f64) {
         .await
         .ok();
     let mut ao = AoRecord::new(val);
-    ao.siml = "SIM_ON".to_string();
-    ao.siol = siol.to_string();
+    ao.siml = "SIM_ON".into();
+    ao.siol = siol.into();
     db.add_record(name, Box::new(ao)).await.unwrap();
     let rec = db.get_record(name).unwrap();
     let mut inst = rec.write();
@@ -67,6 +67,8 @@ async fn r15_63_siol_pp_processes_the_passive_target() {
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TGT".into()))
             .unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
     let before = db.get_record("FLNK_TGT").unwrap().read().common.time;
 
     add_simulated_ao(&db, "AO_SIM", "SIOL_TGT PP", 42.0).await;

@@ -20,6 +20,11 @@ pub enum BridgeError {
     #[error("monitor not started")]
     MonitorNotStarted,
 
+    /// pvxs's text for a `db_add_event` that returned NULL
+    /// (subscriptionctx.h:48).
+    #[error("Failed to create db subscription")]
+    SubscriptionFailed,
+
     #[error("group config parse error: {0}")]
     GroupConfigError(String),
 

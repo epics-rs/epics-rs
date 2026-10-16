@@ -74,7 +74,7 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 }
 
 async fn nord(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.NORD")).unwrap().to_f64().unwrap()
 }
 
 async fn udf(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> bool {

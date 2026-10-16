@@ -30,16 +30,16 @@ struct FailingLset;
 
 #[async_trait::async_trait]
 impl LinkSet for FailingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         false
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         Err("not connected".to_string())
     }
 }
@@ -51,17 +51,20 @@ struct OkLset {
 
 #[async_trait::async_trait]
 impl LinkSet for OkLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, name: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
-        self.puts.lock().unwrap().push(name.to_string());
+    async fn put_value(&self, name: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+        self.puts
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(name).into_owned());
         Ok(())
     }
 }
@@ -140,8 +143,8 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
         .unwrap();
 
     let mut ao = AoRecord::new(55.0);
-    ao.siml = "SIM_ON".to_string(); // nonzero → SIMM=YES this cycle
-    ao.siol = "NO_SUCH_SIOL".to_string(); // no local record, no link set
+    ao.siml = "SIM_ON".into(); // nonzero → SIMM=YES this cycle
+    ao.siol = "NO_SUCH_SIOL".into(); // no local record, no link set
     db.add_record("AO_BADSIOL", Box::new(ao)).await.unwrap();
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();

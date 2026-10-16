@@ -53,7 +53,8 @@ impl NTAttribute {
                 ("timeStamp".into(), time_desc()),
                 ("sourceType".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("source".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         }
     }
 

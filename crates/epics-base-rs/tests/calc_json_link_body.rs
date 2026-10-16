@@ -23,7 +23,7 @@ use epics_base_rs::server::record::{CalcArg, ParsedLink, parse_link_v2};
 
 fn calc_of(text: &str) -> epics_base_rs::server::record::CalcLink {
     match parse_link_v2(text) {
-        ParsedLink::Calc(c) => c,
+        ParsedLink::Calc(c) => *c,
         other => panic!("expected ParsedLink::Calc for {text}, got {other:?}"),
     }
 }
@@ -34,7 +34,7 @@ fn calc_of(text: &str) -> epics_base_rs::server::record::CalcLink {
 #[test]
 fn an_unquoted_key_parses() {
     let calc = calc_of(r#"{calc: {expr:"A*B", args:[3, 1.5]}}"#);
-    assert_eq!(calc.expr, "A*B");
+    assert_eq!(calc.expr.as_deref(), Some("A*B"));
     assert_eq!(
         calc.args,
         vec![CalcArg::Literal(3.0), CalcArg::Literal(1.5)]
@@ -46,7 +46,7 @@ fn an_unquoted_key_parses() {
 #[test]
 fn a_quoted_key_still_parses() {
     let calc = calc_of(r#"{calc:{"expr":"A*B","args":[3,1.5]}}"#);
-    assert_eq!(calc.expr, "A*B");
+    assert_eq!(calc.expr.as_deref(), Some("A*B"));
     assert_eq!(
         calc.args,
         vec![CalcArg::Literal(3.0), CalcArg::Literal(1.5)]
@@ -77,7 +77,7 @@ fn an_embedded_link_arg_parses_beside_a_literal() {
     assert_eq!(
         calc.args,
         vec![
-            CalcArg::Link(Box::new(ParsedLink::Pva("record".to_string()))),
+            CalcArg::Link(Box::new(ParsedLink::Pva("record".into()))),
             CalcArg::Literal(1.5),
         ]
     );
@@ -129,7 +129,7 @@ fn one_arg_over_calc_nargs_refuses_the_link() {
 #[test]
 fn a_single_quoted_expression_parses() {
     let calc = calc_of(r#"{calc:{expr:'A+5', args:[3]}}"#);
-    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.expr.as_deref(), Some("A+5"));
     assert_eq!(calc.args, vec![CalcArg::Literal(3.0)]);
 }
 
@@ -139,11 +139,11 @@ fn a_single_quoted_expression_parses() {
 #[test]
 fn a_single_quoted_string_may_contain_a_double_quote() {
     let calc = calc_of(r#"{calc:{expr:'A', args:[{const:'say "hi"'}]}}"#);
-    assert_eq!(calc.expr, "A");
+    assert_eq!(calc.expr.as_deref(), Some("A"));
     assert_eq!(
         calc.args,
-        vec![CalcArg::Link(Box::new(ParsedLink::Constant(
-            "say \"hi\"".to_string()
+        vec![CalcArg::Link(Box::new(ParsedLink::json_constant(
+            r#""say \"hi\"""#
         )))]
     );
 }
@@ -156,7 +156,7 @@ fn a_single_quoted_string_may_contain_a_double_quote() {
 #[test]
 fn a_scalar_args_value_is_one_argument() {
     let calc = calc_of(r#"{calc:{expr:'A+5', args:5}}"#);
-    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.expr.as_deref(), Some("A+5"));
     assert_eq!(calc.args, vec![CalcArg::Literal(5.0)]);
 }
 
@@ -166,7 +166,7 @@ fn a_scalar_args_value_is_one_argument() {
 fn base_link_retarget_test_database_form_parses() {
     let calc =
         calc_of("{calc:{\n                expr:'A+5',\n                args:5\n             }}");
-    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.expr.as_deref(), Some("A+5"));
     assert_eq!(calc.args, vec![CalcArg::Literal(5.0)]);
 }
 

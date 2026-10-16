@@ -35,11 +35,22 @@
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport, PropertyPost};
-use epics_base_rs::server::record::Record;
+#[cfg(tokio_backend)]
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 use std::collections::HashMap;
+
+/// `device(mbbi, CONSTANT, devMbbiEnumProp, "enumProp")`, with the
+/// `init_record` and `read_mbbi` a C dset for it would carry.
+static ENUM_PROP: DevSup = DevSup {
+    name: "devMbbiEnumProp",
+    choice: "enumProp",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
 /// Holds both ends until the framework claims the receiver: the device owns
 /// the source subscription, the framework owns the post.
@@ -79,7 +90,7 @@ impl DeviceSupport for EnumProp {
                 })
                 .await;
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -112,14 +123,22 @@ record(mbbi, "RIG:MBBI") {
     field(SCAN, "Passive")
 }
 "#;
-    let server = CaServer::builder()
-        .port(port)
-        .tcp_port(port)
+    let ioc = IocBuilder::new()
         .db_string(db, &HashMap::new())?
-        .register_device_support("enumProp", || Box::new(EnumProp::new()))
-        .build()
+        .register_device_support("mbbi", &ENUM_PROP, || Box::new(EnumProp::new()))
+        .build_ioc()
         .await?;
-    let _scan = epics_base_rs::server::scan::ScanOwner::start(server.database().clone());
+    let db = ioc.database().clone();
+    ioc.run().await;
+    let server = CaServer::from_parts(
+        db,
+        port,
+        Some(port),
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .await?;
     eprintln!("[ioc] serving RIG:MBBI on CA port {port}");
     server.run().await
 }
@@ -128,9 +147,8 @@ record(mbbi, "RIG:MBBI") {
 /// this backend does not compile.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mbbi_enum_property_ioc: needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread."
-    );
-    Ok(())
+         EPICS_RS_BUILD_EXEC_BACKEND=thread.",
+    )
 }

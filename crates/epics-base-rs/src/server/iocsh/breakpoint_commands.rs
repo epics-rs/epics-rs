@@ -36,9 +36,9 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
 /// C `iocshArgStringRecord` reaches the handler as `args[0].sval`, which is
 /// `NULL` when the argument was omitted. Every command but `dbc`/`dbs` treats
 /// that as its usage error; those two treat it as "the default lock set".
-fn sval(args: &[ArgValue], index: usize) -> Option<&str> {
+fn sval(args: &[ArgValue], index: usize) -> Option<&[u8]> {
     match args.get(index) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.as_bytes()),
         _ => None,
     }
 }
@@ -76,7 +76,7 @@ fn table_with_printer(ctx: &CommandContext) -> Arc<BreakpointTable> {
     let table = ctx.db().breakpoints_or_install();
     let db = ctx.db().clone();
     let bridge = ctx.bridge().clone();
-    table.set_printer(Arc::new(move |name: &str| {
+    table.set_printer(Arc::new(move |name: &[u8]| {
         // C `dbPrint` (`dbBkpt.c:818-821`): a blank line, the level-2 dump,
         // then the hanging `-> ` prompt. Its own context, because the one the
         // `dbb` line ran on is long gone by the time a record processes — and
@@ -211,7 +211,7 @@ fn cmd_dbs() -> CommandDef {
     )
 }
 
-fn resume(ctx: &CommandContext, name: Option<&str>, stepping: bool) -> CommandResult {
+fn resume(ctx: &CommandContext, name: Option<&[u8]>, stepping: bool) -> CommandResult {
     let Some(table) = ctx.db().breakpoints() else {
         return refuse(ctx, &BkptError::NoneStopped);
     };
@@ -364,7 +364,7 @@ mod tests {
         );
 
         let cmd = reg.get("dbb").unwrap();
-        let args = parse_args(&["BKPT:ONE".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["BKPT:ONE".into()], &cmd.args).unwrap();
         assert!(
             matches!(cmd.handler.call(&args, &ctx), Ok(CommandOutcome::Continue)),
             "dbb on a record with a lock set must succeed"

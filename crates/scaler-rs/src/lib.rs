@@ -59,6 +59,7 @@ pub const SCALER_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
 
 /// Return the scaler record type factory for injection into IocBuilder.
 pub fn scaler_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    epics_base_rs::server::record::register_contributed_dbd(&records::dbd_generated::DBD);
     ("scaler", Box::new(|| Box::new(ScalerRecord::default())))
 }
 

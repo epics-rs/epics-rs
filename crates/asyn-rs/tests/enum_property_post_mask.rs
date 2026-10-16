@@ -97,7 +97,11 @@ async fn enum_ioc(
         create_port_runtime(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
-    register_port(port, handle.clone()).expect("port name is free");
+    // The port belongs to the database its records load into, and the
+    // callbacks are dropped until that database's `iocRun`.
+    let owner = Arc::new(PvDatabase::new());
+    register_port(port, handle.clone(), owner.scan_control().interrupt_gate())
+        .expect("port name is free");
     drop(runtime);
 
     let db_text = format!(
@@ -109,11 +113,16 @@ async fn enum_ioc(
     );
     let (database, _) =
         asyn_rs::adapter::register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
             .db_string(&db_text, &HashMap::new())
             .unwrap()
             .build()
             .await
             .unwrap();
+    database.scan_control().run();
+    // `iocRun`'s boot flush posts the port's seeded table; let it land so a
+    // test's own subscription sees only what the test drives.
+    settle().await;
     (database, handle)
 }
 
@@ -141,7 +150,7 @@ fn drive_table_change(handle: &PortHandle, choices: Vec<EnumEntry>) {
 fn drain(reader: &mut EventReader) -> Vec<(EventMask, EpicsValue)> {
     let mut out = Vec::new();
     while let Ok(ev) = reader.try_recv() {
-        out.push((ev.mask, ev.snapshot.value.clone()));
+        out.push((ev.mask(), ev.value().as_value().cloned().unwrap()));
     }
     out
 }

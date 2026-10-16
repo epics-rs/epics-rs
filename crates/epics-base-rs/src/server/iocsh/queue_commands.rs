@@ -102,10 +102,10 @@ fn ival(args: &[ArgValue], index: usize) -> i64 {
 
 /// The same for an `iocshArgString`: C's `args[n].sval` is NULL when the
 /// argument was omitted, and `scanRateThreads` prints `''` for it.
-fn sval(args: &[ArgValue], index: usize) -> &str {
+fn sval(args: &[ArgValue], index: usize) -> std::borrow::Cow<'_, str> {
     match args.get(index) {
-        Some(ArgValue::String(s)) => s.as_str(),
-        _ => "",
+        Some(ArgValue::String(s)) => s.to_str_lossy(),
+        _ => "".into(),
     }
 }
 
@@ -285,7 +285,7 @@ fn cmd_scan_rate_threads() -> CommandDef {
                 return Ok(CommandOutcome::Failed);
             }
             let rate = sval(args, 0);
-            let Some(ind) = pending_index_of(rate)
+            let Some(ind) = pending_index_of(&rate)
                 .filter(|index| *index >= SCAN_1ST_PERIODIC)
                 .map(|index| (index - SCAN_1ST_PERIODIC) as usize)
                 .filter(|ind| *ind < crate::server::scan::MAX_PARALLEL_THREADS)
@@ -422,15 +422,15 @@ fn cmd_callback_parallel_threads() -> CommandDef {
                 return Ok(CommandOutcome::Failed);
             }
             let prio = match args.get(1) {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s.to_str_lossy()),
                 _ => None,
             };
-            let band = match priority_from_name(prio) {
+            let band = match priority_from_name(prio.as_deref()) {
                 Ok(band) => band,
                 Err(()) => {
                     ctx.eprintln(&format!(
                         "callbackParallelThreads: Unknown priority \"{}\"",
-                        prio.unwrap_or("")
+                        prio.as_deref().unwrap_or("")
                     ));
                     return Ok(CommandOutcome::Failed);
                 }
@@ -476,7 +476,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let out_tmp = tempfile::NamedTempFile::new().unwrap();
         let err_tmp = tempfile::NamedTempFile::new().unwrap();

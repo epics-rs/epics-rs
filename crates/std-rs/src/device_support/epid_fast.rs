@@ -422,7 +422,7 @@ impl EpidFastDeviceSupport {
     /// [`start_from_asyn_interrupts_with_port`]: Self::start_from_asyn_interrupts_with_port
     pub fn start_from_asyn_interrupts(
         &self,
-        interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        interrupt_rx: asyn_rs::interrupt::AsyncInterruptReceiver,
         input_reason: usize,
         output_fn: Arc<Mutex<dyn FnMut(f64) + Send>>,
     ) {
@@ -448,7 +448,7 @@ impl EpidFastDeviceSupport {
     /// [`set_output_port`]: Self::set_output_port
     pub fn start_from_asyn_interrupts_with_port(
         &self,
-        interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        interrupt_rx: asyn_rs::interrupt::AsyncInterruptReceiver,
         input_reason: usize,
         output_sync_io: asyn_rs::sync_io::SyncIOHandle,
         output_reason: usize,
@@ -461,7 +461,7 @@ impl EpidFastDeviceSupport {
     /// `do_pid`. Shared by both `start_from_asyn_interrupts` variants.
     fn spawn_interrupt_loop(
         &self,
-        mut interrupt_rx: tokio::sync::broadcast::Receiver<asyn_rs::interrupt::InterruptValue>,
+        mut interrupt_rx: asyn_rs::interrupt::AsyncInterruptReceiver,
         input_reason: usize,
     ) {
         let pvt = Arc::clone(&self.pvt);
@@ -482,8 +482,8 @@ impl EpidFastDeviceSupport {
                             }
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Err(asyn_rs::interrupt::AsyncRecvError::Closed) => break,
+                    Err(asyn_rs::interrupt::AsyncRecvError::Lagged(_)) => {
                         // Dropped some interrupts — continue
                     }
                 }

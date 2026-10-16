@@ -39,7 +39,8 @@
 //! 1. a file-level `#![cfg(..)]` gate;
 //! 2. an enclosing column-0 `mod` carrying a `#[cfg(..)]` gate — the
 //!    `server_connection_drop_tests` precedent;
-//! 3. a per-test `#[cfg(..)]` gate directly above it — the
+//! 3. a per-test `#[cfg(..)]` gate among the attributes of the test the site
+//!    opens or sits in — the
 //!    `protocol_tests.rs` precedent, which keeps that file's pure wire-format
 //!    tests running on the exec backend;
 //!
@@ -60,10 +61,12 @@
 //!    file may carry one marker at the top counting everything below it, or
 //!    one marker beside each site counting just that site.
 //!
-//! A "reactor-dependent test site" is a `#[tokio::test]` attribute, or a line
-//! in test code that builds a tokio runtime by hand. Both spellings obtain the
-//! ambient reactor that the exec backend does not provide, so both are
-//! counted.
+//! A "reactor-dependent test site" is a `#[tokio::test]` attribute, a line
+//! in test code that builds a tokio runtime by hand, or the first line of an
+//! `#[epics_test]` body that names a tokio timer, spawn or socket. The first
+//! two obtain the ambient reactor that the exec backend does not provide; the
+//! third uses one without obtaining it, and panics "there is no reactor
+//! running" there, where `runtime::task` is the spelling that works.
 //!
 //! # Why this fails closed
 //!
@@ -129,11 +132,13 @@ pub const CENSUS_MARKER: &str = "RTEMS-EXEC-MODEL-ALLOW(";
 /// Printed with every violation so the failure explains itself without the
 /// reader having to find this file first.
 pub const RULE: &str = "\
-exec-backend gating rule: every #[tokio::test] and every hand-built tokio
-runtime in test code must be accounted for by exactly one of
+exec-backend gating rule: every #[tokio::test], every hand-built tokio
+runtime in test code, and every #[epics_test] body naming tokio::time,
+tokio::spawn or tokio::net (spell those through epics_base_rs::runtime::task
+instead) must be accounted for by exactly one of
   (1) a file-level #![cfg(..)] gate
   (2) an enclosing column-0 mod carrying a #[cfg(..)] gate
-  (3) a per-test #[cfg(..)] gate directly above it
+  (3) a per-test #[cfg(..)] gate among its test's attributes
 where a gate is any cfg predicate that is false on the exec backend:
 tokio_backend and not(any(exec_backend, ..)) are the spellings in use, and the
 guard evaluates the predicate rather than matching either of them
@@ -158,7 +163,7 @@ pub struct Audit {
     ///
     /// Options (1) and (2) are the only two accountings that take a site out
     /// of [`Audit::ungated`] without leaving anything at the site to see. A
-    /// per-test gate — option (3) — is a line directly above the test, so it
+    /// per-test gate — option (3) — is a line on the test itself, so it
     /// reads as an accounting in the diff; a whole-file or whole-module gate
     /// is one line far away that silently empties everything below it. That
     /// asymmetry is the reason this vector exists and per-test gates are not
@@ -230,6 +235,7 @@ pub fn removal_cost(path: &str, text: &str, integration: bool) -> GateCost {
 fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: bool) -> Audit {
     let lines: Vec<&str> = text.lines().collect();
     let attrs = Attrs::collect(&lines);
+    let in_literal = opens_inside_a_literal(&lines);
     let file_gated = removed_by_parent
         || lines.iter().enumerate().any(|(i, l)| {
             l.trim_start().starts_with("#![")
@@ -261,8 +267,17 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
     // Gated reactor-free test attributes, each with whether a runtime-building
     // line below it has claimed it — a claimed entry is a site, not collateral.
     let mut gated_tests: Vec<(usize, bool)> = Vec::new();
+    // The test whose body this line is in: its 0-based attribute line, that
+    // line's indent, which the body's closing `}` shares, whether it is an
+    // `epics_test`, and whether that body has already been counted as a site.
+    let mut test_body: Option<(usize, usize, bool, bool)> = None;
 
     for (idx, raw) in lines.iter().enumerate() {
+        // A `.db` fixture's column-0 `}` in a raw string is not the end of
+        // the test around it.
+        if in_literal[idx] {
+            continue;
+        }
         let trimmed = raw.trim_start();
         let col0 = !raw.is_empty() && raw.len() == trimmed.len();
 
@@ -296,8 +311,30 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
 
         // -- reactor-dependent sites ----------------------------------------
         let is_tokio_test = trimmed.starts_with(concat!("#[tokio", "::test"));
+        if is_tokio_test || is_reactor_free_test(trimmed) {
+            test_body = Some((
+                idx,
+                raw.len() - trimmed.len(),
+                is_epics_test(trimmed),
+                false,
+            ));
+        } else if test_body.is_some_and(|(_, indent, _, _)| {
+            trimmed.starts_with('}') && raw.len() - trimmed.len() == indent
+        }) {
+            test_body = None;
+        }
         let builds_runtime = region.is_test && builds_a_runtime(trimmed);
-        if !is_tokio_test && !builds_runtime {
+        // One site per body: the census counts tests that need a reactor.
+        let reactor_in_body = match test_body.as_mut() {
+            Some((attr, _, true, counted))
+                if region.is_test && !*counted && names_a_reactor(trimmed) =>
+            {
+                *counted = true;
+                Some(*attr)
+            }
+            _ => None,
+        };
+        if !is_tokio_test && !builds_runtime && reactor_in_body.is_none() {
             continue;
         }
         if file_gated || region.is_gated {
@@ -313,7 +350,10 @@ fn audit_inner(path: &str, text: &str, integration: bool, removed_by_parent: boo
             }
             continue;
         }
-        if is_tokio_test && per_test_gated(&lines, &attrs, idx) {
+        // Every site belongs to the test it opens or sits in — a tokio test,
+        // a reactor-naming `epics_test` body, a runtime built in any test —
+        // and that test's own gate accounts for it.
+        if test_body.is_some_and(|(attr, ..)| per_test_gated(&lines, &attrs, attr)) {
             continue;
         }
         ungated.push(idx + 1);
@@ -429,6 +469,34 @@ fn is_reactor_free_test(trimmed: &str) -> bool {
     last == "test" || last == concat!("epics", "_test")
 }
 
+/// `#[epics_test]` by any path: the reactor-free test whose body runs on the
+/// `runtime::task` seam, so on the exec backend it has no reactor either.
+fn is_epics_test(trimmed: &str) -> bool {
+    is_reactor_free_test(trimmed)
+        && trimmed
+            .split(['(', ']'])
+            .next()
+            .is_some_and(|p| p.ends_with(concat!("epics", "_test")))
+}
+
+/// A line of code naming a tokio item that needs the ambient reactor: a timer
+/// or a spawn panics "there is no reactor running" on the exec backend, where
+/// `runtime::task::{sleep, timeout, spawn}` are the spellings that work.
+/// `tokio::sync`, `select!` and in-memory `io` need no reactor and are not
+/// sites.
+fn names_a_reactor(trimmed: &str) -> bool {
+    const NEEDS_REACTOR: [&str; 6] = [
+        concat!("tokio::", "time::sleep"),
+        concat!("tokio::", "time::timeout"),
+        concat!("tokio::", "time::interval"),
+        concat!("tokio::", "spawn"),
+        concat!("tokio::", "task::spawn"),
+        concat!("tokio::", "net::"),
+    ];
+    let code = trimmed.split("//").next().unwrap_or(trimmed);
+    NEEDS_REACTOR.iter().any(|path| code.contains(path))
+}
+
 /// `mod foo {` / `pub mod foo {` at column 0 — an inline module opening.
 fn is_mod_open(raw: &str) -> bool {
     let rest = raw.strip_prefix("pub ").unwrap_or(raw);
@@ -536,29 +604,29 @@ fn builds_a_runtime(trimmed: &str) -> bool {
         || trimmed.contains(concat!("tokio::runtime::Builder", "::new_"))
 }
 
-/// Is the attribute block directly above `idx` carrying the per-test gate?
+/// Does the attribute block around the test attribute at `idx` carry the
+/// per-test gate?
 ///
-/// Walks up over attributes, comments and blank lines only, so a preceding
-/// test's gate cannot be mistaken for this one's — any code line (a closing
-/// brace, in practice) stops the walk.
+/// The whole block, above and below `idx`: `#[test] #[cfg(..)]` gates the test
+/// exactly as `#[cfg(..)] #[test]` does. Attributes, comments and blank lines
+/// only, so a neighbouring test's gate cannot be mistaken for this one's — any
+/// code line (a closing brace above, the `fn` below) ends the block.
 fn per_test_gated(lines: &[&str], attrs: &Attrs, idx: usize) -> bool {
-    for above in (0..idx).rev() {
-        if attrs.continuation[above] {
-            continue;
+    let gate_at = |i: usize| -> Option<bool> {
+        if attrs.continuation[i] {
+            return Some(false);
         }
-        if let Some(attr) = attrs.opened[above].as_deref() {
-            if is_gate_attr(attr) {
-                return true;
-            }
-            continue;
+        if let Some(attr) = attrs.opened[i].as_deref() {
+            return Some(is_gate_attr(attr));
         }
-        let t = lines[above].trim();
-        if t.is_empty() || t.starts_with("//") {
-            continue;
-        }
-        return false;
-    }
-    false
+        let t = lines[i].trim();
+        (t.is_empty() || t.starts_with("//")).then_some(false)
+    };
+    let mut block = (0..idx)
+        .rev()
+        .map_while(gate_at)
+        .chain((idx + 1..lines.len()).map_while(gate_at));
+    block.any(|gated| gated)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +834,88 @@ impl Attrs {
     }
 }
 
+/// Per line: does it begin inside a string literal or a block comment?
+fn opens_inside_a_literal(lines: &[&str]) -> Vec<bool> {
+    enum In {
+        Code,
+        Str,
+        Raw(usize),
+        Comment(usize),
+    }
+    let mut state = In::Code;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        out.push(!matches!(state, In::Code));
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match state {
+                In::Code => match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => break,
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        state = In::Comment(1);
+                        i += 1;
+                    }
+                    b'"' => state = In::Str,
+                    // `r`, `br` and `cr` open a raw string; `\"` inside one
+                    // does not escape the closing quote.
+                    b'r' if !b[..i]
+                        .strip_suffix(b"b")
+                        .or_else(|| b[..i].strip_suffix(b"c"))
+                        .unwrap_or(&b[..i])
+                        .last()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+                    {
+                        let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                        if b.get(i + 1 + hashes) == Some(&b'"') {
+                            state = In::Raw(hashes);
+                            i += hashes + 1;
+                        }
+                    }
+                    // A char literal, so `'"'` opens nothing; a lifetime has
+                    // no closing quote within two bytes.
+                    b'\'' if b.get(i + 1) == Some(&b'\\') => {
+                        i += b[i + 2..]
+                            .iter()
+                            .position(|c| *c == b'\'')
+                            .map_or(b.len(), |p| p + 2);
+                    }
+                    b'\'' if b.get(i + 2) == Some(&b'\'') => i += 2,
+                    _ => {}
+                },
+                In::Str => match b[i] {
+                    b'\\' => i += 1,
+                    b'"' => state = In::Code,
+                    _ => {}
+                },
+                In::Raw(n) => {
+                    if b[i] == b'"'
+                        && b[i + 1..].iter().take(n).filter(|c| **c == b'#').count() == n
+                    {
+                        state = In::Code;
+                        i += n;
+                    }
+                }
+                In::Comment(depth) => {
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        state = if depth == 1 {
+                            In::Code
+                        } else {
+                            In::Comment(depth - 1)
+                        };
+                        i += 1;
+                    } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        state = In::Comment(depth + 1);
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 fn bracket_depth(line: &str) -> i32 {
     line.chars()
         .map(|c| match c {
@@ -967,7 +1117,13 @@ pub struct GateCost {
 /// reports a compliant crate, which is the failure this whole crate exists to
 /// prevent.
 pub fn audit_crate(manifest_dir: &str) -> CrateCensus {
-    let root = Path::new(manifest_dir);
+    // One spelling for the whole scan: a `#[path]` is resolved by `normalise`,
+    // so the root is too. `canonicalize` would hand Windows a `\\?\` path, in
+    // which `components` never splits out a `..`.
+    let root = &normalise(
+        &std::path::absolute(manifest_dir)
+            .unwrap_or_else(|e| panic!("rtems-exec-gate: cannot resolve {manifest_dir}: {e}")),
+    );
     let mut files = Vec::new();
     crate_rust_files(root, &mut files);
     assert!(
@@ -1657,6 +1813,92 @@ mod fixtures {
         );
         let audit = audit_source("src/x.rs", &src, false);
         assert_eq!(audit.ungated.len(), 1, "{:?}", audit.ungated);
+    }
+
+    /// Option 3 for a plain `#[test]` that builds its own runtime: the test's
+    /// gate accounts for the runtime, in either attribute order and any
+    /// spelling that is false on the exec backend; a `cfg` that still holds
+    /// there, or none, leaves it counted.
+    #[test]
+    fn a_gated_plain_test_accounts_for_the_runtime_it_builds() {
+        let test = |attrs: &str, name: &str| {
+            format!("{attrs}\n    fn {name}() {{\n{}\n    }}\n", runtime_build())
+        };
+        let src = format!(
+            "#[cfg(test)]\nmod tests {{\n{}{}{}{}{}}}\n",
+            test(&format!("    {GATE_ATTR}\n    #[test]"), "above"),
+            test(&format!("    #[test]\n    {GATE_ATTR}"), "below"),
+            test("    #[cfg(not(exec_backend))]\n    #[test]", "spelled"),
+            test("    #[cfg(unix)]\n    #[test]", "not_a_gate"),
+            test("    #[test]", "open"),
+        );
+        let audit = audit_source("src/x.rs", &src, false);
+        assert_eq!(audit.ungated, vec![21, 25], "{src}");
+        assert!(audit.scope_gated.is_empty(), "{:?}", audit.scope_gated);
+    }
+
+    fn epics_test_sleeping(head: &str, sleep: &str) -> String {
+        format!(
+            "{head}\n#[epics_macros_rs::epics_test]\nasync fn t() {{\n    let db = r#\"\nrecord(ai, \"X\") {{\n}}\n\"#;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n    {sleep}(std::time::Duration::from_millis(1)).await;\n}}\n"
+        )
+    }
+
+    /// A raw byte string ending in a backslash closes at its quote, so the
+    /// runtime after it is still seen as test code.
+    #[test]
+    fn a_raw_byte_string_ending_in_a_backslash_closes() {
+        let src = concat!(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n",
+            "        let _ = br\"a\\\";\n    }\n",
+            "    fn ctx() {\n        let _rt = tokio::runtime::",
+            "Runtime::new().unwrap();\n    }\n}\n"
+        );
+        let audit = audit_source("src/x.rs", src, false);
+        assert_eq!(audit.ungated, vec![8], "{src}");
+    }
+
+    /// The third spelling: an `#[epics_test]` body that sleeps on tokio has no
+    /// reactor on the exec backend. One site per body, at its first such line,
+    /// and a fixture's column-0 `}` inside a raw string does not end the body.
+    #[test]
+    fn a_tokio_timer_in_an_epics_test_body_is_a_site() {
+        let src = epics_test_sleeping("", concat!("tokio::", "time::sleep"));
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert_eq!(audit.ungated, vec![8], "{src}");
+        assert_eq!(audit.violations.len(), 1, "{:?}", audit.violations);
+    }
+
+    /// ...accounted for by a file gate, which makes it a site, not collateral...
+    #[test]
+    fn a_file_gate_accounts_for_a_tokio_timer_in_an_epics_test_body() {
+        let src = epics_test_sleeping(FILE_GATE_ATTR, concat!("tokio::", "time::sleep"));
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert!(audit.violations.is_empty(), "{:?}", audit.violations);
+        assert_eq!(audit.scope_gated, vec![8]);
+        assert!(audit.collateral.is_empty(), "{:?}", audit.collateral);
+    }
+
+    /// ...and absent when the body sleeps through `runtime::task`.
+    #[test]
+    fn a_runtime_task_timer_in_an_epics_test_body_is_not_a_site() {
+        let src = epics_test_sleeping("", "epics_base_rs::runtime::task::sleep");
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert!(audit.ungated.is_empty(), "{:?}", audit.ungated);
+        assert!(audit.violations.is_empty(), "{:?}", audit.violations);
+    }
+
+    /// `tokio::sync` needs no reactor, and a tokio timer in a `#[tokio::test]`
+    /// body is that attribute's site, not a second one.
+    #[test]
+    fn tokio_sync_in_an_epics_test_and_a_timer_in_a_tokio_test_are_not_sites() {
+        let src = format!(
+            "#[epics_macros_rs::epics_test]\nasync fn a() {{\n    let (tx, rx) = {}();\n}}\n\n{}\nasync fn b() {{\n    {}(d).await;\n}}\n",
+            concat!("tokio::", "sync::oneshot::channel"),
+            tokio_test(),
+            concat!("tokio::", "time::sleep"),
+        );
+        let audit = audit_source("tests/x.rs", &src, true);
+        assert_eq!(audit.ungated, vec![6], "{src}");
     }
 
     /// ...but the same call in production code is not a test site, so the

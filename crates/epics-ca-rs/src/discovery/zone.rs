@@ -28,7 +28,11 @@ impl ZoneSnippet {
 
     /// Register an IOC instance. `name` is the unique service-instance
     /// name (e.g. "motor-ioc"), `host` is a hostname A record on the
-    /// same zone (e.g. "motor-host"), `port` is the CA TCP port.
+    /// same zone (e.g. "motor-host"), `port` is the UDP search port a client
+    /// sends SEARCH to: a discovering client adds the SRV `host:port` to its
+    /// SEARCH destinations. It equals the TCP port in the default setup, and
+    /// differs only when the server was given distinct ones. The snippet is
+    /// written offline, so the operator supplies the number.
     pub fn instance(mut self, name: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
         self.instances.push(Instance {
             name: name.into(),

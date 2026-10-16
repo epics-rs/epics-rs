@@ -121,3 +121,33 @@ fn the_shared_pva_port_variable_still_works() {
         port
     );
 }
+
+/// With no script the demo runs its own `ioc/st.cmd`; the fallback used to
+/// load `qsrv_demo.db` without the `P` that script sets, and the load failed.
+#[test]
+fn no_script_serves_the_demo_records() {
+    let ports: Vec<u16> = (0..2)
+        .map(|_| {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("take a port");
+            probe.local_addr().expect("bound").port()
+        })
+        .collect();
+    let mut ioc = Reaped(
+        Command::new(env!("CARGO_BIN_EXE_qsrv-ioc"))
+            .env("EPICS_CAS_SERVER_PORT", ports[0].to_string())
+            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
+            .env("EPICS_PVAS_SERVER_PORT", ports[1].to_string())
+            .env_remove("EPICS_PVA_SERVER_PORT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn qsrv-ioc"),
+    );
+    let stderr = BufReader::new(ioc.0.stderr.take().expect("piped stderr"));
+    let served = stderr
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.trim() == "DEMO:AI");
+    assert!(served, "qsrv-ioc never listed DEMO:AI");
+}

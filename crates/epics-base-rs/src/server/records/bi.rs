@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{MENU_SIMM, ProcessOutcome, RawSoftEntry, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -34,8 +35,8 @@ pub struct BiRecord {
     pub mlst: u16, // last monitored value
     // Simulation
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     // SVAL is `DBF_ULONG` (biRecord.dbd.pod:263-265) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
     // &prec->sval)`, biRecord.c:289) before publishing `val = sval`.
@@ -63,8 +64,8 @@ impl Default for BiRecord {
             lalm: 0,
             mlst: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sval: 0,
             sims: 0,
             sdly: -1.0,
@@ -83,6 +84,22 @@ impl BiRecord {
 }
 
 impl Record for BiRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::bi;
+        RVAL => rval);
+
+    /// `biRecord.c:100` loads a constant SIOL as `DBF_USHORT` into the ULONG SVAL.
+    fn siol_load_type(&self) -> Option<crate::types::DbFieldType> {
+        Some(crate::types::DbFieldType::UShort)
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     /// UDF belongs to the dset here, not to `process()`. C
     /// `biRecord.c:136-141` assigns `prec->udf = FALSE` at `:139`, INSIDE
     /// `if (status == 0)`, and folds `2` into `0` only at `:141`, so a device
@@ -99,14 +116,13 @@ impl Record for BiRecord {
         "bi"
     }
 
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // Initialize tracking fields from current val
+    // biRecord.c:112 returns a nonzero dset status before :114-116.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
             self.mlst = self.val;
             self.lalm = self.val;
             self.oraw = self.rval;
         }
-        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -119,9 +135,46 @@ impl Record for BiRecord {
             }
         }
         self.skip_convert = false; // reset for next cycle
-
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `biRecord.c:298-299` posts RVAL with `monitor_mask | DBE_VALUE |
+    /// DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("RVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// `monitor()` decides RVAL from the record's own `oraw`, so the
+    /// framework keeps no published copy of it.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
+
+    /// `monitor()` posts VAL and RVAL alone (`biRecord.c:283-305`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BI_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`biRecord.c:297-303`), minus the post. Outside init, `monitor()` is
+    /// the only writer of `oraw`, so an RVAL put posts again from its cycle
+    /// unless the cycle reads back the value `oraw` already holds.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval),
+        ))
     }
 
     fn set_device_did_compute(&mut self, did_compute: bool) {
@@ -145,14 +198,18 @@ impl Record for BiRecord {
     /// `devBiSoft` `read_bi` returns 2). Routing the device raw here instead of
     /// through `set_val` keeps `set_val` single-meaning (a Soft Channel `bi`
     /// linked to a non-binary source still passes its value through as C does).
-    /// Input twin of `bo::apply_raw_readback` (same `mask != 0` split).
+    /// Input twin of `bo::apply_raw_readback`.
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        self.rval = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
+        self.rval = raw as u32;
         self.val = if self.rval != 0 { 1 } else { 0 };
+        true
+    }
+
+    fn refused_async_read_keeps_udf(&self) -> bool {
+        true
+    }
+
+    fn raw_soft_read_failure_skips_convert(&self) -> bool {
         true
     }
 
@@ -200,8 +257,8 @@ impl Record for BiRecord {
             state_sev as u16,
             self.aftc,
             self.afvl,
+            common.time_last.get(),
             common.time,
-            crate::runtime::general_time::get_current(),
         );
         self.afvl = new_afvl;
         // C biRecord.c:272-273 — `recGblSetSevr(prec, STATE_ALARM, asev)`.
@@ -226,14 +283,70 @@ impl Record for BiRecord {
         ))
     }
 
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
+    }
+
+    /// `prec->udf = FALSE` (`biRecord.c:227`).
+    fn enum_str_clears_udf(&self) -> bool {
+        true
+    }
+
     /// C `get_enum_str` (biRecord.c:173-192): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
     /// is the LABEL list's, not this read's.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::binary_enum_string_form(
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Binary([
             &self.znam, &self.onam,
-        ))
+        ]))
+    }
+
+    /// `devBiSoft.c:50` reads INP as `DBR_USHORT`, `devBiSoftRaw.c:50` as
+    /// `DBR_ULONG`, `devBiSoftCallback.c:62` as `DBR_ENUM`.
+    fn soft_input_request(
+        &self,
+        soft: crate::server::device_support::SoftDtyp,
+    ) -> crate::server::record::InputLinkRequest {
+        use crate::server::device_support::SoftDtyp;
+        use crate::server::record::{InputLinkRequest, LinkReadAs};
+        InputLinkRequest::As(match soft {
+            SoftDtyp::Plain => LinkReadAs::UShort,
+            SoftDtyp::Raw => LinkReadAs::ULong,
+            SoftDtyp::Async => LinkReadAs::Enum,
+        })
+    }
+
+    /// The Async dset copies its buffer into VAL; the other soft dsets never
+    /// read `async_buffer`, so taking every delivered value is exact for it.
+    fn soft_input_read(
+        &mut self,
+        value: Option<EpicsValue>,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        match value {
+            None => return Ok(()),
+            // A read that stores nothing (a state name, NORD=0) hands back
+            // the devPvt buffer, not VAL; with no devPvt C never read.
+            Some(EpicsValue::EnumArray(a)) if a.is_empty() => match dpvt.callback_buffer() {
+                Some(buffer) => self.set_val(EpicsValue::Enum(buffer))?,
+                None => return Ok(()),
+            },
+            Some(value) => self.set_val(value)?,
+        }
+        dpvt.keep_buffer(self.val);
+        Ok(())
+    }
+
+    /// The Plain dset's `DBR_USHORT` read: VAL is that state index.
+    fn soft_input_read_u16(
+        &mut self,
+        value: u16,
+        dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> CaResult<()> {
+        self.val = value;
+        dpvt.keep_buffer(value);
+        Ok(())
     }
 
     /// C `devBiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
@@ -250,6 +363,48 @@ impl Record for BiRecord {
             self.rval &= self.mask;
         }
         Some(Ok(()))
+    }
+
+    /// `biRecord.c:332` `prec->rval = (unsigned short) prec->sval`.
+    fn sval_as_rval(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::ULong(u32::from(self.sval as u16)))
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            CycleCell::Aftc => CycleRead::Value(CycleValue::Double(self.aftc)),
+            CycleCell::Afvl => CycleRead::Value(CycleValue::Double(self.afvl)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Afvl, CycleValue::Double(v)) => self.afvl = v,
+            (CycleCell::Lalm, CycleValue::UShort(v)) => self.lalm = v,
+            (CycleCell::Mlst, CycleValue::UShort(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -270,6 +425,7 @@ impl Record for BiRecord {
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::ULong(self.sval)),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
@@ -293,15 +449,12 @@ impl Record for BiRecord {
                 }
                 // C rset `put_enum_str` (biRecord.c:208-217), reached from
                 // `dbConvert.c::putStringEnum`. The framework's put paths
-                // already resolve a DBR_STRING against `enum_state_strings`
+                // already resolve a DBR_STRING through `enum_str_state`
                 // before they reach here; a direct caller takes the same
                 // converter, so there is one string→state rule.
                 EpicsValue::String(ref s) => {
-                    let resolved = crate::server::record::resolve_enum_state_string(
-                        "VAL",
-                        self.enum_state_strings().as_deref(),
-                        s,
-                    )?;
+                    let resolved =
+                        crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                     if let EpicsValue::Enum(v) = resolved {
                         self.val = v;
                     }
@@ -417,14 +570,14 @@ impl Record for BiRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -439,6 +592,13 @@ impl Record for BiRecord {
             "SDLY" => match value {
                 EpicsValue::Double(v) => {
                     self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::ULong(v) => {
+                    self.sval = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

@@ -39,17 +39,161 @@ pub struct ArgDesc {
     pub arg_type: ArgType,
 }
 
+/// One `iocshArgString` value: C's `sval`, a `char *` into the line buffer,
+/// so it is the bytes the script held. A command that needs text converts
+/// at its own site — [`Self::to_str`] where the bytes are an identity,
+/// [`Self::to_str_lossy`] where they are only shown.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IocshString(Vec<u8>);
+
+impl IocshString {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// The text, or the refusal a String-keyed consumer answers a
+    /// non-UTF-8 argument with.
+    pub fn to_str(&self) -> Result<&str, String> {
+        std::str::from_utf8(&self.0)
+            .map_err(|_| format!("'{}' is not valid UTF-8", self.to_str_lossy()))
+    }
+
+    pub fn to_str_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
+    }
+
+    /// The file name C `fopen`s: the bytes themselves on Unix.
+    pub fn to_path(&self) -> Result<&std::path::Path, String> {
+        bytes_path(&self.0)
+    }
+
+    /// The bytes as the OS takes a name (`setenv`, `unsetenv`).
+    pub fn to_os_str(&self) -> Result<&std::ffi::OsStr, String> {
+        bytes_os_str(&self.0)
+    }
+}
+
+/// A file name held as bytes, as C hands it to `fopen`.
+pub fn bytes_path(name: &[u8]) -> Result<&std::path::Path, String> {
+    bytes_os_str(name).map(std::path::Path::new)
+}
+
+/// Bytes as an OS string: the bytes themselves on Unix, UTF-8 elsewhere.
+pub fn bytes_os_str(name: &[u8]) -> Result<&std::ffi::OsStr, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::ffi::OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(name)
+            .map(std::ffi::OsStr::new)
+            .map_err(|_| format!("'{}' is not valid UTF-8", String::from_utf8_lossy(name)))
+    }
+}
+
+impl std::ops::Deref for IocshString {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for IocshString {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for IocshString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_str_lossy(), f)
+    }
+}
+
+/// Display-only: a diagnostic quoting the argument.
+impl std::fmt::Display for IocshString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_str_lossy())
+    }
+}
+
+impl From<Vec<u8>> for IocshString {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<&[u8]> for IocshString {
+    fn from(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
+impl From<String> for IocshString {
+    fn from(s: String) -> Self {
+        Self(s.into_bytes())
+    }
+}
+
+impl From<&str> for IocshString {
+    fn from(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+impl From<&String> for IocshString {
+    fn from(s: &String) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
+
+impl From<std::borrow::Cow<'_, str>> for IocshString {
+    fn from(s: std::borrow::Cow<'_, str>) -> Self {
+        Self(s.into_owned().into_bytes())
+    }
+}
+
+impl PartialEq<str> for IocshString {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl PartialEq<&str> for IocshString {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+
+impl PartialEq<IocshString> for &str {
+    fn eq(&self, other: &IocshString) -> bool {
+        self.as_bytes() == other.0
+    }
+}
+
+impl PartialEq<IocshString> for str {
+    fn eq(&self, other: &IocshString) -> bool {
+        self.as_bytes() == other.0
+    }
+}
+
 /// A parsed argument value.
 #[derive(Debug, Clone)]
 pub enum ArgValue {
-    String(String),
+    String(IocshString),
     Int(i64),
     Double(f64),
     /// Every remaining token, for an [`ArgType::Argv`] parameter. Empty when
     /// the line ended at this position — C hands the callback `ac == 0` there
     /// rather than treating the argument as absent, so there is no `Missing`
     /// case for this type.
-    Argv(Vec<String>),
+    Argv(Vec<IocshString>),
     Missing,
 }
 
@@ -430,21 +574,13 @@ impl CommandRegistry {
 /// position resolves before the command name is taken. The caller
 /// ([`super::IocShell::execute_line`]) owns that one expansion; this
 /// function must not perform a second one.
-pub(crate) fn tokenize(line: &str) -> Vec<String> {
-    // Only ASCII bytes can be a separator, a quote or an escape, and
-    // every byte of a multi-byte character is >= 0x80, so one such byte
-    // stands for the whole character: classifying per character reaches
-    // the same words C reaches per byte, without ever cutting a token
-    // inside a UTF-8 sequence.
-    const NON_ASCII: u8 = 0x80;
-
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
+pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
+    let mut tokens: Vec<IocshString> = Vec::new();
+    let mut current = Vec::new();
     let mut inword = false;
     let mut scan = ShellScan::default();
 
-    for ch in line.chars() {
-        let byte = if ch.is_ascii() { ch as u8 } else { NON_ASCII };
+    for &byte in line {
         match scan.feed(byte) {
             // C `:275-278` `continue`s past the word builder, so the
             // backslash neither starts a word nor ends one.
@@ -454,7 +590,7 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
             // run of them yields no empty tokens.
             SplitRole::Separator => {
                 if inword {
-                    tokens.push(std::mem::take(&mut current));
+                    tokens.push(std::mem::take(&mut current).into());
                     inword = false;
                 }
             }
@@ -463,16 +599,36 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
             // not an absent one.
             SplitRole::Quote => inword = true,
             SplitRole::Data => {
-                current.push(ch);
+                current.push(byte);
                 inword = true;
             }
         }
     }
     // C `:353-354` terminates the word the end of the line leaves open.
     if inword {
-        tokens.push(current);
+        tokens.push(current.into());
     }
     tokens
+}
+
+/// `arg` as line text that [`super::IocShell::execute_line`]'s expansion and
+/// `tokenize` hand back as exactly `arg`: for a caller holding a value C
+/// would pass as a pointer, not as text. Inside a quote a backslash is data
+/// and nothing can be escaped; outside one it makes the next byte data for
+/// both passes (`macCore.c:741-743`, `iocsh.cpp:273-278`). Empty is `""`,
+/// which `split` keeps as an empty word (`:345-346`).
+pub fn escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if c.is_ascii_whitespace() || "\\\"'(),$<>".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Scan a command line for the malformed-input conditions C
@@ -481,9 +637,9 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
 /// diagnostic for the first problem found, or `None` if the line is
 /// well-formed. L-5: C marks such a line errored; the Rust tokenizer
 /// previously consumed them silently.
-pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
+pub(crate) fn lint_line(line: &[u8]) -> Option<&'static str> {
     let mut scan = ShellScan::default();
-    for &b in line.as_bytes() {
+    for &b in line {
         scan.feed(b);
     }
     // C reports these after the same loop, from the same two pieces of
@@ -734,7 +890,10 @@ pub(super) fn epics_strtod_whole(token: &str) -> Option<f64> {
 }
 
 /// Parse tokens into argument values according to argument descriptors.
-pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<ArgValue>, String> {
+pub(crate) fn parse_args(
+    tokens: &[IocshString],
+    descs: &[ArgDesc],
+) -> Result<Vec<ArgValue>, String> {
     let mut result = Vec::with_capacity(descs.len());
 
     for (i, desc) in descs.iter().enumerate() {
@@ -786,13 +945,15 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
             // <n>: ` — already says which line, and adding the parameter
             // name is the only thing on this stream that stops a site
             // script's grep from matching.
-            ArgType::Int => parse_iocsh_int(token)
+            // `strtol`/`epicsStrtod` read the bytes; a non-UTF-8 byte is
+            // not a digit to them, and U+FFFD is not one to these.
+            ArgType::Int => parse_iocsh_int(&token.to_str_lossy())
                 .map(ArgValue::Int)
                 .map_err(|why| match why {
                     IntArgError::OutOfRange => format!("Integer '{token}' out of range."),
                     IntArgError::Invalid => format!("Invalid integer '{token}'."),
                 })?,
-            ArgType::Double => epics_strtod_whole(token)
+            ArgType::Double => epics_strtod_whole(&token.to_str_lossy())
                 .map(ArgValue::Double)
                 .ok_or_else(|| format!("Invalid double '{token}'."))?,
             // Handled above: an `Argv` parameter never reaches the
@@ -813,14 +974,14 @@ mod tests {
 
     #[test]
     fn test_tokenize_simple() {
-        assert_eq!(tokenize("dbl"), vec!["dbl"]);
-        assert_eq!(tokenize("dbgf TEMP.VAL"), vec!["dbgf", "TEMP.VAL"]);
+        assert_eq!(tokenize(b"dbl"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbgf TEMP.VAL"), vec!["dbgf", "TEMP.VAL"]);
     }
 
     #[test]
     fn test_tokenize_quoted() {
         assert_eq!(
-            tokenize(r#"dbpf TEMP "42.0""#),
+            tokenize(br#"dbpf TEMP "42.0""#),
             vec!["dbpf", "TEMP", "42.0"]
         );
     }
@@ -836,8 +997,8 @@ mod tests {
     /// `epicsEnvSet("X", "a\\\\b")` → `X=a\\\\b`.
     #[test]
     fn a_backslash_inside_a_quote_is_data() {
-        assert_eq!(tokenize(r#"cmd "a\\b""#), vec!["cmd", r#"a\\b"#]);
-        assert_eq!(tokenize(r#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\\\b"#]);
+        assert_eq!(tokenize(br#"cmd "a\\b""#), vec!["cmd", r#"a\\b"#]);
+        assert_eq!(tokenize(br#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\\\b"#]);
     }
 
     /// The same rule read from the other side: `\"` inside a quoted run
@@ -848,7 +1009,7 @@ mod tests {
     #[test]
     fn an_escaped_quote_inside_a_quote_leaves_the_line_unbalanced() {
         assert_eq!(
-            lint_line(r#"cmd "hello \"world\"""#),
+            lint_line(br#"cmd "hello \"world\"""#),
             Some("Unbalanced quote.")
         );
     }
@@ -861,33 +1022,33 @@ mod tests {
     fn out_of_quote_backslash_escapes_like_c_split() {
         // Space syntax: `echo \"hello\"` prints `"hello"`, `echo a\ b`
         // prints `a b`.
-        assert_eq!(tokenize(r#"echo \"hello\""#), vec!["echo", r#""hello""#]);
-        assert_eq!(tokenize(r#"echo a\ b"#), vec!["echo", "a b"]);
+        assert_eq!(tokenize(br#"echo \"hello\""#), vec!["echo", r#""hello""#]);
+        assert_eq!(tokenize(br#"echo a\ b"#), vec!["echo", "a b"]);
         // Call syntax: `echo(a\,b)` prints `a,b` — the escaped comma
         // does not split the argument.
-        assert_eq!(tokenize(r#"echo(a\,b)"#), vec!["echo", "a,b"]);
+        assert_eq!(tokenize(br#"echo(a\,b)"#), vec!["echo", "a,b"]);
         // Escape-produced quotes are data, not outer quotes — nothing
         // strips them: `echo(\"hi\")` prints `"hi"`.
-        assert_eq!(tokenize(r#"echo(\"hi\")"#), vec!["echo", r#""hi""#]);
+        assert_eq!(tokenize(br#"echo(\"hi\")"#), vec!["echo", r#""hi""#]);
         // The closing-paren scanner honors the same rules:
         // `echo(a\))` prints `a)`, `echo('a)b')` prints `a)b`.
-        assert_eq!(tokenize(r#"echo(a\))"#), vec!["echo", "a)"]);
-        assert_eq!(tokenize(r#"echo('a)b')"#), vec!["echo", "a)b"]);
+        assert_eq!(tokenize(br#"echo(a\))"#), vec!["echo", "a)"]);
+        assert_eq!(tokenize(br#"echo('a)b')"#), vec!["echo", "a)b"]);
         // lint_line agrees these lines are well-formed — pre-fix it
         // passed them and the splitters then mis-parsed.
-        assert_eq!(lint_line(r#"echo \"hello\""#), None);
-        assert_eq!(lint_line(r#"echo(a\,b)"#), None);
+        assert_eq!(lint_line(br#"echo \"hello\""#), None);
+        assert_eq!(lint_line(br#"echo(a\,b)"#), None);
     }
 
     #[test]
     fn test_tokenize_empty() {
-        assert!(tokenize("").is_empty());
-        assert!(tokenize("   ").is_empty());
+        assert!(tokenize(b"").is_empty());
+        assert!(tokenize(b"   ").is_empty());
     }
 
     #[test]
     fn test_tokenize_trailing_whitespace() {
-        assert_eq!(tokenize("dbl   "), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl   "), vec!["dbl"]);
     }
 
     // --- C++ EPICS function-call syntax ---
@@ -895,7 +1056,7 @@ mod tests {
     #[test]
     fn test_tokenize_cpp_basic() {
         assert_eq!(
-            tokenize(r#"epicsEnvSet("PREFIX", "SIM1:")"#),
+            tokenize(br#"epicsEnvSet("PREFIX", "SIM1:")"#),
             vec!["epicsEnvSet", "PREFIX", "SIM1:"]
         );
     }
@@ -903,14 +1064,14 @@ mod tests {
     #[test]
     fn test_tokenize_cpp_mixed_types() {
         assert_eq!(
-            tokenize(r#"simDetectorConfig("SIM1", 256, 256, 50000000)"#),
+            tokenize(br#"simDetectorConfig("SIM1", 256, 256, 50000000)"#),
             vec!["simDetectorConfig", "SIM1", "256", "256", "50000000"]
         );
     }
 
     #[test]
     fn test_tokenize_cpp_no_args() {
-        assert_eq!(tokenize("iocInit()"), vec!["iocInit"]);
+        assert_eq!(tokenize(b"iocInit()"), vec!["iocInit"]);
     }
 
     #[test]
@@ -920,17 +1081,17 @@ mod tests {
         // nothing there. The port must not fall back to space-separated
         // syntax and hand the command `("L0",`-shaped tokens.
         assert_eq!(
-            tokenize(r#"asynOctetSetInputEos ("L0", 0, "\r")"#),
-            tokenize(r#"asynOctetSetInputEos("L0", 0, "\r")"#)
+            tokenize(br#"asynOctetSetInputEos ("L0", 0, "\r")"#),
+            tokenize(br#"asynOctetSetInputEos("L0", 0, "\r")"#)
         );
-        assert_eq!(tokenize("cmd\t(a, b)"), vec!["cmd", "a", "b"]);
-        assert_eq!(tokenize("iocInit ()"), vec!["iocInit"]);
+        assert_eq!(tokenize(b"cmd\t(a, b)"), vec!["cmd", "a", "b"]);
+        assert_eq!(tokenize(b"iocInit ()"), vec!["iocInit"]);
     }
 
     #[test]
     fn test_tokenize_cpp_spaces_around_commas() {
         assert_eq!(
-            tokenize(r#"cmd( "a" , "b" , 3 )"#),
+            tokenize(br#"cmd( "a" , "b" , 3 )"#),
             vec!["cmd", "a", "b", "3"]
         );
     }
@@ -939,7 +1100,7 @@ mod tests {
     fn test_tokenize_cpp_dbloadrecords() {
         // Matches real C++ EPICS syntax
         assert_eq!(
-            tokenize(r#"dbLoadRecords("path/to/file.db","P=SIM1:,R=cam1:")"#),
+            tokenize(br#"dbLoadRecords("path/to/file.db","P=SIM1:,R=cam1:")"#),
             vec!["dbLoadRecords", "path/to/file.db", "P=SIM1:,R=cam1:"]
         );
     }
@@ -957,23 +1118,23 @@ mod tests {
     /// argument between them.
     #[test]
     fn one_separator_set_applies_off_the_call_shape_too() {
-        assert_eq!(tokenize("dbl)"), vec!["dbl"]);
-        assert_eq!(tokenize("dbl )"), vec!["dbl"]);
-        assert_eq!(tokenize("dbl , ai"), vec!["dbl", "ai"]);
-        assert_eq!(tokenize(r#"echo(a"b"c)"#), vec!["echo", "abc"]);
-        assert_eq!(tokenize(r#"echo "a"b"c""#), vec!["echo", "abc"]);
-        assert_eq!(tokenize("echo(a,,b)"), vec!["echo", "a", "b"]);
+        assert_eq!(tokenize(b"dbl)"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl )"), vec!["dbl"]);
+        assert_eq!(tokenize(b"dbl , ai"), vec!["dbl", "ai"]);
+        assert_eq!(tokenize(br#"echo(a"b"c)"#), vec!["echo", "abc"]);
+        assert_eq!(tokenize(br#"echo "a"b"c""#), vec!["echo", "abc"]);
+        assert_eq!(tokenize(b"echo(a,,b)"), vec!["echo", "a", "b"]);
         // An opening quote begins a word even when it closes at once, so
         // an empty argument stays distinguishable from an absent one —
         // `cvtArg` keeps `""` and NULL apart (`iocsh.cpp:858-862`).
-        assert_eq!(tokenize(r#"cmd "" x"#), vec!["cmd", "", "x"]);
+        assert_eq!(tokenize(br#"cmd "" x"#), vec!["cmd", "", "x"]);
     }
 
     #[test]
     fn test_tokenize_cpp_quoted_with_parens_inside() {
         // Parens inside quotes should not confuse the parser
         assert_eq!(
-            tokenize(r#"cmd("hello(world)")"#),
+            tokenize(br#"cmd("hello(world)")"#),
             vec!["cmd", "hello(world)"]
         );
     }
@@ -984,7 +1145,7 @@ mod tests {
             name: "name",
             arg_type: ArgType::String,
         }];
-        let tokens = vec!["TEMP".to_string()];
+        let tokens: Vec<IocshString> = vec!["TEMP".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::String(s) if s == "TEMP"));
     }
@@ -1034,7 +1195,7 @@ mod tests {
     /// `sval = arg`, which keeps `""` distinct from NULL.
     #[test]
     fn an_empty_token_defaults_for_numbers_and_stays_empty_for_strings() {
-        let empty = vec![String::new()];
+        let empty: Vec<IocshString> = vec![IocshString::default()];
         for arg_type in [ArgType::Int, ArgType::Double] {
             let descs = vec![ArgDesc {
                 name: "only",
@@ -1065,7 +1226,7 @@ mod tests {
                 name: "only",
                 arg_type,
             }];
-            assert!(parse_args(&[token.to_string()], &descs).is_err());
+            assert!(parse_args(&[token.to_string().into()], &descs).is_err());
         }
     }
 
@@ -1078,7 +1239,7 @@ mod tests {
             name: "seconds",
             arg_type: ArgType::Double,
         }];
-        let tokens = vec!["0.0".to_string(), "extra".to_string()];
+        let tokens: Vec<IocshString> = vec!["0.0".into(), "extra".into()];
         let got = parse_args(&tokens, &descs).expect("a surplus token is not an error");
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], ArgValue::Double(d) if *d == 0.0));
@@ -1102,7 +1263,7 @@ mod tests {
                 arg_type: ArgType::String,
             },
         ];
-        let got = parse_args(&["only.db".to_string()], &descs).expect("a short line still runs");
+        let got = parse_args(&["only.db".into()], &descs).expect("a short line still runs");
         assert_eq!(got.len(), 3);
         assert!(matches!(&got[0], ArgValue::String(s) if s == "only.db"));
         assert!(matches!(&got[1], ArgValue::Missing));
@@ -1115,7 +1276,7 @@ mod tests {
             name: "level",
             arg_type: ArgType::Int,
         }];
-        let tokens = vec!["42".to_string()];
+        let tokens: Vec<IocshString> = vec!["42".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(42)));
     }
@@ -1126,7 +1287,7 @@ mod tests {
             name: "level",
             arg_type: ArgType::Int,
         }];
-        let tokens = vec!["abc".to_string()];
+        let tokens: Vec<IocshString> = vec!["abc".into()];
         assert!(parse_args(&tokens, &descs).is_err());
     }
 
@@ -1195,11 +1356,11 @@ mod tests {
             arg_type: ArgType::Int,
         }];
         assert_eq!(
-            parse_args(&["notanumber".to_string()], &int_desc).unwrap_err(),
+            parse_args(&["notanumber".into()], &int_desc).unwrap_err(),
             "Invalid integer 'notanumber'."
         );
         assert_eq!(
-            parse_args(&["99999999999999999999".to_string()], &int_desc).unwrap_err(),
+            parse_args(&["99999999999999999999".into()], &int_desc).unwrap_err(),
             "Integer '99999999999999999999' out of range."
         );
         let double_desc = vec![ArgDesc {
@@ -1207,7 +1368,7 @@ mod tests {
             arg_type: ArgType::Double,
         }];
         assert_eq!(
-            parse_args(&["0.1abc".to_string()], &double_desc).unwrap_err(),
+            parse_args(&["0.1abc".into()], &double_desc).unwrap_err(),
             "Invalid double '0.1abc'."
         );
     }
@@ -1245,7 +1406,7 @@ mod tests {
             arg_type: ArgType::Double,
         }];
         assert!(matches!(
-            parse_args(&["0x10".to_string()], &descs).unwrap()[0],
+            parse_args(&["0x10".into()], &descs).unwrap()[0],
             ArgValue::Double(v) if v == 16.0
         ));
     }
@@ -1256,7 +1417,7 @@ mod tests {
             name: "mask",
             arg_type: ArgType::Int,
         }];
-        let result = parse_args(&["0x10".to_string()], &descs).unwrap();
+        let result = parse_args(&["0x10".into()], &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(16)));
     }
 
@@ -1266,7 +1427,7 @@ mod tests {
             name: "value",
             arg_type: ArgType::Double,
         }];
-        let tokens = vec!["3.14".to_string()];
+        let tokens: Vec<IocshString> = vec!["3.14".into()];
         let result = parse_args(&tokens, &descs).unwrap();
         match &result[0] {
             ArgValue::Double(v) => assert!((*v - 3.14).abs() < 1e-10),

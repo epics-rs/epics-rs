@@ -92,7 +92,7 @@ pub enum PortCommand {
     NoIo,
     Connect,
     Disconnect,
-    /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2251.
+    /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2253.
     ShutdownPort,
     ConnectAddr,
     DisconnectAddr,
@@ -114,7 +114,7 @@ pub enum PortCommand {
     /// Query whether auto-connect is enabled for the port.
     GetAutoConnect,
     /// C's `allDevices` argument to `blockProcessCallback`
-    /// (asynManager.c:1692): `true` takes the port-wide holder, `false` the
+    /// (asynManager.c:1694): `true` takes the port-wide holder, `false` the
     /// holder of the `dpCommon` the request's own `addr` resolves to. The
     /// variant was a unit before, which is the wire shape of a port-wide
     /// block only — an externally-tagged unit variant and a struct variant do
@@ -153,6 +153,11 @@ pub enum PortCommand {
     /// `RequestOp::WithDriver`. Code does not serialize, so only the kind of
     /// request survives; converting back yields a call the actor refuses.
     WithDriver,
+    /// `RequestOp::Cell`, which carries code the same way; it converts back to
+    /// the same refused call `WithDriver` does.
+    Callback {
+        connect_queue: bool,
+    },
     /// Set input EOS bytes — C `pasynOctet->setInputEos` /
     /// asynRecord IEOS.
     SetInputEos {
@@ -303,6 +308,9 @@ mod tests {
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
             PortCommand::WithDriver,
+            PortCommand::Callback {
+                connect_queue: true,
+            },
             PortCommand::ConnectUser,
         ];
         for cmd in commands {

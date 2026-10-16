@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::runtime::sync::{Event, EventWaiter, PriorityInheritanceMutex};
+use crate::runtime::sync::{CMutex, Event, EventWaiter, PriorityInheritanceMutex};
 
 /// True when no `tracing` subscriber would take an event — i.e. when
 /// everything this module emits is being discarded.
@@ -61,32 +61,20 @@ fn console_subscriber_is_current() -> bool {
     tracing::dispatcher::get_default(|d| d.is::<ConsoleSubscriber>())
 }
 
-/// Write one already-formatted errlog line to the console, when this process's
-/// errlog console is ours and the `eltc` setting still says to.
-///
-/// The single owner of "does this line reach the console". C's owner is the
-/// errlog worker's `pvt.toConsole ? pvt.console : NULL` (`errlog.c:648`); here
-/// it is this function, called on the logging thread so that a scoped
-/// `tracing` subscriber and the caller's span still apply.
+/// Whether this process's errlog console is ours to write — asked on the
+/// posting thread, so a scoped `tracing` subscriber still decides it, and
+/// carried with the message to the worker that writes it.
 ///
 /// The console is ours in the two states an IOC runs in: nothing listening at
 /// all ([`nothing_is_listening`]), and [`ConsoleSubscriber`] installed — which
 /// then skips `epics_base_rs::errlog` events precisely so these bytes are
 /// written once, verbatim, instead of a second time behind a `LEVEL target:`
-/// prefix. Routing errlog's console through here rather than through the
+/// prefix. Routing errlog's console through the queue rather than through the
 /// subscriber is also what keeps `errlogPrintfNoConsole` off the console and
 /// makes `eltc(0)` mean what C means by it: both are decisions about *these*
 /// bytes, and a `tracing` event carries neither.
-///
-/// `local_echo` is C's `msgbufCommit` argument, decided once per message by
-/// [`errlog_post`] under the queue lock. It is a parameter rather than another
-/// [`errlog_to_console`] call because the same answer also decides whether the
-/// producer waits for the drain: two reads of `eltc` would let one message
-/// print without back-pressure, or take back-pressure without printing.
-fn console_fallback(line: &str, local_echo: bool) {
-    if local_echo && (nothing_is_listening() || console_subscriber_is_current()) {
-        console().write(line);
-    }
+fn console_is_ours() -> bool {
+    nothing_is_listening() || console_subscriber_is_current()
 }
 
 /// The one place errlog bytes become console bytes, and it adds nothing.
@@ -104,10 +92,10 @@ fn console_fallback(line: &str, local_echo: bool) {
 /// Framing only: which stream the bytes land on, and whether that stream has
 /// to be flushed afterwards, belong to [`Console`] — this is the step both of
 /// its arms share.
-fn write_console(out: &mut impl std::io::Write, line: &str) {
+fn write_console(out: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
     // C ignores `fprintf`'s return here too: a console that cannot be written
     // is not something an errlog line can report.
-    let _ = out.write_all(line.as_bytes());
+    let _ = out.write_fmt(line);
 }
 
 /// C's `pvt.console` and `pvt.ttyConsole` (`errlog.c:100-101`): the stream
@@ -168,7 +156,7 @@ fn console() -> std::sync::MutexGuard<'static, Console> {
 
 impl Console {
     /// One already-formatted errlog line to whichever stream is installed.
-    fn write(&mut self, line: &str) {
+    fn write(&mut self, line: std::fmt::Arguments<'_>) {
         match &mut self.sink {
             // stderr is unbuffered, so C's `fflush(console)` (`errlog.c:830`)
             // has nothing to do here.
@@ -205,8 +193,9 @@ impl Console {
 /// support from a terminal that declines to say what it is, and it is the half
 /// that makes a captured Rust IOC's bytes match a captured C IOC's.
 fn is_a_tty(stream: &impl std::io::IsTerminal) -> bool {
-    let term_names_itself = std::env::var_os("TERM").is_some_and(|t| !t.is_empty());
-    stream.is_terminal() && term_names_itself
+    // C's order: `$TERM` is read only for a terminal, so a piped console asks
+    // nothing of the environment.
+    stream.is_terminal() && std::env::var_os("TERM").is_some_and(|t| !t.is_empty())
 }
 
 /// The same bytes as a `tracing` record, which is one event and not a byte
@@ -225,6 +214,40 @@ fn is_a_tty(stream: &impl std::io::IsTerminal) -> bool {
 /// content and stay.
 fn as_record(line: &str) -> &str {
     line.strip_suffix('\n').unwrap_or(line)
+}
+
+/// [`as_record`] for a message still in `format_args!` form: the text with
+/// one trailing newline held back, without formatting it anywhere first.
+struct Record<'a>(std::fmt::Arguments<'a>);
+
+impl std::fmt::Display for Record<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// Writes everything but a final `\n`, which waits for a later piece.
+        struct HoldNewline<'f, 'g> {
+            out: &'f mut std::fmt::Formatter<'g>,
+            held: bool,
+        }
+        impl std::fmt::Write for HoldNewline<'_, '_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if s.is_empty() {
+                    return Ok(());
+                }
+                if std::mem::take(&mut self.held) {
+                    self.out.write_str("\n")?;
+                }
+                let body = s.strip_suffix('\n').unwrap_or(s);
+                self.held = body.len() != s.len();
+                self.out.write_str(body)
+            }
+        }
+        std::fmt::write(
+            &mut HoldNewline {
+                out: f,
+                held: false,
+            },
+            self.0,
+        )
+    }
 }
 
 /// A `tracing` subscriber that writes events to the console and nothing else.
@@ -307,7 +330,7 @@ impl tracing::Subscriber for ConsoleSubscriber {
     /// These are the lines whose C originals are `errlogPrintf` calls in the
     /// servers — `pvt.console`'s bytes there — and while this subscriber is
     /// the installed one, the errlog console is ours by the same test
-    /// [`console_fallback`] applies ([`console_subscriber_is_current`]). An
+    /// [`console_is_ours`] applies ([`console_subscriber_is_current`]). An
     /// application that redirects errlog to a file and then reads only errlog
     /// lines in it would otherwise be missing half of what C puts there. The
     /// subscriber frames the event, so the newline is added here: C's
@@ -317,7 +340,7 @@ impl tracing::Subscriber for ConsoleSubscriber {
     /// gates messages that went through errlog's queue, and these did not.
     fn event(&self, event: &tracing::Event<'_>) {
         if let Some(line) = Self::line_for(event) {
-            console().write(&format!("{line}\n"));
+            console().write(format_args!("{line}\n"));
         }
     }
 
@@ -426,8 +449,8 @@ fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
 /// 1. **The output would be doubled.** The line below already carries the
 ///    thread, the panic site and the payload — everything the default hook
 ///    prints — so chaining puts the same panic on the console twice. It reaches
-///    the console either way: `console_fallback` writes it with nothing
-///    listening and with [`install_console_subscriber`] in place alike, and an
+///    the console either way: it is written with nothing listening and with
+///    [`install_console_subscriber`] in place alike, and an
 ///    application that installed its own subscriber gets it through that.
 /// 2. **The `RUST_BACKTRACE` note is advice that cannot be taken.** There is no
 ///    environment on the target to set that variable in, so a backtrace is off
@@ -471,15 +494,17 @@ pub fn install_panic_hook() -> bool {
             None => "an unknown location".to_string(),
         };
         let thread = std::thread::current();
-        errlog_sev_printf(
-            ErrlogSevEnum::Fatal,
-            // Terminated by the caller, as every C errlog format string is:
-            // the console writer appends nothing (see [`write_console`]).
-            &format!(
-                "{}\n",
-                panic_announcement(thread.name(), &location, &panic_payload(info))
-            ),
+        // Terminated by the caller, as every C errlog format string is: the
+        // console writer appends nothing (see [`write_console`]).
+        let line = format!(
+            "sevr={} {}\n",
+            ErrlogSevEnum::Fatal.as_str(),
+            panic_announcement(thread.name(), &location, &panic_payload(info))
         );
+        tracing::error!(target: "epics_base_rs::errlog", "{}", as_record(&line));
+        // Written by the panicking thread itself: it may be about to abort
+        // the process, and it may not wait for the worker.
+        errlog_post(format_args!("{line}"), ConsoleEcho::Immediate);
     }));
     true
 }
@@ -648,6 +673,16 @@ pub fn erl_warning() -> &'static str {
     }
 }
 
+/// [`erl_warning`] for `ERL_ERROR`: red on a terminal console, plain
+/// everywhere else, for the word an `errlogPrintf` line carries.
+pub fn erl_error() -> &'static str {
+    if errlog_console_paints() {
+        ERL_ERROR
+    } else {
+        "ERROR"
+    }
+}
+
 /// Whether an errlog line keeps the ANSI escapes its C literal carries.
 ///
 /// C strips them at print time when the console is not a terminal
@@ -676,8 +711,15 @@ pub fn errlog_console_paints() -> bool {
 /// threshold, so an `errlogInfo` line reaches a C console whatever
 /// `errlogSetSevToLog` was told. See [`errlog_set_sev_to_log`].
 pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
-    let line = format!("sevr={} {}", severity.as_str(), message);
-    let record = as_record(&line);
+    errlog_sev_vprintf(severity, format_args!("{message}"));
+}
+
+/// C `errlogSevVprintf` (`errlog.c:366-388`): [`errlog_sev_printf`] for a
+/// caller's `format_args!`, which is formatted straight into the errlog arena,
+/// so posting allocates nothing.
+pub fn errlog_sev_vprintf(severity: ErrlogSevEnum, message: std::fmt::Arguments<'_>) {
+    let line = format_args!("sevr={} {}", severity.as_str(), message);
+    let record = Record(line);
     match severity {
         ErrlogSevEnum::Info => {
             tracing::info!(target: "epics_base_rs::errlog", "{record}")
@@ -689,7 +731,7 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
             tracing::error!(target: "epics_base_rs::errlog", "{record}")
         }
     }
-    errlog_post(&line, ConsoleEcho::Yes);
+    errlog_post(line, ConsoleEcho::Yes);
 }
 
 /// Emit a pre-formatted message through the errlog facility
@@ -703,15 +745,22 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
 /// subscriber sees it on the errlog sink. Used by `stdio` device support
 /// for the `"errlog"` output stream (`devStdio.c` `logPrintf`).
 pub fn errlog_printf(message: &str) {
-    tracing::info!(target: "epics_base_rs::errlog", "{}", as_record(message));
+    errlog_vprintf(format_args!("{message}"));
+}
+
+/// C `errlogVprintf` (`errlog.c:315-335`): [`errlog_printf`] for a caller's
+/// `format_args!`, which is formatted straight into the errlog arena, so
+/// posting allocates nothing.
+pub fn errlog_vprintf(message: std::fmt::Arguments<'_>) {
+    tracing::info!(target: "epics_base_rs::errlog", "{}", Record(message));
     errlog_post(message, ConsoleEcho::Yes);
 }
 
 /// C `errlogPrintfNoConsole` (`errlog.c:343-364`): the same message queue,
 /// but the console echo is suppressed for this line whatever `eltc` says.
 /// Listeners — the IOC log client among them — still receive it.
-pub fn errlog_printf_no_console(message: &str) {
-    tracing::info!(target: "epics_base_rs::errlog", "{}", as_record(message));
+pub fn errlog_printf_no_console(message: std::fmt::Arguments<'_>) {
+    tracing::info!(target: "epics_base_rs::errlog", "{}", Record(message));
     errlog_post(message, ConsoleEcho::No);
 }
 
@@ -757,11 +806,15 @@ macro_rules! rt_error {
 // ---------------------------------------------------------------------------
 
 /// C `errlog.c:44`. `errlogInit` raises anything smaller to this.
-pub const MIN_BUFFER_SIZE: usize = 1280;
-/// C `errlog.c:45` — also the `maxMsgSize` `errlogInit` uses.
-pub const MIN_MESSAGE_SIZE: usize = 256;
+pub const MIN_BUFFER_SIZE: usize = 2560;
+/// C `errlog.c:45` — the `maxMsgSize` `errlogInit` passes.
+pub const DEFAULT_MAX_MSG_SIZE: usize = 512;
 /// C `errlog.c:46`.
-pub const MAX_MESSAGE_SIZE: usize = 0x00ff_ffff;
+pub const MIN_MESSAGE_SIZE: usize = 256;
+/// C `MAX_MESSAGE_SIZE(bufsize)` (`errlog.c:47`): a fifth of the arena.
+pub const fn max_message_size(bufsize: usize) -> usize {
+    bufsize / 5
+}
 
 /// What `errlogAddListener` hands back.
 ///
@@ -775,24 +828,78 @@ pub const MAX_MESSAGE_SIZE: usize = 0x00ff_ffff;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ErrlogListenerId(u64);
 
-/// A registered listener, shared with the worker's per-drain snapshot.
+/// A registered listener. Shared so the worker can call it with the list's
+/// `RefCell` released, which is what lets a callback add or remove listeners.
 type ErrlogListenerFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// One buffered message. C stores a flag byte and a NUL-terminated string in a
-/// flat arena; the byte layout is not observable, but which messages the arena
-/// ACCEPTS is, so `pos` below tracks C's arithmetic exactly.
+/// C `listenerNode` (`errlog.c:79-85`).
+struct ListenerNode {
+    id: ErrlogListenerId,
+    listener: ErrlogListenerFn,
+    /// The worker is inside this listener's callback.
+    active: bool,
+    /// Removed by its own callback; the worker drops it when the call returns.
+    removed: bool,
+}
+
+/// C `pvt.listenerList` under `pvt.listenerLock` (`errlog.c:96-97`), an
+/// `epicsMutex` and so recursive: a callback may add or remove listeners,
+/// and the worker sees the change from the next listener of the same message.
+type ErrlogListeners = parking_lot::ReentrantMutex<std::cell::RefCell<Vec<ListenerNode>>>;
+
+/// C `ERL_STATE_READY` (`errlog.c:56`): the flag byte of a committed message.
+const ERL_STATE_READY: u8 = 0x40;
+/// C `ERL_LOCALECHO` (`errlog.c:58`): the worker writes this one to the
+/// console. The port folds the poster's [`console_is_ours`] into it.
+const ERL_LOCALECHO: u8 = 0x20;
+
+/// C `buffer_t` (`errlog.c:74-77`): a flat arena of `[flag][text][NUL]`
+/// records, allocated once at init, so admitting a message is a bounded copy
+/// under the queue lock and never an allocation.
 struct ErrlogBuf {
-    entries: Vec<String>,
+    base: Box<[u8]>,
     /// C `buffer_t::pos` — bytes consumed, `1 + nchar + 1` per message
-    /// (`errlog.c:158`).
+    /// (`errlog.c:175`).
     pos: usize,
 }
 
 impl ErrlogBuf {
-    fn new() -> Self {
+    fn new(size: usize) -> Self {
         Self {
-            entries: Vec::new(),
+            base: vec![0; size].into_boxed_slice(),
             pos: 0,
+        }
+    }
+
+    /// The committed messages in order, as `(console, text)`.
+    #[cfg(test)]
+    fn messages(&self) -> impl Iterator<Item = (bool, &str)> {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            if at >= self.pos {
+                return None;
+            }
+            let flag = self.base[at];
+            let body = &self.base[at + 1..self.pos];
+            let len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            at += 1 + len + 1;
+            // Only `accept` writes here, and it copies whole characters.
+            let text = std::str::from_utf8(&body[..len]).unwrap_or_default();
+            Some((flag & ERL_LOCALECHO != 0, text))
+        })
+    }
+
+    /// The committed messages in order, each handed over mutable: the worker
+    /// owns a drained arena outright, so a message is rewritten in its own
+    /// record instead of copied out.
+    fn drain(&mut self, mut each: impl FnMut(bool, &mut [u8])) {
+        let mut at = 0;
+        while at < self.pos {
+            let flag = self.base[at];
+            let body = &mut self.base[at + 1..self.pos];
+            let len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            each(flag & ERL_LOCALECHO != 0, &mut body[..len]);
+            at += 1 + len + 1;
         }
     }
 }
@@ -834,21 +941,34 @@ struct Errlog {
     /// Fused to a `Condvar` the lock could not be the PI one, so a record at
     /// High logging an alarm waited behind a Low worker for as long as
     /// anything in between cared to run.
+    ///
+    /// Contention allocates on a thread's first park unless the thread came
+    /// through [`enter_ioc_thread`](crate::runtime::task::enter_ioc_thread),
+    /// which builds that park state at entry.
     queue: PriorityInheritanceMutex<ErrlogQueue>,
     /// C `pvt.waitForWork` (`errlog.c:93`) — one waiter, the worker.
     work: Event,
-    listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
+    /// The worker has left its loop for good — the end of C's
+    /// `epicsThreadMustJoin(tid)` in `errlogExitHandler` (`errlog.c:530`).
+    ///
+    /// Not an [`Event`]: its waiter is the process `atexit` handler, and on
+    /// macOS `exit()` destroys the main thread's locals first, so
+    /// `std::thread::current()` and `park` abort there. parking_lot parks
+    /// on a stack `ThreadData` once its thread-local is gone.
+    stopped: parking_lot::Mutex<bool>,
+    exited: parking_lot::Condvar,
+    listeners: ErrlogListeners,
     next_id: std::sync::atomic::AtomicU64,
 }
 
 static ERRLOG: std::sync::OnceLock<&'static Errlog> = std::sync::OnceLock::new();
 
-/// C `errlogInit(bufsize)` — `errlogInit2(bufsize, MIN_MESSAGE_SIZE)`
-/// (`errlog.c:609-612`). Idempotent: C runs `errlogInitPvt` under
+/// C `errlogInit(bufsize)` — `errlogInit2(bufsize, DEFAULT_MAX_MSG_SIZE)`
+/// (`errlog.c:689-692`). Idempotent: C runs `errlogInitPvt` under
 /// `epicsThreadOnce`, so the FIRST call fixes the sizes and every later one is
 /// a no-op whatever it asks for.
 pub fn errlog_init(bufsize: usize) {
-    errlog_init2(bufsize, MIN_MESSAGE_SIZE);
+    errlog_init2(bufsize, DEFAULT_MAX_MSG_SIZE);
 }
 
 /// C `errlogInit2` (`errlog.c:583-607`): both sizes are clamped before the
@@ -861,27 +981,34 @@ pub fn errlog_init2(bufsize: usize, max_msg_size: usize) {
 /// entry point below starts here, exactly as every C entry point starts with
 /// `errlogInit(0)`.
 fn errlog_pvt() -> &'static Errlog {
-    errlog_pvt2(0, MIN_MESSAGE_SIZE)
+    errlog_pvt2(0, DEFAULT_MAX_MSG_SIZE)
 }
 
 fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
     ERRLOG.get_or_init(|| {
         let (buf_size, max_msg_size) = errlog_clamp_sizes(bufsize, max_msg_size);
         let errlog: &'static Errlog = Box::leak(Box::new(Errlog {
-            queue: PriorityInheritanceMutex::new(ErrlogQueue {
-                buf_size,
-                max_msg_size,
-                log: ErrlogBuf::new(),
-                print: ErrlogBuf::new(),
-                n_lost: 0,
-                at_exit: false,
-                // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
-                to_console: true,
-                flush_seq: 0,
-                flushers: Vec::new(),
-            }),
+            queue: PriorityInheritanceMutex::new(
+                ErrlogQueue {
+                    buf_size,
+                    max_msg_size,
+                    // C `errlogInitPvt` `calloc`s both once (`errlog.c:592-593`);
+                    // nothing on the posting path allocates after this.
+                    log: ErrlogBuf::new(buf_size),
+                    print: ErrlogBuf::new(buf_size),
+                    n_lost: 0,
+                    at_exit: false,
+                    // C `errlogInitPvt`: `pvt.toConsole = TRUE`.
+                    to_console: true,
+                    flush_seq: 0,
+                    flushers: Vec::new(),
+                },
+                CMutex::ErrlogMsgQueue,
+            ),
             work: Event::new(),
-            listeners: std::sync::Mutex::new(Vec::new()),
+            stopped: parking_lot::Mutex::new(false),
+            exited: parking_lot::Condvar::new(),
+            listeners: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(Vec::new())),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }));
         // C `epicsThreadCreateOpt("errlog", …)` at `epicsThreadPriorityLow`
@@ -904,13 +1031,58 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             crate::runtime::task::StackSizeClass::Small,
         )
         .spawn(move || errlog_worker(errlog));
+        // C `epicsAtExit(errlogExitHandler, pvt.tid)` (`errlog.c:609`). A
+        // process-level hook rather than `runtime::exit::at_exit`, because a
+        // Rust IOC also ends by returning from `main`, which runs no
+        // `epicsExit` list, and a queued line must not die with it.
+        #[cfg(unix)]
+        {
+            extern "C" fn on_exit() {
+                errlog_exit_handler();
+            }
+            // SAFETY: registers a plain `extern "C"` function with no state.
+            unsafe { libc::atexit(on_exit) };
+        }
+        #[cfg(not(unix))]
+        crate::runtime::exit::at_exit("errlog", errlog_exit_handler);
         errlog
     })
+}
+
+/// The errlog worker's [`os_thread_id`](crate::runtime::task::os_thread_id),
+/// so the exit handler never waits for itself.
+static WORKER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// C `errlogExitHandler` (`errlog.c:523-531`): stop admitting, and wait for
+/// the worker to write out what was already queued.
+///
+/// Nothing here may touch `std` thread-local state (`thread::current`,
+/// `park`, a `thread_local!`): see [`Errlog::stopped`].
+fn errlog_exit_handler() {
+    let Some(errlog) = ERRLOG.get() else {
+        return;
+    };
+    {
+        let mut q = errlog.queue.lock();
+        if q.at_exit {
+            return;
+        }
+        q.at_exit = true;
+    }
+    errlog.work.signal();
+    if WORKER.get() == Some(&crate::runtime::task::os_thread_id()) {
+        return;
+    }
+    let mut stopped = errlog.stopped.lock();
+    while !*stopped {
+        errlog.exited.wait(&mut stopped);
+    }
 }
 
 /// C `errlogThread` (`errlog.c:624-720`): swap the buffers, drain the snapshot
 /// with the queue UNLOCKED, then report anything the arena refused.
 fn errlog_worker(errlog: &'static Errlog) {
+    let _ = WORKER.set(crate::runtime::task::os_thread_id());
     let parked = errlog.work.waiter();
     let mut q = errlog.queue.lock();
     loop {
@@ -924,7 +1096,7 @@ fn errlog_worker(errlog: &'static Errlog) {
             }
         }
 
-        if q.log.entries.is_empty() {
+        if q.log.pos == 0 {
             if q.at_exit {
                 break;
             }
@@ -937,9 +1109,7 @@ fn errlog_worker(errlog: &'static Errlog) {
             // of its pass answers the same question without the extra pass.
             parked.wait_until(|| {
                 let q = errlog.queue.lock();
-                !q.log.entries.is_empty()
-                    || q.at_exit
-                    || q.flushers.iter().any(|f| f.start >= q.flush_seq)
+                q.log.pos != 0 || q.at_exit || q.flushers.iter().any(|f| f.start >= q.flush_seq)
             });
             q = errlog.queue.lock();
             continue;
@@ -948,44 +1118,82 @@ fn errlog_worker(errlog: &'static Errlog) {
         let n_lost = std::mem::take(&mut q.n_lost);
         let to_console = q.to_console;
         // C swaps `pvt.log` and `pvt.print` so logging can continue while
-        // this pass drains (`errlog.c:650-655`); the spare buffer goes back
-        // as `q.print` at the bottom of the loop.
-        let spare = std::mem::replace(&mut q.print, ErrlogBuf::new());
-        let mut print = std::mem::replace(&mut q.log, spare);
+        // this pass drains (`errlog.c:766-770`). The worker owns the drained
+        // arena until it hands it back below; `q.print` is an empty
+        // placeholder meanwhile, which allocates nothing.
+        let ErrlogQueue { log, print, .. } = &mut *q;
+        std::mem::swap(log, print);
+        let mut print = std::mem::replace(&mut q.print, ErrlogBuf::new(0));
         drop(q);
 
-        // A snapshot, not the live list: a listener that removes itself from
-        // inside its own callback is C's `active`/`removed` dance
-        // (`errlog.c:684-697`), and taking a copy makes that state
-        // unrepresentable — `errlog_remove_listener` can never deadlock
-        // against a running callback, and the removal simply takes effect on
-        // the next drain.
-        let listeners: Vec<_> = errlog
-            .listeners
-            .lock()
-            .expect("errlog listeners")
-            .iter()
-            .map(|(_, f)| std::sync::Arc::clone(f))
-            .collect();
-
-        for text in print.entries.drain(..) {
-            // C strips before the listeners see it, always (`errlog.c:678-681`).
-            let stripped = errlog_strip_ansi(&text);
-            for listener in &listeners {
-                listener(&stripped);
+        print.drain(|echo, record| {
+            // Only `accept` writes the arena, and it copies whole characters.
+            // C writes the console first, from this thread, for a message
+            // posted with local echo while `pvt.toConsole` holds, stripped
+            // in the record unless the console is a terminal (`errlog.c:789-795`);
+            // the listeners always get it stripped (`:798-799`).
+            let mut len = None;
+            if echo && to_console {
+                let mut console = console();
+                if !console.paints() {
+                    len = Some(strip_ansi_in_place(record));
+                }
+                let text =
+                    std::str::from_utf8(&record[..len.unwrap_or(record.len())]).unwrap_or_default();
+                console.write(format_args!("{text}"));
             }
-        }
+            let len = len.unwrap_or_else(|| strip_ansi_in_place(record));
+            let text = std::str::from_utf8(&record[..len]).unwrap_or_default();
+            deliver(&errlog.listeners, text);
+        });
+        // C `errlog.c:823-824`.
+        print.base.fill(0);
         print.pos = 0;
 
         if n_lost > 0 && to_console {
             // C `fprintf(console, "errlog: lost %zu messages\n", nLost)`
             // (`errlog.c:826-827`). The stream is `pvt.console`, so this line
             // follows [`errlog_set_console`] exactly as a message does.
-            console().write(&format!("errlog: lost {n_lost} messages\n"));
+            console().write(format_args!("errlog: lost {n_lost} messages\n"));
         }
 
         q = errlog.queue.lock();
         q.print = print;
+    }
+    drop(q);
+    *errlog.stopped.lock() = true;
+    errlog.exited.notify_all();
+}
+
+/// C `errlogThread`'s listener walk (`errlog.c:801-815`): the live list, under
+/// its lock, once per message. The next node is found after the call, so a
+/// listener added by a callback hears this message, and one removed by it
+/// hears nothing more.
+fn deliver(listeners: &ErrlogListeners, text: &str) {
+    let list = listeners.lock();
+    let mut at = 0;
+    loop {
+        let listener = {
+            let mut nodes = list.borrow_mut();
+            let Some(node) = nodes.get_mut(at) else {
+                return;
+            };
+            node.active = true;
+            std::sync::Arc::clone(&node.listener)
+        };
+        listener(text);
+        let mut nodes = list.borrow_mut();
+        // The callback may have removed a node ahead of this one.
+        let Some(here) = nodes.iter().position(|n| n.active) else {
+            return;
+        };
+        if nodes[here].removed {
+            nodes.remove(here);
+            at = here;
+        } else {
+            nodes[here].active = false;
+            at = here + 1;
+        }
     }
 }
 
@@ -997,55 +1205,63 @@ fn errlog_worker(errlog: &'static Errlog) {
 enum ConsoleEcho {
     Yes,
     No,
+    /// The panic hook's line, which has no C original: written by the posting
+    /// thread before it returns, because that thread may never get to wait
+    /// for the worker and must not be made to.
+    Immediate,
 }
 
 /// C `msgbufAlloc`/`msgbufCommit` (`errlog.c:113-188`) as one step: admit the
-/// message, wake the worker, echo it, and — the part that makes the arena a
-/// bound on *latency* rather than on messages — wait for the drain.
+/// message, wake the worker, and — for a poster that may block — wait for the
+/// drain.
+///
+/// The worker writes the console, as C's `errlogThread` does
+/// (`errlog.c:790-796`); a poster never does. So the order of an errlog line
+/// against the poster's own `stderr` is C's: a poster that may block returns
+/// only after the worker has written it (`msgbufCommit`'s `errlogFlush()`,
+/// `errlog.c:186-187`), and one that may not — every `epicsThreadCreate`
+/// thread, and softMain's `_main_` (`osdThread.c:406`) — returns at once and
+/// its line comes out after whatever it writes next.
 ///
 /// The admission rule is C's: a message is accepted only when the WORST CASE
 /// still fits — `bufSize - pos >= 1 + maxMsgSize` — so a burst is dropped and
 /// counted instead of consuming memory, and the count reaches the console as
-/// `errlog: lost N messages`.
+/// `errlog: lost N messages`. The flush is what keeps a boot from hitting it:
+/// a blocking producer cannot get ahead of the drainer by more than one
+/// message, which is why a C IOC boots a 400-line script through a 2560-byte
+/// arena and loses nothing. Admission itself is a bounded copy into an arena
+/// allocated at init: it never allocates and never waits for space.
 ///
-/// # Why the flush is not optional
-///
-/// C pairs that refusal with back-pressure in the same function: after a
-/// message that echoes to the console, logged from a thread that may block and
-/// outside shutdown, `msgbufCommit` runs `errlogFlush()` (`errlog.c:186-187`).
-/// The producer therefore cannot get ahead of the drainer by more than one
-/// message, and `pos` is back at 0 before the next call — which is why a C IOC
-/// boots a 400-line script through a 1280-byte arena and loses nothing.
-///
-/// Porting the arena without the flush turned a bound on memory into silent
-/// loss of listener copies: a boot burst filled `pos` and every further line
-/// was refused until the worker happened to run. The fix belongs here and not
-/// in [`MIN_BUFFER_SIZE`], because no buffer size is large enough — the rule C
-/// relies on is that the producer waits, not that the arena is big.
-///
-/// The three gates are C's and each closes a real path: `ok_to_block` keeps a
-/// scan or serving thread off the drain and, because
-/// [`enter_ioc_thread`](crate::runtime::task::enter_ioc_thread) clears it, also
-/// stops the errlog worker from flushing into itself when a listener logs;
+/// The three flush gates are C's and each closes a real path: `ok_to_block`
+/// keeps a scan or serving thread off the drain and, because only an iocsh
+/// scope or `iocInit` raises it, also stops the errlog worker from flushing
+/// into itself when a listener logs;
 /// `at_exit` matches C's `!atExit`, the worker having stopped; `local_echo`
 /// matches C's argument, so `errlogPrintfNoConsole` and `eltc(0)` cost no wait.
-fn errlog_post(message: &str, echo: ConsoleEcho) {
+fn errlog_post(message: std::fmt::Arguments<'_>, echo: ConsoleEcho) {
     let errlog = errlog_pvt();
     // C reads it before the lock (`errlog.c:147`); it is this thread's own.
     let ok_to_block = crate::runtime::task::thread_is_ok_to_block();
+    // The poster's dispatcher, not the worker's, says whose console it is.
+    let ours = echo != ConsoleEcho::No && console_is_ours();
 
     let mut q = errlog.queue.lock();
     let was_empty = q.log.pos == 0;
     let at_exit = q.at_exit;
     // One read of `eltc` per message, under the same lock that admits it.
     let local_echo = echo == ConsoleEcho::Yes && q.to_console;
-    let accepted = q.accept(message);
+    let immediate = echo == ConsoleEcho::Immediate && q.to_console && ours;
+    let accepted = q.accept(message, local_echo && ours);
     drop(q);
 
     if accepted && was_empty {
         errlog.work.signal();
     }
-    console_fallback(message, local_echo);
+    // C `msgbufCommit` (`errlog.c:166-170`): with the worker gone, a poster
+    // that may block prints its own line and the rest are dropped.
+    if immediate || (at_exit && local_echo && ours && ok_to_block) {
+        console().write(message);
+    }
 
     // C `msgbufCommit`'s tail (`errlog.c:186-187`). `accepted` stands for C's
     // `msgbufAlloc` having returned a buffer at all: a refused message never
@@ -1055,62 +1271,107 @@ fn errlog_post(message: &str, echo: ConsoleEcho) {
     }
 }
 
-/// C `msgbufCommit`'s truncation marker (`errlog.c:151`).
+/// C `msgbufCommit`'s truncation marker (`errlog.c:157`).
 const TRUNCATED: &str = "<<TRUNCATED>>\n";
+
+/// C `vsnprintf` into `msgbufAlloc`'s slot: copies the prefix that fits, in
+/// whole characters so the arena only ever holds UTF-8, and counts the rest.
+struct ArenaText<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    /// What an unbounded write would have produced — `vsnprintf`'s return.
+    nchar: usize,
+    /// A NUL was written: C's `%s` ends there, and so does the record.
+    ended: bool,
+}
+
+impl std::fmt::Write for ArenaText<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.ended {
+            return Ok(());
+        }
+        let s = match s.find('\0') {
+            Some(nul) => {
+                self.ended = true;
+                &s[..nul]
+            }
+            None => s,
+        };
+        let mut take = s.len().min(self.buf.len() - self.len);
+        while !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        self.nchar += s.len();
+        Ok(())
+    }
+}
 
 impl ErrlogQueue {
     /// The whole admission decision, in one place so it can be tested at its
     /// boundaries without a worker thread. `true` when the message was taken.
-    fn accept(&mut self, message: &str) -> bool {
+    fn accept(&mut self, message: std::fmt::Arguments<'_>, console: bool) -> bool {
         if self.at_exit {
             return false;
         }
-        // C `msgbufAlloc` (`errlog.c:124-128`): a message is taken only when
-        // the WORST CASE still fits, so the arena bounds memory instead of
-        // growing, and the refusals are counted for the console.
+        // C `msgbufAlloc` (`errlog.c:132-142`): a message is taken only when
+        // the WORST CASE still fits, whoever posts it, so a burst is dropped
+        // and counted rather than waited on or grown into.
         if self.buf_size - self.log.pos < 1 + self.max_msg_size {
             self.n_lost += 1;
             return false;
         }
 
-        // C `msgbufCommit` (`errlog.c:145-155`): `nchar` is what `snprintf`
-        // WOULD have written, so a message at or past `maxMsgSize` is cut to
-        // `maxMsgSize - 1` bytes with its tail overwritten by the marker.
+        // C `errlogVprintf` (`errlog.c:121-144`): format into the slot under
+        // the lock, then `msgbufCommit` (`errlog.c:155-163`): `nchar` is what
+        // `vsnprintf` WOULD have written, so a message at or past `maxMsgSize`
+        // is cut to `maxMsgSize - 1` bytes with its tail overwritten by the
+        // marker.
         let max = self.max_msg_size;
-        let text = if message.len() >= max {
+        let start = self.log.pos;
+        let rec = &mut self.log.base[start..start + 1 + max];
+        let (flag, text) = rec.split_first_mut().expect("1 + max bytes");
+        let mut slot = ArenaText {
+            buf: &mut text[..max - 1],
+            len: 0,
+            nchar: 0,
+            ended: false,
+        };
+        // A `Display` that fails leaves what it wrote, as `vsnprintf` has no
+        // failure to report.
+        let _ = std::fmt::write(&mut slot, message);
+        let mut nchar = slot.len;
+        if slot.nchar >= max {
             let mut cut = (max - 1).saturating_sub(TRUNCATED.len());
-            while cut > 0 && !message.is_char_boundary(cut) {
+            while cut > 0 && text[cut] & 0xC0 == 0x80 {
                 cut -= 1;
             }
-            let mut t = String::with_capacity(max);
-            t.push_str(&message[..cut]);
-            t.push_str(TRUNCATED);
-            t
-        } else {
-            message.to_string()
-        };
-
-        self.log.pos += 1 + text.len() + 1;
-        self.log.entries.push(text);
+            text[cut..cut + TRUNCATED.len()].copy_from_slice(TRUNCATED.as_bytes());
+            nchar = cut + TRUNCATED.len();
+        }
+        *flag = ERL_STATE_READY | if console { ERL_LOCALECHO } else { 0 };
+        text[nchar] = 0;
+        self.log.pos += 1 + nchar + 1;
         true
     }
 }
 
-/// C `errlogInit2`'s two clamps (`errlog.c:591-599`), extracted so the
-/// boundaries are testable after the once-init has already run.
+/// C `errlogClampConfig` (`errlog.c:539-561`), in C's order: the message
+/// ceiling is a fifth of the CLAMPED buffer, and the floor wins over it.
 fn errlog_clamp_sizes(bufsize: usize, max_msg_size: usize) -> (usize, usize) {
-    (
-        bufsize.max(MIN_BUFFER_SIZE),
-        max_msg_size.clamp(MIN_MESSAGE_SIZE, MAX_MESSAGE_SIZE),
-    )
+    let bufsize = bufsize.max(MIN_BUFFER_SIZE);
+    let max_msg_size = max_msg_size
+        .min(max_message_size(bufsize))
+        .max(MIN_MESSAGE_SIZE);
+    (bufsize, max_msg_size)
 }
 
 /// C `errlogSequence` (`errlog.c:189-217`): block until the worker completes
 /// one pass of its loop.
 ///
-/// The event is the caller's, not the facility's, so the two sequences
-/// [`errlog_flush`] needs cost one allocation between them and the worker
-/// needs no chain to pass a wake from one waiting producer to the next.
+/// The event is the caller's, not the facility's, so the worker needs no
+/// chain to pass a wake from one waiting producer to the next.
 fn errlog_sequence(errlog: &'static Errlog, mine: &std::sync::Arc<Event>, waiter: &EventWaiter) {
     let start = {
         let mut q = errlog.queue.lock();
@@ -1138,8 +1399,15 @@ fn errlog_sequence(errlog: &'static Errlog, mine: &std::sync::Arc<Event>, waiter
 /// C `errlogFlush` (`errlog.c:614-622`): TWO sequences, because it takes both
 /// buffers being handled to know every message logged so far has been seen.
 pub fn errlog_flush() {
+    thread_local! {
+        // An `Event` has one waiter for life, so a thread's flushes share one.
+        static FLUSH: std::sync::Arc<Event> = std::sync::Arc::new(Event::new());
+    }
     let errlog = errlog_pvt();
-    let mine = std::sync::Arc::new(Event::new());
+    // A thread already tearing its locals down flushes on an event of its own.
+    let mine = FLUSH
+        .try_with(std::sync::Arc::clone)
+        .unwrap_or_else(|_| std::sync::Arc::new(Event::new()));
     let waiter = mine.waiter();
     errlog_sequence(errlog, &mine, &waiter);
     errlog_sequence(errlog, &mine, &waiter);
@@ -1159,11 +1427,12 @@ where
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
-    errlog
-        .listeners
-        .lock()
-        .expect("errlog listeners")
-        .push((id, std::sync::Arc::new(listener)));
+    errlog.listeners.lock().borrow_mut().push(ListenerNode {
+        id,
+        listener: std::sync::Arc::new(listener),
+        active: false,
+        removed: false,
+    });
     id
 }
 
@@ -1171,26 +1440,30 @@ where
 ///
 /// C's `errlogRemoveListeners(listener, pPrivate)` returns how many nodes
 /// matched the pair (`errlog.c:434-462`); a token matches at most one, so the
-/// count degenerates to a boolean. Safe to call from inside a listener: the
-/// worker drains against a snapshot, so this takes the lock immediately and
-/// the removal applies from the next message on.
+/// count degenerates to a boolean. When this returns the listener is never
+/// called again, as in C: from another thread it waits out the message being
+/// delivered, and from inside a callback the lock is this thread's already.
 pub fn errlog_remove_listener(id: ErrlogListenerId) -> bool {
-    let errlog = errlog_pvt();
-    let mut listeners = errlog.listeners.lock().expect("errlog listeners");
-    let before = listeners.len();
-    listeners.retain(|(other, _)| *other != id);
-    listeners.len() != before
+    let list = errlog_pvt().listeners.lock();
+    let mut nodes = list.borrow_mut();
+    let Some(at) = nodes.iter().position(|n| n.id == id && !n.removed) else {
+        return false;
+    };
+    // C `errlog.c:450-455`: a callback removing itself is only marked.
+    if nodes[at].active {
+        nodes[at].removed = true;
+    } else {
+        nodes.remove(at);
+    }
+    true
 }
 
 /// How many listeners are registered — C has no such call; this exists for
 /// the tests and for `iocLogShow`.
 #[must_use]
 pub fn errlog_listener_count() -> usize {
-    errlog_pvt()
-        .listeners
-        .lock()
-        .expect("errlog listeners")
-        .len()
+    let list = errlog_pvt().listeners.lock();
+    list.borrow().iter().filter(|n| !n.removed).count()
 }
 
 /// C `errlogShow(level)` (`errlog.c:694-720`). Returns the lines rather than
@@ -1198,31 +1471,33 @@ pub fn errlog_listener_count() -> usize {
 /// redirected output — the same split `ioc_log_show` uses.
 ///
 /// Level 0 is the two sizes, level 1 adds the listener count, level 2 adds
-/// both buffers. The first three quantities are C's own, read from the port's
-/// `buf_size`, `max_msg_size` and listener list.
-///
-/// The buffer dump is NOT C's bytes, and stating what it is beats inventing a
-/// field to match C's line shape. C packs the queued messages into a flat
-/// arena and prints `pvt.log->base`, which `printf("%s")` cuts at the first
-/// NUL — so C shows the FIRST queued message — then `printf("%*s^\n", pos,
-/// "")`, a caret standing at the byte offset the next message would go to.
-/// The port's queue is a `Vec<String>` carrying C's `pos` arithmetic
-/// alongside it (`pos` is what decides acceptance, so it is kept exactly),
-/// and there is no arena for a caret to point into. So every queued message
-/// is printed, one per line, and the position is stated as a number instead
-/// of drawn.
+/// both arenas as C prints them: `printf("%s\n", base)`, which stops at the
+/// first NUL and so shows the first record's flag byte and text, then a caret
+/// at `pos`. The arena the worker is draining reads as empty until it is
+/// handed back.
 #[must_use]
 pub fn errlog_show(level: u32) -> Vec<String> {
+    /// `printf("%s\n", base)` and `printf("%*s^\n", pos, "")` for one arena.
+    fn dump(which: &str, buf: &ErrlogBuf) -> [String; 3] {
+        let first = buf
+            .base
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(buf.base.len());
+        [
+            format!("  buffer({which}) contents:"),
+            String::from_utf8_lossy(&buf.base[..first]).into_owned(),
+            format!("{:>1$}", "^", buf.pos + 1),
+        ]
+    }
     let errlog = errlog_pvt();
-    // Snapshot under the queue lock, format outside it: the queue is the one
-    // lock a formatting path must not be holding if it ever logs.
-    let (buf_size, max_msg_size, log, print) = {
+    // C prints under `msgQueueLock`; copying under it is the same snapshot.
+    let (buf_size, max_msg_size, arenas) = {
         let q = errlog.queue.lock();
         (
             q.buf_size,
             q.max_msg_size,
-            (q.log.entries.clone(), q.log.pos),
-            (q.print.entries.clone(), q.print.pos),
+            (level > 1).then(|| [dump("log", &q.log), dump("print", &q.print)]),
         )
     };
 
@@ -1238,19 +1513,7 @@ pub fn errlog_show(level: u32) -> Vec<String> {
             errlog_listener_count()
         ));
     }
-    if level > 1 {
-        for (which, (entries, pos)) in [("log", log), ("print", print)] {
-            out.push(format!("  buffer({which}) contents:"));
-            out.extend(
-                entries
-                    .iter()
-                    .map(|msg| format!("    {}", msg.trim_end_matches('\n'))),
-            );
-            out.push(format!(
-                "  buffer({which}) position: {pos} of {buf_size} bytes"
-            ));
-        }
-    }
+    out.extend(arenas.into_iter().flatten().flatten());
     out
 }
 
@@ -1347,12 +1610,21 @@ pub fn errlog_messages_lost() -> usize {
 /// text survives.
 #[must_use]
 pub fn errlog_strip_ansi(message: &str) -> String {
-    let b = message.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
+    let mut out = message.as_bytes().to_vec();
+    let len = strip_ansi_in_place(&mut out);
+    out.truncate(len);
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// [`errlog_strip_ansi`]'s rule over `b` itself, as C's `errlogStripANSI`
+/// rewrites its argument; returns the stripped length.
+fn strip_ansi_in_place(b: &mut [u8]) -> usize {
+    let mut out = 0;
     let mut i = 0;
     while i < b.len() {
         if b[i] != 0x1b {
-            out.push(b[i]);
+            b[out] = b[i];
+            out += 1;
             i += 1;
             continue;
         }
@@ -1367,7 +1639,7 @@ pub fn errlog_strip_ansi(message: &str) -> String {
             }
         }
     }
-    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    out
 }
 
 #[cfg(test)]
@@ -1707,12 +1979,12 @@ mod tests {
     }
 
     fn test_queue() -> ErrlogQueue {
-        let (buf_size, max_msg_size) = errlog_clamp_sizes(0, 0);
+        let (buf_size, max_msg_size) = errlog_clamp_sizes(0, DEFAULT_MAX_MSG_SIZE);
         ErrlogQueue {
             buf_size,
             max_msg_size,
-            log: ErrlogBuf::new(),
-            print: ErrlogBuf::new(),
+            log: ErrlogBuf::new(buf_size),
+            print: ErrlogBuf::new(buf_size),
             n_lost: 0,
             at_exit: false,
             to_console: true,
@@ -1721,35 +1993,32 @@ mod tests {
         }
     }
 
-    /// Boundary: both clamps. C raises a small `bufsize` to `MIN_BUFFER_SIZE`
-    /// and holds `maxMsgSize` inside `[MIN_MESSAGE_SIZE, MAX_MESSAGE_SIZE]`
-    /// (`errlog.c:591-599`), so `errlogInit(0)` — the call every entry point
-    /// makes — produces 1280/256 and not 0/0.
+    /// Boundary: every clamp in `errlogClampConfig` (`errlog.c:539-561`).
+    /// `errlogInit(0)` — the call every entry point makes — produces
+    /// 2560/512, and the message ceiling is a fifth of the clamped buffer.
     #[test]
     fn errlog_init_clamps_both_sizes_the_way_c_does() {
-        assert_eq!(
-            errlog_clamp_sizes(0, 0),
-            (MIN_BUFFER_SIZE, MIN_MESSAGE_SIZE)
-        );
+        assert_eq!(errlog_clamp_sizes(0, DEFAULT_MAX_MSG_SIZE), (2560, 512));
         assert_eq!(
             errlog_clamp_sizes(MIN_BUFFER_SIZE - 1, MIN_MESSAGE_SIZE - 1),
             (MIN_BUFFER_SIZE, MIN_MESSAGE_SIZE)
         );
         assert_eq!(
-            errlog_clamp_sizes(MIN_BUFFER_SIZE + 1, MIN_MESSAGE_SIZE + 1),
-            (MIN_BUFFER_SIZE + 1, MIN_MESSAGE_SIZE + 1),
-            "a size above the floor is kept"
+            errlog_clamp_sizes(5000, 1000),
+            (5000, 1000),
+            "a fifth of the buffer is kept"
         );
+        assert_eq!(errlog_clamp_sizes(5000, 1001), (5000, 1000));
         assert_eq!(
-            errlog_clamp_sizes(0, MAX_MESSAGE_SIZE + 1).1,
-            MAX_MESSAGE_SIZE,
-            "and the ceiling holds too"
+            errlog_clamp_sizes(0, 513),
+            (2560, 512),
+            "the ceiling follows the clamped buffer, not the request"
         );
     }
 
     /// Boundary: the admission rule. C takes a message only when the WORST
     /// case still fits — `bufSize - pos >= 1 + maxMsgSize` — so with the
-    /// default 1280/256 the arena stops accepting once `pos` passes 1023,
+    /// default 2560/512 the arena stops accepting once `pos` passes 2047,
     /// whatever the actual message lengths were. This is what makes the
     /// buffer a bound; a `Vec` that simply grew would never refuse.
     #[test]
@@ -1757,19 +2026,37 @@ mod tests {
         let mut q = test_queue();
         let msg = "0123456789"; // 10 bytes, so 12 bytes of `pos` each
         let mut taken = 0;
-        while q.accept(msg) {
+        while q.accept(format_args!("{}", msg), false) {
             taken += 1;
             assert!(taken < 1000, "the arena must stop accepting");
         }
-        // `pos` may reach 1023 and still admit, so the last accepted message
-        // is the one that starts at 1020 — 86 of them, ending with `pos` past
-        // the limit at 1032.
-        assert_eq!(taken, 86, "the last message that starts at or below 1023");
-        assert_eq!(q.log.pos, 86 * 12);
+        // `pos` may reach 2047 and still admit, so the last accepted message
+        // is the one that starts at 2040 — 171 of them.
+        assert_eq!(taken, 171, "the last message that starts at or below 2047");
+        assert_eq!(q.log.pos, 171 * 12);
         assert_eq!(q.n_lost, 1, "the first refusal is counted");
-        assert!(!q.accept(msg));
+        assert!(!q.accept(format_args!("{}", msg), false));
         assert_eq!(q.n_lost, 2, "and so is the next");
-        assert_eq!(q.log.entries.len(), 86, "nothing lost was stored");
+        assert_eq!(q.log.messages().count(), 171, "nothing lost was stored");
+        assert!(q.log.messages().all(|(echo, text)| !echo && text == msg));
+    }
+
+    /// The arena holds C's `[flag][text][NUL]` records, so a NUL inside a
+    /// message — which C's `%s` could never have copied — ends it there and
+    /// does not misplace the record after it.
+    #[test]
+    fn a_record_ends_at_its_first_nul() {
+        let mut q = test_queue();
+        assert!(q.accept(format_args!("{}", "a\0b\n"), true));
+        assert!(q.accept(format_args!("{}", "next\n"), false));
+        assert_eq!(
+            q.log.messages().collect::<Vec<_>>(),
+            [(true, "a"), (false, "next\n")]
+        );
+        assert_eq!(
+            &q.log.base[..3],
+            &[ERL_STATE_READY | ERL_LOCALECHO, b'a', 0]
+        );
     }
 
     /// Boundary: exactly at the limit. `pos == buf_size - (1 + max_msg_size)`
@@ -1778,17 +2065,23 @@ mod tests {
     fn the_admission_boundary_is_inclusive() {
         let mut q = test_queue();
         q.log.pos = q.buf_size - (1 + q.max_msg_size);
-        assert!(q.accept("x"), "the last worst case that fits is taken");
+        assert!(
+            q.accept(format_args!("{}", "x"), false),
+            "the last worst case that fits is taken"
+        );
         let mut q = test_queue();
         q.log.pos = q.buf_size - q.max_msg_size;
-        assert!(!q.accept("x"), "one byte past it is not");
+        assert!(
+            !q.accept(format_args!("{}", "x"), false),
+            "one byte past it is not"
+        );
         assert_eq!(q.n_lost, 1);
     }
 
     /// The defect this arena had without C's back-pressure: a boot burst.
     ///
     /// 200 console-echoed messages is what a real `iocBoot` script produces,
-    /// and 1280/256 admits 86 of them at a time. C loses none of it because
+    /// and 2560/512 admits 171 short ones at a time. C loses none of it because
     /// `msgbufCommit` flushes after every echoed message (`errlog.c:186-187`),
     /// so `pos` is 0 again before the next call. The observable is both halves
     /// of "nothing was lost": the refusal counter, and the listener copies —
@@ -1807,9 +2100,12 @@ mod tests {
         });
 
         const BURST: usize = 200;
+        let blocking_was = crate::runtime::task::thread_is_ok_to_block();
+        crate::runtime::task::set_thread_ok_to_block(true);
         for i in 0..BURST {
-            errlog_printf(&format!("burst line {i}\n"));
+            errlog_vprintf(format_args!("burst line {i}\n"));
         }
+        crate::runtime::task::set_thread_ok_to_block(blocking_was);
 
         let lost = errlog_messages_lost();
         let heard = seen.load(std::sync::atomic::Ordering::SeqCst);
@@ -1830,7 +2126,7 @@ mod tests {
     #[test]
     #[serial(errlog)]
     fn only_a_blocking_producer_waits_for_the_drain() {
-        for prologue in [false, true] {
+        for ok_to_block in [true, false] {
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
             let release_rx = std::sync::Mutex::new(release_rx);
@@ -1842,16 +2138,10 @@ mod tests {
                 }
             });
 
-            // Shuts the gate, and is itself a producer of the kind under test
-            // only in the `false` pass — so the gate is entered from a message
-            // whose own wait has already been satisfied or never taken.
+            // Shuts the gate, and is itself the producer under test.
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let producer = std::thread::spawn(move || {
-                if prologue {
-                    let _ = crate::runtime::task::enter_ioc_thread(
-                        crate::runtime::task::ThreadPriority::ScanLow,
-                    );
-                }
+                crate::runtime::task::set_thread_ok_to_block(ok_to_block);
                 errlog_printf("gated\n");
                 let _ = done_tx.send(());
             });
@@ -1873,8 +2163,8 @@ mod tests {
             assert!(errlog_remove_listener(id));
 
             assert_eq!(
-                returned_while_gated, prologue,
-                "prologue={prologue}: C waits exactly when `epicsThreadIsOkToBlock`"
+                returned_while_gated, !ok_to_block,
+                "ok_to_block={ok_to_block}: C waits exactly when `epicsThreadIsOkToBlock`"
             );
         }
     }
@@ -1909,10 +2199,10 @@ mod tests {
             .map(|i| {
                 let done_tx = done_tx.clone();
                 std::thread::spawn(move || {
-                    // A plain thread is `epicsThreadIsOkToBlock`, which is the
-                    // only kind that waits — see
+                    // Only a thread that may block waits — see
                     // `only_a_blocking_producer_waits_for_the_drain`.
-                    errlog_printf(&format!("rendezvous {i}\n"));
+                    crate::runtime::task::set_thread_ok_to_block(true);
+                    errlog_vprintf(format_args!("rendezvous {i}\n"));
                     let _ = done_tx.send(i);
                 })
             })
@@ -1949,8 +2239,8 @@ mod tests {
     /// proof that the burst really does overflow.
     ///
     /// `eltc(0)` makes `localEcho` 0, so `msgbufCommit` takes no back-pressure
-    /// and the arena behaves as a pure bound: the messages past 86 are refused
-    /// and counted. Holding the worker inside a listener makes that the only
+    /// and the arena behaves as a pure bound: 127 of the 200 fit in 2560/512
+    /// and the other 73 are refused and counted. Holding the worker inside a listener makes that the only
     /// possible outcome rather than a race with the drain — and it is the same
     /// hold that shows the previous test is measuring something, since without
     /// the flush that burst is this one.
@@ -1975,7 +2265,7 @@ mod tests {
             .expect("the worker reaches the listener");
 
         for i in 0..200 {
-            errlog_printf(&format!("burst line {i}\n"));
+            errlog_vprintf(format_args!("burst line {i}\n"));
         }
         let lost = errlog_messages_lost();
 
@@ -1983,9 +2273,10 @@ mod tests {
         errlog_flush();
         eltc(was);
         assert!(errlog_remove_listener(id));
-        assert!(
-            lost > 0,
-            "a stalled drain plus 200 messages must overflow a 1280-byte arena"
+        // 10 records of 15 bytes, 90 of 16, then 17 each while `pos` <= 2047.
+        assert_eq!(
+            lost, 73,
+            "a stalled drain refuses what 2560/512 cannot hold"
         );
     }
 
@@ -1995,7 +2286,8 @@ mod tests {
     /// A listener runs on the worker thread, and a listener that logs is
     /// ordinary — the IOC log client does it on a reconnect. C is protected by
     /// `isOkToBlock`, which is 0 for every `epicsThreadCreate` thread; here
-    /// `enter_ioc_thread` clears the same flag for the worker. Without it this
+    /// it is 0 for every thread until raised, and the worker never raises it.
+    /// Without it this
     /// test does not fail, it hangs, so the wait is bounded and the failure is
     /// a timeout rather than a wedged process.
     #[test]
@@ -2010,6 +2302,7 @@ mod tests {
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
+            crate::runtime::task::set_thread_ok_to_block(true);
             errlog_printf("trigger\n");
             errlog_flush();
             let _ = done_tx.send(());
@@ -2034,16 +2327,35 @@ mod tests {
     fn an_oversized_message_is_cut_to_max_minus_one_with_the_marker_as_its_tail() {
         let mut q = test_queue();
         let max = q.max_msg_size;
-        assert!(q.accept(&"a".repeat(max)));
-        let stored = &q.log.entries[0];
+        assert!(q.accept(format_args!("{}", "a".repeat(max)), false));
+        let (_, stored) = q.log.messages().next().unwrap();
         assert_eq!(stored.len(), max - 1, "C's `nchar = maxMsgSize - 1`");
         assert!(stored.ends_with(TRUNCATED), "{stored}");
 
         // One byte under the limit is stored whole.
         let mut q = test_queue();
-        assert!(q.accept(&"a".repeat(max - 1)));
-        assert_eq!(q.log.entries[0].len(), max - 1);
-        assert!(!q.log.entries[0].contains("TRUNCATED"));
+        assert!(q.accept(format_args!("{}", "a".repeat(max - 1)), false));
+        let (_, stored) = q.log.messages().next().unwrap();
+        assert_eq!(stored.len(), max - 1);
+        assert!(!stored.contains("TRUNCATED"));
+    }
+
+    /// The message is formatted in the slot, piece by piece, and `nchar` is
+    /// the whole would-be length: an argument that crosses the end is cut in
+    /// whole characters, and the cut before the marker never splits one.
+    #[test]
+    fn a_formatted_message_is_measured_and_cut_in_the_slot() {
+        let mut q = test_queue();
+        assert!(q.accept(format_args!("{} {:>3}|{}\n", "sevr=major", 7, 'é'), true));
+        assert_eq!(q.log.messages().next(), Some((true, "sevr=major   7|é\n")));
+
+        let mut q = test_queue();
+        let max = q.max_msg_size;
+        // The cut before the marker, `max - 1 - 14`, falls inside the `é`.
+        let head = "a".repeat(max - 1 - TRUNCATED.len() - 1);
+        assert!(q.accept(format_args!("{head}{}{}", "é", "z".repeat(max)), false));
+        let (_, stored) = q.log.messages().next().unwrap();
+        assert_eq!(stored, format!("{head}{TRUNCATED}"));
     }
 
     /// The two severity words expand exactly as `errlog.h:290-299` does:
@@ -2073,6 +2385,7 @@ mod tests {
         // and this is the assertion that would fail if it were — under
         // `cargo test` stderr is not a terminal.
         assert_eq!(erl_warning(), "WARNING");
+        assert_eq!(erl_error(), "ERROR");
     }
 
     /// The escapes `iocsh` and `softIoc` paint with, pinned to the macros they
@@ -2142,11 +2455,11 @@ mod tests {
     #[test]
     fn the_console_writes_the_callers_bytes_and_appends_nothing() {
         let mut terminated = Vec::new();
-        write_console(&mut terminated, "iocPause: IOC suspended\n");
+        write_console(&mut terminated, format_args!("iocPause: IOC suspended\n"));
         assert_eq!(terminated, b"iocPause: IOC suspended\n");
 
         let mut bare = Vec::new();
-        write_console(&mut bare, "dbConvertJSON: ");
+        write_console(&mut bare, format_args!("dbConvertJSON: "));
         assert_eq!(bare, b"dbConvertJSON: ");
     }
 
@@ -2159,17 +2472,21 @@ mod tests {
     struct ConsoleUnderTest {
         dir: tempfile::TempDir,
         eltc_was: bool,
+        ok_to_block_was: bool,
     }
 
     impl ConsoleUnderTest {
         /// A console at `<tmp>/name`, with `eltc` on so a message is echoed at
-        /// all.
+        /// all, posted to from a thread that may block as a shell's does, so
+        /// a line is on the console when [`Self::log`] returns.
         fn new(name: &str) -> Self {
             let dir = tempfile::tempdir().expect("console dir");
             let under_test = ConsoleUnderTest {
                 dir,
                 eltc_was: eltc(true),
+                ok_to_block_was: crate::runtime::task::thread_is_ok_to_block(),
             };
+            crate::runtime::task::set_thread_ok_to_block(true);
             under_test.redirect(name);
             under_test
         }
@@ -2190,7 +2507,7 @@ mod tests {
         }
 
         /// Log through our own subscriber rather than whatever the process
-        /// has: `console_fallback`'s gate is the ambient dispatcher, and a
+        /// has: `console_is_ours` asks the ambient dispatcher, and a
         /// test that scoped a subscriber earlier in this process has already
         /// latched `nothing_is_listening` false for good.
         fn log(&self, message: &str) {
@@ -2202,6 +2519,7 @@ mod tests {
         fn drop(&mut self) {
             errlog_set_console_to_stderr();
             eltc(self.eltc_was);
+            crate::runtime::task::set_thread_ok_to_block(self.ok_to_block_was);
         }
     }
 
@@ -2333,6 +2651,49 @@ mod tests {
         );
     }
 
+    /// The worker writes the console, so a poster that may not block returns
+    /// before its line is out (`_main_` under softMain `-d`, `osdThread.c:406`)
+    /// and one that may returns after it (`errlog.c:186-187`).
+    #[test]
+    #[serial(errlog)]
+    fn only_an_ok_to_block_poster_returns_after_its_line_is_written() {
+        let console = ConsoleUnderTest::new("order");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let holding = std::sync::atomic::AtomicBool::new(false);
+        let id = errlog_add_listener(move |_| {
+            if !holding.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().expect("gate").recv();
+            }
+        });
+
+        let blocking_was = crate::runtime::task::thread_is_ok_to_block();
+        crate::runtime::task::set_thread_ok_to_block(false);
+        console.log("prime\n");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reaches the listener");
+        console.log("not ok to block\n");
+        let before_release = console.text("order");
+        let _ = release_tx.send(());
+        crate::runtime::task::set_thread_ok_to_block(true);
+        console.log("ok to block\n");
+        let after_blocking_post = console.text("order");
+        crate::runtime::task::set_thread_ok_to_block(blocking_was);
+        assert!(errlog_remove_listener(id));
+
+        assert_eq!(
+            before_release, "prime\n",
+            "a poster that may not block returned before the worker wrote its line"
+        );
+        assert_eq!(
+            after_blocking_post, "prime\nnot ok to block\nok to block\n",
+            "a poster that may block returns after its line, in queue order"
+        );
+    }
+
     /// The subscriber's skip is keyed on a target the `tracing` macros spell as
     /// a literal, so this is what stops the two spellings drifting apart.
     #[test]
@@ -2394,6 +2755,74 @@ mod tests {
             lines[1].as_deref(),
             Some("WARN  epics_base_rs::runtime: a runtime line"),
             "every other target still renders"
+        );
+    }
+
+    /// The exit handler drains a queued line from a context where
+    /// `std::thread::current()` is already gone — what macOS makes of the
+    /// `atexit` list on the main thread. Linux gives one to a pthread key
+    /// destructor that runs after std's own, which destroys `CURRENT`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial(errlog)]
+    fn the_exit_handler_drains_after_the_threads_locals_are_gone() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static DRAINED: AtomicBool = AtomicBool::new(false);
+        static KEY: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn on_thread_exit(_: *mut libc::c_void) {
+            let current_gone = std::panic::catch_unwind(|| {
+                let _ = std::thread::current();
+            })
+            .is_err();
+            if !current_gone {
+                // Std's key has not run yet: come back next round.
+                // SAFETY: `KEY` was created by `pthread_key_create`.
+                unsafe {
+                    libc::pthread_setspecific(
+                        KEY.load(Ordering::SeqCst),
+                        std::ptr::dangling::<libc::c_void>(),
+                    )
+                };
+                return;
+            }
+            errlog_exit_handler();
+            let code = if DRAINED.load(Ordering::SeqCst) { 0 } else { 4 };
+            // SAFETY: ends the process from a thread that is exiting anyway.
+            unsafe { libc::_exit(code) };
+        }
+
+        with_a_process_of_its_own(
+            "runtime::log::tests::the_exit_handler_drains_after_the_threads_locals_are_gone",
+            || {
+                let mut key: libc::pthread_key_t = 0;
+                // SAFETY: `key` is a valid out-pointer.
+                assert_eq!(
+                    unsafe { libc::pthread_key_create(&mut key, Some(on_thread_exit)) },
+                    0
+                );
+                KEY.store(key, Ordering::SeqCst);
+                errlog_init(0);
+                // The worker sits in the first line's delivery until the exit
+                // handler has started, so the second is still queued then.
+                errlog_add_listener(|text| {
+                    if text.contains("held") {
+                        while !errlog_pvt().queue.lock().at_exit {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    } else if text.contains("queued at exit") {
+                        DRAINED.store(true, Ordering::SeqCst);
+                    }
+                });
+                errlog_printf_no_console(format_args!("held\n"));
+                errlog_printf_no_console(format_args!("queued at exit\n"));
+                let _ = std::thread::spawn(move || {
+                    // SAFETY: `key` was created above.
+                    unsafe { libc::pthread_setspecific(key, std::ptr::dangling::<libc::c_void>()) };
+                })
+                .join();
+                unreachable!("the exiting thread's key destructor ends the process");
+            },
         );
     }
 
@@ -2555,9 +2984,8 @@ mod tests {
     }
 
     /// Boundary: a listener that removes itself from inside its own callback.
-    /// C guards this with `active`/`removed` flags; the port drains against a
-    /// snapshot, so the call cannot deadlock and the removal takes effect on
-    /// the next message.
+    /// C's `active`/`removed` flags: the call cannot deadlock on the
+    /// recursive list lock, and the removal takes effect on the next message.
     #[test]
     #[serial(errlog)]
     fn a_listener_can_remove_itself_from_inside_its_own_callback() {
@@ -2625,19 +3053,31 @@ mod tests {
 /// Applying it to already-escaped output is a no-op, because a correct
 /// encoder has already removed every raw control byte.
 pub fn single_line(record: &str) -> std::borrow::Cow<'_, str> {
-    fn must_escape(c: char) -> bool {
-        (c as u32) < 0x20 || c as u32 == 0x7F
+    match single_line_bytes(record.as_bytes()) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(record),
+        // Only ASCII bytes are replaced, by ASCII, so the UTF-8 survives.
+        std::borrow::Cow::Owned(out) => {
+            std::borrow::Cow::Owned(String::from_utf8(out).expect("ASCII-for-ASCII escape"))
+        }
     }
-    if !record.contains(must_escape) {
+}
+
+/// [`single_line`] over bytes, for records that carry a client's bytes
+/// undecoded (a CA user name). Bytes `>= 0x80` pass through.
+pub fn single_line_bytes(record: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    fn must_escape(b: u8) -> bool {
+        b < 0x20 || b == 0x7F
+    }
+    if !record.iter().copied().any(must_escape) {
         return std::borrow::Cow::Borrowed(record);
     }
-    let mut out = String::with_capacity(record.len() + 8);
-    for c in record.chars() {
-        if must_escape(c) {
-            use std::fmt::Write;
-            let _ = write!(out, "\\x{:02x}", c as u32);
+    let mut out = Vec::with_capacity(record.len() + 8);
+    for &b in record {
+        if must_escape(b) {
+            use std::io::Write;
+            let _ = write!(out, "\\x{b:02x}");
         } else {
-            out.push(c);
+            out.push(b);
         }
     }
     std::borrow::Cow::Owned(out)

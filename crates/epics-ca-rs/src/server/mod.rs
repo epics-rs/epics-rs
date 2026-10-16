@@ -16,6 +16,8 @@ pub mod beacon;
 pub mod blocking;
 #[cfg(tokio_backend)]
 pub mod ca_server;
+#[cfg(test)]
+mod delivery_alloc_tests;
 pub(crate) mod frame;
 #[cfg(tokio_backend)]
 pub mod introspection;
@@ -49,84 +51,8 @@ use epics_base_rs::error::CaResult;
 #[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
-/// Convert a `$`-channel snapshot value from `EpicsValue::String` to
-/// `EpicsValue::CharArray` of exactly `MAX_STRING_SIZE` (= 40) elements,
-/// matching C `dbChannel.c:489` which sets `no_elements = field_size` (= 40)
-/// and `dbr_field_type = DBR_CHAR`.  The string bytes are written first,
-/// followed by a NUL terminator, and the remainder zero-padded to 40.
-/// `DBF_STRING` guarantees `strlen <= 39`, so the string always fits.
-/// Non-string values pass through unchanged.
-pub(super) fn apply_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::EpicsValue;
-    const MAX_STRING_SIZE: usize = 40;
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::String(s) => {
-            let mut b = s.into_bytes();
-            b.push(0); // NUL terminator
-            b.resize(MAX_STRING_SIZE, 0); // zero-pad to field_size
-            EpicsValue::CharArray(b.into())
-        }
-        other => other,
-    };
-}
-
-/// Convert a long-string *record* field's snapshot value from
-/// `EpicsValue::CharArray` to a scalar `EpicsValue::String`. C
-/// `cvt_dbaddr` presents lsi/lso VAL & OVAL and printf VAL as a scalar
-/// `DBF_STRING` with `no_elements = 1` (lsiRecord.c:141-143,
-/// lsoRecord.c:183-185, printfRecord.c:415-417); the record stores the
-/// value as a NUL-terminable CHAR array (the long-string carrier). This
-/// is the inverse of [`apply_long_string`] — the conversion the CA
-/// boundary applies for *plain* (non-`$`) access so the channel ships a
-/// single `DBR_STRING` element. The buffer is decoded verbatim (no
-/// UTF-8 validation, matching pvxs raw-byte storage) up to the first
-/// NUL; the DBR_STRING encoder then truncates to `MAX_STRING_SIZE`
-/// (= 40), so an over-long value clips on the wire exactly as C does.
-/// Non-`CharArray` values pass through unchanged.
-pub(super) fn apply_native_long_string(snap: &mut epics_base_rs::server::snapshot::Snapshot) {
-    use epics_base_rs::types::{EpicsValue, PvString};
-    let v = std::mem::replace(&mut snap.value, EpicsValue::Long(0));
-    snap.value = match v {
-        EpicsValue::CharArray(bytes) => {
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            EpicsValue::String(PvString::from_bytes(&bytes[..end]))
-        }
-        other => other,
-    };
-}
-
-/// How a channel presents a long-string field on the CA wire. `$`-access
-/// and plain access to a long-string *record* field are mutually
-/// exclusive boundary conversions, so they share one mode rather than two
-/// booleans — the illegal "both at once" state cannot be constructed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum LongStringMode {
-    /// Ordinary field: deliver the value verbatim.
-    Plain,
-    /// Client appended `$`: a `DBF_STRING` field is delivered as a
-    /// `DBR_CHAR` array of `MAX_STRING_SIZE` (= 40), per the C
-    /// `dbChannel.c` long-string convention. See [`apply_long_string`].
-    DollarChar,
-    /// Plain access to a long-string *record* field (lsi/lso VAL & OVAL,
-    /// printf VAL): C `cvt_dbaddr` presents it as a scalar `DBF_STRING`,
-    /// so the CHAR-array carrier is decoded to a scalar string before
-    /// encoding. See [`apply_native_long_string`].
-    NativeString,
-}
-
-/// Apply the boundary conversion selected by `mode` to a delivery
-/// snapshot before DBR encoding.
-pub(super) fn apply_long_string_mode(
-    snap: &mut epics_base_rs::server::snapshot::Snapshot,
-    mode: LongStringMode,
-) {
-    match mode {
-        LongStringMode::DollarChar => apply_long_string(snap),
-        LongStringMode::NativeString => apply_native_long_string(snap),
-        LongStringMode::Plain => {}
-    }
-}
+pub(crate) use epics_base_rs::server::database::channel_io::LongStringMode;
+pub(crate) use epics_base_rs::server::database::dbr_delivery::DeliveryStage;
 
 /// Stand `app` up on Channel Access — [`run_ca_ioc`] with C's `rsrvRegistrar`
 /// already run, which is the only order that works.
@@ -142,9 +68,19 @@ pub(super) fn apply_long_string_mode(
 /// `IocApplication::run(run_ca_ioc)` still works and still registers `casr`
 /// on the INTERACTIVE shell — it is the startup shell, the one `st.cmd`
 /// executes on, that only this entry point can reach.
+///
+/// The `ca` link set comes with it for the same reason: C's dbCa is in every
+/// IOC, so it is the runner's to install, not each head's.
 #[cfg(tokio_backend)]
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
-    iocsh::register_rsrv_commands(app).run(run_ca_ioc).await
+    iocsh::register_rsrv_commands(app)
+        .register_link_type("ca", {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("run_ca_ioc_app is awaited on the IOC's reactor");
+            move |db| crate::calink::calink_link_set_install(db, reactor)
+        })
+        .run(run_ca_ioc)
+        .await
 }
 
 /// Run an IOC with the Channel Access protocol.
@@ -264,16 +200,16 @@ pub(crate) fn casr_addrs(server: &CaServer) -> CaResult<iocsh::CasrAddrs> {
 ///
 /// The broadcast responder address for one interface, under the same
 /// gate `bind_udp_responders` binds the socket with — C
-/// `caservertask.c:671,728` skips it on Windows, and there is no
+/// `caservertask.c:671,728` skips it on Windows and Cygwin, and there is no
 /// broadcast address for a wildcard or loopback interface.
 #[cfg(tokio_backend)]
 fn bcast_responder_addr(ip: std::net::Ipv4Addr, port: u16) -> Option<std::net::SocketAddr> {
-    #[cfg(any(windows, target_os = "windows"))]
+    #[cfg(not(ca_udp_bcast))]
     {
         let _ = (ip, port);
         None
     }
-    #[cfg(not(any(windows, target_os = "windows")))]
+    #[cfg(ca_udp_bcast)]
     {
         addr_list::broadcast_for_ip(ip).map(|b| std::net::SocketAddr::from((b, port)))
     }
@@ -332,7 +268,7 @@ mod spawn_capability_guard {
             ("ca_server.rs", "pub async fn run("),
             ("tcp.rs", "fn write_notify_queue("),
             ("blocking.rs", "fn command_drives_without_spawn("),
-            ("monitor.rs", "fn spawn_monitor_sender"),
+            ("monitor.rs", "fn deliver_monitor_event"),
         ];
 
         let bare = concat!("tokio", "::spawn(");

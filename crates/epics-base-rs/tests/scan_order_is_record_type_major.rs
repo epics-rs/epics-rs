@@ -12,8 +12,8 @@
 //! so at `iocInit` every `ai` is `scanAdd`ed before every `calc`, whatever
 //! order the `.db` declared them in. `addToList` (`:1081-1087`) then appends
 //! after the last element whose `phas <=` the new record's, which preserves
-//! that feed order within a PHAS. Record-type order is DBD include order
-//! (`dbd/stdRecords.dbd`, `aiRecord.dbd` before `calcRecord.dbd`).
+//! that feed order within a PHAS. Record-type order is name order (see
+//! `scan_order_follows_record_type_list.rs`), `ai` before `calc`.
 //!
 //! The port keyed the list `(PHAS, load_order, name)` — the FIFO was stable,
 //! but over the wrong feed order, so every same-PHAS reader/writer pair whose
@@ -41,11 +41,14 @@ async fn order(db: &str) -> Vec<String> {
         .0
         .records_for_scan(ScanType::SEC1)
         .await
+        .iter()
+        .map(|n| n.to_string())
+        .collect()
 }
 
 /// BOUNDARY: same PHAS, declaration order contradicts DBD order. The brief's
 /// case — `ai` reads `calc`, `calc` is declared first, and C still scans the
-/// `ai` first because `aiRecord.dbd` precedes `calcRecord.dbd`.
+/// `ai` first because `ai` precedes `calc` in `recordTypeList`.
 #[epics_macros_rs::epics_test]
 async fn record_type_order_beats_declaration_order() {
     let got = order(
@@ -94,15 +97,15 @@ record(ai, "A") { field(SCAN,"1 second") }
     assert_eq!(got, vec!["Z".to_string(), "A".to_string()]);
 }
 
-/// BOUNDARY: a record type no vendored `.dbd` declares. C reaches it through a
-/// module `.dbd` included after `base.dbd`, so it joins `recordTypeList`
-/// behind every base type — declaring it first must not move it first.
+/// BOUNDARY: a record type no vendored `.dbd` declares still sorts by name, as
+/// in C's expanded `.dbd`: `aForeign` before `ai`, loaded after it. The C pin
+/// is scaler-rs `scan_order_places_scaler_by_name.rs`.
 #[epics_macros_rs::epics_test]
-async fn an_undeclared_record_type_sorts_after_every_declared_one() {
+async fn an_undeclared_record_type_sorts_by_name_among_declared_ones() {
     struct Foreign;
     impl Record for Foreign {
         fn record_type(&self) -> &'static str {
-            "scan_order_foreign_test"
+            "aForeign"
         }
         fn process(&mut self) -> CaResult<ProcessOutcome> {
             Ok(ProcessOutcome::complete())
@@ -119,18 +122,18 @@ async fn an_undeclared_record_type_sorts_after_every_declared_one() {
     }
 
     assert!(
-        !RECORD_TYPE_ORDER.contains(&"scan_order_foreign_test"),
+        !RECORD_TYPE_ORDER.contains(&"aForeign"),
         "the test double must be a type no vendored .dbd declares"
     );
 
     let db: Arc<PvDatabase> = Arc::new(PvDatabase::new());
-    db.add_record("FIRST", Box::new(Foreign)).await.unwrap();
     db.add_record(
-        "SECOND",
+        "FIRST",
         Box::new(epics_base_rs::server::records::ai::AiRecord::new(0.0)),
     )
     .await
     .unwrap();
+    db.add_record("SECOND", Box::new(Foreign)).await.unwrap();
     for name in ["FIRST", "SECOND"] {
         db.get_record(name).unwrap().write().common.scan = ScanType::SEC1;
         db.update_scan_index(name, ScanType::Passive, ScanType::SEC1, 0, 0);
@@ -139,6 +142,6 @@ async fn an_undeclared_record_type_sorts_after_every_declared_one() {
     assert_eq!(
         db.records_for_scan(ScanType::SEC1).await,
         vec!["SECOND".to_string(), "FIRST".to_string()],
-        "an undeclared type sorts behind every declared one, as in C"
+        "an undeclared type sorts by name, as in C"
     );
 }

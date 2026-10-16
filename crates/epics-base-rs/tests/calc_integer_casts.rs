@@ -20,10 +20,10 @@
 //! `d2i`, because PR #925 is a base-only commit; sCalc/aCalc keep their pristine
 //! synApps `(long)`/`(int)`, which the differential oracle also runs.
 //!
-//! d2i and the plain casts alike stay UNDEFINED in C outside their range
-//! (negatives, `>= 2^32`, NaN); on those the port mirrors its own cast owner
-//! (base d2i's modular wrap, sCalc/aCalc's saturating `c_long`/`c_int`), never
-//! reproducing x86 `cvttsd2si`. Those values carry no claim of C-correctness.
+//! d2i and the plain casts alike are UNDEFINED in C outside their range
+//! (negatives, `>= 2^32`, NaN); the port takes the x86-64 `cvttsd2si` value,
+//! through `c_cast`, and base d2i's own wrap. Expected values are
+//! oracleStdIoc (softIoc R7.0.10-146-g8f5015b66) output.
 //!
 //! This test used to pin the earlier clean no-narrow deviation (`3e9 % 7 == 4`,
 //! `NINT(3e9) == 3e9` in every dialect).
@@ -63,8 +63,7 @@ fn a(expr: &str, a0: f64) -> f64 {
 /// the three genuinely disagree because their C widths do:
 /// * base — `d2i(3e9) = -1294967296`, `% 7 == 0` (fixed `calcPerform.c`, PR #925)
 /// * sCalc — `(long)3e9 = 3000000000`, `% 7 == 4` (64-bit, no loss)
-/// * aCalc — `(int)3e9` is out of int32 range, so the port's saturating cast
-///   (CBUG-E2) gives `i32::MAX = 2147483647`, `% 7 == 1`
+/// * aCalc — `(int)3e9` is out of int32 range: x86-64 `INT32_MIN`, `% 7 == -2`
 ///
 /// Each equals its own pristine/fixed C. This used to pin the clean no-narrow
 /// deviation (`4` everywhere).
@@ -72,7 +71,7 @@ fn a(expr: &str, a0: f64) -> f64 {
 fn modulo_above_2_31_mirrors_each_dialect_width() {
     assert_eq!(n("A%7", 3e9), 0.0); // base d2i
     assert_eq!(s("A%7", 3e9), 4.0); // sCalc (long)
-    assert_eq!(a("A%7", 3e9), 1.0); // aCalc (int), saturating (CBUG-E2)
+    assert_eq!(a("A%7", 3e9), -2.0); // aCalc (int), INT32_MIN
 }
 
 /// sCalc's C picks its evaluator from the `USES_STRING` marker
@@ -144,12 +143,11 @@ fn scalc_bitwise_is_long_wide() {
 /// aCalc's bitwise ops are a plain `(int)` cast, NOT `d2i`'s uint32
 /// reinterpretation — so an out-of-range operand does not come back as
 /// -1294967296. Where it DOES come back is CBUG-E2's call: the `(int)` cast is
-/// UB on an out-of-range double, so compiled C answers INT32_MIN on x86-64 and
-/// INT32_MAX on aarch64. The port saturates.
+/// UB on an out-of-range double; x86-64 answers INT32_MIN, as the port does.
 #[test]
 fn acalc_bitwise_is_a_plain_int_cast() {
     assert_ne!(a("A|0", 3e9), -1_294_967_296.0);
-    assert_eq!(a("A|0", 3e9), i32::MAX as f64);
+    assert_eq!(a("A|0", 3e9), i32::MIN as f64);
 }
 
 /// CBUG-A2 — NINT rounds, then narrows with EACH dialect's own cast:
@@ -168,10 +166,10 @@ fn nint_mirrors_each_dialect_width() {
     assert_eq!(a("NINT(A)", 3e9), 3e9); // aCalc (long)
 
     // Past each width's range: base d2i wraps 1e300 (a multiple of 2^32) to 0;
-    // sCalc/aCalc `(long)` saturate to i64::MAX (CBUG-E2). Not C-defined values.
+    // sCalc/aCalc `(long)` give x86-64's i64::MIN.
     assert_eq!(n("NINT(A)", 1e300), 0.0);
-    assert_eq!(s("NINT(A)", 1e300), i64::MAX as f64);
-    assert_eq!(a("NINT(A)", 1e300), i64::MAX as f64);
+    assert_eq!(s("NINT(A)", 1e300), i64::MIN as f64);
+    assert_eq!(a("NINT(A)", 1e300), i64::MIN as f64);
 
     // In range, all three agree and round half away from zero — same as C.
     for expr_val in [(2.5, 3.0), (-2.5, -3.0), (2.4, 2.0)] {

@@ -40,6 +40,7 @@
 //! a user that wants to own `server` must register at an explicit order
 //! `< -1`.
 
+use epics_base_rs::types::RecordName;
 use std::sync::Arc;
 
 use epics_base_rs::types::PvString;
@@ -167,7 +168,7 @@ pub struct ServerInfoSource {
 }
 
 /// Async closure type for [`ServerInfoSource`]'s channel enumeration.
-type ChannelLister = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
+type ChannelLister = dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send>>
     + Send
     + Sync;
 
@@ -180,7 +181,7 @@ impl ServerInfoSource {
     pub fn new<F, Fut>(channel_lister: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Vec<String>> + Send + 'static,
+        Fut: std::future::Future<Output = Vec<RecordName>> + Send + 'static,
     {
         Self {
             channel_lister: Arc::new(move || Box::pin(channel_lister())),
@@ -199,7 +200,8 @@ impl ServerInfoSource {
             fields: vec![
                 ("implLang".into(), FieldDesc::Scalar(ScalarType::String)),
                 ("version".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -263,13 +265,13 @@ impl ServerInfoSource {
     /// list of channel names. The full NT shape (value + alarm +
     /// timeStamp) comes from the shared builder; only `value` is
     /// overwritten with the channel-name array.
-    fn channels_value(names: Vec<String>) -> PvField {
+    fn channels_value(names: Vec<RecordName>) -> PvField {
         let mut value = NTScalar::array(ScalarType::String).create();
         if let PvField::Structure(s) = &mut value {
             s.set(
                 "value",
                 PvField::ScalarArrayTyped(TypedScalarArray::String(
-                    names.into_iter().map(PvString::from).collect(),
+                    names.iter().map(|n| PvString::from(&n[..])).collect(),
                 )),
             );
         }
@@ -331,13 +333,13 @@ impl ChannelSource for ServerInfoSource {
     /// not appear in its own channel list. Keeping this empty means
     /// `op=channels` reports only user PVs and beacons never advertise
     /// `server`.
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         Vec::new()
     }
 
     /// Only the literal name `server` resolves here.
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let matches = name == SERVER_PV_NAME;
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let matches = name == SERVER_PV_NAME.as_bytes();
         async move { matches }
     }
 
@@ -347,7 +349,7 @@ impl ChannelSource for ServerInfoSource {
     /// Returning `false` here keeps a broadcast SEARCH for the literal
     /// name `server` unanswered while `has_pv("server") == true` still
     /// lets the direct-connect GET / RPC path resolve it.
-    async fn searchable(&self, _name: &str) -> bool {
+    async fn searchable(&self, _name: &[u8]) -> bool {
         false
     }
 
@@ -356,23 +358,23 @@ impl ChannelSource for ServerInfoSource {
     /// introspection prototype to negotiate. Returning `None` makes a
     /// GET (or GET_FIELD) INIT against `server` fail rather than
     /// returning a Rust-only structure pvxs would never serve over GET.
-    async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
         None
     }
 
     /// `None` for every name — `server` answers RPC only, not GET
     /// (pvxs has no `onOp` for it). See [`Self::get_introspection`].
-    async fn get_value(&self, _name: &str) -> Option<PvField> {
+    async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
         None
     }
 
     /// The `server` PV is read-only — like a pvxs readonly SharedPV.
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         _value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         // The `server` PV simply does not accept writes from anyone — a
         // fixed property of the PV, not an authorization decision —
         // so this is Failed, not Denied.
@@ -383,7 +385,7 @@ impl ChannelSource for ServerInfoSource {
         }
     }
 
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         false
     }
 
@@ -392,7 +394,7 @@ impl ChannelSource for ServerInfoSource {
     /// `None` makes a MONITOR INIT against `server` fail cleanly.
     async fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> Option<crate::server_native::source::MonitorStream<PvField>> {
         None
     }
@@ -400,12 +402,12 @@ impl ChannelSource for ServerInfoSource {
     /// RPC dispatch — the heart of the `pvlist` facility.
     fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         _request_desc: FieldDesc,
         request_value: PvField,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
         let this = self.clone();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             if name != SERVER_PV_NAME {
                 return Err(OpError::failed(format!("no such PV: {name}")));
@@ -471,17 +473,21 @@ mod tests {
                     "query".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))],
+                        fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         (desc, PvField::Structure(root))
     }
 
     fn source_with(channels: Vec<String>) -> ServerInfoSource {
         ServerInfoSource::new(move || {
-            let c = channels.clone();
+            let c = channels
+                .iter()
+                .map(|n| RecordName::from(n.as_str()))
+                .collect();
             async move { c }
         })
     }
@@ -489,8 +495,8 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn has_pv_only_matches_server() {
         let src = source_with(vec![]);
-        assert!(src.has_pv("server").await);
-        assert!(!src.has_pv("anything:else").await);
+        assert!(src.has_pv(b"server").await);
+        assert!(!src.has_pv(b"anything:else").await);
     }
 
     #[epics_macros_rs::epics_test]
@@ -509,7 +515,7 @@ mod tests {
         ]);
         let (desc, value) = nturi_op("channels");
         let (resp_desc, resp_value) = src
-            .rpc("server", desc, value)
+            .rpc(b"server", desc, value)
             .await
             .expect("rpc ok")
             .into_value()
@@ -563,7 +569,7 @@ mod tests {
         let src = source_with(vec!["one".into(), "two".into()]);
         let (desc, value) = nturi_op("info");
         let (_, resp) = src
-            .rpc("server", desc, value)
+            .rpc(b"server", desc, value)
             .await
             .expect("rpc ok")
             .into_value()
@@ -612,7 +618,7 @@ mod tests {
         root.fields
             .push(("query".into(), PvField::Structure(query)));
         let (desc, resp) = src
-            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .rpc(b"server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .expect("help rpc ok")
             .into_value()
@@ -666,7 +672,7 @@ mod tests {
     async fn rpc_unknown_op_errors() {
         let src = source_with(vec![]);
         let (desc, value) = nturi_op("frobnicate");
-        let err = src.rpc("server", desc, value).await.unwrap_err();
+        let err = src.rpc(b"server", desc, value).await.unwrap_err();
         // pvxs answers every unmatched op with one bare string
         // (serversource.cpp:93); it never echoes the op back.
         assert_eq!(
@@ -685,7 +691,7 @@ mod tests {
         root.fields
             .push(("query".into(), PvField::Structure(query)));
         let err = src
-            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .rpc(b"server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .unwrap_err();
         assert_eq!(
@@ -705,7 +711,7 @@ mod tests {
             PvField::Scalar(ScalarValue::String("channels".into())),
         ));
         let (_, resp) = src
-            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .rpc(b"server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .expect("flat-struct rpc ok")
             .into_value()
@@ -741,7 +747,7 @@ mod tests {
         root.fields
             .push(("query".into(), PvField::Structure(query)));
         let (_, resp) = src
-            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .rpc(b"server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .expect("rpc ok")
             .into_value()
@@ -775,7 +781,7 @@ mod tests {
         root.fields
             .push(("query".into(), PvField::Structure(query)));
         let err = src
-            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .rpc(b"server", FieldDesc::Variant, PvField::Structure(root))
             .await
             .unwrap_err();
         assert_eq!(
@@ -791,14 +797,14 @@ mod tests {
         // the value read return `None`, which makes a GET INIT against
         // `server` fail rather than returning a Rust-only structure.
         let src = source_with(vec!["a".into()]);
-        assert!(src.get_introspection("server").await.is_none());
-        assert!(src.get_value("server").await.is_none());
+        assert!(src.get_introspection(b"server").await.is_none());
+        assert!(src.get_value(b"server").await.is_none());
     }
 
     #[epics_macros_rs::epics_test]
     async fn put_is_rejected_read_only() {
         let src = source_with(vec![]);
-        let err = src.put_value("server", PvField::Null).await.unwrap_err();
+        let err = src.put_value(b"server", PvField::Null).await.unwrap_err();
         assert!(err.message.contains("read-only"), "put rejected: {err}");
     }
 }

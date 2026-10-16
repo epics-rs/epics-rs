@@ -15,9 +15,10 @@
 //! its two consumers: C gives `PLAIN.TIME == FILT.TIME == SRC.TIME`, so the
 //! filtered link adopts the stamp exactly as the plain one does.
 
+use epics_base_rs::types::WallTime;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -42,7 +43,7 @@ async fn proc(db: &Db, rec: &str) {
         .unwrap();
 }
 
-fn stamp_of(db: &Db, rec: &str) -> (SystemTime, u64) {
+fn stamp_of(db: &Db, rec: &str) -> (WallTime, u64) {
     let inst = db.get_record(rec).expect("record exists");
     let g = inst.read();
     (g.common.time, g.common.utag)
@@ -62,10 +63,10 @@ async fn a_filtered_tsel_time_link_adopts_the_source_stamp() {
     {
         let rec = db.get_record("TSELF_SRC").expect("source exists");
         let mut inst = rec.write();
-        inst.common.time = SystemTime::UNIX_EPOCH + SRC_STAMP;
+        inst.common.time = WallTime::UNIX_EPOCH + SRC_STAMP;
         inst.common.utag = SRC_UTAG;
     }
-    let want = (SystemTime::UNIX_EPOCH + SRC_STAMP, SRC_UTAG);
+    let want = (WallTime::UNIX_EPOCH + SRC_STAMP, SRC_UTAG);
 
     for (rec, label) in [
         ("TSELF_PLAIN", "unfiltered, the control"),

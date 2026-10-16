@@ -87,7 +87,9 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
     process(&db, "A").await;
     let first = aa_rx.try_recv().expect("AA moved on the first fetch");
     assert_eq!(
-        first.snapshot.value,
+        first
+            .delivered_value(&db.get_record("A").unwrap().read(), "AA")
+            .unwrap(),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0].into())
     );
 
@@ -114,7 +116,10 @@ async fn r11_c4_a_link_that_reverts_a_caput_still_posts_aa() {
 
     let mut seen = Vec::new();
     while let Ok(e) = aa_rx.try_recv() {
-        seen.push(e.snapshot.value.clone());
+        seen.push(
+            e.delivered_value(&db.get_record("A").unwrap().read(), "AA")
+                .unwrap(),
+        );
     }
     assert_eq!(
         seen.last(),

@@ -14,7 +14,7 @@ pub struct AlarmInfo {
     /// Alarm message string (`DBR_AMSG` / dbCommon `AMSG`). The record's
     /// committed `common.amsg`, populated by the per-record snapshot
     /// builders that hold the record's `CommonFields`
-    /// (`snapshot_for_field`, `make_monitor_snapshot`); empty on the
+    /// (`snapshot_for_field`); empty on the
     /// minimal `Snapshot::new` path and for non-record channels. PVA's
     /// `build_alarm` prefers a non-empty amsg over the synthesized
     /// condition string, mirroring pvxs `iocsource.cpp:230-236`.
@@ -265,16 +265,23 @@ pub struct Snapshot {
 /// `nsec:lsb:20` mask (`0x000F_FFFF`), `nanoseconds` keeps wall-clock
 /// precision down to ~1 µs while the userTag carries a 20-bit event id.
 pub fn apply_nsec_mask(snap: &mut Snapshot, nsec_mask: u64) {
+    (snap.timestamp, snap.user_tag) = split_nsec(snap.timestamp, snap.user_tag, nsec_mask);
+}
+
+/// [`apply_nsec_mask`] on a bare `(time, utag)` pair, for a consumer holding
+/// a field log rather than a [`Snapshot`].
+pub fn split_nsec(time: WallTime, utag: i32, nsec_mask: u64) -> (WallTime, i32) {
     if nsec_mask == 0 {
-        return;
+        return (time, utag);
     }
     // pvxs holds `nsecMask` as `uint64_t` and applies it to the
     // `epicsUInt32` `nsec`, so only the low 32 bits can ever take effect.
     let mask = nsec_mask as u32;
-    let secs = snap.timestamp.unix_secs();
-    let nanos = snap.timestamp.subsec_nanos();
-    snap.user_tag = (nanos & mask) as i32;
-    snap.timestamp = WallTime::from_unix(secs, nanos & !mask);
+    let nanos = time.subsec_nanos();
+    (
+        WallTime::from_unix(time.unix_secs(), nanos & !mask),
+        (nanos & mask) as i32,
+    )
 }
 
 impl Snapshot {
@@ -401,6 +408,11 @@ pub struct PropertySupport {
     pub alarm_double: bool,
     /// `rset.get_enum_strs`
     pub enum_strs: bool,
+    /// `rset.put_enum_str`, never narrowed: C's scalar `DBF_STRING` →
+    /// `DBR_ENUM` get (`cvt_st_e`, `dbFastLinkConv.c:247-258`) calls it for
+    /// any field of the record and fails `S_db_noRSET` without it. `None` for
+    /// a bare PV, which has no rset to ask.
+    pub put_enum_str: Option<bool>,
 }
 
 impl PropertySupport {
@@ -413,6 +425,7 @@ impl PropertySupport {
         control_double: false,
         alarm_double: false,
         enum_strs: false,
+        put_enum_str: Some(false),
     };
 
     /// Every numeric slot, no enum strings — the `ai`/`ao`/`calc` shape.
@@ -423,6 +436,7 @@ impl PropertySupport {
         control_double: true,
         alarm_double: true,
         enum_strs: false,
+        put_enum_str: Some(false),
     };
 
     /// The record type's slots narrowed to ONE addressed field — C's second

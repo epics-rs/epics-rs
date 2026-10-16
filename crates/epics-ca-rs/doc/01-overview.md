@@ -152,7 +152,7 @@ The server is built around the same Tokio task model:
 ```rust
 struct ClientState {
     channels:       HashMap<sid, ChannelEntry>,     // PV bindings
-    subscriptions:  HashMap<sub_id, SubscriptionEntry>,
+    subscriptions:  HashMap<AttachId, SubscriptionEntry>,
     channel_access: HashMap<sid, AccessLevel>,
     next_sid:       AtomicU32,
     hostname:       HostIdentity,  // Claimed(client name) unless asCheckClientIP / mTLS

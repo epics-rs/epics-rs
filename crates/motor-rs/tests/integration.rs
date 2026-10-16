@@ -269,7 +269,10 @@ async fn test_poll_loop_lifecycle() {
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -334,7 +337,10 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
 
     // idle interval 0 == C idlePollPeriod_ == 0 (event-only); moving 5ms.
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -389,7 +395,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 
     // Non-zero idle interval so the timed arm fires repeatedly; moving 5ms.
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -449,10 +458,6 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 /// calls `check_completion()` directly and so cannot observe a missing forced
 /// poll. Without the `finalize_motion` request_poll the settle poll is
 /// suppressed, no `io_intr` fires, and the axis stays Idle until the deadline.
-// current_thread is required: the synchronous drain below is race-free only
-// because the poll-loop task cannot run during it (no await). On a multi_thread
-// runtime the forced poll could fire concurrently mid-drain and be drained,
-// flaking the assertion.
 #[tokio::test(flavor = "current_thread")]
 async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
@@ -498,11 +503,18 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
         match tokio::time::timeout(Duration::from_millis(100), io_intr_rx.recv()).await {
             Ok(Some(())) => {
                 setup.record.process().unwrap();
-                setup.device_support.write(&mut setup.record).unwrap();
                 if setup.record.stat.dmov && setup.record.stat.phase == MotionPhase::Idle {
                     completed = true;
+                    // Drop any moving-phase io_intr still buffered, so a
+                    // leftover cannot hand the resume a free pass. This must
+                    // precede the completion's write: that write requests the
+                    // forced poll, and the poller is its own thread, so a
+                    // drain after it can eat the very io_intr under test.
+                    while io_intr_rx.try_recv().is_ok() {}
+                    setup.device_support.write(&mut setup.record).unwrap();
                     break;
                 }
+                setup.device_support.write(&mut setup.record).unwrap();
             }
             Ok(None) => break,
             Err(_) => continue,
@@ -510,16 +522,8 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     }
     assert!(completed, "the positional move must complete close-enough");
 
-    // Drain any moving-phase io_intr still buffered (the load-bearing step that
-    // stops a leftover notification from handing the resume a free pass). This
-    // runs synchronously, before the next await, so the forced poll the
-    // completion just requested (write → StartPolling, serviced by the poll-loop
-    // task only at the next await point) is NOT yet in the channel and is not
-    // drained — see the current_thread requirement on the test. After this, the
-    // only way a fresh io_intr arrives on the now-stationary, change-gated axis
-    // is that forced poll.
-    while io_intr_rx.try_recv().is_ok() {}
-
+    // The axis is stationary and its timed polls are change-gated, so the
+    // only io_intr left to come is the completion's forced poll.
     // Phase 2: the held jog must resume. Without the finalize_motion forced
     // poll, no io_intr fires and the axis stays Idle until the deadline.
     let mut resumed = false;
@@ -593,6 +597,7 @@ async fn init_does_not_clobber_live_controller_position() {
     // zero, so NearZero does not restore — no SetPosition reaches the driver.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
         "RSTM=NearZero with a live controller far from zero must not reseed"
@@ -632,6 +637,7 @@ async fn startup_reseeds_controller_that_lost_position() {
     // The Startup process restores: controller near zero + meaningful DVAL.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
         "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
@@ -657,6 +663,7 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
@@ -695,6 +702,7 @@ async fn limit_put_forward_reaches_driver() {
     setup.record.internal.init_invariants_synced = true;
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     setup
         .record
@@ -702,6 +710,7 @@ async fn limit_put_forward_reaches_driver() {
         .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(sim.lock().unwrap().forwarded_high_limit, Some(50.0));
 }
@@ -718,6 +727,7 @@ async fn pid_gain_put_forward_reaches_driver() {
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     // SimMotor's status does not report gain support; model a
     // gain-capable controller the way C reads it — from MSTA.
@@ -728,6 +738,7 @@ async fn pid_gain_put_forward_reaches_driver() {
         .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(
         sim.lock().unwrap().pid_gains,
@@ -814,7 +825,10 @@ async fn failed_poll_posts_comms_error_status() {
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -965,6 +979,7 @@ async fn pass0_restored_val_is_not_a_move_command() {
     // First status pass = Startup -> initial_readback -> RSTM restore.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(
         setup.record.pos.val, 1.5,
@@ -985,4 +1000,245 @@ async fn pass0_restored_val_is_not_a_move_command() {
     let user = AsynUser::new(0);
     let st = motor.lock().unwrap().poll(&user).unwrap();
     assert_eq!(st.position, 1.5, "the controller was redefined, not moved");
+}
+
+/// A driver stuck in a serial/TCP read timeout blocks only the axis's
+/// `motorPoller` thread, as C runs `asynMotorPoller` and the port's queued
+/// writes on their own threads: neither its poll nor a move the record
+/// queues may hold the IOC runtime, here a single-threaded one.
+#[tokio::test]
+async fn blocked_driver_does_not_stall_the_ioc_runtime() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Answers until `dead`, then every call sits out a read timeout.
+    struct DeadLine {
+        dead: Arc<AtomicBool>,
+    }
+    impl DeadLine {
+        fn wire(&self) {
+            if self.dead.load(Ordering::SeqCst) {
+                std::thread::sleep(TIMEOUT);
+            }
+        }
+    }
+    impl AsynMotor for DeadLine {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.wire();
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, _position: f64) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+    }
+
+    let dead = Arc::new(AtomicBool::new(false));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DeadLine { dead: dead.clone() }));
+    let mut setup = make_builder(motor).build();
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    dead.store(true, Ordering::SeqCst);
+
+    // Poll path: the forced poll sits in the dead read while the runtime
+    // keeps serving its other tasks.
+    setup
+        .poll_cmd_tx
+        .send(PollCommand::StartPolling)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        start.elapsed() < TIMEOUT / 2,
+        "a blocked poll held the runtime for {:?}",
+        start.elapsed()
+    );
+
+    // Command path: the record pass that dispatches a move returns at once.
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    let start = Instant::now();
+    setup.device_support.write(&mut setup.record).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        start.elapsed() < TIMEOUT / 2,
+        "a blocked move held the record pass and runtime for {:?}",
+        start.elapsed()
+    );
+
+    dead.store(false, Ordering::SeqCst);
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
+/// The IOC starts the poller with `ctx.bridge().spawn(poll_loop.run())`, from
+/// the iocsh thread; on the exec backend that lands on a cbMedium worker with
+/// no tokio runtime. The poller must serve a move and keep its timed polls
+/// there, on either backend.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use epics_base_rs::runtime::task::BlockingBridge;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Seen {
+        polls: AtomicUsize,
+        moved: AtomicBool,
+    }
+    struct Counting(Arc<Seen>);
+    impl AsynMotor for Counting {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.0.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            self.0.moved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, _position: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+    }
+
+    let seen = Arc::new(Seen::default());
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Counting(seen.clone())));
+    let mut setup = make_builder(motor).build();
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    let bridge = BlockingBridge::capture();
+    let poll_loop = setup.poll_loop;
+    std::thread::spawn(move || {
+        drop(bridge.spawn(poll_loop.run()));
+    })
+    .join()
+    .unwrap();
+
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    setup
+        .poll_cmd_tx
+        .send(PollCommand::StartPolling)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!seen.moved.load(Ordering::SeqCst) || seen.polls.load(Ordering::SeqCst) < 5)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        seen.moved.load(Ordering::SeqCst),
+        "the move never reached the driver"
+    );
+    assert!(
+        seen.polls.load(Ordering::SeqCst) >= 5,
+        "timed polls stopped at {}",
+        seen.polls.load(Ordering::SeqCst)
+    );
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+}
+
+/// MSTA a motorSim axis reads at rest, through init + process: C reads 130
+/// (Done | Home) at the home position and 2 (Done) off it
+/// (motorSimDriver.cpp:471-477, bit order asynMotorController.cpp:85-99).
+#[tokio::test]
+async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
+    for (start, c_msta) in [(0.0, 130u32), (5.0, 2)] {
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(SimMotor::new().with_position(start)));
+        let mut setup = MotorBuilder::new(motor)
+            .poll_interval(Duration::from_millis(5))
+            .build();
+        setup.device_support.init(&mut setup.record).unwrap();
+        let poll_handle = tokio::spawn(setup.poll_loop.run());
+
+        let msta = |rec: &motor_rs::record::MotorRecord| match rec.get_field("MSTA") {
+            Some(EpicsValue::ULong(v)) => v,
+            other => panic!("MSTA read {other:?}"),
+        };
+        let record_ref = &mut setup.record;
+        let ds_ref = &mut setup.device_support;
+        wait_until(Duration::from_secs(2), || {
+            record_ref.process().unwrap();
+            ds_ref.write(record_ref).unwrap();
+            msta(record_ref) == c_msta
+        })
+        .await;
+        assert_eq!(msta(&setup.record), c_msta, "MSTA at position {start}");
+
+        let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+        let _ = poll_handle.await;
+    }
 }

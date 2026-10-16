@@ -143,9 +143,9 @@ impl Record for ReprocessRecord {
 
     /// `OEVT` set: the framework posts the named event from a spawned tail on
     /// the OUT stage of this very put.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<epics_base_rs::types::PvString> {
         match self.deferral {
-            Deferral::OutputEvent => Some(OEVT.to_string()),
+            Deferral::OutputEvent => Some(OEVT.into()),
             Deferral::After => None,
         }
     }
@@ -191,7 +191,7 @@ fn put_and_await_reentry(db: &Arc<PvDatabase>, processes: &Arc<AtomicUsize>) {
         1,
         "the put must have processed the record once"
     );
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -202,9 +202,8 @@ fn put_and_await_reentry(db: &Arc<PvDatabase>, processes: &Arc<AtomicUsize>) {
 }
 
 // ---------------------------------------------------------------------------
-// A minimal raw CA client. Deliberately NOT `tests/common/raw_ca.rs`: this file
-// needs three frames out of that module's twenty, and pulling the whole module
-// in for a subset makes every helper it does not use a `dead_code` error.
+// A minimal raw CA client, apart from the `raw-ca` crate: this file needs three
+// frames out of that crate's twenty.
 // ---------------------------------------------------------------------------
 
 const DBR_DOUBLE: u16 = 6;
@@ -360,7 +359,7 @@ fn blocking_write_notify_to_a_reprocessing_record_answers_the_client() {
     );
 
     // The delayed re-process must land, which is the half `task::spawn` owns.
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -415,7 +414,7 @@ async fn the_same_put_under_a_runtime_reprocesses() {
     db.put_record_field_from_ca(PV, "VAL", EpicsValue::Double(2.5))
         .await
         .expect("the put itself must not error");
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -424,6 +423,3 @@ async fn the_same_put_under_a_runtime_reprocesses() {
         "with a runtime entered the ReprocessAfter re-entry must fire"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

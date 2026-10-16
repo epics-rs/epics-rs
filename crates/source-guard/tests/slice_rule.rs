@@ -301,3 +301,74 @@ fn fixture() {}
     assert!(prod.contains("pub fn ship()"), "{prod}");
     assert!(!prod.contains("fixture"), "{prod}");
 }
+
+/// A column-0 `}` inside a raw string is fixture text, not the end of the
+/// `#[cfg(test)]` module around it: `ioc_builder.rs` carries a `.db` fixture
+/// whose braces sit at column 0, and the module was cut there, leaving the
+/// test code below it in the production slice.
+#[test]
+fn a_closing_brace_inside_a_raw_string_does_not_end_the_test_module() {
+    let src = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        let db = r#\"\nrecord(ai, \"X\") {\n}\n\"#;\n        banned();\n    }\n}\nfn after() {}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("fn prod()"), "{got:?}");
+    assert!(got.contains("fn after()"), "{got:?}");
+    assert!(!got.contains("banned()"), "{got:?}");
+}
+
+/// One lexer feeds both searches of the walk, so a `#[cfg(test)]` that is
+/// fixture text opens nothing: a production raw string quoting one used to
+/// blank everything up to the next column-0 `}`.
+#[test]
+fn a_cfg_test_line_inside_a_production_raw_string_opens_no_item() {
+    let src = "fn prod() {\n    let t = r#\"\n#[cfg(test)]\nmod tests {\n\"#;\n    needle();\n}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("needle()"), "{got:?}");
+}
+
+/// A column-0 `}` inside a block comment is commented-out text, not the end of
+/// the test module around it (`Comments::Keep` leaves the comment in place).
+#[test]
+fn a_closing_brace_inside_a_block_comment_does_not_end_the_test_module() {
+    let src = "#[cfg(test)]\nmod tests {\n    /*\n}\n    */\n    fn t() { banned(); }\n}\nfn after() {}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("fn after()"), "{got:?}");
+    assert!(!got.contains("banned()"), "{got:?}");
+}
+
+/// `cr#"…"#` (a C raw string) is a raw string: a lone `"` and a column-0 `}`
+/// inside it are text.
+#[test]
+fn a_c_raw_string_hides_its_closing_brace() {
+    let src = "#[cfg(test)]\nmod tests {\n    fn t() {\n        let s = cr#\"x \"\n}\n\"#;\n        banned();\n    }\n}\nfn after() {}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("fn after()"), "{got:?}");
+    assert!(!got.contains("banned()"), "{got:?}");
+}
+
+/// `'\''` is one character literal: ending a byte short left its closing quote
+/// to pair with the next `'` and left the `"` after it opening a string that
+/// swallowed the test item below.
+#[test]
+fn an_escaped_quote_char_literal_ends_at_its_closing_quote() {
+    let src = "fn prod() {\n    let q = ['\\'','\"'];\n}\n#[cfg(test)]\nmod tests {\n    fn t() { banned(); \"x\" }\n}\nfn after() {}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("fn after()"), "{got:?}");
+    assert!(!got.contains("banned()"), "{got:?}");
+}
+
+/// A `{` in a string on the head line is not an opening brace: read raw, the
+/// one-line `const` below looked like an item that opens a block, and the walk
+/// ran to the next column-0 `}`, taking `prod()` with it.
+#[test]
+fn a_brace_in_a_string_on_the_head_line_opens_no_block() {
+    let src = "#[cfg(test)]\nconst OPEN: &str = \"{\";\nfn prod() {\n    needle();\n}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("needle()"), "{got:?}");
+    assert!(!got.contains("OPEN"), "{got:?}");
+
+    // The same for a `;` that is only comment text under `Keep`.
+    let src = "#[cfg(test)]\nfn helper() { // done;\n    banned();\n}\nfn prod() {}\n";
+    let got = production(src, Comments::Keep);
+    assert!(got.contains("fn prod()"), "{got:?}");
+    assert!(!got.contains("banned()"), "{got:?}");
+}

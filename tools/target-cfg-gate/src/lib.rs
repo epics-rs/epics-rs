@@ -17,6 +17,13 @@
 //! `scripts/rtems-check.sh` builds that crate with: 58 errors under a flag no
 //! host row passes.
 //!
+//! The same holds for a binary the target runs: a bin that refuses to start
+//! on one backend (it calls `runtime::task::refuse_backend` there, as
+//! `softioc-rs` does on the exec backend) is a requirement of every target that
+//! names it through `CARGO_BIN_EXE_<bin>` or passes its name to `Command::new`. That
+//! dependency lives in a child process, so neither the compiler nor
+//! `rtems-exec-gate`'s count of reactor-dependent test sites can see it.
+//!
 //! # Why a derivation and not a list
 //!
 //! `crates/asyn-rs/tests/epics_only_tests_declare_their_feature.rs` enforced
@@ -68,7 +75,10 @@ pub const RULE: &str = "\
 Every test, bench, example and bin target must declare the cfg its own \
 imports require: a file-level `#![cfg(...)]`, or `required-features` on its \
 manifest block, that implies the requirement of every gated module and \
-optional dependency the target names. Both sides are derived from the \
+optional dependency the target names, and of every binary it runs: a bin \
+that calls `runtime::task::refuse_backend` under a cfg cannot run there, so a test spawning \
+it there fails at startup (a target declared under that very cfg is pinning \
+the refusal, and passes). Both sides are derived from the \
 sources by tools/target-cfg-gate, so an unconditional import of a gated \
 module is a red test on the commit that writes it, instead of a \
 `--no-default-features` build somebody runs six months later. Run \
@@ -424,105 +434,233 @@ fn feature_closed(env: &BTreeMap<String, bool>, feats: &BTreeMap<String, Vec<Str
 /// the same one. Their braces never reach the depth counter -- `line_cfgs`
 /// skips attribute lines before counting -- so keeping them costs nothing.
 pub fn scrub(src: &str) -> String {
-    let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
-    let mut i = 0usize;
     let mut attr_depth = 0i32;
-    while i < b.len() {
-        if attr_depth == 0 && (src[i..].starts_with("#[") || src[i..].starts_with("#![")) {
-            out.push('#');
-            i += 1;
-            continue;
-        }
-        if attr_depth > 0
-            || (i > 0 && b[i] == b'[' && b[i - 1] == b'#')
-            || (i > 1 && b[i] == b'[' && b[i - 1] == b'!' && b[i - 2] == b'#')
-        {
-            match b[i] {
-                b'[' => attr_depth += 1,
-                b']' => attr_depth -= 1,
-                b'"' => {
-                    // Step over the literal without blanking it.
-                    let mut j = i + 1;
-                    while j < b.len() {
-                        match b[j] {
-                            b'\\' => j += 2,
-                            b'"' => break,
-                            _ => j += 1,
-                        }
-                    }
-                    let end = (j + 1).min(b.len());
-                    out.push_str(&src[i..end]);
-                    i = end;
-                    continue;
-                }
-                _ => {}
-            }
-            let ch = src[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-            continue;
-        }
-        // Raw strings: r"..", r#".."#, and any number of hashes.
-        if b[i] == b'r' {
-            let mut j = i + 1;
-            let mut hashes = 0usize;
-            while j < b.len() && b[j] == b'#' {
-                hashes += 1;
-                j += 1;
-            }
-            if j < b.len() && b[j] == b'"' {
-                let close = format!("\"{}", "#".repeat(hashes));
-                let end = src[j + 1..]
-                    .find(&close)
-                    .map(|k| j + 1 + k + close.len())
-                    .unwrap_or(b.len());
-                blank(&mut out, &src[i..end]);
-                i = end;
-                continue;
-            }
-        }
-        match b[i] {
-            b'"' => {
-                let mut j = i + 1;
-                while j < b.len() {
-                    match b[j] {
-                        b'\\' => j += 2,
-                        b'"' => break,
-                        _ => j += 1,
+    for lexeme in lex(src) {
+        let text = &src[lexeme.span.clone()];
+        match lexeme.kind {
+            // A literal inside an attribute is its payload; see above.
+            Lexeme::Str if attr_depth > 0 => out.push_str(text),
+            Lexeme::Str | Lexeme::Char | Lexeme::Comment => blank(&mut out, text),
+            Lexeme::Code => {
+                let b = text.as_bytes();
+                for (k, &c) in b.iter().enumerate() {
+                    let opens = c == b'['
+                        && (attr_depth > 0
+                            || src[..lexeme.span.start + k].ends_with('#')
+                            || src[..lexeme.span.start + k].ends_with("#!"));
+                    if opens {
+                        attr_depth += 1;
+                    } else if c == b']' && attr_depth > 0 {
+                        attr_depth -= 1;
                     }
                 }
-                let end = (j + 1).min(b.len());
-                blank(&mut out, &src[i..end]);
-                i = end;
-            }
-            b'/' if src[i..].starts_with("//") => {
-                let end = src[i..].find('\n').map(|k| i + k).unwrap_or(b.len());
-                blank(&mut out, &src[i..end]);
-                i = end;
-            }
-            b'/' if src[i..].starts_with("/*") => {
-                let end = src[i + 2..]
-                    .find("*/")
-                    .map(|k| i + 2 + k + 2)
-                    .unwrap_or(b.len());
-                blank(&mut out, &src[i..end]);
-                i = end;
-            }
-            _ => {
-                let ch = src[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
+                out.push_str(text);
             }
         }
     }
     out
 }
 
+/// What [`lex`] cuts source text into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lexeme {
+    Code,
+    Comment,
+    /// A string literal, raw or not, with any `b`/`c` prefix outside it.
+    Str,
+    /// A char or byte literal: `'"'`, `b'"'`, `'\''`, `'\u{7f}'`.
+    Char,
+}
+
+struct Lexed {
+    kind: Lexeme,
+    /// The whole lexeme, quotes and hash fences included.
+    span: std::ops::Range<usize>,
+    /// For a [`Lexeme::Str`], its contents between the quotes.
+    body: std::ops::Range<usize>,
+}
+
+/// The one reading of Rust's comment, string and char syntax that [`scrub`]
+/// and [`literals`] share, so they cannot disagree about where a literal ends.
+fn lex(src: &str) -> Vec<Lexed> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut code = 0usize;
+    let mut i = 0usize;
+    let push =
+        |out: &mut Vec<Lexed>, code: &mut usize, kind, span: std::ops::Range<usize>, body| {
+            if *code < span.start {
+                out.push(Lexed {
+                    kind: Lexeme::Code,
+                    span: *code..span.start,
+                    body: 0..0,
+                });
+            }
+            *code = span.end;
+            out.push(Lexed { kind, span, body });
+        };
+    while i < b.len() {
+        // A quote after an identifier closes nothing it opened: `x'` is not
+        // Rust, but the `b` of `b'"'` is a prefix, not an identifier.
+        let after_ident =
+            i > 0 && is_ident(b[i - 1]) && !(b[i - 1] == b'b' && (i < 2 || !is_ident(b[i - 2])));
+        if src[i..].starts_with("//") {
+            let end = src[i..].find('\n').map_or(b.len(), |k| i + k);
+            push(&mut out, &mut code, Lexeme::Comment, i..end, 0..0);
+            i = end;
+        } else if src[i..].starts_with("/*") {
+            let end = src[i + 2..].find("*/").map_or(b.len(), |k| i + 2 + k + 2);
+            push(&mut out, &mut code, Lexeme::Comment, i..end, 0..0);
+            i = end;
+        } else if b[i] == b'r' && raw_prefix_ok(b, i) {
+            // r"..", r#".."#, br#".."#, cr#".."#: no escapes, a fence of hashes.
+            let mut j = i + 1;
+            while j < b.len() && b[j] == b'#' {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'"' {
+                let close = format!("\"{}", "#".repeat(j - i - 1));
+                let body_end = src[j + 1..].find(&close).map_or(b.len(), |k| j + 1 + k);
+                let end = (body_end + close.len()).min(b.len());
+                push(&mut out, &mut code, Lexeme::Str, i..end, j + 1..body_end);
+                i = end;
+            } else {
+                i = j.max(i + 1);
+            }
+        } else if b[i] == b'"' {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            let body_end = j.min(b.len());
+            let end = (j + 1).min(b.len());
+            push(&mut out, &mut code, Lexeme::Str, i..end, i + 1..body_end);
+            i = end;
+        } else if b[i] == b'\'' && !after_ident {
+            // A char literal is one char or one escape between quotes; anything
+            // else after a quote is a lifetime or a label.
+            let close = if b.get(i + 1) == Some(&b'\\') {
+                src[i + 2..]
+                    .find('\'')
+                    .map(|k| i + 2 + k)
+                    .filter(|&c| c > i + 2)
+            } else {
+                src[i + 1..]
+                    .chars()
+                    .next()
+                    .map(|c| i + 1 + c.len_utf8())
+                    .filter(|&c| b.get(c) == Some(&b'\''))
+            };
+            match close {
+                Some(c) => {
+                    push(&mut out, &mut code, Lexeme::Char, i..c + 1, 0..0);
+                    i = c + 1;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += src[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    if code < b.len() {
+        out.push(Lexed {
+            kind: Lexeme::Code,
+            span: code..b.len(),
+            body: 0..0,
+        });
+    }
+    out
+}
+
+/// Whether the `r` at `i` can open a raw string: it starts a token, or follows
+/// a `b`/`c` prefix that does.
+fn raw_prefix_ok(b: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|k| b[k]) {
+        None => true,
+        Some(b'b' | b'c') => i < 2 || !is_ident(b[i - 2]),
+        Some(c) => !is_ident(c),
+    }
+}
+
+/// Every string literal outside comments, with the offset of its opening
+/// quote (or its `r`): what `CARGO_BIN_EXE_<bin>` and a spawn by name are
+/// written in, and what [`scrub`] blanks.
+pub fn literals(src: &str) -> Vec<(usize, String)> {
+    lex(src)
+        .into_iter()
+        .filter(|l| l.kind == Lexeme::Str)
+        .map(|l| (l.span.start, src[l.body].to_string()))
+        .collect()
+}
+
+/// Every binary `src` runs, with the offset it is named at: the bin of a
+/// `CARGO_BIN_EXE_<bin>` literal, and the file name of a literal passed to
+/// `Command::new`. Any other string that happens to equal a bin's name is
+/// not a spawn.
+pub fn binaries_run(src: &str) -> Vec<(String, usize)> {
+    literals(src)
+        .into_iter()
+        .filter_map(|(off, lit)| {
+            let named = match lit.strip_prefix("CARGO_BIN_EXE_") {
+                Some(bin) => bin,
+                None if src[..off].trim_end().ends_with("Command::new(") => {
+                    lit.rsplit('/').next().unwrap_or(&lit)
+                }
+                None => return None,
+            };
+            Some((named.to_string(), off))
+        })
+        .collect()
+}
+
+/// The cfg under which a bin refuses to start: the cfg in force at its call
+/// of `runtime::task::refuse_backend`, the one owner of that refusal (any of
+/// them, if it has several).
+pub fn refused_under(src: &str) -> Option<Pred> {
+    const CALL: &str = "refuse_backend(";
+    let text = scrub(src);
+    let cfgs = line_cfgs(&text, &Pred::True);
+    let starts = line_index(&text);
+    let arms: Vec<Pred> = text
+        .match_indices(CALL)
+        .filter(|&(at, _)| {
+            let before = text[..at].trim_end();
+            !before.ends_with("fn") && !text[..at].ends_with(|c: char| is_ident(c as u8))
+        })
+        .map(|(at, _)| {
+            let line = starts.partition_point(|&s| s <= at) - 1;
+            cfgs.get(line).cloned().unwrap_or(Pred::True)
+        })
+        .filter(|arm| *arm != Pred::True)
+        .collect();
+    match arms.len() {
+        0 => None,
+        1 => arms.into_iter().next(),
+        _ => Some(Pred::Any(arms)),
+    }
+}
+
+/// What a bin refusing under `arm` needs of a target that runs it.
+fn runnable_under(arm: Pred) -> Pred {
+    match arm {
+        // `build.rs` defines one as the other's negation; say it the way the
+        // targets are gated.
+        Pred::Atom(a) if a == "exec_backend" => Pred::Atom("tokio_backend".into()),
+        arm => Pred::Not(Box::new(arm)),
+    }
+}
+
 /// Replace a span by spaces, keeping its newlines so line numbers survive.
 fn blank(out: &mut String, span: &str) {
     for c in span.chars() {
-        out.push(if c == '\n' { '\n' } else { ' ' });
+        if c == '\n' {
+            out.push('\n');
+        } else {
+            // One space per byte, so offsets into the scrubbed text are
+            // offsets into the source.
+            out.extend(std::iter::repeat_n(' ', c.len_utf8()));
+        }
     }
 }
 
@@ -1227,7 +1365,7 @@ pub struct Pair {
     /// Relative to the crate directory -- a `#[path]` submodule reports
     /// itself, not the target root, because that is the file to edit.
     pub file: String,
-    /// `module` or `optional dep`.
+    /// `module`, `optional dep` or `binary`.
     pub shape: &'static str,
     pub named: String,
     pub needs: String,
@@ -1338,15 +1476,22 @@ fn target_files(root_file: &Path, base: &Pred) -> Vec<(PathBuf, Pred)> {
 pub fn audit(root: &Path) -> Report {
     let mut pairs: Vec<Pair> = Vec::new();
     let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
-    let crates = workspace_crates(root);
+    let crates: Vec<CrateInfo> = workspace_crates(root)
+        .iter()
+        .filter_map(|dir| read_crate(dir))
+        .collect();
     let scanned = crates.len();
-    for dir in crates {
-        let Some(info) = read_crate(&dir) else {
-            continue;
-        };
-        if info.gated.is_empty() && info.optional_deps.is_empty() {
-            continue;
-        }
+    // Bin name -> the cfg it refuses to start under.
+    let bins: BTreeMap<String, Pred> = crates
+        .iter()
+        .flat_map(|info| info.targets.iter().map(move |t| (info, t)))
+        .filter(|(_, t)| t.kind == "bin")
+        .filter_map(|(info, t)| {
+            let arm = refused_under(&read(&info.dir.join(&t.rel_path)))?;
+            Some((t.name.clone(), arm))
+        })
+        .collect();
+    for info in crates {
         let snake = info.name.replace('-', "_");
         for target in &info.targets {
             let root_file = info.dir.join(&target.rel_path);
@@ -1375,35 +1520,50 @@ pub fn audit(root: &Path) -> Report {
                     let line = starts.partition_point(|s| *s <= off).saturating_sub(1);
                     lines.get(line).cloned().unwrap_or_else(|| pred.clone())
                 };
-                let mut push = |shape, named: String, need: &Pred, have: &Pred| {
-                    let (needs, has) = (project(need, axis), project(have, axis));
-                    if needs == Pred::True {
-                        return;
-                    }
-                    let key = (info.name.clone(), rel.clone(), named.clone(), has.render());
-                    if !seen.insert(key) {
-                        return;
-                    }
-                    pairs.push(Pair {
-                        crate_name: info.name.clone(),
-                        target: format!("{} {}", target.kind, target.name),
-                        file: rel.clone(),
-                        shape,
-                        named,
-                        satisfied: implies(&has, &needs, &info.features, info.derives_backend),
-                        needs: needs.render(),
-                        has: has.render(),
-                    });
-                };
+                // `refusal`, for a binary: the arm it refuses to start under. A
+                // target declared under it runs that arm on purpose, to pin
+                // the refusal; only one that builds on both arms is a breach.
+                let mut push =
+                    |shape, named: String, need: &Pred, have: &Pred, refusal: Option<&Pred>| {
+                        let (needs, has) = (project(need, axis), project(have, axis));
+                        if needs == Pred::True {
+                            return;
+                        }
+                        let refusal = refusal.map(|r| project(r, axis));
+                        let pins_refusal = refusal.as_ref().is_some_and(|r| {
+                            implies(&has, r, &info.features, info.derives_backend)
+                        });
+                        let key = (info.name.clone(), rel.clone(), named.clone(), has.render());
+                        if !seen.insert(key) {
+                            return;
+                        }
+                        pairs.push(Pair {
+                            crate_name: info.name.clone(),
+                            target: format!("{} {}", target.kind, target.name),
+                            file: rel.clone(),
+                            shape,
+                            named,
+                            satisfied: pins_refusal
+                                || implies(&has, &needs, &info.features, info.derives_backend),
+                            needs: needs.render(),
+                            has: has.render(),
+                        });
+                    };
                 for (off, path) in refs_below(&text, &snake) {
                     let mut segs: Vec<&str> = path.split("::").collect();
                     while !segs.is_empty() {
                         let candidate = segs.join("::");
                         if let Some(need) = info.gated.get(&candidate) {
-                            push("module", candidate, need, &at(off));
+                            push("module", candidate, need, &at(off), None);
                             break;
                         }
                         segs.pop();
+                    }
+                }
+                for (named, off) in binaries_run(&read(&file)) {
+                    if let Some(arm) = bins.get(&named) {
+                        let need = runnable_under(arm.clone());
+                        push("binary", named.to_string(), &need, &at(off), Some(arm));
                     }
                 }
                 for (dep, target_cfg) in &info.optional_deps {
@@ -1421,7 +1581,7 @@ pub fn audit(root: &Path) -> Report {
                             .collect(),
                     ));
                     for (off, _) in refs_below(&text, &dep.replace('-', "_")) {
-                        push("optional dep", dep.clone(), &need, &at(off));
+                        push("optional dep", dep.clone(), &need, &at(off), None);
                     }
                 }
             }
@@ -1698,5 +1858,123 @@ mod tests {
                 vec!["qsrv-core".to_string(), "pvalink".to_string()]
             )]
         );
+    }
+
+    /// A bin's two `main` arms, spelled so the backend scan of `rtems-exec-gate`
+    /// does not read this file as gating on the backend.
+    fn backend_arms(src: &str) -> String {
+        src.replace("TOKIO", "tokio_backend")
+            .replace("EXEC", "exec_backend")
+    }
+
+    #[test]
+    fn a_refuse_backend_call_is_a_requirement() {
+        let src = "#[cfg(TOKIO)]\n#[tokio::main]\nasync fn main() { run().await }\n\
+                   #[cfg(EXEC)]\nfn main() -> std::process::ExitCode {\n    \
+                   epics_base_rs::runtime::task::refuse_backend(\"x: needs a reactor\")\n}\n";
+        let arm = refused_under(&backend_arms(src)).expect("the exec arm refuses");
+        assert_eq!(arm, p("exec_backend"));
+        assert_eq!(runnable_under(arm), p("tokio_backend"));
+    }
+
+    #[test]
+    fn a_refusal_reached_after_main_takes_its_function_cfg() {
+        let src = "fn main() { parse(); refuse(); }\n\
+                   #[cfg(EXEC)]\nfn refuse() -> ! {\n    eprintln!(\"dry run\");\n    \
+                   refuse_backend(\"y: no reactor\")\n}\n";
+        assert_eq!(refused_under(&backend_arms(src)), Some(p("exec_backend")));
+    }
+
+    #[test]
+    fn a_main_that_runs_on_both_backends_requires_nothing() {
+        let src = "#[cfg(TOKIO)]\nasync fn main() -> CaResult<()> { a().await }\n\
+                   #[cfg(EXEC)]\nfn main() -> CaResult<()> {\n    \
+                   eprintln!(\"booting on threads\");\n    b()\n}\n\
+                   // refuse_backend(\"in a comment\")\n\
+                   pub fn refuse_backend(message: &str) -> ! { loop {} }\n";
+        assert_eq!(refused_under(&backend_arms(src)), None);
+    }
+
+    #[test]
+    fn a_bin_is_run_by_its_exe_variable_or_by_command_new() {
+        let got = binaries_run(
+            "Command::new(env!(\"CARGO_BIN_EXE_a\"));\nCommand::new(\"target/debug/b\");\n\
+             assert!(out.contains(\"c\"));\nlet d = \"d\";",
+        );
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    fn names(src: &str) -> Vec<String> {
+        literals(src).into_iter().map(|(_, l)| l).collect()
+    }
+
+    #[test]
+    fn a_quote_char_literal_does_not_open_a_string() {
+        assert_eq!(
+            names("s.trim_matches('\"'); let x = env!(\"CARGO_BIN_EXE_a\");"),
+            ["CARGO_BIN_EXE_a"]
+        );
+    }
+
+    #[test]
+    fn a_quote_byte_literal_does_not_open_a_string() {
+        assert_eq!(
+            names("if c == b'\"' { run(\"CARGO_BIN_EXE_a\") }"),
+            ["CARGO_BIN_EXE_a"]
+        );
+    }
+
+    #[test]
+    fn an_escaped_quote_char_literal_and_a_lifetime_are_not_strings() {
+        assert_eq!(
+            names("fn f<'a>(x: &'a str) { '\\''; 'l: loop {} g(\"CARGO_BIN_EXE_a\") }"),
+            ["CARGO_BIN_EXE_a"]
+        );
+    }
+
+    #[test]
+    fn a_hash_fenced_raw_string_ends_at_its_fence() {
+        assert_eq!(
+            names("r#\"say \"hi\"\"#; Command::new(\"a\");"),
+            ["say \"hi\"", "a"]
+        );
+    }
+
+    #[test]
+    fn a_hash_fenced_raw_byte_string_ends_at_its_fence() {
+        assert_eq!(
+            names("br#\"\"quoted\"\"#; Command::new(\"a\");"),
+            ["\"quoted\"", "a"]
+        );
+    }
+
+    #[test]
+    fn scrub_keeps_code_after_a_quote_char_literal() {
+        let src = "let q = '\"';\n#[cfg(EXEC)]\nfn main() { refuse_backend(\"m\") }\n";
+        let text = scrub(&backend_arms(src));
+        assert_eq!(text.len(), backend_arms(src).len());
+        assert!(text.contains("fn main() { refuse_backend(   ) }"), "{text}");
+        assert_eq!(refused_under(&backend_arms(src)), Some(p("exec_backend")));
+    }
+
+    #[test]
+    fn scrub_keeps_byte_offsets_across_multibyte_text() {
+        let src = "// — é\nlet s = \"→\"; x";
+        let text = scrub(src);
+        assert_eq!(text.len(), src.len());
+        assert_eq!(&text[src.len() - 1..], "x");
+    }
+
+    #[test]
+    fn a_bin_named_in_a_comment_is_not_run() {
+        let got: Vec<String> = literals(
+            "// env!(\"CARGO_BIN_EXE_a\")\n/* \"b\" */ let x = env!(\"CARGO_BIN_EXE_c\"); \
+             let y = r#\"d\"#;",
+        )
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect();
+        assert_eq!(got, ["CARGO_BIN_EXE_c", "d"]);
     }
 }

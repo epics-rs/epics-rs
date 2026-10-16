@@ -694,9 +694,24 @@ pub fn build_put_frame(
     hdr.set_payload_size(body.len(), count, peer_minor)
         .map_err(|_| CaError::BadCount)?;
 
-    let mut frame = hdr.to_bytes_extended();
-    frame.extend_from_slice(&body);
-    Ok(frame)
+    Ok([&hdr.to_bytes_extended()[..], &body[..]].concat())
+}
+
+/// An encoded CA header, 16 or 24 bytes, held by value: framing copies it
+/// into the frame's own buffer, and a heap copy of 24 bytes per message is
+/// an allocation C's `cas_copy_in_header` never makes.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderBytes {
+    buf: [u8; 24],
+    len: u8,
+}
+
+impl std::ops::Deref for HeaderBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[..usize::from(self.len)]
+    }
 }
 
 /// 16-byte CA message header (big-endian), with optional extended fields.
@@ -815,16 +830,21 @@ impl CaHeader {
     }
 
     /// Serialize header, including extended fields if present.
-    pub fn to_bytes_extended(&self) -> Vec<u8> {
-        let mut buf = self.to_bytes().to_vec();
+    pub fn to_bytes_extended(&self) -> HeaderBytes {
+        let mut out = HeaderBytes {
+            buf: [0u8; 24],
+            len: 16,
+        };
+        out.buf[..16].copy_from_slice(&self.to_bytes());
         if self.is_extended() {
             // SAFETY: is_extended() guarantees extended_postsize.is_some()
-            buf.extend_from_slice(&self.extended_postsize.unwrap().to_be_bytes());
+            out.buf[16..20].copy_from_slice(&self.extended_postsize.unwrap().to_be_bytes());
             // SAFETY: extended_count is always set alongside extended_postsize
             // in both set_payload_size() and from_bytes_extended()
-            buf.extend_from_slice(&self.extended_count.unwrap_or(0).to_be_bytes());
+            out.buf[20..24].copy_from_slice(&self.extended_count.unwrap_or(0).to_be_bytes());
+            out.len = 24;
         }
-        buf
+        out
     }
 
     pub fn from_bytes(buf: &[u8]) -> CaResult<Self> {
@@ -914,7 +934,12 @@ pub fn align8(size: usize) -> usize {
 
 /// Build a padded, null-terminated, 8-byte aligned payload from a string
 pub fn pad_string(s: &str) -> Vec<u8> {
-    let mut bytes = s.as_bytes().to_vec();
+    pad_bytes(s.as_bytes())
+}
+
+/// [`pad_string`] for a payload that is bytes, not text.
+pub fn pad_bytes(s: &[u8]) -> Vec<u8> {
+    let mut bytes = s.to_vec();
     bytes.push(0); // null terminator
     let padded_len = align8(bytes.len());
     bytes.resize(padded_len, 0);

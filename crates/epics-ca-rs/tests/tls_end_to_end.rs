@@ -86,12 +86,12 @@ async fn rust_client_tls_to_rust_server() {
     .expect("client");
 
     let ch = client.create_channel("TLS:VAL");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect over TLS");
 
     let (_, value) = ch
-        .get_with_timeout(budget::FACT_BUDGET)
+        .get_with_timeout(fact_budget::FACT_BUDGET)
         .await
         .expect("read over TLS");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 7777);
@@ -99,6 +99,3 @@ async fn rust_client_tls_to_rust_server() {
     // Don't tear down via drop ordering: just abort the server task.
     server_task.abort();
 }
-
-#[path = "common/budget.rs"]
-mod budget;

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pvdata::{FieldDesc, PvField, RpcReply};
+use epics_base_rs::types::RecordName;
 
 use super::source::{
     AccessChecked, ChannelInvalidator, ChannelSource, DynSource, MonitorStream, OpError,
@@ -209,7 +210,7 @@ impl CompositeSource {
     /// with plain `has_pv`.
     async fn resolve_checked(
         sources: Vec<DynSource>,
-        name: &str,
+        name: &RecordName,
         ctx: &crate::server_native::source::ChannelContext,
     ) -> Option<(DynSource, AccessChecked)> {
         for src in sources {
@@ -217,7 +218,7 @@ impl CompositeSource {
                 let inner = src
                     .access_gate()
                     .check(
-                        name,
+                        name.clone(),
                         &ctx.creds.host,
                         &ctx.creds.account,
                         &ctx.creds.method,
@@ -265,12 +266,12 @@ impl ChannelSource for CompositeSource {
     /// owner of the allow/deny transition.
     fn revalidate_read(
         &self,
-        pv_name: &str,
+        pv_name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<
         Output = Option<epics_base_rs::server::access_security::AccessChecked>,
     > + Send {
-        let name = pv_name.to_string();
+        let name = RecordName::from(pv_name);
         let snapshot = self.snapshot();
         async move {
             for src in snapshot {
@@ -302,10 +303,10 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let sources = self.snapshot();
         async move {
-            let mut all: Vec<String> = Vec::new();
+            let mut all: Vec<RecordName> = Vec::new();
             for src in sources {
                 all.extend(src.list_pvs().await);
             }
@@ -315,9 +316,9 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let sources = self.snapshot();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             for src in sources {
                 if src.has_pv(&name).await {
@@ -356,9 +357,9 @@ impl ChannelSource for CompositeSource {
     /// ANDing `has_pv` in here made that shape unrepresentable and forced the
     /// two questions to share one answer. Sources that do not distinguish them
     /// are unaffected: [`ChannelSource::searchable`]'s default IS `has_pv`.
-    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let sources = self.snapshot();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             for src in sources {
                 if src.searchable(&name).await {
@@ -381,11 +382,11 @@ impl ChannelSource for CompositeSource {
     /// why `has_pv` is not ANDed in).
     fn searchable_from(
         &self,
-        name: &str,
+        name: &[u8],
         requester: std::net::SocketAddr,
     ) -> impl std::future::Future<Output = bool> + Send {
         let sources = self.snapshot();
-        let name = name.to_string();
+        let name = RecordName::from(name);
         async move {
             for src in sources {
                 if src.searchable_from(&name, requester).await {
@@ -398,9 +399,9 @@ impl ChannelSource for CompositeSource {
 
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -419,10 +420,10 @@ impl ChannelSource for CompositeSource {
     /// fix exists to avoid.
     fn has_pv_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = bool> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -440,10 +441,10 @@ impl ChannelSource for CompositeSource {
     /// opens upstream state under the shared gateway identity.
     fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -461,10 +462,10 @@ impl ChannelSource for CompositeSource {
     /// instead of collapsing "not open yet" into "no such PV".
     fn await_introspection(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -490,10 +491,10 @@ impl ChannelSource for CompositeSource {
     /// (`src/server.cpp:100-112`).
     fn resolve_owner(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<DynSource>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -508,8 +509,8 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let name = name.to_string();
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -523,10 +524,10 @@ impl ChannelSource for CompositeSource {
 
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -538,8 +539,8 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let name = name.to_string();
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -553,9 +554,9 @@ impl ChannelSource for CompositeSource {
 
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -569,11 +570,11 @@ impl ChannelSource for CompositeSource {
 
     fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -599,7 +600,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -619,7 +620,7 @@ impl ChannelSource for CompositeSource {
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<crate::server_native::source::SourceRead>> + Send
     {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -633,7 +634,7 @@ impl ChannelSource for CompositeSource {
         value: PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -661,7 +662,7 @@ impl ChannelSource for CompositeSource {
         delta: &PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -690,7 +691,7 @@ impl ChannelSource for CompositeSource {
     ) -> impl std::future::Future<
         Output = Result<Option<crate::server_native::source::SourceRead>, OpError>,
     > + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -708,7 +709,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -721,7 +722,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -740,7 +741,7 @@ impl ChannelSource for CompositeSource {
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -760,7 +761,7 @@ impl ChannelSource for CompositeSource {
     ) -> impl std::future::Future<
         Output = Option<MonitorStream<crate::server_native::source::MonitorUpdate>>,
     > + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -776,7 +777,7 @@ impl ChannelSource for CompositeSource {
         ctx: crate::server_native::source::ChannelContext,
         opts: crate::server_native::source::MonitorOptions,
     ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -804,7 +805,7 @@ impl ChannelSource for CompositeSource {
             >,
         >,
     > + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -825,7 +826,7 @@ impl ChannelSource for CompositeSource {
             >,
         >,
     > + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             let (src, inner_checked) = Self::resolve_checked(this, &name, &ctx).await?;
@@ -840,7 +841,7 @@ impl ChannelSource for CompositeSource {
         request_value: PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -855,9 +856,9 @@ impl ChannelSource for CompositeSource {
 
     fn subscribe_raw(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -869,8 +870,11 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = name.to_string();
+    fn process(
+        &self,
+        name: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -887,7 +891,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -907,10 +911,10 @@ impl ChannelSource for CompositeSource {
     // `resolve_checked`, exactly as `put_get_checked` / `process_checked` do.
     fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<FieldDesc, OpError>> + Send {
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let this = self.snapshot();
         async move {
             for src in this {
@@ -930,7 +934,7 @@ impl ChannelSource for CompositeSource {
         stride: u32,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<PvField, OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -951,7 +955,7 @@ impl ChannelSource for CompositeSource {
         value: PvField,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -970,7 +974,7 @@ impl ChannelSource for CompositeSource {
         length: u32,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -988,7 +992,7 @@ impl ChannelSource for CompositeSource {
         checked: AccessChecked,
         ctx: crate::server_native::source::ChannelContext,
     ) -> impl std::future::Future<Output = Result<u32, OpError>> + Send {
-        let name = checked.pv_name().to_string();
+        let name = checked.pv_name().clone();
         let this = self.snapshot();
         async move {
             match Self::resolve_checked(this, &name, &ctx).await {
@@ -1002,7 +1006,7 @@ impl ChannelSource for CompositeSource {
 
     fn monitor_watermarks(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<(usize, usize)>> + Send {
         // surface the watermark levels of the inner source
         // that serves `name`, so the server monitor loop drives the
@@ -1021,7 +1025,7 @@ impl ChannelSource for CompositeSource {
         // the monitor actually rides. The `notify_watermark` fan-out
         // below is unchanged: it lets each source decide per name, and a
         // non-owning source no-ops.
-        let name = name.to_string();
+        let name = RecordName::from(name);
         let sources = self.snapshot();
         async move {
             for src in sources {
@@ -1035,7 +1039,7 @@ impl ChannelSource for CompositeSource {
 
     fn notify_watermark(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: &crate::server_native::source::ChannelContext,
         ev: crate::server_native::source::WatermarkEvent,
     ) {
@@ -1050,7 +1054,7 @@ impl ChannelSource for CompositeSource {
 
     fn notify_monitor_start(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: &crate::server_native::source::ChannelContext,
         start: bool,
     ) {
@@ -1095,27 +1099,27 @@ mod tests {
     }
 
     impl ChannelSource for PvSrc {
-        fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-            let n = self.name.to_string();
+        fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
+            let n = RecordName::from(self.name);
             async move { vec![n] }
         }
-        fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+        fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
             let want = self.name;
-            let got = name.to_string();
+            let got = RecordName::from(name);
             async move { got == want }
         }
         fn get_introspection(
             &self,
-            _: &str,
+            _: &[u8],
         ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
             async {
                 Some(FieldDesc::Structure {
                     struct_id: "epics:nt/NTScalar:1.0".into(),
-                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                    fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
                 })
             }
         }
-        fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
             let v = self.value;
             async move {
                 let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -1126,17 +1130,17 @@ mod tests {
         }
         fn put_value(
             &self,
-            _: &str,
+            _: &[u8],
             _: PvField,
         ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
             async { Ok(()) }
         }
-        fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+        fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
             async { true }
         }
         fn subscribe(
             &self,
-            _: &str,
+            _: &[u8],
         ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
             async { None }
         }
@@ -1157,44 +1161,44 @@ mod tests {
             tag: &'static str,
         }
         impl ChannelSource for EdgeSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { true }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Ok(()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
             fn notify_monitor_start(
                 &self,
-                _name: &str,
+                _name: &[u8],
                 _ctx: &crate::server_native::source::ChannelContext,
                 _start: bool,
             ) {
@@ -1223,7 +1227,7 @@ mod tests {
         let ctx = crate::server_native::source::ChannelContext {
             peer: "127.0.0.1:5075".parse().expect("peer"),
             creds: Arc::new(crate::server_native::config::ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),
@@ -1232,7 +1236,7 @@ mod tests {
             pv_request: None,
             log: Default::default(),
         };
-        <CompositeSource as ChannelSource>::notify_monitor_start(&composite, "dut", &ctx, true);
+        <CompositeSource as ChannelSource>::notify_monitor_start(&composite, b"dut", &ctx, true);
 
         let seen = seen.lock().clone();
         assert!(
@@ -1263,37 +1267,37 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -1356,44 +1360,44 @@ mod tests {
             blanket: bool,
         }
         impl ChannelSource for WmSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let owned = name == self.serves;
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let owned = name == self.serves.as_bytes();
                 async move { owned }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
             }
-            async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
-                if self.blanket || name == self.serves {
+            async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
+                if self.blanket || name == self.serves.as_bytes() {
                     self.levels
                 } else {
                     None
@@ -1432,14 +1436,14 @@ mod tests {
         // name but does NOT own "LOCAL:PV", so it must not shadow the
         // owner's (3,9). The old find_map(first-Some) returned (0,0).
         assert_eq!(
-            comp.monitor_watermarks("LOCAL:PV").await,
+            comp.monitor_watermarks(b"LOCAL:PV").await,
             Some((3, 9)),
             "a catch-all source ordered before the owner must not shadow the owner's levels"
         );
         // A name the gateway-like source owns still gets its (0,0).
-        assert_eq!(comp.monitor_watermarks("GW:PV").await, Some((0, 0)));
+        assert_eq!(comp.monitor_watermarks(b"GW:PV").await, Some((0, 0)));
         // No source owns this name — no levels.
-        assert_eq!(comp.monitor_watermarks("UNKNOWN:PV").await, None);
+        assert_eq!(comp.monitor_watermarks(b"UNKNOWN:PV").await, None);
     }
 
     /// Pre-fix the composite used
@@ -1461,37 +1465,37 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -1680,7 +1684,7 @@ mod tests {
         comp.add_source("hi", hi, 0).unwrap();
 
         // Lower order wins → value=2.
-        let v = comp.get_value("shared").await.unwrap();
+        let v = comp.get_value(b"shared").await.unwrap();
         let PvField::Structure(s) = v else { panic!() };
         let PvField::Scalar(ScalarValue::Int(n)) = &s.fields[0].1 else {
             panic!()
@@ -1717,7 +1721,7 @@ mod tests {
         );
 
         // "aaa" < "zzz" → value=2, even though "zzz" was registered first.
-        let v = comp.get_value("shared").await.unwrap();
+        let v = comp.get_value(b"shared").await.unwrap();
         let PvField::Structure(s) = v else { panic!() };
         let PvField::Scalar(ScalarValue::Int(n)) = &s.fields[0].1 else {
             panic!()
@@ -1777,10 +1781,10 @@ mod tests {
             fn access(&self) -> &AccessGate {
                 &self.gate
             }
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 let seen = self.plain_seen.clone();
                 async move {
                     seen.store(true, Ordering::SeqCst);
@@ -1789,40 +1793,40 @@ mod tests {
             }
             fn has_pv_checked(
                 &self,
-                _: &str,
+                _: &[u8],
                 ctx: ChannelContext,
             ) -> impl std::future::Future<Output = bool> + Send {
                 let acct = self.checked_account.clone();
                 async move {
-                    *acct.lock() = Some(ctx.creds.account.clone());
+                    *acct.lock() = Some(ctx.creds.account.to_string());
                     true
                 }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { Some(PvField::Scalar(ScalarValue::Int(7))) }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Ok(()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { true }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -1907,12 +1911,12 @@ mod tests {
 
         // CREATE_CHANNEL binds the owner that accepted the channel.
         let owner = comp
-            .resolve_owner("pv", ctx.clone())
+            .resolve_owner(b"pv", ctx.clone())
             .await
             .expect("composite resolves an owner for a known PV");
         assert!(
             matches!(
-                owner.get_value("pv").await,
+                owner.get_value(b"pv").await,
                 Some(PvField::Structure(ref s))
                     if matches!(s.fields.first(),
                         Some((_, PvField::Scalar(ScalarValue::Int(1)))))
@@ -1933,7 +1937,7 @@ mod tests {
         // keeps its CREATE_CHANNEL owner.
         assert!(
             matches!(
-                owner.get_value("pv").await,
+                owner.get_value(b"pv").await,
                 Some(PvField::Structure(ref s))
                     if matches!(s.fields.first(),
                         Some((_, PvField::Scalar(ScalarValue::Int(1)))))
@@ -1943,12 +1947,12 @@ mod tests {
 
         // A fresh CREATE_CHANNEL sees the new registry and binds B.
         let fresh = comp
-            .resolve_owner("pv", ctx)
+            .resolve_owner(b"pv", ctx)
             .await
             .expect("composite resolves the new owner");
         assert!(
             matches!(
-                fresh.get_value("pv").await,
+                fresh.get_value(b"pv").await,
                 Some(PvField::Structure(ref s))
                     if matches!(s.fields.first(),
                         Some((_, PvField::Scalar(ScalarValue::Int(2)))))
@@ -1973,41 +1977,41 @@ mod tests {
             name: &'static str,
         }
         impl ChannelSource for NonSearchableSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
-            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == self.name;
+            fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == self.name.as_bytes();
                 async move { m }
             }
-            fn searchable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn searchable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2027,11 +2031,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !bare.searchable("server").await,
+            !bare.searchable(b"server").await,
             "a bare built-in `server` must not be UDP-search-advertised"
         );
         assert!(
-            !bare.searchable_from("server", requester).await,
+            !bare.searchable_from(b"server", requester).await,
             "a bare built-in `server` must not be TCP-circuit search-advertised"
         );
 
@@ -2054,12 +2058,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            comp.searchable("server").await,
+            comp.searchable(b"server").await,
             "a user PV named `server` must be UDP-search-advertised even \
              behind the front non-searchable `__server` source"
         );
         assert!(
-            comp.searchable_from("server", requester).await,
+            comp.searchable_from(b"server", requester).await,
             "a user PV named `server` must be TCP-circuit search-advertised \
              even behind the front non-searchable `__server` source"
         );
@@ -2069,7 +2073,7 @@ mod tests {
         // literal `server` channel, so a GET returns no value (pvxs
         // `server` has no GET surface), not the user PV's value=7.
         assert!(
-            comp.get_value("server").await.is_none(),
+            comp.get_value(b"server").await.is_none(),
             "first-owner CREATE/GET rule must keep `server` owned by the \
              front `__server` source; SEARCH OR must not change ownership"
         );
@@ -2098,43 +2102,43 @@ mod tests {
             name: &'static str,
         }
         impl ChannelSource for RefusesAtCreateSrc {
-            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
                 async { Vec::new() }
             }
             /// The CREATE gate: this source serves nothing.
-            fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn has_pv(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             /// The SEARCH gate: the name resolves, so it is advertised.
-            fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-                let m = name == self.name;
+            fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == self.name.as_bytes();
                 async move { m }
             }
             fn get_introspection(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
                 async { None }
             }
             fn get_value(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<PvField>> + Send {
                 async { None }
             }
             fn put_value(
                 &self,
-                _: &str,
+                _: &[u8],
                 _: PvField,
             ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
                 async { Err("n/a".into()) }
             }
-            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+            fn is_writable(&self, _: &[u8]) -> impl std::future::Future<Output = bool> + Send {
                 async { false }
             }
             fn subscribe(
                 &self,
-                _: &str,
+                _: &[u8],
             ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send
             {
                 async { None }
@@ -2153,17 +2157,17 @@ mod tests {
         .unwrap();
 
         assert!(
-            comp.searchable("REC.NOACCESS").await,
+            comp.searchable(b"REC.NOACCESS").await,
             "SEARCH must be answered for a name the source advertises, even \
              though CREATE will refuse it — else the client never sends \
              CREATE_CHANNEL and the refusal becomes a timeout"
         );
         assert!(
-            comp.searchable_from("REC.NOACCESS", requester).await,
+            comp.searchable_from(b"REC.NOACCESS", requester).await,
             "the TCP-circuit search gate must agree with the UDP one"
         );
         assert!(
-            !comp.has_pv("REC.NOACCESS").await,
+            !comp.has_pv(b"REC.NOACCESS").await,
             "the CREATE gate must still refuse the advertised name"
         );
     }

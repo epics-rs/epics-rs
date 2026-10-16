@@ -134,10 +134,11 @@ This crate owns the two real-time levers a Linux RT deployment uses:
   it. Off by default (the default is a `parking_lot` fallback with no PI);
   only meaningful on systems actually running SCHED_FIFO/SCHED_RR. No-op on
   non-Linux.
-- **`EPICS_RS_ALLOW_RT_PRIORITY=YES`** — opts the process into best-effort
-  SCHED_FIFO banding for IOC threads (falls back to default scheduling when
-  the OS refuses). The default is `NO` on hosted targets and `YES` on RTEMS;
-  an explicit value wins in both directions. Granting the privilege on Linux
+- **`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`** — C's switch for
+  best-effort SCHED_FIFO banding of IOC threads, `YES` by default as in C;
+  only `yes` (any case) turns it on. Where the OS refuses, threads fall back
+  to default scheduling silently, as C's do. `EPICS_RS_ALLOW_RT_PRIORITY` is
+  an older alias, read only when C's name is unset. Granting the privilege on Linux
   is the operator's side: an `RTPRIO` rlimit, `CAP_SYS_NICE`, or launching
   under `chrt`.
 
@@ -226,7 +227,7 @@ ch.put_f64_process(25.0).await?;
 let v = ch.get_f64().await;
 
 let mut sub = DbSubscription::subscribe(&db, "TEMP").await.unwrap();
-while let Some(snap) = sub.recv_snapshot().await {
+while let Some(Ok(snap)) = sub.recv_snapshot().await {
     println!("{:?}", snap.value);
 }
 ```

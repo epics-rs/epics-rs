@@ -16,25 +16,58 @@
 
 mod module_records;
 
+use epics_base_rs::server::device_support::DsetInit;
 use epics_base_rs::types::EpicsValue;
 
-/// `(record type, a nonzero VAL in the type's own representation, does
-/// `seed_deadband_tracking` seed?)`
-const CASES: &[(&str, EpicsValue, bool)] = &[
-    // Seeds — std/rec
-    ("ai", EpicsValue::Double(3.0), true), // aiRecord.c:129-131
-    ("ao", EpicsValue::Double(3.0), true), // aoRecord.c:157-159
-    ("bi", EpicsValue::Enum(1), true),     // biRecord.c:110-111
-    ("bo", EpicsValue::Enum(1), true),     // boRecord.c:165-173
-    ("calcout", EpicsValue::Double(3.0), true), // calcoutRecord.c:217-219
-    ("int64in", EpicsValue::Int64(3), true), // int64inRecord.c:116-118
-    ("int64out", EpicsValue::Int64(3), true), // int64outRecord.c:116-118
-    ("longin", EpicsValue::Long(3), true), // longinRecord.c:120-122
-    ("longout", EpicsValue::Long(3), true), // longoutRecord.c:123-125
-    ("mbbi", EpicsValue::Enum(3), true),   // mbbiRecord.c:137-138
-    ("mbbiDirect", EpicsValue::Long(3), true), // mbbiDirectRecord.c:128
-    ("mbbo", EpicsValue::UShort(3), true), // mbboRecord.c:179-180
-    ("mbboDirect", EpicsValue::Long(3), true), // mbboDirectRecord.c:160
+/// What each type's C `init_record` does to its trackers after its dset
+/// `init_record` was absent, returned 0 (or `ao`/`bo`/`mbbo`'s 2), or
+/// returned anything else.
+#[derive(Clone, Copy)]
+struct Seeds {
+    absent: bool,
+    succeeded: bool,
+    failed: bool,
+}
+
+const ALWAYS: Seeds = Seeds {
+    absent: true,
+    succeeded: true,
+    failed: true,
+};
+const NEVER: Seeds = Seeds {
+    absent: false,
+    succeeded: false,
+    failed: false,
+};
+/// `if (status) return status;` ahead of the seed.
+const UNLESS_FAILED: Seeds = Seeds {
+    absent: true,
+    succeeded: true,
+    failed: false,
+};
+/// `aiRecord.c:122-129`: any dset `init_record` returns before the seed.
+const ONLY_ABSENT: Seeds = Seeds {
+    absent: true,
+    succeeded: false,
+    failed: false,
+};
+
+/// `(record type, a nonzero VAL in the type's own representation, what
+/// `seed_deadband_tracking` does per dset outcome)`.
+const CASES: &[(&str, EpicsValue, Seeds)] = &[
+    ("ai", EpicsValue::Double(3.0), ONLY_ABSENT), // aiRecord.c:122-129
+    ("ao", EpicsValue::Double(3.0), UNLESS_FAILED), // aoRecord.c:127-157
+    ("bi", EpicsValue::Enum(1), UNLESS_FAILED),   // biRecord.c:112-114
+    ("bo", EpicsValue::Enum(1), ALWAYS),          // boRecord.c:158-172
+    ("calcout", EpicsValue::Double(3.0), ALWAYS), // calcoutRecord.c:215-217
+    ("int64in", EpicsValue::Int64(3), UNLESS_FAILED), // int64inRecord.c:114-116
+    ("int64out", EpicsValue::Int64(3), UNLESS_FAILED), // int64outRecord.c:114-116
+    ("longin", EpicsValue::Long(3), UNLESS_FAILED), // longinRecord.c:114-120
+    ("longout", EpicsValue::Long(3), UNLESS_FAILED), // longoutRecord.c:117-123
+    ("mbbi", EpicsValue::Enum(3), ALWAYS),        // mbbiRecord.c:133-137
+    ("mbbiDirect", EpicsValue::Long(3), ALWAYS),  // mbbiDirectRecord.c:116-128
+    ("mbbo", EpicsValue::UShort(3), ALWAYS),      // mbboRecord.c:141-179
+    ("mbboDirect", EpicsValue::Long(3), ALWAYS),  // mbboDirectRecord.c:127-160
     // Does not seed
     //
     // `sub` is the one row whose C counterpart DOES seed: `subRecord.c:130-132`
@@ -44,14 +77,14 @@ const CASES: &[(&str, EpicsValue, bool)] = &[
     // apart, so the seed is performed by the resolution owner
     // (`ioc_app::wire_subroutine`) and this hook is empty. Covered by
     // `tests/snam_is_resolved_only_where_c_resolves_it.rs`.
-    ("sub", EpicsValue::Double(3.0), false), // subRecord.c:130-132
-    ("calc", EpicsValue::Double(3.0), false), // calcRecord.c:90-112
-    ("dfanout", EpicsValue::Double(3.0), false), // dfanoutRecord.c:96-109
-    ("sel", EpicsValue::Double(3.0), false), // selRecord.c:88-108
-    ("scalcout", EpicsValue::Double(3.0), false), // sCalcoutRecord.c:203-320
-    ("acalcout", EpicsValue::Double(3.0), false), // aCalcoutRecord.c:171-277
-    ("busy", EpicsValue::Enum(1), false),    // busyRecord.c:127-181
-    ("swait", EpicsValue::Double(3.0), false), // swaitRecord.c:266-
+    ("sub", EpicsValue::Double(3.0), NEVER), // subRecord.c:130-132
+    ("calc", EpicsValue::Double(3.0), NEVER), // calcRecord.c:90-112
+    ("dfanout", EpicsValue::Double(3.0), NEVER), // dfanoutRecord.c:96-109
+    ("sel", EpicsValue::Double(3.0), NEVER), // selRecord.c:88-108
+    ("scalcout", EpicsValue::Double(3.0), NEVER), // sCalcoutRecord.c:203-320
+    ("acalcout", EpicsValue::Double(3.0), NEVER), // aCalcoutRecord.c:171-277
+    ("busy", EpicsValue::Enum(1), NEVER),    // busyRecord.c:127-181
+    ("swait", EpicsValue::Double(3.0), NEVER), // swaitRecord.c:266-
 ];
 
 #[test]
@@ -62,33 +95,37 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
     let mut wrong = Vec::new();
 
     for (rtype, val, seeds) in CASES {
-        let mut rec =
-            module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
-        rec.put_field("VAL", val.clone())
-            .unwrap_or_else(|e| panic!("{rtype}: VAL put rejected: {e:?}"));
-        let val = val.to_f64().expect("test values are numeric");
-        assert_ne!(
-            val, 0.0,
-            "{rtype}: the case value must differ from the 0 a non-seeding \
-             record leaves behind, or the two groups are indistinguishable"
-        );
+        for (dset_init, seeds) in [
+            (DsetInit::Absent, seeds.absent),
+            (DsetInit::Ok, seeds.succeeded),
+            (DsetInit::Failed, seeds.failed),
+        ] {
+            let mut rec =
+                module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
+            rec.put_field("VAL", val.clone())
+                .unwrap_or_else(|e| panic!("{rtype}: VAL put rejected: {e:?}"));
+            let val = val.to_f64().expect("test values are numeric");
+            assert_ne!(
+                val, 0.0,
+                "{rtype}: the case value must differ from the 0 a non-seeding \
+                 record leaves behind, or the two groups are indistinguishable"
+            );
 
-        rec.seed_deadband_tracking();
+            rec.seed_deadband_tracking(dset_init);
 
-        let want = if *seeds { val } else { 0.0 };
-        for field in ["MLST", "ALST", "LALM"] {
-            let Some(got) = rec.get_field(field) else {
-                continue; // this type carries no such cell
-            };
-            let got = got
-                .to_f64()
-                .unwrap_or_else(|| panic!("{rtype}.{field} is not numeric"));
-            if got != want {
-                wrong.push(format!(
-                    "{rtype}.{field}: VAL={val}, seed_deadband_tracking {} seed, \
-                     got {got} want {want}",
-                    if *seeds { "does" } else { "does not" }
-                ));
+            let want = if seeds { val } else { 0.0 };
+            for field in ["MLST", "ALST", "LALM"] {
+                let Some(got) = rec.get_field(field) else {
+                    continue; // this type carries no such cell
+                };
+                let got = got
+                    .to_f64()
+                    .unwrap_or_else(|| panic!("{rtype}.{field} is not numeric"));
+                if got != want {
+                    wrong.push(format!(
+                        "{rtype}.{field}: VAL={val}, dset {dset_init:?}, got {got} want {want}"
+                    ));
+                }
             }
         }
     }

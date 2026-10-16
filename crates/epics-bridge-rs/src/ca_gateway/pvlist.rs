@@ -51,7 +51,8 @@
 
 use std::path::Path;
 
-use regex::Regex;
+use epics_base_rs::types::RecordName;
+use regex::bytes::Regex;
 
 use crate::error::{BridgeError, BridgeResult};
 
@@ -86,7 +87,7 @@ pub enum PvListEntry {
     /// `pattern ALIAS target [asg [asl]]`
     Alias {
         pattern: Regex,
-        target_template: String,
+        target_template: Vec<u8>,
         asg: Option<String>,
         asl: Option<i32>,
     },
@@ -127,7 +128,7 @@ impl PvListEntry {
 pub struct PvListMatch {
     /// Resolved upstream PV name (after alias substitution if applicable).
     /// Equal to the input name unless an `ALIAS` rule matched.
-    pub resolved_name: String,
+    pub resolved_name: RecordName,
     /// Access security group (from rule), if specified.
     pub asg: Option<String>,
     /// Access security level (from rule), if specified.
@@ -348,7 +349,8 @@ impl PvList {
     /// host-scoped rule — matching C, which converts the requester to an
     /// IPv4 dotted string before `findEntry`. Callers pass the TCP peer IP
     /// in bracket-less form (`192.0.2.1`).
-    pub fn is_host_denied(&self, name: &str, host: &PolicyHost) -> bool {
+    pub fn is_host_denied(&self, name: impl AsRef<[u8]>, host: &PolicyHost) -> bool {
+        let name = name.as_ref();
         let host = host.as_str();
         for entry in &self.entries {
             if let PvListEntry::Deny {
@@ -387,7 +389,8 @@ impl PvList {
     /// host-less callers (preload, pvlist-reload prune) intentionally see
     /// only global rules, because a host-targeted deny must not remove a
     /// PV that is still admissible for other hosts.
-    pub fn match_name(&self, name: &str) -> Option<PvListMatch> {
+    pub fn match_name(&self, name: impl AsRef<[u8]>) -> Option<PvListMatch> {
+        let name = name.as_ref();
         // Select the LAST-in-file matching ALLOW (or ALIAS) and the
         // LAST-in-file matching global DENY, each from its own list.
         // C ca-gateway keeps separate allow/deny `tsSLList`s and inserts
@@ -414,7 +417,7 @@ impl PvList {
 
         let allow_decision: Option<PvListMatch> = allow_match.map(|e| match e {
             PvListEntry::Allow { asg, asl, .. } => PvListMatch {
-                resolved_name: name.to_string(),
+                resolved_name: name.into(),
                 asg: asg.clone(),
                 asl: *asl,
                 is_alias: false,
@@ -427,7 +430,7 @@ impl PvList {
             } => {
                 let resolved = expand_template(pattern, name, target_template);
                 PvListMatch {
-                    resolved_name: resolved,
+                    resolved_name: resolved.into(),
                     asg: asg.clone(),
                     asl: *asl,
                     is_alias: true,
@@ -471,7 +474,12 @@ impl PvList {
     /// `host` must be the bracket-less socket-address host form derived
     /// from the downstream client's address (`127.0.0.1`, `::1`) so it
     /// matches the `.pvlist` `FROM` syntax — see [`Self::is_host_denied`].
-    pub fn match_name_for_host(&self, name: &str, host: &PolicyHost) -> Option<PvListMatch> {
+    pub fn match_name_for_host(
+        &self,
+        name: impl AsRef<[u8]>,
+        host: &PolicyHost,
+    ) -> Option<PvListMatch> {
+        let name = name.as_ref();
         // Host-scoped DENY FROM is a hard blacklist consulted before the
         // normal allow/deny decision (mirrors gateAs::findEntry).
         if self.is_host_denied(name, host) {
@@ -490,14 +498,14 @@ impl Default for PvList {
 /// Expand `\0`–`\9` backreferences in a template using regex captures.
 ///
 /// `\0` refers to the entire match. `\1`–`\9` refer to capture groups.
-fn expand_template(pattern: &Regex, input: &str, template: &str) -> String {
+fn expand_template(pattern: &Regex, input: &[u8], template: &[u8]) -> Vec<u8> {
     let captures = match pattern.captures(input) {
         Some(c) => c,
-        None => return template.to_string(),
+        None => return template.to_vec(),
     };
 
-    let mut out = String::with_capacity(template.len());
-    let bytes = template.as_bytes();
+    let mut out = Vec::with_capacity(template.len());
+    let bytes = template;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
@@ -505,13 +513,13 @@ fn expand_template(pattern: &Regex, input: &str, template: &str) -> String {
             if c.is_ascii_digit() {
                 let group_idx = (c - b'0') as usize;
                 if let Some(g) = captures.get(group_idx) {
-                    out.push_str(g.as_str());
+                    out.extend_from_slice(g.as_bytes());
                 }
                 i += 2;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
@@ -531,11 +539,13 @@ fn expand_template(pattern: &Regex, input: &str, template: &str) -> String {
 /// invalid branch). The only hard error is an I/O failure reading the file,
 /// which lives in [`parse_pvlist_file`]; this string parser therefore always
 /// returns `Ok`.
-pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
+pub fn parse_pvlist(content: impl AsRef<[u8]>) -> BridgeResult<PvList> {
     let mut list = PvList::new();
 
-    for (lineno, raw) in content.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+    // C reads the file with `fgets` and matches the pattern as `char`, so a
+    // line is bytes.
+    for (lineno, raw) in content.as_ref().split(|b| *b == b'\n').enumerate() {
+        let line = strip_comment(raw).trim_ascii();
         if line.is_empty() {
             continue;
         }
@@ -552,11 +562,11 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
         // uppercase prefix) reproduces that and keeps the requirement that a
         // leading word precede ORDER, so `ORDER ALLOW DENY` is still a normal
         // rule line (pattern "ORDER", keyword "ALLOW") exactly as in C.
-        let mut head = line.split_whitespace();
+        let mut head = words(line);
         let _pattern_tok = head.next();
         if head
             .next()
-            .is_some_and(|cmd| cmd.eq_ignore_ascii_case("ORDER"))
+            .is_some_and(|cmd| cmd.eq_ignore_ascii_case(b"ORDER"))
         {
             // `head` now yields the operand tokens (after the pattern token and
             // the ORDER command). A malformed ORDER line is skipped and leaves
@@ -592,19 +602,35 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
 
 /// Parse a `.pvlist` file from disk.
 pub fn parse_pvlist_file(path: &Path) -> BridgeResult<PvList> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read(path)?;
     parse_pvlist(&content)
 }
 
-fn strip_comment(line: &str) -> &str {
-    match line.find('#') {
+fn strip_comment(line: &[u8]) -> &[u8] {
+    match line.iter().position(|b| *b == b'#') {
         Some(i) => &line[..i],
         None => line,
     }
 }
 
-fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
-    let mut tokens = line.split_whitespace();
+fn words(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+    line.split(u8::is_ascii_whitespace)
+        .filter(|t| !t.is_empty())
+}
+
+/// A token the gateway keeps as text (a host or an access-security group
+/// name); the line is skipped when it is not UTF-8.
+fn text_token(token: &[u8], what: &str, lineno: usize) -> BridgeResult<String> {
+    String::from_utf8(token.to_vec()).map_err(|_| {
+        BridgeError::GroupConfigError(format!(
+            "line {lineno}: {what} '{}' is not UTF-8",
+            String::from_utf8_lossy(token)
+        ))
+    })
+}
+
+fn parse_rule_line(line: &[u8], lineno: usize) -> BridgeResult<PvListEntry> {
+    let mut tokens = words(line);
 
     let pattern_str = tokens
         .next()
@@ -615,18 +641,18 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
 
     let pattern = build_pattern(pattern_str, lineno)?;
 
-    match keyword.to_ascii_uppercase().as_str() {
+    match keyword.to_ascii_uppercase().as_slice() {
         // C ca-gateway (gateAs.cc:617-621) treats ALLOW, ALIAS, PATTERN and
         // PV identically: all four insert a `gateAsEntry` into the same
         // `allow_list` with the same ASG/ASL parsing. PATTERN and PV are
         // therefore plain synonyms for ALLOW (they predate the ALLOW keyword
         // and remain accepted for legacy pvlist files). Rejecting them broke
         // load/reload of C-compatible pvlist files that use the older syntax.
-        "ALLOW" | "PATTERN" | "PV" => {
-            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
+        b"ALLOW" | b"PATTERN" | b"PV" => {
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno)?;
             Ok(PvListEntry::Allow { pattern, asg, asl })
         }
-        "DENY" => {
+        b"DENY" => {
             // `pattern DENY [FROM] [host ...]`. C ca-gateway (gateAs.cc:539-552,
             // USE_DENYFROM branch):
             //
@@ -652,34 +678,40 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
             // verbatim here; PvList::resolve_hosts() converts hostnames to IP
             // strings at load time, mirroring C aToIPAddr (gateAs.cc:488-506).
             let mut hosts = tokens
-                .flat_map(|t| t.split(','))
+                .flat_map(|t| t.split(|b| *b == b','))
                 .filter(|s| !s.is_empty())
                 .peekable();
-            if hosts.peek().is_some_and(|h| h.eq_ignore_ascii_case("FROM")) {
+            if hosts
+                .peek()
+                .is_some_and(|h| h.eq_ignore_ascii_case(b"FROM"))
+            {
                 hosts.next();
             }
-            let from_hosts: Vec<String> = hosts.map(String::from).collect();
+            let from_hosts = hosts
+                .map(|h| text_token(h, "DENY FROM host", lineno))
+                .collect::<BridgeResult<Vec<String>>>()?;
             Ok(PvListEntry::Deny {
                 pattern,
                 from_hosts,
             })
         }
-        "ALIAS" => {
+        b"ALIAS" => {
             let target = tokens.next().ok_or_else(|| {
                 BridgeError::GroupConfigError(format!(
                     "line {lineno}: ALIAS requires a target name"
                 ))
             })?;
-            let (asg, asl) = parse_asg_asl(&mut tokens, lineno);
+            let (asg, asl) = parse_asg_asl(&mut tokens, lineno)?;
             Ok(PvListEntry::Alias {
                 pattern,
-                target_template: target.to_string(),
+                target_template: target.to_vec(),
                 asg,
                 asl,
             })
         }
         other => Err(BridgeError::GroupConfigError(format!(
-            "line {lineno}: unknown keyword '{other}', expected ALLOW/PATTERN/PV/DENY/ALIAS"
+            "line {lineno}: unknown keyword '{}', expected ALLOW/PATTERN/PV/DENY/ALIAS",
+            String::from_utf8_lossy(other)
         ))),
     }
 }
@@ -693,13 +725,13 @@ fn parse_rule_line(line: &str, lineno: usize) -> BridgeResult<PvListEntry> {
 /// all accepted; only the two recognised orderings are valid. C reads just the
 /// first two operands and ignores any trailing tokens, so we do too.
 fn parse_order_directive<'a>(
-    operands: impl Iterator<Item = &'a str>,
+    operands: impl Iterator<Item = &'a [u8]>,
     lineno: usize,
 ) -> BridgeResult<EvaluationOrder> {
     // strtok ", \t\n": split each whitespace token further on commas, drop
     // the empties a stray comma (e.g. `ALLOW ,DENY`) would produce.
     let mut ops = operands
-        .flat_map(|t| t.split(','))
+        .flat_map(|t| t.split(|b| *b == b','))
         .filter(|s| !s.is_empty());
     let a = ops.next();
     let b = ops.next();
@@ -708,14 +740,16 @@ fn parse_order_directive<'a>(
             "line {lineno}: ORDER requires two operands (ALLOW, DENY or DENY, ALLOW)"
         )));
     };
-    if a.eq_ignore_ascii_case("ALLOW") && b.eq_ignore_ascii_case("DENY") {
+    if a.eq_ignore_ascii_case(b"ALLOW") && b.eq_ignore_ascii_case(b"DENY") {
         Ok(EvaluationOrder::AllowDeny)
-    } else if a.eq_ignore_ascii_case("DENY") && b.eq_ignore_ascii_case("ALLOW") {
+    } else if a.eq_ignore_ascii_case(b"DENY") && b.eq_ignore_ascii_case(b"ALLOW") {
         Ok(EvaluationOrder::DenyAllow)
     } else {
         Err(BridgeError::GroupConfigError(format!(
-            "line {lineno}: invalid ORDER operands '{a} {b}' \
-             (expected ALLOW, DENY or DENY, ALLOW)"
+            "line {lineno}: invalid ORDER operands '{} {}' \
+             (expected ALLOW, DENY or DENY, ALLOW)",
+            String::from_utf8_lossy(a),
+            String::from_utf8_lossy(b)
         )))
     }
 }
@@ -728,8 +762,8 @@ fn parse_order_directive<'a>(
 /// returns 0 and the caller applies the `lev=1` fallback. Tokens reach here
 /// already split on whitespace, so there is no leading whitespace for
 /// `sscanf` to skip.
-fn sscanf_int_prefix(token: &str) -> Option<i32> {
-    let bytes = token.as_bytes();
+fn sscanf_int_prefix(token: &[u8]) -> Option<i32> {
+    let bytes = token;
     let mut end = 0;
     if matches!(bytes.first(), Some(b'+' | b'-')) {
         end = 1;
@@ -743,7 +777,7 @@ fn sscanf_int_prefix(token: &str) -> Option<i32> {
     }
     // A prefix that overflows `i32` is degenerate input C leaves undefined; map
     // it to the same no-conversion fallback rather than guessing C's wrap.
-    token[..end].parse::<i32>().ok()
+    std::str::from_utf8(&token[..end]).ok()?.parse::<i32>().ok()
 }
 
 /// Parse the optional trailing `[asg [asl]]` of an ALLOW/PATTERN/PV/ALIAS
@@ -775,25 +809,29 @@ fn sscanf_int_prefix(token: &str) -> Option<i32> {
 /// Genuine syntax errors C also rejects (a missing ALIAS target) remain hard
 /// errors at their call site, not here.
 fn parse_asg_asl<'a>(
-    tokens: &mut impl Iterator<Item = &'a str>,
+    tokens: &mut impl Iterator<Item = &'a [u8]>,
     lineno: usize,
-) -> (Option<String>, Option<i32>) {
-    let asg = tokens.next().map(String::from);
+) -> BridgeResult<(Option<String>, Option<i32>)> {
+    let asg = tokens
+        .next()
+        .map(|t| text_token(t, "access security group", lineno))
+        .transpose()?;
     let asl = asg.is_some().then(|| tokens.next()).flatten().map(|s| {
         sscanf_int_prefix(s).unwrap_or_else(|| {
             tracing::warn!(
                 line = lineno,
-                token = %s,
+                token = %String::from_utf8_lossy(s),
                 "pvlist: ASL token has no integer prefix — falling back to level 1 \
                  (C gateAs.cc:611 sscanf!=1 → lev=1)"
             );
             1
         })
     });
-    (asg, asl)
+    Ok((asg, asl))
 }
 
-fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
+fn build_pattern(pat: &[u8], lineno: usize) -> BridgeResult<Regex> {
+    let shown = String::from_utf8_lossy(pat);
     // C ca-gateway's DEFAULT build compiles `.pvlist` patterns as GNU basic
     // regular expressions: configure/CONFIG_SITE leaves USE_PCRE commented out
     // (CONFIG_SITE:15-16), so gateAs::readPvList calls re_compile_pattern
@@ -812,7 +850,7 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
     // of "pattern string -> Regex") so capture-group numbering lines up with
     // the `\1`..`\9` template expansion in `expand_template` by construction.
     let translated = translate_gnu_bre_to_rust(pat).map_err(|e| {
-        BridgeError::GroupConfigError(format!("line {lineno}: pvlist pattern '{pat}': {e}"))
+        BridgeError::GroupConfigError(format!("line {lineno}: pvlist pattern '{shown}': {e}"))
     })?;
     // Anchor the pattern to match the full PV name (C++ ca-gateway behavior:
     // gateAs.cc:386-405 admits a name only when `re_match(...) == len`, a
@@ -826,10 +864,16 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
     // the alternation under both anchors without consuming a capture index, so
     // the `\1`..`\9` ALIAS backreference numbering in `expand_template` (which
     // indexes captures positionally) is unchanged.
+    //
+    // Unicode is off, so `.` and a bracket match one byte, as GNU regex does
+    // in the C locale ca-gateway runs in.
     let anchored = format!("^(?:{translated})$");
-    Regex::new(&anchored).map_err(|e| {
-        BridgeError::GroupConfigError(format!("line {lineno}: invalid regex '{pat}': {e}"))
-    })
+    regex::bytes::RegexBuilder::new(&anchored)
+        .unicode(false)
+        .build()
+        .map_err(|e| {
+            BridgeError::GroupConfigError(format!("line {lineno}: invalid regex '{shown}': {e}"))
+        })
 }
 
 /// Translate a GNU basic-regular-expression (`re_syntax_options == 0`) pattern
@@ -859,8 +903,8 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
 /// represent) is rejected with a clear diagnostic rather than silently
 /// mis-compiled. Alias-target backreferences are unaffected — those are
 /// expanded by [`expand_template`], not by the regex engine.
-fn translate_gnu_bre_to_rust(pat: &str) -> Result<String, String> {
-    let bytes = pat.as_bytes();
+fn translate_gnu_bre_to_rust(pat: &[u8]) -> Result<String, String> {
+    let bytes = pat;
     let mut out = String::with_capacity(pat.len() + 8);
     let mut i = 0;
     while i < bytes.len() {
@@ -891,6 +935,8 @@ fn translate_gnu_bre_to_rust(pat: &str) -> Result<String, String> {
                     }
                     // Every other escape (\., \*, \\, \w, \s, …) means the same
                     // in both dialects — copy it through unchanged.
+                    // An escaped non-ASCII byte is that byte.
+                    other if !other.is_ascii() => push_byte(&mut out, other),
                     other => {
                         out.push('\\');
                         out.push(other as char);
@@ -922,7 +968,7 @@ fn translate_gnu_bre_to_rust(pat: &str) -> Result<String, String> {
                 i = translate_bracket_expr(bytes, i, &mut out);
             }
             _ => {
-                out.push(c as char);
+                push_byte(&mut out, c);
                 i += 1;
             }
         }
@@ -959,7 +1005,7 @@ fn translate_bracket_expr(bytes: &[u8], start: usize, out: &mut String) -> usize
                 out.push_str("[:");
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b':' && bytes[i + 1] == b']') {
-                    out.push(bytes[i] as char);
+                    push_byte(out, bytes[i]);
                     i += 1;
                 }
                 if i + 1 < bytes.len() {
@@ -974,12 +1020,22 @@ fn translate_bracket_expr(bytes: &[u8], start: usize, out: &mut String) -> usize
                 i += 1;
             }
             other => {
-                out.push(other as char);
+                push_byte(out, other);
                 i += 1;
             }
         }
     }
     i
+}
+
+/// A pattern byte in the regex source: a non-ASCII byte is spelled `\xHH`,
+/// which the non-Unicode engine matches as that one byte.
+fn push_byte(out: &mut String, b: u8) {
+    if b.is_ascii() {
+        out.push(b as char);
+    } else {
+        out.push_str(&format!("\\x{b:02X}"));
+    }
 }
 
 #[cfg(test)]
@@ -1199,7 +1255,7 @@ mod tests {
 
         // FROM present (case-insensitive) is consumed, not stored as a host.
         for kw in ["FROM", "from", "From"] {
-            let list = parse_pvlist(&format!("PV.* DENY {kw} host1 host2")).unwrap();
+            let list = parse_pvlist(format!("PV.* DENY {kw} host1 host2")).unwrap();
             if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
                 assert_eq!(from_hosts, &["host1", "host2"], "{kw} consumed");
             } else {
@@ -1244,7 +1300,7 @@ mod tests {
             ..
         } = &list.entries[0]
         {
-            assert_eq!(target_template, r"PSCurrent\1.ai");
+            assert_eq!(target_template, br"PSCurrent\1.ai");
             assert_eq!(asg.as_deref(), Some("PSGroup"));
             assert_eq!(*asl, Some(1));
         } else {
@@ -1276,7 +1332,7 @@ mod tests {
         // to the next line (gateAs.cc:627-629) — the malformed line is dropped,
         // not a whole-file abort. parse_rule_line still reports the error; the
         // file parser skips it.
-        assert!(parse_rule_line("foo BAD", 1).is_err());
+        assert!(parse_rule_line(b"foo BAD", 1).is_err());
         let list = parse_pvlist("foo BAD").unwrap();
         assert!(list.entries.is_empty(), "unknown command line skipped");
     }
@@ -1285,10 +1341,34 @@ mod tests {
     /// for ALLOW — all four insert into the same allow_list with identical
     /// ASG/ASL parsing. A legacy pvlist using PATTERN/PV must load (and
     /// match, alias, and carry ASG/ASL) exactly like the ALLOW form.
+    /// A pattern is matched as the bytes the file holds, as GNU regex does in
+    /// the C locale: a UTF-8 literal matches its own UTF-8 name, a Latin-1
+    /// literal its Latin-1 name and not the other spelling, `.` is one byte,
+    /// and an alias target carries non-UTF-8 bytes through.
+    #[test]
+    fn patterns_and_aliases_match_name_bytes() {
+        let list = parse_pvlist(
+            b"nu\xc3\xa9:.* ALLOW\n\
+              lat\xe9b ALLOW\n\
+              one.b ALLOW\n\
+              A:\\(.*\\) ALIAS z\xe9:\\1\n"
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(list.match_name("nu\u{e9}:x").is_some(), "UTF-8 literal");
+        assert!(list.match_name(b"lat\xe9b").is_some(), "Latin-1 literal");
+        assert!(list.match_name("lat\u{e9}b").is_none(), "other spelling");
+        assert!(list.match_name(b"one\xe9b").is_some(), "dot on one byte");
+        assert!(list.match_name("one\u{e9}b").is_none(), "dot on two bytes");
+        let m = list.match_name("A:q").expect("alias admitted");
+        assert!(m.is_alias);
+        assert_eq!(&*m.resolved_name, b"z\xe9:q");
+    }
+
     #[test]
     fn parse_pattern_and_pv_are_allow_synonyms() {
         for kw in ["PATTERN", "PV", "pattern", "pv"] {
-            let list = parse_pvlist(&format!("PV.* {kw} BeamGroup 2")).unwrap();
+            let list = parse_pvlist(format!("PV.* {kw} BeamGroup 2")).unwrap();
             assert_eq!(list.entries.len(), 1, "{kw}: one entry");
             match &list.entries[0] {
                 PvListEntry::Allow { asg, asl, .. } => {
@@ -1320,7 +1400,7 @@ mod tests {
         // Bad pattern: C's gateAsEntry::init() fails, the entry is deleted and
         // the loop continues (gateAs.cc:619-620). parse_rule_line reports the
         // error; the file parser skips just that line.
-        assert!(parse_rule_line("[invalid ALLOW", 1).is_err());
+        assert!(parse_rule_line(b"[invalid ALLOW", 1).is_err());
         let list = parse_pvlist("[invalid ALLOW").unwrap();
         assert!(list.entries.is_empty(), "invalid-regex line skipped");
     }
@@ -1330,7 +1410,7 @@ mod tests {
         // Missing ALIAS real-name target: C logs "missing real name in ALIAS
         // command" and `continue`s (gateAs.cc:602-605). parse_rule_line reports
         // the error; the file parser skips just that line, not the whole file.
-        assert!(parse_rule_line("foo ALIAS", 1).is_err());
+        assert!(parse_rule_line(b"foo ALIAS", 1).is_err());
         let list = parse_pvlist("foo ALIAS").unwrap();
         assert!(list.entries.is_empty(), "ALIAS-missing-target line skipped");
     }
@@ -1372,7 +1452,7 @@ mod tests {
         );
         for i in 0..6 {
             assert!(
-                list.match_name(&format!("A{i}:x")).is_some(),
+                list.match_name(format!("A{i}:x")).is_some(),
                 "valid sibling A{i} survived",
             );
         }
@@ -1409,7 +1489,7 @@ mod tests {
 
         // Same fallback for the legacy PATTERN/PV synonyms and for ALIAS.
         for kw in ["PATTERN", "PV"] {
-            let list = parse_pvlist(&format!("PV.* {kw} grp xyz")).unwrap();
+            let list = parse_pvlist(format!("PV.* {kw} grp xyz")).unwrap();
             match &list.entries[0] {
                 PvListEntry::Allow { asl, .. } => assert_eq!(*asl, Some(1), "{kw}"),
                 other => panic!("{kw}: expected Allow, got {other:?}"),
@@ -1439,7 +1519,7 @@ mod tests {
         // rule. parse_rule_line rejects it; the file parser skips the line,
         // leaving no entry, distinct from the unparseable-ASL case above which
         // keeps the rule at level 1.
-        assert!(parse_rule_line("foo ALIAS", 1).is_err());
+        assert!(parse_rule_line(b"foo ALIAS", 1).is_err());
         let list = parse_pvlist("foo ALIAS").unwrap();
         assert!(
             list.entries.is_empty(),
@@ -1457,7 +1537,7 @@ mod tests {
     #[test]
     fn parse_asl_numeric_prefix_matches_c_sscanf() {
         for (token, want) in [("0junk", 0), ("1foo", 1), ("-1tail", -1), ("2tail", 2)] {
-            let list = parse_pvlist(&format!("PV.* ALLOW grp {token}")).unwrap();
+            let list = parse_pvlist(format!("PV.* ALLOW grp {token}")).unwrap();
             match &list.entries[0] {
                 PvListEntry::Allow { asl, .. } => assert_eq!(
                     *asl,
@@ -1471,7 +1551,7 @@ mod tests {
         // No integer prefix → C sscanf returns 0 → level-1 fallback. A bare
         // sign with no digit (`+`) also has no prefix.
         for token in ["typo", "+", "junk7"] {
-            let list = parse_pvlist(&format!("PV.* ALLOW grp {token}")).unwrap();
+            let list = parse_pvlist(format!("PV.* ALLOW grp {token}")).unwrap();
             match &list.entries[0] {
                 PvListEntry::Allow { asl, .. } => {
                     assert_eq!(*asl, Some(1), "no-prefix ASL token {token:?} → level 1")
@@ -1829,7 +1909,7 @@ mod tests {
     #[test]
     fn in_pattern_backreference_is_rejected() {
         // parse_rule_line still produces the clear back-reference diagnostic...
-        let err = parse_rule_line(r"\(.*\)\1 ALLOW", 1).unwrap_err();
+        let err = parse_rule_line(br"\(.*\)\1 ALLOW", 1).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("back-reference"),
@@ -1856,8 +1936,8 @@ mod tests {
     fn expand_template_zero_group() {
         let pat = Regex::new(r"^(\w+)$").unwrap();
         // \0 is the whole match
-        let result = expand_template(&pat, "hello", r"prefix_\0_suffix");
-        assert_eq!(result, "prefix_hello_suffix");
+        let result = expand_template(&pat, b"hello", br"prefix_\0_suffix");
+        assert_eq!(result, b"prefix_hello_suffix");
     }
 
     // --- resolve_hosts converts DENY FROM hostnames to IPs ---

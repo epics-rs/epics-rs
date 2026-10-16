@@ -98,21 +98,11 @@ pub struct CompressRecord {
     /// source's capacity and its delivered length both change exactly when the
     /// source array is re-shaped).
     inpn: usize,
-    /// What C `monitor()` (:101-111) decided to post for the SPC_RESET put now
-    /// in flight. Written by [`Self::monitor`] — the only place that makes the
-    /// decision, and the only writer of `ouse` — and read back by
-    /// `monitor_side_effect_fields`, which the put owner calls immediately
-    /// after `special()`, for the same put. One meaning on every path: "the
-    /// field set the last `monitor()` posted".
-    monitor_posts: &'static [&'static str],
-    // True only while applying this cycle's INP read (set in
-    // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
-    // C's element-count reset lives in `process` and keys on `prec->wptr` (the
-    // INP read buffer) — a CA put to VAL goes through `put_array_info`, never
-    // `process`, so it must NOT reset. In Rust both the INP read and a direct
-    // VAL put reach `push_array` via `put_field("VAL")`; this flag is how
-    // `push_array` tells them apart so only the INP-driven ingest can reset.
-    inp_read_pending: bool,
+    /// The posts of the `monitor()` an SPC_RESET `special()` ran, a bit per
+    /// `RESET_POSTS` entry, until the put drains them.
+    reset_posts: u64,
+    /// This cycle's `monitor()` found `nuse != ouse` (`compressRecord.c:105`).
+    nuse_moved: bool,
 }
 
 impl Default for CompressRecord {
@@ -147,8 +137,8 @@ impl Default for CompressRecord {
             cycle_ingested: false,
             cycle_emitted: false,
             inpn: 0,
-            monitor_posts: &[],
-            inp_read_pending: false,
+            reset_posts: 0,
+            nuse_moved: false,
         }
     }
 }
@@ -233,16 +223,12 @@ impl CompressRecord {
     /// of `process()` (`:365-371`, skipped on an accumulate-only cycle — which
     /// is why an accumulating compress does not re-post NUSE).
     ///
-    /// Returns the fields to post; `special()` hands them to the framework
-    /// through [`Record::monitor_side_effect_fields`] (the alarm-mask term is
-    /// the framework's — it posts on an alarm transition regardless).
-    fn monitor(&mut self) -> &'static [&'static str] {
-        if self.nuse != self.ouse {
-            self.ouse = self.nuse;
-            &["NUSE", "VAL"]
-        } else {
-            &["VAL"]
-        }
+    /// Returns whether NUSE moved against the OUSE latch, the record's half
+    /// of C's NUSE condition; `alarm_mask` is the framework's.
+    fn monitor(&mut self) -> bool {
+        let moved = self.nuse != self.ouse;
+        self.ouse = self.nuse;
+        moved
     }
 
     /// N, clamped to at least 1 **and written back** — the single owner of
@@ -428,25 +414,6 @@ impl CompressRecord {
         // A non-empty ingestion happened this cycle; whether it emitted is
         // recorded by `put_one`. See `cycle_ingested`/`cycle_emitted`.
         self.cycle_ingested = true;
-        // C compressRecord.c:334-340: when the INP source's element count
-        // changes between INP-driven cycles, C frees the buffer and `reset()`s,
-        // restarting accumulation clean at the new length. Without this the
-        // rolling Average (ALG=3) keeps stale per-element partial sums from the
-        // old length and blends them with the new waveform → a corrupt average.
-        // C gates the reset on `prec->wptr` already being allocated (a prior
-        // INP read), so the FIRST INP read does not reset; and the reset lives
-        // in `process` (the INP path), NOT in a CA put to VAL (`put_array_info`).
-        // `inp_read_pending` confines the reset to the INP-driven ingest: a
-        // direct VAL put / unit-test `push_array` is a raw buffer op and never
-        // resets. The reset clears no completion-gate state, so C-1's emit gate
-        // holds (a reset cycle still ingests, then the algorithm decides emit).
-        if self.inp_read_pending {
-            self.inp_read_pending = false;
-            if self.inpn != 0 && input.len() != self.inpn {
-                self.reset();
-            }
-            self.inpn = input.len();
-        }
         match self.alg {
             // Circular Buffer (alg=4): every sample independent.
             4 => {
@@ -458,6 +425,9 @@ impl CompressRecord {
             // C `array_average` does NOT apply ILIL/IHIL filtering —
             // the skip loop lives only in `compress_array`.
             3 => self.push_array_average(input),
+            // C `process` (:354-359) picks the N-to-1 path by element count: a
+            // one-element array is `compress_scalar`'s running CVB, not a chunk.
+            _ if input.len() == 1 => self.compress_scalar(input[0]),
             // N-to-1 algorithms (Low/High/N_to_1_Average/Median):
             // C `compress_array` (compressRecord.c:154-221).
             _ => self.compress_array(input),
@@ -592,12 +562,46 @@ const COMPRESS_BALG_CHOICES: &[&str] = &["FIFO Buffer", "LIFO Buffer"];
 /// RES (:396-400), ALG (:402-408), PBUF (:409-416), BALG (:417-423) and
 /// N (:431-437). C's `special()` (compressRecord.c:377-393) does not
 /// discriminate between them — any SPC_RESET write runs `reset(); monitor();` —
-/// so this list is both the [`Record::special`] trigger set and the
-/// [`Record::monitor_side_effect_fields`] key set. None of the five is
-/// `pp(TRUE)`, so the side-effect post is the only monitor the put produces.
+/// so this list is the [`Record::special`] trigger set.
 const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
 
+/// C `monitor()`'s posts (`compressRecord.c:105-110`): NUSE when it moved,
+/// NUSE when only the alarm did, then VAL.
+/// `monitor()` from a cycle: NUSE with `monitor_mask | DBE_VALUE | DBE_LOG`.
+const CYCLE_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 1] = [(
+    "NUSE",
+    crate::server::record::CyclePostMask::MonitorValueLog,
+)];
+
+const RESET_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 3] = [
+    ("NUSE", crate::server::record::CyclePostMask::ResetValueLog),
+    (
+        "NUSE",
+        crate::server::record::CyclePostMask::ResetValueLogOnAlarm,
+    ),
+    ("VAL", crate::server::record::CyclePostMask::ResetValueLog),
+];
+
 impl Record for CompressRecord {
+    /// C allocates `wptr` with the first `inpn` latch and never frees it
+    /// (compressRecord.c:334-339).
+    fn held_pointer(&self, field: &str) -> Option<usize> {
+        (field == "WPTR" && self.inpn > 0).then(|| std::ptr::from_ref(&self.inpn) as usize)
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::PRE_INPUT
+            .union(crate::server::record::CycleHooks::WRITE_POSTED)
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "compress"
     }
@@ -632,36 +636,91 @@ impl Record for CompressRecord {
     /// ```
     ///
     /// The field index never enters the decision, so ALL FIVE SPC_RESET fields
-    /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone. The
-    /// `monitor()` half is [`Record::monitor_side_effect_fields`].
+    /// (`COMPRESS_SPC_RESET_FIELDS`) reset the buffer, not RES alone.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after && COMPRESS_SPC_RESET_FIELDS.contains(&field) {
             self.reset();
-            self.monitor_posts = self.monitor();
+            self.reset_posts = if self.monitor() { 0b101 } else { 0b110 };
         }
         Ok(())
     }
 
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        // The `monitor(prec)` half of C's SPC_RESET `special()`. Which fields
-        // that is, is `monitor()`'s decision, not this hook's: VAL always, NUSE
-        // only when it changed against the OUSE latch (compressRecord.c:104-108)
-        // — so a second RES put on an already-empty buffer re-posts VAL alone,
-        // as C does. Keyed on the same five fields as the reset itself; none of
-        // them is pp(TRUE), so this is the only monitor such a put produces.
-        if COMPRESS_SPC_RESET_FIELDS.contains(&put_field) {
-            self.monitor_posts
-        } else {
-            &[]
+    /// A put's drain takes the `special()` posts; a cycle takes NUSE's mark.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        if std::mem::take(&mut self.nuse_moved) {
+            static CYCLE_POSTS: [(
+                crate::server::record::FieldIx,
+                crate::server::record::CyclePostMask,
+            ); 1] = crate::server::record::declared_post_table(
+                crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                CYCLE_POSTS_NAMED,
+            );
+            return crate::server::record::CycleMarks::of(&CYCLE_POSTS, 1);
         }
+        static RESET_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 3] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::COMPRESS_FIELDS,
+            RESET_POSTS_NAMED,
+        );
+        crate::server::record::CycleMarks::of(
+            &RESET_POSTS,
+            u128::from(std::mem::take(&mut self.reset_posts)),
+        )
+    }
+
+    /// `monitor()` posts VAL and NUSE alone (`compressRecord.c:101-111`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                    ["VAL", "NUSE"],
+                )
+            },
+        )
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["NUSE"]
+    }
+
+    /// The `alarm_mask ||` half of NUSE's test (`compressRecord.c:105`).
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::COMPRESS_FIELDS,
+                ["NUSE"],
+            )
+        }
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
+    /// The deadband classes, with the walk told to take NUSE's mark only on a
+    /// cycle that moved it.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.nuse_moved;
+        classes
     }
 
     /// The `recGblResetAlarms` half of C's SPC_RESET `special()`. C's `monitor()`
     /// (compressRecord.c:103) — which `special()` invokes for every SPC_RESET
     /// write — opens with `recGblResetAlarms(prec)`, so a put to any of the five
     /// reset fields commits the record's pending alarm (clearing the born-UDF of
-    /// a never-processed compress) without a process cycle. Keyed on the same
-    /// five fields as [`Record::monitor_side_effect_fields`].
+    /// a never-processed compress) without a process cycle.
     fn special_commits_alarms(&self, put_field: &str) -> bool {
         COMPRESS_SPC_RESET_FIELDS.contains(&put_field)
     }
@@ -682,10 +741,6 @@ impl Record for CompressRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // Safety net: clear the INP-read marker for any cycle whose read never
-        // reached `push_array` (no INP, empty/error read, scalar via
-        // `push_value`), so a later direct VAL put cannot inherit a stale mark.
-        self.inp_read_pending = false;
         // C's `process()` does NOT inspect RES: the reset is `special()`'s, and
         // `special()` zeroes RES as part of `reset()`. A record can never enter
         // `process()` with RES set.
@@ -703,7 +758,7 @@ impl Record for CompressRecord {
         }
         // C `compressRecord.c:365-371`: the epilogue calls `monitor(prec)`,
         // which is where OUSE latches on a publishing cycle.
-        self.monitor_posts = self.monitor();
+        self.nuse_moved = self.monitor();
         Ok(ProcessOutcome::complete())
     }
 
@@ -940,6 +995,16 @@ impl Record for CompressRecord {
         "VAL"
     }
 
+    /// VAL is always an array, which is never undefined and has no deadband:
+    /// answered from that fact, not by linearising the ring through `val()`.
+    fn value_is_undefined(&self) -> bool {
+        false
+    }
+
+    fn monitor_deadband_value(&self) -> Option<crate::server::record::AlarmLimit> {
+        None
+    }
+
     /// C `compressRecord.c:327-343` — the INP ingest, and the one gate on it:
     ///
     /// ```c
@@ -958,12 +1023,16 @@ impl Record for CompressRecord {
     ///
     /// compress emits no link action of its own. It used to emit a `ReadDbLink`
     /// reading a link string off a `CompressRecord::inp` field the loader never
-    /// populates (a `.db`'s `field(INP,...)` lands in `common.inp`, since
+    /// populates (a `.db`'s `field(INP,...)` lands in `common.text.inp`, since
     /// `COMPRESS_FIELDS` declares no INP, matching `compressRecord.dbd.pod`).
     /// That field was a second, always-empty INP: the action never fired for a
     /// loaded record, and a `caget CMP.INP` answered `""` where softIoc answers
     /// the link text. It is gone; INP has one source.
-    fn pre_input_link_actions(&mut self) -> crate::server::record::ProcessActions {
+    fn pre_input_link_actions(
+        &mut self,
+        _dol_is_constant: bool,
+        _dpvt: &mut crate::server::device_support::Dpvt,
+    ) -> crate::server::record::ProcessActions {
         // The per-cycle ingest/emit facts, cleared before the framework's input
         // stage can set them. If no value arrives (link not connected, or a
         // failed read), both stay false: `check_alarms` raises LINK/INVALID and
@@ -978,16 +1047,28 @@ impl Record for CompressRecord {
     /// C's `dbGetLink(&prec->inp, DBF_DOUBLE, prec->wptr, 0, &nelements)`
     /// inside `process()` (:341).
     ///
-    /// It is the ONLY INP-driven ingest, which is what `inp_read_pending`
-    /// records: C's element-count reset (`nelements != prec->inpn` frees WPTR
-    /// and `reset()`s, :334-340) lives in `process` and keys on WPTR, the INP
-    /// read buffer — a CA put to VAL reaches `put_field` directly, never
-    /// `set_val`, and must NOT reset. Marking the ingest here instead of in
-    /// `pre_process_actions` is what makes the mark fire for a LOADED record:
-    /// the old mark rode on the dead `ReadDbLink` above.
+    /// It is the ONLY INP-driven ingest, so it owns INPN and C's element-count
+    /// reset (:334-340): a changed count frees WPTR and `reset()`s, and the
+    /// first read, with no WPTR yet, only latches. A scalar source latches 1. A
+    /// CA put to VAL is `put_array_info`, never reaches here, and never resets.
+    ///
+    /// The read is `DBF_DOUBLE`, so a `Double`/`DoubleArray` carrier is already
+    /// in the ingest's type and goes straight into the ring; only another
+    /// carrier needs the converter, which asks `get_field("VAL")` its shape.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        self.inp_read_pending = true;
-        self.put_field_internal("VAL", value)
+        let nelements = value.count() as usize;
+        if nelements > 0 {
+            if self.inpn != 0 && nelements != self.inpn {
+                self.reset();
+            }
+            self.inpn = nelements;
+        }
+        match value {
+            EpicsValue::DoubleArray(arr) => self.push_array(&arr),
+            EpicsValue::Double(v) => self.push_value(v),
+            other => return self.put_field_internal("VAL", other),
+        }
+        Ok(())
     }
 
     /// C `compressRecord.c:328-343` — the record's only alarm. A cycle that
@@ -1028,6 +1109,19 @@ mod pbuf_tests {
         assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::ULong(1)));
     }
 
+    /// The overrides answer what the trait defaults derive from `val()`, which
+    /// is a `DoubleArray` whether the ring is empty, partial or full.
+    #[test]
+    fn val_shape_answers_match_the_val_derived_defaults() {
+        let mut rec = CompressRecord::new(3, 4);
+        for fill in [0.0, f64::NAN, 2.0, 3.0] {
+            assert!(matches!(rec.val(), Some(EpicsValue::DoubleArray(_))));
+            assert!(!rec.value_is_undefined());
+            assert_eq!(rec.monitor_deadband_value(), None);
+            rec.push_value(fill);
+        }
+    }
+
     #[test]
     fn alg_defaults_to_zero_per_absent_dbd_initial() {
         // C `field(ALG,DBF_MENU){ menu(compressALG) }` has no `initial(...)`,
@@ -1058,7 +1152,7 @@ mod pbuf_tests {
             "1/4 samples → accumulating (CompleteNoEmit), not emitting"
         );
 
-        let mut inst = RecordInstance::new("CMP".into(), cmp);
+        let mut inst = RecordInstance::new("CMP", cmp);
         let (snap, actions) = inst.process_local().unwrap();
 
         assert!(
@@ -1081,18 +1175,14 @@ mod pbuf_tests {
         let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=3 (Average)
         rec.n = 2; // average over 2 cycles
 
-        // `inp_read_pending` marks each push as the INP-driven ingest (what
-        // `pre_process_actions` sets in the real process path); only those may
-        // trigger the element-count reset.
+        // `set_val` is the INP-driven ingest; only it may reset on a count change.
+        let inp = |v: &[f64]| EpicsValue::DoubleArray(v.to_vec().into());
         // Cycle 1: length 4, mid-window (inx 0 -> 1, no emit).
-        rec.inp_read_pending = true;
-        rec.push_array(&[10.0, 20.0, 30.0, 40.0]);
+        rec.set_val(inp(&[10.0, 20.0, 30.0, 40.0])).unwrap();
         // Cycle 2: length CHANGES to 2 -> reset + restart (inx 0 -> 1, no emit).
-        rec.inp_read_pending = true;
-        rec.push_array(&[2.0, 2.0]);
+        rec.set_val(inp(&[2.0, 2.0])).unwrap();
         // Cycle 3: length 2 again -> inx 1 -> 2 -> emit mean([2,2],[4,4])=[3,3].
-        rec.inp_read_pending = true;
-        rec.push_array(&[4.0, 4.0]);
+        rec.set_val(inp(&[4.0, 4.0])).unwrap();
 
         // Clean restart: the average is the mean of the two post-resize
         // 2-element waveforms, NOT a blend with the stale length-4 cycle-1 data

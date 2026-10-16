@@ -15,9 +15,8 @@
 
 #![cfg(tokio_backend)]
 
-use super::interop_helpers::{LogCapture, pvxs_lib_dir};
+use super::interop_helpers::{LogCapture, PvxsOutput, pvxs_command};
 
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,11 +27,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     use epics_pva_rs::server_native::{SharedPV, SharedSource};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("r20_typed_monitor");
 
     // Capture the server's debug output for the discriminating assertion
@@ -48,7 +43,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
@@ -86,20 +81,11 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
         }
     });
 
-    // Spawn the helper as a subprocess. Wait inside spawn_blocking
-    // so the synchronous .wait_with_output() doesn't park the
-    // runtime worker.
-    let helper_str = helper.display().to_string();
+    // Run the helper inside spawn_blocking so the synchronous wait doesn't
+    // park the runtime worker.
     let server_str = format!("{}:{}", addr.ip(), addr.port());
-    let env_key = if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    };
-    let lib_dir = pvxs_lib_dir();
-
     let output = tokio::task::spawn_blocking(move || {
-        let child = Command::new(&helper_str)
+        pvxs_command(&helper)
             .arg("--server")
             .arg(&server_str)
             .arg("--pv")
@@ -108,11 +94,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
             .arg("3")
             .arg("--timeout")
             .arg("6")
-            .env(env_key, lib_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child.wait_with_output()
+            .pvxs_output()
     })
     .await
     .expect("join helper");

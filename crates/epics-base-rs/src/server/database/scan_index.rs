@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::server::record::{PiniMode, RecordCell, ScanList, ScanType};
 
 use super::PvDatabase;
+use crate::types::RecordName;
 
 /// The scan buckets themselves. `bucket` is private to THIS module, so no
 /// other file in `database` can open a bucket and write it — the only
@@ -29,6 +30,13 @@ use super::PvDatabase;
 /// value and then takes the mutex sees the keys that produced it.
 struct ScanBucket {
     revision: std::sync::atomic::AtomicU64,
+    /// Cumulative over-runs of this list — C `periodic_scan_list::overruns`
+    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
+    /// (`dbScan.c:408-409`). Part of the bucket, so counting one is a store
+    /// into memory the scan thread's own sweep already touched, never a
+    /// first-use allocation on that thread. Only the periodic scan threads
+    /// write it.
+    overruns: std::sync::atomic::AtomicU64,
     entries: crate::runtime::sync::PriorityInheritanceMutex<Bucket>,
 }
 
@@ -45,10 +53,14 @@ impl ScanBucket {
     fn new() -> Self {
         Self {
             revision: std::sync::atomic::AtomicU64::new(0),
-            entries: crate::runtime::sync::PriorityInheritanceMutex::new(Bucket {
-                keys: BTreeSet::new(),
-                ordered: None,
-            }),
+            overruns: std::sync::atomic::AtomicU64::new(0),
+            entries: crate::runtime::sync::PriorityInheritanceMutex::new(
+                Bucket {
+                    keys: BTreeSet::new(),
+                    ordered: None,
+                },
+                crate::runtime::sync::CMutex::ScanList,
+            ),
         }
     }
 
@@ -95,20 +107,15 @@ pub(super) struct ScanIndex {
     /// point by ordering — `dbLoadDatabase`, then `iocInit` → `initPeriodic`
     /// sizes `papPeriodic`.
     buckets: std::sync::OnceLock<Box<[ScanBucket]>>,
-    /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
-    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
-    /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
-    /// `periodic_scan_list`: one owner per rate holds both the list and its
-    /// over-run count, so the counter cannot drift away from the list it
-    /// counts. Only the periodic scan threads write it.
-    overruns: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// C `pevent_list`: every event handle `eventNameToHandle` has created.
+    events: EventTable,
 }
 
 impl ScanIndex {
     pub(super) fn new() -> Self {
         Self {
             buckets: std::sync::OnceLock::new(),
-            overruns: std::sync::OnceLock::new(),
+            events: EventTable::new(),
         }
     }
 
@@ -120,16 +127,9 @@ impl ScanIndex {
             .as_ref()[list.slot()]
     }
 
-    /// This list's over-run counter — the same lazy sizing as [`Self::bucket`].
+    /// This list's over-run counter, which its bucket owns.
     fn overrun(&self, list: ScanList) -> &std::sync::atomic::AtomicU64 {
-        &self
-            .overruns
-            .get_or_init(|| {
-                (0..ScanList::count())
-                    .map(|_| std::sync::atomic::AtomicU64::new(0))
-                    .collect()
-            })
-            .as_ref()[list.slot()]
+        &self.bucket(list).overruns
     }
 }
 
@@ -153,19 +153,17 @@ impl PvDatabase {
         &self,
         scan: ScanType,
         phas: i16,
-        record_type: &str,
+        record_type: &'static str,
         load_order: u64,
-        name: &str,
+        name: impl Into<crate::types::RecordName>,
     ) {
+        let name = name.into();
         let Some(list) = scan.scan_list() else {
             return;
         };
         // Resolved once here, where a record enters the list, instead of once
         // per record per sweep inside the process frame.
-        let handle = self
-            .get_record_no_resolve(name)
-            .map(|rec| std::sync::Arc::downgrade(&rec))
-            .unwrap_or_default();
+        let handle = self.get_record_no_resolve(&name);
         self.inner.scan_index.bucket(list).transition(|keys| {
             keys.insert(super::ScanKey::new(
                 phas,
@@ -184,14 +182,14 @@ impl PvDatabase {
     /// Matches by record name alone: PHAS and load-order may be stale relative
     /// to the entry actually present, and a stale secondary key would leave a
     /// phantom entry behind.
-    pub(super) fn delete_from_scan_list(&self, scan: ScanType, name: &str) {
+    pub(super) fn delete_from_scan_list(&self, scan: ScanType, name: &[u8]) {
         let Some(list) = scan.scan_list() else {
             return;
         };
         self.inner
             .scan_index
             .bucket(list)
-            .transition(|keys| keys.retain(|k| k.name.as_ref() != name));
+            .transition(|keys| keys.retain(|k| *k.name != *name));
     }
 
     /// Update scan index when a record's SCAN or PHAS field changes.
@@ -222,12 +220,13 @@ impl PvDatabase {
     /// `dbScanLock`.
     pub fn update_scan_index(
         &self,
-        name: &str,
+        name: impl AsRef<[u8]>,
         old_scan: ScanType,
         _new_scan: ScanType,
         old_phas: i16,
         _new_phas: i16,
     ) {
+        let name = name.as_ref();
         let _ = old_phas; // entry matched by name; PHAS not needed.
         // The LIVE record's SCAN/PHAS are read under L46 so that the map
         // check and the index mutation are one transaction against a
@@ -264,8 +263,26 @@ impl PvDatabase {
         let Some(rec_arc) = rec_arc else {
             return;
         };
+        // C `scanAdd` creates the record's event handle (dbScan.c:333). That
+        // allocates, so EVNT — DBF_STRING size(40) — is copied out on the
+        // stack and the handle is made once the locks are down.
+        let mut evnt = [0u8; 40];
+        let mut evnt_len = None;
         let (cur_scan, cur_phas, cur_type) = {
             let inst = rec_arc.read();
+            let bytes = inst.common.text.evnt.as_bytes();
+            if inst.common.scan == ScanType::Event
+                && bytes.len() <= evnt.len()
+                && self
+                    .inner
+                    .scan_index
+                    .events
+                    .built
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                evnt[..bytes.len()].copy_from_slice(bytes);
+                evnt_len = Some(bytes.len());
+            }
             (
                 inst.common.scan,
                 inst.common.phas,
@@ -277,6 +294,11 @@ impl PvDatabase {
         // before should always scan before a later-loaded record at the same
         // PHAS.
         self.add_to_scan_list(cur_scan, cur_phas, cur_type, rec_arc.load_order(), name);
+        drop(_gate);
+        drop(_record_gate);
+        if let Some(len) = evnt_len {
+            self.event_name_to_handle(&evnt[..len]);
+        }
     }
 
     /// Count one over-run for `scan`'s list — C `ppsl->overruns++`
@@ -312,7 +334,7 @@ impl PvDatabase {
     ///
     /// A SCAN value that names no list (`Passive`, or an index outside
     /// `menuScan`) holds no records — there is no such bucket to look up.
-    pub async fn records_for_scan(&self, scan_type: ScanType) -> Vec<String> {
+    pub async fn records_for_scan(&self, scan_type: ScanType) -> Vec<RecordName> {
         let Some(list) = scan_type.scan_list() else {
             return Vec::new();
         };
@@ -329,31 +351,126 @@ impl PvDatabase {
             .snapshot()
             .1
             .iter()
-            .map(|k| k.name.to_string())
+            .map(|k| k.name.clone())
             .collect()
+    }
+
+    /// C `eventNameToHandle` for a name some caller holds: creates the event
+    /// if it does not exist yet. `None` names no event.
+    pub(crate) fn event_name_to_handle(&self, name: &[u8]) {
+        if let Some(event) = EventName::of(name) {
+            self.inner.scan_index.events.handle(event);
+        }
+    }
+
+    /// The events C's `scanpel` walks, newest first as `pevent_list` is
+    /// (`dbScan.c:530-531`), each with its `SCAN = "Event"` records in
+    /// scan-list order. An event no record scans on has an empty list.
+    pub(crate) fn event_lists(&self) -> Vec<(Box<[u8]>, Vec<RecordName>)> {
+        let mut events: Vec<(Box<[u8]>, Vec<RecordName>)> = self
+            .inner
+            .scan_index
+            .events
+            .created
+            .lock()
+            .iter()
+            .rev()
+            .map(|label| (label.clone(), Vec::new()))
+            .collect();
+        let keys = self
+            .inner
+            .scan_index
+            .bucket(ScanType::Event.scan_list().expect("Event is a scan list"))
+            .snapshot()
+            .1;
+        for key in keys.iter() {
+            let Some(rec) = key.handle.clone().or_else(|| self.get_record(&key.name)) else {
+                continue;
+            };
+            let Some(event) =
+                EventName::of(rec.read().common.text.evnt.as_bytes()).map(|e| e.to_bytes())
+            else {
+                continue;
+            };
+            if let Some((_, names)) = events.iter_mut().find(|(label, _)| *label == event) {
+                names.push(key.name.clone());
+            }
+        }
+        events
+    }
+
+    /// The `iocInit` share of `pevent_list`, in C's order: `initDatabase`'s
+    /// `init_record` pass first — an event record's VAL (eventRecord.c:102)
+    /// and a calcout's OEVT (calcoutRecord.c:213) — then `buildScanLists`'
+    /// `scanAdd` of every `SCAN = "Event"` record (dbScan.c:333), each pass in
+    /// record-type then load order.
+    pub(super) fn build_event_table(&self) {
+        // Out of the map before any record lock: `update_scan_index` takes a
+        // record's lock and then the map.
+        let cells: Vec<Arc<RecordCell>> = self.inner.records.read().values().cloned().collect();
+        let mut records: Vec<(&'static str, u64, Arc<RecordCell>)> = cells
+            .into_iter()
+            .map(|rec| {
+                let key = super::ScanKey::new(
+                    0,
+                    rec.read().record.record_type(),
+                    rec.load_order(),
+                    "",
+                    None,
+                );
+                (key.record_type, key.load_order, rec)
+            })
+            .collect();
+        records.sort_by_key(|(record_type, load_order, _)| (*record_type, *load_order));
+        for (_, _, rec) in &records {
+            let field = match rec.read().record.record_type() {
+                "event" => "VAL",
+                "calcout" => "OEVT",
+                _ => continue,
+            };
+            let name = rec.read().resolve_field(field);
+            if let Some(crate::types::EpicsValue::String(name)) = name {
+                self.event_name_to_handle(name.as_bytes());
+            }
+        }
+        for (_, _, rec) in &records {
+            let evnt = {
+                let inst = rec.read();
+                (inst.common.scan == ScanType::Event).then(|| inst.common.text.evnt.clone())
+            };
+            if let Some(evnt) = evnt {
+                self.event_name_to_handle(evnt.as_bytes());
+            }
+        }
+        self.inner
+            .scan_index
+            .events
+            .built
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// The scan key `name` would be inserted under RIGHT NOW — its live PHAS,
     /// record type and load-order sequence. `None` if the record is gone.
-    fn live_scan_key(&self, name: &str) -> Option<super::ScanKey> {
+    fn live_scan_key(&self, name: &RecordName) -> Option<super::ScanKey> {
         let rec = self.get_record_no_resolve(name)?;
         let (phas, record_type) = {
             let inst = rec.read();
             (inst.common.phas, inst.record.record_type())
         };
+        let load_order = rec.load_order();
         Some(super::ScanKey::new(
             phas,
             record_type,
-            rec.load_order(),
+            load_order,
             name,
-            std::sync::Arc::downgrade(&rec),
+            Some(rec),
         ))
     }
 
     /// A cursor over `list` as it stands at each step — see [`ScanCursor`].
-    pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor {
+    pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor<'_> {
         ScanCursor {
-            list,
+            bucket: self.inner.scan_index.bucket(list),
             snapshot: None,
             next: 0,
             revision: 0,
@@ -468,12 +585,16 @@ impl PvDatabase {
         // The key carries the instance the list was built with; a key whose
         // record has since been replaced falls back to the name, which is what
         // the sequential sweep's `process_record_with_links_sync` arm is for.
-        let Some(rec) = key
-            .handle
-            .upgrade()
-            .or_else(|| self.get_record_no_resolve(&key.name))
-        else {
-            return;
+        let fallback;
+        let rec = match &key.handle {
+            Some(rec) => rec,
+            None => match self.get_record_no_resolve(&key.name) {
+                Some(rec) => {
+                    fallback = rec;
+                    &fallback
+                }
+                None => return,
+            },
         };
         if rec.read().common.scan != scan {
             return;
@@ -497,9 +618,9 @@ impl PvDatabase {
     /// `add_record` (which now takes the registration_mutex →
     /// records.write()), startup could stall while every PINI
     /// record was inspected serially.
-    pub async fn pini_records(&self, mode: PiniMode) -> Vec<String> {
+    pub async fn pini_records(&self, mode: PiniMode) -> Vec<RecordName> {
         let mut result = Vec::new();
-        for (name, rec) in self.records_in_load_order() {
+        for (name, rec) in self.iterate_records() {
             if rec.read().common.pini == mode.to_u16() as i16 {
                 result.push(name);
             }
@@ -507,29 +628,28 @@ impl PvDatabase {
         result
     }
 
-    /// Every record, in database **load order** — the port's analogue of C's
-    /// `iterateRecords`, which walks the record-type / record-instance lists in
-    /// the order the `.db` declared them. That order is what makes two
-    /// same-`PHAS` records process deterministically; `load_order` is one of
-    /// the `scan_index` sort keys for the same reason (see `ScanKey`, which
-    /// also carries the record-type ordinal C's `iterateRecords` walks first —
-    /// this PINI sweep does not, and that is a separate gap).
+    /// Every record in C's `iterateRecords` order (`iocInit.c:484-506`): the
+    /// record types as `recordTypeList` holds them, each type's records in
+    /// `.db` load order. An IOC loads its expanded `.dbd`, whose record types
+    /// are name-sorted (see `contributed_dbd::record_types`), so the type
+    /// order is `strcmp` order — `aSub` before `aai` — for a type no vendored
+    /// `.dbd` declares as well.
     ///
     /// Snapshots the map under the records read lock and releases it before the
-    /// caller takes any per-record lock. The sort key travels with the record,
-    /// so the snapshot and the key come from that one read.
-    pub(super) fn records_in_load_order(&self) -> Vec<(String, std::sync::Arc<RecordCell>)> {
+    /// caller takes any per-record lock. Both sort keys live on the cell, so no
+    /// record lock is taken to sort.
+    pub(super) fn iterate_records(&self) -> Vec<(RecordName, std::sync::Arc<RecordCell>)> {
         let mut keyed: Vec<_> = {
             let records = self.inner.records.read();
             records
                 .iter()
-                .map(|(n, r)| (r.load_order(), n.to_string(), r.clone()))
+                .map(|(n, r)| (r.rdes().record_type, r.load_order(), n.clone(), r.clone()))
                 .collect()
         };
-        keyed.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        keyed.sort_unstable_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
         keyed
             .into_iter()
-            .map(|(_seq, name, rec)| (name, rec))
+            .map(|(_, _, name, rec)| (name, rec))
             .collect()
     }
 
@@ -538,10 +658,11 @@ impl PvDatabase {
     /// full link chain.
     ///
     /// The single owner of "run a PINI pass": `initialProcess()` calls it with
-    /// [`PiniMode::Yes`], and the `initHook` lifecycle calls it with
-    /// [`PiniMode::Run`] / [`PiniMode::Running`]. Every driver goes through
-    /// here, so neither the pass selection nor the phase ordering can diverge
-    /// between them.
+    /// [`PiniMode::Yes`], and `piniProcessHook` with the RUN, RUNNING, PAUSE
+    /// and PAUSED modes from the lifecycle transitions. Every driver goes
+    /// through here, so neither the pass selection nor the phase ordering can
+    /// diverge between them. Synchronous, as the hooks that call it are;
+    /// [`Self::pini_process`] is its async spelling.
     ///
     /// The sweep is C's, not a pre-sorted list: each pass over the database
     /// processes the records at the current phase and, while doing so, finds
@@ -551,6 +672,11 @@ impl PvDatabase {
     /// phase is raised by an earlier PINI record's processing is still picked
     /// up in the correct later pass, which a snapshot-and-sort would miss.
     pub async fn pini_process(&self, mode: PiniMode) {
+        self.pini_pass(mode);
+    }
+
+    /// C `piniProcess` (`iocInit.c:608-627`); see [`Self::pini_process`].
+    pub(crate) fn pini_pass(&self, mode: PiniMode) {
         // C `dbScan.h:34-35`: MAX_PHASE = SHRT_MAX, MIN_PHASE = SHRT_MIN. The
         // phase cursors are `int` (`phaseData_t`), so `MAX_PHASE + 1` — the
         // "no further phase found" sentinel — does not overflow.
@@ -569,7 +695,7 @@ impl PvDatabase {
             // See `scan_list_once`: one set per sweep, emptied by each frame's
             // own unwind.
             let mut visited = crate::server::database::ProcStack::new();
-            for (name, rec) in self.records_in_load_order() {
+            for (name, rec) in self.iterate_records() {
                 let (pini, phas) = {
                     let instance = rec.read();
                     (instance.common.pini, i32::from(instance.common.phas))
@@ -578,8 +704,7 @@ impl PvDatabase {
                     continue;
                 }
                 if phas == this {
-                    let _ =
-                        self.process_record_with_links_resolved(&name, rec.clone(), &mut visited);
+                    let _ = self.process_record_with_links_resolved(&name, &rec, &mut visited);
                     debug_assert!(
                         visited.is_empty(),
                         "a returned process frame left its cycle marker behind"
@@ -604,7 +729,7 @@ impl PvDatabase {
     pub async fn post_event(&self) {
         // C `postEvent` (`dbScan.c:536-539`): an event posted while the
         // facility is not running queues nothing at all.
-        if !crate::server::scan::scan_is_running() {
+        if !self.inner.scan_ctl.is_running() {
             return;
         }
         if let Some(list) = ScanType::Event.scan_list() {
@@ -621,16 +746,17 @@ impl PvDatabase {
     /// surrounding whitespace is trimmed, and a numeric string with an
     /// integer part in `[1,255]` is normalised to its integer form so
     /// `"5"`, `" 5 "` and `"5.0"` all name the same event.
-    pub async fn post_event_named(&self, event_name: &str) {
-        // C `postEvent` (`dbScan.c:536-539`), reached through
-        // `post_event`/`eventNameToHandle` — the same gate, applied before
-        // the name lookup because C applies it before touching the list.
-        if !crate::server::scan::scan_is_running() {
+    pub async fn post_event_named(&self, event_name: impl AsRef<[u8]>) {
+        // `eventNameToHandle` returns NULL for "0"/empty — no event.
+        let Some(want) = EventName::of(event_name.as_ref()) else {
             return;
-        }
-        let want = normalize_event_name(event_name);
-        if want.is_empty() {
-            // `eventNameToHandle` returns NULL for "0"/empty — no event.
+        };
+        // The handle is created whether or not the post then runs: the event
+        // record (devEventSoft.c:82) and iocsh `postEvent`
+        // (dbIocRegister.c:478) call `eventNameToHandle` before `postEvent`.
+        self.inner.scan_index.events.handle(want);
+        // C `postEvent` (`dbScan.c:538-539`).
+        if !self.inner.scan_ctl.is_running() {
             return;
         }
         let Some(list) = ScanType::Event.scan_list() else {
@@ -649,11 +775,20 @@ impl PvDatabase {
             // Read the record's EVNT and compare against the posted
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
-            let Some(rec) = rec.or_else(|| self.get_record(name)) else {
-                continue;
+            // Borrowed when the list carries the cell; owned only when the key
+            // predates its record and the name has to be resolved.
+            let fallback;
+            let rec = match rec {
+                Some(rec) => rec,
+                None => match self.get_record(name) {
+                    Some(rec) => {
+                        fallback = rec;
+                        &fallback
+                    }
+                    None => continue,
+                },
             };
-            let evnt = rec.read().common.evnt.clone();
-            if normalize_event_name(&evnt) != want {
+            if EventName::of(rec.read().common.text.evnt.as_bytes()) != Some(want) {
                 continue;
             }
             let _ = self.process_record_with_links_resolved(name, rec, &mut visited);
@@ -661,6 +796,64 @@ impl PvDatabase {
                 visited.is_empty(),
                 "a returned process frame left its cycle marker behind"
             );
+        }
+    }
+}
+
+/// C `pevent_list` (`dbScan.c:118-121`): the event handles in creation order.
+/// A handle is never freed, so the table only grows, and its labels are C's —
+/// a numbered event is named by `%i` (`dbScan.c:517`).
+struct EventTable {
+    /// `pevent_list[1..255]`, as "created" flags: a post of a numbered event
+    /// that exists answers from here without the lock.
+    numbered: [std::sync::atomic::AtomicBool; 256],
+    /// C `event_lock` and the chain it guards, oldest first.
+    created: crate::runtime::sync::PriorityInheritanceMutex<Vec<Box<[u8]>>>,
+    /// Set once `ioc_init` has run C's `buildScanLists` share of the table;
+    /// before it, a SCAN change is a load-time edit that pass will meet.
+    built: std::sync::atomic::AtomicBool,
+}
+
+impl EventTable {
+    fn new() -> Self {
+        Self {
+            numbered: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+            created: crate::runtime::sync::PriorityInheritanceMutex::new(
+                Vec::new(),
+                crate::runtime::sync::CMutex::ScanEvent,
+            ),
+            built: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// C `eventNameToHandle`'s find-or-create (`dbScan.c:493-532`). A
+    /// numbered event that exists answers from its flag alone.
+    #[inline]
+    fn handle(&self, event: EventName<'_>) {
+        if let EventName::Number(n) = event
+            && self.numbered[n as usize].load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        self.create(event);
+    }
+
+    #[cold]
+    fn create(&self, event: EventName<'_>) {
+        use std::sync::atomic::Ordering;
+        let mut created = self.created.lock();
+        match event {
+            EventName::Number(n) => {
+                if !self.numbered[n as usize].load(Ordering::Relaxed) {
+                    created.push(n.to_string().into_bytes().into());
+                    self.numbered[n as usize].store(true, Ordering::Release);
+                }
+            }
+            EventName::Named(name) => {
+                if !created.iter().any(|c| **c == *name) {
+                    created.push(name.into());
+                }
+            }
         }
     }
 }
@@ -730,8 +923,10 @@ impl ScanPassSnapshot {
 /// record that moved within this list (its own processing changed its PHAS) is
 /// advanced from where it is now — C's `pse->pscan_list == psl` branch
 /// (`:1023-1029`).
-pub(crate) struct ScanCursor {
-    list: ScanList,
+pub(crate) struct ScanCursor<'a> {
+    /// The list's bucket, found once at the top of the sweep: a step is an
+    /// index and one revision load, with no bucket lookup behind it.
+    bucket: &'a ScanBucket,
     /// The list as it stood at [`Self::revision`]; `None` before the first
     /// step, which is the one state in which there is no place to keep.
     snapshot: Option<Arc<[super::ScanKey]>>,
@@ -742,7 +937,7 @@ pub(crate) struct ScanCursor {
     revision: u64,
 }
 
-impl ScanCursor {
+impl ScanCursor<'_> {
     /// Where the cursor stands: the entry the last step handed out.
     fn standing(&self) -> Option<&super::ScanKey> {
         self.snapshot.as_ref()?.get(self.next.checked_sub(1)?)
@@ -756,10 +951,12 @@ impl ScanCursor {
     /// processing having changed its PHAS, so its key is rebuilt from live
     /// state before the resume point is looked up. `live_scan_key` reads the
     /// records map and the record itself, so no bucket lock is held across it.
+    #[cold]
+    #[inline(never)]
     fn resync(&mut self, db: &PvDatabase) {
         let was = self.standing().cloned();
         let live = was.as_ref().and_then(|w| db.live_scan_key(&w.name));
-        let (revision, snapshot) = db.inner.scan_index.bucket(self.list).snapshot();
+        let (revision, snapshot) = self.bucket.snapshot();
         let resume = match live {
             // The rebuilt key is the resume point only if THIS list is where
             // the record landed; one whose SCAN moved it to another list
@@ -783,52 +980,171 @@ impl ScanCursor {
     /// re-find alone when it is — never across processing, as C releases
     /// `psl->lock` around every `dbProcess`.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&str, Option<Arc<RecordCell>>)> {
-        let bucket = db.inner.scan_index.bucket(self.list);
+    #[inline]
+    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<(&[u8], Option<&Arc<RecordCell>>)> {
         if self.snapshot.is_none()
-            || bucket.revision.load(std::sync::atomic::Ordering::Acquire) != self.revision
+            || self
+                .bucket
+                .revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                != self.revision
         {
             self.resync(db);
         }
-        let key = self.snapshot.as_ref()?.get(self.next)?;
+        let snap = self.snapshot.as_ref()?;
+        let n = self.next;
+        // A record's DRAM misses (cell, then what it points at, then what
+        // that names) are serial inside its own cycle; started here, records
+        // ahead, they overlap the current one's (rs2001 tail).
+        if let Some(rec) = snap.get(n + 3).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_cell();
+        }
+        if let Some(rec) = snap.get(n + 2).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_lock_record();
+        }
+        if let Some(rec) = snap.get(n + 1).and_then(|k| k.handle.as_ref()) {
+            rec.prefetch_targets();
+        }
+        let key = snap.get(n)?;
+        if let Some(rec) = key.handle.as_ref() {
+            rec.prefetch_cell();
+            rec.prefetch_lock_record();
+            rec.prefetch_targets();
+        }
         self.next += 1;
-        Some((&key.name, key.handle.upgrade()))
+        Some((&key.name, key.handle.as_ref()))
     }
 }
 
-/// Normalise an EPICS event name for routing comparison.
-///
-/// Mirrors `dbScan.c::eventNameToHandle` (`dbScan.c:469-533`):
+/// The event an EPICS event name resolves to, borrowed from the name —
+/// C `eventNameToHandle`'s identity (`dbScan.c:469-533`):
 /// * leading/trailing whitespace is stripped;
-/// * a string that parses as a number with an integer part in
-///   `[1,255]` is canonicalised to that integer's decimal form
-///   (so numeric events from calc records match symbolic "5");
-/// * `"0"` (and anything that resolves to event 0) becomes empty —
-///   C's `eventNameToHandle` returns NULL for event 0.
-pub(crate) fn normalize_event_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Ok(num) = trimmed.parse::<f64>() {
-        if num >= 0.0 && num < 256.0 {
-            let int = num as i64;
-            if int < 1 {
-                // event 0 → no event
-                return String::new();
-            }
-            return int.to_string();
+/// * a string that parses as a number with an integer part in `[1,255]` is
+///   that event number (so `"5"`, `" 5 "` and `"5.0"` from a calc record name
+///   one event);
+/// * anything that resolves to event 0, and an empty name, is no event —
+///   C's `eventNameToHandle` returns NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventName<'a> {
+    Number(u8),
+    /// The bytes C `strcmp`s against `pevent_list`, as the name spelled them.
+    Named(&'a [u8]),
+}
+
+impl<'a> EventName<'a> {
+    pub(crate) fn of(name: &'a [u8]) -> Option<Self> {
+        let is_space = |b: &u8| crate::runtime::stdlib::c_isspace(*b as char);
+        let start = name.iter().position(|b| !is_space(b))?;
+        let end = name.iter().rposition(|b| !is_space(b))? + 1;
+        let trimmed = &name[start..end];
+        // C `epicsParseDouble`: `strtod`'s grammar, so `0x10` is event 16. A
+        // non-ASCII byte is never part of a number, so such a name is not one.
+        if let Ok(num) = std::str::from_utf8(trimmed)
+            .map_err(|_| ())
+            .and_then(|t| crate::runtime::stdlib::epics_parse_double(t).map_err(|_| ()))
+            && (0.0..256.0).contains(&num)
+        {
+            // `(0.0..256.0)` holds, so the integer part fits `u8`.
+            return match num as u8 {
+                0 => None,
+                n => Some(Self::Number(n)),
+            };
         }
-        // Numeric but outside [0,256): fall through to literal match.
+        // Numeric but outside [0,256): matched literally.
+        Some(Self::Named(trimmed))
     }
-    trimmed.to_string()
+
+    /// The label C gives the handle: `%i` for a number (`dbScan.c:517`),
+    /// the name's own bytes otherwise.
+    pub(crate) fn to_bytes(self) -> Box<[u8]> {
+        match self {
+            Self::Number(n) => n.to_string().into_bytes().into(),
+            Self::Named(s) => s.into(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::EventName;
     use super::PvDatabase;
-    use super::normalize_event_name;
     use crate::server::record::ScanType;
+
+    /// A frame names on its `LockRecord` what the record's next cycle reads —
+    /// the OUT link's `DbLink`, each monitor's queue and slot — and clears
+    /// what the record no longer has, so the walk is never handed a dropped
+    /// one's address.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[epics_macros_rs::epics_test]
+    async fn a_frame_names_its_next_cycles_reads_for_the_walk() {
+        use crate::server::record::{DbLink, EventMask, ParsedLink};
+        use crate::types::{DbFieldType, EpicsValue};
+        const COUNTS: usize = 2 * std::mem::size_of::<usize>();
+
+        let (db, _) = crate::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(ao, "A") {} record(ao, "T") { field(OUT, "A PP") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .expect("db")
+            .build()
+            .await
+            .expect("ioc");
+        let t = db.get_record("T").unwrap();
+        let h = t.lock_record().hints();
+        let body = (&*t.read().record as *const dyn crate::server::record::Record)
+            .cast::<u8>()
+            .addr();
+        let named = |p: usize, len, align| {
+            let h = crate::server::record::Hint::default();
+            h.set(core::ptr::without_provenance(p), len, align);
+            h.named()
+        };
+        assert_eq!(
+            h.body.named().0,
+            named(body, 1, 1).0,
+            "registration names the body"
+        );
+
+        let reader = t
+            .write()
+            .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::VALUE.bits())
+            .expect("monitor");
+        let mut stack = crate::server::database::ProcStack::new();
+        db.process_record_with_links_sync(b"T", &mut stack).unwrap();
+        {
+            let inst = t.read();
+            let ParsedLink::Db(link) = inst.parsed_out.link() else {
+                panic!("OUT is a DB link");
+            };
+            let at = std::sync::Arc::as_ptr(link).cast::<u8>().addr() - COUNTS;
+            assert_eq!(
+                h.out[1].named(),
+                named(
+                    at,
+                    std::mem::size_of::<DbLink>() + COUNTS,
+                    std::mem::align_of::<DbLink>().max(std::mem::align_of::<usize>())
+                )
+            );
+        }
+        assert_ne!(h.posts[0][0].named().1, 0, "the monitor's queue");
+        assert_ne!(h.posts[0][1].named().1, 0, "the monitor's slot");
+        assert_eq!(h.posts[1][0].named(), (0, 0), "one monitor, one pair");
+
+        t.write().remove_subscriber(reader.id());
+        db.process_record_with_links_sync(b"T", &mut stack).unwrap();
+        assert_eq!(
+            h.posts[0].each_ref().map(|h| h.named()),
+            [(0, 0); 2],
+            "a removed monitor names no queue or slot"
+        );
+
+        db.put_record_field_from_ca("T", "OUT", EpicsValue::String(String::new().into()))
+            .await
+            .unwrap();
+        db.process_record_with_links_sync(b"T", &mut stack).unwrap();
+        assert_eq!(h.out[1].named(), (0, 0), "a cleared OUT names no DbLink");
+    }
 
     /// The cycle guard belongs to the frame that inserted it, and a frame
     /// that does not run must not insert one. The set is ONE per sweep
@@ -840,7 +1156,7 @@ mod tests {
         let db = PvDatabase::new();
         let mut visited = crate::server::database::ProcStack::new();
 
-        let result = db.process_record_with_links_sync("NO:SUCH:RECORD", &mut visited);
+        let result = db.process_record_with_links_sync(b"NO:SUCH:RECORD", &mut visited);
 
         assert!(
             result.is_err(),
@@ -875,7 +1191,7 @@ mod tests {
         let held = db.lock_registration("a_test_standing_in_for_a_registration_entry_point");
 
         let violation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            db.update_scan_index("ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
+            db.update_scan_index(b"ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
         }));
 
         let payload = violation
@@ -898,7 +1214,7 @@ mod tests {
     #[test]
     fn the_scan_index_owner_takes_l46_itself_when_no_caller_holds_it() {
         let db = PvDatabase::new();
-        db.update_scan_index("ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
+        db.update_scan_index(b"ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
     }
 
     /// The gate is released on drop, including by unwinding out of a panic
@@ -948,24 +1264,65 @@ mod tests {
             "re-inserting a key the bucket already holds is a transition too"
         );
 
-        db.delete_from_scan_list(ScanType::SEC01, "R:ONE");
+        db.delete_from_scan_list(ScanType::SEC01, b"R:ONE");
         assert_ne!(revision(), re_added, "a removal is a transition");
+    }
+
+    /// The scan key holds its record STRONGLY, so the key leaving the bucket
+    /// is the only thing that frees the record. `remove_record` must take it
+    /// out, or a periodic record is kept alive by the list forever.
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_periodic_record_frees_it() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "SCAN:GONE",
+            Box::new(crate::server::records::calc::CalcRecord::new("VAL+1")),
+        )
+        .await
+        .unwrap();
+        let _ = db
+            .get_record("SCAN:GONE")
+            .unwrap()
+            .write()
+            .set_scan(ScanType::SEC01);
+        db.add_to_scan_list(ScanType::SEC01, 0, "calc", 0, "SCAN:GONE");
+        let cell = db.get_record("SCAN:GONE").unwrap();
+
+        assert!(db.remove_record("SCAN:GONE").await);
+
+        // The record table keeps the cell; nothing else may.
+        assert_eq!(
+            std::sync::Arc::strong_count(&cell),
+            2,
+            "the scan bucket's key outlived the removal"
+        );
     }
 
     #[test]
     fn event_name_numeric_normalisation() {
+        let of = |n: &str| {
+            EventName::of(n.as_bytes()).map(|e| String::from_utf8(e.to_bytes().into()).unwrap())
+        };
         // Whitespace trimmed, numeric forms canonicalised.
-        assert_eq!(normalize_event_name(" 5 "), "5");
-        assert_eq!(normalize_event_name("5.0"), "5");
-        assert_eq!(normalize_event_name("5"), "5");
+        assert_eq!(EventName::of(b" 5 "), Some(EventName::Number(5)));
+        assert_eq!(EventName::of(b"5.0"), Some(EventName::Number(5)));
+        assert_eq!(of("5"), Some("5".into()));
+        assert_eq!(EventName::of(b"255.9"), Some(EventName::Number(255)));
         // Event 0 / empty → no event.
-        assert_eq!(normalize_event_name("0"), "");
-        assert_eq!(normalize_event_name(""), "");
-        assert_eq!(normalize_event_name("   "), "");
+        assert_eq!(of("0"), None);
+        assert_eq!(of("0.5"), None);
+        assert_eq!(of(""), None);
+        assert_eq!(of("   "), None);
         // Symbolic name preserved.
-        assert_eq!(normalize_event_name("myEvent"), "myEvent");
-        assert_eq!(normalize_event_name(" myEvent "), "myEvent");
+        assert_eq!(of("myEvent"), Some("myEvent".into()));
+        assert_eq!(of(" myEvent "), Some("myEvent".into()));
         // Numeric out of [0,256) is treated literally.
-        assert_eq!(normalize_event_name("999"), "999");
+        assert_eq!(of("999"), Some("999".into()));
+        assert_eq!(of("256"), Some("256".into()));
+        // `strtod`'s grammar: hexadecimal, and an infinity or NaN is a name.
+        assert_eq!(EventName::of(b"0x10"), Some(EventName::Number(16)));
+        assert_eq!(of("0x10"), Some("16".into()));
+        assert_eq!(of("inf"), Some("inf".into()));
+        assert_eq!(of("nan"), Some("nan".into()));
     }
 }

@@ -95,7 +95,7 @@ pub struct EosInterpose {
     /// C `eosPvt::processEosIn` (asynInterposeEos.c:42, set from the
     /// `asynInterposeEosConfig` argument at :128). When false the layer is not
     /// in the input path at all: `readIt` delegates straight to the driver
-    /// (:191-193) and the terminator accessors are the driver's (:293, :318).
+    /// (:191-193) and the terminator accessors are the driver's (:294, :319).
     process_in: bool,
     /// C `eosPvt::processEosOut` (:50, :134) — same, for the write path (:161).
     process_out: bool,
@@ -106,7 +106,7 @@ pub struct EosInterpose {
 
 impl EosInterpose {
     /// The `drvAsynIPPortConfigure` install: C passes `processEosIn = 1,
-    /// processEosOut = 1` (drvAsynIPPort.c:1065-1066), so both halves run.
+    /// processEosOut = 1` (drvAsynIPPort.c:1119-1120), so both halves run.
     pub fn new(config: EosConfig) -> Self {
         Self {
             initial: config,
@@ -268,7 +268,7 @@ impl OctetInterpose for EosInterpose {
             // C parity (`asynInterposeEos.c::readIt:242-253`): a failing
             // lower-layer read `break`s the loop and falls through to the
             // SAME tail as a successful one — null-terminate, `*eomReason =
-            // eom`, `*nbytesTransfered = nRead` — and only then `return
+            // eom`, `*nbytesTransferred = nRead` — and only then `return
             // status`. So the caller gets the error AND everything already
             // transferred: the classic partial-line timeout reaches
             // asynRecord as `asynTimeout` with `AINP="abc"`, `NORD=3`
@@ -277,7 +277,7 @@ impl OctetInterpose for EosInterpose {
             //
             // `?` here would return the bare error and drop both the count
             // and the eom reason. The bytes are not recoverable afterwards —
-            // `in_buf_tail` has already advanced past them at :114-118 — so
+            // `in_buf_tail` has already advanced past them at asynInterposeEos.c:197 — so
             // dropping the count loses the data outright. Run C's tail, then
             // hand the error back with the partial attached.
             //
@@ -303,7 +303,7 @@ impl OctetInterpose for EosInterpose {
             // because available data exceeded our buffer size. This is not a
             // reason for us to stop reading. (C parity: eom &= ~ASYN_EOM_CNT)
             //
-            // C parity (`asynInterposeEos.c:232,241,246,251`): the lower
+            // C parity (`asynInterposeEos.c:232,242,247,252`): the lower
             // read sets `eom` even on a zero-byte read (e.g. ASYN_EOM_END on
             // a TCP EOF), and `*eomReason = eom` propagates it after the
             // loop. Capture the reason BEFORE the zero-byte break so END
@@ -350,8 +350,8 @@ impl OctetInterpose for EosInterpose {
         let mut buf = Vec::with_capacity(data.len() + out_eos.len());
         buf.extend_from_slice(data);
         buf.extend_from_slice(&out_eos);
-        // C `asynInterposeEos.c::writeIt` (:189-197) runs one common tail
-        // regardless of status: `*nbytesTransfered = min(nbytesActual,
+        // C `asynInterposeEos.c::writeIt` (:179-180) runs one common tail
+        // regardless of status: `*nbytesTransferred = min(nbytesActual,
         // numchars); return status`. So the clamp — never report the appended
         // terminator bytes as caller payload — applies to the failure path too,
         // and a lower layer that stalled part-way through the *user* bytes has
@@ -378,7 +378,7 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
-        // C :293-295 — with `processEosIn == 0` the terminator belongs to the
+        // C :294-296 — with `processEosIn == 0` the terminator belongs to the
         // driver, not to this layer, and the call is *delegated downwards*;
         // taking it here would make `read` (which delegates) and the stored
         // terminator disagree. C tests the flag before the length, so a
@@ -398,10 +398,10 @@ impl OctetInterpose for EosInterpose {
     }
 
     fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
-        // C `setOutputEos` (asynInterposeEos.c:344-363) carries no
+        // C `setOutputEos` (asynInterposeEos.c:345-364) carries no
         // `processEosOut` test at all: it validates the length, stores
         // `eosOut`/`eosOutLen` and answers asynSuccess whatever the flag,
-        // and `getOutputEos` (:365-390) reads it back the same way. The flag
+        // and `getOutputEos` (:366-391) reads it back the same way. The flag
         // gates `writeIt` alone (:161-163), so with `processOut = 0` the
         // terminator is held and simply never appended — a set-then-read-back
         // from a startup script succeeds, which is what refusing it broke.
@@ -421,9 +421,9 @@ impl OctetInterpose for EosInterpose {
     /// byte of the new session complete a spurious EOS match.
     fn connection_changed(&mut self) {
         // The connect exception is port-level: C fires it at every `eosPvt`
-        // registered on the port — `exceptionOccurred` (asynManager.c:638)
-        // hands off to `announceExceptionOccurred` (:611-637), which walks the
-        // dpCommon's `exceptionUserList` (:621-625) — so every device drops its
+        // registered on the port — `exceptionOccurred` (asynManager.c:640)
+        // hands off to `announceExceptionOccurred` (:613-639), which walks the
+        // dpCommon's `exceptionUserList` (:623-627) — so every device drops its
         // read-ahead.
         for dev in self.devices.values_mut() {
             dev.reset_link_state();
@@ -474,7 +474,7 @@ mod tests {
         }
     }
 
-    /// C `setOutputEos` (asynInterposeEos.c:344-363) carries no
+    /// C `setOutputEos` (asynInterposeEos.c:345-364) carries no
     /// `processEosOut` test: it validates the length, stores
     /// `eosOut`/`eosOutLen` and answers asynSuccess whatever the flag, which
     /// gates `writeIt` alone (:161-163). So `processOut = 0` means "held but
@@ -510,8 +510,8 @@ mod tests {
     }
 
     /// The input half is *not* the same shape: C's `setInputEos` tests
-    /// `processEosIn` first and delegates downwards when it is 0 (:293-295),
-    /// as `getInputEos` (:318-320) and `readIt` (:191-193) do.
+    /// `processEosIn` first and delegates downwards when it is 0 (:294-296),
+    /// as `getInputEos` (:319-321) and `readIt` (:191-193) do.
     #[test]
     fn input_eos_delegates_when_process_in_is_off() {
         let mut eos = EosInterpose::with_processing(EosConfig::default(), false, true);
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(
             partial.nbytes_transferred(),
             3,
-            "C publishes *nbytesTransfered = nRead on the error path"
+            "C publishes *nbytesTransferred = nRead on the error path"
         );
         assert_eq!(
             partial.data, b"abc",
@@ -1060,8 +1060,8 @@ mod tests {
         );
     }
 
-    /// R8-48: C `asynInterposeEos.c::writeIt` (:189-197) runs one tail on every
-    /// path — `*nbytesTransfered = min(nbytesActual, numchars); return status` —
+    /// R8-48: C `asynInterposeEos.c::writeIt` (:179-180) runs one tail on every
+    /// path — `*nbytesTransferred = min(nbytesActual, numchars); return status` —
     /// so a lower layer that stalled part-way reports its count *through* the
     /// interpose, clamped to the caller's payload. The appended terminator must
     /// never be counted as user bytes, on the error path either.

@@ -37,7 +37,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
+use crate::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 
 thread_local! {
     /// Set for the whole life of a facility worker loop — see
@@ -119,9 +119,9 @@ pub fn recover<T>(facility: &str, result: std::sync::LockResult<T>) -> T {
         Ok(guard) => guard,
         Err(poisoned) => {
             if poison_should_be_announced() {
-                errlog_sev_printf(
+                errlog_sev_vprintf(
                     ErrlogSevEnum::Minor,
-                    &format!(
+                    format_args!(
                         "{facility}: recovered a lock poisoned by a panic elsewhere; \
                          the queued work is intact and the facility continues. Later \
                          recoveries are not repeated.\n"
@@ -141,9 +141,9 @@ pub fn run_isolated(facility: &str, cb: impl FnOnce()) -> bool {
     match catch_unwind(AssertUnwindSafe(cb)) {
         Ok(()) => true,
         Err(payload) => {
-            errlog_sev_printf(
+            errlog_sev_vprintf(
                 ErrlogSevEnum::Major,
-                &format!(
+                format_args!(
                     "{facility}: a callback panicked ({}); the callback was abandoned, \
                      the facility continues\n",
                     panic_text(&*payload)
@@ -173,9 +173,9 @@ pub(super) fn run_facility_loop(facility: &str, body: impl FnOnce(), on_lost: im
     let _marked = FacilityThreadMark::set();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
         on_lost();
-        errlog_sev_printf(
+        errlog_sev_vprintf(
             ErrlogSevEnum::Fatal,
-            &format!(
+            format_args!(
                 "{facility}: the worker thread has STOPPED ({}). Every operation this \
                  facility carries has stopped with it; the IOC keeps serving requests.\n",
                 panic_text(&*payload)

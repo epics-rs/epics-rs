@@ -31,6 +31,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::types::RecordName;
+
 /// The executor a test body spawns on. Every `#[tokio::test]` here is
 /// already inside one; the gateway constructors now take it by value
 /// instead of looking it up behind the caller's back.
@@ -60,7 +62,7 @@ use epics_pva_rs::server_native::{
 fn nt_double_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
@@ -79,28 +81,9 @@ fn spawn_upstream(pv_name: &str, initial: f64) -> (PvaServer, SocketAddr, Shared
     let source = SharedSource::new();
     source.add(pv_name, pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(source), cfg).expect("test server must start");
+    let bound = server.tcp_addr();
     (server, bound, pv)
 }
 
@@ -115,23 +98,7 @@ async fn gateway_get_forwards_upstream_value() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -174,23 +141,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -295,23 +246,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -423,23 +358,7 @@ async fn gateway_control_prefix_cache_size() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
     let cfg = PvaGatewayConfig {
         upstream_client: Some(upstream_client),
         server_config,
@@ -528,23 +447,7 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let gw = MultiTenantPvaGatewayBuilder::new()
         .add_upstream("A", client_a)
@@ -613,23 +516,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let acl = epics_bridge_rs::pva_gateway::AclConfig::default()
         .deny_regex(r"SECRET:.*")
@@ -686,23 +573,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
             .build(),
     );
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let server_config = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
+    let server_config = PvaServerConfig::isolated();
 
     let gw = MultiTenantPvaGatewayBuilder::new()
         .add_upstream("U", upstream)
@@ -737,25 +608,9 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
 /// Build a gateway config pinned at `upstream` with an isolated
 /// random-port downstream server.
 fn gateway_cfg(upstream: Arc<PvaClient>) -> PvaGatewayConfig {
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
     PvaGatewayConfig {
         upstream_client: Some(upstream),
-        server_config: PvaServerConfig {
-            tcp_port: pick(),
-            udp_port: pick_udp(),
-            ..PvaServerConfig::isolated()
-        },
+        server_config: PvaServerConfig::isolated(),
         cleanup_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_secs(2),
         max_cache_entries: 1024,
@@ -920,7 +775,8 @@ async fn br_r6_gateway_typed_put_passthrough() {
         fields: vec![(
             "value".to_string(),
             FieldDesc::ScalarArray(ScalarType::String),
-        )],
+        )]
+        .into(),
     };
     let initial = PvField::Structure({
         let mut s = PvStructure::new("test:strarray/1.0");
@@ -934,28 +790,9 @@ async fn br_r6_gateway_typed_put_passthrough() {
     let source = SharedSource::new();
     source.add("BR:R6:PV", pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -983,7 +820,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
         );
         s
     });
-    src.put_value("BR:R6:PV", put_value)
+    src.put_value(b"BR:R6:PV", put_value)
         .await
         .expect("typed structure PUT through gateway source must succeed");
 
@@ -1042,14 +879,14 @@ async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
     // monitor. The pre-fix `self.cache.peek(name).is_some()` returned false on
     // this cold-cache probe; the connection-state proxy returns true.
     assert!(
-        src.is_writable("GW:WR:PV").await,
+        src.is_writable(b"GW:WR:PV").await,
         "is_writable must proxy the connectable upstream channel (cold cache)"
     );
 
     // A PV no upstream serves cannot be connected, so it is not writable — the
     // probe fails within `connect_timeout` rather than reporting a stale flag.
     assert!(
-        !src.is_writable("GW:NOSUCH:PV").await,
+        !src.is_writable(b"GW:NOSUCH:PV").await,
         "is_writable must be false for a PV the gateway cannot connect to"
     );
 }
@@ -1076,7 +913,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let pv = SharedPV::new();
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
     };
     let initial = PvField::Structure({
         let mut s = PvStructure::new("");
@@ -1087,28 +924,9 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     let source = SharedSource::new();
     source.add("BR:R41:PV", pv.clone());
 
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(Arc::new(source), us_cfg).expect("upstream start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -1128,7 +946,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
     // directly, so 1.0 is NOT delivered here — the regression guarded is
     // that live UPDATES flow through the typed broadcast.
     let mut rx = src
-        .subscribe("BR:R41:PV")
+        .subscribe(b"BR:R41:PV")
         .await
         .expect("subscribe must return Some for a known PV");
 
@@ -1693,36 +1511,36 @@ fn array_doubles(field: &PvField) -> Vec<f64> {
 }
 
 impl ChannelSource for UpstreamArraySource {
-    async fn list_pvs(&self) -> Vec<String> {
-        vec![self.pv.clone()]
+    async fn list_pvs(&self) -> Vec<RecordName> {
+        vec![self.pv.as_str().into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let matches = n == self.pv;
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == self.pv.as_bytes();
         async move { matches }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))].into(),
         })
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(doubles_field(&self.data.lock().unwrap()))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Ok(())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
 
-    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+    async fn channel_array_init(&self, _: &[u8], _: ChannelContext) -> Result<FieldDesc, OpError> {
         Ok(FieldDesc::ScalarArray(ScalarType::Double))
     }
     async fn channel_array_get(
@@ -1796,30 +1614,11 @@ impl ChannelSource for UpstreamArraySource {
 }
 
 /// Spawn an upstream PvaServer serving `source` on a random loopback port;
-/// return (server, addr). Mirrors `spawn_upstream`'s port-pick / isolation.
+/// return (server, addr). Mirrors `spawn_upstream`'s isolation.
 fn spawn_upstream_source<S: ChannelSource + 'static>(source: S) -> (PvaServer, SocketAddr) {
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(source), cfg).expect("upstream array server must start");
+    let bound = server.tcp_addr();
     (server, bound)
 }
 
@@ -2024,25 +1823,25 @@ fn has_record_member(req: &PvField) -> bool {
 }
 
 impl ChannelSource for RecordingDoublingSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(nt_double_desc())
     }
-    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, _: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let v = *self.value.lock().unwrap();
         async move { Some(nt_double_value(v)) }
     }
     fn put_value(
         &self,
-        _: &str,
+        _: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let store = self.value.clone();
@@ -2053,12 +1852,12 @@ impl ChannelSource for RecordingDoublingSource {
             Ok(())
         }
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2094,28 +1893,9 @@ fn spawn_recording_upstream(
     initial: f64,
 ) -> (PvaServer, SocketAddr, RecordingDoublingSource) {
     let src = RecordingDoublingSource::new(pv_name, initial);
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
+    let cfg = PvaServerConfig::isolated();
     let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    let bound = server.tcp_addr();
     (server, bound, src)
 }
 
@@ -2195,8 +1975,8 @@ async fn gateway_put_get_forwards_through_composite_with_control_prefix() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    // gateway_cfg picks fresh ports; override control_prefix so the
-    // CompositeSource + ControlSource wrap the layered gateway source.
+    // Override control_prefix so the CompositeSource + ControlSource wrap
+    // the layered gateway source.
     let cfg = PvaGatewayConfig {
         control_prefix: Some("gw".into()),
         ..gateway_cfg(upstream_client)
@@ -2252,7 +2032,8 @@ fn partial_desc() -> FieldDesc {
         fields: vec![
             ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
             ("spare".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -2266,19 +2047,19 @@ fn partial_value() -> PvField {
 }
 
 impl ChannelSource for PartialReadSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(partial_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(partial_value())
     }
     async fn read_checked(
@@ -2292,15 +2073,15 @@ impl ChannelSource for PartialReadSource {
             vec!["value".to_string()],
         ))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only fixture"))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2318,35 +2099,16 @@ impl ChannelSource for PartialReadSource {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
     let pv = "GW:PARTIAL:PV";
-    let pick = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
 
-    let us_cfg = PvaServerConfig {
-        tcp_port: pick(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let us_addr = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        us_cfg.tcp_port,
-    );
-    let _us = PvaServer::start(
+    let us_cfg = PvaServerConfig::isolated();
+    let us = PvaServer::start(
         Arc::new(PartialReadSource {
             pv_name: pv.to_string(),
         }),
         us_cfg,
     )
     .expect("upstream must start");
+    let us_addr = us.tcp_addr();
 
     let upstream_client = Arc::new(
         PvaClient::builder()
@@ -2358,11 +2120,7 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
         &test_reactor(),
         PvaGatewayConfig {
             upstream_client: Some(upstream_client.clone()),
-            server_config: PvaServerConfig {
-                tcp_port: pick(),
-                udp_port: pick_udp(),
-                ..PvaServerConfig::isolated()
-            },
+            server_config: PvaServerConfig::isolated(),
             cleanup_interval: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(2),
             max_cache_entries: 1024,
@@ -2417,19 +2175,19 @@ struct MarkedMonitorSource {
 }
 
 impl ChannelSource for MarkedMonitorSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let n = self.pv_name.clone();
-        async move { vec![n] }
+        async move { vec![n.into()] }
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let want = self.pv_name.clone();
-        let got = n.to_string();
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone().into_bytes();
+        let got = n.to_vec();
         async move { got == want }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(partial_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(partial_value())
     }
     /// The monitor seed: `value` assigned, `spare` not.
@@ -2455,15 +2213,15 @@ impl ChannelSource for MarkedMonitorSource {
         self.updates.lock().unwrap().push(tx);
         Some(epics_pva_rs::server_native::MonitorStream::Channel(rx))
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only fixture"))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }
@@ -2505,7 +2263,7 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
     let ctx = ChannelContext {
         peer: "127.0.0.1:1234".parse().unwrap(),
         creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
-            account: "tester".to_string(),
+            account: "tester".to_string().into(),
             method: "anonymous".to_string(),
             host: "localhost".to_string(),
             authority: String::new(),
@@ -2515,7 +2273,7 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
         log: Default::default(),
     };
     let checked = src
-        .revalidate_read(pv, ctx.clone())
+        .revalidate_read(pv.as_bytes(), ctx.clone())
         .await
         .expect("read must be allowed by the default gate");
 
@@ -2560,28 +2318,28 @@ impl RefusingUpstream {
 }
 
 impl ChannelSource for RefusingUpstream {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         vec![Self::PV.into()]
     }
-    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
-        let matches = n == Self::PV;
+    fn has_pv(&self, n: &[u8]) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == Self::PV.as_bytes();
         async move { matches }
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         Some(nt_double_desc())
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         Some(nt_double_value(1.0))
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         true
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err(OpError::remote(Self::refusal()))
     }
     async fn subscribe(
         &self,
-        _: &str,
+        _: &[u8],
     ) -> Option<epics_pva_rs::server_native::MonitorStream<PvField>> {
         None
     }

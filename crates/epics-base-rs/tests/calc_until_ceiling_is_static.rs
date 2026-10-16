@@ -58,3 +58,62 @@ fn nine_unreached_untils_are_fine() {
         Ok(ArrayStackValue::Double(7.0))
     );
 }
+
+/// The C pre-scan above skips bytes by opcode value alone. A vararg count
+/// byte of 2 reads as `LITERAL_INT`, so the scan steps over the UNTIL_END and
+/// the first false condition fails the perform with -1: the port reproduces
+/// that (CBUG-O1). A count of 1 reads as `LITERAL_DOUBLE` and walks off the
+/// postfix (ASan heap-buffer-overflow at `sCalcPerform.c:340` /
+/// `aCalcPerform.c:356` for `UNTIL(A:=A+1;FINITE(A))`); there the port
+/// decodes whole opcodes instead (CBUG-O2).
+#[test]
+fn until_prescan_reads_vararg_counts_as_c_does() {
+    for e in [
+        "UNTIL(A:=A+1;MAX(A,B)>3)",
+        "UNTIL(A:=A+1;MIN(A,9)>3)",
+        "UNTIL(MAX(A,B)>3)",
+    ] {
+        assert!(scalc(e, &mut StringInputs::new()).is_err(), "{e}");
+        assert!(acalc(e, &mut ArrayInputs::new(8)).is_err(), "{e}");
+    }
+    // A condition true on the first pass never asks for its UNTIL, in C too.
+    assert_eq!(
+        scalc("UNTIL(MAX(A,B)<3)", &mut StringInputs::new()),
+        Ok(StackValue::Double(1.0))
+    );
+    // The literal skips are C's sizes: an 8-byte double whose bytes hold no
+    // UNTIL_END. C returns 1.
+    // A missed UNTIL is C's -1 when the loop asks for it: the count byte 2
+    // hides the UNTIL after `MAX(A,B)` from the scan. C returns -1.
+    for (e, c) in [
+        ("A:=-1.5;UNTIL(A:=A+1;A>3)", Some(1.0)),
+        ("MAX(A,B)+1+UNTIL(A>-1)", None),
+    ] {
+        let s = scalc(e, &mut StringInputs::new());
+        let a = acalc(e, &mut ArrayInputs::new(8));
+        match c {
+            Some(v) => {
+                assert_eq!(s, Ok(StackValue::Double(v)), "{e}");
+                assert_eq!(a, Ok(ArrayStackValue::Double(v)), "{e}");
+            }
+            None => {
+                assert!(s.is_err(), "{e}: {s:?}");
+                assert!(a.is_err(), "{e}: {a:?}");
+            }
+        }
+    }
+    // Past the end, where C reads out of bounds, the loops run (CBUG-O2).
+    // `MAX(A)` starts false, so the loop needs its UNTIL found.
+    for e in ["UNTIL(A:=A+1;FINITE(A))", "UNTIL(A:=A+1;MAX(A)>3)"] {
+        assert_eq!(
+            scalc(e, &mut StringInputs::new()),
+            Ok(StackValue::Double(1.0)),
+            "{e}"
+        );
+        assert_eq!(
+            acalc(e, &mut ArrayInputs::new(8)),
+            Ok(ArrayStackValue::Double(1.0)),
+            "{e}"
+        );
+    }
+}

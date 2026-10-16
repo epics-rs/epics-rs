@@ -1363,19 +1363,8 @@ mod simd_kernels {
 #[cfg(all(test, feature = "simd"))]
 mod simd_tests {
     use super::*;
-    use fearless_simd::{Level, dispatch};
-
-    fn levels() -> Vec<Level> {
-        let top = crate::simd::level();
-        let mut out = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            out.extend(top.as_avx2().map(Level::Avx2));
-            out.extend(top.as_sse4_2().map(Level::Sse4_2));
-            out.extend(top.as_sse2().map(Level::Sse2));
-        }
-        out
-    }
+    use crate::simd::levels;
+    use fearless_simd::dispatch;
 
     /// A pseudo-random frame, with the values whose BT.601 outputs land on
     /// an exact half, on the clamp edges or beyond them mixed in.

@@ -71,7 +71,7 @@ async fn process(db: &PvDatabase, rec: &str) {
 }
 
 async fn mcnt(db: &PvDatabase, rec: &str) -> f64 {
-    db.get_pv(&format!("{rec}.MCNT")).unwrap().to_f64().unwrap()
+    db.get_pv(format!("{rec}.MCNT")).unwrap().to_f64().unwrap()
 }
 
 /// The softIoc transcript, value for value: MCNT counts up to MDEL+1, the post
@@ -111,24 +111,26 @@ async fn mdel_rate_limits_the_val_monitor() {
         .add_subscriber("VAL", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("VAL subscription accepted");
 
-    for _ in 0..6 {
+    for _ in 0..4 {
         process(&db, "HG").await;
     }
-
-    let collapsed = val_rx.queue().ncollapse(1);
     let mut events = Vec::new();
     while let Ok(ev) = val_rx.try_recv() {
         events.push(ev);
     }
+    assert_eq!(events.len(), 1, "the cycle where mcnt=4 > 3 posts VAL");
+    // VAL is read at delivery, as C's by-reference log is.
     assert_eq!(
-        events.len() as u64 + collapsed,
-        1,
-        "MDEL=3 over 6 processes posts VAL once (on the cycle where mcnt=4 > 3)"
-    );
-    assert_eq!(
-        events[0].snapshot.value,
+        events[0].delivered_value(&rec.read(), "VAL").unwrap(),
         EpicsValue::ULongArray(vec![0, 0, 4, 0].into()),
         "the posted VAL carries the four counts binned so far"
+    );
+    for _ in 0..2 {
+        process(&db, "HG").await;
+    }
+    assert!(
+        val_rx.try_recv().is_err(),
+        "MDEL=3 over 6 processes posts VAL once"
     );
 }
 
@@ -160,7 +162,7 @@ async fn the_default_mdel_of_zero_posts_every_process() {
         process(&db, "HG0").await;
     }
 
-    let collapsed = val_rx.queue().ncollapse(1);
+    let collapsed = val_rx.queue().ncollapse(val_rx.id());
     let mut n = 0u64;
     while val_rx.try_recv().is_ok() {
         n += 1;

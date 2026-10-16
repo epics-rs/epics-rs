@@ -21,8 +21,10 @@
 
 #![cfg(tokio_backend)]
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
 
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
@@ -93,6 +95,29 @@ async fn relay(
     }
 }
 
+/// Send every reply arriving on `upstream` to `client`, each SEARCH reply
+/// re-pointed at the proxy's TCP port.
+async fn relay_search_replies(
+    upstream: Arc<UdpSocket>,
+    udp: Arc<UdpSocket>,
+    client: SocketAddr,
+    circuit_port: u16,
+) {
+    let mut reply = [0u8; 4096];
+    while let Ok((rn, _)) = upstream.recv_from(&mut reply).await {
+        let mut off = 0usize;
+        while off + CaHeader::SIZE <= rn {
+            let cmmd = u16::from_be_bytes([reply[off], reply[off + 1]]);
+            let postsize = u16::from_be_bytes([reply[off + 2], reply[off + 3]]) as usize;
+            if cmmd == CA_PROTO_SEARCH {
+                reply[off + 4..off + 6].copy_from_slice(&circuit_port.to_be_bytes());
+            }
+            off += CaHeader::SIZE + postsize;
+        }
+        let _ = udp.send_to(&reply[..rn], client).await;
+    }
+}
+
 /// Search-and-relay proxy: UDP searches are forwarded to `server_udp` and
 /// their replies re-pointed at the proxy's TCP port; the circuit to
 /// `server_tcp` is relayed with every read reply denied. Returns the proxy's
@@ -106,34 +131,36 @@ async fn read_denying_proxy(server_udp: u16, server_tcp: u16) -> u16 {
     let search: SocketAddr = ([127, 0, 0, 1], server_udp).into();
     let circuit: SocketAddr = ([127, 0, 0, 1], server_tcp).into();
 
+    // Each source gets its own upstream socket and reply task, so a datagram
+    // the server never answers holds nothing back: the kernel can hand this
+    // ephemeral port over while another process still sends to it, and a
+    // forward that waited for its reply stalled caput's searches past `-w 2`.
+    let udp = Arc::new(udp);
     tokio::spawn(async move {
-        let upstream = UdpSocket::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind proxy upstream UDP");
+        let mut upstreams: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
         let mut buf = [0u8; 4096];
         loop {
             let Ok((n, client)) = udp.recv_from(&mut buf).await else {
                 return;
             };
-            if upstream.send_to(&buf[..n], search).await.is_err() {
-                continue;
-            }
-            let mut reply = [0u8; 4096];
-            let Ok(Ok((rn, _))) =
-                tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut reply)).await
-            else {
-                continue;
-            };
-            let mut off = 0usize;
-            while off + CaHeader::SIZE <= rn {
-                let cmmd = u16::from_be_bytes([reply[off], reply[off + 1]]);
-                let postsize = u16::from_be_bytes([reply[off + 2], reply[off + 3]]) as usize;
-                if cmmd == CA_PROTO_SEARCH {
-                    reply[off + 4..off + 6].copy_from_slice(&circuit_port.to_be_bytes());
+            let upstream = match upstreams.entry(client) {
+                Entry::Occupied(e) => e.get().clone(),
+                Entry::Vacant(e) => {
+                    let upstream = Arc::new(
+                        UdpSocket::bind(("127.0.0.1", 0))
+                            .await
+                            .expect("bind proxy upstream UDP"),
+                    );
+                    tokio::spawn(relay_search_replies(
+                        upstream.clone(),
+                        udp.clone(),
+                        client,
+                        circuit_port,
+                    ));
+                    e.insert(upstream).clone()
                 }
-                off += CaHeader::SIZE + postsize;
-            }
-            let _ = udp.send_to(&reply[..rn], client).await;
+            };
+            let _ = upstream.send_to(&buf[..n], search).await;
         }
     });
 

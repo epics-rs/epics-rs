@@ -3,6 +3,7 @@
 //! Uses our own [`crate::pvdata`] types, so only native types appear in the
 //! public surface.
 
+use epics_base_rs::types::RecordName;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -788,7 +789,7 @@ impl From<&str> for OpError {
 ///    overflow, so a slow connection can never make another connection
 ///    (or itself) miss an invalidation.
 /// 2. **One command, one batch.** A removal publishes the whole removed
-///    set as a single [`Arc<[String]>`], so a `:flush` of the full
+///    set as a single [`Arc<[RecordName]>`], so a `:flush` of the full
 ///    50,000-entry cache is one message per connection, not one per name.
 ///
 /// Memory is bounded by connection lifetime: a wedged connection that
@@ -797,7 +798,7 @@ impl From<&str> for OpError {
 /// [`Self::publish`] / [`Self::subscribe`]. Cheap to clone (one `Arc`).
 #[derive(Clone, Default)]
 pub struct ChannelInvalidator {
-    subscribers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<Arc<[String]>>>>>,
+    subscribers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<Arc<[RecordName]>>>>>,
 }
 
 impl ChannelInvalidator {
@@ -812,7 +813,7 @@ impl ChannelInvalidator {
     /// Register a per-connection receiver. Closed subscribers (their
     /// receiver dropped) are pruned here so a high connection-churn
     /// workload cannot grow the registry between publishes.
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Arc<[String]>> {
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Arc<[RecordName]>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         subs.retain(|s| !s.is_closed());
@@ -823,7 +824,7 @@ impl ChannelInvalidator {
     /// Publish one removal batch to every live connection. Unbounded
     /// queues never drop, so no force-disconnect is lost; senders whose
     /// receiver has gone are pruned in passing. An empty batch is a no-op.
-    pub fn publish(&self, names: Arc<[String]>) {
+    pub fn publish(&self, names: Arc<[RecordName]>) {
         if names.is_empty() {
             return;
         }
@@ -869,7 +870,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// their `AcfCell`.
     ///
     /// Type-state ACF gate: the typed op methods take
-    /// `AccessChecked` instead of `name: &str + ctx`. Because
+    /// `AccessChecked` instead of `name: &[u8] + ctx`. Because
     /// `AccessChecked` is unforgeable outside this gate's `check`,
     /// every wire op MUST flow through it — closing the missed-path
     /// pattern that surfaced across rounds 32-39.
@@ -897,10 +898,10 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// Enumerate every PV name this source can serve.
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send;
 
     /// True iff `name` resolves to a known PV.
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send;
 
     /// True iff `name` should be answered to a UDP SEARCH broadcast.
     ///
@@ -927,7 +928,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     ///
     /// The default impl delegates to `has_pv`, so a source that does not
     /// distinguish the two questions is unaffected.
-    fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn searchable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         self.has_pv(name)
     }
 
@@ -946,7 +947,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// A source that wants endpoint-scoped advertisement overrides this.
     fn searchable_from(
         &self,
-        name: &str,
+        name: &[u8],
         requester: SocketAddr,
     ) -> impl std::future::Future<Output = bool> + Send {
         let _ = requester;
@@ -956,7 +957,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Fetch the type descriptor for a PV (used by GET-INIT and GET_FIELD).
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send;
 
     /// Credential-aware [`Self::has_pv`], called at CREATE_CHANNEL time
@@ -972,7 +973,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// non-gateway sources (which ignore credentials) are unaffected.
     fn has_pv_checked(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: ChannelContext,
     ) -> impl std::future::Future<Output = bool> + Send {
         self.has_pv(name)
@@ -990,7 +991,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// [`Self::get_introspection`].
     fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         _ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         self.get_introspection(name)
@@ -1017,7 +1018,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// which is all pvxs's `conn->onClose` erase amounts to.
     fn await_introspection(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         self.get_introspection_checked(name, ctx)
@@ -1042,7 +1043,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// silently changes owner when the registry is mutated.
     fn resolve_owner(
         &self,
-        _name: &str,
+        _name: &[u8],
         _ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<DynSource>> + Send {
         async { None }
@@ -1065,14 +1066,14 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `chan->reportInfo` null).
     fn channel_report_info(
         &self,
-        _name: &str,
+        _name: &[u8],
         _ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<String>> + Send {
         async { None }
     }
 
     /// Fetch the current value of a PV.
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
     /// **The read handoff the server FRAMES.** Every value the server
     /// serializes with a changed-bitset — the GET reply, the PUT_GET
@@ -1132,18 +1133,18 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// after the inner flipped to deny.
     fn revalidate_read(
         &self,
-        pv_name: &str,
+        pv_name: &[u8],
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Option<AccessChecked>> + Send {
         let gate = self.access();
         // one refcount carries host/account/method/authority and the
         // peer's role claims (so `role/<name>` UAG members can match).
         let creds = ctx.creds.clone();
-        let name = pv_name.to_string();
+        let name = RecordName::from(pv_name);
         async move {
             let checked = gate
                 .check_with_roles(
-                    &name,
+                    name,
                     &creds.host,
                     &creds.account,
                     &creds.roles,
@@ -1183,7 +1184,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Apply a PUT.
     fn put_value(
         &self,
-        name: &str,
+        name: &[u8],
         value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send;
 
@@ -1345,7 +1346,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// dropping the frame.
     fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> impl std::future::Future<Output = Result<FieldDesc, OpError>> + Send {
         let _ = (name, ctx);
@@ -1467,7 +1468,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// True iff PUT is allowed against this PV (for ACL gating).
-    fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
+    fn is_writable(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send;
 
     /// pvxs's `onSubscribe` pvRequest read, run at MONITOR INIT — the part of
     /// it that can FAIL.
@@ -1512,7 +1513,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// Subscribe to value-change notifications. Returns `None` if unknown.
     fn subscribe(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send;
 
     /// Type-state-enforced MONITOR. Refuses `NoAccess` tokens; on
@@ -1548,7 +1549,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// downstream IOID + subcmd 0) and emits.
     fn subscribe_raw(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send {
         let _ = name;
         async { None }
@@ -1706,7 +1707,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `(FieldDesc, PvField)` pair converts into the former via `.into()`.
     fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> impl std::future::Future<Output = Result<RpcReply, OpError>> + Send {
@@ -1751,7 +1752,10 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `SharedPV` with an `on_process` hook) override to actually run
     /// the processing chain. An `Err` surfaces to the client as a
     /// PROCESS error status.
-    fn process(&self, name: &str) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+    fn process(
+        &self,
+        name: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         let _ = name;
         async move { Ok(()) }
     }
@@ -1805,7 +1809,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// only when every live op wants pause; a `Withdraw` removes a
     /// torn-down op's vote) and order each op's transitions correctly even
     /// though its LOW and HIGH fire from different tasks.
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         let _ = (name, ctx, ev);
     }
 
@@ -1827,7 +1831,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// [`Self::notify_watermark`] so a fanout gateway can scope the
     /// suspend/resume to the firing credential's upstream cache layer.
     /// Default impl ignores it.
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool) {
         let _ = (name, ctx, start);
     }
 
@@ -1845,7 +1849,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// uses it to acquire per-channel leases or open lazily on first
     /// attach. `ctx` is credential-scoped (no `pv_request`). Paired with
     /// [`Self::notify_channel_close`]. Default impl ignores it.
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext) {
         let _ = (name, ctx);
     }
 
@@ -1863,7 +1867,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// or credential-scoped caches. `ctx` is credential-scoped (no
     /// `pv_request`) like [`Self::notify_monitor_start`]. Default impl
     /// ignores it.
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext) {
         let _ = (name, ctx);
     }
 
@@ -1905,7 +1909,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// name (the PVA gateway) must not preempt the name-scoped owner.
     fn monitor_watermarks(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<(usize, usize)>> + Send {
         let _ = name;
         async { None }
@@ -1945,10 +1949,10 @@ pub trait ChannelSource: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct MonitorUpdate {
     /// The full snapshot value for this event.
-    pub value: PvField,
+    pub value: PostValue,
     /// Explicit changed field paths, or `None` to let the server
     /// derive the changed-bitset.
-    pub marked: Option<Vec<String>>,
+    pub marked: Option<Marks>,
     /// When `true`, this event signals an upstream **descriptor
     /// change** — a subscription boundary, not a value. `value`/`marked`
     /// are meaningless and MUST NOT be encoded under the monitor's
@@ -1990,13 +1994,126 @@ pub struct MonitorUpdate {
     pub overrun: Vec<String>,
 }
 
+/// A post's value: handed over by its producer, or shared with a source that
+/// keeps pvxs's per-subscription `currentValue` (`singlesource.cpp:54-67`)
+/// and fills it in place. A queued `Shared` post pins its slot, so the source
+/// never overwrites a value the queue still holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PostValue {
+    Owned(PvField),
+    Shared(Arc<PvField>),
+}
+
+impl PostValue {
+    /// The value by move; a `Shared` one is copied only while its source
+    /// still holds the slot.
+    pub fn into_owned(self) -> PvField {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => Arc::unwrap_or_clone(v),
+        }
+    }
+}
+
+impl std::ops::Deref for PostValue {
+    type Target = PvField;
+    fn deref(&self) -> &PvField {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+impl PartialEq<PvField> for PostValue {
+    fn eq(&self, other: &PvField) -> bool {
+        **self == *other
+    }
+}
+
+impl From<PvField> for PostValue {
+    fn from(v: PvField) -> Self {
+        Self::Owned(v)
+    }
+}
+
+impl From<Arc<PvField>> for PostValue {
+    fn from(v: Arc<PvField>) -> Self {
+        Self::Shared(v)
+    }
+}
+
+/// A post's marked paths: handed over by its producer, or one of the sets a
+/// subscription fixed at subscribe. The server keys its wire changed-bitset
+/// on a `Shared` set's identity, so a set shared across posts is resolved
+/// against the descriptor once, not once per post.
+#[derive(Debug, Clone)]
+pub enum Marks {
+    Owned(Vec<String>),
+    Shared(Arc<[String]>),
+}
+
+impl Marks {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v.to_vec(),
+        }
+    }
+
+    /// Whether `self` and `other` are one shared set.
+    pub fn same_set(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Shared(a), Self::Shared(b)) if Arc::ptr_eq(a, b))
+    }
+}
+
+impl std::ops::Deref for Marks {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Shared(v) => v,
+        }
+    }
+}
+
+impl PartialEq for Marks {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<String>> for Marks {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        **self == **other
+    }
+}
+
+impl From<Vec<String>> for Marks {
+    fn from(v: Vec<String>) -> Self {
+        Self::Owned(v)
+    }
+}
+
+impl FromIterator<String> for Marks {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+impl From<Arc<[String]>> for Marks {
+    fn from(v: Arc<[String]>) -> Self {
+        Self::Shared(v)
+    }
+}
+
 impl MonitorUpdate {
     /// A descriptor-change boundary marker. Carries a placeholder value
     /// that consumers MUST NOT encode — the decoded monitor loop emits
     /// `MONITOR FINISH` on `type_changed` before any value read.
     pub fn type_change() -> Self {
         Self {
-            value: PvField::Null,
+            value: PvField::Null.into(),
             marked: None,
             type_changed: true,
             overrun: Vec::new(),
@@ -2010,7 +2127,7 @@ impl From<PvField> for MonitorUpdate {
     /// overrun: a freshly produced value reports no lost intermediate.
     fn from(value: PvField) -> Self {
         Self {
-            value,
+            value: value.into(),
             marked: None,
             type_changed: false,
             overrun: Vec::new(),
@@ -2042,16 +2159,18 @@ impl crate::server_native::shared_pv::SquashTail for MonitorUpdate {
         let lost = self.marked.take();
         let both = match (&lost, &newer.marked) {
             (Some(a), Some(b)) => a.iter().filter(|p| b.contains(p)).cloned().collect(),
-            (None, Some(b)) => b.clone(),
-            (Some(a), None) => a.clone(),
+            (None, Some(b)) => b.to_vec(),
+            (Some(a), None) => a.to_vec(),
             (None, None) => Vec::new(),
         };
         union_paths(&mut self.overrun, &newer.overrun);
         union_paths(&mut self.overrun, &both);
         self.marked = match (lost, newer.marked) {
-            (Some(mut a), Some(b)) => {
+            (Some(a), Some(b)) if a.same_set(&b) => Some(a),
+            (Some(a), Some(b)) => {
+                let mut a = a.into_vec();
                 union_paths(&mut a, &b);
-                Some(a)
+                Some(a.into())
             }
             _ => None,
         };
@@ -2107,8 +2226,8 @@ impl From<SourceRead> for MonitorUpdate {
     /// source declared for the read.
     fn from(read: SourceRead) -> Self {
         Self {
-            value: read.value,
-            marked: read.marked,
+            value: read.value.into(),
+            marked: read.marked.map(Marks::from),
             type_changed: false,
             overrun: Vec::new(),
         }
@@ -2316,96 +2435,29 @@ impl<T> From<mpsc::Receiver<T>> for MonitorStream<T> {
 /// subscriber slot — exactly what dropping the bridge task's captured
 /// subscription did.
 pub struct UpstreamMonitor<T> {
-    upstream: UpstreamSub,
-    /// `None` = this event marks nothing and is skipped (the bridge's
-    /// `continue`). A plain `fn`, not a boxed closure: all three transforms
-    /// are pure functions of the event.
-    map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    upstream: UpstreamSub<T>,
     /// Connect-time value delivered before the subscription's own events.
     seed: Option<T>,
 }
 
-enum UpstreamSub {
-    Db(epics_base_rs::server::database::db_access::DbSubscription),
-    /// pvxs's TWO record subscriptions for one single-record channel —
-    /// `ioc/singlesource.cpp:155-167`, under the comment "Two subscription
-    /// are made for pvxs": the value half on the client's resolved `DBE`
-    /// and the property half on a bare `DBE_PROPERTY`, each on its own
-    /// `dbChannel` (`pPropertiesChannel`, built from the same channel name
-    /// at `singlesrcsubscriptionctx.cpp:24`) and therefore its own event
-    /// queue.
-    ///
-    /// The separation is load-bearing, not cosmetic. A by-reference
-    /// channel's subscriber queue latches latest-only
-    /// (`event_queue.rs:436-438`), so a single union subscription collapses
-    /// an arriving `DBE_PROPERTY` post onto the value post already queued
-    /// and the client is told about the metadata change only as extra
-    /// marks on a value update — or, when the value stream is busy, not at
-    /// all. Two queues cannot do that to each other.
-    DbPair {
-        value: epics_base_rs::server::database::db_access::DbSubscription,
-        property: epics_base_rs::server::database::db_access::DbSubscription,
-    },
-    Pv(epics_base_rs::server::pv::PvSubscription),
-}
+/// A subscription's transform. `None` = this event marks nothing and is
+/// skipped (the bridge's `continue`). Boxed once per subscription, not a
+/// `fn`: a transform may own per-subscription state, the value it fills in
+/// place.
+type UpstreamMap<T> = Box<dyn FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send>;
 
-/// Take the next event from either half of a split subscription, value
-/// half first.
-///
-/// The property half needs no mask rewrite, where pvxs's property callback
-/// passes `UpdateType::Property` unconditionally (`singlesource.cpp:100`):
-/// an event's mask is the post narrowed to the subscriber's own select
-/// (`Subscriber::delivered_mask`), and this subscriber's select IS
-/// `DBE_PROPERTY`, so the class is right by construction.
-///
-/// `None` only once BOTH halves have closed — one closed half leaves the
-/// monitor running on the other, as pvxs's two independent subscriptions
-/// do.
-async fn recv_pair(
-    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
-    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
-) -> Option<epics_base_rs::server::pv::MonitorEvent> {
-    use std::task::Poll;
-    std::future::poll_fn(|cx| {
-        let mut open = false;
-        match value.poll_recv_event(cx) {
-            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-            Poll::Ready(None) => {}
-            Poll::Pending => open = true,
-        }
-        match property.poll_recv_event(cx) {
-            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-            Poll::Ready(None) => {}
-            Poll::Pending => open = true,
-        }
-        if open {
-            Poll::Pending
-        } else {
-            Poll::Ready(None)
-        }
-    })
-    .await
-}
+/// A mailbox PV's transform, of the read its subscription makes at delivery.
+type DeliveredMap<T> =
+    Box<dyn FnMut(epics_base_rs::server::snapshot::Snapshot) -> Option<T> + Send>;
 
-/// [`recv_pair`]'s poll-free twin, with the same value-first order and the
-/// same both-halves rule for `Disconnected`.
-fn try_recv_pair(
-    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
-    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
-) -> Result<epics_base_rs::server::pv::MonitorEvent, epics_base_rs::server::event_queue::TryRecvError>
-{
-    use epics_base_rs::server::event_queue::TryRecvError as QueueErr;
-    let value_err = match value.try_recv_event() {
-        Ok(ev) => return Ok(ev),
-        Err(e) => e,
-    };
-    match property.try_recv_event() {
-        Ok(ev) => Ok(ev),
-        Err(QueueErr::Disconnected) if matches!(value_err, QueueErr::Disconnected) => {
-            Err(QueueErr::Disconnected)
-        }
-        Err(_) => Err(QueueErr::Empty),
-    }
+enum UpstreamSub<T> {
+    Db(
+        epics_base_rs::server::database::db_access::DbSubscription,
+        UpstreamMap<T>,
+    ),
+    /// Read through `PvSubscription::recv_snapshot`, which reads the PV's
+    /// metadata at delivery as `dbGet` does; the event carries none.
+    Pv(epics_base_rs::server::pv::PvSubscription, DeliveredMap<T>),
 }
 
 /// `epics-base-rs`'s event queue defines its own `TryRecvError` mirror
@@ -2426,28 +2478,10 @@ impl<T> UpstreamMonitor<T> {
     /// Serve a PVA monitor straight off a record subscription.
     pub fn from_db(
         sub: epics_base_rs::server::database::db_access::DbSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+        map: impl FnMut(epics_base_rs::server::pv::MonitorEvent) -> Option<T> + Send + 'static,
     ) -> Self {
         Self {
-            upstream: UpstreamSub::Db(sub),
-            map,
-            seed: None,
-        }
-    }
-
-    /// Serve a PVA monitor off pvxs's PAIR of record subscriptions — the
-    /// client's `DBE` value half and the unconditional `DBE_PROPERTY` half
-    /// (`singlesource.cpp:155-167`). Both feed the same per-event
-    /// transform: the class each event carries is its own subscriber's,
-    /// so one `map` classifies both halves without asking which one woke.
-    pub fn from_db_pair(
-        value: epics_base_rs::server::database::db_access::DbSubscription,
-        property: epics_base_rs::server::database::db_access::DbSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
-    ) -> Self {
-        Self {
-            upstream: UpstreamSub::DbPair { value, property },
-            map,
+            upstream: UpstreamSub::Db(sub, Box::new(map)),
             seed: None,
         }
     }
@@ -2455,11 +2489,10 @@ impl<T> UpstreamMonitor<T> {
     /// Serve a PVA monitor straight off a `ProcessVariable` subscription.
     pub fn from_pv(
         sub: epics_base_rs::server::pv::PvSubscription,
-        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+        map: impl FnMut(epics_base_rs::server::snapshot::Snapshot) -> Option<T> + Send + 'static,
     ) -> Self {
         Self {
-            upstream: UpstreamSub::Pv(sub),
-            map,
+            upstream: UpstreamSub::Pv(sub, Box::new(map)),
             seed: None,
         }
     }
@@ -2475,12 +2508,11 @@ impl<T> UpstreamMonitor<T> {
             return Some(v);
         }
         loop {
-            let ev = match &mut self.upstream {
-                UpstreamSub::Db(s) => s.recv_event().await?,
-                UpstreamSub::DbPair { value, property } => recv_pair(value, property).await?,
-                UpstreamSub::Pv(s) => s.recv_event().await?,
+            let mapped = match &mut self.upstream {
+                UpstreamSub::Db(s, map) => map(s.recv_event().await?),
+                UpstreamSub::Pv(s, map) => map(s.recv_snapshot().await?),
             };
-            if let Some(v) = (self.map)(ev) {
+            if let Some(v) = mapped {
                 return Some(v);
             }
         }
@@ -2491,14 +2523,11 @@ impl<T> UpstreamMonitor<T> {
             return Ok(v);
         }
         loop {
-            let ev = match &mut self.upstream {
-                UpstreamSub::Db(s) => s.try_recv_event().map_err(from_queue_err)?,
-                UpstreamSub::DbPair { value, property } => {
-                    try_recv_pair(value, property).map_err(from_queue_err)?
-                }
-                UpstreamSub::Pv(s) => s.try_recv_event().map_err(from_queue_err)?,
+            let mapped = match &mut self.upstream {
+                UpstreamSub::Db(s, map) => map(s.try_recv_event().map_err(from_queue_err)?),
+                UpstreamSub::Pv(s, map) => map(s.try_recv_snapshot().map_err(from_queue_err)?),
             };
-            if let Some(v) = (self.map)(ev) {
+            if let Some(v) = mapped {
                 return Ok(v);
             }
         }
@@ -2635,12 +2664,12 @@ pub type DynSource = Arc<dyn ChannelSourceObj>;
 /// vtable is the *only* way it can enter user code — which makes the
 /// containment structural rather than a rule each call site has to remember.
 /// No call site in `server_native` wraps these callbacks itself.
-fn contain_callback_panic(what: &str, name: &str, f: impl FnOnce()) {
+fn contain_callback_panic(what: &str, name: &[u8], f: impl FnOnce()) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
         // pvxs logs and carries on (`log_err_printf(connsetup, ...)`); the
         // transition the callback was reporting has already been committed by
         // the caller, so there is nothing to roll back.
-        tracing::error!(pv = %name, "source {what} panicked; connection continues");
+        tracing::error!(pv = %String::from_utf8_lossy(name), "source {what} panicked; connection continues");
     }
 }
 
@@ -2649,59 +2678,59 @@ fn contain_callback_panic(what: &str, name: &str, f: impl FnOnce()) {
 pub trait ChannelSourceObj: Send + Sync {
     fn list_pvs<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send + 'a>>;
     fn has_pv<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     /// Dyn forwarder for [`ChannelSource::searchable`].
     fn searchable<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     /// Dyn forwarder for [`ChannelSource::searchable_from`].
     fn searchable_from<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         requester: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn get_introspection<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
     /// dyn forwarder for credential-aware existence.
     fn has_pv_checked<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     /// dyn forwarder for credential-aware introspection.
     fn get_introspection_checked<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
     /// dyn forwarder for the parking introspection wait.
     fn await_introspection<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
     /// dyn forwarder for CREATE_CHANNEL owner resolution.
     fn resolve_owner<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>>;
     /// dyn forwarder for the channel's source-supplied report info.
     fn channel_report_info<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
     fn get_value<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>>;
     /// Type-state-gated GET. Dyn forwarder.
     fn get_value_checked<'a>(
@@ -2722,12 +2751,12 @@ pub trait ChannelSourceObj: Send + Sync {
     /// Monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
-        pv_name: &'a str,
+        pv_name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<AccessChecked>> + Send + 'a>>;
     fn put_value<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         value: PvField,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state PUT.
@@ -2760,7 +2789,7 @@ pub trait ChannelSourceObj: Send + Sync {
     /// Dyn forwarder for ChannelArray INIT.
     fn channel_array_init<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FieldDesc, OpError>> + Send + 'a>>;
     /// Dyn forwarder for ChannelArray `getArray`.
@@ -2796,7 +2825,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, OpError>> + Send + 'a>>;
     fn is_writable<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     /// Dyn forwarder for the MONITOR INIT pvRequest check
     /// ([`ChannelSource::check_monitor_request`]).
@@ -2807,7 +2836,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     fn subscribe<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     >;
@@ -2821,7 +2850,7 @@ pub trait ChannelSourceObj: Send + Sync {
     >;
     fn subscribe_raw<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     >;
@@ -2886,7 +2915,7 @@ pub trait ChannelSourceObj: Send + Sync {
     >;
     fn rpc<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
@@ -2900,7 +2929,7 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>;
     fn process<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
     /// Dyn forwarder for type-state PROCESS.
     fn process_checked<'a>(
@@ -2908,38 +2937,38 @@ pub trait ChannelSourceObj: Send + Sync {
         checked: AccessChecked,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent);
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool);
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext);
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext);
     fn set_channel_invalidator(&self, invalidator: ChannelInvalidator);
     fn monitor_watermarks<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(usize, usize)>> + Send + 'a>>;
 }
 
 impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn list_pvs<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RecordName>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::list_pvs(self))
     }
     fn has_pv<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::has_pv(self, name))
     }
     fn searchable<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::searchable(self, name))
     }
     fn searchable_from<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         requester: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::searchable_from(
@@ -2948,20 +2977,20 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn get_introspection<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_introspection(self, name))
     }
     fn has_pv_checked<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::has_pv_checked(self, name, ctx))
     }
     fn get_introspection_checked<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_introspection_checked(
@@ -2970,7 +2999,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn await_introspection<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::await_introspection(
@@ -2979,14 +3008,14 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn resolve_owner<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::resolve_owner(self, name, ctx))
     }
     fn channel_report_info<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::channel_report_info(
@@ -2995,7 +3024,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn get_value<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PvField>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_value(self, name))
     }
@@ -3023,7 +3052,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn revalidate_read<'a>(
         &'a self,
-        pv_name: &'a str,
+        pv_name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<AccessChecked>> + Send + 'a>>
     {
@@ -3031,7 +3060,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn put_value<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         value: PvField,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_value(self, name, value))
@@ -3074,7 +3103,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn channel_array_init<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FieldDesc, OpError>> + Send + 'a>>
     {
@@ -3127,7 +3156,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn is_writable<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::is_writable(self, name))
     }
@@ -3142,7 +3171,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn subscribe<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<MonitorStream<PvField>>> + Send + 'a>,
     > {
@@ -3161,7 +3190,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn subscribe_raw<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Option<MonitorStream<RawMonitorEvent>>> + Send + 'a>,
     > {
@@ -3242,7 +3271,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn rpc<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RpcReply, OpError>> + Send + 'a>>
@@ -3272,7 +3301,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn process<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process(self, name))
     }
@@ -3283,22 +3312,22 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::process_checked(self, checked, ctx))
     }
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         contain_callback_panic("notify_watermark", name, || {
             <Self as ChannelSource>::notify_watermark(self, name, ctx, ev)
         });
     }
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool) {
         contain_callback_panic("notify_monitor_start", name, || {
             <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start)
         });
     }
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext) {
         contain_callback_panic("notify_channel_open", name, || {
             <Self as ChannelSource>::notify_channel_open(self, name, ctx)
         });
     }
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext) {
         contain_callback_panic("notify_channel_close", name, || {
             <Self as ChannelSource>::notify_channel_close(self, name, ctx)
         });
@@ -3308,7 +3337,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn monitor_watermarks<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(usize, usize)>> + Send + 'a>>
     {
         Box::pin(<Self as ChannelSource>::monitor_watermarks(self, name))
@@ -3338,40 +3367,40 @@ mod tests {
             seen: Mutex<Vec<&'static str>>,
         }
         impl ChannelSource for PanickyLifecycle {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 Vec::new()
             }
-            async fn has_pv(&self, _n: &str) -> bool {
+            async fn has_pv(&self, _n: &[u8]) -> bool {
                 false
             }
-            async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _n: &[u8]) -> Option<FieldDesc> {
                 None
             }
-            async fn get_value(&self, _n: &str) -> Option<PvField> {
+            async fn get_value(&self, _n: &[u8]) -> Option<PvField> {
                 None
             }
-            async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _n: &[u8], _v: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _n: &str) -> bool {
+            async fn is_writable(&self, _n: &[u8]) -> bool {
                 false
             }
-            async fn subscribe(&self, _n: &str) -> Option<MonitorStream<PvField>> {
+            async fn subscribe(&self, _n: &[u8]) -> Option<MonitorStream<PvField>> {
                 None
             }
-            fn notify_watermark(&self, _n: &str, _c: &ChannelContext, _e: WatermarkEvent) {
+            fn notify_watermark(&self, _n: &[u8], _c: &ChannelContext, _e: WatermarkEvent) {
                 self.seen.lock().expect("seen").push("notify_watermark");
                 panic!("notify_watermark");
             }
-            fn notify_monitor_start(&self, _n: &str, _c: &ChannelContext, _s: bool) {
+            fn notify_monitor_start(&self, _n: &[u8], _c: &ChannelContext, _s: bool) {
                 self.seen.lock().expect("seen").push("notify_monitor_start");
                 panic!("notify_monitor_start");
             }
-            fn notify_channel_open(&self, _n: &str, _c: &ChannelContext) {
+            fn notify_channel_open(&self, _n: &[u8], _c: &ChannelContext) {
                 self.seen.lock().expect("seen").push("notify_channel_open");
                 panic!("notify_channel_open");
             }
-            fn notify_channel_close(&self, _n: &str, _c: &ChannelContext) {
+            fn notify_channel_close(&self, _n: &[u8], _c: &ChannelContext) {
                 self.seen.lock().expect("seen").push("notify_channel_close");
                 panic!("notify_channel_close");
             }
@@ -3382,7 +3411,7 @@ mod tests {
         let ctx = ChannelContext {
             peer: "127.0.0.1:5075".parse().expect("peer"),
             creds: Arc::new(crate::server_native::config::ClientCredentials {
-                account: String::new(),
+                account: Default::default(),
                 method: "anonymous".into(),
                 host: String::new(),
                 authority: String::new(),
@@ -3393,10 +3422,10 @@ mod tests {
         };
 
         // Each call must return; reaching the line after it IS the assertion.
-        dyn_src.notify_channel_open("dut", &ctx);
-        dyn_src.notify_monitor_start("dut", &ctx, true);
+        dyn_src.notify_channel_open(b"dut", &ctx);
+        dyn_src.notify_monitor_start(b"dut", &ctx, true);
         dyn_src.notify_watermark(
-            "dut",
+            b"dut",
             &ctx,
             WatermarkEvent {
                 op_id: 1,
@@ -3404,7 +3433,7 @@ mod tests {
                 kind: WatermarkKind::Pause,
             },
         );
-        dyn_src.notify_channel_close("dut", &ctx);
+        dyn_src.notify_channel_close(b"dut", &ctx);
 
         assert_eq!(
             *src.seen.lock().expect("seen"),
@@ -3418,13 +3447,13 @@ mod tests {
         );
     }
 
-    fn batch(names: &[&str]) -> Arc<[String]> {
-        names.iter().map(|s| s.to_string()).collect()
+    fn batch(names: &[&str]) -> Arc<[RecordName]> {
+        names.iter().map(|s| RecordName::from(*s)).collect()
     }
 
     fn marked(v: i32, paths: &[&str]) -> MonitorUpdate {
         MonitorUpdate {
-            value: PvField::Scalar(ScalarValue::Int(v)),
+            value: PvField::Scalar(ScalarValue::Int(v)).into(),
             marked: Some(paths.iter().map(|p| p.to_string()).collect()),
             type_changed: false,
             overrun: Vec::new(),

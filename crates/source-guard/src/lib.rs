@@ -93,10 +93,11 @@ pub fn production_str(src: &str, comments: Comments) -> String {
         }
     };
     let lines: Vec<&str> = src.lines().collect();
+    let (code_line, code_text) = code_view(src, &lex(src));
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     let mut i = 0usize;
     while i < lines.len() {
-        match test_only_item_at(&lines, i) {
+        match test_only_item_at(&lines, &code_line, &code_text, i) {
             Some(past) => {
                 // An item's documentation is part of the item. Left in, a
                 // test helper's doc comment is production text under
@@ -151,8 +152,14 @@ pub fn production(src: &'static str, comments: Comments) -> &'static str {
 ///
 /// An item this cannot close is left in the slice, so an unparsable shape
 /// raises a false alarm in the guard rather than silencing it.
-fn test_only_item_at(lines: &[&str], i: usize) -> Option<usize> {
-    if !cfg_is_test_only(lines[i].trim_start()) {
+fn test_only_item_at(
+    lines: &[&str],
+    code_line: &[bool],
+    code_text: &[String],
+    i: usize,
+) -> Option<usize> {
+    // A `#[cfg(test)]` that is fixture text or commented out opens nothing.
+    if !code_line[i] || !cfg_is_test_only(lines[i].trim_start()) {
         return None;
     }
     // The item's own indentation. The rule is the same at every depth: a
@@ -164,10 +171,12 @@ fn test_only_item_at(lines: &[&str], i: usize) -> Option<usize> {
     let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
     // Further attributes may sit between the `cfg` and the item it applies to.
     let mut item = i + 1;
-    while lines.get(item)?.trim_start().starts_with('#') {
+    while code_text.get(item)?.trim_start().starts_with('#') {
         item += 1;
     }
-    let head = lines.get(item)?;
+    // The head line as syntax: a `{` in a string or a `;` in a trailing
+    // comment is not one.
+    let head = code_text.get(item)?;
     let opens = head.matches('{').count();
     let closes = head.matches('}').count();
     if opens > 0 && opens == closes {
@@ -184,7 +193,11 @@ fn test_only_item_at(lines: &[&str], i: usize) -> Option<usize> {
     // whole line rather than counting braces is what makes a `"{"` inside a
     // test fixture harmless.
     let close_marker = format!("{indent}}}");
-    let close = (item..lines.len()).find(|&k| lines[k] == close_marker)?;
+    // A line that begins inside a multi-line string or block comment is not
+    // the item's closing brace: a `.db` or JSON fixture in a raw string, or
+    // commented-out code, carries a column-0 `}` of its own.
+    let close = (item..lines.len())
+        .find(|&k| lines[k] == close_marker && code_line.get(k).copied().unwrap_or(true))?;
     Some(close + 1)
 }
 
@@ -252,60 +265,113 @@ fn split_top(args: &str) -> Vec<&str> {
     out
 }
 
-/// Remove every comment, keeping line structure and literal text intact.
-fn strip_comments(src: &str) -> String {
+/// What a source byte is: ordinary code, comment text, or a string/char
+/// literal (delimiters included).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Code,
+    Comment,
+    Literal,
+}
+
+/// **The one lexer.** Classifies every byte of `src`; comment stripping and
+/// both searches of the test-item walk (the `cfg` line that opens an item and
+/// the column-0 `}` that closes it) read this and nothing else, so a
+/// `#[cfg(test)]` or a `}` is only ever syntax when this says it is `Code`.
+fn lex(src: &str) -> Vec<Class> {
     let b = src.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut class = vec![Class::Code; b.len()];
     let mut i = 0usize;
     while i < b.len() {
-        // A raw string opener has to be recognised before its `r`/`b` is taken
-        // for an identifier character, because `\` is not an escape inside it.
-        if let Some((hashes, quote)) = raw_string_at(b, i) {
-            let end = raw_string_end(b, quote + 1, hashes);
-            out.extend_from_slice(&b[i..end]);
-            i = end;
-            continue;
-        }
-        match b[i] {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let mut depth = 1usize;
-                i += 2;
-                while i < b.len() && depth > 0 {
-                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        if b[i] == b'\n' {
-                            out.push(b'\n');
-                        }
-                        i += 1;
+        // A raw string opener has to be recognised before its `r`/`b`/`c` is
+        // taken for an identifier character, because `\` is not an escape in it.
+        let (kind, end) = if let Some((hashes, quote)) = raw_string_at(b, i) {
+            (Class::Literal, raw_string_end(b, quote + 1, hashes))
+        } else {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    let mut j = i;
+                    while j < b.len() && b[j] != b'\n' {
+                        j += 1;
                     }
+                    (Class::Comment, j)
                 }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let mut depth = 1usize;
+                    let mut j = i + 2;
+                    while j < b.len() && depth > 0 {
+                        if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                            depth += 1;
+                            j += 2;
+                        } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                            depth -= 1;
+                            j += 2;
+                        } else {
+                            j += 1;
+                        }
+                    }
+                    (Class::Comment, j)
+                }
+                b'"' => (Class::Literal, string_end(b, i + 1)),
+                b'\'' => {
+                    let end = quote_end(b, i);
+                    // A lifetime's lone `'` is code; the name after it too.
+                    let kind = if end > i + 1 {
+                        Class::Literal
+                    } else {
+                        Class::Code
+                    };
+                    (kind, end)
+                }
+                _ => (Class::Code, i + 1),
             }
-            b'"' => {
-                let end = string_end(b, i + 1);
-                out.extend_from_slice(&b[i..end]);
-                i = end;
-            }
-            b'\'' => {
-                let end = quote_end(b, i);
-                out.extend_from_slice(&b[i..end]);
-                i = end;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
+        };
+        let end = end.min(b.len()).max(i + 1);
+        class[i..end].fill(kind);
+        i = end;
     }
+    class
+}
+
+/// Per line of `src`: whether its first non-blank byte is `Code` (a line that
+/// begins inside a multi-line string or block comment is not syntax, whatever
+/// it spells; a blank line counts as code), and the line with every `Comment`
+/// and `Literal` byte blanked, so a `{` or a trailing `;` is only read where it
+/// is syntax.
+fn code_view(src: &str, class: &[Class]) -> (Vec<bool>, Vec<String>) {
+    let mut starts = Vec::new();
+    let mut masked = Vec::new();
+    let mut at = 0usize;
+    for line in src.split_inclusive('\n') {
+        let first = line
+            .bytes()
+            .position(|c| !c.is_ascii_whitespace())
+            .map(|k| at + k);
+        starts.push(first.is_none_or(|k| class[k] == Class::Code));
+        let bytes: Vec<u8> = line
+            .bytes()
+            .zip(&class[at..at + line.len()])
+            .map(|(c, k)| if *k == Class::Code { c } else { b' ' })
+            .collect();
+        masked.push(
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches(['\n', '\r'])
+                .to_string(),
+        );
+        at += line.len();
+    }
+    (starts, masked)
+}
+
+/// Remove every comment, keeping line structure and literal text intact.
+fn strip_comments(src: &str) -> String {
+    let class = lex(src);
+    let out: Vec<u8> = src
+        .bytes()
+        .zip(&class)
+        .filter(|&(c, k)| *k != Class::Comment || c == b'\n')
+        .map(|(c, _)| c)
+        .collect();
     // Only ever split at ASCII delimiters, so the bytes are still valid UTF-8.
     String::from_utf8(out).expect("comment stripping splits only at ASCII")
 }
@@ -316,7 +382,8 @@ fn raw_string_at(b: &[u8], i: usize) -> Option<(usize, usize)> {
         return None;
     }
     let mut j = i;
-    if b.get(j) == Some(&b'b') {
+    // `r"`, `br"` and `cr"` (C string, Rust 1.77).
+    if matches!(b.get(j), Some(&b'b') | Some(&b'c')) {
         j += 1;
     }
     if b.get(j) != Some(&b'r') {
@@ -360,7 +427,8 @@ fn string_end(b: &[u8], mut i: usize) -> usize {
 /// a lifetime, which is emitted alone so the name after it stays code.
 fn quote_end(b: &[u8], i: usize) -> usize {
     if b.get(i + 1) == Some(&b'\\') {
-        let mut j = i + 2;
+        // Past the escaped character: `'\''` has its payload quote at `i + 2`.
+        let mut j = i + 3;
         while j < b.len() && b[j] != b'\'' {
             j += 1;
         }

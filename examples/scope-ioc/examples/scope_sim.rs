@@ -29,7 +29,7 @@ async fn main() {
     let port_handle = runtime_handle.port_handle().clone();
 
     // 3. Subscribe for interrupt notifications
-    let mut rx = port_handle.interrupts().subscribe_async();
+    let mut rx = port_handle.interrupts().subscribe_async(256, 4096);
 
     // 4. Open `interruptAccept`. `call_param_callbacks` returns without
     // notifying while the gate is closed, and the gate's single owner is the
@@ -40,7 +40,14 @@ async fn main() {
     // (asynPortDriver.cpp:23-25); here the non-IOC program opens it itself.
     // Subscribed first, above, so the one-shot flush of the driver's
     // construction seeds is delivered rather than missed.
-    epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+    // The gate is a database's; this program has none, so it owns the port
+    // with an open one: registering flushes the construction seeds at once.
+    asyn_rs::asyn_record::register_port(
+        port_handle.port_name(),
+        port_handle.clone(),
+        &asyn_rs::registry::open_owner(),
+    )
+    .expect("the port name is free");
 
     // 5. Spawn background simulation task
     let sim_handle = port_handle.clone();

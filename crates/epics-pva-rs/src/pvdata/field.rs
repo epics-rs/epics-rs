@@ -23,11 +23,11 @@ pub enum FieldDesc {
     ScalarArray(ScalarType),
     Structure {
         struct_id: String,
-        fields: Vec<(String, FieldDesc)>,
+        fields: StructFields,
     },
     StructureArray {
         struct_id: String,
-        fields: Vec<(String, FieldDesc)>,
+        fields: StructFields,
     },
     Union {
         struct_id: String,
@@ -39,6 +39,65 @@ pub enum FieldDesc {
     },
     Variant,
     VariantArray,
+}
+
+/// The members of a structure (or of a structure array's element), with
+/// the number of `BitSet` positions a structure of these members spans —
+/// its own bit plus every descendant's, pvxs `FieldDesc::size()`. The count
+/// is taken once here and the list cannot be changed afterwards, so it can
+/// never disagree with the members.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StructFields {
+    fields: Vec<(String, FieldDesc)>,
+    bits: usize,
+}
+
+impl StructFields {
+    pub fn into_vec(self) -> Vec<(String, FieldDesc)> {
+        self.fields
+    }
+}
+
+impl Default for StructFields {
+    fn default() -> Self {
+        Vec::new().into()
+    }
+}
+
+impl From<Vec<(String, FieldDesc)>> for StructFields {
+    fn from(fields: Vec<(String, FieldDesc)>) -> Self {
+        let bits = 1 + fields.iter().map(|(_, c)| c.total_bits()).sum::<usize>();
+        Self { fields, bits }
+    }
+}
+
+impl FromIterator<(String, FieldDesc)> for StructFields {
+    fn from_iter<I: IntoIterator<Item = (String, FieldDesc)>>(iter: I) -> Self {
+        Vec::from_iter(iter).into()
+    }
+}
+
+impl std::ops::Deref for StructFields {
+    type Target = [(String, FieldDesc)];
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl<'a> IntoIterator for &'a StructFields {
+    type Item = &'a (String, FieldDesc);
+    type IntoIter = std::slice::Iter<'a, (String, FieldDesc)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter()
+    }
+}
+
+impl IntoIterator for StructFields {
+    type Item = (String, FieldDesc);
+    type IntoIter = std::vec::IntoIter<(String, FieldDesc)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
 }
 
 impl FieldDesc {
@@ -75,12 +134,9 @@ impl FieldDesc {
     ///
     /// Unions, scalars, and arrays count as a single bit.
     pub fn total_bits(&self) -> usize {
-        1 + match self {
-            FieldDesc::Structure { fields, .. } => fields
-                .iter()
-                .map(|(_, child)| child.total_bits())
-                .sum::<usize>(),
-            _ => 0,
+        match self {
+            FieldDesc::Structure { fields, .. } => fields.bits,
+            _ => 1,
         }
     }
 
@@ -340,11 +396,11 @@ impl TypeDef {
         match self.kind {
             TypeDefKind::Structure => FieldDesc::Structure {
                 struct_id: self.struct_id,
-                fields,
+                fields: fields.into(),
             },
             TypeDefKind::StructureArray => FieldDesc::StructureArray {
                 struct_id: self.struct_id,
-                fields,
+                fields: fields.into(),
             },
             TypeDefKind::Union => FieldDesc::Union {
                 struct_id: self.struct_id,
@@ -362,6 +418,154 @@ impl TypeDef {
 mod tests {
     use super::*;
 
+    /// pvxs 1.5.3 `NTScalar double display control valueAlarm form`: member names in `iall()` order, bit `i + 1`.
+    const PVXS_NTSCALAR_FORM: &[&str] = &[
+        "value",
+        "alarm",
+        "alarm.severity",
+        "alarm.status",
+        "alarm.message",
+        "timeStamp",
+        "timeStamp.secondsPastEpoch",
+        "timeStamp.nanoseconds",
+        "timeStamp.userTag",
+        "display",
+        "display.limitLow",
+        "display.limitHigh",
+        "display.description",
+        "display.units",
+        "display.precision",
+        "display.form",
+        "display.form.index",
+        "display.form.choices",
+        "control",
+        "control.limitLow",
+        "control.limitHigh",
+        "control.minStep",
+        "valueAlarm",
+        "valueAlarm.active",
+        "valueAlarm.lowAlarmLimit",
+        "valueAlarm.lowWarningLimit",
+        "valueAlarm.highWarningLimit",
+        "valueAlarm.highAlarmLimit",
+        "valueAlarm.lowAlarmSeverity",
+        "valueAlarm.lowWarningSeverity",
+        "valueAlarm.highWarningSeverity",
+        "valueAlarm.highAlarmSeverity",
+        "valueAlarm.hysteresis",
+    ];
+
+    /// pvxs 1.5.3 `NTTable a:double b:int32 c:string`: member names in `iall()` order, bit `i + 1`.
+    const PVXS_NTTABLE: &[&str] = &[
+        "labels",
+        "value",
+        "value.a",
+        "value.b",
+        "value.c",
+        "descriptor",
+        "alarm",
+        "alarm.severity",
+        "alarm.status",
+        "alarm.message",
+        "timeStamp",
+        "timeStamp.secondsPastEpoch",
+        "timeStamp.nanoseconds",
+        "timeStamp.userTag",
+    ];
+
+    /// pvxs 1.5.3 `NTEnum`: member names in `iall()` order, bit `i + 1`.
+    const PVXS_NTENUM: &[&str] = &[
+        "value",
+        "value.index",
+        "value.choices",
+        "alarm",
+        "alarm.severity",
+        "alarm.status",
+        "alarm.message",
+        "timeStamp",
+        "timeStamp.secondsPastEpoch",
+        "timeStamp.nanoseconds",
+        "timeStamp.userTag",
+        "display",
+        "display.description",
+    ];
+
+    fn assert_pvxs_bits(desc: &FieldDesc, pvxs: &[&str]) {
+        for (i, path) in pvxs.iter().enumerate() {
+            assert_eq!(desc.bit_for_path(path), Some(i + 1), "{path}");
+        }
+        assert_eq!(desc.total_bits(), pvxs.len() + 1);
+    }
+
+    #[test]
+    fn nt_bit_offsets_match_pvxs() {
+        use crate::nt::{NTEnum, NTScalar, NTTable};
+        let scalar = NTScalar::new(ScalarType::Double)
+            .with_display()
+            .with_form()
+            .with_control()
+            .with_value_alarm()
+            .build();
+        assert_pvxs_bits(&scalar, PVXS_NTSCALAR_FORM);
+        let table = NTTable::new()
+            .add_column(ScalarType::Double, "a", None)
+            .add_column(ScalarType::Int, "b", None)
+            .add_column(ScalarType::String, "c", None)
+            .build();
+        assert_pvxs_bits(&table, PVXS_NTTABLE);
+        assert_pvxs_bits(&NTEnum::new().build(), PVXS_NTENUM);
+    }
+
+    /// pvxs 1.5.3 `TypeDef(Struct, {Int32 before, StructA arr {Float64 x,
+    /// Struct inner {Int32 a, Int32 b}}, Int32 after, Struct tail {String s,
+    /// Float64 d}})`, `iall()` order: the array is one bit, its element
+    /// members are not numbered.
+    const PVXS_STRUCT_ARRAY: &[&str] = &["before", "arr", "after", "tail", "tail.s", "tail.d"];
+
+    #[test]
+    fn struct_array_member_spans_one_bit_like_pvxs() {
+        let int = || FieldDesc::Scalar(ScalarType::Int);
+        let elem = vec![
+            ("x".into(), FieldDesc::Scalar(ScalarType::Double)),
+            (
+                "inner".into(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![("a".into(), int()), ("b".into(), int())].into(),
+                },
+            ),
+        ];
+        let desc = FieldDesc::Structure {
+            struct_id: "sa_t".into(),
+            fields: vec![
+                ("before".into(), int()),
+                (
+                    "arr".into(),
+                    FieldDesc::StructureArray {
+                        struct_id: "elem_t".into(),
+                        fields: elem.into(),
+                    },
+                ),
+                ("after".into(), int()),
+                (
+                    "tail".into(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![
+                            ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+                            ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+                        ]
+                        .into(),
+                    },
+                ),
+            ]
+            .into(),
+        };
+        assert_pvxs_bits(&desc, PVXS_STRUCT_ARRAY);
+        assert_eq!(desc.bit_span_for_path("arr"), Some((2, 3)));
+        assert_eq!(desc.bit_span_for_path("tail"), Some((4, 7)));
+    }
+
     fn nt_scalar_double() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -375,7 +579,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -389,10 +594,12 @@ mod tests {
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -578,10 +785,12 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         assert_eq!(built.total_bits(), hand.total_bits());
     }

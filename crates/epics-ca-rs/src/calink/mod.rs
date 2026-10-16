@@ -13,6 +13,10 @@
 //! (`dbCa.c:891`) — a CA link is **monitor-backed**, served from
 //! cache, never a synchronous per-read fetch.
 //!
+//! This is the network half only. A name the IOC's own database serves is
+//! answered in process by the database's `ca` link set, as C `dbContext`
+//! answers it ahead of libca, and never reaches this module.
+//!
 //! ## Why this lives in `epics-ca-rs`
 //!
 //! A CA-link resolver needs both halves: the database-side
@@ -28,24 +32,17 @@
 //!
 //! ## Usage
 //!
-//! A CA-serving IOC built on [`epics_base_rs::server::ioc_app::IocApplication`]
-//! wires the link set once, at construction, via the base
-//! `register_link_set_installer` seam. The installer fires at the
+//! The IOC runners (`run_ca_ioc_app`, the bridge's `run_qsrv_ioc_app`) wire
+//! the link set once, at construction, via the base `register_link_type`
+//! seam, so a head that runs through one never names it. The installer fires at the
 //! iocInit `AfterCaLinkInit` hook — BEFORE `setup_cp_links` warms Passive
 //! CP holders — so CA links (including a Passive CP/CPP holder's source)
 //! resolve with no further setup:
 //!
 //! ```ignore
-//! use epics_ca_rs::calink::calink_link_set_install;
-//!
 //! // `run_ca_ioc_app`, not `IocApplication::run(run_ca_ioc)`: it runs C's
-//! // `rsrvRegistrar` before the startup script, which the runner cannot.
-//! epics_ca_rs::server::run_ca_ioc_app(
-//!     IocApplication::new()
-//!         .startup_script("st.cmd")
-//!         .register_link_set_installer(calink_link_set_install),
-//! )
-//! .await
+//! // `rsrvRegistrar` before the startup script and installs this link set.
+//! epics_ca_rs::server::run_ca_ioc_app(IocApplication::new().startup_script("st.cmd")).await
 //! ```
 //!
 //! The lower-level [`crate::calink::install_calink_resolver`] is also available for
@@ -65,7 +62,7 @@ pub use iocsh::{ca_caxr_command, db_dbcaxr_command, register_calink_commands};
 pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver};
 
 /// Async link-set installer for
-/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_type`].
 ///
 /// Installs the `"ca"` link set on `db` and returns the `caxr` /
 /// `dbcaxr` iocsh commands. Registered at IOC construction, it is fired
@@ -74,7 +71,10 @@ pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver}
 /// CA-serving IOC needs to make CA links resolve: no feature opt-in, no
 /// manual [`CaLinkResolver::open`] calls. The shared CA client is
 /// created lazily on the first link open.
-pub async fn calink_link_set_install(db: Arc<PvDatabase>) -> Vec<CommandDef> {
-    let resolver = install_calink_resolver(&db).await;
+pub async fn calink_link_set_install(
+    db: Arc<PvDatabase>,
+    reactor: epics_base_rs::runtime::task::Reactor,
+) -> Vec<CommandDef> {
+    let resolver = install_calink_resolver(&db, reactor).await;
     register_calink_commands(resolver)
 }

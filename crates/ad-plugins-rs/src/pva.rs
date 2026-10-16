@@ -67,6 +67,7 @@ impl Default for PvaProcessor {
 }
 
 impl NDPluginProcess for PvaProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 
@@ -736,6 +737,7 @@ mod tests {
             10,
             "",
             Arc::new(WiringRegistry::new()),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
         );
         let dropped = handle.array_sender().dropped_arrays_counter().clone();
         handle

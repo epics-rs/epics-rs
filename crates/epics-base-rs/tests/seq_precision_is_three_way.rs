@@ -23,7 +23,7 @@ use epics_base_rs::types::EpicsValue;
 
 fn seq_with_prec(prec: i16) -> RecordInstance {
     let rec = create_record("seq").expect("seq is registered");
-    let mut inst = RecordInstance::new_boxed("S".to_string(), rec);
+    let mut inst = RecordInstance::new_boxed("S", rec);
     inst.put_common_field("PREC", EpicsValue::Short(prec))
         .expect("seq declares PREC");
     inst

@@ -194,7 +194,8 @@ impl IntoServiceResponse for Status {
                 fields: vec![
                     ("ok".into(), FieldDesc::Scalar(ScalarType::Boolean)),
                     ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                ],
+                ]
+                .into(),
             },
             value: PvField::Structure(s),
         }

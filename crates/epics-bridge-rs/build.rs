@@ -15,9 +15,8 @@
 //! No-ops on every non-RTEMS target.
 //!
 //! Also emits `epics_embedded_target` (set when `CARGO_CFG_TARGET_OS` is
-//! `rtems` or `vxworks`) for this crate's own module gates
-//! (`qsrv::run_ca_pva_qsrv_ioc` and its definition in `pva_adapter.rs`) —
-//! a `cargo::rustc-cfg` set by a dependency's build script does not
+//! `rtems` or `vxworks`) for this crate's own gates, which read it through
+//! the `exec_backend`/`tokio_backend` pair below — a `cargo::rustc-cfg` set by a dependency's build script does not
 //! propagate to a dependent crate either, so each crate that reads the cfg
 //! emits its own copy, same as `epics-libcom-rs`/`epics-base-rs`/
 //! `epics-ca-rs`/`epics-pva-rs`.

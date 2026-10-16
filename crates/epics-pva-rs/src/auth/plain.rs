@@ -1,42 +1,39 @@
 //! Plain (non-TLS) authentication: "anonymous" or "ca" with user+host AuthZ.
 //!
 //! The user/host pair is part of the CONNECTION_VALIDATION reply per pvxs
-//! `clientconn.cpp::handle_validation`. We default to `$USER`/`hostname()`
-//! but callers can override via `client_native::PvaClientBuilder`
-//! or the `EPICS_PVA_AUTH_USER` / `EPICS_PVA_AUTH_HOST` environment variables.
+//! `clientconn.cpp::handle_validation`. The user is `osiGetUserName`'s, as in
+//! pvxs `buildCAMethod`; callers can override via
+//! `client_native::PvaClientBuilder`, as can the host.
 
 /// pvxs `buildCAMethod` (src/client.cpp:519-532) sends these literals in the
 /// `ca` credential when the OS user / hostname lookup fails — `nobody`
 /// for an unresolved user, `invalidhost.` for an unresolved host. PVA ACF
 /// rules can match on user and host, so the degraded identity must match
 /// pvxs exactly rather than diverging to `anonymous` / `localhost`.
+use epics_base_rs::types::PvString;
+
 const CA_FALLBACK_USER: &str = "nobody";
 const CA_FALLBACK_HOST: &str = "invalidhost.";
 
 /// Fold a resolved user identity to the pvxs CA fallback when absent.
 /// Split out so the fallback literal is unit-testable without depending
 /// on the host's environment.
-fn user_or_ca_fallback(resolved: Option<String>) -> String {
-    resolved.unwrap_or_else(|| CA_FALLBACK_USER.to_string())
+fn user_or_ca_fallback(resolved: Option<PvString>) -> PvString {
+    resolved.unwrap_or_else(|| CA_FALLBACK_USER.into())
 }
 
 /// Fold a resolved host identity to the pvxs CA fallback when absent.
 /// Split out because `gethostname()` cannot be forced to fail from a
 /// test, so the fallback literal is exercised through this pure helper.
-fn host_or_ca_fallback(resolved: Option<String>) -> String {
-    resolved.unwrap_or_else(|| CA_FALLBACK_HOST.to_string())
+fn host_or_ca_fallback(resolved: Option<PvString>) -> PvString {
+    resolved.unwrap_or_else(|| CA_FALLBACK_HOST.into())
 }
 
-/// Resolve the AuthZ user. Honours `EPICS_PVA_AUTH_USER`, then `USER`,
-/// then `USERNAME`, then falls back to the pvxs CA default identity
-/// (`nobody`), matching `buildCAMethod` when `osiGetUserName()` fails.
-pub fn authnz_default_user() -> String {
-    user_or_ca_fallback(
-        std::env::var("EPICS_PVA_AUTH_USER")
-            .or_else(|_| std::env::var("USER"))
-            .or_else(|_| std::env::var("USERNAME"))
-            .ok(),
-    )
+/// Resolve the AuthZ user: pvxs `buildCAMethod` (`client.cpp:521`) takes
+/// `osiGetUserName`'s bytes and `nobody` when it fails; no environment
+/// variable is read.
+pub fn authnz_default_user() -> PvString {
+    user_or_ca_fallback(epics_base_rs::runtime::env::user_name().map(PvString::from_bytes))
 }
 
 /// Run `getgrouplist(3)` for `name`/`basegid`, returning `basegid` plus
@@ -94,6 +91,37 @@ fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gi
     gids
 }
 
+/// `getgrgid(3)` each gid into its `gr_name` (osgroups.cpp:120-124); a gid
+/// with no group entry names no role.
+#[cfg(local_account_db)]
+fn group_names(gids: &[libc::gid_t]) -> Vec<PvString> {
+    let mut names = Vec::with_capacity(gids.len());
+    for &gid in gids {
+        // SAFETY: getgrgid returns a pointer valid until the next NSS call;
+        // the name is copied out before the next iteration.
+        unsafe {
+            let gr = libc::getgrgid(gid);
+            if !gr.is_null() {
+                names.push(std::ffi::CStr::from_ptr((*gr).gr_name).to_owned());
+            }
+        }
+    }
+    roles_from_gr_names(names.iter().map(|n| n.as_c_str()))
+}
+
+/// pvxs `osdGetRoles` keeps every `gr_name` as the C bytes, sorted and
+/// deduplicated by its `std::set<std::string>`.
+#[cfg(local_account_db)]
+fn roles_from_gr_names<'a>(names: impl IntoIterator<Item = &'a std::ffi::CStr>) -> Vec<PvString> {
+    let mut roles: Vec<PvString> = names
+        .into_iter()
+        .map(|n| PvString::from(n.to_bytes()))
+        .collect();
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
 /// Enumerate the current process's POSIX group names. Mirrors pvxs
 /// `osdGetRoles()` (osgroups.cpp:54). On targets with no local account
 /// database returns an empty list. The `ca` auth method advertises these as
@@ -104,7 +132,7 @@ fn getgrouplist_ids(name: &std::ffi::CStr, basegid: libc::gid_t) -> Vec<libc::gi
 /// Calls `getgrouplist(3)` directly via `libc` — same data libca
 /// gathers on the C side. Result is sorted + deduped for stable
 /// matching.
-pub fn posix_groups() -> Vec<String> {
+pub fn posix_groups() -> Vec<PvString> {
     #[cfg(local_account_db)]
     {
         use std::ffi::CStr;
@@ -112,54 +140,24 @@ pub fn posix_groups() -> Vec<String> {
         // SAFETY: getuid is always safe; geteuid returns the
         // current effective uid.
         let uid = unsafe { libc::getuid() };
-        // Look up the login name AND the passwd primary group
-        // (`pw_gid`) via getpwuid. Both fields are read and copied out
-        // while the returned pointer is still valid. Falls back to the
-        // `$USER` env when the lookup misses (then no `pw_gid` exists).
-        let (name, pw_gid) = unsafe {
+        // Copy the login name and passwd primary group (`pw_gid`) out while
+        // the returned pointer is valid; no passwd entry means no groups.
+        let (user_cstr, primary) = unsafe {
             let pw = libc::getpwuid(uid);
             if pw.is_null() {
-                (None, None)
-            } else {
-                let cs = CStr::from_ptr((*pw).pw_name);
-                (cs.to_str().ok().map(|s| s.to_string()), Some((*pw).pw_gid))
+                return Vec::new();
             }
+            (CStr::from_ptr((*pw).pw_name).to_owned(), (*pw).pw_gid)
         };
-        let user = name
-            .or_else(|| std::env::var("USER").ok())
-            .unwrap_or_default();
-        if user.is_empty() {
+        if user_cstr.is_empty() {
             return Vec::new();
         }
         // Step 2: supplementary groups via the shared getgrouplist(3)
-        // doubling loop. The basegid is the account's passwd primary group
-        // (`pw_gid`), matching pvxs `osdGetRoles` (osgroups.cpp:65,88 seed
-        // getgrouplist with `user->pw_gid`). Only when getpwuid missed (the
-        // $USER-env fallback, no passwd entry) do we fall back to the
-        // process `getgid()`.
-        let user_cstr = match std::ffi::CString::new(user) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        let primary = pw_gid.unwrap_or_else(|| unsafe { libc::getgid() }) as libc::gid_t;
+        // doubling loop, seeded with `pw_gid` as pvxs `osdGetRoles`
+        // (osgroups.cpp:65,88) does.
         let gids = getgrouplist_ids(&user_cstr, primary);
         // Step 3: gid → group name via getgrgid.
-        let mut names: Vec<String> = Vec::with_capacity(gids.len());
-        for gid in gids {
-            unsafe {
-                let gr = libc::getgrgid(gid);
-                if gr.is_null() {
-                    continue;
-                }
-                let cs = CStr::from_ptr((*gr).gr_name);
-                if let Ok(s) = cs.to_str() {
-                    names.push(s.to_string());
-                }
-            }
-        }
-        names.sort();
-        names.dedup();
-        names
+        group_names(&gids)
     }
     #[cfg(not(local_account_db))]
     {
@@ -190,65 +188,37 @@ pub fn posix_groups() -> Vec<String> {
 /// identity); this resolves an ARBITRARY named account via
 /// `getpwnam(account)` and uses the account's `pw_gid` (not the process
 /// `getgid()`).
-pub fn osd_get_roles(account: &str) -> Vec<String> {
+pub fn osd_get_roles(account: &[u8]) -> Vec<PvString> {
     #[cfg(local_account_db)]
     {
         use std::ffi::{CStr, CString};
 
-        let account_cstr = match CString::new(account) {
-            Ok(c) => c,
-            // An embedded NUL cannot name a real passwd entry — treat as
-            // the getpwnam-miss fallback.
-            Err(_) => return vec![account.to_string()],
-        };
+        // `getpwnam(account.c_str())` (osgroups.cpp:55): the name ends at the
+        // first NUL, while the unknown-account fallback keeps all of it.
+        let len = account
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(account.len());
+        let account_cstr = CString::new(&account[..len]).expect("NUL-free prefix");
         // getpwnam(account): the named account's passwd entry. A NULL
         // result means the account is unknown locally — pvxs returns
         // {account} ("don't know who this is").
         // SAFETY: `account_cstr` is a valid NUL-terminated C string. We
         // read the returned passwd's fields only while the pointer is
         // valid (before any further NSS call) and copy them out at once.
-        let (pw_name, pw_gid) = unsafe {
+        let (name_cstr, pw_gid) = unsafe {
             let pw = libc::getpwnam(account_cstr.as_ptr());
             if pw.is_null() {
-                return vec![account.to_string()];
+                return vec![PvString::from(account)];
             }
-            let name = CStr::from_ptr((*pw).pw_name)
-                .to_str()
-                .ok()
-                .map(|s| s.to_string());
-            (name, (*pw).pw_gid)
-        };
-        let pw_name = match pw_name {
-            Some(n) => n,
-            None => return vec![account.to_string()],
-        };
-        let name_cstr = match CString::new(pw_name) {
-            Ok(c) => c,
-            Err(_) => return vec![account.to_string()],
+            (CStr::from_ptr((*pw).pw_name).to_owned(), (*pw).pw_gid)
         };
 
         // gids = primary `pw_gid` + supplementary groups, via the shared
         // getgrouplist(3) doubling loop (osgroups.cpp:82-118).
         let gids = getgrouplist_ids(&name_cstr, pw_gid);
 
-        // gid -> group name via getgrgid.
-        let mut names: Vec<String> = Vec::with_capacity(gids.len());
-        for gid in gids {
-            // SAFETY: getgrgid returns a pointer valid until the next NSS
-            // call; the name is copied out immediately.
-            unsafe {
-                let gr = libc::getgrgid(gid);
-                if gr.is_null() {
-                    continue;
-                }
-                if let Ok(s) = CStr::from_ptr((*gr).gr_name).to_str() {
-                    names.push(s.to_string());
-                }
-            }
-        }
-        names.sort();
-        names.dedup();
-        names
+        group_names(&gids)
     }
     #[cfg(not(local_account_db))]
     {
@@ -261,18 +231,18 @@ pub fn osd_get_roles(account: &str) -> Vec<String> {
         // derived ACF roles from whatever a BSP's synthetic passwd entry
         // happened to say. See `build.rs` for why the predicate is a named
         // capability and not `not(target_os = "rtems")`.
-        vec![account.to_string()]
+        vec![PvString::from(account)]
     }
 }
 
-/// Resolve the AuthZ host. Honours `EPICS_PVA_AUTH_HOST`, then the OS
-/// hostname, falling back to the pvxs CA default identity
-/// (`invalidhost.`), matching `buildCAMethod` when `gethostname()` fails.
-pub fn authnz_default_host() -> String {
-    if let Ok(h) = std::env::var("EPICS_PVA_AUTH_HOST") {
-        return h;
-    }
-    host_or_ca_fallback(hostname::get().ok().and_then(|s| s.into_string().ok()))
+/// Resolve the AuthZ host: pvxs `buildCAMethod` (`client.cpp:528-533`)
+/// takes `gethostname`'s bytes from a 256-byte buffer and `invalidhost.`
+/// when it fails; no environment variable is read.
+pub fn authnz_default_host() -> PvString {
+    host_or_ca_fallback(epics_base_rs::runtime::env::hostname().map(|mut h| {
+        h.truncate(255);
+        PvString::from_bytes(h)
+    }))
 }
 
 #[cfg(test)]
@@ -309,7 +279,7 @@ mod tests {
         // Both halves of the capability must exist: the implementation and the
         // no-database fallback. A count check rather than a mere `contains`, so
         // deleting one arm and leaving the other cannot pass.
-        assert_eq!(prod.matches("#[cfg(local_account_db)]").count(), 3);
+        assert_eq!(prod.matches("#[cfg(local_account_db)]").count(), 5);
         assert_eq!(prod.matches("#[cfg(not(local_account_db))]").count(), 2);
     }
 
@@ -380,6 +350,32 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn the_user_is_the_passwd_name_not_the_environment() {
+        use std::os::unix::ffi::OsStrExt;
+        let saved: Vec<_> = ["USER", "EPICS_PVA_AUTH_USER"]
+            .map(|k| (k, std::env::var_os(k)))
+            .into();
+        for (k, _) in &saved {
+            // SAFETY: single-threaded under the `epics_env` serial group.
+            unsafe { std::env::set_var(k, std::ffi::OsStr::from_bytes(b"op\xff")) };
+        }
+        let user = authnz_default_user();
+        for (k, v) in saved {
+            // SAFETY: same serial group.
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let pw_name = epics_base_rs::runtime::env::user_name().expect("passwd entry");
+        assert_eq!(user.as_bytes(), pw_name.as_slice());
+    }
+
     #[test]
     fn user_falls_back() {
         // Just check it returns *something*.
@@ -398,7 +394,7 @@ mod tests {
         // pvxs buildCAMethod (src/client.cpp:519-526) sends "nobody" when the
         // OS user lookup fails. A resolved name passes through unchanged;
         // an absent one degrades to exactly that literal (not "anonymous").
-        assert_eq!(user_or_ca_fallback(Some("alice".to_string())), "alice");
+        assert_eq!(user_or_ca_fallback(Some("alice".into())), "alice");
         assert_eq!(user_or_ca_fallback(None), "nobody");
     }
 
@@ -408,7 +404,7 @@ mod tests {
         // when gethostname() fails. gethostname() cannot be forced to fail
         // from a test, so the fallback literal is exercised through the
         // pure helper; a resolved host passes through unchanged.
-        assert_eq!(host_or_ca_fallback(Some("myhost".to_string())), "myhost");
+        assert_eq!(host_or_ca_fallback(Some("myhost".into())), "myhost");
         assert_eq!(host_or_ca_fallback(None), "invalidhost.");
     }
 
@@ -418,7 +414,34 @@ mod tests {
         // who this is" fallback (osgroups.cpp:57-60): the account name is
         // its only role. Deterministic regardless of host.
         let acct = "pvxs_unknown_account_zzqq";
-        assert_eq!(osd_get_roles(acct), vec![acct.to_string()]);
+        assert_eq!(osd_get_roles(acct.as_bytes()), vec![acct.to_string()]);
+    }
+
+    /// pvxs `osdGetRoles` looks the account up by `c_str()` (osgroups.cpp:55)
+    /// but returns the whole `std::string` when it is unknown: a NUL ends the
+    /// lookup name, and non-UTF-8 bytes survive the fallback.
+    #[cfg(local_account_db)]
+    #[test]
+    fn osd_get_roles_takes_the_account_bytes() {
+        assert_eq!(
+            osd_get_roles(b"no\xffsuch"),
+            vec![PvString::from(&b"no\xffsuch"[..])]
+        );
+        assert_eq!(osd_get_roles(b"root\0x"), osd_get_roles(b"root"));
+    }
+
+    /// A group name that is not UTF-8 is still a role, byte for byte.
+    #[cfg(local_account_db)]
+    #[test]
+    fn a_non_utf8_gr_name_is_kept_as_its_bytes() {
+        let roles = roles_from_gr_names([c"wheel", c"op\xff", c"wheel"]);
+        assert_eq!(
+            roles,
+            [
+                PvString::from(b"op\xff".as_slice()),
+                PvString::from("wheel")
+            ]
+        );
     }
 
     #[cfg(local_account_db)]
@@ -431,7 +454,7 @@ mod tests {
         // list, so that primary group must appear in posix_groups().
         // If this env has no passwd entry or the gid has no name
         // mapping, there is nothing to assert.
-        let primary_name: Option<String> = unsafe {
+        let primary_name: Option<PvString> = unsafe {
             let pw = libc::getpwuid(libc::getuid());
             if pw.is_null() {
                 None
@@ -440,7 +463,7 @@ mod tests {
                 if gr.is_null() {
                     None
                 } else {
-                    Some(CStr::from_ptr((*gr).gr_name).to_string_lossy().into_owned())
+                    Some(PvString::from(CStr::from_ptr((*gr).gr_name).to_bytes()))
                 }
             }
         };
@@ -458,7 +481,7 @@ mod tests {
         // `root` exists on every Unix host; its primary group maps to a
         // name via getgrgid, so the server-derived role set is non-empty.
         assert!(
-            !osd_get_roles("root").is_empty(),
+            !osd_get_roles(b"root").is_empty(),
             "root must derive at least one group role from the local DB"
         );
     }

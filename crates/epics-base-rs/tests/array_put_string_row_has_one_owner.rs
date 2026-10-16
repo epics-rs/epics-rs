@@ -70,7 +70,7 @@ async fn caput_array(db: &Db, rec: &str, texts: &[&str]) -> epics_base_rs::error
 /// What a CA client sees: the record's own `cvt_dbaddr`/`get_array_info` shape,
 /// not the raw backing `Vec`.
 fn val(db: &Db, rec: &str) -> Vec<f64> {
-    match db.get_pv(&format!("{rec}.VAL")).expect("VAL") {
+    match db.get_pv(format!("{rec}.VAL")).expect("VAL") {
         EpicsValue::DoubleArray(a) => a.to_vec(),
         EpicsValue::ULongArray(a) => a.into_iter().map(|v| v as f64).collect(),
         EpicsValue::Double(v) => vec![v],

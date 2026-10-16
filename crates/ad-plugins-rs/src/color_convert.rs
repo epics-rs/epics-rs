@@ -1006,6 +1006,7 @@ impl ColorConvertProcessor {
 }
 
 impl NDPluginProcess for ColorConvertProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
@@ -1385,15 +1386,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn demosaic_kernels_match_the_c_pixel_arithmetic_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         let (w, h) = (301, 4);
         let vals: Vec<u32> = (0..w * h).map(|i| (i * 7919 + 13) as u32 % 65536).collect();
         for pattern in [

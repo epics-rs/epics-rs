@@ -9,6 +9,9 @@ description = "Differential oracle harness: boots the C softIoc and the Rust IOC
 publish = false
 
 [dependencies]
+# Path-only and unpublished, as this crate is: the one exact reader of who
+# holds a port (`foreign_udp_holders`, `listens_on_tcp`).
+named-port = { path = "../named-port" }
 epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }
 # The Rust side of the PVA differential pair (`oracle-ioc --pva`), measured
@@ -17,6 +20,11 @@ epics-pva-rs = { workspace = true }
 # The asyn record + a null port so the oracle's asyn reproducer has a named
 # port to attach to (C's asynRecord refuses to init against an empty PORT).
 asyn-rs = { workspace = true }
+# optics' `table` record, which the C side loads into oracleTableIoc.
+optics-rs = { workspace = true }
+# The scaler record and its `Asyn Scaler` soft port, as oracleScalerIoc
+# loads them from scalerSupport.dbd.
+scaler-rs = { workspace = true, optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -24,6 +32,8 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
 [features]
+default = ["scaler"]
+scaler = ["dep:scaler-rs"]
 
 [[bin]]
 name = "oracle"

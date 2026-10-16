@@ -46,7 +46,9 @@
 //! `RUNNING_NOTIFIED` is what makes a wake that races the poll safe: it is
 //! never dropped, it is deferred to the end of the current poll and turned into
 //! a re-enqueue. A wake arriving in any other state either enqueues (`IDLE`) or
-//! is redundant (`SCHEDULED` — already queued; `DONE` — nothing to run).
+//! is redundant (`SCHEDULED` — already queued; `DONE` — nothing to run). Every
+//! transition and every redundant wake but `DONE` is a read-modify-write of
+//! the state, so the poll a wake joins acquires what the waker wrote first.
 //!
 //! ## Abort
 //!
@@ -96,7 +98,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
+use super::callback_executor::{Callback, CallbackHandle, CallbackPriority, Run, TaskEntry};
+use crate::runtime::offload::{OffloadJob, OffloadPool};
 
 /// Default band for a general spawned tail. C routes general deferred work
 /// through `callbackRequest` at `priorityMedium` (`callback.h:42`) — the middle
@@ -304,20 +307,18 @@ impl<T: Send + 'static> Task<T> {
         #[cfg(test)]
         self.enqueues.fetch_add(1, Ordering::Relaxed);
 
-        // `Entry` finalizes the task if it is dropped without running — see its
-        // `Drop` — which is what the band does with it once shut down. That is
-        // the only way an entry goes un-run: it holds no ring slot, so a full
-        // ring cannot turn a wake into the silent end of a long-lived task.
-        let mut entry = Entry {
-            task: Some(Arc::clone(self)),
-        };
-        self.callbacks
-            .schedule_task(self.priority, Box::new(move || entry.run()));
+        // The entry is this task's own `Arc`, so a wake allocates nothing under
+        // whatever lock its waker holds. Dropped without running — what the
+        // band does with it once shut down — it cancels the task
+        // (`cancel_unrun`). It holds no ring slot, so a full ring cannot turn
+        // a wake into the silent end of a long-lived task.
+        let entry = TaskEntry::new(Arc::clone(self) as Arc<dyn Run>);
+        self.callbacks.schedule_task(self.priority, entry);
     }
 
     /// Poll the task once on the calling worker, then either publish its
     /// outcome or release the worker.
-    fn run(self: Arc<Self>) {
+    fn poll_once(self: Arc<Self>) {
         // SCHEDULED → RUNNING. Anything else means the task was finalized out
         // from under this ring entry; there is nothing left to poll.
         if self
@@ -379,7 +380,9 @@ impl<T: Send + 'static> Task<T> {
                     // It was deliberately not enqueued then — that is this
                     // path's job, and re-enqueueing at the tail is what keeps a
                     // self-waking task from monopolising the worker.
-                    self.state.store(SCHEDULED, Ordering::Release);
+                    // A swap: a wake joining this deferral after the failed
+                    // exchange above is acquired here, not overwritten.
+                    self.state.swap(SCHEDULED, Ordering::AcqRel);
                     self.enqueue();
                 }
             }
@@ -417,7 +420,18 @@ impl<T: Send + 'static> Schedulable for Task<T> {
                     }
                 }
                 // SCHEDULED: already on a ring. RUNNING_NOTIFIED: already
-                // deferred. DONE: nothing to run. All redundant.
+                // deferred. Either way the wake still writes, or the poll it
+                // joins could read state older than the wake.
+                s @ (SCHEDULED | RUNNING_NOTIFIED) => {
+                    if self
+                        .state
+                        .compare_exchange(s, s, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                // DONE: nothing to run.
                 _ => return,
             }
         }
@@ -443,35 +457,18 @@ impl<T> Drop for Task<T> {
     }
 }
 
-/// One run-queue entry for a task, with the "ran or was dropped" bookkeeping.
-///
-/// A [`Callback`] is a `FnOnce` that the pool drops instead of calling when the
-/// band shuts down (`callback.c:237-284` semantics). Then this
-/// task's only scheduled run is gone and its state is stuck at `SCHEDULED`, so
-/// no later wake would re-enqueue it. `Drop` closes that: an entry that is
-/// dropped un-run finalizes its task as cancelled.
-struct Entry<T> {
-    task: Option<Arc<Task<T>>>,
-}
-
-impl<T: Send + 'static> Entry<T> {
-    fn run(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.run();
-        }
+impl<T: Send + 'static> Run for Task<T> {
+    fn run(self: Arc<Self>) {
+        self.poll_once();
     }
-}
 
-impl<T> Drop for Entry<T> {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.state.store(DONE, Ordering::Release);
-            // Drop the future here rather than leaving it to the task's own
-            // `Drop`, which may not run promptly if a waker still holds a
-            // reference. Its destructors are part of the cancel.
-            let _ = task.future.lock().unwrap().take();
-            task.shared.finalize(Err(JoinError::cancelled()));
-        }
+    fn cancel_unrun(&self) {
+        self.state.store(DONE, Ordering::Release);
+        // Drop the future here rather than leaving it to the task's own
+        // `Drop`, which may not run promptly if a waker still holds a
+        // reference. Its destructors are part of the cancel.
+        let _ = self.future.lock().unwrap().take();
+        self.shared.finalize(Err(JoinError::cancelled()));
     }
 }
 
@@ -605,8 +602,27 @@ where
     (JoinFuture { shared }, task)
 }
 
-/// Run a blocking closure `f` on a callback-pool worker — the RTEMS backend for
-/// [`crate::runtime::task::spawn_blocking`]. Returns a [`JoinFuture`] resolving
+/// Proof that the code holding it runs on a callback band (C
+/// `callbackRequest`), handed to a band closure by [`spawn_blocking_on`]. A
+/// function that must run there takes one.
+///
+/// Only the band machinery makes one, and it is neither `Send` nor `Clone`,
+/// so it cannot leave the band it was handed on. A band-run function is
+/// therefore unreachable through the blocking seam:
+///
+/// ```compile_fail
+/// use epics_libcom_rs::runtime::task::{
+///     CallbackPriority, OnBand, spawn_blocking, spawn_blocking_background,
+/// };
+/// fn band_only(_: OnBand) {}
+/// spawn_blocking_background(CallbackPriority::Low, |on| {
+///     spawn_blocking(move || band_only(on));
+/// });
+/// ```
+pub struct OnBand(std::marker::PhantomData<*const ()>);
+
+/// Run a blocking closure `f` on a callback-pool worker of `priority`'s band,
+/// handing it the [`OnBand`] that proves it. Returns a [`JoinFuture`] resolving
 /// to `f`'s return value.
 ///
 /// A blocking closure has no suspension point, so it cannot be aborted
@@ -620,7 +636,7 @@ pub fn spawn_blocking_on<F, R>(
     f: F,
 ) -> JoinFuture<R>
 where
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce(OnBand) -> R + Send + 'static,
     R: Send + 'static,
 {
     let shared = Shared::new();
@@ -637,7 +653,7 @@ where
             task_shared.finalize(Err(JoinError::cancelled()));
             return;
         }
-        let outcome = catch_unwind(AssertUnwindSafe(f));
+        let outcome = catch_unwind(AssertUnwindSafe(|| f(OnBand(std::marker::PhantomData))));
         let result = match outcome {
             Ok(value) => Ok(value),
             Err(_panic) => Err(JoinError::panicked()),
@@ -654,8 +670,43 @@ where
     JoinFuture { shared }
 }
 
+/// [`spawn_blocking_on`] onto an [`OffloadPool`] instead of a band: the
+/// `exec_backend` [`crate::runtime::task::spawn_blocking`]. Same handle, same
+/// abort-before-start and panic isolation; the closure holds a pool worker,
+/// never a callback band. A pool that cannot create a worker resolves the
+/// handle cancelled.
+pub fn spawn_blocking_offloaded<F, R>(pool: &'static OffloadPool, f: F) -> JoinFuture<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let shared = Shared::new();
+    let task_shared = Arc::clone(&shared);
+    let mut guard = FinalizeOnDrop {
+        shared: Some(Arc::clone(&shared)),
+    };
+    let job: OffloadJob = Box::new(move |release| {
+        guard.defuse();
+        let result = if task_shared.control.abort.load(Ordering::Acquire) {
+            Err(JoinError::cancelled())
+        } else {
+            catch_unwind(AssertUnwindSafe(f)).map_err(|_panic| JoinError::panicked())
+        };
+        release();
+        task_shared.finalize(result);
+    });
+
+    if let Err(e) = pool.submit(job) {
+        tracing::error!(
+            target: "epics_base_rs::runtime::future_exec",
+            "spawn_blocking_offloaded: no worker ({e}); closure dropped, handle resolves cancelled"
+        );
+    }
+    JoinFuture { shared }
+}
+
 /// Resolves a handle as cancelled unless [`defuse`](Self::defuse)d — the
-/// blocking-closure counterpart of [`Entry`]'s `Drop`.
+/// blocking-closure counterpart of [`TaskEntry`]'s `Drop`.
 struct FinalizeOnDrop<R> {
     shared: Option<Arc<Shared<R>>>,
 }
@@ -739,6 +790,75 @@ mod tests {
     }
 
     // -- basic execution ----------------------------------------------------
+
+    /// A wake that finds the task already scheduled or deferred is served by
+    /// the poll it joins: that poll sees what the waker wrote first.
+    /// Probabilistic and time-bounded. A plain-load wake loses that on x86
+    /// too: the waker's store of `latest` may wait in its store buffer past
+    /// its own load of `state` (StoreLoad), which the poll's exchange does not
+    /// order. This probe's poll path outlasts the drain, so it caught none in
+    /// ~700k release trials; a `store(SCHEDULED)` re-enqueue loses it only
+    /// under the C11 model.
+    #[test]
+    fn a_coalesced_wake_is_seen_by_the_poll_it_joins() {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::task::Waker;
+        use std::time::Instant;
+        struct Probe {
+            latest: AtomicUsize,
+            waker: OnceLock<Waker>,
+            done: AtomicBool,
+        }
+        struct Wait(Arc<Probe>);
+        impl Future for Wait {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.0.latest.load(Ordering::Acquire) == N {
+                    self.0.done.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                let _ = self.0.waker.set(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        const N: usize = 50;
+        let pool = CallbackPool::with_config(1024, 1);
+        let budget = Instant::now() + Duration::from_secs(2);
+        let (mut trials, mut lost) = (0usize, 0usize);
+        while Instant::now() < budget {
+            let p = Arc::new(Probe {
+                latest: AtomicUsize::new(0),
+                waker: OnceLock::new(),
+                done: AtomicBool::new(false),
+            });
+            let jf = spawn_future(&pool.handle(), CallbackPriority::Low, Wait(Arc::clone(&p)));
+            let waker = loop {
+                if let Some(w) = p.waker.get() {
+                    break w.clone();
+                }
+                std::thread::yield_now();
+            };
+            for i in 1..=N {
+                p.latest.store(i, Ordering::Release);
+                waker.wake_by_ref();
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !p.done.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if !p.done.load(Ordering::Acquire) {
+                lost += 1;
+                waker.wake_by_ref();
+            }
+            join(jf).unwrap();
+            trials += 1;
+        }
+        assert_eq!(
+            lost, 0,
+            "{lost} of {trials} trials left the last wake unserved"
+        );
+    }
 
     #[test]
     fn future_runs_to_completion() {
@@ -1204,16 +1324,168 @@ mod tests {
     #[test]
     fn spawn_blocking_returns_value_and_isolates_panic() {
         let pool = CallbackPool::new();
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || 123u32);
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| 123u32);
         assert_eq!(join(jf).unwrap(), 123);
 
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || {
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| {
             panic!("blocking boom")
         });
         assert!(!join::<()>(jf).unwrap_err().is_cancelled());
 
         // Worker survived the panic.
-        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, || 5u32);
+        let jf = spawn_blocking_on(&pool.handle(), CallbackPriority::Medium, |_| 5u32);
         assert_eq!(join(jf).unwrap(), 5);
+    }
+
+    #[test]
+    fn spawn_blocking_offloaded_returns_value_and_isolates_panic() {
+        use crate::runtime::task::ThreadPriority;
+        static POOL: OffloadPool = OffloadPool::new("test-sbo", ThreadPriority::Low);
+        assert_eq!(
+            join(spawn_blocking_offloaded(&POOL, || 123u32)).unwrap(),
+            123
+        );
+        let jf = spawn_blocking_offloaded(&POOL, || panic!("offloaded boom"));
+        assert!(!join::<()>(jf).unwrap_err().is_cancelled());
+        assert_eq!(join(spawn_blocking_offloaded(&POOL, || 5u32)).unwrap(), 5);
+        assert_eq!(POOL.worker_count(), 1, "the panic cost the pool its worker");
+    }
+
+    /// An abort that lands while the job is still queued cancels it unrun.
+    #[test]
+    fn spawn_blocking_offloaded_abort_before_start_cancels_unrun() {
+        use crate::runtime::offload::MAX_OFFLOAD_WORKERS;
+        use crate::runtime::task::ThreadPriority;
+        static POOL: OffloadPool = OffloadPool::new("test-sboa", ThreadPriority::Low);
+        let (release, held) = mpsc::channel::<()>();
+        let held = Arc::new(Mutex::new(held));
+        let busy: Vec<_> = (0..MAX_OFFLOAD_WORKERS)
+            .map(|_| {
+                let held = Arc::clone(&held);
+                spawn_blocking_offloaded(&POOL, move || {
+                    let _ = held.lock().unwrap().recv_timeout(T);
+                })
+            })
+            .collect();
+        let ran = Arc::new(AtomicBool::new(false));
+        let queued = spawn_blocking_offloaded(&POOL, {
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, Ordering::Release)
+        });
+        queued.abort();
+        for _ in &busy {
+            release.send(()).unwrap();
+        }
+        assert!(join(queued).unwrap_err().is_cancelled());
+        assert!(!ran.load(Ordering::Acquire), "an aborted job ran");
+        for jf in busy {
+            join(jf).unwrap();
+        }
+    }
+
+    /// A wake runs under whatever lock its waker holds — a record's, when a
+    /// post notifies a parked tail — so it must not allocate. Counted on the
+    /// waking thread only, an IOC thread as a record's is, over wakes that each
+    /// re-queued a parked task.
+    #[test]
+    fn a_wake_of_a_parked_task_allocates_nothing() {
+        crate::runtime::task::test_ioc_thread(wakes_allocate_nothing);
+    }
+
+    fn wakes_allocate_nothing() {
+        let pool = CallbackPool::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_jf, task) = spawn_task(&pool.handle(), CallbackPriority::Medium, {
+            let (notify, woken) = (Arc::clone(&notify), Arc::clone(&woken));
+            async move {
+                loop {
+                    notify.notified().await;
+                    woken.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        });
+        let wait = |cond: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !cond() {
+                assert!(start.elapsed() < T, "the task never got there");
+                std::thread::yield_now();
+            }
+        };
+        // One wake of a task that is parked on `notify`: it re-queues the task.
+        let wake = |round: usize| {
+            wait(&|| task.state.load(Ordering::Acquire) == IDLE);
+            counting::arm();
+            notify.notify_one();
+            let allocs = counting::disarm();
+            wait(&|| woken.load(Ordering::Acquire) == round);
+            allocs
+        };
+        // The first wakes may grow the band's node arena to its working size.
+        for round in 1..=10 {
+            wake(round);
+        }
+        let enqueues = task.enqueues.load(Ordering::Relaxed);
+        let allocs: usize = (11..=110).map(wake).sum();
+        assert_eq!(
+            task.enqueues.load(Ordering::Relaxed) - enqueues,
+            100,
+            "a counted wake did not re-queue a parked task"
+        );
+        assert_eq!(allocs, 0, "allocations in 100 wakes of a parked task");
+    }
+
+    #[test]
+    fn a_task_spawned_onto_a_shut_down_band_resolves_cancelled() {
+        let mut pool = CallbackPool::new();
+        let handle = pool.handle();
+        pool.shutdown();
+        let jf = spawn_future(&handle, CallbackPriority::Medium, async { 1u32 });
+        assert!(join(jf).unwrap_err().is_cancelled());
+    }
+
+    /// The allocations of the thread that armed it, in this test binary.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+            static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub fn arm() {
+            ALLOCS.with(|n| n.set(0));
+            ARMED.with(|a| a.set(true));
+        }
+
+        pub fn disarm() -> usize {
+            ARMED.with(|a| a.set(false));
+            assert!(
+                crate::runtime::task::in_test_ioc_thread(),
+                "counted off an IOC thread"
+            );
+            ALLOCS.with(Cell::get)
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if ARMED.with(Cell::get) {
+                    ALLOCS.with(|n| n.set(n.get() + 1));
+                }
+                // SAFETY: forwarded unchanged.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: forwarded unchanged.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
     }
 }

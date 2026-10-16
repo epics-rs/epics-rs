@@ -1,4 +1,4 @@
-use crate::server::record::{AlarmSeverity, CommonFields};
+use crate::server::record::{AlarmSeverity, CommonFields, SparseText};
 use crate::types::{DbFieldType, DbfCode};
 
 pub mod simm;
@@ -246,12 +246,12 @@ pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
-    msg: impl AsRef<str>,
+    msg: impl crate::server::record::AlarmText,
 ) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
-        common.namsg.set(msg.as_ref());
+        msg.store_into(&mut common.namsg);
         return true;
     }
     false
@@ -285,13 +285,22 @@ pub fn rec_gbl_set_sevr_msg(
 /// NOT used for `dbTryGetLink`, which does not call `setLinkAlarm`:
 /// `recGblGetSimm`'s SIML read (recGbl.c:453-454) instead writes
 /// `nsta = LINK_ALARM` directly, leaving SEVR untouched.
-pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
+#[cold]
+pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &'static str) {
     rec_gbl_set_sevr_msg(
         common,
         alarm_status::LINK_ALARM,
         AlarmSeverity::Invalid,
-        format!("field {field}"),
+        SparseText::link_field(field),
     );
+}
+
+/// C `strcpy(amsg, namsg); namsg[0] = '\0';` — rare, and kept out of the
+/// inlined reset so the old text's drop does not cost the cycle registers.
+#[cold]
+#[inline(never)]
+fn transfer_amsg(common: &mut CommonFields) {
+    common.amsg = std::mem::take(&mut common.namsg);
 }
 
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
@@ -299,6 +308,7 @@ pub fn rec_gbl_set_link_alarm(common: &mut CommonFields, field: &str) {
 ///
 /// Mirrors epics-base PR #566 — the alarm-message string (`amsg`) is
 /// transferred from `namsg` alongside the severity / status.
+#[inline]
 pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     let prev_sevr = common.sevr;
     let prev_stat = common.stat;
@@ -335,7 +345,7 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
     // on every failing read).
     let amsg_changed = common.namsg != common.amsg;
     if amsg_changed {
-        common.amsg = std::mem::take(&mut common.namsg);
+        transfer_amsg(common);
     }
 
     // Transfer new alarm state
@@ -420,6 +430,7 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 /// `""` for them, and PVA then serves the `"UDF"` condition string
 /// (`iocsource.cpp:230-236`). Only `mbboDirectRecord.c:191` passes a
 /// literal (`"UDFS"`).
+#[inline]
 pub fn rec_gbl_check_udf(
     common: &mut CommonFields,
     exact_one: bool,
@@ -452,18 +463,25 @@ pub fn rec_gbl_check_udf(
 /// drift.
 pub fn get_time_stamp(
     tse: i16,
-    device_time: std::time::SystemTime,
-) -> Option<std::time::SystemTime> {
+    device_time: crate::types::WallTime,
+) -> Option<crate::types::WallTime> {
     if tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
         // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support has
         // already written the time; C recGbl.c:324-342 makes this the only
         // TSE that does not go through `epicsTimeGetEvent`.
         return Some(device_time);
     }
-    // Every other TSE is one C call — `epicsTimeGetEvent(&prec->time,
-    // prec->tse)` — including 0 and -1, which it dispatches itself. `None`
-    // is C's non-zero status: `prec->time` keeps its old value and
-    // `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
+    event_time(tse)
+}
+
+/// `get_time_stamp` for a `tse` already known not to be `-2`.
+///
+/// Every such TSE is one C call — `epicsTimeGetEvent(&prec->time,
+/// prec->tse)` — including 0 and -1, which it dispatches itself. `None`
+/// is C's non-zero status: `prec->time` keeps its old value and
+/// `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
+#[inline]
+pub(crate) fn event_time(tse: i16) -> Option<crate::types::WallTime> {
     crate::runtime::general_time::get_event(tse as i32)
 }
 
@@ -648,7 +666,7 @@ pub fn rec_gbl_get_prec(field_type: Option<DbFieldType>, seed: i16) -> i16 {
 /// non-positive statuses. C's `precord ? ... : "Unknown"` guard is for a null
 /// record, which this signature cannot express.
 pub fn rec_gbl_record_error(status_text: &str, record_name: &str, message: &str) {
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "recGblRecordError: {message} {status_text} PV: {record_name}\n"
     ));
 }
@@ -804,9 +822,237 @@ pub fn dev_sup_process_refusal(record_type: &str) -> Option<&'static str> {
 /// `sprintf`ed prefix and carries no newline of its own — C's format string
 /// owns the only one (`recGbl.c:87-90`), so the report is one console line.
 pub fn rec_gbl_dbaddr_error(status_text: &str, record_name: &str, field_name: &str, message: &str) {
-    crate::runtime::log::errlog_printf(&format!(
+    crate::runtime::log::errlog_vprintf(format_args!(
         "recGblDbaddrError: {message} {status_text} PV: {record_name}.{field_name}\n"
     ));
+}
+
+/// The `sprintf` prefix `dbGet` and `dbPut` hand `recGblDbaddrError` with
+/// `S_db_badDbrtype` (`dbAccess.c:959`, `:1343`). `dbr` and `field_type` are
+/// separate inputs: `dbgf` passes `addr.dbr_field_type` (`dbTest.c:380`), a DB
+/// link's `dbPut` the source's request type. `%.12s` is kept so the name is
+/// cut where C cuts it.
+pub fn bad_dbrtype_message(op: &str, dbr: DbfCode, field_type: DbfCode) -> String {
+    let ft_name = format!("DBF_{}", field_type.name());
+    format!(
+        "{op}: dbrType = {}, field_type = {ft_name:.12} ({}).",
+        dbr as i16, field_type as i16
+    )
+}
+
+/// `recGblDbaddrError(S_db_badDbrtype, paddr, message)` with
+/// [`bad_dbrtype_message`] as the message.
+pub fn rec_gbl_bad_dbrtype(
+    op: &str,
+    dbr: DbfCode,
+    field_type: DbfCode,
+    record_name: &str,
+    field_name: &str,
+) {
+    rec_gbl_dbaddr_error(
+        "Illegal Database Request Type",
+        record_name,
+        field_name,
+        &bad_dbrtype_message(op, dbr, field_type),
+    );
+}
+
+/// The console report of a put refused under the record hold, made there as
+/// data and printed by the put's owner once the hold is down.
+///
+/// C prints these from inside `dbPut`, under `dbScanLock`; the port does not
+/// format or print under a hold, so the maker stores one of these instead and
+/// the put frame carries it out. Nothing in it allocates: the messages are the
+/// C literals, the statuses their `errSymLookup` text (as
+/// [`rec_gbl_record_error`] takes them), and the record and field are the
+/// put's own, which the owner names when it prints.
+///
+/// One per put. C's `dbPut` reports at most once — its link-field and
+/// SPC_NOMOD refusals return before `special()` runs, and a `special()` that
+/// reports does so once, from the one pass that refuses.
+///
+/// Makers:
+/// - `special(_, true)` stores it in the record and answers it from
+///   [`Record::take_put_report`](crate::server::record::Record::take_put_report).
+///   A refused `special()` is always drained; a `special()` that reports and
+///   still returns `Ok` (calcout, scalcout, acalcout, `return 0` after the
+///   report) declares [`CycleHooks::PUT_REPORT`](crate::server::record::CycleHooks::PUT_REPORT).
+///   `CalcCompile::put_report_in_expression` builds calc's and calcout's;
+///   scalcout and acalcout pair `CalcCompile::error_number` with
+///   [`ReportTail::PostfixReturns`].
+/// - A `dbPut` gate in the put path (link-field type, SPC_NOMOD) stores it in
+///   the put frame directly.
+/// - A converter refusal (`putStringEnum`) rides out in
+///   [`ChoiceRefusal`](crate::error::ChoiceRefusal) and the put body moves it
+///   into the put frame.
+///
+/// A put made inside a process cycle (a DB OUT link's `dbPut`) has no hold to
+/// drop before the cycle ends; its report prints in place, under the cycle's
+/// hold, as C's does under `dbScanLock`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutReport {
+    /// `recGblRecordError(status, prec, message)` (`recGbl.c:59-71`), then
+    /// `then`.
+    RecordError {
+        status: &'static str,
+        message: &'static str,
+        then: Option<ReportTail>,
+    },
+    /// `recGblDbaddrError(status, paddr, message)` (`recGbl.c:73-91`) naming
+    /// the put's field.
+    DbaddrError {
+        status: &'static str,
+        message: &'static str,
+    },
+    /// `dbPut`'s link-field refusal, [`rec_gbl_bad_dbrtype`] with `"dbPut"`
+    /// (`dbAccess.c:1340-1347`).
+    BadDbrtype { dbr: DbfCode, field_type: DbfCode },
+    /// `putStringEnum`'s `recGblRecordError(S_db_badChoice, precord, pfrom)`
+    /// (`dbConvert.c:1189`): the put's own string is the message.
+    IllegalChoice { from: ReportString },
+    /// `recGblRecSupError(S_db_noRSET, paddr, message, support)`
+    /// (`recGbl.c:93-116`): the record type has no `support` rset entry.
+    RecSupError {
+        message: &'static str,
+        record_type: &'static str,
+        support: &'static str,
+    },
+}
+
+/// The line a [`PutReport::RecordError`] is followed by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportTail {
+    /// calc/calcout `errlogPrintf("%s.<field>: %s in expression \"%s\"\n",
+    /// prec->name, calcErrorStr(error_number), <expr>)` (`calcRecord.c:150`,
+    /// `calcoutRecord.c:53`, `:64`).
+    InExpression {
+        field: &'static str,
+        error: &'static str,
+        expr: ReportText,
+    },
+    /// scalcout/acalcout `printf("<routine> returns: %d\n", error_number)` on
+    /// stdout, not errlog (`sCalcoutRecord.c:55`, `aCalcoutRecord.c:56`).
+    PostfixReturns { routine: &'static str, number: i16 },
+}
+
+/// A record string copied into a report: C's `char[80]` CALC/OCAL, so the
+/// copy is fixed-size and C could not have printed more.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReportText {
+    buf: [u8; 80],
+    len: u8,
+}
+
+impl ReportText {
+    /// `text` cut to the 79 bytes C's `char[80]` holds, at a char boundary.
+    pub fn new(text: &str) -> Self {
+        let mut len = text.len().min(79);
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut buf = [0; 80];
+        buf[..len].copy_from_slice(&text.as_bytes()[..len]);
+        Self {
+            buf,
+            len: len as u8,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Cut at a char boundary of a `&str` in `new`.
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+/// A put's `DBR_STRING` copied into a report: C's `MAX_STRING_SIZE` buffer.
+/// Half a [`ReportText`], so a [`ChoiceRefusal`](crate::error::ChoiceRefusal)
+/// can carry it without growing every `CaResult`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReportString {
+    buf: [u8; 40],
+    len: u8,
+}
+
+impl ReportString {
+    /// `text` cut to the 39 bytes a `DBR_STRING` holds, at a char boundary.
+    pub fn new(text: &str) -> Self {
+        let mut len = text.len().min(39);
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut buf = [0; 40];
+        buf[..len].copy_from_slice(&text.as_bytes()[..len]);
+        Self {
+            buf,
+            len: len as u8,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Cut at a char boundary of a `&str` in `new`.
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ReportString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl std::fmt::Debug for ReportText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl PutReport {
+    /// Print the report for `record_name`.`field_name`, on C's streams. Only
+    /// the put's owner calls this: a client put once its gate is down, a
+    /// link put inside the cycle under the hold, as C reports under
+    /// `dbScanLock`.
+    pub(crate) fn emit(&self, record_name: &str, field_name: &str) {
+        match *self {
+            PutReport::RecordError {
+                status,
+                message,
+                then,
+            } => {
+                rec_gbl_record_error(status, record_name, message);
+                match then {
+                    Some(ReportTail::InExpression { field, error, expr }) => {
+                        crate::runtime::log::errlog_vprintf(format_args!(
+                            "{record_name}.{field}: {error} in expression \"{}\"\n",
+                            expr.as_str()
+                        ));
+                    }
+                    Some(ReportTail::PostfixReturns { routine, number }) => {
+                        println!("{routine} returns: {number}");
+                    }
+                    None => {}
+                }
+            }
+            PutReport::DbaddrError { status, message } => {
+                rec_gbl_dbaddr_error(status, record_name, field_name, message);
+            }
+            PutReport::BadDbrtype { dbr, field_type } => {
+                rec_gbl_bad_dbrtype("dbPut", dbr, field_type, record_name, field_name);
+            }
+            PutReport::IllegalChoice { from } => {
+                rec_gbl_record_error("Illegal choice", record_name, from.as_str());
+            }
+            PutReport::RecSupError {
+                message,
+                record_type,
+                support,
+            } => {
+                crate::runtime::log::errlog_vprintf(format_args!(
+                    "recGblRecSupError: {message} missing record support entry table \
+                     {record_type}::{support} PV: {record_name}.{field_name}\n"
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

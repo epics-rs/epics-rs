@@ -65,7 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use crate::runtime::sync::PriorityInheritanceMutex;
+use crate::runtime::sync::{CMutex, PriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
 
 /// How often the watchdog looks at its list — C `TASKWD_DELAY` (`taskwd.c:80`).
@@ -202,8 +202,8 @@ static TASKWD: LazyLock<Arc<Taskwd>> = LazyLock::new(Taskwd::new);
 impl Taskwd {
     fn new() -> Arc<Self> {
         Arc::new(Taskwd {
-            tasks: PriorityInheritanceMutex::new(Vec::new()),
-            monitors: PriorityInheritanceMutex::new(Vec::new()),
+            tasks: PriorityInheritanceMutex::new(Vec::new(), CMutex::TaskwdTasks),
+            monitors: PriorityInheritanceMutex::new(Vec::new(), CMutex::TaskwdMonitors),
             ctl: Mutex::new(Ctl::Run),
             wake: Condvar::new(),
             thread: Mutex::new(None),
@@ -297,7 +297,7 @@ impl Taskwd {
             if suspended {
                 // C's wording, because it is what an operator greps for
                 // (`taskwd.c:114-115`).
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "Thread {} ({}) suspended\n",
                     info.name, info.id.0
                 ));

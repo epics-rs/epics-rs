@@ -57,10 +57,7 @@ fn create_monitor_set_after_ioc_init_starts_a_saving_set() {
     find(&cmds, "create_monitor_set")
         .handler
         .call(
-            &[
-                ArgValue::String("settings.req".to_string()),
-                ArgValue::Int(1),
-            ],
+            &[ArgValue::String("settings.req".into()), ArgValue::Int(1)],
             &ctx,
         )
         .expect("create_monitor_set after iocInit is accepted");
@@ -103,10 +100,7 @@ fn create_monitor_set_after_ioc_init_reports_an_unloadable_request_file() {
     let ctx = CommandContext::new(db, bridge);
 
     let err = match find(&cmds, "create_monitor_set").handler.call(
-        &[
-            ArgValue::String("missing.req".to_string()),
-            ArgValue::Int(1),
-        ],
+        &[ArgValue::String("missing.req".into()), ArgValue::Int(1)],
         &ctx,
     ) {
         Err(e) => e,

@@ -69,18 +69,17 @@ mod deferred_tail_owner_tests {
     /// The one source under `server/` that may name the ambient seam.
     ///
     /// `autosave/manager.rs`'s tasks are not on the record-processing chain:
-    /// every save goes through `runtime::fs` — hosted `spawn_blocking`, which
-    /// needs the very runtime `IocApplication::run` already gives them — and
-    /// all four save strategies are pollers started from there, none of them
-    /// reached from a record callback.
+    /// all four save strategies are `interval` pollers started from
+    /// `IocApplication::run`, on its runtime, none of them reached from a
+    /// record callback.
     ///
     /// `event_queue.rs` used to need a line here too. It no longer does: its
     /// seam uses are inside its test module, which the slicer drops, so the
     /// walk clears it without a waiver. One fewer hand-written claim to trust.
     const EXEMPT: &[(&str, &str)] = &[(
         "src/server/autosave/manager.rs",
-        "off the record-processing chain; saves go through runtime::fs \
-         (hosted spawn_blocking), which needs IocApplication::run's runtime",
+        "off the record-processing chain; its interval pollers run on \
+         IocApplication::run's runtime",
     )];
 
     #[test]

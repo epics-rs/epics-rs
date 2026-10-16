@@ -3,6 +3,13 @@ use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
 use epics_base_rs::types::EpicsValue;
 use std_rs::EpidRecord;
+
+/// The limit checks run only past `epidRecord.c:309`'s `udf == TRUE` return.
+fn defined_common() -> CommonFields {
+    let mut common = CommonFields::default();
+    common.udf = 0;
+    common
+}
 use std_rs::device_support::epid_soft::EpidSoftDeviceSupport;
 
 // ============================================================
@@ -183,7 +190,7 @@ fn test_check_alarms_hysteresis() {
     // First alarm triggers at 100. The trait hook commits LALM to the
     // alarmed threshold only after `recGblSetSevr` raises the severity.
     rec.val = 100.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(rec.lalm, 100.0);
 
@@ -210,7 +217,7 @@ fn test_check_alarms_lalm_gated_on_severity_raise() {
     rec.val = 85.0;
     let lalm_before = rec.lalm;
 
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     // Pre-seed a higher pending severity, as an upstream MS link would.
     common.nsev = AlarmSeverity::Invalid;
     common.nsta = alarm_status::COMM_ALARM;
@@ -230,7 +237,7 @@ fn test_check_alarms_lalm_gated_on_severity_raise() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(common.nsev, AlarmSeverity::Minor);
     assert_eq!(
@@ -252,7 +259,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -270,7 +277,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.hihi = 100.0;
     rec.hhsv = 2; // MAJOR
     rec.val = 110.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -294,7 +301,7 @@ fn test_check_alarms_hook_applies_severity() {
     rec.lsv = 1;
     rec.llsv = 2;
     rec.val = 50.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     Record::check_alarms(&mut rec, &mut common);
     assert_eq!(
         common.nsev,
@@ -317,7 +324,7 @@ fn test_check_alarms_hook_maximizes_severity() {
     rec.hihi = 100.0;
     rec.hhsv = 2; // MAJOR
     rec.val = 110.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
 
     // Pre-seed a lower pending severity, as an upstream MS link would.
     common.nsev = AlarmSeverity::Minor;
@@ -336,7 +343,7 @@ fn test_check_alarms_hook_maximizes_severity() {
     rec.high = 80.0;
     rec.hsv = 1; // MINOR
     rec.val = 85.0;
-    let mut common = CommonFields::default();
+    let mut common = defined_common();
     common.nsev = AlarmSeverity::Invalid;
     common.nsta = alarm_status::COMM_ALARM;
     Record::check_alarms(&mut rec, &mut common);
@@ -732,7 +739,7 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
 
     // CONSTANT INP → C `:110-112` returns before the OUTL write.
     let mut konst = EpidRecord::default();
-    konst.inp = "5.0".to_string();
+    konst.inp = "5.0".into();
     assert_eq!(link_field_type(&konst.inp), LinkType::Constant);
     konst.fbon = 1;
     konst.fbop = 1;
@@ -1124,7 +1131,9 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
     base.set_float64_param(reason, 0, 33.0).unwrap();
 
     let manager = PortManager::new();
-    manager.register_port(OutputPort { base }).unwrap();
+    manager
+        .register_port(OutputPort { base }, &asyn_rs::registry::open_owner())
+        .unwrap();
 
     let sync_io = SyncIOHandle::connect(&manager, "EPID_OUT_PORT", 0, Duration::from_secs(1))
         .expect("connect to output port");
@@ -1172,8 +1181,25 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
 // ============================================================
 
 use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::device_support::Dpvt;
 use epics_base_rs::server::record::{LinkType, ProcessAction, link_field_type};
 use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
+
+/// The pre-input stage as the cycle runs it: the record's reads, then the
+/// gate's writes, with `resolved` the reads that succeeded.
+fn pre_input(
+    rec: &mut EpidRecord,
+    dpvt: &mut Dpvt,
+    resolved: &[&'static str],
+) -> epics_base_rs::server::record::ProcessActions {
+    let mut actions = rec.pre_input_link_actions(true, dpvt);
+    if let Some(writes) = rec.gate_after_pre_input_reads(resolved, dpvt) {
+        for a in writes.into_vec() {
+            actions.push(a);
+        }
+    }
+    actions
+}
 
 /// C `devEpidSoft.c:110-112`: a CONSTANT `INP` link means "nothing to
 /// control" — `do_pid` must skip the PID compute and the record must
@@ -1182,7 +1208,7 @@ use std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport;
 fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
     let mut rec = EpidRecord::default();
     // CONSTANT INP link — a literal value, not a PV reference.
-    rec.inp = "3.14".to_string();
+    rec.inp = "3.14".into();
     rec.kp = 2.0;
     rec.val = 100.0;
     rec.cval = 10.0;
@@ -1212,7 +1238,7 @@ fn test_constant_inp_raises_soft_alarm_and_skips_compute() {
 #[test]
 fn test_db_inp_does_not_raise_soft_alarm() {
     let mut rec = EpidRecord::default();
-    rec.inp = "OTHER:REC.VAL".to_string();
+    rec.inp = "OTHER:REC.VAL".into();
     assert_eq!(link_field_type(&rec.inp), LinkType::Db);
     rec.kp = 2.0;
     rec.val = 100.0;
@@ -1240,7 +1266,8 @@ fn test_db_inp_does_not_raise_soft_alarm() {
 #[test]
 fn test_db_trig_link_synchronous_fallthrough() {
     let mut rec = EpidRecord::default();
-    rec.trig = "READBACK:REC.VAL".to_string();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "READBACK:REC.VAL".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1249,7 +1276,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     // The TRIG write is a pre-input-link action emitted by the record,
     // gated on the callback DSET (DTYP "Async Soft Channel").
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
-    let pre = rec.pre_input_link_actions();
+    let pre = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         pre.iter().any(|a| matches!(
             a,
@@ -1287,12 +1314,13 @@ fn test_db_trig_link_synchronous_fallthrough() {
 #[test]
 fn test_non_callback_dtyp_emits_no_trig_write() {
     let mut rec = EpidRecord::default();
-    rec.trig = "READBACK:REC.VAL".to_string();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "READBACK:REC.VAL".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Db);
 
     rec.set_process_context(&ctx_with_dtyp("Soft Channel"));
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "non-callback DSET must not drive the TRIG link"
     );
 }
@@ -1303,7 +1331,8 @@ fn test_non_callback_dtyp_emits_no_trig_write() {
 #[test]
 fn test_ca_trig_link_deferred_second_pass() {
     let mut rec = EpidRecord::default();
-    rec.trig = "ca://REMOTE:READBACK".to_string();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "ca://REMOTE:READBACK".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1313,7 +1342,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 
     // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
     // PID compute is deferred to the re-process pass.
-    let actions = rec.pre_input_link_actions();
+    let actions = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         actions.iter().any(|a| matches!(
             a,
@@ -1335,9 +1364,45 @@ fn test_ca_trig_link_deferred_second_pass() {
     // `if (!pepid->pact)` skips the whole trigger block, so nothing is
     // re-fired and the PID runs.
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "second pass must not re-trigger"
     );
+}
+
+/// A device-link put lands between the trigger and its callback: C
+/// clears `pact` (`dbAccess.c:1194`) and the callback's process fires
+/// the trigger again (`devEpidSoftCallback.c:116`). The put replaces the
+/// `dpvt` the trigger lives in. oracleStdIoc, TRIG `TG.PROC CA` on a
+/// calcout with ODLY 2: after `dbpf E.INP CV2` E.PACT is 0, at the
+/// callback TG.VAL is 2 with E.PACT 1 and CVAL 0, at the next one CVAL is
+/// 2 and E.PACT 0.
+#[test]
+fn a_device_link_put_mid_trigger_fires_the_trigger_again() {
+    let mut rec = EpidRecord::default();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "ca://REMOTE:READBACK".into();
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
+    let fires = |actions: &epics_base_rs::server::record::ProcessActions| {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "TRIG",
+                    ..
+                }
+            )
+        })
+    };
+
+    assert!(fires(&pre_input(&mut rec, &mut dpvt, &[])));
+    // `rebind_device_link` takes the record's dpvt and installs the new
+    // dset's, which `devEpidSoftCB` leaves NULL.
+    dpvt = Dpvt::Null;
+    assert!(
+        fires(&pre_input(&mut rec, &mut dpvt, &[])),
+        "the callback after a device-link put fires the trigger again"
+    );
+    assert!(!fires(&pre_input(&mut rec, &mut dpvt, &[])));
 }
 
 /// TASK 2 — bumpless transfer: on the feedback OFF->ON edge in PID
@@ -1347,7 +1412,7 @@ fn test_ca_trig_link_deferred_second_pass() {
 #[test]
 fn test_bumpless_edge_emits_outl_readback_for_db_link() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 0; // PID mode
     rec.fbon = 1;
     rec.fbop = 0; // OFF -> ON edge
@@ -1372,7 +1437,7 @@ fn test_bumpless_edge_emits_outl_readback_for_db_link() {
 #[test]
 fn test_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
-    rec.outl = "5.0".to_string(); // CONSTANT link
+    rec.outl = "5.0".into(); // CONSTANT link
     assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 0;
     rec.fbon = 1;
@@ -1389,7 +1454,7 @@ fn test_bumpless_edge_no_readback_for_constant_outl() {
 #[test]
 fn test_no_bumpless_readback_when_no_edge() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 0;
     rec.fbon = 1;
     rec.fbop = 1; // steady ON, not an edge
@@ -1404,28 +1469,28 @@ fn test_no_bumpless_readback_when_no_edge() {
 // ============================================================
 use epics_base_rs::server::record::ProcessContext;
 
-fn ctx_with_udf(udf: bool) -> ProcessContext<'static> {
+fn ctx_with_udf(udf: u8) -> ProcessContext {
     ProcessContext {
         udf,
         udfs: AlarmSeverity::Invalid,
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
-        time: std::time::SystemTime::UNIX_EPOCH,
-        dtyp: "",
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
+        soft: None,
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
 
-fn ctx_with_dtyp(dtyp: &str) -> ProcessContext<'_> {
+fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
     ProcessContext {
-        udf: false,
+        udf: 0,
         udfs: AlarmSeverity::Invalid,
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
-        time: std::time::SystemTime::UNIX_EPOCH,
-        dtyp,
+        time: epics_base_rs::types::WallTime::UNIX_EPOCH,
+        soft: epics_base_rs::server::device_support::classify_soft(dtyp),
         callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
@@ -1447,7 +1512,7 @@ fn test_process_skips_do_pid_while_udf_set() {
     let p_before = rec.p;
 
     // Framework pushes udf=TRUE before process() (record uninitialized).
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.process().unwrap();
 
     assert_eq!(
@@ -1475,7 +1540,7 @@ fn test_process_runs_do_pid_once_udf_cleared() {
     std::thread::sleep(std::time::Duration::from_millis(5));
 
     // Framework pushes udf=FALSE — record now has a defined value.
-    rec.set_process_context(&ctx_with_udf(false));
+    rec.set_process_context(&ctx_with_udf(0));
     rec.process().unwrap();
 
     // P = KP * (VAL - CVAL) = 2.0 * 90.0 = 180.0 — proves do_pid ran.
@@ -1488,10 +1553,9 @@ fn test_process_runs_do_pid_once_udf_cleared() {
 
 /// C `epidRecord.c:191-193`: in closed-loop mode (SMSL=1) a successful
 /// `dbGetLink(stpl)` clears `udf` *before* the `if (udf==TRUE)` check.
-/// The framework fetches STPL->VAL before process() and reports the
-/// fetch success via `set_resolved_input_links(ResolvedInputLinks::of_names(&["STPL"]))`; with that
-/// signal, a closed-loop epid runs do_pid that cycle even though the
-/// pushed `udf` is still the stale-TRUE from before the fetch.
+/// The STPL read is a pre-input read whose success reaches the gate; with
+/// it, a closed-loop epid runs do_pid that cycle even though the pushed
+/// `udf` is still the stale-TRUE from before the fetch.
 #[test]
 fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
     let mut rec = EpidRecord::default();
@@ -1506,10 +1570,8 @@ fn test_process_closed_loop_runs_do_pid_when_stpl_gave_value() {
 
     // Framework reports the STPL fetch succeeded this cycle, then
     // pushes the stale udf=TRUE (recomputed only after process()).
-    rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
-        &["STPL"],
-    ));
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
+    pre_input(&mut rec, &mut Dpvt::Null, &["STPL"]);
     rec.process().unwrap();
 
     assert!(
@@ -1544,7 +1606,7 @@ fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
     rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
         &[],
     ));
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.process().unwrap();
 
     assert_eq!(
@@ -1552,11 +1614,10 @@ fn test_process_closed_loop_keeps_udf_when_stpl_fetch_failed() {
         "closed-loop epid whose STPL fetch failed must keep udf set and \
          skip do_pid — !val.is_nan() must NOT proxy fetch success"
     );
-    assert!(
-        rec.value_is_undefined(),
-        "value_is_undefined() must stay true so the framework keeps \
-         common.udf set for the next cycle"
-    );
+    let mut common = epics_base_rs::server::record::CommonFields::default();
+    common.udf = 1;
+    Record::check_alarms(&mut rec, &mut common);
+    assert_eq!(common.udf, 1, "a failed STPL fetch leaves UDF set");
 }
 
 /// The UDF gate applies only on the non-callback pass. When device
@@ -1574,7 +1635,7 @@ fn test_process_with_device_did_compute_ignores_udf_gate() {
     let oval_before = rec.oval;
     let p_before = rec.p;
 
-    rec.set_process_context(&ctx_with_udf(true));
+    rec.set_process_context(&ctx_with_udf(1));
     rec.set_device_did_compute(true); // device support already ran do_pid
     rec.process().unwrap();
 
@@ -1611,7 +1672,8 @@ use epics_base_rs::server::record::RecordProcessResult;
 #[test]
 fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut rec = EpidRecord::default();
-    rec.trig = "ca://REMOTE:READBACK".to_string();
+    let mut dpvt = Dpvt::Null;
+    rec.trig = "ca://REMOTE:READBACK".into();
     assert_eq!(link_field_type(&rec.trig), LinkType::Ca);
     rec.kp = 1.0;
     rec.fbon = 1;
@@ -1619,14 +1681,14 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     // A CONSTANT STPL clears UDF (C `epidRecord.c:160-164`) so the
     // UDF gate does not pre-empt the trigger path — isolate the
     // CA-TRIG path under test.
-    rec.stpl = "10.0".to_string();
+    rec.stpl = "10.0".into();
     let mut udf = true;
     rec.post_init_finalize_undef(&mut udf).unwrap();
 
     rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
     // --- Trigger pass: pre_input_link_actions fires the CA trigger ---
-    let actions1 = rec.pre_input_link_actions();
+    let actions1 = pre_input(&mut rec, &mut dpvt, &[]);
     assert!(
         actions1.iter().any(|a| matches!(
             a,
@@ -1658,7 +1720,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 
     // --- Reprocess (callback) pass: the trigger block is skipped ---
     assert!(
-        rec.pre_input_link_actions().is_empty(),
+        pre_input(&mut rec, &mut dpvt, &[]).is_empty(),
         "reprocess pass must not re-trigger"
     );
     rec.set_device_did_compute(false);
@@ -1682,7 +1744,7 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
 #[test]
 fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
     let mut rec = EpidRecord::default();
-    rec.outl = "DAC:REC.VAL".to_string();
+    rec.outl = "DAC:REC.VAL".into();
     rec.fmod = 1; // MaxMin mode
     rec.fbon = 1;
     rec.fbop = 0; // OFF -> ON edge
@@ -1719,7 +1781,7 @@ fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
     rec.oval = 0.0;
     rec.drvh = 100.0;
     rec.drvl = -100.0;
-    rec.inp = "SENSOR".to_string();
+    rec.inp = "SENSOR".into();
     rec.put_field_internal("__OUTL_SEED", EpicsValue::Double(7.0))
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1739,7 +1801,7 @@ fn test_maxmin_bumpless_edge_emits_outl_readback_into_oval() {
 #[test]
 fn test_bumpless_seed_is_gated_by_mdt() {
     let mut rec = EpidRecord::default();
-    rec.inp = "SENSOR".to_string();
+    rec.inp = "SENSOR".into();
     rec.fmod = 0; // PID
     rec.kp = 1.0;
     rec.ki = 0.5;
@@ -1782,7 +1844,7 @@ fn test_bumpless_seed_is_gated_by_mdt() {
 #[test]
 fn test_maxmin_bumpless_edge_no_readback_for_constant_outl() {
     let mut rec = EpidRecord::default();
-    rec.outl = "5.0".to_string(); // CONSTANT link
+    rec.outl = "5.0".into(); // CONSTANT link
     assert_eq!(link_field_type(&rec.outl), LinkType::Constant);
     rec.fmod = 1; // MaxMin
     rec.fbon = 1;

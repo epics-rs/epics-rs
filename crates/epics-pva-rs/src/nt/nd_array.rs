@@ -326,7 +326,8 @@ fn alarm_desc() -> FieldDesc {
             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -340,7 +341,8 @@ fn time_t_desc() -> FieldDesc {
             ),
             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -356,7 +358,8 @@ fn dimension_desc() -> FieldDesc {
             ("fullSize".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("binning".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("reverse".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -374,7 +377,8 @@ fn attribute_desc() -> FieldDesc {
             ("timeStamp".into(), time_t_desc()),
             ("sourceType".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("source".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -384,7 +388,8 @@ fn codec_desc() -> FieldDesc {
         fields: vec![
             ("name".into(), FieldDesc::Scalar(ScalarType::String)),
             ("parameters".into(), FieldDesc::Variant),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -453,7 +458,8 @@ pub fn nt_nd_array_desc() -> FieldDesc {
             ("timeStamp".into(), time_t_desc()),
             ("dimension".into(), dimension_desc()),
             ("attribute".into(), attribute_desc()),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -702,7 +708,7 @@ mod tests {
         let structure = VariantValue {
             desc: Some(FieldDesc::Structure {
                 struct_id: String::new(),
-                fields: vec![("n".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("n".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             }),
             value: PvField::Structure({
                 let mut s = PvStructure::new("");

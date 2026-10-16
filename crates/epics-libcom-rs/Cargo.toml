@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 parking_lot = "0.12"
+# `runtime::task::enter_ioc_thread` builds a thread's park state at entry.
+parking_lot_core = "0.9"
 tracing = "0.1"
 # `runtime::general_time` formats an `epicsTimeStamp` the way C's
 # `epicsTimeToStrftime` does; `runtime::log` timestamps every errlog line the
@@ -67,6 +69,10 @@ tokio = { version = "1", default-features = false, features = [
 # Windows still skips it entirely.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `runtime::socket::poll_ready`'s `WSAPoll`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 # VxWorks only: `runtime::task::enter_ioc_thread` announces each IOC thread to
 # the statistics funnel's thread census. VxWorks 7 gives an RTP no task

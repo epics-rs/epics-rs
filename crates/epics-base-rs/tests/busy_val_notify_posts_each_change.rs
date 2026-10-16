@@ -45,7 +45,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 fn drain(rx: &mut EventReader) -> Vec<EpicsValue> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        out.push(ev.snapshot.value.clone());
+        out.push(ev.value().as_value().cloned().unwrap());
     }
     out
 }

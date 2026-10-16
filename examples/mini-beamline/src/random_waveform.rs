@@ -255,7 +255,7 @@ pub mod ioc_support {
 
         fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             record.put_field("VAL", EpicsValue::DoubleArray(self.current_data().into()))?;
-            Ok(DeviceInitOutcome::Live)
+            Ok(DeviceInitOutcome::ok())
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -271,15 +271,19 @@ pub mod ioc_support {
             Ok(())
         }
 
-        fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+        fn write_begin(
+            &mut self,
+            _record: &mut dyn Record,
+            _done: &epics_base_rs::server::database::WriteDoneSource<'_>,
+        ) -> CaResult<WriteStart> {
             Ok(WriteStart::Synchronous)
         }
 
-        fn last_alarm(&self) -> Option<(u16, u16)> {
+        fn last_alarm(&self) -> Option<epics_base_rs::server::device_support::DeviceAlarm<'_>> {
             None
         }
 
-        fn last_timestamp(&self) -> Option<std::time::SystemTime> {
+        fn last_timestamp(&self) -> Option<epics_base_rs::types::WallTime> {
             None
         }
 

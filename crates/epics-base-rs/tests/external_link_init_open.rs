@@ -67,25 +67,40 @@ impl CountingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for CountingLset {
-    fn is_connected(&self, name: &str) -> bool {
-        self.cache.lock().contains_key(name)
-    }
-
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
-        self.network_reads.fetch_add(1, Ordering::SeqCst);
-        self.connect_link(name).await;
-        self.cache.lock().get(name).cloned()
-    }
-
-    fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
-        self.cache.lock().get(name).cloned()
-    }
-
-    async fn connect_link(&self, name: &str) {
-        self.opened.lock().push(name.to_string());
+    fn is_connected(&self, name: &[u8]) -> bool {
         self.cache
             .lock()
-            .insert(name.to_string(), EpicsValue::Double(12.5));
+            .contains_key(std::str::from_utf8(name).unwrap())
+    }
+
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        self.network_reads.fetch_add(1, Ordering::SeqCst);
+        self.connect_link(name, None).await;
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
+    }
+
+    fn get_cached_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        self.cache
+            .lock()
+            .get(std::str::from_utf8(name).unwrap())
+            .cloned()
+    }
+
+    async fn connect_link(
+        &self,
+        name: &[u8],
+        _: Option<epics_base_rs::server::database::CaLinkInit>,
+    ) {
+        self.opened
+            .lock()
+            .push(String::from_utf8_lossy(name).into_owned());
+        self.cache.lock().insert(
+            String::from_utf8_lossy(name).into_owned(),
+            EpicsValue::Double(12.5),
+        );
     }
 }
 
@@ -381,9 +396,7 @@ async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
         other => panic!("a non-local CP link must be Ca, got {other:?}"),
     }
     assert!(
-        db.external_cp_pv_names()
-            .await
-            .contains(&"OTHER:CP".to_string()),
+        db.external_cp_pv_names().await.contains(&"OTHER:CP".into()),
         "the external CP trigger must still be registered"
     );
 }
@@ -536,7 +549,7 @@ async fn forward_link_never_registers_a_cp_holder() {
 
     db.setup_cp_links().await;
     assert!(
-        db.get_cp_targets("CP_SRC").is_empty(),
+        db.get_external_cp_targets(b"CP_SRC").is_empty(),
         "a forward link's CP modifier is masked off, so no holder edge exists"
     );
 }

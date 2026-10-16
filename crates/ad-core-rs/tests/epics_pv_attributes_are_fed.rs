@@ -43,7 +43,7 @@ fn attributes_xml() -> String {
 
 fn load_attributes(drv: &mut NDArrayDriverBase, xml: &str) -> Result<(), ()> {
     drv.port_base
-        .set_string_param(drv.params.attributes_file, 0, xml.to_string())
+        .set_string_param(drv.params.attributes_file, 0, xml)
         .expect("set NDAttributesFile");
     drv.read_nd_attributes_file().map_err(|_| ())
 }

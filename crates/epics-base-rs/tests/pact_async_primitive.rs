@@ -202,9 +202,12 @@ async fn post_fields_applies_and_posts_async_update() {
         .try_recv()
         .expect("post_fields must post a monitor event for the field");
     assert!(
-        matches!(event.snapshot.value, EpicsValue::Long(7)),
+        matches!(
+            event.value().as_value().cloned().unwrap(),
+            EpicsValue::Long(7)
+        ),
         "monitor event payload should carry the posted value, got {:?}",
-        event.snapshot.value
+        event.value().as_value().cloned().unwrap()
     );
 
     assert_eq!(
@@ -338,7 +341,7 @@ impl Record for HandleCaptureRecord {
     fn declared_fields(&self) -> &'static [FieldDesc] {
         TEST_FIELDS
     }
-    fn set_async_context(&mut self, _name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, _name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {
         *self.sink.lock().unwrap() = Some(db);
     }
 }
@@ -354,7 +357,10 @@ struct NotifySourceRecord {
 
 static NOTIFY_SRC_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Long, false),
-    FieldDesc::new("LNK", DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Outlink,
+        ..FieldDesc::new("LNK", DbFieldType::String, false)
+    },
 ];
 
 impl Record for NotifySourceRecord {
@@ -553,10 +559,9 @@ impl Record for PendingNotifyWriteSource {
     }
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome {
-            result: RecordProcessResult::AsyncPendingNotify(vec![(
-                "VAL".to_string(),
-                EpicsValue::Long(1),
-            )]),
+            result: RecordProcessResult::AsyncPendingNotify(vec![
+                const { epics_base_rs::server::record::declared_field_ix(NOTIFY_SRC_FIELDS, "VAL") },
+            ]),
             actions: vec![ProcessAction::WriteDbLink {
                 link_field: "LNK",
                 value: EpicsValue::Long(42),

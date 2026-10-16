@@ -1,6 +1,6 @@
 //! R18-60: the octet interpose chain belongs to the *port*, not to the driver.
 //!
-//! C `interposeInterface` (asynManager.c:2190-2220) swaps the octet interface
+//! C `interposeInterface` (asynManager.c:2192-2222) swaps the octet interface
 //! `findInterface` hands out and keeps the displaced one as the new layer's
 //! `pPrev`. The driver underneath is never consulted: it does not dispatch the
 //! chain, it *is* the bottom of it. So `asynInterposeEos` / `asynInterposeEcho`

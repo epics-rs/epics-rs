@@ -24,6 +24,7 @@ impl MotorRecord {
         // this same pass, exactly like C's do_work stop branch.
         if self.recompute_lvio_during_motion() {
             self.ctrl.stop = true;
+            self.mark(m::STOP);
         }
 
         // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
@@ -158,7 +159,7 @@ impl MotorRecord {
                     if matches!(src, CommandSource::Homf | CommandSource::Homr)
                         && self.latent_home_request().is_some()
                     {
-                        self.stat.dmov = false;
+                        self.set_dmov(false);
                     }
                     // C 2167-2181: the tweak fold is NOT gated by
                     // stop_or_pause — only the move dispatch is (the
@@ -181,6 +182,10 @@ impl MotorRecord {
                     {
                         self.collect_tweak();
                     }
+                    if src == CommandSource::Val {
+                        self.collect_set_redefine();
+                    }
+                    self.mark_val_collected();
                     return effects;
                 }
                 // C: 7493d50b — when URIP=Yes and the external RDBL link
@@ -274,6 +279,9 @@ impl MotorRecord {
 
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv => {
+                if src == CommandSource::Val && self.collect_set_redefine() {
+                    return effects;
+                }
                 // C 2187-2193: RLV folds into VAL in the do_work
                 // collection section ("Later, we'll act on this") and the
                 // pass proceeds exactly like a VAL change — including the
@@ -293,6 +301,7 @@ impl MotorRecord {
                             // not apply.
                             self.pos.val += self.pos.rlv;
                             self.pos.rlv = 0.0;
+                            self.mark(m::RLV);
                             self.set_mode_redefine_val(self.pos.val);
                             return effects;
                         }
@@ -301,10 +310,12 @@ impl MotorRecord {
                         // unconditionally, 3811); consume the latched RLV.
                         if self.conv.loadpos_blocked {
                             self.pos.rlv = 0.0;
+                            self.mark(m::RLV);
                             return effects;
                         }
                         self.pos.val += self.pos.rlv;
                         self.pos.rlv = 0.0;
+                        self.mark(m::RLV);
                         let dval =
                             coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
                         if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
@@ -314,6 +325,7 @@ impl MotorRecord {
                     } else {
                         self.pos.val += self.pos.rlv;
                         self.pos.rlv = 0.0;
+                        self.mark(m::RLV);
                         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
                             self.pos.val,
                             self.conv.dir,
@@ -339,7 +351,9 @@ impl MotorRecord {
                         RetargetAction::StopAndReplan => {
                             // Cancel any pending backlash/retry state
                             self.internal.backlash_pending = false;
-                            self.retry.rcnt = 0;
+                            if std::mem::take(&mut self.retry.rcnt) != 0 {
+                                self.mark(m::RCNT);
+                            }
                             // A new explicit command path owns completion now;
                             // disarm any safety-net verify flag armed by a
                             // prior ExtendMove in this motion.
@@ -350,6 +364,7 @@ impl MotorRecord {
                             self.internal.pp = false;
                             self.internal.pending_retarget = Some(self.pos.dval);
                             self.stat.mip.insert(MipFlags::STOP);
+                            self.mark(m::MIP);
                             effects.commands.push(MotorCommand::Stop {
                                 acceleration: self.move_accel_egu(),
                             });
@@ -548,12 +563,20 @@ impl MotorRecord {
         // even when the pass is then suppressed (too_small) or refused
         // (LVIO). The VAL/DVAL/RVAL/RLV/TWF write paths update
         // `pos.dval` but never refresh them; only the poll does.
-        self.pos.diff = self.pos.dval - self.pos.drbv;
+        if self.pos.dval != self.internal.ldvl {
+            self.mark(m::DVAL);
+        }
+        let diff = self.pos.dval - self.pos.drbv;
+        if self.pos.diff != diff {
+            self.pos.diff = diff;
+            self.mark(m::DIFF);
+        }
         self.pos.rdif = if self.conv.mres != 0.0 {
-            (self.pos.diff / self.conv.mres).round() as i64
+            coordinate::to_long((self.pos.diff / self.conv.mres).round())
         } else {
             0
         };
+        self.mark(m::RDIF);
         // C set test (2257-2263): in SET mode every move-block dispatch
         // is a position redefinition routed to load_pos, never a motion
         // — including deferred passes (Go/Move resume, retry, queued
@@ -564,6 +587,11 @@ impl MotorRecord {
                 self.load_pos(effects);
             }
             return;
+        }
+        // C 2299-2305.
+        self.mark_val_collected();
+        if self.pos.rval != self.internal.lrvl {
+            self.mark(m::RVAL);
         }
         // C too_small (2308-2348): a RETRY dispatch is too small when the
         // remaining error is under RDBD in steps (2329-2330); a plain
@@ -592,6 +620,7 @@ impl MotorRecord {
                     && (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY)
                 {
                     self.stat.mip = MipFlags::empty();
+                    self.mark(m::MIP);
                 }
                 // C 2345-2347: update the previous-target registers so the
                 // suppressed divergence is not re-detected on every later
@@ -608,8 +637,8 @@ impl MotorRecord {
                 // suppress with DMOV already 1 stays quiet, like C's
                 // dmov==FALSE gate (2333).
                 if steps < 1 || pending_completion {
-                    self.stat.dmov = false;
-                    self.stat.movn = true;
+                    self.set_dmov(false);
+                    self.set_movn(true);
                     effects.request_poll = true;
                 }
                 return;
@@ -623,12 +652,16 @@ impl MotorRecord {
         // and C preserves rcnt so repeated Pause/Go cycles count against
         // RTRY.
         if !self.stat.mip.contains(MipFlags::RETRY) {
+            if self.retry.rcnt != 0 {
+                self.mark(m::RCNT);
+            }
             self.retry.rcnt = 0;
         }
 
         // C 2391-2395: preferred_dir, computed once for the LVIO check
         // and the dispatch case selection.
         let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
+        let old_lvio = self.limits.lvio;
 
         // C LVIO evaluation (2396-2415), AFTER the too_small suppression:
         // a request whose error is already inside the deadband completes
@@ -651,6 +684,9 @@ impl MotorRecord {
             let bdstpos = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
             bdstpos > self.limits.dhlm || bdstpos < self.limits.dllm
         };
+        if self.limits.lvio != old_lvio {
+            self.mark(m::LVIO);
+        }
         if self.limits.lvio {
             tracing::warn!(
                 "limit violation: dval={:.4}, bdst={:.4}, limits=[{:.4}, {:.4}]",
@@ -738,41 +774,8 @@ impl MotorRecord {
             self.pos.dval
         };
 
-        // Check hardware limits based on first move direction
-        let dir = if move_target > self.pos.drbv {
-            MotionDirection::Positive
-        } else {
-            MotionDirection::Negative
-        };
-        if self.is_blocked_by_hw_limit(dir) {
-            tracing::warn!("hardware limit active, blocking {dir:?} move");
-            // C has no hardware-limit gate in the move block: it
-            // dispatches (2455-2540, adopting the lasts at 2469-2471),
-            // the driver stops at the switch, and maybeRetry's
-            // limit-switch escape (1049, `hls && user_cdir`) completes
-            // the move as close-enough. This refusal skips the futile
-            // controller command but must land the same end state:
-            // lasts adopted (the written target stays in VAL/DVAL like
-            // C, and no dangling `dval != ldvl` re-dispatches on a
-            // later SPMG pass), an armed retry collapsed, and a
-            // pending pulse completed — a blinked put (special pass-0,
-            // 2591-2620) must not leave DMOV latched low with nothing
-            // in flight to restore it.
-            self.internal.ldvl = self.pos.dval;
-            self.internal.lval = self.pos.val;
-            self.internal.lrvl = self.pos.rval;
-            if self.stat.mip.contains(MipFlags::RETRY) {
-                self.stat.mip = MipFlags::empty();
-            }
-            if self.stat.mip.is_empty() && !self.stat.dmov {
-                self.stat.dmov = true;
-                self.set_phase(MotionPhase::Idle);
-            }
-            return;
-        }
-
         // DMOV pulse: set false before starting
-        self.stat.dmov = false;
+        self.set_dmov(false);
         // MISS is not cleared at dispatch: C touches it only inside
         // maybeRetry (1072 set, 1092 clear), so a latched miss stays
         // visible through the next move until its evaluation lands
@@ -792,8 +795,10 @@ impl MotorRecord {
         // marked as a retry (the AJF readback-link retry-count fix).
         let is_retry = self.stat.mip.contains(MipFlags::RETRY);
         self.stat.mip = MipFlags::MOVE;
+        self.mark(m::MIP);
         if is_retry {
             self.stat.mip.insert(MipFlags::RETRY);
+            self.mark(m::MIP);
         }
         self.set_phase(MotionPhase::MainMove);
         self.internal.backlash_pending = backlash;
@@ -805,7 +810,7 @@ impl MotorRecord {
             self.internal.pp = true;
         }
 
-        let frac = self.retry.frac;
+        let frac = f64::from(self.retry.frac);
         // C 2268: currpos ("where we are") is LDVL — the previously
         // dispatched target, NOT the readback. The absolute FRAC dispatch
         // (2488/2513) walks from the previous target toward the new one:
@@ -864,6 +869,7 @@ impl MotorRecord {
     /// Handle STOP command.
     fn handle_stop(&mut self, effects: &mut ProcessEffects) {
         self.ctrl.stop = false; // pulse field
+        self.mark(m::STOP);
         self.stop_axis(effects);
     }
 
@@ -896,6 +902,7 @@ impl MotorRecord {
             // record may lock up."
             if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
                 self.stat.mip = MipFlags::STOP;
+                self.mark(m::MIP);
             }
         } else if in_motion {
             // A stop already in flight (C 1874-1888 early return). The
@@ -914,6 +921,7 @@ impl MotorRecord {
             // The button itself survives (clear_buttons runs only in the
             // movn branch, 1893), so Go can still re-arm from it.
             self.stat.mip = MipFlags::STOP;
+            self.mark(m::MIP);
         }
         // else: idle — bare STOP_AXIS only (C 1874-1888 early return for
         // mip DONE/STOP/RETRY keeps MIP untouched).
@@ -947,6 +955,7 @@ impl MotorRecord {
             } else {
                 MipFlags::JOGR
             } | MipFlags::STOP;
+            self.mark(m::MIP);
             // C 2110: pp = TRUE — the stop completion post-processes
             // (VAL/DVAL <- readback) before the queued jog re-fires.
             self.internal.pp = true;
@@ -976,27 +985,37 @@ impl MotorRecord {
             // C 2095-2104: BOTH buttons release on refusal ("prevent
             // record from locking up in mip = JOG_REQ"), not just the
             // pressed one.
-            self.ctrl.jogf = false;
-            self.ctrl.jogr = false;
+            if self.ctrl.jogf {
+                self.ctrl.jogf = false;
+                self.mark(m::JOGF);
+            }
+            if self.ctrl.jogr {
+                self.ctrl.jogr = false;
+                self.mark(m::JOGR);
+            }
             // C 2092-2104 clears only the buttons and leaves a parked
             // MIP_JOG_REQ in mip (its arming lives in special(), blind to
             // internal clears). Here the request is dropped with its
             // button: JOG_REQ set means a latched, undispatched request.
+            // C never marked the request, so its drop posts nothing.
             self.stat.mip.remove(MipFlags::JOG_REQ);
             self.limits.lvio = true;
+            self.mark(m::LVIO);
             // C 2104: the refusal returns in-section — pass consumed.
             return true;
         }
 
-        self.stat.dmov = false;
+        self.set_dmov(false);
         // C 2125: pp = TRUE at jog dispatch — a pause that interrupts the
         // jog post-processes (syncs) at its stop completion.
         self.internal.pp = true;
 
         if forward {
             self.stat.mip = MipFlags::JOGF;
+            self.mark(m::MIP);
         } else {
             self.stat.mip = MipFlags::JOGR;
+            self.mark(m::MIP);
         }
         self.set_phase(MotionPhase::Jog);
         self.emit_jog(forward, effects);
@@ -1039,7 +1058,8 @@ impl MotorRecord {
         // With the JOG bits gone, the deceleration is no longer "a jog"
         // to the enter_do_work LVIO recompute (1466 gates on MIP_JOG,
         // which excludes JOG_STOP) — the latch is preserved while
-        // stopping. The jog direction survives in jog_was_forward.
+        // stopping. The jog direction survives in jog_was_forward. C marks
+        // neither write; MIP posts at the stop completion.
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
         self.set_phase(MotionPhase::JogStopping);
@@ -1234,6 +1254,7 @@ impl MotorRecord {
         // clear + ack on the next fresh status closes the cycle.
         if put_pass && self.stat.stup == 0 && self.device_state.is_some() {
             self.stat.stup = 2;
+            self.mark(m::STUP);
             effects.status_refresh = true;
         }
     }
@@ -1251,6 +1272,7 @@ impl MotorRecord {
             } else {
                 MipFlags::HOMR
             } | MipFlags::STOP;
+            self.mark(m::MIP);
             // C 2025: pp = TRUE — the stop completion post-processes
             // (VAL/DVAL <- readback) before the queued home re-fires.
             self.internal.pp = true;
@@ -1264,9 +1286,10 @@ impl MotorRecord {
             return;
         }
 
-        self.stat.dmov = false;
+        self.set_dmov(false);
         // C 2069: the home dispatch resets the retry counter.
         self.retry.rcnt = 0;
+        self.mark(m::RCNT);
         // C 2025: pp = TRUE at home dispatch (set for both the queued and
         // the direct branch before the movn test).
         self.internal.pp = true;
@@ -1279,8 +1302,10 @@ impl MotorRecord {
         // limit switch clear), so a latched button cannot re-dispatch.
         if forward {
             self.stat.mip = MipFlags::HOMF;
+            self.mark(m::MIP);
         } else {
             self.stat.mip = MipFlags::HOMR;
+            self.mark(m::MIP);
         }
         self.set_phase(MotionPhase::Homing);
 
@@ -1430,6 +1455,7 @@ impl MotorRecord {
                 // otherwise the record may lock up").
                 if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
                     self.stat.mip = MipFlags::STOP;
+                    self.mark(m::MIP);
                 }
                 effects.commands.push(MotorCommand::Stop {
                     acceleration: self.move_accel_egu(),
@@ -1469,6 +1495,7 @@ impl MotorRecord {
                 } else {
                     if self.stat.mip == MipFlags::STOP {
                         self.stat.mip = MipFlags::empty();
+                        self.mark(m::MIP);
                     }
                     // C move-block entry (2241): `dval != ldvl || !dmov`
                     // consumes the pass whether or not the inner 2455
@@ -1497,7 +1524,9 @@ impl MotorRecord {
                 // overwritten), then the move block re-fires exactly as
                 // for Go.
                 self.stat.mip = MipFlags::empty();
+                self.mark(m::MIP);
                 self.retry.rcnt = 0;
+                self.mark(m::RCNT);
                 self.internal.queued_motion = None;
                 // Like Go, the Move pass falls through to the home
                 // section (2013-2076) before the move block — a latched
@@ -1641,11 +1670,13 @@ impl MotorRecord {
         self.pos.val = self.internal.lval;
         self.pos.dval = self.internal.ldvl;
         self.pos.rval = self.internal.lrvl;
+        self.mark(m::VAL | m::DVAL | m::RVAL);
         if self.stat.mip.contains(MipFlags::RETRY) {
             self.stat.mip = MipFlags::empty();
+            self.mark(m::MIP);
         }
         if self.stat.mip.is_empty() && !self.stat.dmov {
-            self.stat.dmov = true;
+            self.set_dmov(true);
             self.set_phase(MotionPhase::Idle);
         }
     }
@@ -1686,18 +1717,24 @@ impl MotorRecord {
         self.internal.ldvl = self.pos.dval;
         self.internal.lval = self.pos.val;
         if self.conv.mres != 0.0 {
-            self.pos.rval = (self.pos.dval / self.conv.mres).round() as i64;
+            let rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
+            if self.pos.rval != rval {
+                self.mark(m::RVAL);
+            }
+            self.pos.rval = rval;
         }
         self.internal.lrvl = self.pos.rval;
         if self.conv.foff == FreezeOffset::Frozen {
             // C 3782-3791: translate dial to user through the frozen
             // offset.
             self.pos.val = coordinate::dial_to_user(self.pos.dval, self.conv.dir, self.pos.off);
+            self.mark(m::VAL);
             self.internal.lval = self.pos.val;
         } else {
             // C 3792-3800: adjust the offset to keep VAL and retranslate
             // the user limits.
             self.pos.off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
+            self.mark(m::OFF);
             self.set_userlimits();
         }
         // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF/
@@ -1707,7 +1744,8 @@ impl MotorRecord {
         // DRBV and the new OFF. Recomputing RBV here would post it in the
         // new frame one poll early while DRBV is still the old readback.
         self.stat.mip = MipFlags::LOAD_P;
-        self.stat.dmov = false;
+        self.mark(m::MIP);
+        self.set_dmov(false);
         effects.commands.push(MotorCommand::SetPosition {
             position: self.pos.dval,
         });
@@ -1761,6 +1799,7 @@ impl MotorRecord {
         );
         self.limits.hlm = hlm;
         self.limits.llm = llm;
+        self.mark(m::HLM | m::LLM);
     }
 
     /// C SET + FOFF=Variable VAL collection (motorRecord.cc:2206-2227):
@@ -1770,6 +1809,20 @@ impl MotorRecord {
     /// controller command (LOAD_POS belongs to the Frozen/DVAL/RVAL
     /// redefinition paths). Single owner for the direct-VAL,
     /// tweak-fold, and RLV-fold entry points.
+    /// C's VAL collection under SET with a variable offset (2204-2227): a
+    /// collected VAL redefines the offset and the pass ends there. It runs
+    /// ahead of the stop_or_pause return (2237).
+    fn collect_set_redefine(&mut self) -> bool {
+        let redefine = self.conv.set
+            && !self.conv.igset
+            && self.conv.foff == FreezeOffset::Variable
+            && self.pos.val != self.internal.lval;
+        if redefine {
+            self.set_mode_redefine_val(self.pos.val);
+        }
+        redefine
+    }
+
     pub(crate) fn set_mode_redefine_val(&mut self, new_val: f64) {
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
             new_val,
@@ -1789,6 +1842,8 @@ impl MotorRecord {
             self.internal.lval = self.pos.val;
             self.stat.mip = MipFlags::empty();
             self.stat.dmov = true;
+            // C 2206-2226, all unconditional.
+            self.mark(m::VAL | m::OFF | m::RBV | m::MIP | m::DMOV);
             self.set_phase(MotionPhase::Idle);
         }
     }
@@ -1899,7 +1954,7 @@ impl MotorRecord {
         // error, like CDIR itself (2526): under MRES < 0 the dial sign
         // inverts, and a sub-half-step error rounds to 0 (forward).
         let rdif = if self.conv.mres != 0.0 {
-            (diff / self.conv.mres).round() as i64
+            coordinate::to_long((diff / self.conv.mres).round())
         } else {
             0
         };
@@ -1936,10 +1991,16 @@ impl MotorRecord {
     /// C clear_buttons (motorRecord.cc:4386-4408): release all four
     /// latched motion buttons (JOGF/JOGR/HOMF/HOMR).
     pub(crate) fn clear_buttons(&mut self) {
-        self.ctrl.jogf = false;
-        self.ctrl.jogr = false;
-        self.ctrl.homf = false;
-        self.ctrl.homr = false;
+        for (button, bit) in [
+            (&mut self.ctrl.jogf, m::JOGF),
+            (&mut self.ctrl.jogr, m::JOGR),
+            (&mut self.ctrl.homf, m::HOMF),
+            (&mut self.ctrl.homr, m::HOMR),
+        ] {
+            if std::mem::take(button) {
+                self.internal.mmap |= bit;
+            }
+        }
     }
 
     /// C SYNC apply (motorRecord.cc:2540-2544): `else if (sync != 0 &&
@@ -1959,6 +2020,8 @@ impl MotorRecord {
         }
         self.internal.sync = false;
         self.sync_positions();
+        // syncTargetPosition (4446-4449).
+        self.mark(m::RRBV | m::DRBV | m::RBV);
         true
     }
 
@@ -2011,6 +2074,7 @@ impl MotorRecord {
         let stup_fired = stup_requested && self.device_state.is_some();
         if stup_requested {
             self.stat.stup = if stup_fired { 2 } else { 0 };
+            self.mark(m::STUP);
         }
         let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
         // Driver commands queued by put handlers (C sends these from
@@ -2206,6 +2270,8 @@ impl MotorRecord {
                 // cannot inject a stale completion evaluation into the
                 // new motion.
                 let mut effects = ProcessEffects::default();
+                // Unmarked: MIP posts when the GET_INFO pass ends the wait
+                // (1429-1430).
                 if self.stat.mip.contains(MipFlags::DELAY_REQ) {
                     self.stat.mip.remove(MipFlags::DELAY_REQ);
                     self.stat.mip.insert(MipFlags::DELAY_ACK);

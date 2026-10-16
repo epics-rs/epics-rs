@@ -87,7 +87,7 @@ const DOWNSTREAM_DB: &str = concat!(
 
 /// One budget for the whole resolution: search, dial, subscribe, first
 /// monitor, record processing. Generous for a loaded CI box.
-const RESOLVE_BUDGET: Duration = budget::FACT_BUDGET;
+const RESOLVE_BUDGET: Duration = fact_budget::FACT_BUDGET;
 const POLL: Duration = Duration::from_millis(50);
 
 /// Load a database exactly as `realtime-ca-ioc::load_database` does — driven by
@@ -147,12 +147,17 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     // spelling, kept for order fidelity), then the CP warm-up that stages
     // this link's open, then the stage for everything else.
     let downstream = build_db(DOWNSTREAM_DB);
-    let resolver = block_on_sync(install_calink_resolver(&downstream))
-        .expect("no async runtime entered on this test thread");
+    let resolver = block_on_sync(install_calink_resolver(
+        &downstream,
+        epics_base_rs::runtime::task::Reactor::current().expect("test runtime"),
+    ))
+    .expect("no async runtime entered on this test thread");
     block_on_sync(async {
         downstream.initialize_link_locality().await;
         downstream.setup_cp_links().await;
         downstream.setup_external_link_opens().await;
+        // C `dbCaRun`, which releases the processor.
+        downstream.process_cp_links_on_connect().await;
     })
     .expect("no async runtime entered on this test thread");
 
@@ -193,6 +198,3 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     server.shutdown();
     accept.join().expect("the accept thread exits on shutdown");
 }
-
-#[path = "common/budget.rs"]
-mod budget;

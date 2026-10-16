@@ -95,7 +95,7 @@ async fn a_common_string_field_carries_bytes() {
         .unwrap();
 
     let inst = db.get_record("D1").unwrap();
-    let desc = inst.read().common.desc.clone();
+    let desc = inst.read().common.text.desc.clone();
     assert_eq!(
         desc.as_bytes(),
         [b'h', 0xFF, b'z'],

@@ -22,7 +22,7 @@ fn mca() -> RecordInstance {
         .expect("mca models PREC");
     rec.put_field("EGU", EpicsValue::String("cts".into()))
         .expect("mca models EGU");
-    RecordInstance::new("T:MCA".to_string(), rec)
+    RecordInstance::new("T:MCA", rec)
 }
 
 #[test]

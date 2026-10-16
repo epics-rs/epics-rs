@@ -63,6 +63,7 @@ pub const MCA_DBD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dbd");
 
 /// The `mca` record type factory, for `IocBuilder::register_record_type`.
 pub fn mca_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    epics_base_rs::server::record::register_contributed_dbd(&record::dbd_generated::DBD);
     ("mca", Box::new(|| Box::new(McaRecord::default())))
 }
 

@@ -11,7 +11,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(34): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(37): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -85,6 +85,43 @@ const GROUP_JSON_ALLCONST: &str = r#"{
 
 fn empty_request() -> PvStructure {
     PvStructure::new("epics:nt/NTRequest:1.0")
+}
+
+/// MONITOR START as the PVA server issues it, pvxs `onStartSubscription`:
+/// start, enable every member subscription, and take the post their seeds
+/// make, so what follows is deltas.
+async fn start_seeded(mon: &mut epics_bridge_rs::qsrv::group::GroupMonitor, db: &PvDatabase) {
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    mon.start().await.expect("start");
+    for h in mon.activation_handles() {
+        h.enable(db).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+        .await
+        .expect("the seeds post within 2s")
+        .expect("the seed post");
+}
+
+/// A group monitor's first update: START (`onStartSubscription`) and the
+/// post its member seeds make; there is no read seed beside it.
+async fn first_update(
+    mut seed: epics_pva_rs::server_native::source::SubscriptionSeed<
+        epics_pva_rs::server_native::MonitorUpdate,
+    >,
+) -> epics_pva_rs::server_native::MonitorUpdate {
+    assert!(
+        seed.initial.is_none(),
+        "a group with members has no read seed"
+    );
+    seed.on_start
+        .as_ref()
+        .expect("a group monitor has a START gate")
+        .set_active(true)
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), seed.updates.recv())
+        .await
+        .expect("the seeds post within 2s")
+        .expect("the seed post")
 }
 
 async fn make_db() -> Arc<PvDatabase> {
@@ -346,7 +383,7 @@ async fn group_monitor_subscribes_archive_log_events() {
         .cloned()
         .expect("grp_trig registered");
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
@@ -376,7 +413,7 @@ async fn group_monitor_subscribes_archive_log_events() {
         .cloned()
         .expect("grp registered");
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     {
         let rec = db.get_record("TEST:level").expect("rec exists");
         rec.write().notify_field("VAL", EventMask::LOG);
@@ -478,7 +515,7 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     // `Arc<PvDatabase>` clones on top of this; teardown must release them.
     let baseline = Arc::strong_count(&db);
 
-    let mut rx = ChannelSource::subscribe(&store, "TEST:allconst")
+    let mut rx = ChannelSource::subscribe(&store, b"TEST:allconst")
         .await
         .expect("subscribe opens the all-const group monitor");
 
@@ -650,11 +687,7 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
             .subscribe_seeded(checked, ctx, opts)
             .await
             .expect("group monitor subscribes");
-        let initial = match seed
-            .initial
-            .expect("a group monitor seeds from its monitor-stamped value")
-            .value
-        {
+        let initial = match first_update(seed).await.value.into_owned() {
             PvField::Structure(s) => s,
             other => panic!("group seed must be a structure: {other:?}"),
         };
@@ -813,8 +846,8 @@ async fn group_put_member_acf_denial_rejects_entire_put() {
     struct DenySpecific(String);
     #[async_trait::async_trait]
     impl AccessControl for DenySpecific {
-        async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
-            channel != self.0
+        async fn can_write(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+            channel != self.0.as_bytes()
         }
     }
 
@@ -944,7 +977,7 @@ async fn br_fr12_named_trigger_marks_only_target() {
     );
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // The monitor is purely delta-driven: the wire layer owns the full
     // initial frame, so poll() carries only fresh member deltas with
@@ -1012,7 +1045,7 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
     );
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // Delta-driven monitor: a single `level` post yields one delta carrying
     // the self member's leaves — assigned-not-changed, so it is a pure
@@ -1062,7 +1095,7 @@ async fn br113_quiet_member_does_not_block_active_member_update() {
         .expect("grp registered");
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
 
     // Only `level` changes after start; `count` never posts.
     {
@@ -1550,7 +1583,7 @@ async fn group_monitor_stop_disables_member_subscriptions() {
         .expect("grp registered");
 
     let mut mon = GroupMonitor::new(db.clone(), def);
-    mon.start().await.expect("start");
+    start_seeded(&mut mon, &db).await;
     let handles = mon.activation_handles();
     assert!(
         !handles.is_empty(),
@@ -1610,7 +1643,7 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
     struct TrapAll;
     #[async_trait::async_trait]
     impl AccessControl for TrapAll {
-        async fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+        async fn write_grant(&self, _channel: &[u8], _creds: &ClientCreds) -> WriteGrant {
             WriteGrant {
                 allowed: true,
                 rule_was_trap: true,
@@ -1640,11 +1673,11 @@ async fn trapped_group_put_emits_per_member_astrapwrite() {
     let _handle = register_trap_write_listener(Arc::new(move |msg: &TrapWriteMessage<'_>| {
         if matches!(
             msg.pv_name,
-            "TEST:level.VAL" | "TEST:count.VAL" | "TEST:grp"
+            b"TEST:level.VAL" | b"TEST:count.VAL" | b"TEST:grp"
         ) {
             cap.lock().unwrap().push((
                 msg.op,
-                msg.pv_name.to_string(),
+                String::from_utf8_lossy(msg.pv_name).into_owned(),
                 msg.status.map(|s| s.to_string()),
             ));
         }
@@ -2076,14 +2109,16 @@ async fn r17_35_group_long_string_member_put_writes_char_image() {
 /// spawned ~2 forwarder tasks per member onto the shared callback pool, so
 /// the flood put O(members) task wakes per tick between the scalar
 /// monitor's events (16.9 s stalls on target); with the shared drain the
-/// group costs O(1) wakes per tick, and both channels — created through
-/// the provider, so the group rides the provider's shared pump — keep
-/// delivering with bounded latency while the flood runs.
+/// group costs O(1) wakes per tick, and both monitors — the group created
+/// through the provider so it rides the provider's shared pump, the scalar
+/// on `qsrvSingle` as served — keep delivering with bounded latency while
+/// the flood runs.
 #[tokio::test]
 async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_bridge_rs::qsrv::AnyChannel;
     use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use epics_pva_rs::server_native::source::ChannelSource;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -2110,28 +2145,23 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
         .load_group_config(&format!(r#"{{ "TEST:floodgrp": {{ {members} }} }}"#))
         .expect("20-member group loads");
 
-    // Both monitors through the provider, so the group monitor registers
-    // with the provider's shared GroupPump — the as-deployed wiring.
-    let group_ch = provider
-        .create_channel_for("TEST:floodgrp", "u", "h")
+    // The group monitor through the provider, so it registers with the
+    // provider's shared GroupPump — the as-deployed wiring.
+    let group_ch = match provider
+        .create_channel_for(b"TEST:floodgrp", "u", "h")
         .await
-        .expect("group channel");
+        .expect("group channel")
+    {
+        AnyChannel::Group(ch) => ch,
+        other => panic!("expected a group channel, got {:?}", other.channel_name()),
+    };
     let mut group_mon = group_ch.create_monitor().await.expect("group monitor");
     group_mon.start().await.expect("group monitor starts");
 
-    let scalar_ch = match provider
-        .create_channel_for("TEST:flood_scalar", "u", "h")
+    let mut scalar_mon = epics_pva_rs::server::PvDatabaseSource::new(db.clone())
+        .subscribe(b"TEST:flood_scalar")
         .await
-        .expect("scalar channel")
-    {
-        AnyChannel::Single(ch) => ch,
-        other => panic!(
-            "expected a single-record channel, got {:?}",
-            other.channel_name()
-        ),
-    };
-    let mut scalar_mon = scalar_ch.create_monitor().await.expect("scalar monitor");
-    scalar_mon.start().await.expect("scalar monitor starts");
+        .expect("scalar monitor");
 
     // Flood every group member from a concurrent task until told to stop,
     // yielding per round so the current-thread runtime interleaves it with
@@ -2145,7 +2175,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
             while !stop.load(Ordering::Relaxed) {
                 for i in 0..20 {
                     let rec = db
-                        .get_record(&format!("TEST:fm{i:02}"))
+                        .get_record(format!("TEST:fm{i:02}"))
                         .expect("member record");
                     rec.write()
                         .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
@@ -2165,7 +2195,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
             rec.write()
                 .notify_field("VAL", EventMask::VALUE | EventMask::ALARM);
         }
-        tokio::time::timeout(Duration::from_secs(2), scalar_mon.poll())
+        tokio::time::timeout(Duration::from_secs(2), scalar_mon.recv())
             .await
             .unwrap_or_else(|_| {
                 panic!("scalar delivery stalled under the group flood (round {round})")
@@ -2184,7 +2214,6 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
     assert!(rounds > 0, "the flood actually ran");
 
     group_mon.stop().await;
-    scalar_mon.stop().await;
 }
 
 /// pvxs pushes the built-in `record` Struct onto `groupMembersToAdd`
@@ -2281,9 +2310,8 @@ async fn group_monitor_seed_marks_the_negotiated_queue_size() {
         .subscribe_seeded(checked, ctx, MonitorOptions::default())
         .await
         .expect("group monitor subscribes");
-    let marked = seed
-        .initial
-        .expect("a group monitor seeds from its monitor-stamped value")
+    let marked = first_update(seed)
+        .await
         .marked
         .expect("a group seed frames by what it assigned");
     for path in ["record._options.queueSize", "record._options.atomic"] {
@@ -2292,4 +2320,181 @@ async fn group_monitor_seed_marks_the_negotiated_queue_size() {
             "{path} must be marked on the seed, got {marked:?}"
         );
     }
+}
+
+/// A group named by one record's info(Q:group) alone, with the relative
+/// `"+channel":"VAL"` pvxs prefixes with the record name. softIocPVX 1.5.3
+/// creates it, and after `pvxput LZ:O world` serves `txt.value string =
+/// "world"`. The port refused it with "Invalid PV: VAL".
+#[tokio::test]
+async fn a_single_info_group_fragment_resolves_its_relative_channel() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lso, "LZ:O") {
+                field(SIZV, "64")
+                info(Q:group, {"LZ:G":{"txt":{"+channel":"VAL"}}})
+            }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = BridgeProvider::new(db.clone());
+    let json = db
+        .get_record("LZ:O")
+        .unwrap()
+        .read()
+        .get_info("Q:group")
+        .map(str::to_string)
+        .unwrap();
+    provider.load_info_group(b"LZ:O", &json).expect("load");
+    assert_eq!(provider.process_groups().await, 1);
+
+    db.put_pv("LZ:O", EpicsValue::String("world".into()))
+        .await
+        .unwrap();
+    let def = provider.groups().get("LZ:G").cloned().expect("LZ:G");
+    let got = GroupChannel::new(db, def)
+        .get(&empty_request())
+        .await
+        .expect("get");
+    let Some(PvField::Structure(txt)) = got.get_field("txt") else {
+        panic!("no txt in {got:?}");
+    };
+    assert_eq!(
+        txt.get_field("value"),
+        Some(&PvField::Scalar(ScalarValue::String("world".into())))
+    );
+}
+
+/// `$` text members, against `softIocPVX` 1.5.3 over
+/// `record(lso,"LZ:F"){field(SIZV,"64") info(Q:form,"String")}` and
+/// `record(calcout,"LZ:C"){field(INPA,"LZ:J")}`. `GZ` (`LZ:F.VAL$` as a
+/// plain `fp` and a scalar `fs`) answers `pvxget GZ` after `pvxput LZ:F
+/// world` with `fp string = "world"`, `fs.value string = "world"`, and
+/// `pvxmonitor GZ` over `pvxput LZ:F again` posts `fp = "again"`, then
+/// `fs.value = "again"` with `fs.timeStamp`. A group on `LZ:C.INPA$` prints
+/// `Error Group not created: Link fields not allowed in this context`.
+#[tokio::test]
+async fn a_dollar_text_member_serves_what_softiocpvx_serves() {
+    use epics_bridge_rs::qsrv::channel::BridgeChannel;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"
+            record(lso, "LZ:F") { field(SIZV, "64") info(Q:form, "String") }
+            record(lsi, "LZ:J") { field(SIZV, "64") }
+            record(calcout, "LZ:C") { field(INPA, "LZ:J") }
+            "#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(
+            r#"{
+                "GZ": {
+                    "fp": { "+channel": "LZ:F.VAL$", "+type": "plain" },
+                    "fs": { "+channel": "LZ:F.VAL$" }
+                },
+                "GL": { "lp": { "+channel": "LZ:C.INPA$", "+type": "plain" } }
+            }"#,
+        )
+        .expect("load");
+    assert_eq!(provider.process_groups().await, 1, "GL is not created");
+
+    let writer = BridgeChannel::new(db.clone(), b"LZ:F").await.expect("LZ:F");
+    let put = |t: &'static str| {
+        let writer = &writer;
+        async move {
+            let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+            put.fields.push((
+                "value".into(),
+                PvField::Scalar(ScalarValue::String(t.into())),
+            ));
+            writer.put(&put).await.expect("put");
+        }
+    };
+    let text = |t: &str| PvField::Scalar(ScalarValue::String(t.into()));
+    let member = |s: &PvStructure, path: &str| -> PvField {
+        let (head, tail) = path.split_once('.').unwrap_or((path, ""));
+        let field = s.get_field(head).cloned().expect(head);
+        match (field, tail) {
+            (field, "") => field,
+            (PvField::Structure(inner), tail) => inner.get_field(tail).cloned().expect(tail),
+            (other, _) => panic!("{path}: {other:?}"),
+        }
+    };
+
+    put("world").await;
+    let def = provider.groups().get("GZ").cloned().expect("GZ");
+    let got = GroupChannel::new(db.clone(), def.clone())
+        .get(&empty_request())
+        .await
+        .expect("get");
+    assert_eq!(member(&got, "fp"), text("world"));
+    assert_eq!(member(&got, "fs.value"), text("world"));
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    start_seeded(&mut mon, &db).await;
+    put("again").await;
+    let mut posted = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await {
+        for path in ev.marked.clone().unwrap_or_default() {
+            posted.push((path.clone(), member(&ev.value, &path)));
+        }
+    }
+    mon.stop().await;
+    posted.sort_by(|a, b| a.0.cmp(&b.0));
+    let paths: Vec<&str> = posted.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["fp", "fs.timeStamp", "fs.value"]);
+    assert_eq!(posted[0].1, text("again"));
+    assert_eq!(posted[2].1, text("again"));
+}
+
+/// A `$` member with an `arr` slice reads as a single-record one does:
+/// `softIocPVX` 1.5.3 over `record(stringin,"FS"){field(VAL,"hello")}` and
+/// this group answers `pvxget FG` with `t.value` and `p` both
+/// `int8_t[] = {3}[101, 108, 0]`.
+#[tokio::test]
+async fn a_dollar_arr_member_serves_what_softiocpvx_serves() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(stringin, "FS") { field(VAL, "hello") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(
+            r#"{"FG":{
+                "t":{"+channel":"FS.VAL${\"arr\":{\"s\":1,\"e\":3}}"},
+                "p":{"+channel":"FS.VAL${\"arr\":{\"s\":1,\"e\":3}}","+type":"plain"}
+            }}"#,
+        )
+        .expect("load");
+    assert_eq!(provider.process_groups().await, 1);
+    let def = provider.groups().get("FG").cloned().expect("FG");
+    let got = GroupChannel::new(db.clone(), def)
+        .get(&empty_request())
+        .await
+        .expect("get");
+    let want = epics_bridge_rs::convert::epics_to_pv_field(&EpicsValue::CharArray(
+        b"el\0".to_vec().into(),
+    ));
+    let Some(PvField::Structure(t)) = got.get_field("t") else {
+        panic!("{got:?}");
+    };
+    assert_eq!(t.get_field("value"), Some(&want));
+    assert_eq!(got.get_field("p"), Some(&want));
 }

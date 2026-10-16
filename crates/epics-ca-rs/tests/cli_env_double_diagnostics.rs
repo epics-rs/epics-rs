@@ -22,14 +22,12 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-mod common;
-
 use std::process::Command;
 
 // Both are used only by the one `softioc-rs` case below, which the
 // reactor-free backend does not build.
 #[cfg(tokio_backend)]
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 #[cfg(tokio_backend)]
 use std::process::Stdio;
 
@@ -184,30 +182,47 @@ fn max_search_period_below_lower_limit_is_named() {
 #[test]
 fn beacon_period_reject_is_diagnosed_once_per_process() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .args(["-S", "--pv", "R16-18:PV:double:1.0"])
+        .args(["-S", "--port", "0", "--pv", "R16-18:PV:double:1.0"])
         // Keep the IOC off the network: loopback interface, loopback beacon
         // target, and a port the harness picks nothing else on.
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
         .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CAS_BEACON_PERIOD", "garbage")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn softioc-rs");
 
-    // Startup is what prints, and the "CA server:" banner is emitted after
-    // the one-shot env resolution (`addr_list::from_env` in `run()`) — every
-    // startup point that historically duplicated the diagnostic precedes it.
-    // Wait for the banner itself (a fixed sleep races startup under load),
-    // then take the IOC down and judge everything it wrote.
+    // Startup is what prints. The "CA server:" banner is written in
+    // `bind_sockets`, after its env resolution but before `run()`'s, so the
+    // banner alone does not cover every startup point that historically
+    // duplicated the diagnostic. A read answered on the banner's port does:
+    // `run()` resolves before it starts the search responder. Neither wait is
+    // a fixed sleep, which races startup under load.
     let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
     assert!(
-        err_lines.wait_for(budget::FACT_BUDGET, |t| {
+        err_lines.wait_for(fact_budget::FACT_BUDGET, |t| {
             t.contains("CA server: UDP search on port")
         }),
         "softioc-rs never printed its startup banner; stderr: {:?}",
         err_lines.text()
+    );
+    let banner = err_lines.text();
+    let port = banner
+        .split_once("CA server: UDP search on port ")
+        .and_then(|(_, rest)| rest.split(',').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("the banner names the search port");
+    let read = Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+        .args(["-w", "10", "R16-18:PV"])
+        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
+        .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
+        .output()
+        .expect("run caget-rs");
+    assert!(
+        read.status.success(),
+        "softioc-rs never served R16-18:PV: {}",
+        String::from_utf8_lossy(&read.stderr)
     );
     let _ = child.kill();
     let _ = child.wait();
@@ -254,6 +269,3 @@ fn conn_tmo_positive_period_is_silent() {
         "10.5 s is a valid period; no diagnostic is due:\n{err}"
     );
 }
-
-#[cfg(tokio_backend)]
-use common::budget;

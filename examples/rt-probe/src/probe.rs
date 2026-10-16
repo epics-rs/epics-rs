@@ -104,7 +104,7 @@ enum Cmd {
         hogs: usize,
     },
     /// Observe whether an IOC thread actually gets SCHED_FIFO under the
-    /// current `EPICS_RS_ALLOW_RT_PRIORITY` setting — the switch both
+    /// current `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` setting — the switch both
     /// directions. Reports `enter_ioc_thread`'s verdict and the kernel's
     /// own `sched_getscheduler`/priority for the thread.
     RtPolicy,
@@ -189,7 +189,7 @@ async fn boot_ioc_on(ca_port: u16) -> Result<Ioc, Box<dyn std::error::Error>> {
     let macros = std::collections::HashMap::new();
     let (db, _autosave) = IocBuilder::new()
         .db_string(FAST_DB, &macros)?
-        .build()
+        .build_served()
         .await?;
     let scan = ScanOwner::start(db.clone());
     let ca_server = CaServer::from_parts(
@@ -573,16 +573,18 @@ fn extract_pva_double(f: &epics_pva_rs::PvField) -> Option<f64> {
 
 /// Spawn one IOC thread through the real `enter_ioc_thread` path and report
 /// both the runtime's own verdict and the kernel's ground truth. Run twice by
-/// the caller — once with `EPICS_RS_ALLOW_RT_PRIORITY=YES`, once `=NO` — to see
+/// the caller — once with `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=YES`, once `=NO` — to see
 /// the switch bite in both directions. Must run as root (or with CAP_SYS_NICE)
 /// for the YES arm to actually obtain SCHED_FIFO.
 fn rt_policy() {
-    use epics_base_rs::runtime::task::{RtPolicy, ThreadPriority, enter_ioc_thread};
-    let raw = std::env::var(epics_base_rs::runtime::task::RT_PRIORITY_ENV).ok();
+    use epics_base_rs::runtime::task::{
+        C_RT_PRIORITY_ENV, RT_PRIORITY_ENV, RtPolicy, ThreadPriority, enter_ioc_thread,
+    };
+    // Both switches: C's decides whenever it is set, the alias only when not.
     println!(
-        "rt-policy: {}={:?} -> RtPolicy::{:?}",
-        epics_base_rs::runtime::task::RT_PRIORITY_ENV,
-        raw,
+        "rt-policy: {C_RT_PRIORITY_ENV}={:?} {RT_PRIORITY_ENV}={:?} -> RtPolicy::{:?}",
+        std::env::var_os(C_RT_PRIORITY_ENV),
+        std::env::var_os(RT_PRIORITY_ENV),
         RtPolicy::current()
     );
     let handle = std::thread::spawn(|| {

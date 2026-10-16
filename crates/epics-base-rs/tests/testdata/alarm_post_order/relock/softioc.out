@@ -1,0 +1,29 @@
+T                               0 UDF INVALID
+T.SEVR                          INVALID UDF INVALID
+T.STAT                          UDF UDF INVALID
+T.AMSG                           UDF INVALID
+T.ACKS                          NO_ALARM UDF INVALID
+T.LCNT                          0 UDF INVALID
+T.SEVR                          NO_ALARM  
+T.STAT                          NO_ALARM  
+T.AMSG                            
+T.ACKS                          NO_ALARM  
+T                               1  
+T.SEVR                          INVALID SCAN INVALID
+T.STAT                          SCAN SCAN INVALID
+T.AMSG                          Async in progress SCAN INVALID
+T.ACKS                          INVALID SCAN INVALID
+T                               1 SCAN INVALID
+T.SEVR                          NO_ALARM  
+T.STAT                          NO_ALARM  
+T.AMSG                            
+T                               1  
+T.SEVR                          INVALID SCAN INVALID
+T.STAT                          SCAN SCAN INVALID
+T.AMSG                          Async in progress SCAN INVALID
+T.ACKS                          INVALID SCAN INVALID
+T                               1 SCAN INVALID
+T.SEVR                          NO_ALARM  
+T.STAT                          NO_ALARM  
+T.AMSG                            
+T                               1  

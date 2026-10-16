@@ -149,7 +149,12 @@ async fn main() -> ExitCode {
     // receive `Arc<PvDatabase>` clones — a caput on the CA side is
     // immediately visible through PVA monitors and vice versa.
     let macros = parse_macros(&args.macros);
-    let mut builder = IocBuilder::new();
+    // The network half of C's dbCa, libca, for names this IOC does not serve.
+    let mut builder = IocBuilder::new().register_link_type("ca", {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("main runs on the IOC's reactor");
+        move |db| epics_ca_rs::calink::calink_link_set_install(db, reactor)
+    });
 
     // Startup progress goes to the subscriber, not to stderr. An IOC that
     // loaded a database says nothing about it: C `softIoc -d file.db` is
@@ -181,30 +186,29 @@ async fn main() -> ExitCode {
         };
     }
 
-    let (db, autosave_cfg) = match builder.build().await {
-        Ok(p) => p,
+    let ioc = match builder.build_ioc().await {
+        Ok(ioc) => ioc,
         Err(e) => {
             eprintln!("error building IOC: {e}");
             return ExitCode::from(2);
         }
     };
-    let _ = autosave_cfg;
 
     // C iocInit owns scan start (scanInit/scanRun) — neither the CA nor
     // the PVA front-end scans. One core-owned scan owner covers whichever
-    // subset of the two servers is enabled; `try_claim_scan_start` keeps
+    // subset of the two servers is enabled; `ScanControl::try_claim` keeps
     // any redundant start parked, so the shared database never
-    // double-scans. Held to process end.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+    // double-scans.
+    let db = ioc.database().clone();
+    ioc.run().await;
 
-    // Flag > EPICS environment > compiled default. `from_parts` takes a
-    // literal port, so the environment fallback is resolved here.
+    // Flag > EPICS environment > compiled default. `CaServer::from_parts`
+    // takes a literal port, so its fallback is resolved here;
+    // `PvaServer::from_parts` resolves its own from `None`.
     let ca_port = args
         .ca_port
         .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
-    let pva_port = args
-        .pva_port
-        .unwrap_or_else(epics_pva_rs::config::env::pvas_server_port);
+    let pva_port = args.pva_port;
 
     // One live policy cell for both protocol servers, so an ACF
     // (re)load gates CA and PVA together.
@@ -232,7 +236,7 @@ async fn main() -> ExitCode {
     } else {
         let server = PvaServer::from_parts(db.clone(), pva_port, acf, None, None);
         Some(tokio::spawn(async move {
-            tracing::info!(port = pva_port, "PVA listener starting");
+            tracing::info!(port = ?pva_port, "PVA listener starting");
             server.run().await
         }))
     };
@@ -272,13 +276,12 @@ fn format_join(which: &str, r: Result<CaResult<()>, tokio::task::JoinError>) -> 
 /// CA+PVA IOC up on this execution model.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "dual-ioc-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the CA and the PVA server front-ends \
          need a tokio reactor. Use `realtime-pva-ioc` on this backend, or \
-         rebuild without that feature."
-    );
-    ExitCode::FAILURE
+         rebuild without that feature.",
+    )
 }
 
 #[cfg(test)]

@@ -29,6 +29,8 @@
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 use std::time::Instant;
 
 /// A spawned child that is killed and reaped on every exit path.
@@ -39,6 +41,23 @@ impl Drop for Reaped {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// How long the server is given to print a line after the one the test is
+/// waiting for. C prints nothing past the block, so there is no later line to
+/// wait on; a miss here can only pass a late line, never fail a correct run.
+const NO_MORE_GRACE: Duration = Duration::from_millis(1500);
+
+fn stderr_lines(stderr: std::process::ChildStderr) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 #[test]
@@ -65,63 +84,39 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
             .expect("spawn softioc-rs"),
     );
 
-    let stderr = ioc.0.stderr.take().expect("piped stderr");
-    let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let rx = stderr_lines(ioc.0.stderr.take().expect("piped stderr"));
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     let mut seen: Vec<String> = Vec::new();
-    let mut line = String::new();
     // Read until the block under test is complete — NOT until some later
     // startup milestone. The five lines are written by `bind_tcp_listeners`,
     // and the UDP responders bind after it on the same configured port number:
     // `--port` sets both. That port was reserved here for TCP only, so on a
     // loaded host another process can hold the same number on UDP, and
     // softioc-rs then exits with `AddrInUse` — *after* printing all five lines.
-    // Waiting for the "CA server:" banner made that exit fail this test even
-    // though its subject had already been satisfied in full. Reproduced twice
-    // in 400 runs under a concurrent workspace run, at 0.04 s:
-    //
-    //   softioc-rs exited; stderr: [ …five cas lines…,
-    //     "Error: Io(Custom { kind: AddrInUse, error: \"CA server UDP search
-    //      responder bind 0.0.0.0:39103: Address already in use\" })" ]
-    //
-    // EOF *before* the block is still a failure, and stays one: the block is
-    // printed during the TCP bind, so nothing that happens later can suppress
-    // it.
+    // EOF *before* the block is still a failure: the block is printed during
+    // the TCP bind, so nothing that happens later can suppress it.
     let mut block: Vec<String> = Vec::new();
     while block.len() < 5 {
-        assert!(
-            Instant::now() < deadline,
-            "softioc-rs printed {} of the 5 cas lines; stderr so far: {seen:#?}",
-            block.len()
-        );
-        line.clear();
-        let n = reader.read_line(&mut line).expect("read softioc-rs stderr");
-        assert!(
-            n > 0,
-            "softioc-rs exited before the TCP-port warning block was complete; \
-             stderr: {seen:#?}"
-        );
-        let trimmed = line.trim_end().to_string();
-        if trimmed.starts_with("cas ") {
-            block.push(trimmed.clone());
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = rx.recv_timeout(left).unwrap_or_else(|e| {
+            panic!(
+                "softioc-rs printed {} of the 5 cas lines ({e}); stderr so far: {seen:#?}",
+                block.len()
+            )
+        });
+        if line.starts_with("cas ") {
+            block.push(line.clone());
         }
-        assert!(
-            !trimmed.contains("CA server:"),
-            "the banner arrived with only {} cas lines; C writes five before \
-             the server starts; stderr: {seen:#?}",
-            block.len()
-        );
-        seen.push(trimmed);
+        seen.push(line);
     }
-    // "and no more": the next stderr line must not be a sixth. EOF here is the
-    // UDP-collision exit described above — the block was already whole, so it
-    // proves the same thing the banner would have.
-    line.clear();
-    if reader.read_line(&mut line).expect("read softioc-rs stderr") > 0 {
+    // "and no more": a sixth `cas` line inside the grace window. The server
+    // prints nothing after the block when the port is configured, so there is
+    // no later line to wait for; the window can only miss a late sixth, never
+    // fail a correct run.
+    if let Ok(line) = rx.recv_timeout(NO_MORE_GRACE) {
         assert!(
             !line.starts_with("cas "),
-            "C writes five lines and no more; a sixth: {:?}",
-            line.trim_end()
+            "C writes five lines and no more; a sixth: {line:?}"
         );
     }
 
@@ -187,34 +182,39 @@ fn a_free_tcp_port_is_silent() {
                 .expect("spawn softioc-rs"),
         );
 
-        let stderr = ioc.0.stderr.take().expect("piped stderr");
-        let mut reader = BufReader::new(stderr);
-        let deadline = Instant::now() + budget::FACT_BUDGET;
+        let rx = stderr_lines(ioc.0.stderr.take().expect("piped stderr"));
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
         let mut seen: Vec<String> = Vec::new();
-        let mut line = String::new();
-        // Outcomes: reached "CA server:" silently (clean pass), or the port was
-        // stolen — surfaced either as a `cas` fallback line or as softioc-rs
-        // exiting before the banner (it could not bind the stolen port at all).
+        // C prints nothing for a configured port, so the only milestone is the
+        // listener itself: a connect to the port succeeds once the TCP bind is
+        // done. The `cas` block, if the port was stolen, is written during
+        // that bind, so a short drain after the connect sees it. A steal is
+        // also an exit before the listener comes up.
         let mut stolen = false;
         loop {
             assert!(
                 Instant::now() < deadline,
-                "softioc-rs never got past startup; stderr so far: {seen:#?}"
+                "softioc-rs never opened its TCP port; stderr so far: {seen:#?}"
             );
-            line.clear();
-            let n = reader.read_line(&mut line).expect("read softioc-rs stderr");
-            if n == 0 {
-                // Exited before the banner: treat as a steal and retry.
+            while let Ok(line) = rx.try_recv() {
+                stolen |= line.starts_with("cas ");
+                seen.push(line);
+            }
+            if stolen {
+                break;
+            }
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                while let Ok(line) = rx.recv_timeout(NO_MORE_GRACE) {
+                    stolen |= line.starts_with("cas ");
+                    seen.push(line);
+                }
+                break;
+            }
+            if matches!(ioc.0.try_wait(), Ok(Some(_))) {
                 stolen = true;
                 break;
             }
-            seen.push(line.trim_end().to_string());
-            if line.starts_with("cas ") {
-                stolen = true;
-            }
-            if line.contains("CA server:") {
-                break;
-            }
+            std::thread::sleep(Duration::from_millis(20));
         }
 
         if !stolen {
@@ -230,6 +230,3 @@ fn a_free_tcp_port_is_silent() {
         );
     }
 }
-
-#[path = "common/budget.rs"]
-mod budget;

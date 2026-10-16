@@ -115,7 +115,7 @@ async fn main() -> CaResult<()> {
             "xrtBeamlineConfig",
             vec![],
             "xrtBeamlineConfig - Configure XRT beamline simulation IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("xrtBeamlineConfig: setting up beamline...");
 
                 let sim_config = SimConfig {
@@ -150,8 +150,12 @@ async fn main() -> CaResult<()> {
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("XRT", xrt_handle)
-                    .map_err(|e| e.to_string())?;
+                asyn_rs::asyn_record::register_port(
+                    "XRT",
+                    xrt_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(
                     xrt_rt.pool().clone(),
@@ -202,25 +206,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "xrt_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

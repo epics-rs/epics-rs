@@ -25,11 +25,12 @@ use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::proto::{
-    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string,
+    ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string_bytes,
     encode_string_into, ip_from_bytes, ip_to_bytes,
 };
 
 use super::source::DynSource;
+use epics_base_rs::types::RecordName;
 
 // exposed pub(crate) so the TCP-circuit SEARCH handler in
 // tcp.rs can reuse this struct + the parser below. The fields are
@@ -52,7 +53,7 @@ use super::source::DynSource;
 pub(crate) struct SearchRequest {
     pub(crate) seq: u32,
     pub(crate) byte_order: ByteOrder,
-    pub(crate) queries: Vec<(u32, String)>,
+    pub(crate) queries: Vec<(u32, RecordName)>,
     /// Reply destination announced inside the SEARCH payload (the
     /// 16-byte address + 2-byte port fields). `None` means the address
     /// was the unspecified sentinel (`0.0.0.0` / `::`), in which case
@@ -163,7 +164,7 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     }
     let n = p.get_u16(order).ok()? as usize;
     // cap pre-alloc against attacker-announced
-    // count. Each (cid u32, String) consumes >= 5 wire bytes; in
+    // count. Each (cid u32, name) consumes >= 5 wire bytes; in
     // practice n is u16-bounded so the worst case is ~1.5MB but
     // capping at remaining-bytes keeps the small-datagram common
     // case tight.
@@ -171,8 +172,8 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let mut queries = Vec::with_capacity(n.min(remaining));
     for _ in 0..n {
         let cid = p.get_u32(order).ok()?;
-        let name = decode_string(&mut p, order).ok().flatten()?;
-        queries.push((cid, name));
+        let name = decode_string_bytes(&mut p, order).ok().flatten()?;
+        queries.push((cid, RecordName::from(name)));
     }
     Some(SearchRequest {
         seq,

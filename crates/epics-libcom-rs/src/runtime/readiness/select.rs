@@ -149,8 +149,9 @@ pub(super) struct SelectBackend {
     wake_pending: AtomicBool,
     /// Touched only by the poll thread, which is the only caller of
     /// [`SelectBackend::wait`]; the lock is what lets that be true behind the
-    /// `&self` the trait takes, and it is never contended.
-    sets: Mutex<Sets>,
+    /// `&self` the trait takes, and it is never contended. Boxed: the two
+    /// sets are a kilobyte that every poller would otherwise carry inline.
+    sets: Mutex<Box<Sets>>,
 }
 
 impl SelectBackend {
@@ -182,11 +183,11 @@ impl SelectBackend {
         Ok(Self {
             wake: fds,
             wake_pending: AtomicBool::new(false),
-            sets: Mutex::new(Sets {
+            sets: Mutex::new(Box::new(Sets {
                 read,
                 write: FdSet::zeroed(),
                 nfds: fds[0] + 1,
-            }),
+            })),
         })
     }
 
@@ -277,7 +278,7 @@ impl Backend for SelectBackend {
         // `select` below has already taken them.
         let (mut read_set, mut write_set, nfds) = {
             let mut sets = self.sets.lock().expect("readiness select sets poisoned");
-            let Sets { read, write, nfds } = &mut *sets;
+            let Sets { read, write, nfds } = &mut **sets;
             for change in changes {
                 let set = match change.interest {
                     Interest::Read => &mut *read,

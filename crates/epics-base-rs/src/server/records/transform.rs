@@ -4,20 +4,34 @@ use crate::server::record::{
     ProcessOutcome, Record, parse_link_v2, parse_output_link_v2,
 };
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
-use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
+use crate::calc::{Rpcl, StringInputs, scalc_perform};
 
+use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 
 const NUM_CHANNELS: usize = 16; // A-P
 
+/// `transformRecord.c:208` `POSTFIX_SIZE`, `SCALC_INFIX_TO_POSTFIX_SIZE(120)`.
+const TRANSFORM_RPC_SIZE: usize = 2 + 120 * 21 / 6;
+
 /// The sixteen channel value fields, in `A..P` order — the set C's `monitor()`
 /// walks (`transformRecord.c:797-806`) and the only fields it posts.
-const CHANNEL_FIELDS: &[&str] = &[
+const CHANNEL_FIELDS: [&str; NUM_CHANNELS] = [
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+];
+
+/// [`CHANNEL_FIELDS`], then the sixteen CLCx compile statuses `special()`
+/// posts (`transformRecord.c:691-693`): the post table, bit `i` per entry.
+const POSTED_FIELDS: &[&str] = &[
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "CAV", "CBV",
+    "CCV", "CDV", "CEV", "CFV", "CGV", "CHV", "CIV", "CJV", "CKV", "CLV", "CMV", "CNV", "COV",
+    "CPV",
 ];
 
 /// C `transformRecord.c:210` `#define COMMENT_SIZE 39` — the `CMTx` field width
@@ -27,7 +41,7 @@ const CHANNEL_FIELDS: &[&str] = &[
 const COMMENT_SIZE: usize = 39;
 
 /// Code version reported by `VERS` (C `transformRecord.c:92 #define VERSION 5.8`).
-const VERSION: f64 = 5.8;
+const VERSION: f32 = 5.8;
 
 /// C `transformRecord.c:752-767` `get_precision` names `VERS` and answers a
 /// LITERAL 2, ahead of the `fieldIndex >= transformRecordVAL` arm that serves
@@ -69,7 +83,8 @@ pub struct TransformRecord {
     /// nowhere else derived.
     lvals: [f64; NUM_CHANNELS],
     pub calcs: [String; NUM_CHANNELS],
-    compiled: [Option<CompiledExpr>; NUM_CHANNELS],
+    /// C `RPCA..RPCP`.
+    rpc: [Rpcl<TRANSFORM_RPC_SIZE>; NUM_CHANNELS],
     /// `CMTA..CMTP` — "Comment A".."Comment P" (`transformRecord.dbd:681-741`,
     /// DBF_STRING `size(39)`, and note NO `special`).
     ///
@@ -85,8 +100,14 @@ pub struct TransformRecord {
     /// recompile anything — C picks the new macro up at the next CLCx compile
     /// (`special`, `:682`), and so does [`Self::recompile`].
     cmts: [String; NUM_CHANNELS],
-    pub inp_links: [String; NUM_CHANNELS],
-    pub out_links: [String; NUM_CHANNELS],
+    /// INPA..INPP / OUTA..OUTP. Private with `inp_linked` / `out_linked`:
+    /// [`Self::put_field`] is their one writer.
+    inp_links: [PvString; NUM_CHANNELS],
+    out_links: [PvString; NUM_CHANNELS],
+    /// Bit `i` set when `inp_links[i]` is not C's CONSTANT ([`Self::no_inlink`]).
+    inp_linked: u16,
+    /// Bit `i` set when `out_links[i]` is not C's CONSTANT ([`Self::no_outlink`]).
+    out_linked: u16,
     pub copt: i16, // calc option: 0=Conditional (calc only an unlinked, unchanged channel), 1=Always. Gates CALC-eval, NOT the OUTx write.
     pub ivla: i16, // 0=Ignore error, 1=Do Nothing
     pub prec: i16,
@@ -123,8 +144,11 @@ pub struct TransformRecord {
     /// calcout/scalcout/acalcout use (see `link_status::post_link_status`).
     /// sseq and swait own link-status fields too but post them from their own
     /// refresh, because their field sets are not one enum per link.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    /// A refused CLCx's report, made by `recompile` and printed by
+    /// `init_record` or, for a put, by the put's owner after the hold.
+    put_report: Option<PutReport>,
     /// C `transformRecord.c:807` `prpvt->firstCalcPosted`. `rpvt` is
     /// `calloc`'d in `init_record`, `monitor()` sets this to 1
     /// UNCONDITIONALLY after its post loop (`:807`), and nothing ever clears
@@ -134,6 +158,14 @@ pub struct TransformRecord {
     /// cycle of a record nobody has written finds every channel unchanged and
     /// a `DBE_LOG` archiver takes no initial sample.
     first_calc_posted: bool,
+    /// The channels `monitor()` posts this cycle (`:797-806`), bit `i` for
+    /// channel `i`, decided where `l* = *` is committed and TAKEN by
+    /// [`Record::take_cycle_posted_fields`]; bit `16 + i` is CLCx's status.
+    posts: u32,
+    /// CAV..CPV, C's `pcalcInvalid`: `sCalcPostfix()`'s 0/-1 for each CLCx,
+    /// 0 for an empty one. Written by [`Self::recompile`] and by a client put
+    /// (the fields carry no `special`).
+    cav: [i32; NUM_CHANNELS],
 }
 
 impl Default for TransformRecord {
@@ -143,10 +175,12 @@ impl Default for TransformRecord {
             vals: [0.0; NUM_CHANNELS],
             lvals: [0.0; NUM_CHANNELS],
             calcs: Default::default(),
-            compiled: Default::default(),
+            rpc: Default::default(),
             cmts: Default::default(),
             inp_links: Default::default(),
             out_links: Default::default(),
+            inp_linked: 0,
+            out_linked: 0,
             copt: 0,
             ivla: 0,
             prec: 0,
@@ -159,7 +193,10 @@ impl Default for TransformRecord {
             out_status: [LINK_CON; NUM_CHANNELS],
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             first_calc_posted: false,
+            posts: 0,
+            cav: [0; NUM_CHANNELS],
         }
     }
 }
@@ -176,16 +213,39 @@ impl TransformRecord {
     /// reason this matters here, different failure rules (see the eval site in
     /// `process`).
     ///
-    /// C's `postfix_ok = *pclcbuf && (*prpcbuf != BAD_EXPRESSION)` (`:585`): an
-    /// EMPTY CLCx is not compiled and not evaluated — which is why the empty
-    /// case is `None` rather than sCalc's empty-but-valid program.
-    fn recompile(&mut self, idx: usize) {
-        if self.calcs[idx].is_empty() {
-            self.compiled[idx] = None;
+    /// An EMPTY CLCx is not compiled (`:477`, `:677`): its RPCx keeps whatever
+    /// it held, and `process` does not evaluate it.
+    ///
+    /// Both callers, `init_record` (`:481-487`) and `special()` (`:684-689`),
+    /// follow a refused non-empty CLCx with `recGblRecordError(S_db_badField,
+    /// ptran, pmessage)`, left in `put_report` rather than printed because
+    /// `special()` runs under the put's hold. The status lands in CAV..CPV
+    /// (`:476-482`, `:676-692`); returns whether it changed, which
+    /// `special()` posts.
+    fn recompile(&mut self, idx: usize, pmessage: &'static str) -> bool {
+        let status = if self.calcs[idx].is_empty() {
+            0
         } else {
             let converted = self.convert_expression(&self.calcs[idx]);
-            self.compiled[idx] = scalc_compile(&converted).ok();
-        }
+            let compiled = calc_compile::scalc_postfix_into(&converted, &mut self.rpc[idx]);
+            if compiled.status == 0 {
+                0
+            } else {
+                self.put_report = Some(PutReport::RecordError {
+                    status: "Illegal field value",
+                    message: pmessage,
+                    then: None,
+                });
+                -1
+            }
+        };
+        std::mem::replace(&mut self.cav[idx], status) != status
+    }
+
+    fn calc_valid_index(name: &str) -> Option<usize> {
+        POSTED_FIELDS[NUM_CHANNELS..]
+            .iter()
+            .position(|f| *f == name)
     }
 
     /// C `convertExpression` (`transformRecord.c:384-390`): shortcuts first,
@@ -301,13 +361,22 @@ impl TransformRecord {
 
     /// C's `no_inlink` (`transformRecord.c:571`).
     fn no_inlink(&self, i: usize) -> bool {
-        Self::link_is_constant(&parse_link_v2(&self.inp_links[i]))
+        self.inp_linked & 1 << i == 0
     }
 
     /// C's `if (plink->type != CONSTANT)` on OUTx (`transformRecord.c:606`),
     /// negated. An OUT field parses under the OUT modifier mask.
     fn no_outlink(&self, i: usize) -> bool {
-        Self::link_is_constant(&parse_output_link_v2(&self.out_links[i]))
+        self.out_linked & 1 << i == 0
+    }
+
+    /// The bit `i` of `mask` [`Self::no_inlink`]/[`Self::no_outlink`] read.
+    fn set_linked(mask: &mut u16, i: usize, parsed: &ParsedLink) {
+        if Self::link_is_constant(parsed) {
+            *mask &= !(1 << i);
+        } else {
+            *mask |= 1 << i;
+        }
     }
 
     /// C's `same` test, `transformRecord.c:573-575`:
@@ -364,19 +433,11 @@ impl TransformRecord {
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
-    fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(2 * NUM_CHANNELS);
+    fn refresh_link_status(&self, posts: LinkStatusPosts) {
+        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
-            links.push((
-                IAV_FIELD_NAMES[i],
-                self.inp_links[i].clone(),
-                LinkRole::Input,
-            ));
-            links.push((
-                OAV_FIELD_NAMES[i],
-                self.out_links[i].clone(),
-                LinkRole::Output,
-            ));
+            links.push((IAV_FIELD_NAMES[i], self.inp_links[i].clone()));
+            links.push((OAV_FIELD_NAMES[i], self.out_links[i].clone()));
         }
         // C `transformRecord.c:741`, `:858`, `:863`.
         post_link_status(
@@ -384,6 +445,7 @@ impl TransformRecord {
             &self.link_gen,
             links,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            posts,
         );
     }
 
@@ -517,6 +579,22 @@ const TRANSFORM_COPT_CHOICES: &[&str] = &["Conditional", "Always"];
 const TRANSFORM_IVLA_CHOICES: &[&str] = &["Ignore error", "Do Nothing"];
 
 impl Record for TransformRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::CYCLE_POSTED
+            .union(crate::server::record::CycleHooks::WRITE_POSTED)
+            .union(crate::server::record::CycleHooks::CONTEXT)
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
+
     /// The one field C's `get_precision` names. Every other field takes
     /// `prec->prec` through `route_field_metadata`, which is the generic seed
     /// arm — a literal cannot come from there.
@@ -529,6 +607,10 @@ impl Record for TransformRecord {
             })
     }
 
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "transform"
     }
@@ -536,15 +618,21 @@ impl Record for TransformRecord {
     /// C compiles every CLCx in `init_record`, AFTER the whole record has
     /// loaded and after one `getMacros` over the final CMTx set
     /// (`transformRecord.c:426`, then `convertExpression`/`sCalcPostfix` per
-    /// channel at `:481-482`). `put_field` compiling on the way in — the port's
-    /// stand-in for C's `special()` — is correct for a runtime put but makes
-    /// the LOAD order-dependent: a `.db` naming `CLCB` above `CMTA` would
-    /// compile the expression before its macro exists. Re-establishing the
-    /// whole set here, once, is what makes the order irrelevant, as it is on C.
+    /// channel at `:481-482`), so a `.db` naming `CLCB` above `CMTA` still
+    /// sees the macro. `put_field` only stores; a runtime put compiles in
+    /// `special()`.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
             for i in 0..NUM_CHANNELS {
-                self.recompile(i);
+                self.recompile(i, "transform: init_record: Illegal CALC field");
+                // Not under a put's hold, so it prints at once.
+                if let Some(report) = self.put_report.take() {
+                    let name = self
+                        .async_ctx
+                        .as_ref()
+                        .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+                    report.emit(&name, "");
+                }
             }
         }
         Ok(())
@@ -625,16 +713,14 @@ impl Record for TransformRecord {
         //     A channel holding such a value keeps it for one cycle instead of
         //     being overwritten by its own CLCx.
         //   Always (COPT=1): compute whenever CLCx is valid, regardless.
-        // `postfix_ok` is the `if let Some(compiled)` below: `recompile` leaves
-        // `None` for both of C's failing halves — an empty CLCx (never compiled)
-        // and one `sCalcPostfix` rejected (BAD_EXPRESSION).
+        // `BAD_EXPRESSION` is `END_EXPRESSION`, what a refused compile leaves.
         for i in 0..NUM_CHANNELS {
             let new_value = !Self::value_is_same(self.vals[i], self.lvals[i]) || map[i];
             let do_calc = (self.no_inlink(i) && !new_value) || self.copt == 1;
             if !do_calc {
                 continue;
             }
-            if let Some(ref compiled) = self.compiled[i] {
+            if !self.calcs[i].is_empty() && !self.rpc[i].is_empty() {
                 // C `transformRecord.c:593`:
                 //
                 //   sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, prpcbuf, ptran->prec)
@@ -673,7 +759,7 @@ impl Record for TransformRecord {
                 // the `VAL` token (`FETCH_VAL`) pushes `*presult` — *this
                 // channel's* current value, not a record-wide previous VAL.
                 inputs.prev_val = self.vals[i];
-                let outcome = scalc_perform(compiled, &mut inputs, self.prec);
+                let outcome = scalc_perform(&self.rpc[i], &mut inputs, self.prec);
                 // C's store opcodes write through `&ptran->a`
                 // (`sCalcPerform.c:429-433`), so `CLCB="A:=A+1"` mutates the
                 // record's A — before channel C's expression fetches it, and
@@ -748,6 +834,17 @@ impl Record for TransformRecord {
         // that path (`:554-560`) runs checkAlarms/recGblResetAlarms and returns
         // WITHOUT calling `monitor()`, so LA..LP keep the values from the last
         // cycle that did.
+        // C's own test, `*pnew != *pprev || firstCalcPosted == 0`: against LA,
+        // not against what was last published, so a pp put to A posts from
+        // dbPut and again from its cycle.
+        let mut posts = 0u32;
+        for i in 0..NUM_CHANNELS {
+            if self.vals[i] != self.lvals[i] || !self.first_calc_posted {
+                posts |= 1 << i;
+            }
+        }
+        self.posts = posts;
+        self.first_calc_posted = true;
         self.lvals = self.vals;
 
         Ok(ProcessOutcome::complete_with(actions))
@@ -756,12 +853,12 @@ impl Record for TransformRecord {
     /// C reads `ptran->inpa..inpp` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 16 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp_links.get(slot).map(String::as_str)
+        self.inp_links.get(slot).map(PvString::as_bytes)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -781,7 +878,7 @@ impl Record for TransformRecord {
         if name == "VERS" {
             // Fixed code-version constant, C `ptran->vers = VERSION` in
             // init_record; never the `.dbd` initial.
-            return Some(EpicsValue::Double(VERSION));
+            return Some(EpicsValue::Float(VERSION));
         }
         if let Some(idx) = Self::channel_index(name) {
             return Some(EpicsValue::Double(self.vals[idx]));
@@ -791,6 +888,9 @@ impl Record for TransformRecord {
         }
         if let Some(idx) = Self::cmt_field_index(name) {
             return Some(EpicsValue::String(self.cmts[idx].clone().into()));
+        }
+        if let Some(idx) = Self::calc_valid_index(name) {
+            return Some(EpicsValue::Long(self.cav[idx]));
         }
         if let Some(idx) = Self::inp_field_index(name) {
             return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
@@ -860,12 +960,21 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::calc_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
+                    // Stored only: C compiles in `special()`, after `dbPut`
+                    // has stored the string, and `init_record` compiles the
+                    // loaded set.
                     self.calcs[idx] = s.as_str_lossy().into_owned();
-                    self.recompile(idx);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
             }
+        }
+        if let Some(idx) = Self::calc_valid_index(name) {
+            self.cav[idx] = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                as i32;
+            return Ok(());
         }
         if let Some(idx) = Self::cmt_field_index(name) {
             match value {
@@ -882,7 +991,9 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::inp_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.inp_links[idx] = s.as_str_lossy().into_owned();
+                    self.inp_links[idx] = s;
+                    let parsed = parse_link_v2(&self.inp_links[idx]);
+                    Self::set_linked(&mut self.inp_linked, idx, &parsed);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
@@ -891,7 +1002,9 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::out_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.out_links[idx] = s.as_str_lossy().into_owned();
+                    self.out_links[idx] = s;
+                    let parsed = parse_output_link_v2(&self.out_links[idx]);
+                    Self::set_linked(&mut self.out_linked, idx, &parsed);
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
@@ -913,13 +1026,13 @@ impl Record for TransformRecord {
         Err(CaError::FieldNotFound(name.to_string()))
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (transformRecord.c:444-473) classifies all 32 links
         // before any process. Both link tables are transform-owned fields,
         // already applied by the time `add_record` runs, so one refresh here
         // covers what C's init loop does.
-        self.refresh_link_status();
+        self.refresh_link_status(LinkStatusPosts::All);
     }
 
     /// S5 — set C's `map` bit for a value channel `A..P` written by an
@@ -931,6 +1044,14 @@ impl Record for TransformRecord {
     /// link-fed channel has `no_inlink == false` and is never gated by
     /// `new_value` at all.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        // C refuses a put to a value field whose input link is not CONSTANT,
+        // valid or not (`transformRecord.c:651-660`).
+        if !after
+            && let Some(i) = Self::channel_index(field)
+            && !self.no_inlink(i)
+        {
+            return Err(CaError::ReadOnlyField(field.to_string()));
+        }
         if after {
             // C `transformRecord.c:699-705` marks the bitmap only for a field
             // in the `A..P` range (`i = fieldIndex - transformRecordA; if ((i
@@ -939,10 +1060,21 @@ impl Record for TransformRecord {
             if let Some(i) = Self::channel_index(field) {
                 self.map[i] = true;
             }
+            if let Some(i) = Self::calc_field_index(field)
+                && self.recompile(i, "transform:special: Illegal CALC field")
+            {
+                self.posts |= 1 << (NUM_CHANNELS + i);
+            }
             // C `transformRecord.c:709-742` re-classifies the link a put just
-            // re-pointed, over the whole INPA..OUTP range.
-            if Self::inp_field_index(field).is_some() || Self::out_field_index(field).is_some() {
-                self.refresh_link_status();
+            // re-pointed, over the whole INPA..OUTP range, and posts that
+            // link's status alone.
+            let status = match (Self::inp_field_index(field), Self::out_field_index(field)) {
+                (Some(i), _) => Some(IAV_FIELD_NAMES[i]),
+                (_, Some(i)) => Some(OAV_FIELD_NAMES[i]),
+                _ => None,
+            };
+            if let Some(status) = status {
+                self.refresh_link_status(LinkStatusPosts::Put(status));
             }
         }
         Ok(())
@@ -959,7 +1091,7 @@ impl Record for TransformRecord {
     /// Without this, `field(A,"5")` would leave LA=0, make A read "new" on the
     /// very first cycle, and suppress the calc C runs. transform serves no
     /// MLST/ALST/LALM, so there is nothing of the default's work to keep.
-    fn seed_deadband_tracking(&mut self) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.lvals = self.vals;
     }
 
@@ -1027,7 +1159,7 @@ impl Record for TransformRecord {
     /// that literal. No transform field ever carries an alarm bit, so a
     /// `DBE_ALARM`-only subscriber on `.A` is notified on no cycle at all.
     fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
-        CHANNEL_FIELDS
+        &CHANNEL_FIELDS
     }
 
     /// C `transformRecord.c::monitor()` (`:786-809`) is the record's ONLY
@@ -1041,32 +1173,33 @@ impl Record for TransformRecord {
     /// `.VAL` monitor: the deadband post fires whenever ANY class fired, and
     /// on an alarm cycle the alarm bits alone are enough — so a transform
     /// whose input went INVALID was posting `.VAL` where C posts nothing.
-    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
-        Some(CHANNEL_FIELDS)
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::TRANSFORM_FIELDS,
+                    CHANNEL_FIELDS,
+                )
+            },
+        )
     }
 
-    /// The `firstCalcPosted == 0` half of C's post condition
-    /// (`transformRecord.c:798`): on the first process cycle of the IOC every
-    /// channel posts whether or not it moved, and the flag is set
-    /// unconditionally afterwards (`:807`) so no later cycle can.
-    ///
-    /// `take_first_monitor_cycle`, not `take_cycle_posted_fields`: iocInit
-    /// drains the per-cycle marks and would consume this flag before any
-    /// process cycle ran. Both are called once per process cycle by
-    /// `collect_subscriber_posts`, subscribers or not, exactly as C runs
-    /// `monitor()` every cycle — so a client that connects after the record
-    /// has processed sees what C shows it, nothing. The mask is C's own
-    /// `monitor_mask = DBE_VALUE|DBE_LOG` (`:794`), which overwrites
-    /// `recGblResetAlarms`'s: no alarm bit reaches these posts.
-    fn take_first_monitor_cycle(&mut self) -> Vec<(&'static str, CyclePostMask)> {
-        if self.first_calc_posted {
-            return Vec::new();
-        }
-        self.first_calc_posted = true;
-        CHANNEL_FIELDS
-            .iter()
-            .map(|f| (*f, CyclePostMask::ValueLog))
-            .collect()
+    /// `monitor()`'s A..P posts, with C's literal `DBE_VALUE|DBE_LOG` (`:794`)
+    /// overwriting `recGblResetAlarms`'s mask, and `special()`'s CAV..CPV post
+    /// (`:693`), the same mask.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); POSTED_FIELDS.len()] =
+            crate::server::record::uniform_post_table(
+                crate::server::record::dbd_generated::TRANSFORM_FIELDS,
+                POSTED_FIELDS,
+                CyclePostMask::ValueLog,
+            );
+        crate::server::record::CycleMarks::of(&POSTS, std::mem::take(&mut self.posts) as u128)
+    }
+
+    /// C keeps LA..LP and never compares against the published value.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &CHANNEL_FIELDS
     }
 
     /// Transform's UDF is C's `ptran->udf`: cleared at the top of every
@@ -1174,6 +1307,12 @@ mod tests {
     use crate::server::record::CommonFields;
     use crate::server::record::FieldDeclaration;
 
+    /// A CLCx `dbPut`: the store, then `special(field, 1)`, which compiles.
+    fn put_calc(rec: &mut TransformRecord, field: &str, value: EpicsValue) {
+        rec.put_field(field, value).unwrap();
+        rec.special(field, true).unwrap();
+    }
+
     #[test]
     fn link_status_fields_read_derived_constant_and_reject_put() {
         use crate::server::record::RecordInstance;
@@ -1185,7 +1324,7 @@ mod tests {
         // measured (`caget TRANSFORM.IAV` → 1, C → 3). The put is already
         // refused by the framework read-only gate (`is_no_mod`), matching C
         // `S_db_noMod`; the fix is the read value.
-        let inst = RecordInstance::new("T:LS".into(), TransformRecord::new());
+        let inst = RecordInstance::new("T:LS", TransformRecord::new());
         for name in ["IAV", "IPV", "IOV", "OAV", "OPV"] {
             assert_eq!(
                 inst.resolve_field(name),
@@ -1213,6 +1352,45 @@ mod tests {
         assert!(!TransformRecord::is_link_status_field("INPA"));
     }
 
+    /// `no_inlink`/`no_outlink` follow every INPx/OUTx put: in Conditional
+    /// mode a constant-seeded channel recalcs each cycle and a linked one does
+    /// not (C `transformRecord.c:571`), and a runtime put repoints it.
+    #[test]
+    fn link_put_repoints_no_inlink_and_no_outlink() {
+        let mut rec = TransformRecord::new();
+        rec.put_field("INPA", EpicsValue::String("2".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("A+1".into()));
+        ioc_init(&mut rec);
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
+
+        rec.put_field("INPA", EpicsValue::String("SRC:PV".into()))
+            .unwrap();
+        assert!(!rec.no_inlink(0));
+        rec.process().unwrap();
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::Double(3.0)),
+            "a linked, unchanged channel does not recalc"
+        );
+
+        rec.put_field("INPA", EpicsValue::String(String::new().into()))
+            .unwrap();
+        assert!(rec.no_inlink(0));
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(4.0)));
+
+        assert!(rec.no_outlink(1));
+        rec.put_field("OUTB", EpicsValue::String("SINK:PV".into()))
+            .unwrap();
+        assert!(!rec.no_outlink(1));
+        rec.put_field("OUTB", EpicsValue::String("5".into()))
+            .unwrap();
+        assert!(rec.no_outlink(1));
+    }
+
     /// VERS is the code-version constant (C `transformRecord.c:92 #define
     /// VERSION 5.8`, written `ptran->vers = VERSION` in init_record), NOT the
     /// `.dbd` `initial("1")`. A write is accepted-and-ignored, matching
@@ -1220,9 +1398,9 @@ mod tests {
     #[test]
     fn vers_is_the_version_constant_and_ignores_writes() {
         let mut rec = TransformRecord::new();
-        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
         assert!(rec.put_field("VERS", EpicsValue::Double(99.0)).is_ok());
-        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(5.8)));
+        assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(5.8)));
     }
 
     /// C's `init_record` tail, `*plvalue = *pvalue` (`transformRecord.c:490`).
@@ -1232,7 +1410,7 @@ mod tests {
     /// while `A..P` hold their loaded values — i.e. as if every loaded field had
     /// just been written, which suppresses the very calc C performs.
     fn ioc_init(rec: &mut TransformRecord) {
-        rec.seed_deadband_tracking();
+        rec.seed_deadband_tracking(crate::server::device_support::DsetInit::Ok);
     }
 
     /// An expression that compiles clean and FAILS at eval — C
@@ -1257,8 +1435,7 @@ mod tests {
     #[test]
     fn r9_63_calc_failure_raises_calc_alarm_and_udf() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()));
         rec.process().unwrap();
 
         assert!(
@@ -1288,13 +1465,11 @@ mod tests {
     #[test]
     fn r9_63_calc_success_clears_the_previous_failure() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String(DIVIDE_BY_ZERO.into()));
         rec.process().unwrap();
         assert!(rec.value_is_undefined());
 
-        rec.put_field("CLCA", EpicsValue::String("5".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("5".into()));
         rec.process().unwrap();
         assert!(
             !rec.value_is_undefined(),
@@ -1329,8 +1504,7 @@ mod tests {
     #[test]
     fn test_transform_put_get_calc() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("B+C".into()));
         assert_eq!(
             rec.get_field("CLCA"),
             Some(EpicsValue::String("B+C".into()))
@@ -1363,10 +1537,8 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("B", EpicsValue::Double(1.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(100.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("VAL*2".into()))
-            .unwrap();
-        rec.put_field("CLCC", EpicsValue::String("VAL+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("VAL*2".into()));
+        put_calc(&mut rec, "CLCC", EpicsValue::String("VAL+1".into()));
         ioc_init(&mut rec);
 
         // Each CLCx evaluates against its own channel's value: a single
@@ -1384,8 +1556,7 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("B", EpicsValue::Double(3.0)).unwrap();
         rec.put_field("C", EpicsValue::Double(4.0)).unwrap();
-        rec.put_field("CLCA", EpicsValue::String("B+C".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("B+C".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 7.0); // A = B+C = 3+4 = 7
     }
@@ -1394,10 +1565,8 @@ mod tests {
     fn test_transform_process_chain() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
-            .unwrap();
-        rec.put_field("CLCC", EpicsValue::String("B+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*3".into()));
+        put_calc(&mut rec, "CLCC", EpicsValue::String("B+1".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0); // B = A*3 = 6
         assert_eq!(rec.vals[2], 7.0); // C = B+1 = 7 (uses updated B)
@@ -1416,9 +1585,9 @@ mod tests {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("IVLA", EpicsValue::Short(1)).unwrap();
-        // Use invalid expression that fails to compile — compiled[0] stays None
+        // Use invalid expression that fails to compile — RPCA stays END
         rec.calcs[0] = "???invalid".into();
-        rec.compiled[0] = None;
+        rec.rpc[0] = Rpcl::empty();
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // Unchanged — no valid calc
     }
@@ -1430,8 +1599,7 @@ mod tests {
         rec.put_field("B", EpicsValue::Double(5.0)).unwrap();
         rec.put_field("IVLA", EpicsValue::Short(0)).unwrap();
         // CLCA has no valid calc (empty), CLCB evaluates
-        rec.put_field("CLCB", EpicsValue::String("A+1".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A+1".into()));
         ioc_init(&mut rec);
         rec.process().unwrap();
         assert_eq!(rec.vals[0], 10.0); // A unchanged
@@ -1477,14 +1645,12 @@ mod tests {
     fn test_transform_recompile_on_calc_change() {
         let mut rec = TransformRecord::new();
         rec.put_field("A", EpicsValue::Double(2.0)).unwrap();
-        rec.put_field("CLCB", EpicsValue::String("A*2".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*2".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 4.0);
 
         // Change calc expression
-        rec.put_field("CLCB", EpicsValue::String("A*3".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCB", EpicsValue::String("A*3".into()));
         rec.process().unwrap();
         assert_eq!(rec.vals[1], 6.0);
     }
@@ -1500,8 +1666,7 @@ mod tests {
     #[test]
     fn r9_62_val_is_a_constant_zero_dummy_not_channel_a() {
         let mut rec = TransformRecord::new();
-        rec.put_field("CLCA", EpicsValue::String("42".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("42".into()));
         rec.process().unwrap();
         assert_eq!(
             rec.get_field("A"),
@@ -1528,8 +1693,7 @@ mod tests {
             Some(EpicsValue::Double(0.0)),
             "a put to VAL must not land in channel A"
         );
-        rec.put_field("CLCA", EpicsValue::String("3".into()))
-            .unwrap();
+        put_calc(&mut rec, "CLCA", EpicsValue::String("3".into()));
         rec.process().unwrap();
         assert_eq!(rec.get_field("A"), Some(EpicsValue::Double(3.0)));
         assert_eq!(

@@ -59,7 +59,7 @@ async fn the_file_softioc_loads_loads() {
         );
     }
     let rec = db.get_record("QT1").unwrap();
-    let desc = rec.read().common.desc.clone();
+    let desc = rec.read().common.text.desc.clone();
     assert_eq!(desc, "quoted type and field");
 }
 
@@ -132,7 +132,15 @@ fn standalone_alias_takes_both_forms_in_both_args() {
         r#"record(ai,"R"){} alias(R, "N")"#,
     ] {
         let defs = parse_db(text, &HashMap::new()).unwrap_or_else(|e| panic!("{text}\n{e}"));
-        assert_eq!(defs[0].aliases, vec!["N".to_string()], "{text}");
+        assert_eq!(
+            defs[0]
+                .aliases
+                .iter()
+                .map(|a| a.name.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["N"],
+            "{text}"
+        );
     }
 }
 

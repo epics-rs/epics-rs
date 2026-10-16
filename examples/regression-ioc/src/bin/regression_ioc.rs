@@ -39,10 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// reactor-free backend, because the CA and PVA servers it boots are.
 #[cfg(exec_backend)]
 fn main() {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "regression-ioc boots the async CA and PVA servers; this build selects \
          the reactor-free backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), which does not
-         have them."
-    );
-    std::process::exit(2);
+         have them.",
+    )
 }

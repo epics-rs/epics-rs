@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::{CaError, CaResult};
+use crate::server::pv::SubscribeRefused;
 
 /// Access level for a channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub enum AccessLevel {
 /// `AccessGate::check`.
 #[derive(Debug, Clone)]
 pub struct AccessChecked {
-    pv_name: String,
+    pv_name: crate::types::RecordName,
     level: AccessLevel,
     /// Write-trap mask of the rule that resolved `level`. C
     /// `asComputePvt` stores this as `pasgclient->trapMask`
@@ -44,7 +45,7 @@ struct AccessSeal;
 
 impl AccessChecked {
     /// The PV name the check was performed against.
-    pub fn pv_name(&self) -> &str {
+    pub fn pv_name(&self) -> &crate::types::RecordName {
         &self.pv_name
     }
 
@@ -123,21 +124,16 @@ pub struct AccessGate {
     ///   tcp.rs's monitor loop compared against that stale value,
     ///   missing every inner reload.
     acl_version: AclVersionSource,
-    /// optional `INP*`-link value resolver. When present,
-    /// [`Self::check`] evaluates CALC-gated rules against live values;
-    /// when absent, CALC rules fail closed (deny). Installed by the
-    /// owning server via [`Self::with_inp_resolver`].
-    inp_resolver: Option<InpResolver>,
     /// C `asAddClient` computes a client's access once per channel and
     /// every operation is a bit test; the Rust op layer called
     /// [`Self::check_with_roles`] — resolver + full rule walk — on every
     /// EXEC. The walk result is deterministic in (policy snapshot,
-    /// pv name, credential identity) whenever no [`InpResolver`] is
-    /// installed (CALC rules then fail closed, reading no live values),
-    /// so those checks are cached here, shared across gate clones.
+    /// pv name, credential identity, published [`AsgState`]), so checks
+    /// are cached here, shared across gate clones.
     /// An entry is valid only while all three of its stamps hold: the
     /// `acl_version` generation, the ASG-field-change generation
-    /// ([`asg_change_generation`] — the resolver reads `record.ASG`),
+    /// ([`asg_change_generation`] — the resolver reads `record.ASG`, and the
+    /// `INP*` watcher bumps it after publishing a state),
     /// and the identity of the ACF config `Arc` it was computed against
     /// (so a cell swap that forgot to bump the version still misses).
     /// `Open` gates and unattached cells bypass the cache: their checks
@@ -150,12 +146,12 @@ pub struct AccessGate {
 /// part of the key — a re-auth that only changes role claims must miss.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckKey {
-    pv_name: String,
+    pv_name: crate::types::RecordName,
     host: String,
-    user: String,
+    user: Vec<u8>,
     method: String,
     authority: String,
-    roles: Vec<String>,
+    roles: Vec<crate::types::PvString>,
 }
 
 #[derive(Clone, Copy)]
@@ -182,21 +178,9 @@ enum AclVersionSource {
 /// source. Sources install one when constructing an
 /// [`AccessGate::required`].
 pub type AsgAslResolver = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, u8)> + Send>>
-        + Send
-        + Sync,
->;
-
-/// resolves an ASG `INP*` link string (typically a
-/// `record.field` PV name) to its current numeric value, or `None` when
-/// the input is unresolvable / disconnected (bad input → the CALC-gated
-/// rule denies). Installed on an [`AccessGate`] by the owning server so
-/// `check` can evaluate `RULE(...) { CALC(...) }` against live values.
-/// Async because the value typically lives behind the server's async
-/// database lock; [`AccessGate::check_with_roles`] resolves the ASG's
-/// links up front, then evaluates the (sync) expression.
-pub type InpResolver = std::sync::Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<f64>> + Send>>
+    dyn Fn(
+            crate::types::RecordName,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (String, u8)> + Send>>
         + Send
         + Sync,
 >;
@@ -225,17 +209,40 @@ pub type InpResolver = std::sync::Arc<
 /// on. A raw `ArcSwapOption` swap would update enforcement (checks load
 /// per-op) but leave those caches and the wire ACCESS_RIGHTS stale.
 #[derive(Clone)]
-pub struct AcfCell(std::sync::Arc<arc_swap::ArcSwapOption<AccessSecurityConfig>>);
+pub struct AcfCell(std::sync::Arc<AcfShared>);
+
+struct AcfShared {
+    policy: arc_swap::ArcSwapOption<AccessSecurityConfig>,
+    /// What the `INP*` watcher has attached, for [`AcfCell::wait_served`].
+    served: parking_lot::Mutex<Served>,
+    served_cv: parking_lot::Condvar,
+    /// [`AcfCell::install_async`]'s wake, fired beside `served_cv`.
+    served_notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Served {
+    /// A watcher is running for this cell.
+    watching: bool,
+    /// [`load_ident`] of the load whose inputs its last attach pass added.
+    load: usize,
+}
+
+/// Which load of the file `policy` is, 0 for none. A HAG refresh republishes
+/// the same load under a new policy `Arc`; only `asInit` makes a new one.
+fn load_ident(policy: Option<&std::sync::Arc<AccessSecurityConfig>>) -> usize {
+    policy.map_or(0, |c| std::sync::Arc::as_ptr(&c.load.0) as usize)
+}
 
 impl AcfCell {
     /// Snapshot the current policy (lock-free guard).
     pub fn load(&self) -> arc_swap::Guard<Option<std::sync::Arc<AccessSecurityConfig>>> {
-        self.0.load()
+        self.0.policy.load()
     }
 
     /// Snapshot the current policy as an owned `Option<Arc<..>>`.
     pub fn load_full(&self) -> Option<std::sync::Arc<AccessSecurityConfig>> {
-        self.0.load_full()
+        self.0.policy.load_full()
     }
 
     /// Publish a new policy (or `None` to clear it) and fire the
@@ -243,17 +250,96 @@ impl AcfCell {
     /// connections re-evaluate their rights and derived caches drop
     /// their entries.
     pub fn store(&self, value: Option<std::sync::Arc<AccessSecurityConfig>>) {
-        self.0.store(value);
+        self.0.policy.store(value);
         notify_asg_field_changed();
+    }
+
+    /// Publish `derived`, computed from `from`, only while `from` is still the
+    /// published policy: a reload that landed meanwhile is newer than anything
+    /// derived from the policy it replaced, so the derived one is dropped.
+    /// True if it was published.
+    fn replace_derived(
+        &self,
+        from: &std::sync::Arc<AccessSecurityConfig>,
+        derived: AccessSecurityConfig,
+    ) -> bool {
+        let prev = self
+            .0
+            .policy
+            .compare_and_swap(from, Some(std::sync::Arc::new(derived)));
+        let replaced = prev
+            .as_ref()
+            .is_some_and(|p| std::sync::Arc::ptr_eq(p, from));
+        if replaced {
+            notify_asg_field_changed();
+        }
+        replaced
+    }
+
+    /// Block until the `INP*` watcher has added the current policy's inputs,
+    /// each one present taking its first reading — C `asCaStart` waiting on
+    /// `asCaTaskWait`. That wait puts an `asInit`'s initial events before
+    /// `iocInit`'s PINI posts, so when two inputs share a letter the record
+    /// processed last decides. Returns at once for a cell no watcher serves.
+    pub fn wait_served(&self) {
+        let mut served = self.0.served.lock();
+        while !self.is_served(&served) {
+            self.0.served_cv.wait(&mut served);
+        }
+    }
+
+    fn is_served(&self, served: &Served) -> bool {
+        !served.watching || served.load == load_ident(self.load().as_ref())
+    }
+
+    /// C `asInit` for a parsed file: publish it as a new load, then
+    /// [`Self::wait_served`]. Every path that loads a file comes through here
+    /// or [`Self::install_async`], so none returns with the new inputs still
+    /// unread. Blocks the calling thread, so it is for a thread of its own
+    /// (iocsh's): the watcher it waits for runs on cbMedium, and a band worker
+    /// parked here can starve it. Async callers use [`Self::install_async`].
+    pub fn install(&self, config: AccessSecurityConfig) {
+        self.store(Some(std::sync::Arc::new(config)));
+        self.wait_served();
+    }
+
+    /// [`Self::install`] that awaits the first readings instead of parking a
+    /// thread, so it is safe on any executor, the watcher's band included.
+    pub async fn install_async(&self, config: AccessSecurityConfig) {
+        self.store(Some(std::sync::Arc::new(config)));
+        self.wait_served_async().await;
+    }
+
+    /// [`Self::wait_served`] for async callers: parks no thread.
+    pub async fn wait_served_async(&self) {
+        loop {
+            let notified = self.0.served_notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the check, so a mark between them still wakes.
+            notified.as_mut().enable();
+            if self.is_served(&self.0.served.lock()) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn mark_served(&self, watching: bool, load: usize) {
+        *self.0.served.lock() = Served { watching, load };
+        self.0.served_cv.notify_all();
+        self.0.served_notify.notify_waiters();
     }
 }
 
 /// Build a shared [`AcfCell`] holding `initial`. The single construction
 /// point, so no caller has to name `arc_swap` or get the `Arc` nesting right.
 pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
-    AcfCell(std::sync::Arc::new(arc_swap::ArcSwapOption::new(
-        initial.map(std::sync::Arc::new),
-    )))
+    AcfCell(std::sync::Arc::new(AcfShared {
+        policy: arc_swap::ArcSwapOption::new(initial.map(std::sync::Arc::new)),
+        served: Default::default(),
+        served_cv: Default::default(),
+        served_notify: tokio::sync::Notify::new(),
+    }))
 }
 
 /// Build a shared [`AcfCell`] that serves `db`, with its ASG `INP*` watcher
@@ -319,10 +405,10 @@ const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 /// rights automatically. C recovers stale HAG IPs only on a manual
 /// `asInit`; this is the sibling of the CA-side `refresh_dns` deviation.
 ///
-/// Resolution runs inline in the task (the established `refresh_dns`
-/// pattern): a wedged resolver delays this refresher, nothing else. The
-/// task holds only a `Weak` to the cell and ends when the owning IOC
-/// drops it.
+/// Resolution runs on [`AS_OFFLOAD`], not on the band: a wedged resolver
+/// holds one of its workers and delays this refresher, while cbMedium, which
+/// the INP watcher shares, keeps running. The task holds only a `Weak` to
+/// the cell and ends when the owning IOC drops it.
 fn spawn_hag_refresh(cell: &AcfCell) {
     let weak = std::sync::Arc::downgrade(&cell.0);
     // Middle band: an IOC-wide HAG re-resolution owns no record and so has no
@@ -334,23 +420,55 @@ fn spawn_hag_refresh(cell: &AcfCell) {
         async move {
             loop {
                 crate::runtime::task::sleep_background(HAG_DNS_REFRESH).await;
-                let Some(inner) = weak.upgrade() else { break };
-                if !as_check_client_ip() {
-                    continue;
-                }
-                let Some(config) = inner.load_full() else {
-                    continue;
-                };
-                if let Some(refreshed) = config.with_refreshed_hags() {
-                    tracing::info!(
-                        target: "epics_base_rs::access_security",
-                        "HAG DNS refresh: re-resolved members changed; republishing policy"
-                    );
-                    AcfCell(inner).store(Some(std::sync::Arc::new(refreshed)));
+                if !refresh_hags_once(&weak, AccessSecurityConfig::with_refreshed_hags).await {
+                    break;
                 }
             }
         },
     );
+}
+
+/// One [`spawn_hag_refresh`] tick, `resolve` run on [`AS_OFFLOAD`]. False once
+/// the cell is gone.
+async fn refresh_hags_once<F>(weak: &std::sync::Weak<AcfShared>, resolve: F) -> bool
+where
+    F: FnOnce(&AccessSecurityConfig) -> Option<AccessSecurityConfig> + Send + 'static,
+{
+    let Some(inner) = weak.upgrade() else {
+        return false;
+    };
+    if !as_check_client_ip() {
+        return true;
+    }
+    let Some(config) = inner.policy.load_full() else {
+        return true;
+    };
+    drop(inner);
+    let from = config.clone();
+    let refreshed = match AS_OFFLOAD.run(move || resolve(&config)) {
+        Ok(job) => job.await,
+        Err(e) => {
+            tracing::warn!(
+                target: "epics_base_rs::access_security",
+                error = %e,
+                "HAG DNS refresh: no offload thread; skipping this tick"
+            );
+            return true;
+        }
+    };
+    let Some(refreshed) = refreshed else {
+        return true;
+    };
+    let Some(inner) = weak.upgrade() else {
+        return false;
+    };
+    if AcfCell(inner).replace_derived(&from, refreshed) {
+        tracing::info!(
+            target: "epics_base_rs::access_security",
+            "HAG DNS refresh: re-resolved members changed; republishing policy"
+        );
+    }
+    true
 }
 
 /// Retry cadence for an ASG `INP*` link whose record is not in the database
@@ -371,9 +489,9 @@ const ASG_INP_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 /// was open, and a client that connected while it was shut stayed read-only
 /// after it opened.
 ///
-/// This is that monitor, in-process: one `EventMask::VALUE` subscription per
-/// distinct link target ([`AccessSecurityConfig::inp_link_targets`]), and
-/// [`notify_asg_field_changed`] on any post. That is the signal
+/// This is that monitor, in-process: one `VALUE | ALARM` subscription per
+/// distinct link target, each post delivered into the [`AsgState`] of every
+/// input naming it, then [`notify_asg_field_changed`]. That is the signal
 /// [`AcfCell::store`] already raises, so the CA server's `reeval_access_rights`
 /// and the QSRV grant cache need no new plumbing. Like C's `asComputeAsg` this
 /// re-evaluates every client rather than only the ASGs reading the changed
@@ -386,6 +504,18 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     let weak_cell = std::sync::Arc::downgrade(&cell.0);
     let weak_db = std::sync::Arc::downgrade(db);
     let mut acf_rx = subscribe_asg_changes();
+    cell.mark_served(true, 0);
+    // Clears `watching` however the task ends, so `wait_served` cannot hang
+    // on a watcher that is gone.
+    struct Unwatch(std::sync::Weak<AcfShared>);
+    impl Drop for Unwatch {
+        fn drop(&mut self) {
+            if let Some(inner) = self.0.upgrade() {
+                AcfCell(inner).mark_served(false, 0);
+            }
+        }
+    }
+    let unwatch = Unwatch(weak_cell.clone());
     // Middle band: the watcher spans every ASG INP link in the IOC, so no one
     // record's PRIO applies. It is the other entry behind the cbMedium
     // high-water of 2: C does this work on `asCaTask`, a CA client thread that
@@ -393,6 +523,7 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     crate::runtime::task::spawn_background(
         crate::runtime::task::CallbackPriority::Medium,
         async move {
+            let _unwatch = unwatch;
             // C `asCaTask` registers with the watchdog as its first act
             // (`asCa.c:171`) and removes on the way out (`:232`) — but the
             // thread itself only exists between `asCaStart` and `asCaStop`,
@@ -405,28 +536,20 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
             // ASG INP readers, and access inputs that never change are not a
             // fault.
             let mut watched: Option<crate::runtime::taskwd::TaskwdEntry> = None;
-            enum Wake {
-                /// A watched link posted a new value.
-                Values,
-                /// Re-derive the watch set (policy may have been replaced, or a
-                /// link's record may have loaded since the last attempt).
-                Rebuild,
-                Stop,
-            }
-            let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
-            // Targets not yet attached because their record is not loaded.
-            let mut pending: Vec<(String, String)> = Vec::new();
-            // Identity of the policy `readers` was built from. A notification this
-            // task raises itself does not move it, so the watcher cannot re-enter
-            // its own rebuild.
-            let mut built_from: usize = 0;
+            let mut watch = InpWatch::default();
+            // The policy whose groups take the deliveries. `watch` is rebuilt
+            // only for a new load: a republish of the same one (a HAG refresh,
+            // or a notification this task raises itself) keeps the
+            // subscriptions and the state C's events built, as C has no
+            // refresher to replay them.
+            let mut built_from: Option<std::sync::Arc<AccessSecurityConfig>> = None;
 
             loop {
                 let (Some(inner), Some(db)) = (weak_cell.upgrade(), weak_db.upgrade()) else {
                     break;
                 };
-                let config = inner.load_full();
-                drop(inner);
+                let cell = AcfCell(inner);
+                let config = cell.load_full();
                 match (config.is_some(), watched.is_some()) {
                     (true, false) => {
                         watched = Some(crate::runtime::taskwd::taskwd_insert(
@@ -438,78 +561,296 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                     (false, true) => watched = None,
                     _ => {}
                 }
-                let id = config
-                    .as_ref()
-                    .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize);
-                if id != built_from {
-                    built_from = id;
-                    readers.clear();
-                    pending = config.map(|c| c.inp_link_targets()).unwrap_or_default();
+                if load_ident(config.as_ref()) != load_ident(built_from.as_ref()) {
+                    watch = config.as_deref().map(InpWatch::of).unwrap_or_default();
                 }
-                pending.retain(|(record, field)| !attach_asg_inp(&db, record, field, &mut readers));
+                built_from = config;
+                let attached = built_from
+                    .as_ref()
+                    .is_some_and(|cfg| watch.attach(&db, cfg));
                 drop(db);
+                cell.mark_served(true, load_ident(built_from.as_ref()));
+                drop(cell);
+                // C's `asComputeAllAsg` after the adds (asCa.c:204-205).
+                if attached {
+                    notify_asg_field_changed();
+                }
 
                 let wake = tokio::select! {
                     r = acf_rx.recv() => match r {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Stop,
                         _ => Wake::Rebuild,
                     },
-                    () = drain_any_asg_inp(&mut readers) => Wake::Values,
+                    posted = drain_any_asg_inp(&watch.user) => Wake::Values(posted),
                     () = crate::runtime::task::sleep_background(ASG_INP_RETRY) => Wake::Rebuild,
                 };
                 match wake {
                     Wake::Stop => break,
                     Wake::Rebuild => {}
-                    Wake::Values => notify_asg_field_changed(),
+                    Wake::Values(posted) => {
+                        let (Some(cfg), Some(db)) = (&built_from, weak_db.upgrade()) else {
+                            continue;
+                        };
+                        watch.deliver(&db, cfg, posted);
+                        notify_asg_field_changed();
+                    }
                 }
             }
         },
     );
 }
 
-/// Subscribe one `INP*` target to its record's value events. `false` = not
-/// attached, retry later; the record is not in the database yet, or its
-/// subscriber cap is full (which frees again as clients disconnect, and losing
-/// a security monitor is worth the retry's log noise).
-fn attach_asg_inp(
-    db: &crate::server::database::PvDatabase,
-    record: &str,
-    field: &str,
-    readers: &mut Vec<crate::server::event_queue::EventReader>,
-) -> bool {
-    let Some(rec) = db.get_record(record) else {
-        return false;
-    };
-    let reader = rec.write().add_subscriber(
-        field,
-        0,
-        crate::types::DbFieldType::Double,
-        crate::server::recgbl::EventMask::VALUE.bits(),
-    );
-    match reader {
-        Some(reader) => {
-            readers.push(reader);
-            true
+/// Why the watcher woke.
+enum Wake {
+    /// Watched links posted, in post order.
+    Values(Vec<crate::server::event_queue::CircuitEvent>),
+    /// Re-derive the watch set (policy may have been replaced, or a link's
+    /// record may have loaded since the last attempt).
+    Rebuild,
+    Stop,
+}
+
+/// One subscription the watcher holds — C's channel per `ASGINP`, shared by
+/// every input naming the same `(record, field)`.
+struct InpTarget {
+    record: String,
+    field: String,
+    /// `(ASG, INP index)` of each input reading this target.
+    inputs: Vec<(Vec<u8>, u8)>,
+    /// `None` until attached, and again once the record goes away.
+    reader: Option<crate::server::event_queue::EventReader>,
+    /// Whether a full subscriber cap has been reported: C's exception arrives
+    /// once per `ca_add_event`.
+    reported: bool,
+}
+
+/// Everything the watcher holds for one policy: C's CA context and its
+/// channels.
+#[derive(Default)]
+struct InpWatch {
+    /// One event queue for every subscription, read in post order as C's
+    /// `asCaTask` context receives its events: when two inputs share a letter
+    /// the last event decides, so the record processing order does.
+    user: crate::server::event_queue::EventUser,
+    /// Distinct link targets; a subscription's `sid` is its index here.
+    targets: Vec<InpTarget>,
+    /// `(ASG, INP index, target)` in `asCaTask`'s add order (`asCa.c:178-200`):
+    /// ASGs by name, as `asAsgAdd` keeps them, inputs as the file lists them.
+    order: Vec<(Vec<u8>, u8, usize)>,
+}
+
+impl InpWatch {
+    fn of(config: &AccessSecurityConfig) -> Self {
+        let mut watch = Self::default();
+        let mut names: Vec<_> = config.asg.keys().collect();
+        names.sort();
+        for name in names {
+            for inp in &config.asg[name].inp {
+                let Some(link) = inp.record_link() else {
+                    continue;
+                };
+                let (record, field) = inp_link_target(link);
+                let found = watch
+                    .targets
+                    .iter()
+                    .position(|t| t.record == record && t.field == field);
+                let ix = found.unwrap_or_else(|| {
+                    watch.targets.push(InpTarget {
+                        record: record.to_string(),
+                        field: field.to_string(),
+                        inputs: Vec::new(),
+                        reader: None,
+                        reported: false,
+                    });
+                    watch.targets.len() - 1
+                });
+                watch.targets[ix].inputs.push((name.clone(), inp.index));
+                watch.order.push((name.clone(), inp.index, ix));
+            }
         }
-        None => false,
+        watch
+    }
+
+    /// Add every unattached input in `asCaTask` order, each taking the
+    /// reading its `ca_add_event` delivers first. True when any attached.
+    fn attach(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+    ) -> bool {
+        let mut fresh = vec![false; self.targets.len()];
+        for (asg, index, ix) in &self.order {
+            let target = &mut self.targets[*ix];
+            let reading = if target.reader.is_none() {
+                match attach_asg_inp(db, &self.user, *ix, &target.record, &target.field) {
+                    Ok((reader, initial)) => {
+                        target.reader = Some(reader);
+                        fresh[*ix] = true;
+                        initial
+                    }
+                    Err(SubscribeRefused::CapReached) if !target.reported => {
+                        target.reported = true;
+                        report_asg_inp_refused(db, Some(config), &target.record, &target.field);
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            } else if fresh[*ix] {
+                // C's next channel to the same PV takes its own first event.
+                db.get_record(&target.record)
+                    .and_then(|rec| inp_reading(&rec.read(), &target.field))
+            } else {
+                continue;
+            };
+            if let (Some(reading), Some(group)) = (reading, config.asg.get(asg)) {
+                group.deliver([(*index, InpEvent::Reading(reading))]);
+            }
+        }
+        fresh.contains(&true)
+    }
+
+    /// Events off the queue, in order, each into every input its target
+    /// feeds.
+    fn deliver(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+        posted: Vec<crate::server::event_queue::CircuitEvent>,
+    ) {
+        for post in posted {
+            self.deliver_one(db, config, post);
+        }
+    }
+
+    fn deliver_one(
+        &mut self,
+        db: &crate::server::database::PvDatabase,
+        config: &AccessSecurityConfig,
+        post: crate::server::event_queue::CircuitEvent,
+    ) {
+        use crate::server::event_queue::CircuitEvent;
+        let (ix, event) = match post {
+            CircuitEvent::Event { sid, event, .. } => {
+                let ix = sid as usize;
+                let Some(target) = self.targets.get(ix) else {
+                    return;
+                };
+                let value = event
+                    .value()
+                    .as_value()
+                    .and_then(|v| v.to_f64())
+                    .or_else(|| read_inp_value(db, &target.record, &target.field));
+                let Some(value) = value else { return };
+                let severity = crate::server::record::AlarmSeverity::from_u16(event.sevr());
+                (ix, InpEvent::Reading(InpReading { value, severity }))
+            }
+            CircuitEvent::Ended(id) => {
+                let Some(ix) = self
+                    .targets
+                    .iter()
+                    .position(|t| t.reader.as_ref().is_some_and(|r| r.id() == id))
+                else {
+                    return;
+                };
+                self.targets[ix].reader = None;
+                (ix, InpEvent::Disconnected)
+            }
+        };
+        for (asg, index) in &self.targets[ix].inputs {
+            if let Some(group) = config.asg.get(asg) {
+                group.deliver([(*index, event)]);
+            }
+        }
     }
 }
 
-/// Resolve once any watched link has posted, having drained every queued post
-/// so one re-evaluation covers a burst. C coalesces the same way — many
-/// `asComputeAsg` calls, one `asClientCOAR` per actual level change.
-async fn drain_any_asg_inp(readers: &mut [crate::server::event_queue::EventReader]) {
-    std::future::poll_fn(|cx| {
-        let mut fired = false;
-        for reader in readers.iter_mut() {
-            while let std::task::Poll::Ready(Some(_)) = reader.poll_recv(cx) {
-                fired = true;
-            }
-        }
-        if fired {
-            std::task::Poll::Ready(())
+/// Subscribe one `INP*` target to its record's value and alarm events, the
+/// default mask of C's `ca_add_event(DBR_STS_DOUBLE, ...)` (`asCa.c:193`),
+/// and take the reading that call delivers first. Both happen under one
+/// record lock, so no post falls between them.
+/// Refused = not attached, retry later; the record is not in the database yet,
+/// or its subscriber cap is full (which frees again as clients disconnect).
+fn attach_asg_inp(
+    db: &crate::server::database::PvDatabase,
+    user: &crate::server::event_queue::EventUser,
+    sid: usize,
+    record: &str,
+    field: &str,
+) -> Result<(crate::server::event_queue::EventReader, Option<InpReading>), SubscribeRefused> {
+    let rec = db.get_record(record).ok_or(SubscribeRefused::NoRecord)?;
+    let mut inst = rec.write();
+    let reader = inst.add_subscriber_on(
+        user,
+        field,
+        sid as u32,
+        crate::types::DbFieldType::Double,
+        (crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::ALARM).bits(),
+        crate::server::event_queue::no_context(),
+    )?;
+    Ok((reader, inp_reading(&inst, field)))
+}
+
+/// asCa.c:79's `exceptionCallback` line for an `ECA_ALLOCMEM` on
+/// `ca_add_event`, with rsrv's `send_err` context (camessage.c:1872) and the
+/// rights rsrv would grant asCa's own circuit.
+fn report_asg_inp_refused(
+    db: &crate::server::database::PvDatabase,
+    config: Option<&AccessSecurityConfig>,
+    record: &str,
+    field: &str,
+) {
+    let Some(rec) = db.get_record(record) else {
+        return;
+    };
+    let (native, (asg, asl)) = {
+        let rec = rec.read();
+        (
+            rec.resolve_field(field),
+            (rec.common.text.asg.clone(), rec.common.asl),
+        )
+    };
+    let level = config.map_or(AccessLevel::ReadWrite, |c| {
+        // asCa's libca circuit names itself as `cac.cpp:176-178` does.
+        let user = crate::runtime::env::user_name().unwrap_or_default();
+        c.check_access_asl(&asg, crate::runtime::env::ca_local_host_name(), &user, asl)
+    });
+    crate::runtime::log::errlog_vprintf(format_args!(
+        "dbCa:exceptionCallback stat \"Unable to allocate additional dynamic memory\" \
+         channel \"{record}.{field}\" context \"subscription install into record {record} failed\"\n \
+         nativeType {} requestType DBR_STS_DOUBLE nativeCount {} requestCount 0 {} {}\n",
+        native
+            .as_ref()
+            .map_or("DBR_invalid", |v| crate::types::dbr_type_to_text(
+                v.dbr_type() as u16
+            )),
+        native.as_ref().map_or(0, |v| v.count()),
+        if level == AccessLevel::NoAccess {
+            "noReadAccess"
         } else {
+            "readAccess"
+        },
+        if level == AccessLevel::ReadWrite {
+            "writeAccess"
+        } else {
+            "noWriteAccess"
+        },
+    ));
+}
+
+/// Resolve once any watched link has posted, with every queued post in post
+/// order, so one wake covers a burst.
+async fn drain_any_asg_inp(
+    user: &crate::server::event_queue::EventUser,
+) -> Vec<crate::server::event_queue::CircuitEvent> {
+    std::future::poll_fn(|cx| {
+        let mut posted = Vec::new();
+        while let std::task::Poll::Ready(event) = user.poll_next(cx) {
+            posted.push(event);
+        }
+        if posted.is_empty() {
             std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(posted)
         }
     })
     .await
@@ -558,18 +899,8 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Required { acf, resolver },
             acl_version: AclVersionSource::Atomic(acl_version),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
-    }
-
-    /// attach an `INP*`-link value resolver so CALC-gated ACF
-    /// rules are evaluated against live values instead of failing
-    /// closed. The owning server installs one backed by its PV value
-    /// registry.
-    pub fn with_inp_resolver(mut self, resolver: InpResolver) -> Self {
-        self.inp_resolver = Some(resolver);
-        self
     }
 
     /// Build a gate that grants `ReadWrite` to everyone. Used for
@@ -581,7 +912,6 @@ impl AccessGate {
             acl_version: AclVersionSource::Atomic(std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(0),
             )),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -606,7 +936,6 @@ impl AccessGate {
         Self {
             inner: AccessGateInner::Open,
             acl_version: AclVersionSource::Aggregator(f),
-            inp_resolver: None,
             check_cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
@@ -640,9 +969,9 @@ impl AccessGate {
     /// kind of value the source's op methods will accept.
     pub async fn check(
         &self,
-        pv_name: impl Into<String>,
+        pv_name: impl Into<crate::types::RecordName>,
         host: &str,
-        user: &str,
+        user: impl AsRef<[u8]>,
         method: &str,
         authority: &str,
     ) -> AccessChecked {
@@ -652,14 +981,13 @@ impl AccessGate {
 
     /// Like [`Self::check`] but with the client's
     /// `roles` (QSRV local-group-derived credentials) so a `role/<name>`
-    /// UAG member can match, and with CALC-gated rules evaluated against
-    /// the installed [`InpResolver`] (fail closed when none is set).
+    /// UAG member can match.
     pub async fn check_with_roles(
         &self,
-        pv_name: impl Into<String>,
+        pv_name: impl Into<crate::types::RecordName>,
         host: &str,
-        user: &str,
-        roles: &[String],
+        user: impl AsRef<[u8]>,
+        roles: &[crate::types::PvString],
         method: &str,
         authority: &str,
     ) -> AccessChecked {
@@ -673,24 +1001,21 @@ impl AccessGate {
                 match acf.load_full() {
                     None => (AccessLevel::ReadWrite, false),
                     Some(cfg) => {
-                        // See the [`Self::check_cache`] field doc: cache
-                        // only walk results that read no live values, and
-                        // snapshot every stamp BEFORE the compute so a
-                        // change racing it invalidates the entry instead
-                        // of being lost.
+                        // See the [`Self::check_cache`] field doc: snapshot
+                        // every stamp BEFORE the compute so a change racing
+                        // it invalidates the entry instead of being lost.
                         let acl_version = self.acl_version();
                         let asg_generation = asg_change_generation();
                         let cfg_ident = std::sync::Arc::as_ptr(&cfg) as usize;
-                        let key = self.inp_resolver.is_none().then(|| CheckKey {
+                        let key = CheckKey {
                             pv_name: pv_name.clone(),
                             host: host.to_string(),
-                            user: user.to_string(),
+                            user: user.as_ref().to_vec(),
                             method: method.to_string(),
                             authority: authority.to_string(),
                             roles: roles.to_vec(),
-                        });
-                        if let Some(ref key) = key
-                            && let Some(hit) = self.check_cache.read().get(key)
+                        };
+                        if let Some(hit) = self.check_cache.read().get(&key)
                             && hit.acl_version == acl_version
                             && hit.asg_generation == asg_generation
                             && hit.cfg_ident == cfg_ident
@@ -703,53 +1028,29 @@ impl AccessGate {
                             };
                         }
                         let (asg, asl) = resolver(pv_name.clone()).await;
-                        // pre-resolve the ASG's INP* links up
-                        // front — the resolver is async (it reads the
-                        // server DB). `Some(inputs)` when every declared
-                        // link resolved; `None` when there is no resolver
-                        // or any input is bad/disconnected → CALC fails
-                        // closed. Each rule's expression is then evaluated
-                        // synchronously in `compute_rules`.
-                        let inp_values: Option<AsgInputs> = match self.inp_resolver {
-                            None => None,
-                            Some(ref res) => {
-                                let mut inputs = AsgInputs::default();
-                                if let Some(group) =
-                                    cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT"))
-                                {
-                                    for inp in &group.inp {
-                                        inputs.record(inp.index, res(inp.link.clone()).await);
-                                    }
-                                }
-                                Some(inputs)
-                            }
-                        };
                         let (level, rule_was_trap) = cfg.compute_for_name(
                             &asg,
                             host,
-                            user,
+                            user.as_ref(),
                             roles,
                             asl,
                             method,
                             authority,
-                            inp_values.as_ref(),
                         );
-                        if let Some(key) = key {
-                            let mut cache = self.check_cache.write();
-                            if cache.len() >= CHECK_CACHE_CAP {
-                                cache.clear();
-                            }
-                            cache.insert(
-                                key,
-                                CachedCheck {
-                                    acl_version,
-                                    asg_generation,
-                                    cfg_ident,
-                                    level,
-                                    rule_was_trap,
-                                },
-                            );
+                        let mut cache = self.check_cache.write();
+                        if cache.len() >= CHECK_CACHE_CAP {
+                            cache.clear();
                         }
+                        cache.insert(
+                            key,
+                            CachedCheck {
+                                acl_version,
+                                asg_generation,
+                                cfg_ident,
+                                level,
+                                rule_was_trap,
+                            },
+                        );
                         (level, rule_was_trap)
                     }
                 }
@@ -776,7 +1077,7 @@ mod access_checked_tests {
         assert_eq!(checked.level(), AccessLevel::ReadWrite);
         assert!(checked.allows_read());
         assert!(checked.allows_write());
-        assert_eq!(checked.pv_name(), "any:pv");
+        assert_eq!(&checked.pv_name()[..], b"any:pv");
     }
 
     #[epics_macros_rs::epics_test]
@@ -823,8 +1124,7 @@ ASG(DEFAULT) {
     async fn check_cache_misses_on_acf_swap_without_version_bump() {
         let cfg_deny = parse_acf(
             r#"
-ASG(DEFAULT) {
-}
+ASG(DEFAULT)
 "#,
         )
         .unwrap();
@@ -884,23 +1184,24 @@ pub enum RuleAccess {
 /// A single access rule within an ASG.
 #[derive(Debug, Clone, Default)]
 pub struct AccessRule {
-    pub level: u8,
+    /// C `pasgrule->level`, an `int`.
+    pub level: i32,
     /// Three-way access this rule grants when it matches. C
     /// `asLib.y:259-267` distinguishes `NONE`/`READ`/`WRITE`.
     pub access: RuleAccess,
-    pub uag: Vec<String>,
-    pub hag: Vec<String>,
+    pub uag: Vec<Vec<u8>>,
+    pub hag: Vec<Vec<u8>>,
     /// Authentication method scope (epics-base PR #563). When set,
     /// the rule only applies when the requesting client authenticated
     /// via one of the listed methods. Common values: `"anonymous"`,
     /// `"ca"`, `"x509"`, `"cap-token"`. Empty vector means "any method".
-    pub method: Vec<String>,
+    pub method: Vec<Vec<u8>>,
     /// Cert authority / issuer scope (epics-base PR #563 + #618).
     /// When set, the rule only applies when the client's authenticator
     /// was vouched by one of the listed authorities — e.g. an
     /// X.509 issuer DN, or the cap-token issuer ID. Empty means "any
     /// authority".
-    pub authority: Vec<String>,
+    pub authority: Vec<Vec<u8>>,
     /// Write-trap mask (epics-base `asLib.y:272-283` `rule_log_option`,
     /// `AS_TRAP_WRITE`). `true` when the RULE header carried the
     /// `TRAPWRITE` option, `false` for `NOTRAPWRITE` or no option.
@@ -918,7 +1219,7 @@ pub struct AccessRule {
     /// `RULE(...) { CALC("A=1") }`). `None` means an unconditional
     /// rule. When `Some`, the rule only grants access while the
     /// expression evaluates to 1 against the ASG's `INP*` link values.
-    pub calc: Option<String>,
+    pub calc: Option<Vec<u8>>,
     /// The expression compiled at ACF parse — C compiles a RULE's CALC
     /// once at load (`asAsgRuleCalc` runs `postfix()`), then every
     /// `asComputePvt` evaluates the stored RPN. `parse_acf` upholds
@@ -990,50 +1291,132 @@ pub struct AccessSecurityGroup {
     /// inspection and to feed `CALC` rule evaluation; the link
     /// values are not resolved by this crate (see `AccessRule::calc`).
     pub inp: Vec<AsgInp>,
+    /// What `asCa.c` has delivered for [`Self::inp`] and the rule results
+    /// computed from it. Shared by clones, so a HAG refresh keeps it and only
+    /// a reloaded file starts afresh, as C's `asInit` builds a new `ASG`.
+    state: std::sync::Arc<arc_swap::ArcSwap<AsgState>>,
 }
 
-/// The live state of an ASG's `INP(A..U)` links: the resolved values C keeps
-/// in `pasg->pavalue[]` and the `inpBad` bitmap it keeps alongside them.
-///
-/// C sets a bit per *input* (`asCa.c connectCallback:91-105`, on a channel
-/// that is not connected) and `asComputePvt` (`asLibRoutines.c:1048`) tests it
-/// against the *rule's* own `inpUsed`:
-///
-/// ```c
-/// if(!pasgrule->calc
-/// || (!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)))
-/// ```
-///
-/// so a bad input disables only the rules that read it. Both of this port's
-/// resolvers used to abort their link walk on the first unresolvable link and
-/// hand `None` to the evaluator, which failed EVERY CALC rule in the group —
-/// one typo in an `INPB` no rule mentions took writes away from the whole ASG.
+/// C's per-ASG `asCa` state: `pavalue`, `inpBad`, `inpChanged` and every
+/// rule's `result`. The ASG `INP*` watcher is its only writer, through
+/// `AccessSecurityGroup::deliver`; access checks and the dumps read the
+/// published snapshot and never resolve a link themselves.
 #[derive(Debug, Clone, Default)]
-pub struct AsgInputs {
-    /// Resolved values, indexed A..U.
-    pub values: crate::calc::NumericInputs,
-    /// Bit `i` set ⟹ `INP(i)` is declared but could not be resolved.
-    pub bad: u32,
+pub struct AsgState {
+    /// C `pasg->pavalue`.
+    values: crate::calc::NumericInputs,
+    /// The declared inputs whose last delivery was good — C's `inpBad`
+    /// inverted, so the state before any delivery has every declared input
+    /// bad, as `asCaTask` leaves it (`asCa.c:183`).
+    good: u32,
+    /// C `pasg->inpChanged`, consumed by [`Self::compute`].
+    changed: u32,
+    /// C `pasgrule->result`, by rule index; a rule never computed is FALSE.
+    results: Vec<bool>,
 }
 
-impl AsgInputs {
-    /// Record one declared link's resolution. `None` — no such record, no such
-    /// field, a non-numeric value, a disconnected CA link — sets the input's
-    /// `bad` bit and leaves its value at 0, which is what C holds for a
-    /// channel that never connected.
-    ///
-    /// This is the single owner of "what an unresolvable INP link means";
-    /// every resolver drives it rather than deciding for itself.
-    pub fn record(&mut self, index: u8, value: Option<f64>) {
+/// One `asCa.c` callback for an input.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InpEvent {
+    /// `eventCallback` with a `DBR_STS_DOUBLE`.
+    Reading(InpReading),
+    /// `connectCallback` on a disconnect: the record went away.
+    Disconnected,
+}
+
+impl AsgState {
+    /// `asCa.c eventCallback` (`:146-162`) and `connectCallback` (`:91-105`).
+    fn apply(&mut self, index: u8, event: InpEvent) {
         let idx = index as usize;
         if idx >= crate::calc::CALC_NARGS {
             return;
         }
-        match value {
-            Some(v) => self.values.vars[idx] = v,
-            None => self.bad |= 1u32 << idx,
+        let bit = 1u32 << idx;
+        match event {
+            InpEvent::Reading(r) if r.severity == crate::server::record::AlarmSeverity::Invalid => {
+                self.good &= !bit;
+                self.changed |= bit;
+            }
+            InpEvent::Reading(r) => {
+                self.good |= bit;
+                self.values.vars[idx] = r.value;
+                self.changed |= bit;
+            }
+            InpEvent::Disconnected => self.good &= !bit,
         }
     }
+
+    /// C `asComputeAsgPvt` (`asLibRoutines.c:953-978`): rerun each CALC that
+    /// reads a changed input, with `VAL` its previous result.
+    fn compute(&mut self, rules: &[AccessRule]) {
+        self.results.resize(rules.len(), false);
+        for (rule, result) in rules.iter().zip(self.results.iter_mut()) {
+            if rule.ignore || self.changed & rule.inp_used == 0 {
+                continue;
+            }
+            let Some(compiled) = &rule.calc_compiled else {
+                continue;
+            };
+            let mut args = self.values.clone();
+            args.prev_val = f64::from(u8::from(*result));
+            *result = crate::calc::eval(compiled, &mut args).is_ok_and(calc_result_is_true);
+        }
+        self.changed = 0;
+    }
+
+    /// C `pasg->inpBad` for a group declaring `declared`.
+    fn bad(&self, declared: u32) -> u32 {
+        declared & !self.good
+    }
+
+    /// C `pasg->pavalue[index]`: the last good value delivered, 0 before one.
+    pub fn value(&self, index: u8) -> f64 {
+        self.values.vars.get(index as usize).copied().unwrap_or(0.0)
+    }
+
+    /// C `pasgrule->result` of rule `index`.
+    pub fn result(&self, index: usize) -> bool {
+        self.results.get(index).copied().unwrap_or(false)
+    }
+}
+
+impl AccessSecurityGroup {
+    /// The inputs this group declares, as a bitmap over A..U.
+    fn declared(&self) -> u32 {
+        self.inp
+            .iter()
+            .filter(|inp| (inp.index as usize) < crate::calc::CALC_NARGS)
+            .fold(0, |bits, inp| bits | 1u32 << inp.index)
+    }
+
+    /// The published state.
+    pub fn state(&self) -> std::sync::Arc<AsgState> {
+        self.state.load_full()
+    }
+
+    /// C `pasg->inpBad`: the declared inputs with no good value delivered.
+    pub fn inp_bad(&self) -> u32 {
+        self.state.load().bad(self.declared())
+    }
+
+    /// Apply `events` in order, each followed by `asComputeAsg` as
+    /// `asCa.c:161` runs it, and publish the result once.
+    pub(crate) fn deliver(&self, events: impl IntoIterator<Item = (u8, InpEvent)>) {
+        let mut state = AsgState::clone(&self.state.load());
+        for (index, event) in events {
+            state.apply(index, event);
+            state.compute(&self.rules);
+        }
+        self.state.store(std::sync::Arc::new(state));
+    }
+}
+
+/// One `INP*` link's value with its alarm severity: the `DBR_STS_DOUBLE`
+/// `asCa.c` subscribes for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InpReading {
+    pub value: f64,
+    pub severity: crate::server::record::AlarmSeverity,
 }
 
 /// A single `INP(A..U)` link declaration within an ASG.
@@ -1042,7 +1425,15 @@ pub struct AsgInp {
     /// Letter index: 0 = `A`, .. 20 = `U`.
     pub index: u8,
     /// The link string (typically a record.field PV name).
-    pub link: String,
+    pub link: Vec<u8>,
+}
+
+impl AsgInp {
+    /// The link as a record name. Database names are text, so a link that is
+    /// not UTF-8 names no record and its input is bad, as an unknown name is.
+    pub fn record_link(&self) -> Option<&str> {
+        std::str::from_utf8(&self.link).ok()
+    }
 }
 
 /// Split an ASG `INP*` link into the `(record, field)` it names — C's
@@ -1054,23 +1445,52 @@ pub struct AsgInp {
 /// fires no re-evaluation.
 pub fn inp_link_target(link: &str) -> (&str, &str) {
     let (record, field) = crate::server::database::parse_pv_name(link);
+    // A prefix of `link` cut at an ASCII `.`, so still UTF-8.
+    let record = &link[..record.len()];
     (record, if field.is_empty() { "VAL" } else { field })
+}
+
+/// `inst`'s `field` as a `DBR_STS_DOUBLE`.
+fn inp_reading(inst: &crate::server::record::RecordInstance, field: &str) -> Option<InpReading> {
+    let value = inst.resolve_field(field).and_then(|v| v.to_f64())?;
+    Some(InpReading {
+        value,
+        severity: inst.common.sevr,
+    })
+}
+
+/// `record.field` as a double, for a post whose log holds no value.
+fn read_inp_value(
+    db: &crate::server::database::PvDatabase,
+    record: &str,
+    field: &str,
+) -> Option<f64> {
+    db.get_record(record)?.read().resolve_field(field)?.to_f64()
 }
 
 /// Access Security Configuration parsed from an ACF file.
 #[derive(Debug, Clone)]
 pub struct AccessSecurityConfig {
-    pub uag: HashMap<String, Vec<String>>,
-    pub hag: HashMap<String, Vec<String>>,
+    /// Names and members as the file spells them: C keys and compares every
+    /// ACF token by its bytes (`gphFind`, `strcmp`).
+    pub uag: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    pub hag: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// The HAG members exactly as spelled in the ACF, keyed like `hag`.
     /// `hag` stores `hag_members` resolution *output* (dotted quads
     /// under `asCheckClientIP`), which cannot be re-resolved after a
     /// DNS change; [`Self::with_refreshed_hags`] re-runs the resolution
     /// from these raw spellings (epics-base#863 / UI-107).
-    pub hag_raw: HashMap<String, Vec<String>>,
-    pub asg: HashMap<String, AccessSecurityGroup>,
+    pub hag_raw: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    pub asg: HashMap<Vec<u8>, AccessSecurityGroup>,
     pub unknown_access: AccessLevel,
+    /// This load of the file, kept by clones as each group's state is.
+    load: LoadId,
 }
+
+/// The identity of one parse of an ACF: what C's `asInit` builds afresh with
+/// its `ASG`s and `asCa` channels. Fresh per [`Default`], shared by clones.
+#[derive(Debug, Clone, Default)]
+struct LoadId(std::sync::Arc<()>);
 
 impl AccessSecurityConfig {
     /// Re-run `hag_members` — the single resolution owner — over the
@@ -1085,7 +1505,7 @@ impl AccessSecurityConfig {
     /// refresh) — this is the sibling of the CA-side `refresh_dns`
     /// deviation that closed the client half of that issue.
     pub fn with_refreshed_hags(&self) -> Option<Self> {
-        let refreshed: HashMap<String, Vec<String>> = self
+        let refreshed: HashMap<Vec<u8>, Vec<Vec<u8>>> = self
             .hag_raw
             .iter()
             .map(|(name, raw)| (name.clone(), hag_members(raw)))
@@ -1098,85 +1518,94 @@ impl AccessSecurityConfig {
         Some(new)
     }
 
-    /// Render the parsed ACF (UAG/HAG/ASG with their `INP*` links and
-    /// RULEs) in C `asDumpFP` shape, as a `String`.
-    ///
-    /// This is the single owner of the dump format: the `asdbdump` iocsh
-    /// command and the CA gateway's R3 access-security report both render
-    /// through here, so the two cannot drift. UAG, HAG, and ASG names are
-    /// emitted in sorted order so the dump is stable across `HashMap`
-    /// iteration order.
-    ///
-    /// The verbose member/client listing of C's
-    /// `asDumpFP(fp, NULL, NULL, verbose=TRUE)` is intentionally *not*
-    /// included: this crate models no live AS-member/client registry (see
-    /// the `aspmem` iocsh command, which derives membership by scanning
-    /// records rather than from an `asgMemberList`). The dump therefore
-    /// covers the parsed configuration structures only.
-    pub fn dump_report(&self) -> String {
-        let mut out = String::new();
-        let mut uags: Vec<_> = self.uag.keys().collect();
-        uags.sort();
-        for name in uags {
-            out.push_str(&format!("UAG({name})\n"));
-            for m in &self.uag[name] {
-                out.push('\t');
-                dump_quoted(&mut out, m);
-                out.push('\n');
-            }
-        }
-        let mut hags: Vec<_> = self.hag.keys().collect();
-        hags.sort();
-        for name in hags {
-            out.push_str(&format!("HAG({name})\n"));
-            for h in &self.hag[name] {
-                out.push('\t');
-                dump_quoted(&mut out, h);
-                out.push('\n');
-            }
-        }
-        let mut asgs: Vec<_> = self.asg.keys().collect();
-        asgs.sort();
-        for name in asgs {
-            out.push_str(&format!("ASG({name})\n"));
-            self.fmt_asg(name, &mut out);
-        }
+    /// C `asDumpFP(fp, memcallback, NULL, verbose=TRUE)`, the `asdbdump` and
+    /// CA gateway R3 dump, without its MEMBERLIST: this crate keeps no
+    /// `asgMemberList`. Inputs and CALC results are each group's published
+    /// [`AsgState`], as C prints `pasg`'s. Names come out sorted because C's
+    /// `asUagAdd`/`asHagAdd`/`asAsgAdd` keep each list sorted.
+    pub fn dump_report(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        dump_groups(&mut out, b"UAG", &self.uag);
+        dump_groups(&mut out, b"HAG", &self.hag);
+        self.dump_asgs(None, AsgDump::Verbose, &mut out);
         out
     }
 
-    /// Append one ASG's `INP*` links and RULEs to `out`, in C `asDumpFP`
-    /// shape. Shared by [`Self::dump_report`] and the `asprules` iocsh
-    /// command's per-ASG renderer so the rule format has one owner.
-    pub fn fmt_asg(&self, name: &str, out: &mut String) {
-        let Some(asg) = self.asg.get(name) else {
-            return;
-        };
-        for inp in &asg.inp {
-            let letter = (b'A' + inp.index) as char;
-            out.push_str(&format!("\tINP{letter}(\"{}\")\n", inp.link));
+    /// C `asDumpRulesFP`, the `asprules` dump: every ASG, or only `asgname`.
+    pub fn dump_rules(&self, asgname: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.dump_asgs(asgname, AsgDump::Rules, &mut out);
+        out
+    }
+
+    fn dump_asgs(&self, only: Option<&[u8]>, style: AsgDump, out: &mut Vec<u8>) {
+        if self.asg.is_empty() {
+            out.extend_from_slice(b"No ASGs\n");
         }
-        for rule in &asg.rules {
-            let access = match rule.access {
-                RuleAccess::None => "NONE",
-                RuleAccess::Read => "READ",
-                RuleAccess::Write => "WRITE",
-            };
-            let disabled = if rule.ignore { " [DISABLED]" } else { "" };
-            out.push_str(&format!("\tRULE({},{access}){disabled}\n", rule.level));
-            for u in &rule.uag {
-                out.push_str(&format!("\t\tUAG({u})\n"));
+        let mut names: Vec<_> = self.asg.keys().collect();
+        names.sort();
+        for name in names.into_iter().filter(|n| only.is_none_or(|o| o == *n)) {
+            let asg = &self.asg[name];
+            push_all(out, &[b"ASG(", name, b")"]);
+            let braced = !asg.inp.is_empty() || !asg.rules.is_empty();
+            out.extend_from_slice(if braced { b" {\n" } else { b"\n" });
+            let state = asg.state();
+            let inp_bad = state.bad(asg.declared());
+            for inp in &asg.inp {
+                push_all(out, &[b"\tINP", &[b'A' + inp.index], b"(", &inp.link, b")"]);
+                let bad = inp_bad & (1u32 << inp.index) != 0;
+                out.extend_from_slice(match (bad, style) {
+                    (true, _) => b" INVALID".as_slice(),
+                    (false, AsgDump::Verbose) => b"   VALID",
+                    (false, AsgDump::Rules) => b"",
+                });
+                let value = state.value(inp.index);
+                out.extend_from_slice(format!(" value={}\n", c_percent_f(value)).as_bytes());
             }
-            for h in &rule.hag {
-                out.push_str(&format!("\t\tHAG({h})\n"));
+            for (index, rule) in asg.rules.iter().enumerate().filter(|(_, r)| !r.ignore) {
+                let access = match rule.access {
+                    RuleAccess::None => "NONE",
+                    RuleAccess::Read => "READ",
+                    RuleAccess::Write => "WRITE",
+                };
+                let trap = if rule.trap {
+                    "TRAPWRITE"
+                } else {
+                    "NOTRAPWRITE"
+                };
+                out.extend_from_slice(format!("\tRULE({},{access},{trap})", rule.level).as_bytes());
+                let braced = !rule.uag.is_empty()
+                    || !rule.hag.is_empty()
+                    || rule.calc.is_some()
+                    || !rule.method.is_empty()
+                    || !rule.authority.is_empty();
+                out.extend_from_slice(if braced { b" {\n" } else { b"\n" });
+                for (kw, names) in [(b"UAG", &rule.uag), (b"HAG", &rule.hag)] {
+                    if !names.is_empty() {
+                        push_all(out, &[b"\t\t", kw, b"(", &names.join(&b','), b")\n"]);
+                    }
+                }
+                // Not in C base, which disables a rule naming either keyword.
+                for m in &rule.method {
+                    push_all(out, &[b"\t\tMETHOD(\"", m, b"\")\n"]);
+                }
+                for a in &rule.authority {
+                    push_all(out, &[b"\t\tAUTHORITY(\"", a, b"\")\n"]);
+                }
+                if let Some(calc) = &rule.calc {
+                    let result: &[u8] = if state.result(index) {
+                        b"TRUE"
+                    } else {
+                        b"FALSE"
+                    };
+                    push_all(out, &[b"\t\tCALC(\"", calc, b"\") result=", result, b"\n"]);
+                }
+                if braced {
+                    out.extend_from_slice(b"\t}\n");
+                }
             }
-            for m in &rule.method {
-                out.push_str(&format!("\t\tMETHOD(\"{m}\")\n"));
-            }
-            for a in &rule.authority {
-                out.push_str(&format!("\t\tAUTHORITY(\"{a}\")\n"));
-            }
-            if let Some(calc) = &rule.calc {
-                out.push_str(&format!("\t\tCALC(\"{calc}\")\n"));
+            if braced {
+                out.extend_from_slice(b"}\n");
             }
         }
     }
@@ -1188,7 +1617,12 @@ impl AccessSecurityConfig {
     /// rules typically declared at level 0/1. New code should call
     /// [`Self::check_access_asl`] so a per-record ASL can correctly
     /// disable a rule whose level is below the record's ASL.
-    pub fn check_access(&self, asg_name: &str, host: &str, user: &str) -> AccessLevel {
+    pub fn check_access(
+        &self,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
+    ) -> AccessLevel {
         self.check_access_asl(asg_name, host, user, 0)
     }
 
@@ -1200,9 +1634,9 @@ impl AccessSecurityConfig {
     /// (legacy behaviour preserved).
     pub fn check_access_method(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
         method: &str,
         authority: &str,
@@ -1228,38 +1662,37 @@ impl AccessSecurityConfig {
     /// matching rule carried `NOTRAPWRITE`, and when it carried no
     /// trap option at all.
     /// Resolve `asg_name` (falling back to `DEFAULT`) and evaluate its
-    /// rules with the given `roles` and the ASG's resolved `INP*` values.
-    /// The single entry every CALC-aware caller uses — the CA server and
-    /// [`AccessGate::check_with_roles`] alike.
+    /// rules with the given `roles`.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_for_name(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
-        roles: &[String],
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
+        roles: &[crate::types::PvString],
         record_asl: u8,
         method: &str,
         authority: &str,
-        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
-        let asg = match self.asg.get(asg_name) {
-            Some(a) => a,
-            None => match self.asg.get("DEFAULT") {
-                Some(a) => a,
-                None => return (AccessLevel::NoAccess, false),
-            },
+        let Some(asg) = self.asg_or_default(asg_name.as_ref()) else {
+            return (AccessLevel::NoAccess, false);
         };
         self.compute_rules(
-            asg, host, user, roles, record_asl, method, authority, inputs,
+            asg,
+            host.as_ref(),
+            user.as_ref(),
+            roles,
+            record_asl,
+            method,
+            authority,
         )
     }
 
     pub fn check_access_method_trap(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
         method: &str,
         authority: &str,
@@ -1272,19 +1705,14 @@ impl AccessSecurityConfig {
         // that by always inserting an (empty) `DEFAULT`. A missing
         // `DEFAULT` here would mean the config was built by hand
         // bypassing `parse_acf`; fail CLOSED rather than open.
-        let asg = match self.asg.get(asg_name) {
-            Some(a) => a,
-            None => match self.asg.get("DEFAULT") {
-                Some(a) => a,
-                // Never grant ReadWrite on an ASG-lookup
-                // miss. C resolves every miss to the always-present
-                // empty `DEFAULT` ⇒ `asNOACCESS`.
-                None => return (AccessLevel::NoAccess, false),
-            },
+        // Never grant ReadWrite on an ASG-lookup miss. C resolves every miss
+        // to the always-present empty `DEFAULT` ⇒ `asNOACCESS`.
+        let Some(asg) = self.asg_or_default(asg_name.as_ref()) else {
+            return (AccessLevel::NoAccess, false);
         };
         // C `asComputePvt` (asLibRoutines.c:983) initialises
         // `access = asNOACCESS` and only ever *raises* it on a matching
-        // RULE. An ASG with no RULE statements (`ASG(LOCKED) { }`)
+        // RULE. An ASG with no RULE statements (`ASG(LOCKED)`)
         // therefore denies every client. Never short-circuit
         // an empty rule list to ReadWrite.
         //
@@ -1299,40 +1727,39 @@ impl AccessSecurityConfig {
         // matching rule's `trapMask` only on the lines that also raise
         // `access` (`asLibRoutines.c:986`, `:1042`). A `NoAccess`
         // outcome therefore always carries `trap = false`.
-        // No INP* resolution on this sync path, so a CALC-gated rule has no
-        // values to evaluate against and fails CLOSED — see `compute_rules`.
-        self.compute_rules(asg, host, user, &[], record_asl, method, authority, None)
+        self.compute_rules(
+            asg,
+            host.as_ref(),
+            user.as_ref(),
+            &[],
+            record_asl,
+            method,
+            authority,
+        )
     }
 
     /// The single rule-matching loop — C `asComputePvt`
     /// (`asLibRoutines.c:992-1062`) — parameterised by the client's `roles`
-    /// (for `role/<name>` UAG members, QSRV `documentation/ioc.rst:181-188`)
-    /// and by the ASG's resolved `INP*` values.
-    ///
-    /// CALC evaluation lives HERE and nowhere else. C has one owner too:
-    /// `asComputeAsgPvt` (`asLibRoutines.c:953-990`) computes
-    /// `pasgrule->result` and `asComputePvt` (`:1048`) consumes it. The port
-    /// used to take a `calc_ok` closure instead, which every caller wrote for
-    /// itself — and both callers wrote the same wrong truth test.
-    ///
-    /// `inputs` is `None` on the sync path
-    /// ([`Self::check_access_method_trap`]), which resolves no links; a
-    /// CALC-gated rule then fails CLOSED.
+    /// (for `role/<name>` UAG members, QSRV `documentation/ioc.rst:181-188`).
+    /// A CALC-gated rule reads the result the `INP*` watcher published
+    /// ([`AsgState`]); C's `asComputePvt` (`:1048`) likewise only consumes the
+    /// `pasgrule->result` that `asComputeAsgPvt` stored.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_rules(
         &self,
         asg: &AccessSecurityGroup,
-        host: &str,
-        user: &str,
-        roles: &[String],
+        host: &[u8],
+        user: &[u8],
+        roles: &[crate::types::PvString],
         record_asl: u8,
         method: &str,
         authority: &str,
-        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
-        for rule in &asg.rules {
+        let state = asg.state.load();
+        let bad = state.bad(asg.declared());
+        for (index, rule) in asg.rules.iter().enumerate() {
             // C `asComputePvt`: a rule disabled by `asAsgRuleDisable`
             // (unsupported keyword) is skipped. A CALC clause no longer
             // forces `ignore`; it is gated by `calc_ok` below.
@@ -1348,7 +1775,7 @@ impl AccessSecurityConfig {
             if rule_rank(rule_access(rule)) <= rule_rank(access) {
                 continue;
             }
-            if record_asl > rule.level {
+            if i32::from(record_asl) > rule.level {
                 continue;
             }
             // UAG: only consulted when the rule scopes one. An empty
@@ -1369,10 +1796,10 @@ impl AccessSecurityConfig {
                                 // strings and passes them as `user`), OR
                                 // a `role/<name>` member matches when the
                                 // client's `roles` slice carries that role.
-                                m == user
+                                m.as_slice() == user
                                     || matches!(
-                                        m.strip_prefix("role/"),
-                                        Some(role) if roles.iter().any(|r| r == role)
+                                        m.strip_prefix(b"role/"),
+                                        Some(role) if roles.iter().any(|r| r.as_bytes() == role)
                                     )
                             })
                         })
@@ -1384,19 +1811,21 @@ impl AccessSecurityConfig {
             // HAG: host comparison is case-insensitive. C stores
             // every HAG host lowercased (`asHagAddHost`) and lowercases
             // the connecting client's host before `asComputePvt`.
-            let host_lc = host.to_ascii_lowercase();
             let host_match = rule.hag.is_empty()
                 || rule.hag.iter().any(|g| {
                     self.hag
                         .get(g)
-                        .map(|members| members.iter().any(|m| m.eq_ignore_ascii_case(&host_lc)))
+                        .map(|members| members.iter().any(|m| m.eq_ignore_ascii_case(host)))
                         .unwrap_or(false)
                 });
             if !host_match {
                 continue;
             }
             let method_match = rule.method.is_empty()
-                || rule.method.iter().any(|m| m.eq_ignore_ascii_case(method));
+                || rule
+                    .method
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(method.as_bytes()));
             if !method_match {
                 continue;
             }
@@ -1404,32 +1833,16 @@ impl AccessSecurityConfig {
                 || rule
                     .authority
                     .iter()
-                    .any(|a| a.eq_ignore_ascii_case(authority));
+                    .any(|a| a.eq_ignore_ascii_case(authority.as_bytes()));
             if !authority_match {
                 continue;
             }
-            // A CALC-gated rule grants only while its expression evaluates
-            // true against the resolved INP* link values. The program was
-            // compiled once at ACF parse; a rule holding `calc` text with no
-            // compiled form (hand-built, bypassing `parse_acf`) fails closed
-            // here, as does one with no resolved inputs at all.
-            if rule.calc.is_some() {
-                let Some(compiled) = rule.calc_compiled.as_ref() else {
-                    continue;
-                };
-                let Some(inputs) = inputs else {
-                    continue;
-                };
-                // C `asLibRoutines.c:1048`: `!(pasg->inpBad & pasgrule->inpUsed)`.
-                // A bad input the rule READS disables it; a bad input elsewhere
-                // in the group is none of this rule's business.
-                if inputs.bad & rule.inp_used != 0 {
-                    continue;
-                }
-                match crate::calc::eval(compiled, &mut inputs.values.clone()) {
-                    Ok(result) if calc_result_is_true(result) => {}
-                    _ => continue,
-                }
+            // C `asLibRoutines.c:1048`:
+            // `!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)`.
+            // A bad input the rule READS disables it; a bad input elsewhere
+            // in the group is none of this rule's business.
+            if rule.calc.is_some() && (bad & rule.inp_used != 0 || !state.result(index)) {
+                continue;
             }
             // C `asLibRoutines.c:1041-1042`: a matching rule sets
             // both `access` and `trapMask` together. The trap mask of
@@ -1441,42 +1854,12 @@ impl AccessSecurityConfig {
         (access, trap)
     }
 
-    /// Walk `asg_name`'s declared `INP(A..U)` links (falling back to
-    /// `DEFAULT`, as every other lookup here does) and resolve each with
-    /// `resolve`, returning C's per-ASG input state. This is `asCa.c`'s job
-    /// done on demand: the port has no standing CA monitor per link, so the
-    /// values are read when the rules are evaluated.
-    ///
-    /// An unknown ASG with no `DEFAULT` yields empty inputs — no links, so no
-    /// bad bits, and a CALC rule then evaluates against zeros exactly as C
-    /// does for an ASG that declares none.
-    pub fn resolve_asg_inputs(
-        &self,
-        asg_name: &str,
-        resolve: &dyn Fn(&str) -> Option<f64>,
-    ) -> AsgInputs {
-        let mut inputs = AsgInputs::default();
-        let Some(group) = self.asg.get(asg_name).or_else(|| self.asg.get("DEFAULT")) else {
-            return inputs;
-        };
-        for inp in &group.inp {
-            inputs.record(inp.index, resolve(&inp.link));
-        }
-        inputs
-    }
-
-    /// Every distinct `(record, field)` an `INP*` link in this policy names,
-    /// across all ASGs — the set a re-evaluation trigger must watch. C builds
-    /// the same set one CA channel at a time in `asCaStart`.
-    pub fn inp_link_targets(&self) -> Vec<(String, String)> {
-        let mut targets = std::collections::BTreeSet::new();
-        for group in self.asg.values() {
-            for inp in &group.inp {
-                let (record, field) = inp_link_target(&inp.link);
-                targets.insert((record.to_string(), field.to_string()));
-            }
-        }
-        targets.into_iter().collect()
+    /// `asg_name`'s group, or `DEFAULT` for a name the file does not declare
+    /// (C `asAddMemberPvt`).
+    fn asg_or_default(&self, asg_name: &[u8]) -> Option<&AccessSecurityGroup> {
+        self.asg
+            .get(asg_name)
+            .or_else(|| self.asg.get(b"DEFAULT".as_slice()))
     }
 
     /// Check access taking the per-record ASL into account.
@@ -1489,9 +1872,9 @@ impl AccessSecurityConfig {
     /// is silently equivalent to ASL 0.
     pub fn check_access_asl(
         &self,
-        asg_name: &str,
-        host: &str,
-        user: &str,
+        asg_name: impl AsRef<[u8]>,
+        host: impl AsRef<[u8]>,
+        user: impl AsRef<[u8]>,
         record_asl: u8,
     ) -> AccessLevel {
         // Forward to the method-aware path with default scopes
@@ -1547,9 +1930,11 @@ pub enum TrapWriteOp {
 #[derive(Debug, Clone, Copy)]
 pub struct TrapWriteMessage<'a> {
     pub op: TrapWriteOp,
-    pub pv_name: &'a str,
-    pub user: &'a str,
-    pub host: &'a str,
+    /// C `asTrapWriteMessage::serverSpecific` channel name: bytes, never decoded.
+    pub pv_name: &'a [u8],
+    /// C `asTrapWriteMessage::userid`: the client's bytes, never decoded.
+    pub user: &'a [u8],
+    pub host: &'a [u8],
     pub peer: &'a str,
     /// Pre-rendered value string. Empty when the listener subsystem
     /// is being notified at audit-off cost (caller may pass `""` to
@@ -1693,7 +2078,7 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
             };
             tracing::error!(
                 target: "epics_base_rs::server::access_security",
-                pv = msg.pv_name,
+                pv = %String::from_utf8_lossy(msg.pv_name),
                 event_id = msg.event_id,
                 op = ?msg.op,
                 panic = %descr,
@@ -1713,9 +2098,9 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
 /// `.await` points until the put really finishes, is superseded, or the
 /// connection tears down.
 pub struct TrapWriteFields {
-    pub pv_name: String,
-    pub user: String,
-    pub host: String,
+    pub pv_name: Vec<u8>,
+    pub user: Vec<u8>,
+    pub host: Vec<u8>,
     pub peer: String,
     pub value_str: String,
     pub dbr_type: u16,
@@ -1831,9 +2216,9 @@ impl Drop for TrapWriteGuard {
 pub struct TrapWriteMeta<'a> {
     /// The channel (`record.FIELD`) being written — pvxs passes
     /// `dbChannelName(pChan)`.
-    pub pv_name: &'a str,
-    /// Authenticated account name (pvxs `cred->account`).
-    pub user: &'a str,
+    pub pv_name: &'a [u8],
+    /// Authenticated account name (pvxs `cred->account`), as bytes.
+    pub user: &'a [u8],
     /// Client host (pvxs `cred->host`).
     pub host: &'a str,
     /// Client peer ("ip:port") when the caller has the socket address;
@@ -1926,9 +2311,9 @@ where
 
 fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> TrapWriteFields {
     TrapWriteFields {
-        pv_name: meta.pv_name.to_string(),
-        user: meta.user.to_string(),
-        host: meta.host.to_string(),
+        pv_name: meta.pv_name.to_vec(),
+        user: meta.user.to_vec(),
+        host: meta.host.as_bytes().to_vec(),
         peer: meta.peer.to_string(),
         value_str: value.display_truncated(64),
         dbr_type: meta.dbr_type,
@@ -1946,7 +2331,7 @@ fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> Tr
 /// callback; `dbPut record.ASG NEW_ASG` invokes `asChangeGroup` →
 /// `asAddMemberPvt` → `asComputePvt` for every `ASGCLIENT` and
 /// fires the COAR callback for each affected CA connection. Pre-fix
-/// Rust mutated `instance.common.asg` directly with no notification
+/// Rust mutated `instance.common.text.asg` directly with no notification
 /// — the *next* CA op used live `compute_access` so enforcement was
 /// correct, but the wire ACCESS_RIGHTS the client saw still
 /// reflected the OLD ASG until something else (CLIENT_NAME / ACF
@@ -2006,16 +2391,49 @@ pub fn subscribe_asg_changes() -> tokio::sync::broadcast::Receiver<()> {
     asg_change_broadcast().subscribe()
 }
 
-/// Parse an ACF (Access Control File).
-/// C `asDumpQuoted` (asLibRoutines.c:660-666, epics-base #871): print a
-/// UAG/HAG member as `"` + `epicsStrPrintEscaped` + `"`. C passes
-/// `strlen(s)`, so the escape never runs past a NUL byte.
-fn dump_quoted(out: &mut String, s: &str) {
-    let bytes = s.as_bytes();
-    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    out.push('"');
-    out.push_str(&crate::runtime::epics_string::print_escaped(&bytes[..len]));
-    out.push('"');
+/// Which of C's two ASG dumps: `asDumpFP` verbose pads a good input with
+/// `   VALID`, `asDumpRulesFP` prints nothing for it.
+#[derive(Clone, Copy)]
+enum AsgDump {
+    Verbose,
+    Rules,
+}
+
+/// `asDumpFP`'s UAG or HAG list: `NAME(g) {a,b}`, members raw, or `No UAGs`.
+fn dump_groups(out: &mut Vec<u8>, kind: &[u8], groups: &HashMap<Vec<u8>, Vec<Vec<u8>>>) {
+    if groups.is_empty() {
+        push_all(out, &[b"No ", kind, b"s\n"]);
+    }
+    let mut names: Vec<_> = groups.keys().collect();
+    names.sort();
+    for name in names {
+        push_all(out, &[kind, b"(", name, b")"]);
+        let members = &groups[name];
+        if members.is_empty() {
+            out.push(b'\n');
+        } else {
+            push_all(out, &[b" {", &members.join(&b','), b"}\n"]);
+        }
+    }
+}
+
+/// glibc `%f`.
+fn c_percent_f(v: f64) -> String {
+    let sign = if v.is_sign_negative() { "-" } else { "" };
+    if v.is_nan() {
+        format!("{sign}nan")
+    } else if v.is_infinite() {
+        format!("{sign}inf")
+    } else {
+        format!("{v:.6}")
+    }
+}
+
+/// C `asDumpFP` prints names, links and CALC with `%s`: the bytes as stored.
+fn push_all(out: &mut Vec<u8>, parts: &[&[u8]]) {
+    for p in parts {
+        out.extend_from_slice(p);
+    }
 }
 
 /// The ACF reader, and the single owner of the line counter every rejection
@@ -2029,17 +2447,18 @@ fn dump_quoted(out: &mut String, s: &str) {
 /// sentences and simply says where they happened, because an ACF that fails
 /// on line 240 of 900 is otherwise unlocatable.
 struct AcfScanner<'a> {
-    src: &'a str,
+    /// C lexes bytes: a quoted string takes any byte but `"`, `\n` and `\`.
+    src: &'a [u8],
     /// Byte offset of the next character. The text stays addressable behind
     /// the cursor so a diagnostic can quote what the operator wrote without
-    /// consuming it — see [`Self::offending`].
+    /// consuming it.
     pos: usize,
     /// 1-based, counting every `\n` consumed.
     line: u32,
 }
 
 impl<'a> AcfScanner<'a> {
-    fn new(content: &'a str) -> Self {
+    fn new(content: &'a [u8]) -> Self {
         Self {
             src: content,
             pos: 0,
@@ -2047,58 +2466,51 @@ impl<'a> AcfScanner<'a> {
         }
     }
 
-    fn peek(&mut self) -> Option<char> {
-        self.src[self.pos..].chars().next()
+    fn peek(&mut self) -> Option<u8> {
+        self.src.get(self.pos).copied()
     }
 
     /// The one place the input advances, so the one place `line` moves.
-    fn next(&mut self) -> Option<char> {
-        let c = self.src[self.pos..].chars().next()?;
-        self.pos += c.len_utf8();
-        if c == '\n' {
+    fn next(&mut self) -> Option<u8> {
+        let c = *self.src.get(self.pos)?;
+        self.pos += 1;
+        if c == b'\n' {
             self.line += 1;
         }
         Some(c)
     }
 
-    /// Quote the token the operator actually typed, for a diagnostic that
-    /// says `got '…'`.
-    ///
-    /// A "consume while it matches" loop stops BEFORE the character that
-    /// broke it, so its buffer holds only what was ACCEPTED — on
-    /// `RULE(abc, READ)` the digit loop accepts nothing and the buffer is
-    /// empty, and quoting it reports `got ''`, a token that is nowhere in
-    /// the file. `accepted` is that buffer; the rest is read forward from
-    /// the cursor to the next delimiter, without consuming, so the same call
-    /// is right whether the caller is about to unwind or to carry on.
-    ///
-    /// Capped so a file with a megabyte-long run cannot put a megabyte on
-    /// the operator's console.
-    fn offending(&self, accepted: &str) -> String {
-        const CAP: usize = 32;
-        let rest: String = self.src[self.pos..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && !matches!(c, '(' | ')' | '{' | '}' | ',' | '#'))
-            .collect();
-        let token: String = accepted.chars().chain(rest.chars()).collect();
-        if token.chars().count() > CAP {
-            let head: String = token.chars().take(CAP).collect();
-            format!("{head}…")
-        } else {
-            token
+    /// The body of a quoted token, its opening `"` already consumed:
+    /// asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`, which
+    /// C stores from `yytext+1` with every `\x` pair verbatim. A newline or
+    /// EOF before the closing quote is C's "Newline in quoted string" error.
+    fn quoted(&mut self) -> CaResult<Vec<u8>> {
+        let opened = self.line;
+        let mut body = Vec::new();
+        loop {
+            match self.next() {
+                Some(b'"') => return Ok(body),
+                Some(b'\\') => match self.next() {
+                    Some(c) if c != b'\n' => body.extend([b'\\', c]),
+                    _ => break,
+                },
+                Some(b'\n') | None => break,
+                Some(c) => body.push(c),
+            }
         }
+        Err(self.reject_at(opened, "unterminated quoted string"))
     }
 
     /// Whitespace and `#` comments are not tokens; a comment runs to the end
     /// of its line and the newline that ends it still counts.
     fn skip_ws_comments(&mut self) {
         while let Some(c) = self.peek() {
-            if c.is_whitespace() {
+            if is_acf_space(c) {
                 self.next();
-            } else if c == '#' {
+            } else if c == b'#' {
                 while let Some(c) = self.peek() {
                     self.next();
-                    if c == '\n' {
+                    if c == b'\n' {
                         break;
                     }
                 }
@@ -2131,15 +2543,97 @@ impl<'a> AcfScanner<'a> {
     fn reject_at(&self, line: u32, what: impl std::fmt::Display) -> CaError {
         CaError::Protocol(format!("ACF line {line}: {what}"))
     }
+
+    /// asLib_lex.l's catch-all `.` rule over the whole file. C's lexer
+    /// refuses a byte that starts no token wherever it stands, so the
+    /// refusal runs before the parser and cannot depend on which construct
+    /// the parser happens to be in. Quoted strings and comments are skipped
+    /// as the lexer takes them; their own errors stay with the parser.
+    fn check_tokens(src: &'a [u8]) -> CaResult<()> {
+        let mut sc = Self::new(src);
+        while let Some(c) = sc.next() {
+            match c {
+                b'"' => {
+                    while let Some(c) = sc.peek() {
+                        if c == b'\n' {
+                            break;
+                        }
+                        sc.next();
+                        if c == b'"' {
+                            break;
+                        }
+                        if c == b'\\' && sc.peek().is_some_and(|c| c != b'\n') {
+                            sc.next();
+                        }
+                    }
+                }
+                b'#' => {
+                    while sc.peek().is_some_and(|c| c != b'\n') {
+                        sc.next();
+                    }
+                }
+                b'(' | b')' | b'{' | b'}' | b',' => {}
+                c if is_acf_space(c) || is_acf_name_char(c) => {}
+                c => return Err(sc.reject(invalid_character(c))),
+            }
+        }
+        Ok(())
+    }
 }
 
-pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
+/// asLib_lex.l `whitespace [ \t\r]` plus `newline`; form feed and vertical
+/// tab are not whitespace to C.
+fn is_acf_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`.
+fn is_acf_name_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'_' | b'.' | b'-' | b'+' | b':' | b'[' | b']' | b'<' | b'>' | b';'
+        )
+}
+
+/// asLib_lex.l's `.` rule message. e_flex's 8-bit `yytext` is `unsigned
+/// char *`, so a high byte prints as `0xff`, not a sign-extended
+/// `0xffffffff` (ascheck agrees).
+fn invalid_character(c: u8) -> String {
+    if c.is_ascii_graphic() || c == b' ' {
+        format!("Invalid character '{}'", c as char)
+    } else {
+        format!("Invalid character 0x{c:02x}")
+    }
+}
+
+/// The threads access security blocks on: an ACF file read, and the host
+/// lookups a HAG parse or refresh makes. Not a callback band, because the
+/// INP watcher shares cbMedium and C does this work on the iocsh thread.
+pub static AS_OFFLOAD: crate::runtime::offload::OffloadPool =
+    crate::runtime::offload::OffloadPool::new(
+        "asOffload",
+        crate::runtime::task::ThreadPriority::Low,
+    );
+
+/// [`parse_acf`] of a file, for async callers, on [`AS_OFFLOAD`]: the read can
+/// stall on a slow mount and a HAG parse resolves its hosts.
+pub async fn read_acf(path: impl AsRef<std::path::Path>) -> CaResult<AccessSecurityConfig> {
+    let path = path.as_ref().to_path_buf();
+    AS_OFFLOAD
+        .run(move || parse_acf(std::fs::read(path).map_err(CaError::Io)?))
+        .map_err(CaError::Io)?
+        .await
+}
+
+pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
         hag: HashMap::new(),
         hag_raw: HashMap::new(),
         asg: HashMap::new(),
         unknown_access: AccessLevel::Read,
+        load: LoadId::default(),
     };
 
     // C `asInitialize` (asLibRoutines.c:107) calls `asAsgAdd(DEFAULT)`
@@ -2147,181 +2641,104 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     // Synthesise it here unconditionally: any record whose
     // `ASG` field names an unknown group resolves to this empty
     // `DEFAULT`, which has no RULEs ⇒ `asNOACCESS` ⇒ access denied.
-    // A `DEFAULT` block declared in the file simply overwrites this
-    // placeholder below.
+    // A `DEFAULT` block in the file takes this placeholder over while it is
+    // still empty, as `asAsgAdd` returns it.
     config
         .asg
-        .insert("DEFAULT".to_string(), AccessSecurityGroup::default());
+        .insert(b"DEFAULT".to_vec(), AccessSecurityGroup::default());
 
-    let mut sc = AcfScanner::new(content);
-    let mut buf = String::new();
+    AcfScanner::check_tokens(content.as_ref())?;
+    let mut sc = AcfScanner::new(content.as_ref());
+    let mut current: CurrentRule = None;
 
-    while sc.peek().is_some() {
+    loop {
         sc.skip_ws_comments();
-        buf.clear();
-        read_word(&mut sc, &mut buf);
-
-        match buf.as_str() {
-            "UAG" => {
+        let at = sc.line;
+        let keyword = match read_token(&mut sc)? {
+            Some(Token::Keyword(k)) => k,
+            Some(Token::Name(k) | Token::Quoted(k)) => {
+                skip_generic_item(&mut sc, at, &k)?;
+                continue;
+            }
+            Some(Token::Number(n)) => return Err(number_error(&sc, &n)),
+            // An empty or comment-only file is the deliberate divergence
+            // from C kept by `empty_acf_denies_all_access`.
+            None => match sc.peek() {
+                Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
+                None => break,
+            },
+        };
+        match keyword.as_slice() {
+            b"UAG" => {
                 let name = read_paren_name(&mut sc)?;
-                let members = read_brace_list(&mut sc)?;
+                if config.uag.contains_key(&name) {
+                    return Err(duplicate(&sc, at, "User Access Group", &name));
+                }
+                let members = read_optional_brace_list(&mut sc)?;
                 config.uag.insert(name, members);
             }
-            "HAG" => {
+            b"HAG" => {
                 let name = read_paren_name(&mut sc)?;
-                let members = read_brace_list(&mut sc)?;
+                if config.hag.contains_key(&name) {
+                    return Err(duplicate(&sc, at, "Host Access Group", &name));
+                }
+                let members = read_optional_brace_list(&mut sc)?;
                 // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
                 // time and stores names or resolved IPs accordingly.
                 config.hag.insert(name.clone(), hag_members(&members));
                 config.hag_raw.insert(name, members);
             }
-            "ASG" => {
+            b"ASG" => {
                 let name = read_paren_name(&mut sc)?;
-                let asg = parse_asg_body(&mut sc)?;
-                config.asg.insert(name, asg);
-            }
-            "" => {
-                // `read_word` only consumes `[A-Za-z0-9_]`, and
-                // `skip_ws_comments` already ran above. So an empty
-                // word means one of two things:
-                //
-                //   * genuine EOF / whitespace-only / comment-only
-                //     input — `sc.peek()` is `None` ⇒ break, `Ok`
-                //     (the pre-existing, deliberate empty-file
-                //     divergence from C; see `empty_acf_denies_all_access`);
-                //   * a stray top-level punctuation token where a
-                //     block keyword is expected (`(`, `)`, `{`, `}`,
-                //     `,`) — C's grammar has no production starting
-                //     with bare punctuation at top level ⇒ `yyerror`.
-                //     A file of only `(((` or only `}` is genuine
-                //     garbage and must fail closed.
-                match sc.peek() {
-                    Some(c) if matches!(c, '(' | ')' | '{' | '}' | ',') => {
-                        return Err(sc.reject(format!(
-                            "unexpected '{c}' where a top-level block keyword is expected"
-                        )));
-                    }
-                    // EOF, or any other stray character — preserve the
-                    // pre-existing break-and-`Ok` behaviour; only the
-                    // stray block-punctuation case is in scope here.
-                    _ => break,
+                let taken = |g: &AccessSecurityGroup| {
+                    name != b"DEFAULT" || !g.rules.is_empty() || !g.inp.is_empty()
+                };
+                if config.asg.get(&name).is_some_and(taken) {
+                    return Err(duplicate(&sc, at, "Access Security Group", &name));
+                }
+                // `asAsgAdd` makes the group, or hands back the empty DEFAULT,
+                // before the body is read; a bare head leaves it empty.
+                config.asg.entry(name.clone()).or_default();
+                sc.skip_ws_comments();
+                if sc.peek() == Some(b'{') {
+                    parse_asg_body(&mut sc, &mut config, &name, &mut current)?;
                 }
             }
-            other => {
-                // C `asLib.y:88-103` (`generic_item`) treats an
-                // unrecognised top-level *block* as a *warning*
-                // (`yywarn "Ignoring unsupported TOP LEVEL block"`) and
-                // parsing continues — forward-compat with future/vendor
-                // ACF extensions.
-                //
-                // The leniency is bounded by the grammar: every
-                // `generic_item` alternative is `tokenSTRING
-                // generic_head [...]`, and `generic_head`
-                // (asLib.y:105-108) is `'(' ... ')'` — a *mandatory*
-                // balanced parenthesised head. There is no
-                // `generic_item: tokenSTRING` alone. So C only warns
-                // when the unknown keyword is immediately followed by
-                // `(`; a bare keyword (followed by another word, or at
-                // EOF) matches no rule ⇒ `yyerror` ⇒ `asInitialize`
-                // fails. `skip_unknown_top_level_block` enforces exactly
-                // that: it returns `Err` for genuine garbage and `Ok`
-                // (after warning) for a well-formed unknown block.
-                skip_unknown_top_level_block(other, &mut sc)?;
-            }
+            // The other lexer keywords cannot start a `generic_item`.
+            k => return Err(sc.reject_at(at, format!("syntax error at '{}'", shown(k)))),
         }
     }
 
     Ok(config)
 }
 
-/// Skip an unrecognised top-level block: a *mandatory* `(...)` head and
-/// an optional `{...}` body. Mirrors C `asLib.y` `generic_item`
-/// (asLib.y:88-103) + `generic_head` (asLib.y:105-108) — the only
-/// recover-and-continue posture C allows for an unknown keyword.
-///
-/// C's grammar makes the parenthesised head mandatory: every
-/// `generic_item` alternative is `tokenSTRING generic_head [...]`, and
-/// `generic_head` is `'(' ')'` | `'(' generic_element ')'` |
-/// `'(' generic_list ')'`. So:
-///
-/// * unknown keyword **followed by `(`** with a balanced head ⇒ warn
-///   and continue (`yywarn "Ignoring unsupported TOP LEVEL block"`);
-/// * unknown keyword **not** followed by `(` (another bare word, or
-///   EOF) ⇒ no grammar rule matches ⇒ C `yyerror` ⇒ `asInitialize`
-///   fails. Return `Err`;
-/// * unbalanced parens/braces (depth never returns to 0 before EOF) ⇒
-///   the C lexer/parser raises `yyerror` ⇒ return `Err`.
-fn skip_unknown_top_level_block(keyword: &str, sc: &mut AcfScanner) -> CaResult<()> {
-    // Every complaint below names `keyword`, so every one of them belongs to
-    // the line the keyword is on — not to wherever the scan ran out.
-    let at = sc.line;
+/// `asUagAdd` / `asHagAdd` / `asAsgAdd` refusing a name already defined.
+fn duplicate(sc: &AcfScanner, at: u32, kind: &str, name: &[u8]) -> CaError {
+    sc.reject_at(at, format!("Duplicate {kind} named '{}'", shown(name)))
+}
+
+/// asLib.y `generic_item`: a `generic_head`, then a `generic_block`, or a
+/// one-element block followed by a `{ generic_list }` (the nested form).
+/// C warns and parses on; anything else is `yyerror`.
+fn skip_generic_item(sc: &mut AcfScanner, at: u32, keyword: &[u8]) -> CaResult<()> {
     sc.skip_ws_comments();
-    // C `generic_head` requires a `(` here. A bare keyword with another
-    // word or EOF after it matches no production ⇒ hard parse error.
-    if sc.peek() != Some('(') {
-        return Err(sc.reject_at(
-            at,
-            format!(
-                "unexpected token '{keyword}' — expected a top-level \
-                 UAG/HAG/ASG block or an unknown keyword followed by '('"
-            ),
-        ));
+    if sc.peek() != Some(b'(') {
+        let e = format!("expected '(' after '{}'", shown(keyword));
+        return Err(sc.reject_at(at, e));
     }
-    // Consume the balanced `(...)` head. Unbalanced ⇒ error.
-    let mut depth = 0;
-    let mut closed = false;
-    while let Some(c) = sc.peek() {
-        sc.next();
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    closed = true;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if !closed {
-        return Err(sc.reject_at(
-            at,
-            format!("unbalanced '(' in unsupported top-level block '{keyword}'"),
-        ));
-    }
+    read_token_list(sc, b'(', b')', ListKind::Generic)?;
     sc.skip_ws_comments();
-    // The `{...}` body is optional (the `tokenSTRING generic_head` bare
-    // form). If present it must be balanced.
-    if sc.peek() == Some('{') {
-        let mut depth = 0;
-        let mut closed = false;
-        while let Some(c) = sc.peek() {
-            sc.next();
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        closed = true;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !closed {
-            return Err(sc.reject_at(
-                at,
-                format!("unbalanced '{{' in unsupported top-level block '{keyword}'"),
-            ));
+    if sc.peek() == Some(b'{') && skip_generic_block(sc)? {
+        sc.skip_ws_comments();
+        if sc.peek() == Some(b'{') && read_token_list(sc, b'{', b'}', ListKind::Generic)?.len() < 2
+        {
+            return Err(sc.reject("syntax error at '}'"));
         }
     }
-    // Well-formed unknown block: warn and continue.
     tracing::warn!(
         target: "epics_base_rs::access_security",
         line = at,
-        keyword = %keyword,
+        keyword = %String::from_utf8_lossy(keyword),
         "ACF: ignoring unsupported top-level block"
     );
     Ok(())
@@ -2378,242 +2795,337 @@ pub fn set_as_check_client_ip(on: bool) {
 /// The two halves are read from the same flag on purpose: a mixed
 /// configuration (names on one side, IPs on the other) matches nothing,
 /// which is precisely the R7-16 defect.
-fn hag_members(members: &[String]) -> Vec<String> {
+fn hag_members(members: &[Vec<u8>]) -> Vec<Vec<u8>> {
     if !as_check_client_ip() {
+        // C `tolower` in the C locale moves only ASCII letters.
         return members.iter().map(|m| m.to_ascii_lowercase()).collect();
     }
 
-    use std::net::ToSocketAddrs;
+    let unresolved = |m: &[u8]| [b"unresolved:".as_slice(), m].concat();
     members
         .iter()
-        .map(|m| match format!("{m}:0").to_socket_addrs() {
-            // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
-            // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
-            // quad. Taking `iter.next()` blindly would store an IPv6 address on a
-            // dual-stack host that resolves `::1` first (e.g. `localhost` on many
-            // CI runners) — an entry no IPv4 CA peer could ever match. A host with
-            // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
-            // C does when `aToIPAddr` yields nothing.
-            Ok(iter) => match iter.filter(|sa| sa.is_ipv4()).map(|sa| sa.ip()).next() {
-                Some(ip) => ip.to_string(),
-                None => format!("unresolved:{m}"),
-            },
-            Err(e) => {
-                tracing::warn!(
-                    target: "epics_base_rs::access_security",
-                    host = %m,
-                    error = %e,
-                    "ACF: Unable to resolve host (asCheckClientIP=1)"
-                );
-                format!("unresolved:{m}")
-            }
+        .map(|m| {
+            // Name resolution takes text; bytes that are not UTF-8 name no host.
+            let Ok(name) = std::str::from_utf8(m) else {
+                return unresolved(m);
+            };
+            resolve_hag_host(name).unwrap_or_else(|| unresolved(m))
         })
         .collect()
 }
 
-fn read_word(sc: &mut AcfScanner, buf: &mut String) {
-    while let Some(c) = sc.peek() {
-        if c.is_alphanumeric() || c == '_' {
-            buf.push(c);
-            sc.next();
-        } else {
-            break;
+/// `aToIPAddr` for one HAG host: its IPv4 dotted quad, or `None`.
+fn resolve_hag_host(m: &str) -> Option<Vec<u8>> {
+    use std::net::ToSocketAddrs;
+    match format!("{m}:0").to_socket_addrs() {
+        // C `aToIPAddr` resolves via `AF_INET` and the CA server keys ACF on
+        // an IPv4 peer address, so a HAG host must store its **IPv4** dotted
+        // quad. Taking `iter.next()` blindly would store an IPv6 address on a
+        // dual-stack host that resolves `::1` first (e.g. `localhost` on many
+        // CI runners) — an entry no IPv4 CA peer could ever match. A host with
+        // no IPv4 address is stored as the `unresolved:` sentinel, exactly as
+        // C does when `aToIPAddr` yields nothing.
+        Ok(iter) => iter
+            .filter(|sa| sa.is_ipv4())
+            .map(|sa| sa.ip().to_string().into_bytes())
+            .next(),
+        Err(e) => {
+            tracing::warn!(
+                target: "epics_base_rs::access_security",
+                host = %m,
+                error = %e,
+                "ACF: Unable to resolve host (asCheckClientIP=1)"
+            );
+            None
         }
     }
 }
 
-fn read_paren_name(sc: &mut AcfScanner) -> CaResult<String> {
-    sc.skip_ws_comments();
-    if sc.next() != Some('(') {
-        return Err(sc.reject("expected '('"));
+/// asLib.y `'(' tokenSTRING ')'`: a UAG/HAG/ASG head or an `INP*` link.
+fn read_paren_name(sc: &mut AcfScanner) -> CaResult<Vec<u8>> {
+    let mut names = read_token_list(sc, b'(', b')', ListKind::Strings)?;
+    match names.len() {
+        1 => Ok(names.remove(0)),
+        _ => Err(sc.reject("syntax error: expected one name")),
     }
-    let opened = sc.line;
-    sc.skip_ws_comments();
-    // L-4: C's lexer requires a single `tokenSTRING` then `')'`.
-    // Accept an optional double-quoted form; in the unquoted form
-    // interior whitespace ends the name — a second non-space run
-    // before `)` is a parse error rather than being silently merged
-    // (`UAG(my group)` must NOT become `mygroup`). EOF before `)` is
-    // also an error.
-    let mut name = String::new();
-    if sc.peek() == Some('"') {
-        sc.next();
-        let mut closed = false;
-        while let Some(c) = sc.peek() {
-            sc.next();
-            if c == '"' {
-                closed = true;
-                break;
-            }
-            name.push(c);
-        }
-        if !closed {
-            return Err(sc.reject_at(opened, "unterminated quoted name"));
-        }
-        sc.skip_ws_comments();
-        if sc.next() != Some(')') {
-            return Err(sc.reject("expected ')' after quoted name"));
-        }
-        return Ok(name);
-    }
-    loop {
-        match sc.peek() {
-            Some(')') => {
-                sc.next();
-                break;
-            }
-            Some(c) if c.is_whitespace() => {
-                // Whitespace ends the name. Allow only trailing
-                // whitespace before `)`; reject embedded whitespace.
-                sc.skip_ws_comments();
-                match sc.peek() {
-                    Some(')') => {
-                        sc.next();
-                        break;
-                    }
-                    Some(_) => {
-                        return Err(sc.reject("whitespace inside parenthesised name"));
-                    }
-                    None => {
-                        return Err(sc.reject_at(opened, "unterminated '(' — missing ')'"));
-                    }
-                }
-            }
-            Some(c) => {
-                name.push(c);
-                sc.next();
-            }
-            None => {
-                return Err(sc.reject_at(opened, "unterminated '(' — missing ')'"));
-            }
-        }
-    }
-    Ok(name)
 }
 
-fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
+/// asLib.y `tokenUAG uag_head` / `tokenHAG hag_head`: the member list is
+/// optional, and a bare head is a group with no members.
+fn read_optional_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<Vec<u8>>> {
     sc.skip_ws_comments();
-    if sc.next() != Some('{') {
-        return Err(sc.reject("expected '{'"));
+    if sc.peek() == Some(b'{') {
+        read_token_list(sc, b'{', b'}', ListKind::Strings)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Which asLib.y comma list: `tokenSTRING` items only, or `generic_head`,
+/// whose items may also be numbers and which `()` may close at once.
+#[derive(Clone, Copy, PartialEq)]
+enum ListKind {
+    Strings,
+    Generic,
+}
+
+/// asLib.y's comma lists between `open` and `close`. Each item is one token,
+/// so `a b`, `a,,b` and `a,` are syntax errors.
+fn read_token_list(
+    sc: &mut AcfScanner,
+    open: u8,
+    close: u8,
+    kind: ListKind,
+) -> CaResult<Vec<Vec<u8>>> {
+    sc.skip_ws_comments();
+    if sc.next() != Some(open) {
+        return Err(sc.reject(format!("expected '{}'", open as char)));
     }
     let opened = sc.line;
     let mut items = Vec::new();
-    let mut current = String::new();
-
+    sc.skip_ws_comments();
+    if kind == ListKind::Generic && sc.peek() == Some(close) {
+        sc.next();
+        return Ok(items);
+    }
+    let unterminated =
+        |sc: &AcfScanner| sc.reject_at(opened, format!("unterminated '{}'", open as char));
     loop {
         sc.skip_ws_comments();
-        match sc.peek() {
-            Some('}') => {
-                sc.next();
-                break;
+        match read_token(sc)? {
+            Some(Token::Number(n)) if kind == ListKind::Strings => {
+                return Err(number_error(sc, &n));
             }
-            Some(',') => {
-                sc.next();
-                if !current.is_empty() {
-                    items.push(current.clone());
-                    current.clear();
-                }
+            Some(Token::Keyword(k)) if kind == ListKind::Strings => {
+                return Err(keyword_error(sc, &k));
             }
-            // Quoted string: asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`
-            // where stringchar is [^"\n\\]. Allows '/' so "role/groupname" entries work.
-            // pvxs/documentation/ioc.rst shows: UAG(special) { someone, "role/op" }
-            Some('"') => {
-                sc.next(); // consume opening '"'
-                let quote_opened = sc.line;
-                if !current.is_empty() {
-                    items.push(current.clone());
-                    current.clear();
-                }
-                let mut quoted = String::new();
-                loop {
-                    match sc.next() {
-                        Some('"') => break,
-                        Some('\\') => {
-                            if let Some(esc) = sc.next() {
-                                quoted.push(esc);
-                            }
-                        }
-                        Some('\n') | None => {
-                            return Err(sc.reject_at(quote_opened, "unterminated quoted string"));
-                        }
-                        Some(c) => quoted.push(c),
-                    }
-                }
-                if !quoted.is_empty() {
-                    items.push(quoted);
-                }
-            }
-            // Unquoted name: asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`
-            Some(c)
-                if c.is_alphanumeric()
-                    || matches!(c, '_' | '.' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';') =>
-            {
-                current.push(c);
-                sc.next();
-            }
-            Some(_) => {
-                sc.next();
-            }
-            None => return Err(sc.reject_at(opened, "unterminated '{'")),
+            Some(token) => items.push(token.into_bytes()),
+            None => match sc.peek() {
+                Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
+                None => return Err(unterminated(sc)),
+            },
+        }
+        sc.skip_ws_comments();
+        match sc.next() {
+            Some(b',') => {}
+            Some(c) if c == close => return Ok(items),
+            Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
+            None => return Err(unterminated(sc)),
         }
     }
-    if !current.is_empty() {
-        items.push(current);
-    }
-    Ok(items)
 }
 
-fn parse_asg_body(sc: &mut AcfScanner) -> CaResult<AccessSecurityGroup> {
-    sc.skip_ws_comments();
-    if sc.next() != Some('{') {
-        return Err(sc.reject("expected '{' after ASG name"));
-    }
-    let opened = sc.line;
+/// An asLib_lex.l token: a quoted string, a bare `{name}+` run, a run the
+/// longest match hands to the integer or float rule, or a run that is
+/// exactly a keyword. Only the first two are `tokenSTRING`, so a keyword is
+/// refused wherever the grammar wants a name.
+enum Token {
+    Quoted(Vec<u8>),
+    Name(Vec<u8>),
+    Number(Vec<u8>),
+    Keyword(Vec<u8>),
+}
 
-    let mut asg = AccessSecurityGroup::default();
-
-    loop {
-        sc.skip_ws_comments();
-        match sc.peek() {
-            Some('}') => {
-                sc.next();
-                break;
-            }
-            Some(_) => {
-                let mut kw = String::new();
-                read_word(sc, &mut kw);
-                if kw == "RULE" {
-                    let rule = parse_rule(sc)?;
-                    asg.rules.push(rule);
-                } else if let Some(stripped) = kw.strip_prefix("INP") {
-                    // `INP(A..U)("link")` — C `asLib_lex.l:48-52`
-                    // lexes `INP[A-U]` as one token whose `Int64`
-                    // payload is the letter index (`yytext[3] - 'A'`).
-                    // `asLib.y:234-243` then reads the parenthesised
-                    // link string.
-                    let index = match parse_inp_index(stripped) {
-                        Some(i) => i,
-                        None => {
-                            return Err(sc.reject(format!(
-                                "invalid INP link selector 'INP{stripped}' \
-                                 (expected INPA..INPU)"
-                            )));
-                        }
-                    };
-                    let link = read_paren_name(sc)?;
-                    asg.inp.push(AsgInp { index, link });
-                } else if kw.is_empty() {
-                    sc.next(); // skip unknown char
-                }
-                // Unknown alphanumeric keywords inside an ASG body are
-                // skipped (forward-compat); the next loop iteration
-                // resumes from the following token.
-            }
-            None => return Err(sc.reject_at(opened, "unterminated ASG")),
+impl Token {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Token::Quoted(b) | Token::Name(b) | Token::Number(b) | Token::Keyword(b) => b,
         }
     }
+}
 
-    Ok(asg)
+/// asLib_lex.l's keyword rules: `UAG`, `HAG`, `ASG`, `RULE`, `CALC`, `INP[A-U]`.
+fn is_acf_keyword(run: &[u8]) -> bool {
+    matches!(run, b"UAG" | b"HAG" | b"ASG" | b"RULE" | b"CALC")
+        || run.strip_prefix(b"INP").and_then(parse_inp_index).is_some()
+}
+
+fn keyword_error(sc: &AcfScanner, k: &[u8]) -> CaError {
+    sc.reject(format!("syntax error at '{}'", shown(k)))
+}
+
+/// The token at the cursor; `None` leaves a punctuation byte unread.
+fn read_token(sc: &mut AcfScanner) -> CaResult<Option<Token>> {
+    match sc.peek() {
+        // `""` is a tokenSTRING, so `asUagAddUser` stores an empty
+        // member that an empty user name matches.
+        Some(b'"') => {
+            sc.next();
+            Ok(Some(Token::Quoted(sc.quoted()?)))
+        }
+        Some(c) if is_acf_name_char(c) => {
+            let mut run = Vec::new();
+            while let Some(c) = sc.peek().filter(|&c| is_acf_name_char(c)) {
+                run.push(c);
+                sc.next();
+            }
+            Ok(Some(if is_acf_number(&run) {
+                Token::Number(run)
+            } else if is_acf_keyword(&run) {
+                Token::Keyword(run)
+            } else {
+                Token::Name(run)
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn number_error(sc: &AcfScanner, n: &[u8]) -> CaError {
+    sc.reject(format!(
+        "syntax error at number '{}'",
+        String::from_utf8_lossy(n)
+    ))
+}
+
+/// The byte at the cursor is no token the grammar takes here, or the input
+/// ended inside the construct opened on line `opened`.
+fn unexpected(sc: &mut AcfScanner, opened: u32, what: &str) -> CaError {
+    match sc.peek() {
+        Some(c) => sc.reject(format!("syntax error at '{}'", c as char)),
+        None => sc.reject_at(opened, format!("unterminated {what}")),
+    }
+}
+
+/// asLib.y `rule_generic_block_elem` after its name: a `generic_head`, then
+/// an optional `generic_block`. Read only to be skipped.
+fn skip_generic_elem(sc: &mut AcfScanner) -> CaResult<()> {
+    read_token_list(sc, b'(', b')', ListKind::Generic)?;
+    sc.skip_ws_comments();
+    if sc.peek() == Some(b'{') {
+        skip_generic_block(sc)?;
+    }
+    Ok(())
+}
+
+/// asLib.y `generic_block`: `{ e }`, `{ e, e }`, or a run of named elements
+/// `{ X(..) Y(..) {..} }`. True for `{ e }`, which a top-level item may
+/// follow with a `{ generic_list }`.
+fn skip_generic_block(sc: &mut AcfScanner) -> CaResult<bool> {
+    sc.next();
+    let opened = sc.line;
+    sc.skip_ws_comments();
+    let first = read_token(sc)?.ok_or_else(|| unexpected(sc, opened, "'{'"))?;
+    sc.skip_ws_comments();
+    if sc.peek() == Some(b'(') {
+        if let Token::Number(n) = first {
+            return Err(number_error(sc, &n));
+        }
+        loop {
+            skip_generic_elem(sc)?;
+            sc.skip_ws_comments();
+            if sc.peek() == Some(b'}') {
+                sc.next();
+                return Ok(false);
+            }
+            match read_token(sc)? {
+                Some(Token::Number(n)) => return Err(number_error(sc, &n)),
+                Some(_) => sc.skip_ws_comments(),
+                None => return Err(unexpected(sc, opened, "'{'")),
+            }
+            if sc.peek() != Some(b'(') {
+                return Err(unexpected(sc, opened, "'{'"));
+            }
+        }
+    }
+    let mut single = true;
+    loop {
+        match sc.peek() {
+            Some(b'}') => {
+                sc.next();
+                return Ok(single);
+            }
+            Some(b',') => {
+                single = false;
+                sc.next();
+                sc.skip_ws_comments();
+                read_token(sc)?.ok_or_else(|| unexpected(sc, opened, "'{'"))?;
+                sc.skip_ws_comments();
+            }
+            _ => return Err(unexpected(sc, opened, "'{'")),
+        }
+    }
+}
+
+/// asLib_lex.l `[-+]?{digit}+` or `[-+]?{digit}*\.{digit}+([eE][-+]?{digit}+)?`
+/// matching a whole `{name}+` run: a tie goes to the earlier number rules.
+fn is_acf_number(run: &[u8]) -> bool {
+    let unsigned = |t: &[u8]| -> usize { t.iter().take_while(|c| c.is_ascii_digit()).count() };
+    let sign = |t: &'_ [u8]| -> usize { usize::from(matches!(t.first(), Some(b'-' | b'+'))) };
+    let t = &run[sign(run)..];
+    let int = unsigned(t);
+    let t = &t[int..];
+    let Some(t) = t.strip_prefix(b".") else {
+        return int > 0 && t.is_empty();
+    };
+    let frac = unsigned(t);
+    let t = &t[frac..];
+    if frac == 0 {
+        return false;
+    }
+    let Some(e) = t.strip_prefix(b"e").or_else(|| t.strip_prefix(b"E")) else {
+        return t.is_empty();
+    };
+    let e = &e[sign(e)..];
+    !e.is_empty() && unsigned(e) == e.len()
+}
+
+/// asLib.y's `yyAsgRule`: the ASG and index of the last rule `asAsgAddRule`
+/// made in this parse, in any ASG. A rule with an unsupported access
+/// keyword makes none and leaves it where it was (CBUG-Q1).
+type CurrentRule = Option<(Vec<u8>, usize)>;
+
+fn current_rule<'a>(
+    asgs: &'a mut HashMap<Vec<u8>, AccessSecurityGroup>,
+    current: &CurrentRule,
+) -> Option<&'a mut AccessRule> {
+    let (asg, index) = current.as_ref()?;
+    asgs.get_mut(asg)?.rules.get_mut(*index)
+}
+
+fn parse_asg_body(
+    sc: &mut AcfScanner,
+    config: &mut AccessSecurityConfig,
+    name: &[u8],
+    current: &mut CurrentRule,
+) -> CaResult<()> {
+    sc.next();
+    let opened = sc.line;
+
+    // asLib.y `asg_body_list`: one or more `inp_config | rule_config`.
+    let mut items = 0;
+    loop {
+        sc.skip_ws_comments();
+        if items > 0 && sc.peek() == Some(b'}') {
+            sc.next();
+            return Ok(());
+        }
+        items += 1;
+        let kw = match read_token(sc)? {
+            Some(Token::Keyword(kw)) => kw,
+            Some(Token::Name(n)) => return Err(keyword_error(sc, &n)),
+            Some(Token::Quoted(_)) => return Err(sc.reject("syntax error at quoted string")),
+            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
+            None => return Err(unexpected(sc, opened, "ASG")),
+        };
+        if kw == b"RULE" {
+            parse_rule(sc, config, name, current)?;
+        } else if let Some(index) = kw.strip_prefix(b"INP").and_then(parse_inp_index) {
+            // `INP[A-U]` is one token, `tokenINP` (`asLib_lex.l:48-52`), whose
+            // payload is the letter index; `asLib.y:237-243` reads the link.
+            let link = read_paren_name(sc)?;
+            let asg = config
+                .asg
+                .get_mut(name)
+                .expect("parse_acf adds the ASG first");
+            asg.inp.push(AsgInp { index, link });
+        } else {
+            return Err(sc.reject(format!(
+                "syntax error at '{}' (expected RULE or INPA..INPU)",
+                String::from_utf8_lossy(&kw)
+            )));
+        }
+    }
 }
 
 /// Parse the `A..U` selector suffix of an `INP` token into a 0-based
@@ -2624,353 +3136,308 @@ fn parse_asg_body(sc: &mut AcfScanner) -> CaResult<AccessSecurityGroup> {
 /// match the `tokenINP` rule — it is a syntax error in C, not selector
 /// index 0. Matching only uppercase here keeps that behaviour; a
 /// lowercase suffix returns `None` and the caller rejects the ASG.
-fn parse_inp_index(suffix: &str) -> Option<u8> {
-    let mut it = suffix.chars();
-    let c = it.next()?;
-    if it.next().is_some() {
-        return None; // INP selector is exactly one letter
-    }
-    if ('A'..='U').contains(&c) {
-        Some((c as u8) - b'A')
-    } else {
-        None
+fn parse_inp_index(suffix: &[u8]) -> Option<u8> {
+    match suffix {
+        [c @ b'A'..=b'U'] => Some(c - b'A'),
+        _ => None,
     }
 }
 
-fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
+/// A token for a `got '…'` diagnostic, capped so a megabyte-long run cannot
+/// put a megabyte on the operator's console.
+fn shown(token: &[u8]) -> String {
+    const CAP: usize = 32;
+    let token = String::from_utf8_lossy(token);
+    if token.chars().count() > CAP {
+        format!("{}…", token.chars().take(CAP).collect::<String>())
+    } else {
+        token.into_owned()
+    }
+}
+
+/// A `tokenSTRING` in a RULE head.
+fn read_head_string(sc: &mut AcfScanner, opened: u32) -> CaResult<Vec<u8>> {
+    match read_token(sc)? {
+        Some(Token::Name(t) | Token::Quoted(t)) => Ok(t),
+        Some(Token::Number(n)) => Err(number_error(sc, &n)),
+        Some(Token::Keyword(k)) => Err(keyword_error(sc, &k)),
+        None => Err(unexpected(sc, opened, "RULE head")),
+    }
+}
+
+/// The punctuation byte the grammar requires next.
+fn expect_byte(sc: &mut AcfScanner, opened: u32, want: u8) -> CaResult<()> {
     sc.skip_ws_comments();
-    if sc.next() != Some('(') {
+    if sc.peek() == Some(want) {
+        sc.next();
+        Ok(())
+    } else {
+        Err(unexpected(sc, opened, "RULE head"))
+    }
+}
+
+/// asLib.y `rule_config`. Every clause, the head's TRAPWRITE included, goes to
+/// the rule `current` names, as C sends it to `yyAsgRule`.
+fn parse_rule(
+    sc: &mut AcfScanner,
+    config: &mut AccessSecurityConfig,
+    asg: &[u8],
+    current: &mut CurrentRule,
+) -> CaResult<()> {
+    // asLib.y `rule_head`: `'(' tokenINT64 ',' tokenSTRING [',' tokenSTRING] ')'`.
+    sc.skip_ws_comments();
+    if sc.next() != Some(b'(') {
         return Err(sc.reject("expected '(' after RULE"));
     }
-
-    // Read level. C `asLib.y:253-258` requires `tokenINT64` and
-    // rejects a negative or non-numeric level with `yyerror`, which
-    // fails the whole ACF load (a fail-safe abort). Accept an optional
-    // leading sign so a `RULE(-1, ...)` is detected and rejected
-    // rather than silently re-read as level 1.
+    let opened = sc.line;
     sc.skip_ws_comments();
-    let mut level_str = String::new();
-    if matches!(sc.peek(), Some('+') | Some('-')) {
-        level_str.push(sc.next().unwrap());
-    }
-    while let Some(c) = sc.peek() {
-        if c.is_ascii_digit() {
-            level_str.push(c);
-            sc.next();
-        } else {
-            break;
+    let level_num = match read_token(sc)? {
+        Some(Token::Number(n)) if !n.contains(&b'.') => std::str::from_utf8(&n)
+            .ok()
+            .and_then(|n| n.parse::<i64>().ok())
+            .ok_or_else(|| sc.reject(format!("Error parsing Int64: {}", shown(&n))))?,
+        Some(token) => {
+            return Err(sc.reject(format!(
+                "RULE level must be an integer, got '{}'",
+                shown(&token.into_bytes())
+            )));
         }
-    }
-    let level_num: i64 = match level_str.parse() {
-        Ok(n) => n,
-        Err(_) => {
-            let got = sc.offending(&level_str);
-            return Err(sc.reject(format!("RULE level must be an integer, got '{got}'")));
-        }
+        None => return Err(unexpected(sc, opened, "RULE head")),
     };
     if level_num < 0 {
         return Err(sc.reject(format!("RULE LEVEL must be positive: {level_num}")));
     }
-    let level: u8 = u8::try_from(level_num)
-        .map_err(|_| sc.reject(format!("RULE level out of range: {level_num}")))?;
+    expect_byte(sc, opened, b',')?;
 
+    // C matches `NONE`/`READ`/`WRITE` with `strcmp` and calls
+    // `asAsgAddRule(yyAsg, access, (int)$1)`; any other string only warns,
+    // adds no rule and leaves `yyAsgRule` on the previous one (CBUG-Q1).
     sc.skip_ws_comments();
-    if sc.peek() == Some(',') {
-        sc.next();
-    }
-
-    // Read access keyword. C `asLib.y:259-264` matches `NONE`/`READ`/
-    // `WRITE` with `strcmp` (case-SENSITIVE); any other keyword triggers
-    // `yywarn "Ignoring RULE that contains an unsupported keyword"`
-    // and the rule is dropped. Match case-sensitively here too: a
-    // case variant like `write` is an unsupported keyword in C, so it
-    // must not build an active Write rule. We keep the rule but mark it
-    // `ignore` (inert) so any unsupported keyword fails CLOSED — the
-    // same effect as C dropping the rule.
-    sc.skip_ws_comments();
-    let mut access_str = String::new();
-    read_word(sc, &mut access_str);
-    let (access, mut ignore) = if access_str == "WRITE" {
-        (RuleAccess::Write, false)
-    } else if access_str == "READ" {
-        (RuleAccess::Read, false)
-    } else if access_str == "NONE" {
-        (RuleAccess::None, false)
-    } else {
-        // `offending` and not `access_str`: `read_word` stops before the
-        // character it cannot take, so on `RULE(1, %)` the buffer is empty
-        // and the warning would name a keyword the operator never wrote.
-        let keyword = sc.offending(&access_str);
-        tracing::warn!(
+    let access_str = read_head_string(sc, opened)?;
+    let access = match access_str.as_slice() {
+        b"WRITE" => Some(RuleAccess::Write),
+        b"READ" => Some(RuleAccess::Read),
+        b"NONE" => Some(RuleAccess::None),
+        _ => None,
+    };
+    match access {
+        Some(access) => {
+            let rules = &mut config
+                .asg
+                .get_mut(asg)
+                .expect("parse_acf adds the ASG first")
+                .rules;
+            rules.push(AccessRule {
+                level: level_num as i32,
+                access,
+                ..AccessRule::default()
+            });
+            *current = Some((asg.to_vec(), rules.len() - 1));
+        }
+        None => tracing::warn!(
             target: "epics_base_rs::access_security",
             line = sc.line,
-            keyword = %keyword,
+            keyword = %shown(&access_str),
             "ACF: ignoring RULE with unsupported access keyword"
-        );
-        (RuleAccess::None, true)
-    };
+        ),
+    }
 
-    // Optional log option: `RULE(level, access, TRAPWRITE)` /
-    // `RULE(level, access, NOTRAPWRITE)`. C `asLib.y:272-283`
-    // (`rule_log_option`) matches both with `strcmp` (case-SENSITIVE):
-    // a lowercase `trapwrite` matches neither and hits
-    // `yyerror "Log options must be TRAPWRITE or NOTRAPWRITE"`, which
-    // fails the whole ACF load. Match case-sensitively here too so a
-    // case variant is rejected rather than silently accepted. The trap
-    // mask is captured in `AccessRule::trap`; the `asTrapWrite`
-    // put-logging listener that would consume it is a separate
-    // subsystem not present in this crate (see the UNFIXED note).
-    let mut trap = false;
+    // `rule_log_option`, matched with `strcmp`: anything else fails the load.
     sc.skip_ws_comments();
-    if sc.peek() == Some(',') {
+    if sc.peek() == Some(b',') {
         sc.next();
         sc.skip_ws_comments();
-        let mut log_opt = String::new();
-        read_word(sc, &mut log_opt);
-        if log_opt == "TRAPWRITE" {
-            trap = true;
-        } else if log_opt != "NOTRAPWRITE" {
-            let got = sc.offending(&log_opt);
-            return Err(sc.reject(format!(
-                "RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{got}'"
-            )));
+        let log_opt = read_head_string(sc, opened)?;
+        match log_opt.as_slice() {
+            b"TRAPWRITE" => {
+                if let Some(rule) = current_rule(&mut config.asg, current) {
+                    rule.trap = true;
+                }
+            }
+            b"NOTRAPWRITE" => {}
+            _ => {
+                return Err(sc.reject(format!(
+                    "RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{}'",
+                    shown(&log_opt)
+                )));
+            }
         }
     }
+    expect_byte(sc, opened, b')')?;
 
     sc.skip_ws_comments();
-    if sc.peek() == Some(')') {
-        sc.next();
+    if sc.peek() != Some(b'{') {
+        return Ok(());
     }
-
-    // Optional body with UAG/HAG/METHOD/AUTHORITY/CALC.
-    let mut uag = Vec::new();
-    let mut hag = Vec::new();
-    let mut method = Vec::new();
-    let mut authority = Vec::new();
-    // The CALC clause travels with the line it was written on: the two
-    // rejections below name the expression, and a rule body can close many
-    // lines after the `CALC(...)` that is wrong.
-    let mut calc: Option<(u32, String)> = None;
-
-    sc.skip_ws_comments();
-    if sc.peek() == Some('{') {
-        sc.next();
-        loop {
-            sc.skip_ws_comments();
-            match sc.peek() {
-                Some('}') => {
-                    sc.next();
-                    break;
-                }
-                Some(_) => {
-                    let mut kw = String::new();
-                    read_word(sc, &mut kw);
-                    if kw == "UAG" {
-                        let name = read_paren_name(sc)?;
-                        uag.push(name);
-                    } else if kw == "HAG" {
-                        let name = read_paren_name(sc)?;
-                        hag.push(name);
-                    } else if kw == "METHOD" {
-                        // PR #563: METHOD("ca", "x509", ...)
-                        method.extend(read_paren_string_list(sc)?);
-                    } else if kw == "AUTHORITY" {
-                        // PR #563/#618: AUTHORITY("CA Issuer", ...)
-                        authority.extend(read_paren_string_list(sc)?);
-                    } else if kw == "CALC" {
-                        // `CALC("<expr>")` — C `asLib.y:294-299`.
-                        // The expression gates the rule against the
-                        // ASG's INP* link values. Take the *last*
-                        // CALC clause if several are given (matches
-                        // C `asAsgRuleCalc` last-wins overwrite).
-                        let at = sc.line;
-                        let expr = read_paren_name_raw(sc)?;
-                        calc = Some((at, expr));
-                    } else if kw.is_empty() {
-                        // Unknown punctuation — advance to avoid infinite loop.
-                        sc.next();
-                    } else {
-                        // C `asLib.y:300-306`: a RULE body with
-                        // an unsupported keyword is *disabled* by
-                        // `asAsgRuleDisable`. Mark the rule inert and
-                        // consume the keyword's `(...)` argument if
-                        // present so parsing recovers.
-                        tracing::warn!(
-                            target: "epics_base_rs::access_security",
-                            line = sc.line,
-                            keyword = %kw,
-                            "ACF: ignoring RULE with unsupported keyword — rule disabled"
-                        );
-                        ignore = true;
-                        sc.skip_ws_comments();
-                        if sc.peek() == Some('(') {
-                            let _ = read_paren_name(sc)?;
-                        }
+    sc.next();
+    let opened = sc.line;
+    // asLib.y `rule_list`: one or more items, no separator. With no current
+    // rule, C's clause helpers return 0 at once: a group is not looked up and
+    // a CALC is not compiled.
+    let mut items = 0;
+    loop {
+        sc.skip_ws_comments();
+        if items > 0 && sc.peek() == Some(b'}') {
+            sc.next();
+            return Ok(());
+        }
+        items += 1;
+        let at = sc.line;
+        let name = match read_token(sc)? {
+            Some(Token::Keyword(kw)) if kw == b"UAG" || kw == b"HAG" => {
+                let names = read_token_list(sc, b'(', b')', ListKind::Strings)?;
+                let (kind, defined) = if kw == b"UAG" {
+                    ("User", &config.uag)
+                } else {
+                    ("Host", &config.hag)
+                };
+                if current.is_some() {
+                    if let Some(n) = names.iter().find(|n| !defined.contains_key(*n)) {
+                        return Err(sc.reject(format!(
+                            "No {kind} Access Group named '{}' defined",
+                            String::from_utf8_lossy(n)
+                        )));
                     }
                 }
-                None => break,
-            }
-        }
-    }
-
-    // a CALC clause must actually gate the rule. This crate's
-    // access-security layer has no `INP*` database-link resolution
-    // (the `AsgInp` links are stored but never read), so the calc
-    // expression cannot be evaluated at access-check time. C disables
-    // any rule it cannot fully honour (`asAsgRuleDisable`); to fail
-    // CLOSED we do the same — a present-but-unevaluable CALC condition
-    // marks the rule inert rather than letting it become an
-    // unconditional grant. The expression is still validated (compiled)
-    // here so a syntactically broken CALC is rejected exactly as C's
-    // `postfix()` rejects it in `asAsgRuleCalc`.
-    // compile the CALC expression at parse (C `postfix()` rejects a
-    // broken one in `asAsgRuleCalc` and stores the RPN for every later
-    // `asComputePvt`). The rule is conditionally active and gated at
-    // access-check time by `compute_rules`'s `calc_ok`, which resolves
-    // the ASG's INP* links and evaluates the stored program. When no
-    // INP* resolver is installed the evaluator returns false (fail
-    // closed), preserving the previous deny behaviour without
-    // hard-disabling the rule.
-    let mut inp_used: u32 = 0;
-    let calc_compiled = match calc {
-        Some((at, ref expr)) => {
-            let compiled = crate::calc::compile(expr)
-                .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{expr}': {e}")))?;
-            // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) runs
-            // `calcArgUsage` right after `postfix()` and refuses the rule when
-            // the expression stores into an argument:
-            //
-            //     /* Until someone proves stores are not dangerous, don't allow them */
-            //     if (stores) { … status = S_asLib_badCalc; … }
-            //
-            // `asLib.y:294-299` turns that status into `yyerror("")`, so the
-            // WHOLE file is rejected and a running IOC keeps its previous rule
-            // set. Accepting the rest of the file instead would be strictly
-            // less safe than C: the operator's edit would silently install a
-            // weaker policy than the one they wrote.
-            //
-            // The danger is concrete — `CALC("A:=1")` evaluates to 1 whatever
-            // the INP links read, so the rule becomes an unconditional grant
-            // to everyone in the group.
-            let (used, stores) = compiled.arg_usage();
-            if stores != 0 {
-                return Err(sc.reject_at(
-                    at,
-                    format!("assignment operator used in CALC expression '{expr}'"),
-                ));
-            }
-            inp_used = used;
-            Some(compiled)
-        }
-        None => None,
-    };
-
-    Ok(AccessRule {
-        level,
-        access,
-        uag,
-        hag,
-        method,
-        authority,
-        trap,
-        calc: calc.map(|(_, expr)| expr),
-        calc_compiled,
-        inp_used,
-        ignore,
-    })
-}
-
-/// Read a parenthesised, double-quoted string verbatim — used for the
-/// `CALC("<expr>")` clause where the expression contains operators and
-/// spaces that `read_paren_name` would mangle (it strips whitespace).
-/// Accepts `( "expr" )` or `( expr )`; whitespace around the parens is
-/// skipped, whitespace *inside* a quoted body is preserved.
-fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<String> {
-    sc.skip_ws_comments();
-    if sc.next() != Some('(') {
-        return Err(sc.reject("expected '(' after CALC"));
-    }
-    let opened = sc.line;
-    sc.skip_ws_comments();
-    let mut body = String::new();
-    if sc.peek() == Some('"') {
-        sc.next();
-        while let Some(c) = sc.peek() {
-            sc.next();
-            if c == '"' {
-                break;
-            }
-            body.push(c);
-        }
-        sc.skip_ws_comments();
-        if sc.next() != Some(')') {
-            return Err(sc.reject_at(opened, "expected ')' after CALC expression"));
-        }
-    } else {
-        // Unquoted form — read until the closing paren.
-        while let Some(c) = sc.peek() {
-            if c == ')' {
-                sc.next();
-                break;
-            }
-            body.push(c);
-            sc.next();
-        }
-    }
-    Ok(body.trim().to_string())
-}
-
-/// Parse `(item1, "item 2", ...)` — commas separate items, optional
-/// quotes around each item are stripped. Used for METHOD/AUTHORITY
-/// rule clauses (epics-base PR #563/#618). Whitespace inside an
-/// unquoted item is preserved verbatim *between* word characters but
-/// trimmed at the boundaries; the typical caller passes quoted strings.
-fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
-    sc.skip_ws_comments();
-    if sc.next() != Some('(') {
-        return Err(sc.reject("expected '(' after METHOD/AUTHORITY"));
-    }
-    let opened = sc.line;
-    let mut items = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    loop {
-        match sc.peek() {
-            Some('"') => {
-                sc.next();
-                in_quotes = !in_quotes;
-            }
-            Some(')') if !in_quotes => {
-                sc.next();
-                break;
-            }
-            Some(',') if !in_quotes => {
-                sc.next();
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    items.push(trimmed);
+                if let Some(rule) = current_rule(&mut config.asg, current) {
+                    if kw == b"UAG" {
+                        &mut rule.uag
+                    } else {
+                        &mut rule.hag
+                    }
+                    .extend(names);
                 }
-                current.clear();
+                continue;
             }
-            Some(c) => {
-                current.push(c);
-                sc.next();
+            // `CALC("<expr>")` — C `asLib.y:294-299`. The *last* CALC
+            // clause wins, as C `asAsgRuleCalc` overwrites.
+            Some(Token::Keyword(kw)) if kw == b"CALC" => {
+                let expr = read_paren_name(sc)?;
+                if let Some(rule) = current_rule(&mut config.asg, current) {
+                    let (compiled, used) = compile_rule_calc(sc, at, &expr)?;
+                    rule.calc = Some(expr);
+                    rule.calc_compiled = Some(compiled);
+                    rule.inp_used = used;
+                }
+                continue;
             }
-            None => {
-                return Err(sc.reject_at(opened, "unterminated METHOD/AUTHORITY list"));
+            // PR #563: METHOD("ca", "x509", ...); PR #563/#618:
+            // AUTHORITY("CA Issuer", ...). C base reads either as the
+            // unsupported keyword below, so with no current rule it is refused.
+            Some(Token::Name(kw)) if kw == b"METHOD" || kw == b"AUTHORITY" => {
+                let items = read_token_list(sc, b'(', b')', ListKind::Generic)?;
+                // `rule_generic_block_elem` takes an optional `generic_block`
+                // after the head; it carries nothing a rule keeps.
+                sc.skip_ws_comments();
+                if sc.peek() == Some(b'{') {
+                    skip_generic_block(sc)?;
+                }
+                let rule = current_rule(&mut config.asg, current)
+                    .ok_or_else(|| no_rule_to_disable(sc, at, &kw))?;
+                if kw == b"METHOD" {
+                    &mut rule.method
+                } else {
+                    &mut rule.authority
+                }
+                .extend(items);
+                continue;
             }
-        }
+            // asLib.y `rule_generic_block_elem_name`: a `non_rule_keyword`
+            // or a string.
+            Some(Token::Name(name) | Token::Quoted(name) | Token::Keyword(name)) => name,
+            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
+            None => return Err(unexpected(sc, opened, "RULE body")),
+        };
+        // C `asLib.y:300-306`: any other element disables the rule
+        // (`asAsgRuleDisable`), which fails on a NULL `yyAsgRule`.
+        tracing::warn!(
+            target: "epics_base_rs::access_security",
+            line = at,
+            keyword = %String::from_utf8_lossy(&name),
+            "ACF: ignoring RULE with unsupported keyword — rule disabled"
+        );
+        skip_generic_elem(sc)?;
+        current_rule(&mut config.asg, current)
+            .ok_or_else(|| no_rule_to_disable(sc, at, &name))?
+            .ignore = true;
     }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        items.push(trimmed);
+}
+
+/// `asAsgRuleDisable(NULL)` returns 1 and asLib.y makes it `yyerror`.
+fn no_rule_to_disable(sc: &AcfScanner, at: u32, keyword: &[u8]) -> CaError {
+    sc.reject_at(
+        at,
+        format!(
+            "unsupported keyword '{}' with no RULE to disable",
+            shown(keyword)
+        ),
+    )
+}
+
+/// C `asAsgRuleCalc`: `postfix()`, then `calcArgUsage` for the arguments the
+/// expression reads.
+fn compile_rule_calc(
+    sc: &AcfScanner,
+    at: u32,
+    expr: &[u8],
+) -> CaResult<(crate::calc::CompiledExpr, u32)> {
+    let shown = String::from_utf8_lossy(expr);
+    // A byte that is not UTF-8 is no CALC token, as in C `postfix`.
+    let compiled = std::str::from_utf8(expr)
+        .map_err(|e| e.to_string())
+        .and_then(|text| crate::calc::compile(text).map_err(|e| e.to_string()))
+        .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{shown}': {e}")))?;
+    // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) refuses the rule when
+    // the expression stores into an argument:
+    //
+    //     /* Until someone proves stores are not dangerous, don't allow them */
+    //     if (stores) { … status = S_asLib_badCalc; … }
+    //
+    // `asLib.y:294-299` turns that status into `yyerror("")`, so the WHOLE
+    // file is rejected and a running IOC keeps its previous rule set.
+    // `CALC("A:=1")` evaluates to 1 whatever the INP links read, so accepting
+    // it would make the rule an unconditional grant.
+    let (used, stores) = compiled.arg_usage();
+    if stores != 0 {
+        return Err(sc.reject_at(
+            at,
+            format!("assignment operator used in CALC expression '{shown}'"),
+        ));
     }
-    Ok(items)
+    Ok((compiled, used))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A delivered reading with no alarm.
+    /// What the `INP*` watcher delivers for `links`: each declared input whose
+    /// link names one of them takes its reading, then the change signal fires.
+    fn serve(cfg: &AccessSecurityConfig, links: &[(&str, Option<InpReading>)]) {
+        let watch = InpWatch::of(cfg);
+        for (asg, index, ix) in &watch.order {
+            let target = &watch.targets[*ix];
+            for (link, reading) in links {
+                if inp_link_target(link) == (target.record.as_str(), target.field.as_str()) {
+                    let event = reading.map_or(InpEvent::Disconnected, InpEvent::Reading);
+                    cfg.asg[asg].deliver([(*index, event)]);
+                }
+            }
+        }
+        notify_asg_field_changed();
+    }
+
+    fn ok(value: f64) -> InpReading {
+        InpReading {
+            value,
+            severity: crate::server::record::AlarmSeverity::NoAlarm,
+        }
+    }
+
+    fn bs(items: &[&str]) -> Vec<Vec<u8>> {
+        items.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
 
     /// [`AS_CHECK_CLIENT_IP`] is a process-global flag, mirroring C's
     /// global IOC variable — every `parse_acf` call whose ACF has a
@@ -3004,10 +3471,16 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        assert_eq!(config.uag.get("admins").unwrap(), &["user1", "user2"]);
-        assert_eq!(config.hag.get("operators").unwrap(), &["host1", "host2"]);
-        assert!(config.asg.contains_key("DEFAULT"));
-        assert_eq!(config.asg["DEFAULT"].rules.len(), 2);
+        assert_eq!(
+            config.uag[b"admins".as_slice()],
+            [b"user1".to_vec(), b"user2".to_vec()]
+        );
+        assert_eq!(
+            config.hag.get(b"operators".as_slice()).unwrap(),
+            &bs(&["host1", "host2"])
+        );
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
+        assert_eq!(config.asg[b"DEFAULT".as_slice()].rules.len(), 2);
     }
 
     #[test]
@@ -3027,8 +3500,11 @@ ASG(SECURE) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        assert_eq!(config.uag["ops"], vec!["alice", "bob"]);
-        assert_eq!(config.hag["lab"], vec!["lab-pc1.invalid"]);
+        assert_eq!(
+            config.uag[b"ops".as_slice()],
+            [b"alice".to_vec(), b"bob".to_vec()]
+        );
+        assert_eq!(config.hag[b"lab".as_slice()], bs(&["lab-pc1.invalid"]));
     }
 
     /// R7-16 / C `asHagAddHost` (`asLibRoutines.c:1218-1256`): with
@@ -3051,8 +3527,8 @@ ASG(DEFAULT) {
 "#;
         let config = parse_acf(acf).unwrap();
         assert_eq!(
-            config.hag["local"],
-            vec!["localhost"],
+            config.hag[b"local".as_slice()],
+            bs(&["localhost"]),
             "C stores the lowercased literal name and resolves nothing"
         );
         assert_eq!(
@@ -3083,8 +3559,8 @@ ASG(DEFAULT) {
         let config = parse_acf(acf).unwrap();
         set_as_check_client_ip(false); // restore before asserting
         assert_eq!(
-            config.hag["local"],
-            vec!["127.0.0.1"],
+            config.hag[b"local".as_slice()],
+            bs(&["127.0.0.1"]),
             "C resolves the host to its IP under asCheckClientIP"
         );
         assert_eq!(
@@ -3103,7 +3579,10 @@ ASG(DEFAULT) {
         set_as_check_client_ip(true);
         let config = parse_acf("HAG(lab) { lab-pc1.invalid }\n").unwrap();
         set_as_check_client_ip(false);
-        assert_eq!(config.hag["lab"], vec!["unresolved:lab-pc1.invalid"]);
+        assert_eq!(
+            config.hag[b"lab".as_slice()],
+            bs(&["unresolved:lab-pc1.invalid"])
+        );
     }
 
     #[test]
@@ -3121,14 +3600,14 @@ ASG(DEFAULT) {
 }
 "#;
         let config = parse_acf(acf).expect("parser must not abort on bad DNS");
-        let entries = &config.hag["quarantine"];
+        let entries = &config.hag[b"quarantine".as_slice()];
         assert_eq!(
             entries.len(),
             2,
             "literal entries preserved verbatim; no resolved IPs appended"
         );
-        assert_eq!(entries[0], "gone.invalid");
-        assert_eq!(entries[1], "alive.invalid");
+        assert_eq!(entries[0], b"gone.invalid");
+        assert_eq!(entries[1], b"alive.invalid");
     }
 
     /// UI-107 / epics-base#863 (access-security half): under
@@ -3140,20 +3619,20 @@ ASG(DEFAULT) {
         let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(true);
         let mut config = parse_acf("HAG(local) { localhost }\n").unwrap();
-        assert_eq!(config.hag_raw["local"], vec!["localhost"]);
+        assert_eq!(config.hag_raw[b"local".as_slice()], bs(&["localhost"]));
 
         // Simulate DNS moving after load: the stored quad no longer
         // matches what `localhost` resolves to.
-        config.hag.insert("local".into(), vec!["192.0.2.1".into()]);
+        config.hag.insert(b"local".to_vec(), bs(&["192.0.2.1"]));
 
         let refreshed = config
             .with_refreshed_hags()
             .expect("a moved resolution must produce a refreshed config");
         set_as_check_client_ip(false);
-        assert_eq!(refreshed.hag["local"], vec!["127.0.0.1"]);
+        assert_eq!(refreshed.hag[b"local".as_slice()], bs(&["127.0.0.1"]));
         assert_eq!(
-            refreshed.hag_raw["local"],
-            vec!["localhost"],
+            refreshed.hag_raw[b"local".as_slice()],
+            bs(&["localhost"]),
             "raw spellings survive the refresh for the next round"
         );
     }
@@ -3174,6 +3653,82 @@ ASG(DEFAULT) {
         );
     }
 
+    /// A HAG refresh tick awaited on cbMedium leaves cbMedium free while its
+    /// lookups block, and publishes what they return.
+    #[test]
+    fn a_hag_refresh_tick_leaves_cb_medium_free() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let cell = new_acf_cell(Some(parse_acf("ASG(DEFAULT) { RULE(1, READ) }\n").unwrap()));
+        let weak = std::sync::Arc::downgrade(&cell.0);
+        let (release, held) = channel::<()>();
+        let (ticked, tick) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let alive = refresh_hags_once(&weak, move |c| {
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                let mut moved = c.clone();
+                moved.hag.insert(b"h".to_vec(), bs(&["127.0.0.1"]));
+                Some(moved)
+            })
+            .await;
+            let _ = ticked.send(alive);
+        });
+        // Queued only once the tick is blocked in its lookup.
+        std::thread::sleep(Duration::from_millis(200));
+        let (ran, beside) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let _ = ran.send(());
+        });
+        let free = beside.recv_timeout(Duration::from_secs(3)).is_ok();
+        release.send(()).unwrap();
+        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        set_as_check_client_ip(false);
+        assert!(free, "the HAG lookup parked cbMedium");
+        assert!(alive);
+        assert!(cell.load_full().unwrap().hag.contains_key(b"h".as_slice()));
+    }
+
+    /// A reload that lands while a HAG lookup is blocked wins: the refresh,
+    /// derived from the policy the reload replaced, is dropped.
+    #[test]
+    fn a_reload_during_a_hag_lookup_is_not_overwritten() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _guard = lock_as_check_client_ip();
+        set_as_check_client_ip(true);
+        let cell = new_acf_cell(Some(parse_acf("ASG(DEFAULT) { RULE(1, READ) }\n").unwrap()));
+        let weak = std::sync::Arc::downgrade(&cell.0);
+        let (looking, in_lookup) = channel::<()>();
+        let (release, held) = channel::<()>();
+        let (ticked, tick) = channel();
+        spawn_background(CallbackPriority::Medium, async move {
+            let alive = refresh_hags_once(&weak, move |c| {
+                let _ = looking.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                let mut moved = c.clone();
+                moved.hag.insert(b"h".to_vec(), bs(&["127.0.0.1"]));
+                Some(moved)
+            })
+            .await;
+            let _ = ticked.send(alive);
+        });
+        in_lookup.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reload = std::sync::Arc::new(parse_acf("ASG(RELOADED) { RULE(1, READ) }\n").unwrap());
+        cell.store(Some(reload.clone()));
+        release.send(()).unwrap();
+        let alive = tick.recv_timeout(Duration::from_secs(10)).unwrap();
+        set_as_check_client_ip(false);
+        assert!(alive);
+        assert!(
+            std::sync::Arc::ptr_eq(&cell.load_full().unwrap(), &reload),
+            "a refresh derived from the replaced policy overwrote the reload"
+        );
+    }
+
     /// In default string mode the stored members are lowercased
     /// literals no DNS change can move — a refresh is always a no-op
     /// (`spawn_hag_refresh` gates on the flag, but the method must
@@ -3183,8 +3738,8 @@ ASG(DEFAULT) {
         let _guard = lock_as_check_client_ip();
         set_as_check_client_ip(false);
         let config = parse_acf("HAG(local) { LocalHost }\n").unwrap();
-        assert_eq!(config.hag_raw["local"], vec!["LocalHost"]);
-        assert_eq!(config.hag["local"], vec!["localhost"]);
+        assert_eq!(config.hag_raw[b"local".as_slice()], bs(&["LocalHost"]));
+        assert_eq!(config.hag[b"local".as_slice()], bs(&["localhost"]));
         assert!(config.with_refreshed_hags().is_none());
     }
 
@@ -3218,6 +3773,349 @@ ASG(READONLY) {
             config.check_access("READONLY", "host1", "regular"),
             AccessLevel::Read
         );
+    }
+
+    /// C `asCompute` compares the user with `strcmp`: bytes, so a non-UTF-8
+    /// user matches only its own bytes, never its U+FFFD rendering.
+    #[test]
+    fn a_uag_member_matches_the_user_s_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = "UAG(ops) { \"op\u{fffd}\", \"op\u{e9}\" }\nASG(G) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.check_access("G", "h", b"op\xff"),
+            AccessLevel::NoAccess
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\u{e9}"),
+            AccessLevel::ReadWrite
+        );
+    }
+
+    /// asLib_lex.l whitespace is `[ \t\r]` and newline: a form feed is the
+    /// `.` rule wherever it stands, as `ascheck` reports it.
+    #[test]
+    fn a_form_feed_is_an_invalid_character_not_whitespace() {
+        let _guard = lock_as_check_client_ip();
+        for acf in [
+            b"UAG(u) {a,\x0cb}\n".as_slice(),
+            b"ASG(DEFAULT) {\x0c RULE(1,READ) }\n",
+            b"UAG(a\x0c) {x}\n",
+            b"\x0c\n",
+        ] {
+            let err = parse_acf(acf).unwrap_err().to_string();
+            assert!(
+                err.contains("ACF line 1: Invalid character 0x0c"),
+                "{acf:?}: {err}"
+            );
+        }
+        // Inside a quoted string or a comment it is the lexer's to keep.
+        let _ = parse_acf(b"# \x0c\nUAG(u) {\"a\x0cb\"}\n").unwrap();
+    }
+
+    /// `ascheck` on these files prints `0xff`, `0x80` and `0x7f`: e_flex's
+    /// 8-bit `yytext` is unsigned, so no byte sign-extends to `0xffffff..`.
+    #[test]
+    fn a_high_byte_is_reported_as_ascheck_prints_it() {
+        let _guard = lock_as_check_client_ip();
+        for (acf, want) in [
+            (b"UAG(u) {a,\xffb}\n".as_slice(), "Invalid character 0xff"),
+            (b"UAG(u) {a,\x80b}\n", "Invalid character 0x80"),
+            (b"UAG(u) {a,\x7fb}\n", "Invalid character 0x7f"),
+            (b"\xff\n", "Invalid character 0xff"),
+        ] {
+            let err = parse_acf(acf).unwrap_err().to_string();
+            assert!(err.ends_with(want), "{acf:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_empty_quoted_member_is_kept_and_matches_an_empty_user() {
+        let _guard = lock_as_check_client_ip();
+        let acf = "UAG(u) { a, \"\", b }\nHAG(h) { \"\" }\n\
+                   ASG(G) {\n    RULE(1, WRITE) { UAG(u) }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(config.uag[b"u".as_slice()], bs(&["a", "", "b"]));
+        assert_eq!(config.hag_raw[b"h".as_slice()], bs(&[""]));
+        assert_eq!(config.check_access("G", "h", ""), AccessLevel::ReadWrite);
+    }
+
+    /// asLib.y:57-63 takes a UAG, HAG or ASG head with no body; `ascheck`
+    /// accepts the file.
+    #[test]
+    fn a_bare_group_head_is_an_empty_group() {
+        let _guard = lock_as_check_client_ip();
+        let config = parse_acf("UAG(e)\nHAG(h)\nASG(G)\nASG(DEFAULT) { RULE(1,READ) }\n").unwrap();
+        assert!(config.uag[b"e".as_slice()].is_empty());
+        assert!(config.hag[b"h".as_slice()].is_empty());
+        assert!(config.asg[b"G".as_slice()].rules.is_empty());
+        assert_eq!(config.check_access("G", "h", "u"), AccessLevel::NoAccess);
+        assert_eq!(config.check_access("DEFAULT", "h", "u"), AccessLevel::Read);
+    }
+
+    #[test]
+    fn a_non_utf8_uag_member_keeps_its_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = b"UAG(ops) { \"op\xff\" }\nASG(G) {\n    RULE(1, WRITE) { UAG(ops) }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(config.uag[b"ops".as_slice()], [b"op\xff".to_vec()]);
+        assert_eq!(
+            config.check_access("G", "h", b"op\xff"),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\u{fffd}"),
+            AccessLevel::NoAccess
+        );
+        // Unquoted, the byte is outside C's name class.
+        assert!(parse_acf(b"UAG(ops) { op\xff }\n").is_err());
+    }
+
+    /// C keys groups and compares HAG hosts by their bytes, lowercasing only
+    /// ASCII letters (`asLibRoutines.c:1233-1236`, `:378-381`).
+    #[test]
+    fn non_utf8_group_names_and_hosts_keep_their_bytes() {
+        let _guard = lock_as_check_client_ip();
+        let acf = b"HAG(\"h\xff\") { \"Lab\xc0pc\" }\n\
+                    ASG(\"g\xff\") {\n    RULE(1, WRITE) { HAG(\"h\xff\") }\n}\n";
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(config.hag[b"h\xff".as_slice()], [b"lab\xc0pc".to_vec()]);
+        assert_eq!(
+            config.check_access(b"g\xff", b"LAB\xc0PC", "u"),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("g\u{fffd}", b"lab\xc0pc", "u"),
+            AccessLevel::NoAccess
+        );
+        assert_eq!(
+            config.check_access(b"g\xff", "lab\u{fffd}pc", "u"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    /// asLib_lex.l keeps a quoted token's `\\x` pairs verbatim (`yytext+1`),
+    /// in every position a quoted token can take.
+    #[test]
+    fn quoted_tokens_keep_their_escapes_verbatim() {
+        let _guard = lock_as_check_client_ip();
+        let acf = br#"UAG("u\"g") { "op\"x", "a\\b" }
+HAG(h) { "lab\-pc" }
+ASG(G) {
+    RULE(1, WRITE) { UAG("u\"g") }
+    RULE(1, READ) { METHOD("c\"a") }
+}
+"#;
+        let config = parse_acf(acf).unwrap();
+        assert_eq!(
+            config.uag[br#"u\"g"#.as_slice()],
+            [br#"op\"x"#.to_vec(), br#"a\\b"#.to_vec()]
+        );
+        assert_eq!(config.hag[b"h".as_slice()], [br"lab\-pc".to_vec()]);
+        let rule = &config.asg[b"G".as_slice()].rules[1];
+        assert_eq!(rule.method, [br#"c\"a"#.to_vec()]);
+        assert_eq!(
+            config.check_access("G", "h", br#"op\"x"#),
+            AccessLevel::ReadWrite
+        );
+        assert_eq!(
+            config.check_access("G", "h", "op\"x"),
+            AccessLevel::NoAccess
+        );
+        // `\` before a newline is no escape: the string never closes.
+        assert!(parse_acf(b"UAG(\"a\\\n\") { x }\n").is_err());
+        assert!(parse_acf(b"UAG(a) { \"x\ny\" }\n").is_err());
+    }
+
+    /// `ascheck` (R7.0.10) on each list: one token per item, one comma
+    /// between items, and only `generic_head` may be empty.
+    #[test]
+    fn list_items_are_single_tokens_as_ascheck_reads_them() {
+        for (acf, accepted) in [
+            ("UAG(u) { a b }", false),
+            ("UAG(u) { a,,b }", false),
+            ("UAG(u) { a, }", false),
+            ("UAG(u) { }", false),
+            ("UAG(u) { \"a\" \"b\" }", false),
+            ("UAG(u) { a # c\n b }", false),
+            ("UAG(u) { a , \"b\" }", true),
+            ("ASG(G) { RULE(1,READ) { METHOD(ca x509) } }", false),
+            ("ASG(G) { RULE(1,READ) { METHOD() } }", true),
+            ("ASG(G) { RULE(1,READ) { METHOD(\"ca\", x509) } }", true),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            assert_eq!(parsed.is_ok(), accepted, "{acf}: {parsed:?}");
+        }
+    }
+
+    /// asLib.y `rule_uag_list` / `rule_hag_list`: a rule names any number of
+    /// groups in one clause, which `ascheck` accepts.
+    #[test]
+    fn a_rule_names_several_groups_in_one_clause() {
+        let config = parse_acf(
+            b"UAG(a) {x}\nUAG(b) {y}\nHAG(h) {p}\nHAG(k) {q}\n\
+              ASG(G) { RULE(1,WRITE) { UAG(a, \"b\") HAG(h,k) } }\n",
+        )
+        .unwrap();
+        let rule = &config.asg[b"G".as_slice()].rules[0];
+        assert_eq!(rule.uag, [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(rule.hag, [b"h".to_vec(), b"k".to_vec()]);
+        assert_eq!(config.check_access("G", "q", "y"), AccessLevel::ReadWrite);
+        assert!(parse_acf(b"UAG(a) {x}\nASG(G) { RULE(1,READ) { UAG() } }\n").is_err());
+        assert!(parse_acf(b"UAG(a) {x}\nASG(G) { RULE(1,READ) { UAG(a,) } }\n").is_err());
+    }
+
+    /// `ascheck` (R7.0.10) refuses a rule naming a group the file has not
+    /// defined above it, forward references included.
+    #[test]
+    fn a_rule_naming_an_undefined_group_fails_the_load() {
+        for (acf, error) in [
+            (
+                "ASG(G) { RULE(1,READ) { UAG(a) } }\nUAG(a) {x}\n",
+                "No User Access Group named 'a' defined",
+            ),
+            (
+                "ASG(G) { RULE(1,READ) { HAG(nosuch) } }\n",
+                "No Host Access Group named 'nosuch' defined",
+            ),
+            (
+                "UAG(a) {x}\nASG(G) { RULE(1,READ) { UAG(a, zz) } }\n",
+                "No User Access Group named 'zz' defined",
+            ),
+        ] {
+            let err = parse_acf(acf.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(error), "{acf}: {err}");
+        }
+        assert!(parse_acf(b"HAG(h)\nASG(G) { RULE(1,READ) { HAG(h) } }\n").is_ok());
+    }
+
+    /// `ascheck` (R7.0.10): a name is one `tokenSTRING`, and a bare run
+    /// the lexer reads as a number is not one.
+    #[test]
+    fn a_name_is_one_string_token_as_ascheck_reads_it() {
+        for (acf, accepted) in [
+            ("UAG(a,b) {x}", false),
+            ("UAG() {x}", false),
+            ("UAG(\"5\") {\"7\"}", true),
+            ("ASG(G) { INPA(5) }", false),
+            ("ASG(G) { INPA(-1.5e3) }", false),
+            ("ASG(G) { INPA(-1.5e3x) }", true),
+            ("UAG(u) { 5 }", false),
+            ("UAG(u) { 1.5 }", false),
+            ("UAG(u) { +7 }", false),
+            ("UAG(u) { .5 }", false),
+            ("UAG(u) { 5a }", true),
+            ("UAG(u) { 5. }", true),
+            ("UAG(u) { 1e5 }", true),
+            ("UAG(u) { - }", true),
+            ("HAG(h) { 10.0.0.1 }", true),
+            ("ASG(G) { RULE(1,READ) { FOO(5, 1.5) } }", true),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            assert_eq!(parsed.is_ok(), accepted, "{acf}: {parsed:?}");
+        }
+    }
+
+    /// `ascheck` (R7.0.10) on ASG and RULE bodies: no separator between
+    /// items, and an unsupported keyword takes any `generic_head` and an
+    /// optional nested block, which disables the rule.
+    #[test]
+    fn rule_and_asg_bodies_parse_as_ascheck_reads_them() {
+        for (acf, accepted) in [
+            (
+                "UAG(a) {x}\nASG(G) { RULE(1,READ) { UAG(a), UAG(a) } }",
+                false,
+            ),
+            ("UAG(a) {x}\nASG(G) { RULE(1,READ) { UAG(a); } }", false),
+            ("ASG(G) { RULE(1,READ) { , } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a,b) } }", true),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { b } } }", true),
+            ("ASG(G) { RULE(1,READ) { FOO } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO() } }", true),
+            ("ASG(G) { RULE(1,READ) { \"x\"(a) } }", true),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { BAR(c) { d } } } }", true),
+            ("ASG(G) { RULE(1,READ), RULE(1,WRITE) }", false),
+            ("ASG(G) { , }", false),
+            ("ASG(G) { FOO(a) }", false),
+            ("ASG(G) { }", false),
+            ("ASG(G) { RULE(1,READ) { } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { } } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { b, c } } }", true),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { b c } } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { B(c) d } } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { B(c) D() } } }", true),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { 5(b) } } }", false),
+            ("ASG(G) { RULE(1,READ) { FOO(a) { 5, 6 } } }", true),
+            ("ASG(G) { RULE(1,READ) { RULE(a) } }", true),
+            ("UAG(a) {x}\nASG(G) { RULE(1,READ) { \"UAG\"(a) } }", true),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            assert_eq!(parsed.is_ok(), accepted, "{acf}: {parsed:?}");
+            if let Ok(config) = parsed {
+                assert!(config.asg[b"G".as_slice()].rules[0].ignore, "{acf}");
+            }
+        }
+    }
+
+    /// `ascheck` (R7.0.10) on RULE heads: both commas and the `)` are
+    /// required, the level is an integer token kept as C's `(int)`, and the
+    /// access and log option are strings, quoted or not.
+    #[test]
+    fn rule_heads_parse_as_ascheck_reads_them() {
+        for (head, accepted) in [
+            ("RULE(1 READ)", false),
+            ("RULE(1,READ { UAG(a) }", false),
+            ("RULE(1.5,READ)", false),
+            ("RULE(1,\"READ\")", true),
+            ("RULE(1,READ,\"TRAPWRITE\")", true),
+            ("RULE(1,5)", false),
+            ("RULE(1)", false),
+            ("RULE(1,READ,)", false),
+            ("RULE(01,READ)", true),
+            ("RULE(+1,READ)", true),
+            ("RULE(256,READ)", true),
+            ("RULE(99999999999,READ)", true),
+            ("RULE(1x,READ)", false),
+            ("RULE(1,write)", true),
+            ("RULE(\"1\",READ)", false),
+            ("RULE(1,READ,TRAPWRITE,x)", false),
+        ] {
+            let parsed = parse_acf(format!("UAG(a) {{x}}\nASG(G) {{ {head} }}\n").as_bytes());
+            assert_eq!(parsed.is_ok(), accepted, "{head}: {parsed:?}");
+        }
+        let level = |head: &str| {
+            parse_acf(format!("ASG(G) {{ {head} }}\n").as_bytes())
+                .unwrap()
+                .asg[b"G".as_slice()]
+            .rules[0]
+                .level
+        };
+        assert_eq!(level("RULE(256,READ)"), 256);
+        assert_eq!(level("RULE(99999999999,READ)"), 99999999999_i64 as i32);
+    }
+
+    /// A quoted METHOD/AUTHORITY item is one token, as a UAG member is: its
+    /// spaces are bytes of it, not padding to trim.
+    #[test]
+    fn method_and_authority_items_keep_their_quoted_bytes() {
+        let config = parse_acf(
+            b"ASG(G) { RULE(1, READ) { METHOD(\" ca \", x509) AUTHORITY(\" Root \") } }\n",
+        )
+        .unwrap();
+        let rule = &config.asg[b"G".as_slice()].rules[0];
+        assert_eq!(rule.method, [b" ca ".to_vec(), b"x509".to_vec()]);
+        assert_eq!(rule.authority, [b" Root ".to_vec()]);
+    }
+
+    /// No record has a name that is not UTF-8, so such a link is a bad input;
+    /// a byte outside UTF-8 is no CALC token.
+    #[test]
+    fn a_non_utf8_inp_link_is_bad_and_a_non_utf8_calc_is_refused() {
+        let config = parse_acf(b"ASG(G) {\n    INPA(\"r\xff\")\n    RULE(1, WRITE)\n}\n").unwrap();
+        assert_eq!(config.asg[b"G".as_slice()].inp[0].link, b"r\xff");
+        assert_eq!(config.asg[b"G".as_slice()].inp_bad(), 1);
+        assert!(InpWatch::of(&config).targets.is_empty());
+        assert!(parse_acf(b"ASG(G) {\n    RULE(1, WRITE) { CALC(\"A\xff\") }\n}\n").is_err());
     }
 
     #[test]
@@ -3271,21 +4169,71 @@ ASG(DEFAULT) {
         );
     }
 
-    /// epics-base #871 (7e18b8cff): `asDump*` quotes every UAG and HAG
-    /// member through `asDumpQuoted` — `"` + `epicsStrPrintEscaped` + `"`
-    /// — so a member that needed ACF quoting (`"role/op"`, an embedded
-    /// `"`) survives the dump unambiguously instead of printing raw.
+    /// The expected text is softIoc R7.0.10 `asdbdump` and `asprules` on
+    /// this ACF with `okrec` at 1 and no `missing` record, MEMBERLIST cut.
+    /// `asDumpFP` prints members raw; only `asDumpUagFP`/`asDumpHagFP` quote.
     #[test]
-    fn dump_report_quotes_uag_and_hag_members() {
-        let cfg =
-            parse_acf("UAG(special) { someone, \"role/op\", \"a\\\"b\" }\nHAG(hosts) { HostA }\n")
-                .unwrap();
-        let dump = cfg.dump_report();
-        assert!(dump.contains("\t\"someone\"\n"), "{dump}");
-        assert!(dump.contains("\t\"role/op\"\n"), "{dump}");
-        assert!(dump.contains("\t\"a\\\"b\"\n"), "{dump}");
-        // HAG members are stored lowercased; quoted the same way.
-        assert!(dump.contains("\t\"hosta\"\n"), "{dump}");
+    fn dumps_match_c_as_dump_fp_and_as_dump_rules_fp() {
+        let cfg = parse_acf(
+            b"UAG(zops) { bob, \"role/op\" }
+UAG(aempty)
+HAG(lab) { pc1, pc2 }
+ASG(ZZ) {
+    INPA(okrec)
+    INPB(missing)
+    RULE(1, WRITE, TRAPWRITE) { UAG(zops, aempty) HAG(lab) }
+    RULE(0, READ)
+    RULE(1, WRITE) { FOO(x) }
+    RULE(1, WRITE, NOTRAPWRITE) { CALC(\"A=1\") }
+}
+ASG(BARE)
+ASG(DEFAULT) { RULE(1, READ) }
+",
+        )
+        .unwrap();
+        serve(&cfg, &[("okrec", Some(ok(1.0)))]);
+        let zz_rules = "\tRULE(1,WRITE,TRAPWRITE) {
+\t\tUAG(zops,aempty)
+\t\tHAG(lab)
+\t}
+\tRULE(0,READ,NOTRAPWRITE)
+\tRULE(1,WRITE,NOTRAPWRITE) {
+\t\tCALC(\"A=1\") result=TRUE
+\t}
+}
+";
+        let head = "ASG(BARE)\nASG(DEFAULT) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\nASG(ZZ) {\n";
+        assert_eq!(
+            String::from_utf8(cfg.dump_report()).unwrap(),
+            format!(
+                "UAG(aempty)\nUAG(zops) {{bob,role/op}}\nHAG(lab) {{pc1,pc2}}\n{head}\
+                 \tINPA(okrec)   VALID value=1.000000\n\
+                 \tINPB(missing) INVALID value=0.000000\n{zz_rules}"
+            )
+        );
+        assert_eq!(
+            String::from_utf8(cfg.dump_rules(None)).unwrap(),
+            format!(
+                "{head}\tINPA(okrec) value=1.000000\n\
+                 \tINPB(missing) INVALID value=0.000000\n{zz_rules}"
+            )
+        );
+        assert_eq!(cfg.dump_rules(Some(b"NONE")), b"");
+        // The CALC result is the published one: FALSE until A delivers.
+        let fresh =
+            parse_acf(b"ASG(ZZ) { INPA(okrec) RULE(1, WRITE) { CALC(\"A=1\") } }\n").unwrap();
+        let off = String::from_utf8(fresh.dump_rules(Some(b"ZZ"))).unwrap();
+        assert!(off.contains("CALC(\"A=1\") result=FALSE"), "{off}");
+    }
+
+    /// softIoc R7.0.10 on an ACF with neither UAG nor ASG lines.
+    #[test]
+    fn dump_report_names_an_empty_list_as_c_does() {
+        let cfg = parse_acf(b"HAG(h) { a }\n").unwrap();
+        assert_eq!(
+            String::from_utf8(cfg.dump_report()).unwrap(),
+            "No UAGs\nHAG(h) {a}\nASG(DEFAULT)\n"
+        );
     }
 
     // ----- epics-base PR #563/#618: METHOD / AUTHORITY -----
@@ -3302,10 +4250,10 @@ ASG(SECURE) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        let asg = &config.asg["SECURE"];
+        let asg = &config.asg[b"SECURE".as_slice()];
         assert_eq!(asg.rules.len(), 2);
-        assert_eq!(asg.rules[0].method, vec!["ca", "x509"]);
-        assert_eq!(asg.rules[0].authority, vec!["ANL CA"]);
+        assert_eq!(asg.rules[0].method, bs(&["ca", "x509"]));
+        assert_eq!(asg.rules[0].authority, bs(&["ANL CA"]));
         assert!(
             asg.rules[1].method.is_empty(),
             "READ rule must not inherit METHOD list",
@@ -3429,7 +4377,7 @@ ASG(MIXED_CASE) {
     /// raises it on a matching RULE — an empty rule list never raises.
     #[test]
     fn empty_rule_asg_denies_access() {
-        let config = parse_acf("ASG(LOCKED) { }").unwrap();
+        let config = parse_acf("ASG(LOCKED)").unwrap();
         assert_eq!(
             config.check_access("LOCKED", "host", "user"),
             AccessLevel::NoAccess,
@@ -3444,7 +4392,7 @@ ASG(MIXED_CASE) {
         let config = parse_acf("UAG(ops) { alice }").unwrap();
         // `DEFAULT` is auto-synthesised by parse_acf (C asInitialize
         // always calls asAsgAdd("DEFAULT")) and has no rules.
-        assert!(config.asg.contains_key("DEFAULT"));
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
         assert_eq!(
             config.check_access("TYPO", "host", "alice"),
             AccessLevel::NoAccess,
@@ -3482,11 +4430,11 @@ ASG(MIXED_CASE) {
             // Accepted the sign, then nothing.
             ("ASG(G) { RULE(-abc, READ) }", "-abc"),
             // Accepted nothing; the token is pure punctuation.
-            ("ASG(G) { RULE(1, READ, %%%) }", "%%%"),
+            ("ASG(G) { RULE(1, READ, ;;;) }", ";;;"),
             // Accepted the whole word — unchanged by the fix.
             ("ASG(G) { RULE(1, READ, trapwrite) }", "trapwrite"),
             // Accepted a prefix, then hit a character it could not take.
-            ("ASG(G) { RULE(1, READ, TRAP%WRITE) }", "TRAP%WRITE"),
+            ("ASG(G) { RULE(1, READ, TRAP;WRITE) }", "TRAP;WRITE"),
         ] {
             let e = parse_acf(acf).unwrap_err().to_string();
             assert!(
@@ -3495,9 +4443,15 @@ ASG(MIXED_CASE) {
             );
         }
 
+        // `%` is no token at all: the lexer refuses it before any rule.
+        let e = parse_acf("ASG(G) { RULE(1, READ, TRAP%WRITE) }")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Invalid character '%'"), "{e:?}");
+
         // A pathological run does not put the whole file on the console.
         let long = "z".repeat(4096);
-        let e = parse_acf(&format!("ASG(G) {{ RULE({long}, READ) }}"))
+        let e = parse_acf(format!("ASG(G) {{ RULE({long}, READ) }}"))
             .unwrap_err()
             .to_string();
         assert!(e.contains('…') && e.len() < 200, "uncapped quote: {e:?}");
@@ -3523,7 +4477,7 @@ ASG(MIXED_CASE) {
             (
                 "UAG(a) { x }\n\nUAG(my group) { b }\n",
                 3,
-                "whitespace inside",
+                "syntax error at 'g'",
             ),
             ("ASG(G) {\n  RULE(-1, READ)\n}\n", 2, "must be positive"),
             (
@@ -3531,7 +4485,7 @@ ASG(MIXED_CASE) {
                 2,
                 "TRAPWRITE or NOTRAPWRITE",
             ),
-            ("UAG(a) { x }\n}\n", 2, "top-level block keyword"),
+            ("UAG(a) { x }\n}\n", 2, "syntax error at '}'"),
         ] {
             let e = parse_acf(acf).unwrap_err().to_string();
             assert!(
@@ -3546,8 +4500,8 @@ ASG(MIXED_CASE) {
         // report 7 where the operator needs 1.
         let tail = "\n\n\n\n\n";
         for (acf, line, needle) in [
-            (format!("UAG(a{tail}"), 1, "missing ')'"),
-            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted name"),
+            (format!("UAG(a{tail}"), 1, "unterminated '('"),
+            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted string"),
             (format!("UAG(a) {{ x{tail}"), 1, "unterminated '{'"),
             (
                 format!("UAG(a) {{ \"unterminated{tail}"),
@@ -3559,7 +4513,7 @@ ASG(MIXED_CASE) {
                 1,
                 "unterminated ASG",
             ),
-            (format!("BOGUS{tail}"), 1, "unexpected token 'BOGUS'"),
+            (format!("BOGUS{tail}"), 1, "expected '(' after 'BOGUS'"),
             (
                 // The CALC is on line 3; the rule body closes on line 4 and
                 // the ASG on line 5.
@@ -3612,6 +4566,7 @@ ASG(MIXED_CASE) {
             hag_raw: HashMap::new(),
             asg: HashMap::new(),
             unknown_access: AccessLevel::Read,
+            load: LoadId::default(),
         };
         assert_eq!(
             config.check_access("WHATEVER", "host", "user"),
@@ -3632,17 +4587,65 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// A misspelled access keyword disables the rule (C warns and
-    /// drops it) — it must not silently become a READ rule.
+    /// A misspelled access keyword adds no rule, and its clauses go to the
+    /// last rule made anywhere above it, as C's `yyAsgRule` (CBUG-Q1). The
+    /// expected text is softIoc R7.0.10 `asprules` on each ACF.
     #[test]
-    fn rule_unsupported_access_keyword_is_inert() {
-        let config = parse_acf("ASG(B) { RULE(0, WRIET) }").unwrap();
-        assert_eq!(config.asg["B"].rules.len(), 1);
-        assert!(config.asg["B"].rules[0].ignore, "bad keyword ⇒ inert rule");
+    fn an_unsupported_access_keyword_adds_no_rule_and_feeds_the_previous_one() {
+        for (acf, asprules) in [
+            (
+                "UAG(u){x}\nASG(g){RULE(1,READ) RULE(1,FOO){UAG(u)}}",
+                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tUAG(u)\n\t}\n}\n",
+            ),
+            (
+                "ASG(g){RULE(1,READ) RULE(1,FOO,TRAPWRITE)}",
+                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,TRAPWRITE)\n}\n",
+            ),
+            (
+                "UAG(u){x}\nASG(A){RULE(1,READ)}\nASG(B){RULE(1,FOO){UAG(u)}}",
+                "ASG(A) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tUAG(u)\n\t}\n}\nASG(B)\nASG(DEFAULT)\n",
+            ),
+            ("ASG(g){RULE(1,FOO){UAG(nope)}}", "ASG(DEFAULT)\nASG(g)\n"),
+            (
+                "ASG(DEFAULT){RULE(1,FOO)}\nASG(DEFAULT){RULE(1,READ)}",
+                "ASG(DEFAULT) {\n\tRULE(1,READ,NOTRAPWRITE)\n}\n",
+            ),
+            (
+                "ASG(g){RULE(1,READ) RULE(1,FOO){FOO(x)}}",
+                "ASG(DEFAULT)\nASG(g) {\n}\n",
+            ),
+            (
+                "ASG(g){RULE(1,READ) RULE(1,FOO){CALC(\"A\")}}",
+                "ASG(DEFAULT)\nASG(g) {\n\tRULE(1,READ,NOTRAPWRITE) {\n\t\tCALC(\"A\") result=FALSE\n\t}\n}\n",
+            ),
+            (
+                "ASG(g){RULE(1,FOO){CALC(\"A>\")}}",
+                "ASG(DEFAULT)\nASG(g)\n",
+            ),
+        ] {
+            let config =
+                parse_acf(format!("{acf}\n").as_bytes()).unwrap_or_else(|e| panic!("{acf}: {e}"));
+            let dump = config.dump_rules(None);
+            assert_eq!(String::from_utf8(dump).unwrap(), asprules, "{acf}");
+        }
+        // The READ rule now needs UAG(u): a stranger is denied.
+        let config = parse_acf("UAG(u){x}\nASG(g){RULE(1,READ) RULE(1,FOO){UAG(u)}}").unwrap();
         assert_eq!(
-            config.check_access("B", "host", "user"),
+            config.check_access("g", "h", "stranger"),
             AccessLevel::NoAccess
         );
+        assert_eq!(config.check_access("g", "h", "x"), AccessLevel::Read);
+        // `ascheck` refuses these: no rule to disable, or a clause reaching a
+        // previous rule that then fails as it would on that rule.
+        for acf in [
+            "ASG(g){RULE(1,FOO){METHOD(\"x\")}}",
+            "ASG(g){RULE(1,FOO){FOO(x)}}",
+            "ASG(g){RULE(1,FOO,BOGUS)}",
+            "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){UAG(nope)}}",
+            "ASG(g){RULE(1,READ)}\nASG(h){RULE(1,FOO){CALC(\"A>\")}}",
+        ] {
+            assert!(parse_acf(format!("{acf}\n").as_bytes()).is_err(), "{acf}");
+        }
     }
 
     // ----- RULE level validation -----
@@ -3700,7 +4703,7 @@ ASG(DEFAULT) { RULE(1, READ) }
     fn unknown_block_bare_head_parses_ok() {
         let acf = "VENDOR(x) ASG(DEFAULT) { RULE(1, READ) }";
         let config = parse_acf(acf).expect("bare unknown-block head must warn-and-continue");
-        assert!(config.asg.contains_key("DEFAULT"));
+        assert!(config.asg.contains_key(b"DEFAULT".as_slice()));
     }
 
     /// Genuine garbage — a bare token where a top-level block keyword
@@ -3776,6 +4779,209 @@ ASG(DEFAULT) { RULE(1, READ) }
         assert!(parse_acf("VENDOR(x) { unterminated").is_err());
     }
 
+    /// `ascheck` (R7.0.10) reads METHOD and AUTHORITY as C base's
+    /// `rule_generic_block_elem`: a `generic_head`, then an optional
+    /// `generic_block`, which the rule does not keep.
+    #[test]
+    fn method_and_authority_take_a_generic_block_as_ascheck_does() {
+        for (acf, method, authority) in [
+            (
+                "ASG(g){RULE(1,READ){METHOD(\"a\"){b,c}}}",
+                vec!["a"],
+                vec![],
+            ),
+            (
+                "ASG(g){RULE(1,WRITE){METHOD(\"ca\"){x}}}",
+                vec!["ca"],
+                vec![],
+            ),
+            (
+                "ASG(g){RULE(1,READ){AUTHORITY(\"a\"){b}}}",
+                vec![],
+                vec!["a"],
+            ),
+            (
+                "ASG(g){RULE(1,READ){METHOD(\"a\"){X(y) Z()}}}",
+                vec!["a"],
+                vec![],
+            ),
+        ] {
+            let config =
+                parse_acf(format!("{acf}\n").as_bytes()).unwrap_or_else(|e| panic!("{acf}: {e}"));
+            let rule = &config.asg[b"g".as_slice()].rules[0];
+            assert_eq!(rule.method, bs(&method), "{acf}");
+            assert_eq!(rule.authority, bs(&authority), "{acf}");
+        }
+        for acf in [
+            "ASG(g){RULE(1,READ){METHOD}}",
+            "ASG(g){RULE(1,READ){METHOD(\"a\"){}}}",
+        ] {
+            assert!(parse_acf(format!("{acf}\n").as_bytes()).is_err(), "{acf}");
+        }
+    }
+
+    /// `ascheck` (R7.0.10): `UAG`, `HAG`, `ASG`, `RULE`, `CALC` and `INP<A-U>`
+    /// lex as keywords, so every place asLib.y wants a `tokenSTRING` refuses
+    /// them with a syntax error, while a generic element or a quoted string
+    /// takes them.
+    #[test]
+    fn keywords_are_refused_where_a_name_is_wanted_as_ascheck_does() {
+        for (acf, refused_at) in [
+            ("ASG(HAG){RULE(1,READ)}", Some("HAG")),
+            ("ASG(g){RULE(1,READ){CALC(INPA)}}", Some("INPA")),
+            ("FOO(x){UAG(y) RULE(z){a}}", None),
+            ("FOO(UAG,RULE,INPA)", None),
+            ("HAG(h){ASG}", Some("ASG")),
+            ("ASG(g){INPA(CALC)}", Some("CALC")),
+            ("ASG(g){RULE(1,READ){METHOD(UAG)}}", None),
+            ("ASG(g){RULE(1,RULE)}", Some("RULE")),
+            ("ASG(g){RULE(1,READ){ASG(x)}}", None),
+            ("ASG(g){RULE(1,READ){FOO(x){UAG(y)}}}", None),
+            ("ASG(g){RULE(1,READ){INPA(x)}}", None),
+            ("ASG(g){RULE(1,READ,UAG)}", Some("UAG")),
+            ("UAG(a){x}\nASG(g){RULE(1,READ){UAG(UAG)}}", Some("UAG")),
+            ("UAG(a){\"RULE\"}", None),
+            ("UAG(UAG){x}", Some("UAG")),
+            ("UAG(CALC){x}", Some("CALC")),
+            ("UAG(INPA){x}", Some("INPA")),
+            ("UAG(INPV){x}", None),
+            ("UAG(RULE){x}", Some("RULE")),
+            ("UAG(a){RULE}", Some("RULE")),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            match refused_at {
+                None => assert!(parsed.is_ok(), "{acf}: {parsed:?}"),
+                Some(k) => {
+                    let e = parsed.unwrap_err().to_string();
+                    assert!(e.contains(&format!("syntax error at '{k}'")), "{acf}: {e}");
+                }
+            }
+        }
+    }
+
+    /// `ascheck` (R7.0.10) on `CALC '(' tokenSTRING ')'`: one string token,
+    /// quoted or bare, kept as written.
+    #[test]
+    fn a_calc_expression_is_one_string_token_as_ascheck_reads_it() {
+        for (clause, expr) in [
+            ("CALC(\"A\")", Some("A")),
+            ("CALC(A)", Some("A")),
+            ("CALC( \"A\" )", Some("A")),
+            ("CALC(\"A\",\"B\")", None),
+            ("CALC()", None),
+            ("CALC(\" A \")", Some(" A ")),
+            ("CALC(A>1)", Some("A>1")),
+            ("CALC(A+1)", Some("A+1")),
+            ("CALC(5)", None),
+            ("CALC(A B)", None),
+            ("CALC", None),
+        ] {
+            let acf = format!("ASG(G) {{ INPA(r) RULE(1,READ) {{ {clause} }} }}\n");
+            let parsed = parse_acf(acf.as_bytes());
+            match expr {
+                None => assert!(parsed.is_err(), "{clause}: {parsed:?}"),
+                Some(e) => {
+                    let config = parsed.unwrap_or_else(|err| panic!("{clause}: {err}"));
+                    let rule = &config.asg[b"G".as_slice()].rules[0];
+                    assert_eq!(rule.calc.as_deref(), Some(e.as_bytes()), "{clause}");
+                }
+            }
+        }
+    }
+
+    /// `ascheck` (R7.0.10): `asUagAdd`, `asHagAdd` and `asAsgAdd` refuse a
+    /// name already defined, except a `DEFAULT` ASG with no INP or RULE yet.
+    #[test]
+    fn a_group_name_defined_twice_fails_the_load() {
+        for (acf, error) in [
+            (
+                "UAG(a) {x}\nUAG(a) {y}",
+                Some("Duplicate User Access Group named 'a'"),
+            ),
+            (
+                "UAG(a)\nUAG(a)",
+                Some("Duplicate User Access Group named 'a'"),
+            ),
+            (
+                "HAG(h) {x}\nHAG(h) {y}",
+                Some("Duplicate Host Access Group named 'h'"),
+            ),
+            (
+                "ASG(G)\nASG(G)",
+                Some("Duplicate Access Security Group named 'G'"),
+            ),
+            ("ASG(DEFAULT)\nASG(DEFAULT)", None),
+            (
+                "ASG(DEFAULT) {RULE(1,READ)}\nASG(DEFAULT)",
+                Some("Duplicate Access Security Group named 'DEFAULT'"),
+            ),
+            ("ASG(DEFAULT)\nASG(DEFAULT) {RULE(1,READ)}", None),
+            (
+                "ASG(DEFAULT) {INPA(x)}\nASG(DEFAULT)",
+                Some("Duplicate Access Security Group named 'DEFAULT'"),
+            ),
+            (
+                "ASG(DEFAULT) {RULE(1,READ) {FOO(a)}}\nASG(DEFAULT)",
+                Some("Duplicate Access Security Group named 'DEFAULT'"),
+            ),
+            ("UAG(a) {x,x}", None),
+            ("UAG(a) {x}\nHAG(a) {y}\nASG(a)", None),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            match error {
+                None => assert!(parsed.is_ok(), "{acf}: {parsed:?}"),
+                Some(e) => {
+                    let got = parsed.unwrap_err().to_string();
+                    assert!(
+                        got.contains("ACF line 2:") && got.contains(e),
+                        "{acf}: {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `ascheck` (R7.0.10) on top-level items: any string but RULE, CALC and
+    /// `INP<A-U>` names a `generic_item`, whose head is mandatory, whose
+    /// block is not empty, and whose second block follows only a one-element
+    /// first block and holds a list.
+    #[test]
+    fn top_level_items_parse_as_ascheck_reads_them() {
+        for (acf, accepted) in [
+            ("FOO(a)", true),
+            ("FOO(a) {b}", true),
+            ("\"x\"(a)", true),
+            ("-x(a)", true),
+            ("FOO", false),
+            ("5(a)", false),
+            ("FOO() {}", false),
+            ("FOO(a) {}", false),
+            ("RULE(a)", false),
+            ("INPA(a)", false),
+            ("CALC(a)", false),
+            ("FOO(a) {b} {c,d}", true),
+            ("FOO(a) {b} {c}", false),
+            ("FOO(a) {b,c} {d,e}", false),
+            ("FOO(a) {B(x)} {c,d}", false),
+            ("FOO(a) {b} {c,d} {e,f}", false),
+            ("FOO(a)(b)", false),
+            ("FOO()", true),
+            ("FOO(1,2.5,UAG,\"q\")", true),
+            ("FOO(a) {X(1) Y() {z}}", true),
+            ("\"UAG\"(a) {b}", true),
+            ("INPAB(a)", true),
+            ("INPV(a)", true),
+            ("FOO(a) {b} ASG(G)", true),
+            (",", false),
+            ("FOO(a,)", false),
+            ("\"x\" {a}", false),
+            ("FOO(a) {b} {c,}", false),
+        ] {
+            let parsed = parse_acf(format!("{acf}\n").as_bytes());
+            assert_eq!(parsed.is_ok(), accepted, "{acf}: {parsed:?}");
+        }
+    }
+
     // ----- HAG host matching is case-insensitive -----
 
     #[test]
@@ -3812,15 +5018,21 @@ ASG(C) {
     fn rule_trapwrite_log_option_parses() {
         let config =
             parse_acf("ASG(T) { RULE(1, WRITE, TRAPWRITE) RULE(1, READ, NOTRAPWRITE) }").unwrap();
-        assert_eq!(config.asg["T"].rules.len(), 2);
-        assert_eq!(config.asg["T"].rules[0].access, RuleAccess::Write);
+        assert_eq!(config.asg[b"T".as_slice()].rules.len(), 2);
+        assert_eq!(
+            config.asg[b"T".as_slice()].rules[0].access,
+            RuleAccess::Write
+        );
         assert!(
-            config.asg["T"].rules[0].trap,
+            config.asg[b"T".as_slice()].rules[0].trap,
             "TRAPWRITE must set the trap mask"
         );
-        assert_eq!(config.asg["T"].rules[1].access, RuleAccess::Read);
+        assert_eq!(
+            config.asg[b"T".as_slice()].rules[1].access,
+            RuleAccess::Read
+        );
         assert!(
-            !config.asg["T"].rules[1].trap,
+            !config.asg[b"T".as_slice()].rules[1].trap,
             "NOTRAPWRITE must clear the trap mask"
         );
     }
@@ -3879,7 +5091,7 @@ ASG(C) {
 ASG(TRAPPED)   { RULE(0, WRITE, TRAPWRITE) }
 ASG(UNTRAPPED) { RULE(0, WRITE, NOTRAPWRITE) }
 ASG(PLAIN)     { RULE(0, WRITE) }
-ASG(LOCKED)    { }
+ASG(LOCKED)
 "#,
         )
         .unwrap();
@@ -3945,7 +5157,7 @@ ASG(LOCKED)    { }
     #[test]
     fn calc_rule_is_conditionally_active_and_fails_closed_without_resolver() {
         let config = parse_acf(r#"ASG(G) { INPA("ref") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
-        let rule = &config.asg["G"].rules[0];
+        let rule = &config.asg[b"G".as_slice()].rules[0];
         assert!(rule.calc.is_some(), "CALC clause must be parsed and stored");
         // a CALC rule is no longer hard-disabled — it is
         // conditionally active and gated at check time.
@@ -3974,57 +5186,253 @@ ASG(LOCKED)    { }
             "#,
         )
         .expect("parse");
+        let targets: Vec<_> = InpWatch::of(&cfg)
+            .targets
+            .into_iter()
+            .map(|t| (t.record, t.field))
+            .collect();
         assert_eq!(
-            cfg.inp_link_targets(),
+            targets,
             vec![
-                ("gate".to_string(), "RVAL".to_string()),
                 ("gate".to_string(), "VAL".to_string()),
+                ("gate".to_string(), "RVAL".to_string()),
                 ("other".to_string(), "SEVR".to_string()),
             ],
             "`gate` is read by both groups but is one subscription"
         );
     }
 
-    /// with an `INP*` resolver installed, a CALC-gated rule
-    /// grants when the expression is true, denies when false, denies on
-    /// a bad input, and denies when no resolver is installed.
+    /// softIoc R7.0.10 with `okrec` at 1: `asprules` prints `CALC("1")
+    /// result=FALSE` and `CALC("A") result=TRUE`, and `cainfo` reports
+    /// "read, no write". A CALC reading no input is never recomputed.
     #[epics_macros_rs::epics_test]
-    async fn calc_gated_rule_evaluates_against_inp_resolver() {
+    async fn a_calc_reading_no_input_never_grants() {
         use std::sync::Arc;
-        let cfg =
-            parse_acf(r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#).unwrap();
+        let cfg = parse_acf(
+            br#"ASG(g) { INPA(okrec) RULE(1,WRITE){CALC("1")} RULE(1,READ){CALC("A")} }"#,
+        )
+        .unwrap();
+        serve(&cfg, &[("okrec", Some(ok(1.0)))]);
+        let dump = String::from_utf8(cfg.dump_rules(Some(b"g"))).unwrap();
+        assert!(dump.contains("CALC(\"1\") result=FALSE"), "{dump}");
+        assert!(dump.contains("CALC(\"A\") result=TRUE"), "{dump}");
+
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg));
+        let asg_resolver: AsgAslResolver =
+            Arc::new(|_name| Box::pin(async { ("g".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell, asg_resolver);
+        let access = gate.check("r", "h", "u", "ca", "").await;
+        assert!(access.allows_read() && !access.allows_write(), "{access:?}");
+    }
+
+    /// C runs a CALC only when `inpChanged & inpUsed` (`asLibRoutines.c:966`),
+    /// and `asCa.c:160` sets `inpChanged` only for a declared INP that
+    /// delivered a value. softIoc R7.0.10 `cainfo`: no read for the first two,
+    /// and `asprules` prints `result=FALSE` for all three.
+    #[epics_macros_rs::epics_test]
+    async fn a_calc_reading_only_undeclared_or_undelivered_inputs_never_runs() {
+        use std::sync::Arc;
+        for acf in [
+            r#"ASG(DEFAULT) { INPA(rv:ai) RULE(1,READ) { CALC("B<1") } }"#,
+            r#"ASG(DEFAULT) { RULE(1,READ) { CALC("A<1") } }"#,
+            r#"ASG(DEFAULT) { INPA(nope:pv) RULE(1,READ) { CALC("A<1") } }"#,
+        ] {
+            let cfg = parse_acf(acf).unwrap();
+            serve(&cfg, &[("rv:ai", Some(ok(5.0)))]);
+            let dump = String::from_utf8(cfg.dump_rules(None)).unwrap();
+            assert!(dump.contains("result=FALSE"), "{acf}: {dump}");
+
+            let cell = crate::server::access_security::new_acf_cell(Some(cfg));
+            let asg_resolver: AsgAslResolver =
+                Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+            let gate = AccessGate::required(cell, asg_resolver);
+            let access = gate.check("q", "h", "u", "ca", "").await;
+            assert!(!access.allows_read(), "{acf}: {access:?}");
+        }
+    }
+
+    /// Records `(name, VAL, SEVR)` in a database the `INP*` links read; the
+    /// watcher's attach pass delivers each existing one. Returns `asprules`
+    /// and whether `DEFAULT` grants read.
+    async fn inp_case(
+        acf: &str,
+        records: &[(&str, f64, crate::server::record::AlarmSeverity)],
+    ) -> (String, bool) {
+        use crate::server::database::PvDatabase;
+        use std::sync::Arc;
+        let db = Arc::new(PvDatabase::new());
+        for &(name, value, sevr) in records {
+            db.add_record(
+                name,
+                Box::new(crate::server::records::ai::AiRecord::new(value)),
+            )
+            .await
+            .unwrap();
+            db.get_record(name).unwrap().write().common.sevr = sevr;
+        }
+        let cfg = parse_acf(acf).unwrap();
+        InpWatch::of(&cfg).attach(&db, &cfg);
+        let dump = String::from_utf8(cfg.dump_rules(None)).unwrap();
+        let cell = crate::server::access_security::new_acf_cell(Some(cfg));
+        let asg_resolver: AsgAslResolver =
+            Arc::new(|_name| Box::pin(async { ("DEFAULT".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell, asg_resolver);
+        let read = gate.check("r", "h", "u", "ca", "").await.allows_read();
+        (dump, read)
+    }
+
+    /// `asCa.c:149-151`: a value delivered at INVALID marks the input bad and
+    /// is not stored, but still sets `inpChanged`, so the CALC runs on the old
+    /// value and the rule denies (`asLibRoutines.c:1049`). softIoc R7.0.10
+    /// with `q` a UDF ai: `INPA(q) INVALID value=0.000000`,
+    /// `CALC("A<1") result=TRUE`, and `cainfo` reports no read.
+    #[epics_macros_rs::epics_test]
+    async fn an_inp_delivered_at_invalid_is_bad_and_denies() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(q) RULE(1,READ) { CALC("A<1") } }"#,
+            &[("q", 5.0, AlarmSeverity::Invalid)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(q) INVALID value=0.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A<1\") result=TRUE"), "{dump}");
+        assert!(!read);
+    }
+
+    /// A link that never resolves delivers nothing (`asCa.c:133-162` runs only
+    /// on an event), so a second `INPA` naming a missing PV leaves the bad bit
+    /// the first one's delivery cleared. softIoc R7.0.10, `rv:ai` at 5: read,
+    /// both lines `value=5.000000` with no INVALID, `result=TRUE`.
+    #[epics_macros_rs::epics_test]
+    async fn an_unresolved_duplicate_input_is_no_event() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(rv:ai) INPA(nope:pv) RULE(1,READ) { CALC("A>1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(rv:ai) value=5.000000\n\tINPA(nope:pv) value=5.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A>1\") result=TRUE"), "{dump}");
+        assert!(read);
+    }
+
+    /// A good delivery clears the input's bad bit (`asCa.c:154`), so a
+    /// missing PV listed first under the same letter does not keep it bad.
+    /// softIoc R7.0.10, `rv:ai` at 5: read, both lines `value=5.000000`.
+    #[epics_macros_rs::epics_test]
+    async fn a_good_delivery_clears_the_bad_bit_whatever_the_order() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(nope:pv) INPA(rv:ai) RULE(1,READ) { CALC("A>1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPA(nope:pv) value=5.000000\n\tINPA(rv:ai) value=5.000000\n"),
+            "{dump}"
+        );
+        assert!(read);
+    }
+
+    /// With nothing processed, each channel's first event arrives in
+    /// `asCaTask`'s add order (`asCa.c:178-200`), so of two inputs on one
+    /// letter the one listed last holds the value. softIoc R7.0.10, `a1` at 1
+    /// and `a2` at 2 with no PINI: `value=2.000000` on both lines, and
+    /// `value=1.000000` with the listing reversed.
+    #[epics_macros_rs::epics_test]
+    async fn two_first_readings_on_one_letter_follow_the_listing() {
+        use crate::server::record::AlarmSeverity;
+        let records = [
+            ("a1", 1.0, AlarmSeverity::NoAlarm),
+            ("a2", 2.0, AlarmSeverity::NoAlarm),
+        ];
+        for (acf, want) in [
+            (
+                r#"ASG(DEFAULT) { INPA(a1) INPA(a2) RULE(1,READ) { CALC("A>1") } }"#,
+                "2",
+            ),
+            (
+                r#"ASG(DEFAULT) { INPA(a2) INPA(a1) RULE(1,READ) { CALC("A>1") } }"#,
+                "1",
+            ),
+        ] {
+            let (dump, _) = inp_case(acf, &records).await;
+            for line in ["\tINPA(a1)", "\tINPA(a2)"] {
+                assert!(
+                    dump.contains(&format!("{line} value={want}.000000\n")),
+                    "{dump}"
+                );
+            }
+        }
+    }
+
+    /// Only INVALID makes a delivery bad (`asCa.c:149`): an input in MINOR or
+    /// MAJOR alarm is stored and grants. softIoc R7.0.10 with the ai at 5 in a
+    /// HIGH alarm of either severity: read, `INPA(..) value=5.000000`.
+    #[epics_macros_rs::epics_test]
+    async fn a_minor_or_major_input_stays_good() {
+        use crate::server::record::AlarmSeverity;
+        for sevr in [AlarmSeverity::Minor, AlarmSeverity::Major] {
+            let (dump, read) = inp_case(
+                r#"ASG(DEFAULT) { INPA(alm) RULE(1,READ) { CALC("A>1") } }"#,
+                &[("alm", 5.0, sevr)],
+            )
+            .await;
+            assert!(
+                dump.contains("\tINPA(alm) value=5.000000\n"),
+                "{sevr:?}: {dump}"
+            );
+            assert!(read, "{sevr:?}");
+        }
+    }
+
+    /// `asCa.c:183` starts every declared input bad, so an input that never
+    /// delivers still disables the rules reading it. softIoc R7.0.10:
+    /// `INPB(nope:pv) INVALID value=0.000000`, `result=TRUE`, no read.
+    #[epics_macros_rs::epics_test]
+    async fn a_declared_input_that_never_delivers_is_bad() {
+        use crate::server::record::AlarmSeverity;
+        let (dump, read) = inp_case(
+            r#"ASG(DEFAULT) { INPA(rv:ai) INPB(nope:pv) RULE(1,READ) { CALC("A>1&&B<1") } }"#,
+            &[("rv:ai", 5.0, AlarmSeverity::NoAlarm)],
+        )
+        .await;
+        assert!(
+            dump.contains("\tINPB(nope:pv) INVALID value=0.000000\n"),
+            "{dump}"
+        );
+        assert!(dump.contains("CALC(\"A>1&&B<1\") result=TRUE"), "{dump}");
+        assert!(!read);
+    }
+
+    /// A CALC-gated rule grants while the published result is true, denies
+    /// when it is false, when its input disconnects, and before any delivery.
+    #[epics_macros_rs::epics_test]
+    async fn calc_gated_rule_follows_the_published_state() {
+        use std::sync::Arc;
+        let acf = r#"ASG(OPS) { INPA("permit.VAL") RULE(1, WRITE) { CALC("A=1") } }"#;
+        let cfg = parse_acf(acf).unwrap();
         let cell = crate::server::access_security::new_acf_cell(Some(cfg));
         let asg_resolver: AsgAslResolver =
             Arc::new(|_name| Box::pin(async { ("OPS".to_string(), 0u8) }));
+        let gate = AccessGate::required(cell.clone(), asg_resolver);
+        let writes = || async { gate.check("x", "h", "u", "ca", "").await.allows_write() };
+        let cfg = cell.load_full().unwrap();
 
-        let grant = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
-            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(1.0) })),
-        );
-        assert!(
-            grant.check("x", "h", "u", "ca", "").await.allows_write(),
-            "CALC A=1 with permit=1 grants WRITE"
-        );
-
-        let deny = AccessGate::required(cell.clone(), asg_resolver.clone()).with_inp_resolver(
-            Arc::new(|link: String| Box::pin(async move { (link == "permit.VAL").then_some(0.0) })),
-        );
-        assert!(
-            !deny.check("x", "h", "u", "ca", "").await.allows_write(),
-            "CALC A=1 with permit=0 denies WRITE"
-        );
-
-        let bad = AccessGate::required(cell.clone(), asg_resolver.clone())
-            .with_inp_resolver(Arc::new(|_link: String| Box::pin(async move { None })));
-        assert!(
-            !bad.check("x", "h", "u", "ca", "").await.allows_write(),
-            "a bad/disconnected INP denies the CALC-gated rule"
-        );
-
-        let none = AccessGate::required(cell, asg_resolver);
-        assert!(
-            !none.check("x", "h", "u", "ca", "").await.allows_write(),
-            "no INP resolver installed → CALC rule fails closed"
-        );
+        assert!(!writes().await, "no delivery yet: INPA is bad");
+        serve(&cfg, &[("permit", Some(ok(1.0)))]);
+        assert!(writes().await, "CALC A=1 with permit=1 grants WRITE");
+        serve(&cfg, &[("permit", Some(ok(0.0)))]);
+        assert!(!writes().await, "CALC A=1 with permit=0 denies WRITE");
+        serve(&cfg, &[("permit", Some(ok(1.0)))]);
+        serve(&cfg, &[("permit", None)]);
+        assert!(!writes().await, "a disconnected INP denies the rule");
     }
 
     /// a `role/<name>` UAG member matches a client that holds
@@ -4035,13 +5443,13 @@ ASG(LOCKED)    { }
             parse_acf(r#"UAG(special) { "role/op" } ASG(G) { RULE(1, WRITE) { UAG(special) } }"#)
                 .unwrap();
         let (lvl, _) =
-            cfg.compute_for_name("G", "h", "acct", &["op".to_string()], 0, "ca", "", None);
+            cfg.compute_for_name("G", "h", "acct", &["op".to_string().into()], 0, "ca", "");
         assert_eq!(
             lvl,
             AccessLevel::ReadWrite,
             "role/op member matches a client holding role 'op'"
         );
-        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "", None);
+        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "");
         assert_eq!(
             lvl_none,
             AccessLevel::NoAccess,
@@ -4069,12 +5477,12 @@ ASG(G) {
 }
 "#;
         let config = parse_acf(acf).unwrap();
-        let inp = &config.asg["G"].inp;
+        let inp = &config.asg[b"G".as_slice()].inp;
         assert_eq!(inp.len(), 2);
         assert_eq!(inp[0].index, 0);
-        assert_eq!(inp[0].link, "rec1.VAL");
+        assert_eq!(inp[0].link, b"rec1.VAL");
         assert_eq!(inp[1].index, 2);
-        assert_eq!(inp[1].link, "rec3.VAL");
+        assert_eq!(inp[1].link, b"rec3.VAL");
     }
 
     #[test]
@@ -4110,7 +5518,7 @@ ASG(G) {
     #[test]
     fn paren_name_accepts_quoted_form() {
         let config = parse_acf(r#"UAG("my group") { x }"#).unwrap();
-        assert!(config.uag.contains_key("my group"));
+        assert!(config.uag.contains_key(b"my group".as_slice()));
     }
 
     /// ASL gate still works: a low-level WRITE rule does not apply to
@@ -4143,7 +5551,7 @@ ASG(G) {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = events.clone();
         let handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
-            if msg.pv_name == pv {
+            if msg.pv_name == pv.as_bytes() {
                 sink.lock()
                     .unwrap()
                     .push((msg.op, msg.status.map(str::to_owned)));
@@ -4154,9 +5562,9 @@ ASG(G) {
 
     fn trap_fields(pv: &'static str) -> TrapWriteFields {
         TrapWriteFields {
-            pv_name: pv.to_string(),
-            user: "u".to_string(),
-            host: "h".to_string(),
+            pv_name: pv.as_bytes().to_vec(),
+            user: b"u".to_vec(),
+            host: b"h".to_vec(),
             peer: "h:5064".to_string(),
             value_str: "42".to_string(),
             dbr_type: 5,
@@ -4208,11 +5616,456 @@ ASG(G) {
             ]
         );
     }
+
+    #[test]
+    fn a_non_utf8_user_reaches_the_trap_listener_byte_for_byte() {
+        let users = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = users.clone();
+        let _handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
+            if msg.pv_name == b"trap:nonutf8" {
+                sink.lock().unwrap().push(msg.user.to_vec());
+            }
+        }));
+        let meta = TrapWriteMeta {
+            pv_name: b"trap:nonutf8",
+            user: b"op\xff",
+            host: "h",
+            peer: "h:5064",
+            dbr_type: 5,
+        };
+        put_with_trap_blocking(true, meta, crate::types::EpicsValue::Long(1), |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(*users.lock().unwrap(), vec![b"op\xff".to_vec(); 2]);
+    }
+
+    /// C `asTrapWriteMessage` hands listeners the channel name as stored;
+    /// a Latin-1 name must not be decoded on the way.
+    #[test]
+    fn a_non_utf8_pv_name_reaches_the_trap_listener_byte_for_byte() {
+        let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = names.clone();
+        let _handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
+            if msg.pv_name.starts_with(b"trap:latin1") {
+                sink.lock().unwrap().push(msg.pv_name.to_vec());
+            }
+        }));
+        let meta = TrapWriteMeta {
+            pv_name: b"trap:latin1\xb5",
+            user: b"op",
+            host: "h",
+            peer: "h:5064",
+            dbr_type: 5,
+        };
+        put_with_trap_blocking(true, meta, crate::types::EpicsValue::Long(1), |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        assert_eq!(*names.lock().unwrap(), vec![b"trap:latin1\xb5".to_vec(); 2]);
+    }
 }
 
 #[cfg(test)]
 mod as_ca_task_tests {
     use super::*;
+    use crate::server::database::PvDatabase;
+    use crate::server::records::ai::AiRecord;
+    use crate::types::EpicsValue;
+    use std::sync::Arc;
+
+    /// Poll `DEFAULT`'s published state until `done` holds.
+    async fn wait_state(cell: &AcfCell, done: impl Fn(&AsgState) -> bool) -> Arc<AsgState> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].state();
+            if done(&state) {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "state never settled: {state:?}"
+            );
+            crate::runtime::task::sleep_background(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A database holding `rv` at `value`, processed so it is not UDF.
+    async fn rv_db(value: f64) -> Arc<PvDatabase> {
+        let db = Arc::new(PvDatabase::new());
+        add_rv(&db, value).await;
+        db
+    }
+
+    async fn add_rv(db: &PvDatabase, value: f64) {
+        db.add_record("rv", Box::new(AiRecord::new(value)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(value))
+            .await
+            .unwrap();
+    }
+
+    /// `asCa.c:149-151`: an INVALID post marks the input bad and keeps the
+    /// value and the result the last good one gave. softIoc R7.0.10, `rv` at 5
+    /// then driven INVALID: `INPA(rv) INVALID value=5.000000`,
+    /// `CALC("A>1") result=TRUE`.
+    #[epics_macros_rs::epics_test]
+    async fn an_invalid_post_keeps_the_last_good_value_and_result() {
+        let db = rv_db(5.0).await;
+        db.put_record_field_from_ca("rv", "HIGH", EpicsValue::Double(6.0))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca("rv", "HSV", EpicsValue::String("INVALID".into()))
+            .await
+            .unwrap();
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        let good = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((good.values.vars[0], good.result(0)), (5.0, true));
+
+        db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(7.0))
+            .await
+            .unwrap();
+        let bad = wait_state(&cell, |s| s.bad(1) == 1).await;
+        assert_eq!((bad.values.vars[0], bad.result(0)), (5.0, true));
+        // softIoc R7.0.10 `asprules` after the same two posts.
+        assert_eq!(
+            String::from_utf8(cell.load_full().unwrap().dump_rules(None)).unwrap(),
+            "ASG(DEFAULT) {\n\tINPA(rv) INVALID value=5.000000\n\
+             \tRULE(1,READ,NOTRAPWRITE) {\n\t\tCALC(\"A>1\") result=TRUE\n\t}\n}\n"
+        );
+    }
+
+    /// `asCa.c connectCallback`: a channel that disconnects is bad and keeps
+    /// its value; the record's return is a fresh connection.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_input_record_is_bad_until_it_returns() {
+        let db = rv_db(5.0).await;
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        wait_state(&cell, |s| s.bad(1) == 0).await;
+
+        assert!(db.remove_record("rv").await);
+        let gone = wait_state(&cell, |s| s.bad(1) == 1).await;
+        assert_eq!((gone.values.vars[0], gone.result(0)), (5.0, true));
+
+        add_rv(&db, 0.0).await;
+        notify_asg_field_changed();
+        let back = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((back.values.vars[0], back.result(0)), (0.0, false));
+    }
+
+    /// A reload is a new `ASG` (C `asInit`): the new file's inputs start bad
+    /// and take their own first delivery, whatever the old file had.
+    #[epics_macros_rs::epics_test]
+    async fn a_reload_starts_from_a_fresh_state() {
+        let db = rv_db(5.0).await;
+        let acf = r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#;
+        let cell = new_acf_cell_watching(Some(parse_acf(acf).unwrap()), &db);
+        wait_state(&cell, |s| s.bad(1) == 0).await;
+
+        let reloaded = Arc::new(parse_acf(acf).unwrap());
+        assert_eq!(reloaded.asg[b"DEFAULT".as_slice()].state().bad(1), 1);
+        cell.store(Some(reloaded));
+        let state = wait_state(&cell, |s| s.bad(1) == 0).await;
+        assert_eq!((state.values.vars[0], state.result(0)), (5.0, true));
+    }
+
+    /// `asCaStart` returns only after `asCaTask` has added the inputs
+    /// (`asCaTaskWait`), so the first readings are in place when `asInit`
+    /// returns, with no wait of the caller's own.
+    #[epics_macros_rs::epics_test]
+    async fn wait_served_returns_with_the_first_readings_in_place() {
+        let db = rv_db(5.0).await;
+        let cell = new_acf_cell_watching(None, &db);
+        // Two ASGs on one record: C opens a channel per input, so each takes
+        // its own first event.
+        let acf = r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }
+            ASG(B) { INPB(rv) RULE(1,READ) { CALC("B>1") } }"#;
+        cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+        cell.wait_served();
+        let cfg = cell.load_full().unwrap();
+        for (asg, index) in [(&b"DEFAULT"[..], 0u8), (b"B", 1)] {
+            let state = cfg.asg[asg].state();
+            assert_eq!(
+                (state.bad(1 << index), state.value(index), state.result(0)),
+                (0, 5.0, true),
+                "{}",
+                String::from_utf8_lossy(asg)
+            );
+        }
+    }
+
+    /// `read_acf` awaited from cbMedium leaves cbMedium free while the file is
+    /// read: the fifo's writer waits for a second cbMedium future, which a read
+    /// on the band never lets run. Under tokio the seam it replaced panicked
+    /// here instead, a band future having no runtime.
+    #[cfg(unix)]
+    #[epics_macros_rs::epics_test]
+    async fn read_acf_from_cb_medium_leaves_the_band_free() {
+        use crate::runtime::task::{CallbackPriority, spawn_background};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("acf");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let waited = wait.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            std::fs::write(path, "ASG(DEFAULT) { RULE(1, READ) }\n").unwrap();
+            waited
+        });
+        let read = spawn_background(CallbackPriority::Medium, read_acf(fifo));
+        // Queued only once the read is parked on the fifo, wherever it runs.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        spawn_background(CallbackPriority::Medium, async move {
+            let _ = go.send(());
+        });
+        let cfg = read.await.unwrap();
+        assert!(writer.join().unwrap(), "read_acf parked cbMedium");
+        assert!(cfg.unwrap().asg.contains_key(b"DEFAULT".as_slice()));
+    }
+
+    /// `install_async` awaits the first readings without parking a thread,
+    /// so it completes on cbMedium beside the watcher it waits for, where a
+    /// blocking `install` starves it.
+    #[epics_macros_rs::epics_test]
+    async fn install_async_completes_on_the_watchers_band() {
+        let db = rv_db(5.0).await;
+        let cell = new_acf_cell_watching(None, &db);
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        // Hold `rv`'s lock so the first reading lands only after the install
+        // is waiting for it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        let installing = cell.clone();
+        let installed = crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move { installing.install_async(cfg).await },
+        );
+        crate::runtime::task::timeout(std::time::Duration::from_secs(5), installed)
+            .await
+            .expect("install_async never returned")
+            .unwrap();
+        assert_eq!(
+            cell.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
+    }
+
+    /// U11: two inputs on one letter that both deliver. C keeps whichever
+    /// event arrives last (`asCa.c:146-161`), so the record processed last
+    /// decides, whichever the ACF lists last. softIoc R7.0.10 with `g` an ai
+    /// at 5 and `bi` an ai at 20 with HIHI 10, HHSV INVALID: read exactly
+    /// when `g` is processed after `bi`.
+    #[epics_macros_rs::epics_test]
+    async fn two_inputs_on_one_letter_follow_the_processing_order() {
+        for acf in [
+            r#"ASG(DEFAULT) { INPA(bi) INPA(g) RULE(1,READ) { CALC("A>1") } }"#,
+            r#"ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#,
+        ] {
+            for last in ["g", "bi"] {
+                let db = Arc::new(PvDatabase::new());
+                for name in ["g", "bi"] {
+                    db.add_record(name, Box::new(AiRecord::new(0.0)))
+                        .await
+                        .unwrap();
+                }
+                for (field, value) in [
+                    ("HIHI", EpicsValue::Double(10.0)),
+                    ("HHSV", EpicsValue::String("INVALID".into())),
+                ] {
+                    db.put_pv(&format!("bi.{field}"), value).await.unwrap();
+                }
+                let cell = new_acf_cell_watching(None, &db);
+                cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+                cell.wait_served_async().await;
+                let order = if last == "g" {
+                    ["bi", "g"]
+                } else {
+                    ["g", "bi"]
+                };
+                for name in order {
+                    let value = if name == "g" { 5.0 } else { 20.0 };
+                    db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                        .await
+                        .unwrap();
+                }
+                let want = u32::from(last == "bi");
+                let state = wait_state(&cell, |s| s.bad(1) == want && s.value(0) == 5.0).await;
+                assert!(state.result(0), "{acf}, {last} last: {state:?}");
+                let (level, _) =
+                    cell.load_full()
+                        .unwrap()
+                        .compute_for_name("x", "h", "u", &[], 0, "ca", "");
+                assert_eq!(
+                    level == AccessLevel::Read,
+                    last == "g",
+                    "{acf}, {last} processed last"
+                );
+            }
+        }
+    }
+
+    /// A HAG refresh republishes the same load. C has no refresher and moves
+    /// the state only on events, so the record processed last still decides:
+    /// the republish must not replay the first readings in listing order.
+    #[epics_macros_rs::epics_test]
+    async fn a_hag_refresh_keeps_the_state_the_events_built() {
+        let db = Arc::new(PvDatabase::new());
+        for name in ["g", "bi"] {
+            db.add_record(name, Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        }
+        for (field, value) in [
+            ("HIHI", EpicsValue::Double(10.0)),
+            ("HHSV", EpicsValue::String("INVALID".into())),
+        ] {
+            db.put_pv(&format!("bi.{field}"), value).await.unwrap();
+        }
+        let acf = r#"HAG(local) { localhost }
+            ASG(DEFAULT) { INPA(g) INPA(bi) RULE(1,READ) { CALC("A>1") } }"#;
+        let cell = new_acf_cell_watching(None, &db);
+        cell.store(Some(Arc::new(parse_acf(acf).unwrap())));
+        cell.wait_served_async().await;
+        for (name, value) in [("bi", 20.0), ("g", 5.0)] {
+            db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                .await
+                .unwrap();
+        }
+        wait_state(&cell, |s| s.bad(1) == 0 && s.value(0) == 5.0).await;
+
+        // What `spawn_hag_refresh` publishes once a HAG resolution moves.
+        let mut moved = AccessSecurityConfig::clone(&cell.load_full().unwrap());
+        moved
+            .hag
+            .insert(b"local".to_vec(), vec![b"192.0.2.1".to_vec()]);
+        let refreshed = moved.with_refreshed_hags().expect("the HAG moved");
+        cell.store(Some(Arc::new(refreshed)));
+        cell.wait_served_async().await;
+        // Let the watcher take the republish's wake.
+        crate::runtime::task::sleep_background(std::time::Duration::from_millis(200)).await;
+        let cfg = cell.load_full().unwrap();
+        assert_eq!(cfg.asg[b"DEFAULT".as_slice()].state().bad(1), 0);
+        let (level, _) = cfg.compute_for_name("x", "h", "u", &[], 0, "ca", "");
+        assert_eq!(level, AccessLevel::Read);
+    }
+
+    /// A post is published before the change signal fires, so whoever sees
+    /// the new generation sees the new state: [`AccessGate`]'s check cache
+    /// stamps the generation before it computes, and a signal first would
+    /// let it cache the old result under the new stamp for good.
+    #[epics_macros_rs::epics_test]
+    async fn the_change_signal_follows_the_published_state() {
+        let db = rv_db(0.0).await;
+        let cfg = parse_acf(r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#).unwrap();
+        let cell = new_acf_cell_watching(Some(cfg), &db);
+        cell.wait_served_async().await;
+        for k in 1..=50 {
+            let before = asg_change_generation();
+            let spinning = Arc::new(std::sync::Barrier::new(2));
+            let checker = {
+                let (cell, spinning) = (cell.clone(), spinning.clone());
+                std::thread::spawn(move || {
+                    spinning.wait();
+                    while asg_change_generation() == before {
+                        std::hint::spin_loop();
+                    }
+                    cell.load_full().unwrap().asg[b"DEFAULT".as_slice()]
+                        .state()
+                        .value(0)
+                })
+            };
+            spinning.wait();
+            db.put_record_field_from_ca("rv", "VAL", EpicsValue::Double(f64::from(k)))
+                .await
+                .unwrap();
+            let seen = crate::runtime::task::spawn_blocking(move || checker.join().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(seen, f64::from(k), "post {k}");
+        }
+    }
+
+    /// Posts that queue up between two wakes are delivered in post order, so
+    /// of two inputs on one letter the later post wins.
+    #[epics_macros_rs::epics_test]
+    async fn a_burst_of_posts_is_delivered_in_post_order() {
+        for (first, second, want) in [("a1", "a2", 2.0), ("a2", "a1", 1.0)] {
+            let db = Arc::new(PvDatabase::new());
+            for name in ["a1", "a2"] {
+                db.add_record(name, Box::new(AiRecord::new(0.0)))
+                    .await
+                    .unwrap();
+            }
+            let cfg =
+                parse_acf(r#"ASG(DEFAULT) { INPA(a1) INPA(a2) RULE(1,READ) { CALC("A>1") } }"#)
+                    .unwrap();
+            let mut watch = InpWatch::of(&cfg);
+            assert!(watch.attach(&db, &cfg));
+            for name in [first, second] {
+                let value = if name == "a1" { 1.0 } else { 2.0 };
+                db.put_record_field_from_ca(name, "VAL", EpicsValue::Double(value))
+                    .await
+                    .unwrap();
+            }
+            let posted = drain_any_asg_inp(&watch.user).await;
+            assert!(posted.len() >= 2, "both posts queued");
+            watch.deliver(&db, &cfg, posted);
+            let state = cfg.asg[b"DEFAULT".as_slice()].state();
+            assert_eq!(state.value(0), want, "{second} posted last");
+        }
+    }
+
+    /// `asComputeAsgPvt` passes the rule's previous result as `VAL`
+    /// (`asLibRoutines.c:961`).
+    #[test]
+    fn a_calc_reads_its_previous_result_as_val() {
+        let cfg = parse_acf(r#"ASG(G) { INPA(x) RULE(1,READ) { CALC("A>1||VAL") } }"#).unwrap();
+        let g = &cfg.asg[b"G".as_slice()];
+        let at = |v| {
+            InpEvent::Reading(InpReading {
+                value: v,
+                severity: crate::server::record::AlarmSeverity::NoAlarm,
+            })
+        };
+        g.deliver([(0, at(5.0))]);
+        g.deliver([(0, at(0.0))]);
+        assert!(g.state().result(0), "VAL latched the TRUE result");
+    }
+
+    /// `asComputeAsgPvt` clears `inpChanged` once the CALCs ran
+    /// (`asLibRoutines.c:979`), so an event on B does not rerun a CALC that
+    /// reads only A — which would flip this one, as it toggles on `VAL`.
+    #[test]
+    fn a_calc_reruns_only_for_its_own_inputs() {
+        let cfg = parse_acf(
+            r#"ASG(G) { INPA(x) INPB(y) RULE(1,READ) { CALC("A&&!VAL") } RULE(1,WRITE) { CALC("B") } }"#,
+        )
+        .unwrap();
+        let g = &cfg.asg[b"G".as_slice()];
+        let at = |v| {
+            InpEvent::Reading(InpReading {
+                value: v,
+                severity: crate::server::record::AlarmSeverity::NoAlarm,
+            })
+        };
+        g.deliver([(0, at(1.0))]);
+        assert!(g.state().result(0));
+        g.deliver([(1, at(1.0))]);
+        let state = g.state();
+        assert_eq!((state.result(0), state.result(1)), (true, true));
+        assert_eq!(state.changed, 0);
+    }
 
     /// C only has an `asCaTask` between `asCaStart` and `asCaStop`, and
     /// nothing but `asInitCommon` calls either (`asDbLib.c:147`, `:136`), so

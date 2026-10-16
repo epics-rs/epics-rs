@@ -173,16 +173,6 @@ pub mod replay;
 pub mod server;
 pub mod tls;
 
-// The timing contract for this crate's tests — `FACT_BUDGET` and the
-// `barrier` primitive — lives in `tests/common/budget.rs`, because the
-// integration suites reach it by `#[path]` and a test rule with two homes is
-// two rules. The unit tests inside `src/` cannot use `#[path]` from their own
-// (often inline, variably nested) module, so the crate root declares it once
-// and they reach it as `crate::test_budget`.
-#[cfg(test)]
-#[path = "../tests/common/budget.rs"]
-mod test_budget;
-
 // Pins this crate's `exec_backend`/`tokio_backend` decision (`build.rs`) to
 // `epics-base-rs`'s.
 //

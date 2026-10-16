@@ -118,7 +118,7 @@ async fn constant_inp_is_not_re_applied_at_process() {
              `if (dbLinkIsConstant(pinp)) return 0;`)"
         );
         assert_eq!(
-            db.get_pv(&format!("{rec}.NORD")).unwrap().to_f64(),
+            db.get_pv(format!("{rec}.NORD")).unwrap().to_f64(),
             Some(4.0)
         );
     }

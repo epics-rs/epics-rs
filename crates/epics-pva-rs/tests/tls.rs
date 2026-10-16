@@ -15,6 +15,7 @@
 #![allow(clippy::manual_async_fn)]
 #![cfg(feature = "client")]
 
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +82,7 @@ fn make_leaf(
 
 #[derive(Clone)]
 struct StaticSource {
-    inner: Arc<Mutex<std::collections::HashMap<String, PvField>>>,
+    inner: Arc<Mutex<std::collections::HashMap<RecordName, PvField>>>,
 }
 
 impl StaticSource {
@@ -97,33 +98,33 @@ impl StaticSource {
         self.inner
             .lock()
             .await
-            .insert(name.to_string(), PvField::Structure(s));
+            .insert(RecordName::from(name), PvField::Structure(s));
     }
 }
 
 fn nt_scalar_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "epics:nt/NTScalar:1.0".into(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
     }
 }
 
 impl ChannelSource for StaticSource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send {
         let inner = self.inner.clone();
         async move { inner.lock().await.keys().cloned().collect::<Vec<_>>() }
     }
-    fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn has_pv(&self, name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move { inner.lock().await.contains_key(&n) }
     }
     fn get_introspection(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move {
             if inner.lock().await.contains_key(&n) {
                 Some(nt_scalar_desc())
@@ -132,24 +133,24 @@ impl ChannelSource for StaticSource {
             }
         }
     }
-    fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+    fn get_value(&self, name: &[u8]) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let inner = self.inner.clone();
-        let n = name.to_string();
+        let n = RecordName::from(name);
         async move { inner.lock().await.get(&n).cloned() }
     }
     fn put_value(
         &self,
-        _name: &str,
+        _name: &[u8],
         _value: PvField,
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async { Ok(()) }
     }
-    fn is_writable(&self, _name: &str) -> impl std::future::Future<Output = bool> + Send {
+    fn is_writable(&self, _name: &[u8]) -> impl std::future::Future<Output = bool> + Send {
         async { false }
     }
     fn subscribe(
         &self,
-        _name: &str,
+        _name: &[u8],
     ) -> impl std::future::Future<Output = Option<MonitorStream<PvField>>> + Send {
         async { None }
     }
@@ -307,6 +308,80 @@ async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
     server.stop();
 }
 
+/// Each interface gets a TLS listener on `tls_port`, not on the interface
+/// entry's own (plaintext) port, which keeps its plaintext listener.
+#[tokio::test]
+async fn tls_listener_on_every_interface_uses_tls_port() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (cert, key) = generate_self_signed();
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
+    });
+    // Explicit numbers on both: an entry on port 0 hands its TLS listener
+    // `tls_port` anyway, so TLS bound on the entries' own port would pass.
+    // A number somebody takes before the server binds it fails the start or
+    // moves the listener, so the pair is retried with fresh numbers.
+    let pick = || {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr())
+            .expect("pick a port")
+            .port()
+    };
+    let mut tries = 0;
+    let (server, report) = loop {
+        tries += 1;
+        let (tcp, tls) = (pick(), pick());
+        let cfg = PvaServerConfig {
+            interfaces: vec![
+                std::net::SocketAddr::from(([127, 0, 0, 1], tcp)).into(),
+                std::net::SocketAddr::from(([127, 0, 0, 2], tcp)).into(),
+            ],
+            tls_port: tls,
+            tls: Some(server_tls.clone()),
+            ..PvaServerConfig::isolated()
+        };
+        let started =
+            epics_pva_rs::server_native::PvaServer::start(Arc::new(StaticSource::new()), cfg);
+        let got = match started {
+            Ok(server) => {
+                let report = server.report();
+                if tcp != tls && (report.tcp_port, report.tls_port) == (tcp, tls) {
+                    break (server, report);
+                }
+                server.stop();
+                format!("tcp {} tls {}", report.tcp_port, report.tls_port)
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            tries < 5,
+            "asked for tcp {tcp} tls {tls}, got {got}, {tries} times"
+        );
+    };
+    let (tcp, tls) = (report.tcp_port, report.tls_port);
+    assert_ne!(tls, tcp, "TLS must have its own listener");
+    let a = std::net::SocketAddr::from(([127, 0, 0, 1], tcp));
+    let b = std::net::SocketAddr::from(([127, 0, 0, 2], tcp));
+    for addr in [
+        a,
+        b,
+        std::net::SocketAddr::new(a.ip(), tls),
+        std::net::SocketAddr::new(b.ip(), tls),
+    ] {
+        assert!(
+            std::net::TcpStream::connect(addr).is_ok(),
+            "nothing listens on {addr}"
+        );
+    }
+    server.stop();
+}
+
 /// With `disable_plaintext` set the server must REFUSE a plaintext peer
 /// (anti-downgrade) while still serving a TLS client. pvxs carries
 /// `tls_disable_plaintext` in the shared config and refuses the downgrade
@@ -436,7 +511,7 @@ async fn mtls_client_cert_populates_x509_credentials() {
         if let Ok(mut g) = captured_hook.try_lock() {
             *g = Some((
                 cred.method.clone(),
-                cred.account.clone(),
+                cred.account.to_string(),
                 cred.authority.clone(),
             ));
         }
@@ -548,7 +623,7 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         if let Ok(mut g) = captured_hook.try_lock() {
             *g = Some((
                 cred.method.clone(),
-                cred.account.clone(),
+                cred.account.to_string(),
                 cred.authority.clone(),
             ));
         }

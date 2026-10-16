@@ -1,9 +1,8 @@
 //! PVA interop: Rust ↔ pvxs (`$PVXS_HOME`) `pvget`/`pvput`/`pvmonitor`.
 //!
 //! Opt-in via `cargo nextest run --profile interop`. Each test
-//! shells out to a pvxs CLI binary; missing binaries → skip with a
-//! SKIP-prefixed stderr line so a host without pvxs installed isn't
-//! a hard fail.
+//! shells out to a pvxs CLI binary; a missing binary fails the test,
+//! because an early return would score as a pass.
 //!
 //! Targets the gaps that pure Rust↔Rust tests can't catch:
 //!
@@ -51,6 +50,9 @@ mod harness_paths;
 #[path = "interop_pvxs_mods/large_array.rs"]
 mod large_array;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/monitor_seed_mask.rs"]
+mod monitor_seed_mask;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/monitor_stream.rs"]
 mod monitor_stream;
 #[cfg(unix)]
@@ -69,6 +71,18 @@ mod reverse_complex_types;
 #[path = "interop_pvxs_mods/rpc_and_get_field.rs"]
 mod rpc_and_get_field;
 #[cfg(unix)]
+#[path = "interop_pvxs_mods/search_prefix.rs"]
+mod search_prefix;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/server_ports_env.rs"]
+mod server_ports_env;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/soft_ioc_pvx_ca_port.rs"]
+mod soft_ioc_pvx_ca_port;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/start_pvxs_rule.rs"]
+mod start_pvxs_rule;
+#[cfg(unix)]
 #[path = "interop_pvxs_mods/tcp_search_r11.rs"]
 mod tcp_search_r11;
 #[cfg(all(unix, feature = "tls"))]
@@ -80,3 +94,6 @@ mod tls_mtls;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/type_cache.rs"]
 mod type_cache;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/udp_v6_port_held.rs"]
+mod udp_v6_port_held;

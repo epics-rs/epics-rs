@@ -36,6 +36,8 @@ async fn caput(port: u16, args: &[&str]) -> (String, String, i32) {
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_caput-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -76,14 +78,14 @@ async fn a_rejected_enum_string_prints_no_old_value() {
     let port = server_with_mbbo("TST:MBBO").await;
 
     // The menu is live — a VALID string does reach the readback+put.
-    let (out, _, code) = caput(port, &["TST:MBBO", "One"]).await;
-    assert_eq!(code, 0);
-    assert!(out.contains("Old : "), "baseline put: {out:?}");
-    assert!(out.contains("New : "), "baseline put: {out:?}");
+    let (out, err, code) = caput(port, &["TST:MBBO", "One"]).await;
+    assert_eq!(code, 0, "baseline put: stderr {err:?}");
+    assert!(out.contains("Old : "), "baseline put: {out:?} {err:?}");
+    assert!(out.contains("New : "), "baseline put: {out:?} {err:?}");
 
     // An INVALID one dies in the build step, before `Old : ` can be printed.
     let (out, err, code) = caput(port, &["TST:MBBO", "Bogus"]).await;
-    assert_eq!(code, 1);
+    assert_eq!(code, 1, "stderr {err:?}");
     assert_eq!(err.trim(), "Enum string value 'Bogus' invalid.");
     assert!(
         out.is_empty(),
@@ -99,7 +101,7 @@ async fn a_rejected_numeric_enum_prints_no_old_value() {
     let port = server_with_mbbo("TST:MBBO").await;
 
     let (out, err, code) = caput(port, &["-n", "TST:MBBO", "abc"]).await;
-    assert_eq!(code, 1);
+    assert_eq!(code, 1, "stdout {out:?} stderr {err:?}");
     assert!(
         !err.trim().is_empty(),
         "C diagnoses the bad number on stderr"
@@ -128,7 +130,10 @@ async fn an_out_of_range_enum_index_warns_and_still_puts() {
 
     // -n path (caput.c:477-479).
     let (out, err, code) = caput(port, &["-n", "TST:MBBO", "99"]).await;
-    assert_eq!(code, 0, "the warning is not fatal: C puts the value anyway");
+    assert_eq!(
+        code, 0,
+        "the warning is not fatal: C puts the value anyway; stderr {err:?}"
+    );
     assert!(err.contains(warning), "-n path stderr was: {err:?}");
     assert!(out.contains("Old : "), "the put still runs: {out:?}");
     assert!(out.contains("New : "), "the put still runs: {out:?}");
@@ -138,7 +143,7 @@ async fn an_out_of_range_enum_index_warns_and_still_puts() {
     let (out, err, code) = caput(port, &["TST:MBBO", "99"]).await;
     assert_eq!(
         code, 0,
-        "the warning is not fatal on the string path either"
+        "the warning is not fatal on the string path either; stderr {err:?}"
     );
     assert!(err.contains(warning), "string-path stderr was: {err:?}");
     assert!(out.contains("New : "), "the put still runs: {out:?}");
@@ -146,13 +151,13 @@ async fn an_out_of_range_enum_index_warns_and_still_puts() {
     // The boundary: `dbuf[i] >= no_str`. With three states, 2 is in range and 3
     // is not — the first index past the end is the first to warn.
     let (_, err, code) = caput(port, &["-n", "TST:MBBO", "2"]).await;
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "stderr {err:?}");
     assert!(
         !err.contains("may be too large"),
         "index 2 is the last valid state of a 3-state menu: {err:?}"
     );
     let (_, err, code) = caput(port, &["-n", "TST:MBBO", "3"]).await;
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "stderr {err:?}");
     assert!(
         err.contains("Warning: enum index value '3' may be too large."),
         "index 3 is one past the end of a 3-state menu: {err:?}"
@@ -161,6 +166,6 @@ async fn an_out_of_range_enum_index_warns_and_still_puts() {
     // A menu NAME is never compared against `no_str` — C only tests the numeric
     // `dbuf[i]`, so the valid-name path stays silent.
     let (_, err, code) = caput(port, &["TST:MBBO", "Two"]).await;
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "stderr {err:?}");
     assert!(!err.contains("may be too large"), "name path: {err:?}");
 }

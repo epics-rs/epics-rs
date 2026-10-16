@@ -1,6 +1,6 @@
 //! InProcessClient: direct enum pass-through to PortHandle (no serialization).
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked, not waived — all 6 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(9): checked, not waived — all 9 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1081/1081). asyn-rs became a census subject when its
@@ -12,15 +12,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::interrupt::InterruptFilter;
 use crate::port_handle::PortHandle;
 use crate::protocol::convert::result_to_reply;
-use crate::protocol::event::{EventPayload, PortEvent};
-use crate::protocol::value::Timestamp;
-use crate::protocol::{EventFilter, PortReply, PortRequest};
+use crate::protocol::{EventFilter, EventRing, PortReply, PortRequest};
 use crate::request::RequestOp;
 use crate::user::AsynUser;
 
-use super::client::{ConnectionState, RuntimeClient};
+use super::client::{ConnectionState, EventReceiver, RuntimeClient};
 use super::error::TransportError;
 use super::tracker::RequestTracker;
 
@@ -91,58 +90,21 @@ impl RuntimeClient for InProcessClient {
     fn subscribe(
         &self,
         filter: EventFilter,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<tokio::sync::mpsc::Receiver<PortEvent>, TransportError>>
-                + Send
-                + '_,
-        >,
-    > {
-        let port_name = self.handle.port_name().to_string();
-        let mut broadcast_rx = self.handle.interrupts().subscribe_async();
-
-        Box::pin(async move {
-            let (tx, rx) = tokio::sync::mpsc::channel(256);
-
-            crate::runtime::task::spawn(async move {
-                loop {
-                    // Exit promptly when the consumer drops its receiver,
-                    // rather than parking on `recv()` until the broadcast
-                    // channel closes (i.e. the port is destroyed) — that
-                    // leaked a task per short-lived subscription.
-                    let recv = tokio::select! {
-                        _ = tx.closed() => break,
-                        recv = broadcast_rx.recv() => recv,
-                    };
-                    match recv {
-                        Ok(iv) => {
-                            if let Some(r) = filter.reason {
-                                if iv.reason != r {
-                                    continue;
-                                }
-                            }
-                            if let Some(a) = filter.addr {
-                                if iv.addr != a {
-                                    continue;
-                                }
-                            }
-                            let event = PortEvent {
-                                port_name: port_name.clone(),
-                                payload: EventPayload::from(&iv),
-                                timestamp: Timestamp::from(iv.timestamp),
-                            };
-                            if tx.send(event).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-
-            Ok(rx)
-        })
+        ring: EventRing,
+    ) -> Pin<Box<dyn Future<Output = Result<EventReceiver, TransportError>> + Send + '_>> {
+        let rx = EventReceiver {
+            ring: self.handle.interrupts().subscribe_async_filtered(
+                InterruptFilter {
+                    reason: filter.reason,
+                    addr: filter.addr,
+                    ..Default::default()
+                },
+                ring.ring_len,
+                ring.payload_bytes,
+            ),
+            port_name: self.handle.port_name().to_string(),
+        };
+        Box::pin(async move { Ok(rx) })
     }
 
     fn connection_state(&self) -> ConnectionState {
@@ -156,10 +118,11 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::interrupt::InterruptValue;
+    use crate::interrupt::{AsyncRecvError, InterruptValue};
     use crate::manager::PortManager;
     use crate::param::ParamType;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
+    use crate::protocol::EventPayload;
     use crate::protocol::command::PortCommand;
     use crate::protocol::reply::ReplyPayload;
     use crate::protocol::request::{ProtocolPriority, RequestMeta};
@@ -192,9 +155,16 @@ mod tests {
         }
     }
 
+    const TEST_RING: EventRing = EventRing {
+        ring_len: 256,
+        payload_bytes: 4096,
+    };
+
     fn make_client(name: &str) -> (PortManager, InProcessClient) {
         let mgr = PortManager::new();
-        let rt_handle = mgr.register_port(TestPort::new(name)).unwrap();
+        let rt_handle = mgr
+            .register_port(TestPort::new(name), &crate::registry::open_owner())
+            .unwrap();
         let client = InProcessClient::new(rt_handle.port_handle().clone());
         (mgr, client)
     }
@@ -280,11 +250,65 @@ mod tests {
         assert_eq!(client.connection_state(), ConnectionState::Connected);
     }
 
+    /// The ring holds only what its filter passes: values of other reasons
+    /// do not push out the subscriber's own (C registers the ring's
+    /// callback with the record's reason and addr).
+    #[tokio::test]
+    async fn other_reasons_do_not_evict_a_filtered_subscribers_values() {
+        let (_mgr, client) = make_client("ipc_filter_ring");
+        let mut rx = client
+            .subscribe(
+                EventFilter {
+                    reason: Some(1),
+                    addr: None,
+                },
+                EventRing {
+                    ring_len: 4,
+                    payload_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let handle = client.handle();
+        let fire = |reason| {
+            handle.interrupts().notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(reason as i32),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0,
+                aux_status: crate::error::AsynStatus::Success,
+                alarm_status: 0,
+                alarm_severity: 0,
+                iface: None,
+            })
+        };
+        fire(1);
+        for _ in 0..4 {
+            fire(0);
+        }
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the reason-1 value arrives")
+            .expect("not lagged");
+        assert_eq!(
+            ev.payload,
+            EventPayload::ValueChanged {
+                reason: 1,
+                addr: 0,
+                value: ParamValue::Int32(1)
+            }
+        );
+    }
+
     #[tokio::test]
     async fn event_subscription() {
         let (_mgr, client) = make_client("ipc_event");
 
-        let mut rx = client.subscribe(EventFilter::default()).await.unwrap();
+        let mut rx = client
+            .subscribe(EventFilter::default(), TEST_RING)
+            .await
+            .unwrap();
 
         // Trigger an interrupt via the port handle
         let handle = client.handle();
@@ -317,15 +341,55 @@ mod tests {
         }
     }
 
+    /// The subscription's payload clamp is the ring the caller passed, not a
+    /// default: an octet longer than `payload_bytes` arrives cut to the ring.
+    #[tokio::test]
+    async fn event_subscription_clamps_to_the_requested_ring() {
+        let (_mgr, client) = make_client("ipc_event_ring");
+        let mut rx = client
+            .subscribe(
+                EventFilter::default(),
+                EventRing {
+                    ring_len: 4,
+                    payload_bytes: 8,
+                },
+            )
+            .await
+            .unwrap();
+        client.handle().interrupts().notify(InterruptValue {
+            reason: 0,
+            addr: 0,
+            value: crate::param::ParamValue::Octet(vec![b'x'; 20].into()),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0,
+            ..Default::default()
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event.payload {
+            EventPayload::ValueChanged { value, .. } => match value {
+                // valSize - 1: C keeps a byte for the NUL (devAsynOctet.c:489).
+                ParamValue::Octet(bytes) => assert_eq!(bytes.len(), 7),
+                other => panic!("expected Octet, got {other:?}"),
+            },
+            _ => panic!("expected ValueChanged"),
+        }
+    }
+
     #[tokio::test]
     async fn event_subscription_filtered() {
         let (_mgr, client) = make_client("ipc_event_filt");
 
         let mut rx = client
-            .subscribe(EventFilter {
-                reason: Some(1),
-                addr: None,
-            })
+            .subscribe(
+                EventFilter {
+                    reason: Some(1),
+                    addr: None,
+                },
+                TEST_RING,
+            )
             .await
             .unwrap();
 
@@ -362,6 +426,43 @@ mod tests {
                 assert_eq!(value, ParamValue::Int32(20));
             }
             _ => panic!("expected ValueChanged"),
+        }
+    }
+
+    /// The caller's `ring_len` is the whole depth: nothing between the ring and
+    /// the consumer queues more, and the survivors are the newest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_callers_ring_is_the_only_queue() {
+        let (_mgr, client) = make_client("ipc_event_depth");
+        let mut rx = client
+            .subscribe(
+                EventFilter::default(),
+                EventRing {
+                    ring_len: 4,
+                    payload_bytes: 0,
+                },
+            )
+            .await
+            .unwrap();
+        for i in 0..300 {
+            client.handle().interrupts().notify(InterruptValue {
+                reason: 0,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(i),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0,
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+        }
+        assert_eq!(rx.recv().await.unwrap_err(), AsyncRecvError::Lagged(296));
+        for want in 296..300 {
+            match rx.recv().await.unwrap().payload {
+                EventPayload::ValueChanged { value, .. } => {
+                    assert_eq!(value, ParamValue::Int32(want))
+                }
+                _ => panic!("expected ValueChanged"),
+            }
         }
     }
 }

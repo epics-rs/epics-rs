@@ -205,7 +205,13 @@ pub struct PortIocDevices {
 /// universal asyn factory, so no record's read fields or processing change —
 /// only the `DTYP` `value.choices` a client reads, matching the fat-C ground
 /// truth.
-pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
+///
+/// `db` is the database the IOC then boots into
+/// (`port_ioc_builder().with_database(db.clone())`): the port is owned by its
+/// `interruptAccept`.
+pub fn register_port_ioc_devices(
+    db: &std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+) -> Result<PortIocDevices, String> {
     use asyn_rs::drivers::ip_port::DrvAsynIPPort;
     use asyn_rs::manager::PortManager;
 
@@ -219,6 +225,7 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
                 false, // noProcessEos=0 — install the default EOS interpose, as C does
             )
             .map_err(|e| format!("configure {ORACLE_ASYN_PORT}: {e}"))?,
+            db.scan_control().interrupt_gate(),
         )
         .map_err(|e| format!("register {ORACLE_ASYN_PORT}: {e}"))?;
 
@@ -230,16 +237,25 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
     })
 }
 
+/// The soft scaler ports this process configured — C's asyn port registry
+/// for `drvScalerSoftConfigure`, which is process-global in C as well.
+#[cfg(feature = "scaler")]
+pub fn scaler_soft_ports() -> &'static scaler_rs::device_support::soft_port::SoftScalerPorts {
+    static PORTS: std::sync::LazyLock<scaler_rs::device_support::soft_port::SoftScalerPorts> =
+        std::sync::LazyLock::new(Default::default);
+    &PORTS
+}
+
 /// The per-builder half of the port IOC's configuration: the record types the
 /// C side we diff against gets from loading module `.dbd`s, and which
 /// `epics-base-rs` therefore does not register by default.
 ///
 /// `asyn` is routed to asyn-rs's full `AsynRecord` rather than epics-base-rs's
 /// CNCT-only display stub; see [`register_port_ioc_devices`] for why that
-/// record type's two halves must stay together. The other six are synApps
+/// record type's two halves must stay together. The next six are synApps
 /// `calc`'s (`aCalcout`, `sCalcout`, `sseq`, `swait`, `transform`) and busy's,
 /// implemented in `epics-base-rs` but outside `stdRecords.dbd`, so base leaves
-/// them to the application. Registering them here is what keeps the oracle's
+/// them to the application; `table` is optics-rs's, as in `oracleTableIoc`. Registering them here is what keeps the oracle's
 /// denominator the fat IOC's record set instead of bare base's — the boot probe
 /// reports any type the port cannot build, so dropping one shows up as
 /// "unimplemented", not as silent agreement.
@@ -250,13 +266,36 @@ pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
     };
 
     let (asyn_type, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
-    epics_base_rs::server::ioc_builder::IocBuilder::new()
+    let (table_type, table_factory) = optics_rs::table_record_factory();
+    let builder = epics_base_rs::server::ioc_builder::IocBuilder::new();
+    #[cfg(feature = "scaler")]
+    let builder = {
+        let (scaler_type, scaler_factory) = scaler_rs::scaler_record_factory();
+        builder
+            .register_record_type(scaler_type, scaler_factory)
+            .register_dynamic_device_support(|ctx| {
+                // C `scalerSupport.dbd`: `device(scaler,INST_IO,devScalerAsyn,
+                // "Asyn Scaler")`, whose `init_record` parses OUT's `@asyn(port
+                // ..)` and connects to that port.
+                if ctx.record_type != "scaler" || ctx.dtyp != "Asyn Scaler" {
+                    return None;
+                }
+                let link = asyn_rs::adapter::parse_asyn_link(ctx.out).ok()?;
+                let dset = scaler_soft_ports().device_support(&link.port_name)?;
+                Some(Box::new(dset)
+                    as Box<
+                        dyn epics_base_rs::server::device_support::DeviceSupport,
+                    >)
+            })
+    };
+    builder
         .register_record_type(asyn_type, asyn_factory)
         .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .register_record_type("sseq", || Box::new(SseqRecord::default()))
         .register_record_type("swait", || Box::new(SwaitRecord::default()))
+        .register_record_type(table_type, table_factory)
         .register_record_type("transform", || Box::new(TransformRecord::default()))
 }
 

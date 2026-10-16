@@ -136,7 +136,7 @@ async fn pini_uses_the_menu_converter() {
 /// `dbPut` (`putStringMenu`, bound `val < nChoice`) does not.
 #[epics_macros_rs::epics_test]
 async fn sscn_sentinel_loads_from_db_but_is_refused_at_runtime() {
-    let mut inst = RecordInstance::new("SIM".to_string(), AiRecord::default());
+    let mut inst = RecordInstance::new("SIM", AiRecord::default());
     inst.put_common_field_db_load("SSCN", EpicsValue::String("65535".into()))
         .expect("field(SSCN,\"65535\") is what the dbd initial() is");
     assert!(inst.common.sscn.is_unset());

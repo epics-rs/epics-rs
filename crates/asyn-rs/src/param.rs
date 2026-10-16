@@ -63,7 +63,10 @@ pub enum ParamValue {
     /// `val.c_str()` and a device answer may carry any byte, so a `String` here
     /// could not hold one (`0x80..=0xff` alone is not UTF-8) and replaced it
     /// with U+FFFD on the way in.
-    Octet(Vec<u8>),
+    ///
+    /// Shared, like the array variants: cloning an `InterruptValue` for a
+    /// subscriber is a reference count, not a copy under the record's hold.
+    Octet(Arc<[u8]>),
     UInt32Digital(u32),
     Int8Array(Arc<[i8]>),
     Int16Array(Arc<[i16]>),
@@ -239,7 +242,6 @@ struct ParamEntry {
     status: AsynStatus,
     alarm_status: u16,
     alarm_severity: u16,
-    value_changed: bool,
     timestamp: Option<SystemTime>,
     /// UInt32Digital: bitmask of bits that changed (for interrupt filtering).
     /// C parity: uInt32CallbackMask in paramVal.
@@ -267,7 +269,7 @@ impl ParamEntry {
             ParamType::Int64 => ParamValue::Int64(0),
             ParamType::UInt64 => ParamValue::UInt64(0),
             ParamType::Float64 => ParamValue::Float64(0.0),
-            ParamType::Octet => ParamValue::Octet(Vec::new()),
+            ParamType::Octet => ParamValue::Octet(Arc::from([])),
             ParamType::UInt32Digital => ParamValue::UInt32Digital(0),
             ParamType::Int8Array => ParamValue::Int8Array(Arc::from([] as [i8; 0])),
             ParamType::Int16Array => ParamValue::Int16Array(Arc::from([] as [i16; 0])),
@@ -294,11 +296,24 @@ impl ParamEntry {
             status: AsynStatus::Success,
             alarm_status: 0,
             alarm_severity: 0,
-            value_changed: false,
             timestamp: None,
             uint32_interrupt_mask: 0,
             uint32_rising_mask: 0,
             uint32_falling_mask: 0,
+        }
+    }
+}
+
+/// C `paramList::flags`: indices in first-set order, each at most once.
+#[derive(Default)]
+struct FlagList(Vec<usize>);
+
+impl FlagList {
+    /// C `paramList::setFlag` (asynPortDriver.cpp:107-116): a second set of
+    /// the same parameter keeps its first position (:112).
+    fn set(&mut self, index: usize) {
+        if !self.0.contains(&index) {
+            self.0.push(index);
         }
     }
 }
@@ -309,6 +324,12 @@ pub struct ParamList {
     max_addr: usize,
     /// `params[addr][index] = ParamEntry`
     params: Vec<Vec<ParamEntry>>,
+    /// C `paramList::flags` (asynPortDriver.cpp): per address, the indices of
+    /// the parameters changed since the last flush, in the order they were
+    /// first set. It is the only record of "changed" — there is no per-entry
+    /// flag to disagree with it. Capacity is reserved to the parameter count
+    /// at creation (`createParam`, :135) so a set never allocates.
+    flags: Vec<FlagList>,
     name_to_index: HashMap<String, usize>,
 }
 
@@ -318,6 +339,7 @@ impl ParamList {
         Self {
             max_addr,
             params: (0..max_addr).map(|_| Vec::new()).collect(),
+            flags: (0..max_addr).map(|_| FlagList::default()).collect(),
             name_to_index: HashMap::new(),
         }
     }
@@ -344,6 +366,20 @@ impl ParamList {
         self.params[a]
             .get(index)
             .ok_or(AsynError::ParamIndexOutOfRange(index))
+    }
+
+    /// The entry and its address's changed-flag list, borrowed together so a
+    /// setter marks the change where it makes it.
+    fn entry_flags_mut(
+        &mut self,
+        index: usize,
+        addr: i32,
+    ) -> AsynResult<(&mut ParamEntry, &mut FlagList)> {
+        let a = self.validate_addr(addr)?;
+        let entry = self.params[a]
+            .get_mut(index)
+            .ok_or(AsynError::ParamIndexOutOfRange(index))?;
+        Ok((entry, &mut self.flags[a]))
     }
 
     fn get_entry_mut(&mut self, index: usize, addr: i32) -> AsynResult<&mut ParamEntry> {
@@ -400,6 +436,11 @@ impl ParamList {
         for addr_params in &mut self.params {
             addr_params.push(ParamEntry::new(name.to_string(), param_type));
         }
+        // C `createParam` (:135): flags.reserve(vals.size()) — a set never grows
+        // the list, so it never allocates.
+        for list in &mut self.flags {
+            list.0.reserve((index + 1).saturating_sub(list.0.len()));
+        }
         self.name_to_index.insert(name.to_string(), index);
         Ok(index)
     }
@@ -455,7 +496,7 @@ impl ParamList {
     }
 
     pub fn set_int32(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         match entry.value {
             ParamValue::Int32(ref old) => {
                 // C parity: paramVal::setInteger gates on
@@ -463,14 +504,14 @@ impl ParamList {
                 // a first set with `value == default` still flips `defined`.
                 if !entry.defined || *old != value {
                     entry.value = ParamValue::Int32(value);
-                    entry.value_changed = true;
+                    flags.set(index);
                     entry.defined = true;
                 }
             }
             // C EPICS asyn: asynInt32 interface writes enum index transparently
             ParamValue::Enum {
                 ref choices,
-                ref mut index,
+                index: ref mut enum_index,
             } => {
                 let new_idx = value as usize;
                 if new_idx >= choices.len() {
@@ -482,9 +523,9 @@ impl ParamList {
                         ),
                     });
                 }
-                if !entry.defined || *index != new_idx {
-                    *index = new_idx;
-                    entry.value_changed = true;
+                if !entry.defined || *enum_index != new_idx {
+                    *enum_index = new_idx;
+                    flags.set(index);
                     entry.defined = true;
                 }
             }
@@ -518,14 +559,14 @@ impl ParamList {
     }
 
     pub fn set_float64(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Float64(ref old) = entry.value {
             // C parity: paramVal::setDouble (paramVal.cpp:243-253) —
             // `!isDefined() || data.dval != value` flips defined on the
             // first set even when `value` equals the type default.
             if !entry.defined || *old != value {
                 entry.value = ParamValue::Float64(value);
-                entry.value_changed = true;
+                flags.set(index);
                 entry.defined = true;
             }
         } else {
@@ -557,12 +598,12 @@ impl ParamList {
     }
 
     pub fn set_int64(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Int64(ref old) = entry.value {
             // C parity: paramVal::setInteger64 (paramVal.cpp:160-170).
             if !entry.defined || *old != value {
                 entry.value = ParamValue::Int64(value);
-                entry.value_changed = true;
+                flags.set(index);
                 entry.defined = true;
             }
         } else {
@@ -596,20 +637,37 @@ impl ParamList {
     /// `value` is taken as bytes — C's `setStringParam(int, const char *)`
     /// copies whatever the driver points at, and a device answer is not
     /// required to be UTF-8. `String`/`&str` callers are unaffected.
+    ///
+    /// The bytes are compared in place and copied once, into the shared
+    /// buffer, only when they differ — C's `sval != value` then
+    /// `sval = value` (paramVal.cpp:271-281). An unchanged value allocates
+    /// nothing.
     pub fn set_string(
         &mut self,
         index: usize,
         addr: i32,
-        value: impl Into<Vec<u8>>,
+        value: impl AsRef<[u8]>,
     ) -> AsynResult<()> {
-        let value = value.into();
-        let entry = self.get_entry_mut(index, addr)?;
+        self.store_octet(index, addr, value.as_ref(), None)
+    }
+
+    /// The one owner of an octet store. `shared` is the value's buffer when
+    /// the caller already holds one; otherwise `bytes` is copied into a new
+    /// one, and only when the stored value differs.
+    fn store_octet(
+        &mut self,
+        index: usize,
+        addr: i32,
+        bytes: &[u8],
+        shared: Option<Arc<[u8]>>,
+    ) -> AsynResult<()> {
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Octet(ref old) = entry.value {
             // C parity: paramVal::setString (paramVal.cpp:271-281) —
             // `!isDefined() || sval != value`.
-            if !entry.defined || *old != value {
-                entry.value = ParamValue::Octet(value);
-                entry.value_changed = true;
+            if !entry.defined || **old != *bytes {
+                entry.value = ParamValue::Octet(shared.unwrap_or_else(|| Arc::from(bytes)));
+                flags.set(index);
                 entry.defined = true;
             }
         } else {
@@ -648,7 +706,7 @@ impl ParamList {
         mask: u32,
         interrupt_mask: u32,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::UInt32Digital(ref old) = entry.value {
             // C parity: paramVal::setUInt32 (paramVal.cpp:197-225).
             //   if (!isDefined()) { uival = 0; setDefined(true); setValueChanged(); }
@@ -674,7 +732,7 @@ impl ParamList {
                 // to 0 after firing (see take_uint32_interrupt_mask).
                 entry.uint32_interrupt_mask |= changed_bits;
                 entry.value = ParamValue::UInt32Digital(new_val);
-                entry.value_changed = true;
+                flags.set(index);
                 entry.defined = true;
             }
             // C parity: paramVal.cpp:220-224 — a non-zero `interruptMask`
@@ -685,7 +743,7 @@ impl ParamList {
             // first-write `defined` flip above already ran when needed.
             if interrupt_mask != 0 {
                 entry.uint32_interrupt_mask |= interrupt_mask;
-                entry.value_changed = true;
+                flags.set(index);
             }
         } else {
             return Err(AsynError::TypeMismatch {
@@ -809,10 +867,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[f64]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Float64Array(_)) {
             entry.value = ParamValue::Float64Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -839,10 +897,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[i32]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int32Array(_)) {
             entry.value = ParamValue::Int32Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -869,10 +927,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[i8]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int8Array(_)) {
             entry.value = ParamValue::Int8Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -899,10 +957,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[i16]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int16Array(_)) {
             entry.value = ParamValue::Int16Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -929,10 +987,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[i64]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Int64Array(_)) {
             entry.value = ParamValue::Int64Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -959,10 +1017,10 @@ impl ParamList {
         addr: i32,
         data: impl Into<Arc<[f32]>>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::Float32Array(_)) {
             entry.value = ParamValue::Float32Array(data.into());
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
             Ok(())
         } else {
@@ -980,7 +1038,7 @@ impl ParamList {
     }
 
     pub fn set_enum_index(&mut self, index: usize, addr: i32, value: usize) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Enum {
             ref choices,
             index: ref mut idx,
@@ -997,7 +1055,7 @@ impl ParamList {
             // to index 0 (the default) must still flip `defined`.
             if !entry.defined || *idx != value {
                 *idx = value;
-                entry.value_changed = true;
+                flags.set(index);
                 entry.defined = true;
             }
         } else {
@@ -1015,7 +1073,7 @@ impl ParamList {
         addr: i32,
         choices: Arc<[EnumEntry]>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Enum {
             index: ref mut idx,
             choices: ref mut ch,
@@ -1026,7 +1084,7 @@ impl ParamList {
             if *idx >= ch.len() {
                 *idx = 0;
             }
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true;
         } else {
             return Err(AsynError::TypeMismatch {
@@ -1059,10 +1117,10 @@ impl ParamList {
         addr: i32,
         value: Arc<dyn Any + Send + Sync>,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if matches!(entry.value, ParamValue::GenericPointer(_)) {
             entry.value = ParamValue::GenericPointer(value);
-            entry.value_changed = true;
+            flags.set(index);
             entry.defined = true; // Any is not comparable
             Ok(())
         } else {
@@ -1091,7 +1149,7 @@ impl ParamList {
             ParamValue::Int32(v) => self.set_int32(index, addr, v),
             ParamValue::Int64(v) => self.set_int64(index, addr, v),
             ParamValue::Float64(v) => self.set_float64(index, addr, v),
-            ParamValue::Octet(s) => self.set_string(index, addr, s),
+            ParamValue::Octet(s) => self.store_octet(index, addr, &s, Some(s.clone())),
             ParamValue::UInt32Digital(v) => self.set_uint32(index, addr, v, u32::MAX, 0),
             ParamValue::Int8Array(a) => self.set_int8_array(index, addr, a.to_vec()),
             ParamValue::Int16Array(a) => self.set_int16_array(index, addr, a.to_vec()),
@@ -1144,7 +1202,7 @@ impl ParamList {
         alarm_status: u16,
         alarm_severity: u16,
     ) -> AsynResult<()> {
-        let entry = self.get_entry_mut(index, addr)?;
+        let (entry, flags) = self.entry_flags_mut(index, addr)?;
         // C paramVal::setStatus / setAlarmStatus / setAlarmSeverity
         // (paramVal.cpp:71-78,84-91,97-104) each call setValueChanged()
         // when their field actually changes; the paramList wrappers
@@ -1164,7 +1222,7 @@ impl ParamList {
         entry.alarm_status = alarm_status;
         entry.alarm_severity = alarm_severity;
         if changed {
-            entry.value_changed = true;
+            flags.set(index);
             if entry.param_type == ParamType::UInt32Digital {
                 entry.uint32_interrupt_mask = 0xFFFF_FFFF;
             }
@@ -1192,31 +1250,74 @@ impl ParamList {
 
     /// Clear the changed flag for a single parameter. Returns true if it was changed.
     pub fn take_changed_single(&mut self, index: usize, addr: i32) -> AsynResult<bool> {
-        let entry = self.get_entry_mut(index, addr)?;
-        let was_changed = entry.value_changed;
-        entry.value_changed = false;
-        Ok(was_changed)
+        self.get_entry(index, addr)?;
+        let a = self.validate_addr(addr)?;
+        let list = &mut self.flags[a].0;
+        Ok(match list.iter().position(|&i| i == index) {
+            Some(at) => {
+                list.remove(at);
+                true
+            }
+            None => false,
+        })
     }
 
     /// Mark a parameter as changed without modifying its value.
     /// Useful for triggering I/O Intr on params whose data is served via
     /// read_*_array overrides rather than the param cache.
     pub fn mark_changed(&mut self, index: usize, addr: i32) -> AsynResult<()> {
-        self.get_entry_mut(index, addr)?.value_changed = true;
+        let (_, flags) = self.entry_flags_mut(index, addr)?;
+        flags.set(index);
         Ok(())
     }
 
-    /// Returns indices of parameters whose values changed since last call, then clears flags.
+    /// Returns indices of parameters whose values changed since last call, in
+    /// the order they were first set, then clears flags.
+    ///
+    /// Allocates the list; the flush path walks the flags with
+    /// [`flush_changed`](Self::flush_changed) instead.
     pub fn take_changed(&mut self, addr: i32) -> AsynResult<Vec<usize>> {
         let a = self.validate_addr(addr)?;
-        let mut changed = Vec::new();
-        for (i, entry) in self.params[a].iter_mut().enumerate() {
-            if entry.value_changed {
-                entry.value_changed = false;
-                changed.push(i);
+        let list = &mut self.flags[a].0;
+        let taken = list.clone();
+        list.clear();
+        Ok(taken)
+    }
+
+    /// C `paramList::callCallbacks` (asynPortDriver.cpp:833-873): call `step`
+    /// for every changed parameter at `addr` in the order they were first set
+    /// (:841-843 walks `flags`, which `setFlag` appends to once per index,
+    /// :107-116), then clear every changed flag (:871). Allocates nothing —
+    /// the flush runs under a synchronous port's hold.
+    ///
+    /// `step` returns `Ok(true)` when it fired a callback, `Ok(false)` when it
+    /// skipped the parameter (C's `!isDefined() → continue`, which leaves the
+    /// status alone). A callback's error only overwrites the status and the
+    /// walk continues (:841-866); the last status is what is returned (:872).
+    /// Only a bad parameter index (C `ParamListInvalidIndex`, :868-870)
+    /// returns early, and then no flag is cleared.
+    pub fn flush_changed(
+        &mut self,
+        addr: i32,
+        mut step: impl FnMut(&mut ParamList, usize) -> AsynResult<bool>,
+    ) -> AsynResult<()> {
+        let a = self.validate_addr(addr)?;
+        let mut status = Ok(());
+        // Index-addressed, not iterated: a step may set a parameter, which
+        // appends to the list being walked (C's `flags.size()` is re-read).
+        let mut k = 0;
+        while k < self.flags[a].0.len() {
+            let i = self.flags[a].0[k];
+            k += 1;
+            match step(self, i) {
+                Ok(true) => status = Ok(()),
+                Ok(false) => {}
+                Err(e @ AsynError::ParamIndexOutOfRange(_)) => return Err(e),
+                Err(e) => status = Err(e),
             }
         }
-        Ok(changed)
+        self.flags[a].0.clear();
+        status
     }
 
     /// Number of parameters.
@@ -2531,5 +2632,141 @@ mod tests {
             !pl.take_changed_single(idx, 0).unwrap(),
             "re-asserting the same status/alarm must not mark the param value_changed"
         );
+    }
+
+    fn three_changed() -> ParamList {
+        let mut pl = ParamList::new(1);
+        for n in ["A", "B", "C"] {
+            let i = pl.create_param(n, ParamType::Int32).unwrap();
+            pl.set_int32(i, 0, 1).unwrap();
+        }
+        pl
+    }
+
+    fn flags(pl: &mut ParamList) -> Vec<bool> {
+        (0..3)
+            .map(|i| {
+                let was = pl.take_changed_single(i, 0).unwrap();
+                if was {
+                    pl.mark_changed(i, 0).unwrap();
+                }
+                was
+            })
+            .collect()
+    }
+
+    /// C `callCallbacks` (asynPortDriver.cpp:841-872): a callback's error
+    /// overwrites the status and the walk goes on; all flags are cleared at
+    /// the end; the status of the last callback is returned.
+    #[test]
+    fn flush_changed_continues_past_a_callback_error_and_clears_every_flag() {
+        let mut pl = three_changed();
+        let mut called = Vec::new();
+        let r = pl.flush_changed(0, |_, i| {
+            called.push(i);
+            if i == 1 {
+                Err(AsynError::ParamNotFound("B".into()))
+            } else {
+                Ok(true)
+            }
+        });
+        assert_eq!(called, vec![0, 1, 2], "the third still fires");
+        assert!(r.is_ok(), "the last callback's status is returned");
+        assert_eq!(flags(&mut pl), vec![false; 3], "all flags cleared");
+    }
+
+    #[test]
+    fn flush_changed_returns_the_last_status_and_a_skip_leaves_it_alone() {
+        let mut pl = three_changed();
+        let r = pl.flush_changed(0, |_, i| match i {
+            1 => Err(AsynError::ParamNotFound("B".into())),
+            2 => Ok(false),
+            _ => Ok(true),
+        });
+        assert!(
+            matches!(r, Err(AsynError::ParamNotFound(_))),
+            "an undefined param's `continue` (:845) does not touch status: {r:?}"
+        );
+        assert_eq!(flags(&mut pl), vec![false; 3]);
+
+        let mut pl = three_changed();
+        let r = pl.flush_changed(0, |_, i| {
+            if i == 2 {
+                Err(AsynError::ParamNotFound("C".into()))
+            } else {
+                Ok(true)
+            }
+        });
+        assert!(matches!(r, Err(AsynError::ParamNotFound(_))));
+        assert_eq!(flags(&mut pl), vec![false; 3]);
+    }
+
+    /// C `ParamListInvalidIndex` (:868-870) returns before `flags.clear()`:
+    /// the walk stops and every flag, the ones already walked included, stays.
+    #[test]
+    fn flush_changed_stops_on_a_bad_index_and_keeps_every_flag() {
+        let mut pl = three_changed();
+        let mut called = Vec::new();
+        let r = pl.flush_changed(0, |_, i| {
+            called.push(i);
+            if i == 1 {
+                Err(AsynError::ParamIndexOutOfRange(99))
+            } else {
+                Ok(true)
+            }
+        });
+        assert!(matches!(r, Err(AsynError::ParamIndexOutOfRange(99))));
+        assert_eq!(called, vec![0, 1], "the third is not reached");
+        assert_eq!(flags(&mut pl), vec![true; 3], "no flag was cleared");
+    }
+
+    fn flush_order(pl: &mut ParamList) -> Vec<usize> {
+        let mut seen = Vec::new();
+        pl.flush_changed(0, |_, i| {
+            seen.push(i);
+            Ok(true)
+        })
+        .unwrap();
+        seen
+    }
+
+    fn fresh_abc() -> (ParamList, [usize; 3]) {
+        let mut pl = ParamList::new(1);
+        let ids = ["A", "B", "C"].map(|n| pl.create_param(n, ParamType::Int32).unwrap());
+        (pl, ids)
+    }
+
+    /// C `paramList::setFlag` appends the index once (asynPortDriver.cpp:107-116)
+    /// and `callCallbacks` walks that vector (:841-843): callbacks fire in
+    /// first-set order, not index order.
+    #[test]
+    fn callbacks_fire_in_the_order_the_params_were_first_set() {
+        let (mut pl, [a, b, c]) = fresh_abc();
+        pl.set_int32(c, 0, 1).unwrap();
+        pl.set_int32(a, 0, 1).unwrap();
+        pl.set_int32(b, 0, 1).unwrap();
+        assert_eq!(flush_order(&mut pl), vec![2, 0, 1]);
+
+        let (mut pl, [_, b, c]) = fresh_abc();
+        pl.set_int32(b, 0, 1).unwrap();
+        pl.set_int32(c, 0, 1).unwrap();
+        assert_eq!(flush_order(&mut pl), vec![1, 2]);
+    }
+
+    /// `if (flags[i] == index) return` (:112): a second set keeps its position.
+    #[test]
+    fn a_second_set_of_a_param_keeps_its_first_position() {
+        let (mut pl, [a, b, _]) = fresh_abc();
+        pl.set_int32(a, 0, 1).unwrap();
+        pl.set_int32(a, 0, 2).unwrap();
+        pl.set_int32(b, 0, 1).unwrap();
+        assert_eq!(flush_order(&mut pl), vec![0, 1]);
+        assert_eq!(flush_order(&mut pl), Vec::<usize>::new(), "cleared");
+
+        let (mut pl, [a, b, _]) = fresh_abc();
+        pl.set_int32(b, 0, 1).unwrap();
+        pl.set_int32(a, 0, 1).unwrap();
+        pl.set_int32(b, 0, 2).unwrap();
+        assert_eq!(flush_order(&mut pl), vec![1, 0]);
     }
 }

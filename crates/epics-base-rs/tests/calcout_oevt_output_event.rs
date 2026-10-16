@@ -65,7 +65,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         let r = db.get_record(name).unwrap();
         let mut inst = r.write();
         inst.common.scan = ScanType::Event;
-        inst.common.evnt = evnt.to_string();
+        inst.common.text.evnt = evnt.into();
     }
     db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
@@ -91,6 +91,8 @@ async fn settle(cond: impl Fn() -> bool) {
 #[epics_macros_rs::epics_test]
 async fn calcout_oevt_posts_string_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "SIB", "e1", count.clone()).await;
 
@@ -168,6 +170,8 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
 #[epics_macros_rs::epics_test]
 async fn scalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "S_SIB", "5", count.clone()).await;
 
@@ -195,6 +199,8 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
 #[epics_macros_rs::epics_test]
 async fn acalcout_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "A_SIB", "7", count.clone()).await;
 
@@ -225,6 +231,8 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
 #[epics_macros_rs::epics_test]
 async fn swait_oevt_posts_numeric_event_on_output() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "W_SIB", "3", count.clone()).await;
 

@@ -1,3 +1,5 @@
+use std::fmt;
+
 /// Status codes matching C asyn's asynStatus enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AsynStatus {
@@ -18,12 +20,12 @@ pub enum AsynError {
     /// An octet read that failed *after* transferring bytes into the
     /// caller's buffer.
     ///
-    /// C parity: `asynOctet::read` reports `*nbytesTransfered` and
+    /// C parity: `asynOctet::read` reports `*nbytesTransferred` and
     /// `*eomReason` **together with** a failing `asynStatus` — the EOS
     /// interpose breaks out of its accumulation loop on a lower-layer error
     /// and still runs the common tail
     /// (`asynInterposeEos.c:242-253`: null-terminate, `*eomReason = eom`,
-    /// `*nbytesTransfered = nRead`, `return status`). A device that emits a
+    /// `*nbytesTransferred = nRead`, `return status`). A device that emits a
     /// partial line and then goes quiet therefore reaches the record as
     /// `asynTimeout` *plus* the bytes it did send; `asynRecord` commits both
     /// (`asynRecord.c:1591,1627`: `eomr` and `nord` are assigned regardless
@@ -56,23 +58,23 @@ pub enum AsynError {
         /// The failure that ended the transfer, intact.
         source: Box<AsynError>,
         /// The bytes transferred before the failure and the end-of-message
-        /// reason accumulated up to that point — the `*nbytesTransfered` /
+        /// reason accumulated up to that point — the `*nbytesTransferred` /
         /// `*eomReason` pair C writes out alongside the error.
         partial: crate::interpose::PartialOctetRead,
     },
 
     /// An octet write that failed *after* the device accepted bytes.
     ///
-    /// C parity: `asynOctet::write` reports `*nbytesTransfered` **together
+    /// C parity: `asynOctet::write` reports `*nbytesTransferred` **together
     /// with** a failing `asynStatus`, at every layer of the write chain —
     /// `drvAsynSerialPort.c::writeIt` (`:843`) assigns
-    /// `*nbytesTransfered = numchars - nleft` on the way out of the loop no
+    /// `*nbytesTransferred = numchars - nleft` on the way out of the loop no
     /// matter whether it broke on `asynTimeout` or on a fatal `write()` errno;
     /// `asynInterposeEcho.c::writeIt` (`:83`) and `asynInterposeDelay.c` (`:51`)
-    /// assign `*nbytesTransfered = transfered` on every break; and
+    /// assign `*nbytesTransferred = transferred` on every break; and
     /// `asynInterposeEos.c::writeIt` (`:179`) clamps the lower layer's count to
     /// the caller's `numchars` and returns it beside the status. `asynRecord`
-    /// commits the result unconditionally — `nawt = nbytesTransfered`
+    /// commits the result unconditionally — `nawt = nbytesTransferred`
     /// (asynRecord.c:1547) runs *before* the status check at `:1551` — so a
     /// half-written command lands `NAWT=3` next to its `Write error, nout=3`
     /// diagnostic.
@@ -93,16 +95,16 @@ pub enum AsynError {
         /// The failure that ended the write, intact.
         source: Box<AsynError>,
         /// The bytes the device accepted before the failure — C's
-        /// `*nbytesTransfered` on the error path.
+        /// `*nbytesTransferred` on the error path.
         nbytes: usize,
     },
 
     /// The request waited in the port queue past the deadline its
     /// `queueRequest` was given, so it was removed and **never ran**.
     ///
-    /// C `queueTimeoutCallback` (asynManager.c:647-700): the timer
+    /// C `queueTimeoutCallback` (asynManager.c:649-703): the timer
     /// `queueRequest(pasynUser, priority, timeout)` armed at enqueue
-    /// (asynManager.c:1617-1623) fires while `isQueued` is still true, the
+    /// (asynManager.c:1619-1625) fires while `isQueued` is still true, the
     /// request is unlinked from the port's queue list, and the caller's
     /// `timeoutUser` runs **instead of** its `processUser`. Only a caller that
     /// asked for a queue deadline can see this — device support passes
@@ -119,7 +121,7 @@ pub enum AsynError {
 
     /// The port's queue gate refused the request, so it was **never queued and
     /// never ran** — C's `queueRequest` returning `asynDisabled` /
-    /// `asynDisconnected` (asynManager.c:1541-1552).
+    /// `asynDisconnected` (asynManager.c:1543-1554).
     ///
     /// Distinct from an [`AsynError::Status`] carrying the same `AsynStatus`,
     /// and that distinction is the whole point: in C the two arrive by different
@@ -141,6 +143,12 @@ pub enum AsynError {
 
     #[error("port already registered: {0}")]
     PortAlreadyRegistered(String),
+
+    /// The handle's interrupt manager already has an owner gate: it was
+    /// registered before, or built with [`crate::interrupt::InterruptManager::owned_by`]
+    /// for a driver driven by hand. A port has one owner, set once.
+    #[error("port already has an owner gate: {0}")]
+    PortAlreadyOwned(String),
 
     #[error("param not found: {0}")]
     ParamNotFound(String),
@@ -193,8 +201,8 @@ pub enum AsynError {
 
     /// An option key the port does not implement — C's trailing
     /// `else if (epicsStrCaseCmp(key, "") != 0)` arm, in `setOption` and
-    /// `getOption` alike (drvAsynSerialPort.c:594-597, :1171;
-    /// drvAsynSerialPortWin32.c:341-344; drvAsynIPPort.c:902-905). The text is
+    /// `getOption` alike (drvAsynSerialPort.c:594-597, :226-229;
+    /// drvAsynSerialPortWin32.c:341-344; drvAsynIPPort.c:995-998). The text is
     /// C's, verbatim: it is what reaches the operator through
     /// `pasynUser->errorMessage` and lands in the record's ERRS.
     #[error("Unsupported key \"{0}\"")]
@@ -237,15 +245,13 @@ impl AsynError {
     /// into `ERRS`. Reads *through* the partial carriers, so a failed transfer
     /// reports the same text whether or not it moved bytes first.
     pub fn message(&self) -> String {
-        match self {
-            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
-                message.clone()
-            }
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.message()
-            }
-            other => other.to_string(),
-        }
+        self.message_display().to_string()
+    }
+
+    /// [`Self::message`] as a borrowed `Display`, for a caller that formats it
+    /// into a fixed buffer and must not allocate.
+    pub fn message_display(&self) -> ErrorMessage<'_> {
+        ErrorMessage(self)
     }
 
     /// Re-stamp a gate refusal as one: the request was rejected by
@@ -269,8 +275,8 @@ impl AsynError {
     /// request must ask before doing anything a *completed* request implies.
     /// C draws the line structurally: both outcomes are decided before
     /// `processUser` is ever dispatched — `queueRequest` returns the refusal
-    /// (asynManager.c:1541-1552) and `queueTimeoutCallback` runs `timeoutUser`
-    /// *instead of* `processUser` (:647-700) — so no bytes moved, no option or
+    /// (asynManager.c:1543-1554) and `queueTimeoutCallback` runs `timeoutUser`
+    /// *instead of* `processUser` (:649-703) — so no bytes moved, no option or
     /// EOS was written, no connect was attempted, and none of the follow-up work
     /// a completed request implies (asynRecord's `setOption` → `getOptions`
     /// fall-through, its `monitorStatus` tail) may run.
@@ -315,7 +321,7 @@ impl AsynError {
     /// on the fd/socket, not a timeout and not a higher-layer complaint.
     ///
     /// C's drivers decide this at the errno itself, calling `closeConnection`
-    /// right where `read`/`write` failed (drvAsynIPPort.c:692-698,
+    /// right where `read`/`write` failed (drvAsynIPPort.c:741-748,
     /// drvAsynSerialPort.c:836-845) while returning `asynTimeout` with the link
     /// intact on a poll expiry. Rust re-derives the decision one layer up, in
     /// [`AsynError::is_fatal_transport`], so the errno has to survive the trip:
@@ -347,7 +353,7 @@ impl AsynError {
     }
 
     /// The partial octet transfer delivered before this error, if any —
-    /// C's `*nbytesTransfered` / `*eomReason` / caller-buffer contents on the
+    /// C's `*nbytesTransferred` / `*eomReason` / caller-buffer contents on the
     /// failure path.
     ///
     /// Every consumer of an octet read MUST consult this on the error path:
@@ -368,7 +374,7 @@ impl AsynError {
     ///
     /// Re-attaching overwrites the count: in a stacked interpose chain the
     /// outermost layer is the one that filled the caller's buffer, so its count
-    /// is the authoritative `*nbytesTransfered`. The original source is kept —
+    /// is the authoritative `*nbytesTransferred`. The original source is kept —
     /// re-wrapping must not bury it one layer deeper each hop.
     pub fn with_partial_read(self, partial: crate::interpose::PartialOctetRead) -> Self {
         let source = match self {
@@ -379,12 +385,12 @@ impl AsynError {
     }
 
     /// The bytes the device accepted before this write failed — C's
-    /// `*nbytesTransfered` on a failing `asynOctet::write`. `None` means the
+    /// `*nbytesTransferred` on a failing `asynOctet::write`. `None` means the
     /// layer reported no transfer, which is C's pre-call
-    /// `nbytesTransfered = 0` (asynRecord.c:1527) left untouched: zero bytes.
+    /// `nbytesTransferred = 0` (asynRecord.c:1527) left untouched: zero bytes.
     ///
     /// Every consumer of an octet write MUST consult this on the error path:
-    /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransfered`
+    /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransferred`
     /// before it looks at the status (asynRecord.c:1547-1551), so an error
     /// branch that reports only "0 written" contradicts what the device
     /// actually received.
@@ -402,7 +408,7 @@ impl AsynError {
     /// Re-attaching overwrites the count: in a stacked interpose chain the
     /// outermost layer is the one that owns the caller's `numchars` (the EOS
     /// interpose must not report its appended terminator bytes), so its count
-    /// is the authoritative `*nbytesTransfered`. The original source is kept.
+    /// is the authoritative `*nbytesTransferred`. The original source is kept.
     pub fn with_partial_write(self, nbytes: usize) -> Self {
         let source = match self {
             AsynError::PartialWrite { source, .. } => source,
@@ -413,3 +419,65 @@ impl AsynError {
 }
 
 pub type AsynResult<T> = Result<T, AsynError>;
+
+/// C `queueRequest`'s refusal (asynManager.c:1538-1579), its text made only
+/// when printed: a caller queueing under a hold reports it without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueRefusal<'a> {
+    /// `port %s disabled` (:1543-1546).
+    PortDisabled(&'a str),
+    /// `port %s not connected` (:1549-1552).
+    PortNotConnected(&'a str),
+    /// The user is already on a queue (:1586-1591).
+    AlreadyQueued,
+    /// The port's queue is gone.
+    ShutDown,
+}
+
+impl QueueRefusal<'_> {
+    pub fn status(&self) -> AsynStatus {
+        match self {
+            Self::PortDisabled(_) => AsynStatus::Disabled,
+            Self::PortNotConnected(_) => AsynStatus::Disconnected,
+            Self::AlreadyQueued | Self::ShutDown => AsynStatus::Error,
+        }
+    }
+}
+
+impl fmt::Display for QueueRefusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PortDisabled(port) => write!(f, "port {port} disabled"),
+            Self::PortNotConnected(port) => write!(f, "port {port} not connected"),
+            Self::AlreadyQueued => f.write_str("asynManager::queueRequest is already queued"),
+            Self::ShutDown => f.write_str("port shut down"),
+        }
+    }
+}
+
+/// The refusal as a [`AsynError::QueueRefused`].
+impl From<QueueRefusal<'_>> for AsynError {
+    fn from(refusal: QueueRefusal<'_>) -> Self {
+        AsynError::QueueRefused {
+            status: refusal.status(),
+            message: refusal.to_string(),
+        }
+    }
+}
+
+/// [`AsynError::message`] without the copy.
+pub struct ErrorMessage<'a>(&'a AsynError);
+
+impl fmt::Display for ErrorMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
+                f.write_str(message)
+            }
+            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
+                source.message_display().fmt(f)
+            }
+            other => fmt::Display::fmt(other, f),
+        }
+    }
+}

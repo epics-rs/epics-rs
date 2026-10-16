@@ -22,7 +22,7 @@ use motor_rs::flags::SpmgMode;
 use motor_rs::record::MotorRecord;
 
 fn instance_of(rec: MotorRecord) -> RecordInstance {
-    RecordInstance::new("M".to_string(), rec)
+    RecordInstance::new("M", rec)
 }
 
 /// `motorRecord.dbd:495-501` — `field(LSPG,DBF_MENU) initial("3")`, and C

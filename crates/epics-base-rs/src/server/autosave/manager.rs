@@ -11,7 +11,8 @@ use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
 use super::save_file;
 use super::save_set::{
-    RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
+    ListStatus, RestoreMode, RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy,
+    SrStatus, TriggerMode,
 };
 use super::watermark::{ChangeWatermark, Tick};
 
@@ -77,6 +78,7 @@ impl AutosaveBuilder {
             compat: self.compat,
             global_macros: self.global_macros,
             runtime: OnceLock::new(),
+            recent: Mutex::new(None),
         };
         for cfg in self.save_sets {
             // Announced and recorded by `add_set`; nothing is left to say.
@@ -115,6 +117,8 @@ pub struct AutosaveManager {
     compat: CompatMode,
     global_macros: HashMap<String, String>,
     runtime: OnceLock<Runtime>,
+    /// The manager's own latest SR_recentlyStr event; see [`SaveSet::recent`].
+    recent: Mutex<Option<(std::time::Instant, String)>>,
 }
 
 impl std::fmt::Debug for AutosaveManager {
@@ -143,7 +147,7 @@ impl AutosaveManager {
         let set = match SaveSet::new_with_mode(cfg, self.compat).await {
             Ok(set) => Arc::new(set),
             Err(e) => {
-                crate::runtime::log::errlog_printf(&format!(
+                crate::runtime::log::errlog_vprintf(format_args!(
                     "autosave: save set '{name}' not built: {e} - its PVs are not saved\n"
                 ));
                 self.failed.lock().unwrap().push((name, e.to_string()));
@@ -178,10 +182,8 @@ impl AutosaveManager {
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
     ///
     /// Takes the [`Reactor`](crate::runtime::task::Reactor), unlike every
-    /// deferred record tail: a save writes through `runtime::fs`, whose hosted
-    /// implementation is `tokio::task::spawn_blocking` and panics off a runtime
-    /// thread, and each strategy is a poller on `runtime::task::interval`,
-    /// which is `tokio::time` there. Autosave is started from
+    /// deferred record tail: each strategy is a poller on
+    /// `runtime::task::interval`, which is `tokio::time` on a hosted build. Autosave is started from
     /// `IocApplication::run`, which owns that runtime; it is not on the
     /// synchronous record-processing chain that reaches a runtime-less
     /// connection thread. The parameter is what says so for the *spawns*,
@@ -209,17 +211,80 @@ impl AutosaveManager {
         });
         let outer = reactor.clone();
         reactor.spawn(async move {
-            let handles: Vec<_> = self
+            let mut handles: Vec<_> = self
                 .sets()
                 .into_iter()
                 .filter_map(|(set, lock)| self.spawn_set_task(&outer, set, lock, db.clone()))
                 .collect();
+            if let Some(prefix) = self.status_prefix.clone() {
+                let me = self.clone();
+                let db = db.clone();
+                handles.push(outer.spawn(async move { me.report_status(&db, &prefix).await }));
+            }
 
             // Wait for all tasks to complete
             for h in handles {
                 let _ = h.await;
             }
         })
+    }
+
+    /// The tail of each pass of C's save_restore loop (save_restore.c:1059-1121),
+    /// once per `MIN_DELAY` (1 s, :395): SR_status is the worst list status,
+    /// starting from OK (:903, :1044).
+    async fn report_status(&self, db: &PvDatabase, prefix: &str) {
+        let mut shutdown_rx = self.shutdown.subscribe();
+        let mut heartbeat = 0i16;
+        loop {
+            // The first pass is immediate, as C's loop runs before it waits.
+            if is_stopped(&shutdown_rx) {
+                return;
+            }
+            let sets = self.sets();
+            let statuses: Vec<_> = sets.iter().map(|(set, _)| set.list_status()).collect();
+            // `<=`: of equally bad lists the later one's text wins (:1043-1046).
+            let mut worst = ListStatus {
+                code: SrStatus::Ok,
+                text: "Ok".into(),
+            };
+            for status in &statuses {
+                if status.code <= worst.code {
+                    worst = status.clone();
+                }
+            }
+            let recently = sets
+                .iter()
+                .filter_map(|(set, _)| set.recent())
+                .chain(self.recent.lock().unwrap().clone())
+                .max_by_key(|(at, _)| *at)
+                .map(|(_, text)| text)
+                .unwrap_or_default();
+            let _ = ca_put(
+                db,
+                &format!("{prefix}SR_status"),
+                EpicsValue::Long(worst.code as i32),
+            )
+            .await;
+            heartbeat = (heartbeat + 1) % 2;
+            let _ = ca_put(
+                db,
+                &format!("{prefix}SR_heartbeat"),
+                EpicsValue::Short(heartbeat),
+            )
+            .await;
+            let _ = ca_put_str(db, &format!("{prefix}SR_statusStr"), &worst.text).await;
+            let _ = ca_put_str(db, &format!("{prefix}SR_recentlyStr"), &recently).await;
+            // The first NUM_STATUS_PV_SETS lists, in creation order
+            // (save_restore.c:2466-2470); a set is never removed.
+            for (index, ((set, _), status)) in sets.iter().zip(statuses).enumerate().take(8) {
+                report_list(db, &format!("{prefix}SR_{index}_"), set, status).await;
+            }
+            tokio::select! {
+                biased;
+                _ = stopped(&mut shutdown_rx) => return,
+                _ = crate::runtime::task::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+        }
     }
 
     /// Spawn the poller for one set; `None` for a [`SaveStrategy::Manual`]
@@ -232,31 +297,27 @@ impl AutosaveManager {
         db: Arc<PvDatabase>,
     ) -> Option<TaskHandle<()>> {
         let outer = reactor;
+        // C `enable_list` (save_restore.c:1485), every list's first pass.
+        self.note_recent(format!("list '{}' enabled", set.save_file()));
         let mut shutdown_rx = self.shutdown.subscribe();
-        let status_prefix = self.status_prefix.clone();
 
         let handle = match set.config().strategy.clone() {
             SaveStrategy::Periodic { interval } => {
                 outer.spawn(async move {
-                    let mut ticker = crate::runtime::task::interval(interval);
-                    ticker.tick().await; // first tick is immediate, skip it
                     loop {
                         tokio::select! {
-                            _ = ticker.tick() => {
+                            biased;
+                            _ = stopped(&mut shutdown_rx) => break,
+                            _ = crate::runtime::task::sleep(interval) => {
                                 // No watermark to gate: a Periodic set
                                 // re-saves the whole set every interval,
-                                // so the next tick retries a failed save
+                                // so the next pass retries a failed save
                                 // by construction.
                                 let _guard = lock.lock().await;
-                                let result = set.save_once(&db).await;
-                                if let Some(ref prefix) = status_prefix {
-                                    update_status_pvs(&db, prefix, &set, &result).await;
-                                }
-                            }
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
+                                if is_stopped(&shutdown_rx) {
                                     break;
                                 }
+                                let _ = set.save_once(&db).await;
                             }
                         }
                     }
@@ -268,7 +329,6 @@ impl AutosaveManager {
                 poll_interval,
             } => {
                 outer.spawn(async move {
-                    let mut ticker = crate::runtime::task::interval(poll_interval);
                     let mut watermark = ChangeWatermark::new(
                         TriggerState {
                             last_value: None,
@@ -277,19 +337,19 @@ impl AutosaveManager {
                         set,
                         lock,
                         db,
-                        status_prefix,
+                        shutdown_rx.clone(),
                     );
 
+                    // The first poll is immediate: it is the baseline.
                     loop {
+                        if is_stopped(&shutdown_rx) {
+                            break;
+                        }
+                        triggered_poll(&mut watermark, &trigger_pv, mode).await;
                         tokio::select! {
-                            _ = ticker.tick() => {
-                                triggered_poll(&mut watermark, &trigger_pv, mode).await;
-                            }
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    break;
-                                }
-                            }
+                            biased;
+                            _ = stopped(&mut shutdown_rx) => break,
+                            _ = crate::runtime::task::sleep(poll_interval) => {}
                         }
                     }
                 })
@@ -298,20 +358,19 @@ impl AutosaveManager {
                 min_interval,
                 float_epsilon,
             } => outer.spawn(async move {
-                let mut ticker = crate::runtime::task::interval(min_interval);
                 let mut watermark =
-                    ChangeWatermark::new(HashMap::new(), set, lock, db, status_prefix);
+                    ChangeWatermark::new(HashMap::new(), set, lock, db, shutdown_rx.clone());
 
+                // The first poll is immediate: it is the baseline.
                 loop {
+                    if is_stopped(&shutdown_rx) {
+                        break;
+                    }
+                    onchange_poll(&mut watermark, float_epsilon).await;
                     tokio::select! {
-                        _ = ticker.tick() => {
-                            onchange_poll(&mut watermark, float_epsilon).await;
-                        }
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
+                        biased;
+                        _ = stopped(&mut shutdown_rx) => break,
+                        _ = crate::runtime::task::sleep(min_interval) => {}
                     }
                 }
             }),
@@ -344,7 +403,19 @@ impl AutosaveManager {
             .find_set(set_name)
             .ok_or_else(|| AutosaveError::PvNotFound(format!("save set '{set_name}' not found")))?;
 
-        set.restore_once(db).await
+        // C `do_manual_restore` writes each value with `ca_put`, i.e.
+        // `dbPutField` (save_restore.c:3245), unlike the boot restore's `dbPut`.
+        let result = set.restore_once_with_mode(db, RestoreMode::Process).await;
+        self.note_recent(match &result {
+            Ok(r) if r.failed_puts.is_empty() => "Manual restore succeeded".into(),
+            Ok(r) => format!("{} errors during manual restore", r.failed_puts.len()),
+            Err(_) => "Manual restore failed".into(),
+        });
+        result
+    }
+
+    fn note_recent(&self, text: String) {
+        *self.recent.lock().unwrap() = Some((std::time::Instant::now(), text));
     }
 
     /// Get status of all save sets, built and unbuilt alike.
@@ -365,7 +436,7 @@ impl AutosaveManager {
 
     /// Send shutdown signal to all tasks.
     pub fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Get the list of save set names.
@@ -392,6 +463,23 @@ impl AutosaveManager {
     pub fn sets(&self) -> Vec<SetEntry> {
         self.sets.lock().unwrap().clone()
     }
+}
+
+/// Resolve once `shutdown` has been called, or the manager is gone. A task
+/// subscribes when it starts, which can be after `shutdown`; a late receiver
+/// has already seen `true`, so this cannot be `changed()`, and `shutdown`
+/// must `send_replace`, since `send` stores nothing while no task listens.
+async fn stopped(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// Whether the manager has been shut down or dropped, without waiting.
+///
+/// Read immediately before a save starts: the loops' `select!` only sees a
+/// stop between passes, and a pass can sit on the set lock behind a slow
+/// save while the manager goes away. Once this is true no save may start.
+pub(super) fn is_stopped(rx: &watch::Receiver<bool>) -> bool {
+    *rx.borrow() || rx.has_changed().is_err()
 }
 
 /// Compare two stringified values with float epsilon tolerance.
@@ -502,48 +590,44 @@ async fn onchange_poll(
     watermark.advance(tick).await;
 }
 
-/// Update status PVs after a save cycle.
-pub(super) async fn update_status_pvs(
-    db: &PvDatabase,
-    prefix: &str,
-    set: &SaveSet,
-    result: &AutosaveResult<usize>,
-) {
-    let set_name = &set.config().name;
-    let status_code = match result {
-        Ok(_) => 0i32,
-        Err(_) => 2i32,
-    };
-
-    let _ = db
-        .put_pv_no_process(
-            &format!("{prefix}SR_{set_name}_status"),
-            EpicsValue::Long(status_code),
-        )
-        .await;
-
-    if let Ok(count) = result {
-        let _ = db
-            .put_pv_no_process(
-                &format!("{prefix}SR_{set_name}_savedCount"),
-                EpicsValue::Long(*count as i32),
-            )
-            .await;
+/// One list's status PVs, as save_restore.c:1109-1121 writes them.
+async fn report_list(db: &PvDatabase, pv: &str, set: &SaveSet, status: ListStatus) {
+    let _ = ca_put(
+        db,
+        &format!("{pv}Status"),
+        EpicsValue::Long(status.code as i32),
+    )
+    .await;
+    // `save_file` cut to a DBR_STRING, then at its last '.'.
+    let mut name: String = set.save_file().chars().take(39).collect();
+    if let Some(dot) = name.rfind('.') {
+        name.truncate(dot);
     }
-
-    let _ = db
-        .put_pv_no_process(&format!("{prefix}SR_status"), EpicsValue::Long(status_code))
-        .await;
-
-    // Heartbeat
-    if let Ok(current) = db.get_pv(&format!("{prefix}SR_heartbeat")) {
-        if let Some(v) = current.to_f64() {
-            let _ = db
-                .put_pv_no_process(
-                    &format!("{prefix}SR_heartbeat"),
-                    EpicsValue::Long(v as i32 + 1),
-                )
-                .await;
-        }
+    let _ = ca_put_str(db, &format!("{pv}Name"), &name).await;
+    // C's `save_state` once the pass has cleared the events it served,
+    // which leaves nothing for these strategies.
+    if !matches!(set.config().strategy, SaveStrategy::OnChange { .. }) {
+        let _ = ca_put(db, &format!("{pv}State"), EpicsValue::Long(0)).await;
     }
+    let _ = ca_put_str(db, &format!("{pv}StatusStr"), &status.text).await;
+    if status.code >= SrStatus::Warn {
+        let time = set.save_time().format("%a %b %d %H:%M:%S").to_string();
+        let _ = ca_put_str(db, &format!("{pv}Time"), &time).await;
+    }
+}
+
+/// C autosave's `ca_put` on a status PV, which rsrv serves as `dbPutField`
+/// (save_restore.c:1061-1062): the record processes, so an mbbo status takes
+/// its state alarm and a heartbeat bo fires its FLNK.
+async fn ca_put(db: &PvDatabase, name: &str, value: EpicsValue) -> crate::error::CaResult<()> {
+    let (record, field) = crate::server::database::parse_pv_name(name);
+    db.put_record_field_from_ca_no_notify(record, field, value)
+        .await
+}
+
+/// [`ca_put`] of C's `DBR_STRING` from a `STATUS_STR_LEN` buffer: the record
+/// keeps the first 39 characters.
+async fn ca_put_str(db: &PvDatabase, name: &str, text: &str) -> crate::error::CaResult<()> {
+    let text: String = text.chars().take(39).collect();
+    ca_put(db, name, EpicsValue::String(text.into())).await
 }

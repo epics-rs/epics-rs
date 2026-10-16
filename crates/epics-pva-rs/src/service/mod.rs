@@ -181,7 +181,7 @@ pub fn add_rpc_service<S: PvaService>(
                 }
             }
         });
-        if let Err(e) = source.try_add(&pv_name, pv) {
+        if let Err(e) = source.try_add(pv_name.as_str(), pv) {
             // Roll back the methods registered so far so a duplicate
             // leaves the namespace exactly as it was before this call.
             for name in &registered {

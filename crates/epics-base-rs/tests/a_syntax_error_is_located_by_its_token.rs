@@ -13,11 +13,10 @@
 //! a line the echo below already prints, where C names the text.
 //!
 //! Every expected byte below was captured from `softIoc` built from
-//! `~/work/epics-base` (`R7.0.10`) loading these exact files, with two known
-//! subtractions noted per case: C's `WARNING: dbReadCOM: Parser stack dirty
-//! w/o error. 1` counts half-built objects on a `tempList` this parser does not
-//! have, and C's `in path "."` names its own cwd where this gate names the
-//! directory it wrote the fixture into.
+//! `~/work/epics-base` (`R7.0.10`) loading these exact files, with one known
+//! subtraction: C's `in path "."` names its own cwd where this gate names the
+//! directory it wrote the fixture into. C's `WARNING: dbReadCOM: Parser stack
+//! dirty w/o error. 1` follows the three aborts inside a record body.
 //!
 //! ANSI is stripped before comparing; whether the escapes are emitted has its
 //! own gate. Unix only: what is captured is the process console.
@@ -123,6 +122,12 @@ async fn every_rejection_says_syntax_error_and_names_its_token() {
     unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", &found_under) };
 
     for (name, body, token, line) in CASES {
+        // The abort came with a record body open (`dbLexRoutines.c:303-306`).
+        let dirty = if matches!(*name, "quoted.db" | "bareword_val.db" | "next_line.db") {
+            "WARNING: dbReadCOM: Parser stack dirty w/o error. 1\n"
+        } else {
+            ""
+        };
         let got = stderr_of(
             &format!("dbLoadRecords(\"{name}\")"),
             Arc::new(PvDatabase::new()),
@@ -138,7 +143,7 @@ ERROR: syntax error
 
  {line} | {source}
 
-ERROR: Failed to load '{name}'
+{dirty}ERROR: Failed to load '{name}'
 "
         );
         assert_eq!(

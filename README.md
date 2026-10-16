@@ -24,7 +24,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.31", features = ["ad"] }
+epics-rs = { version = "0.32", features = ["ad"] }
 ```
 
 ```rust
@@ -55,8 +55,8 @@ through the umbrella crate — depend on them directly when needed.
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.31"  # just the IOC runtime
-epics-ca-rs   = "0.31"  # just Channel Access
+epics-base-rs = "0.32"  # just the IOC runtime
+epics-ca-rs   = "0.32"  # just Channel Access
 ```
 
 ## Workspace
@@ -240,9 +240,11 @@ is enabled at run/feature level, not by cross-compiling:
 # build with priority-inheritance mutexes (PTHREAD_PRIO_INHERIT)
 cargo build --release --features epics-base-rs/linux-rt
 
-# opt the IOC into SCHED_FIFO thread banding (default is off on hosted targets),
-# granting the privilege via an RTPRIO rlimit, CAP_SYS_NICE, or chrt
-EPICS_RS_ALLOW_RT_PRIORITY=YES ./your-ioc
+# SCHED_FIFO thread banding is on by default, as in C; grant the privilege via
+# an RTPRIO rlimit, CAP_SYS_NICE, or chrt (without it threads stay SCHED_OTHER)
+./your-ioc
+# turn it off
+EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=NO ./your-ioc
 ```
 
 Both levers are documented in
@@ -250,6 +252,22 @@ Both levers are documented in
 deployment"). Measured on a real PREEMPT_RT kernel, PI collapses the
 record-gate priority inversion to its critical-section bound: worst case
 24.9 ms to 10.1 ms on the measured guest.
+
+## Release binaries for Linux x86_64 (PGO)
+
+The shipped `realtime-ca-ioc`, `realtime-pva-ioc` and `softioc-rs` binaries
+for `x86_64-unknown-linux-gnu` are built with profile-guided optimization:
+
+```bash
+scripts/pgo-train.sh   # needs `rustup component add llvm-tools`
+scripts/pgo-build.sh   # target/x86_64-unknown-linux-gnu/release/
+```
+
+The profile is a release artifact, regenerated at each tag and never
+committed: a profile older than the sources builds without error and without
+the gain, so `pgo-build.sh` refuses one. Every other build stays plain —
+dev, test, RTEMS and VxWorks images, and the benchmark builds, whose
+instruction-count anchors assume the plain layout.
 
 ## Architecture
 

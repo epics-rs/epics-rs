@@ -39,25 +39,28 @@ struct GateLset {
     /// is how the per-link independence boundary stays deterministic.
     gated: String,
     completed: Arc<Mutex<Vec<f64>>>,
+    /// Signalled after each push to `completed` (`notify_one` keeps the
+    /// permit, so a waiter that checks first and waits second misses none).
+    settled: Arc<tokio::sync::Notify>,
     entered: tokio::sync::mpsc::UnboundedSender<f64>,
     release: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait::async_trait]
 impl LinkSet for GateLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, name: &str, value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, name: &[u8], value: EpicsValue, _: LinkPutOp) -> Result<(), String> {
         let v = value.to_f64().expect("tests only put doubles");
         let _ = self.entered.send(v);
-        if name == self.gated {
+        if name == self.gated.as_bytes() {
             self.release
                 .acquire()
                 .await
@@ -65,6 +68,7 @@ impl LinkSet for GateLset {
                 .forget();
         }
         self.completed.lock().unwrap().push(v);
+        self.settled.notify_one();
         Ok(())
     }
 }
@@ -90,19 +94,19 @@ impl RecordingLset {
 
 #[async_trait::async_trait]
 impl LinkSet for RecordingLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         self.admission == PutAdmission::Connected
     }
-    fn put_admission(&self, _: &str) -> PutAdmission {
+    fn put_admission(&self, _: &[u8]) -> PutAdmission {
         self.admission
     }
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         None
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
-    async fn put_value(&self, _: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+    async fn put_value(&self, _: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         self.writes
             .lock()
             .unwrap()
@@ -185,6 +189,7 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 #[epics_macros_rs::epics_test]
 async fn plain_put_returns_before_the_wire_write_completes() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
@@ -194,6 +199,7 @@ async fn plain_put_returns_before_the_wire_write_completes() {
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
@@ -276,6 +282,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
 #[epics_macros_rs::epics_test]
 async fn pending_put_is_overwritten_latest_wins() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
@@ -285,6 +292,7 @@ async fn pending_put_is_overwritten_latest_wins() {
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
@@ -366,6 +374,7 @@ async fn per_link_put_ordering_is_preserved() {
 #[epics_macros_rs::epics_test]
 async fn async_put_completion_is_reported_through_the_notify_chain() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
@@ -375,6 +384,7 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
         Arc::new(GateLset {
             gated: "REMOTE:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
@@ -471,6 +481,7 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
 #[epics_macros_rs::epics_test]
 async fn a_blocked_link_does_not_stall_other_links() {
     let completed = Arc::new(Mutex::new(Vec::new()));
+    let settled = Arc::new(tokio::sync::Notify::new());
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
 
@@ -482,6 +493,7 @@ async fn a_blocked_link_does_not_stall_other_links() {
             // hands it over.
             gated: "SLOW:OUT".to_string(),
             completed: Arc::clone(&completed),
+            settled: Arc::clone(&settled),
             entered,
             release: Arc::clone(&release),
         }),
@@ -500,11 +512,19 @@ async fn a_blocked_link_does_not_stall_other_links() {
         Some(2.0),
         "FAST:OUT reached the lset while SLOW:OUT was still in flight"
     );
-    for _ in 0..10_000 {
-        if completed.lock().unwrap().contains(&2.0) {
-            break;
+    let fast_done = async {
+        while !completed.lock().unwrap().contains(&2.0) {
+            settled.notified().await;
         }
-        epics_base_rs::runtime::task::yield_now().await;
+    };
+    if epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(30), fast_done)
+        .await
+        .is_err()
+    {
+        panic!(
+            "FAST:OUT not completed 30 s after it reached the lset; completed = {:?}",
+            completed.lock().unwrap()
+        );
     }
     let mid = completed.lock().unwrap().clone();
     assert_eq!(

@@ -37,25 +37,25 @@ use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 struct EmptySource;
 
 impl ChannelSource for EmptySource {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<epics_base_rs::types::RecordName> {
         Vec::new()
     }
-    async fn has_pv(&self, _: &str) -> bool {
+    async fn has_pv(&self, _: &[u8]) -> bool {
         false
     }
-    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, _: &[u8]) -> Option<FieldDesc> {
         None
     }
-    async fn get_value(&self, _: &str) -> Option<PvField> {
+    async fn get_value(&self, _: &[u8]) -> Option<PvField> {
         None
     }
-    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _: &[u8], _: PvField) -> Result<(), OpError> {
         Err("read-only".into())
     }
-    async fn is_writable(&self, _: &str) -> bool {
+    async fn is_writable(&self, _: &[u8]) -> bool {
         false
     }
-    async fn subscribe(&self, _: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, _: &[u8]) -> Option<MonitorStream<PvField>> {
         None
     }
 }
@@ -80,12 +80,6 @@ async fn server_relatches_outbound_order_on_mid_stream_set_byte_order() {
     let cfg = PvaServerConfig {
         wire_byte_order: ByteOrder::Little,
         tcp_port: 0,
-        udp_port: {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        },
         ..PvaServerConfig::isolated()
     };
     let server = PvaServer::start(Arc::new(EmptySource), cfg).expect("server start");

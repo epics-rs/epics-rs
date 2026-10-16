@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
@@ -76,13 +77,13 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
         self.inner.access()
     }
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         self.inner.list_pvs().await
     }
-    async fn has_pv(&self, name: &str) -> bool {
+    async fn has_pv(&self, name: &[u8]) -> bool {
         self.inner.has_pv(name).await
     }
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
     }
     // forward the credential-aware existence/introspection
@@ -91,20 +92,20 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // dropping the downstream peer's identity before it reaches a
     // gateway inner source — the same ctx-severing bug the typed-op
     // forwarders below already guard against.
-    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+    async fn has_pv_checked(&self, name: &[u8], ctx: ChannelContext) -> bool {
         self.inner.has_pv_checked(name, ctx).await
     }
     async fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
         self.inner.get_introspection_checked(name, ctx).await
     }
-    async fn get_value(&self, name: &str) -> Option<PvField> {
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
         self.inner.get_value(name).await
     }
-    async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
     }
     async fn put_value_checked(
@@ -149,7 +150,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // so reject it here exactly the way `put_value` does. Without this
     // override the trait-default `process` (`Ok(())`) would falsely
     // report success and let a PROCESS slip past read-only mode.
-    async fn process(&self, _name: &str) -> Result<(), OpError> {
+    async fn process(&self, _name: &[u8]) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PROCESS rejected"))
     }
     // Typed PROCESS — same WRITE-class rejection as `process` above.
@@ -164,10 +165,10 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PROCESS rejected"))
     }
-    async fn is_writable(&self, _name: &str) -> bool {
+    async fn is_writable(&self, _name: &[u8]) -> bool {
         false
     }
-    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, name: &[u8]) -> Option<MonitorStream<PvField>> {
         self.inner.subscribe(name).await
     }
     // Forward type-state op variants to the inner. Without these,
@@ -204,7 +205,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Option<MonitorStream<PvField>> {
         self.inner.subscribe_checked(checked, ctx).await
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &[u8]) -> Option<MonitorStream<RawMonitorEvent>> {
         self.inner.subscribe_raw(name).await
     }
     async fn subscribe_raw_checked(
@@ -274,7 +275,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // RPCs straight to the upstream server.
     async fn rpc(
         &self,
-        _name: &str,
+        _name: &[u8],
         _request_desc: FieldDesc,
         _request_value: PvField,
     ) -> Result<RpcReply, OpError> {
@@ -303,7 +304,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // WRITE-class here, so a read-only gateway must refuse them.
     async fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Result<FieldDesc, OpError> {
         self.inner.channel_array_init(name, ctx).await
@@ -351,10 +352,10 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
         self.inner.monitor_watermarks(name).await
     }
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
     // same wrapper-severs-override defect family as
@@ -363,7 +364,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // other would sever the inner source's monitor-start (onStart)
     // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
     // Idle↔Executing edge unchanged.
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
     }
     // Same wrapper-severs-override defect family as the `notify_*` and
@@ -384,19 +385,19 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     fn beacon_change(&self) -> u64 {
         self.inner.beacon_change()
     }
-    async fn searchable(&self, name: &str) -> bool {
+    async fn searchable(&self, name: &[u8]) -> bool {
         self.inner.searchable(name).await
     }
-    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+    async fn searchable_from(&self, name: &[u8], requester: SocketAddr) -> bool {
         self.inner.searchable_from(name, requester).await
     }
-    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+    async fn channel_report_info(&self, name: &[u8], ctx: ChannelContext) -> Option<String> {
         self.inner.channel_report_info(name, ctx).await
     }
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_open(name, ctx);
     }
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
     }
     // R17-33: the delegation contract of a transparent layer — EVERY
@@ -421,7 +422,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     }
     async fn revalidate_read(
         &self,
-        pv_name: &str,
+        pv_name: &[u8],
         ctx: ChannelContext,
     ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
         // Read-only adds no READ policy — the inner's gate decides.
@@ -475,10 +476,10 @@ pub struct AclConfig {
     pub allow_only: Vec<String>,
     /// B7: compiled regex deny patterns. Built via
     /// [`AclConfig::deny_regex`]; anchored at both ends.
-    deny_re: Vec<regex::Regex>,
+    deny_re: Vec<regex::bytes::Regex>,
     /// B7: compiled regex allow-only patterns. Built via
     /// [`AclConfig::allow_regex`]; anchored at both ends.
-    allow_re: Vec<regex::Regex>,
+    allow_re: Vec<regex::bytes::Regex>,
 }
 
 impl AclConfig {
@@ -507,7 +508,7 @@ impl AclConfig {
         !self.allow_only.is_empty() || !self.allow_re.is_empty()
     }
 
-    pub fn allowed(&self, name: &str) -> bool {
+    pub fn allowed(&self, name: &[u8]) -> bool {
         // Deny always wins — glob or regex.
         if self.deny.iter().any(|p| matches_pattern(p, name))
             || self.deny_re.iter().any(|re| re.is_match(name))
@@ -540,12 +541,12 @@ const ACL_REGEX_SIZE_LIMIT: usize = 256 * 1024;
 /// non-capturing group keeps top-level alternation (`a|b`) anchored
 /// as `^(?:a|b)$` rather than `^a|b$`.
 ///
-/// Compiled via [`regex::RegexBuilder`] with explicit `size_limit`
+/// Compiled via [`regex::bytes::RegexBuilder`] with explicit `size_limit`
 /// and `dfa_size_limit` so an operator-supplied pathological pattern
 /// fails fast with a bounded `regex::Error` rather than compiling
 /// with the crate defaults (which allow far larger programs).
-fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+fn compile_anchored(pattern: &str) -> Result<regex::bytes::Regex, regex::Error> {
+    regex::bytes::RegexBuilder::new(&format!("^(?:{pattern})$"))
         .size_limit(ACL_REGEX_SIZE_LIMIT)
         .dfa_size_limit(ACL_REGEX_SIZE_LIMIT)
         .build()
@@ -558,9 +559,10 @@ fn compile_anchored(pattern: &str) -> Result<regex::Regex, regex::Error> {
 /// pvlist semantics for `*` (`gateAs.cc` compiles each pvlist pattern
 /// to an anchored regex). Only `*` is special — for full regular
 /// expressions use the `allow_regex` / `deny_regex` lists.
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+fn matches_pattern(pattern: &str, name: &[u8]) -> bool {
+    let pattern = pattern.as_bytes();
     // No wildcard → exact match.
-    if !pattern.contains('*') {
+    if !pattern.contains(&b'*') {
         return name == pattern;
     }
 
@@ -569,7 +571,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
     // no constraint. Non-empty segments must appear in order; a
     // non-empty first segment is anchored to the start, a non-empty
     // last segment to the end.
-    let segments: Vec<&str> = pattern.split('*').collect();
+    let segments: Vec<&[u8]> = pattern.split(|&b| b == b'*').collect();
     let last = segments.len() - 1;
     let mut pos = 0; // byte offset into `name` already consumed
 
@@ -591,7 +593,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
             }
         } else {
             // Interior literal: must occur at or after `pos`.
-            match name[pos..].find(seg) {
+            match name[pos..].windows(seg.len()).position(|w| w == *seg) {
                 Some(off) => pos += off + seg.len(),
                 None => return false,
             }
@@ -626,20 +628,20 @@ impl<S: ChannelSource> Layer<S> for AclLayer {
 }
 
 impl<S: ChannelSource> ChannelSource for Acl<S> {
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         // Filter the underlying list so introspection sweeps don't
         // leak the names of denied PVs.
         let mut names = self.inner.list_pvs().await;
         names.retain(|n| self.config.allowed(n));
         names
     }
-    async fn has_pv(&self, name: &str) -> bool {
+    async fn has_pv(&self, name: &[u8]) -> bool {
         if !self.config.allowed(name) {
             return false;
         }
         self.inner.has_pv(name).await
     }
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
         if !self.config.allowed(name) {
             return None;
         }
@@ -651,7 +653,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // gateway inner source resolves under THIS peer's identity. Without
     // these the trait default would delegate to this layer's ctx-less
     // `has_pv`/`get_introspection`, dropping the downstream credentials.
-    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+    async fn has_pv_checked(&self, name: &[u8], ctx: ChannelContext) -> bool {
         if !self.config.allowed(name) {
             return false;
         }
@@ -659,7 +661,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     }
     async fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
         if !self.config.allowed(name) {
@@ -667,15 +669,18 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner.get_introspection_checked(name, ctx).await
     }
-    async fn get_value(&self, name: &str) -> Option<PvField> {
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
         if !self.config.allowed(name) {
             return None;
         }
         self.inner.get_value(name).await
     }
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, name: &[u8], value: PvField) -> Result<(), OpError> {
         if !self.config.allowed(name) {
-            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                String::from_utf8_lossy(name)
+            )));
         }
         self.inner.put_value(name, value).await
     }
@@ -683,9 +688,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // it by the layer's static allowlist BEFORE forwarding, exactly
     // the way `put_value` is gated. Without this override the trait
     // default `process` (`Ok(())`) bypasses the ACL entirely.
-    async fn process(&self, name: &str) -> Result<(), OpError> {
+    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
         if !self.config.allowed(name) {
-            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                String::from_utf8_lossy(name)
+            )));
         }
         self.inner.process(name).await
     }
@@ -701,7 +709,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Option<PvField> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.get_value_checked(checked, ctx).await
@@ -716,7 +724,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Option<SourceRead> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.read_checked(checked, ctx).await
@@ -727,7 +735,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -750,7 +758,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -774,7 +782,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         delta: &PvField,
         ctx: ChannelContext,
     ) -> Result<Option<SourceRead>, OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -784,10 +792,10 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             .put_get_checked(checked, desc, changed, delta, ctx)
             .await
     }
-    async fn is_writable(&self, name: &str) -> bool {
+    async fn is_writable(&self, name: &[u8]) -> bool {
         self.config.allowed(name) && self.inner.is_writable(name).await
     }
-    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, name: &[u8]) -> Option<MonitorStream<PvField>> {
         if !self.config.allowed(name) {
             return None;
         }
@@ -798,12 +806,12 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Option<MonitorStream<PvField>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.subscribe_checked(checked, ctx).await
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &[u8]) -> Option<MonitorStream<RawMonitorEvent>> {
         if !self.config.allowed(name) {
             return None;
         }
@@ -814,7 +822,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Option<MonitorStream<RawMonitorEvent>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.subscribe_raw_checked(checked, ctx).await
@@ -828,7 +836,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<epics_pva_rs::server_native::MonitorUpdate>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner
@@ -841,7 +849,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<RawMonitorEvent>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner
@@ -861,7 +869,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             epics_pva_rs::server_native::source::MonitorUpdate,
         >,
     > {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.subscribe_seeded(checked, ctx, opts).await
@@ -872,19 +880,22 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<epics_pva_rs::server_native::source::SubscriptionSeed<RawMonitorEvent>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.subscribe_raw_seeded(checked, ctx, opts).await
     }
     async fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> Result<RpcReply, OpError> {
         if !self.config.allowed(name) {
-            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                String::from_utf8_lossy(name)
+            )));
         }
         self.inner.rpc(name, request_desc, request_value).await
     }
@@ -895,7 +906,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         request_value: PvField,
         ctx: ChannelContext,
     ) -> Result<RpcReply, OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -914,7 +925,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -930,11 +941,14 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // ctx and applies its own ACF read/write gate on top.
     async fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Result<FieldDesc, OpError> {
         if !self.config.allowed(name) {
-            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                String::from_utf8_lossy(name)
+            )));
         }
         self.inner.channel_array_init(name, ctx).await
     }
@@ -946,7 +960,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         stride: u32,
         ctx: ChannelContext,
     ) -> Result<PvField, OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -964,7 +978,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         value: PvField,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -980,7 +994,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         length: u32,
         ctx: ChannelContext,
     ) -> Result<(), OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -995,7 +1009,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         checked: epics_pva_rs::server_native::source::AccessChecked,
         ctx: ChannelContext,
     ) -> Result<u32, OpError> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return Err(OpError::denied(format!(
                 "ACL: PV '{}' denied",
                 checked.pv_name()
@@ -1017,14 +1031,14 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     /// accident, not by policy. It is not defensible on its own terms: an ACL
     /// that filters `list_pvs` so an introspection sweep cannot "leak the
     /// names of denied PVs" must not then answer a SEARCH for one.
-    async fn searchable(&self, name: &str) -> bool {
+    async fn searchable(&self, name: &[u8]) -> bool {
         if !self.config.allowed(name) {
             return false;
         }
         self.inner.searchable(name).await
     }
     /// Endpoint-scoped [`Self::searchable`] — same allowlist gate, same reason.
-    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+    async fn searchable_from(&self, name: &[u8], requester: SocketAddr) -> bool {
         if !self.config.allowed(name) {
             return false;
         }
@@ -1036,10 +1050,10 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
         self.inner.monitor_watermarks(name).await
     }
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
     // same wrapper-severs-override defect family as
@@ -1048,7 +1062,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // other would sever the inner source's monitor-start (onStart)
     // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
     // Idle↔Executing edge unchanged.
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
     }
     // Same wrapper-severs-override defect family as the `notify_*` and
@@ -1070,13 +1084,13 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     fn beacon_change(&self) -> u64 {
         self.inner.beacon_change()
     }
-    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+    async fn channel_report_info(&self, name: &[u8], ctx: ChannelContext) -> Option<String> {
         self.inner.channel_report_info(name, ctx).await
     }
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_open(name, ctx);
     }
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
     }
     // R17-33 (see `ReadOnly`): forward every method whose inner override
@@ -1090,7 +1104,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     }
     async fn revalidate_read(
         &self,
-        pv_name: &str,
+        pv_name: &[u8],
         ctx: ChannelContext,
     ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
         if !self.config.allowed(pv_name) {
@@ -1111,7 +1125,7 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         ctx: ChannelContext,
         opts: epics_pva_rs::server_native::MonitorOptions,
     ) -> Option<MonitorStream<PvField>> {
-        if !self.config.allowed(checked.pv_name()) {
+        if !self.config.allowed(checked.pv_name().as_bytes()) {
             return None;
         }
         self.inner.subscribe_checked_opts(checked, ctx, opts).await
@@ -1289,8 +1303,8 @@ pub enum AuditResult {
 /// classified `Failed`, because only a gateway access decision sets
 /// the `Denied` kind.
 fn make_audit_event(
-    name: &str,
-    user: &str,
+    name: impl AsRef<[u8]>,
+    user: impl AsRef<[u8]>,
     host: &str,
     result: &Result<(), OpError>,
 ) -> AuditEvent {
@@ -1305,9 +1319,10 @@ fn make_audit_event(
         }
     };
     AuditEvent {
-        pv: name.to_string(),
+        // The gateway audit record is Rust-only and text.
+        pv: String::from_utf8_lossy(name.as_ref()).into_owned(),
         event: AuditEventKind::Put,
-        user: user.to_string(),
+        user: String::from_utf8_lossy(user.as_ref()).into_owned(),
         host: host.to_string(),
         result: kind,
         timestamp: std::time::SystemTime::now(),
@@ -1405,13 +1420,13 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     fn access(&self) -> &epics_pva_rs::server_native::source::AccessGate {
         self.inner.access()
     }
-    async fn list_pvs(&self) -> Vec<String> {
+    async fn list_pvs(&self) -> Vec<RecordName> {
         self.inner.list_pvs().await
     }
-    async fn has_pv(&self, name: &str) -> bool {
+    async fn has_pv(&self, name: &[u8]) -> bool {
         self.inner.has_pv(name).await
     }
-    async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
+    async fn get_introspection(&self, name: &[u8]) -> Option<FieldDesc> {
         self.inner.get_introspection(name).await
     }
     // pure pass-through of the credential-aware variants,
@@ -1420,17 +1435,17 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // the trait default would route through this layer's ctx-less
     // `has_pv`/`get_introspection`, dropping the downstream peer's
     // identity before it reaches a gateway inner source.
-    async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
+    async fn has_pv_checked(&self, name: &[u8], ctx: ChannelContext) -> bool {
         self.inner.has_pv_checked(name, ctx).await
     }
     async fn get_introspection_checked(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Option<FieldDesc> {
         self.inner.get_introspection_checked(name, ctx).await
     }
-    async fn get_value(&self, name: &str) -> Option<PvField> {
+    async fn get_value(&self, name: &[u8]) -> Option<PvField> {
         let result = self.inner.get_value(name).await;
         if self.audit_get {
             // GET has no error path here — None means "missing" not
@@ -1438,7 +1453,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(OpError::failed(format!("PV '{name}' not found")))
+                Err(OpError::failed(format!(
+                    "PV '{}' not found",
+                    String::from_utf8_lossy(name)
+                )))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
             ev.event = AuditEventKind::Get;
@@ -1446,7 +1464,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    async fn put_value(&self, name: &str, value: PvField) -> Result<(), OpError> {
+    async fn put_value(&self, name: &[u8], value: PvField) -> Result<(), OpError> {
         let result = self.inner.put_value(name, value).await;
         self.sink.record(make_audit_event(name, "", "", &result));
         result
@@ -1527,7 +1545,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // row shape as PUT (`AuditEventKind::Process`), then forward.
     // Without this override the trait-default `process` would never
     // reach the inner source and no audit row would be emitted.
-    async fn process(&self, name: &str) -> Result<(), OpError> {
+    async fn process(&self, name: &[u8]) -> Result<(), OpError> {
         let result = self.inner.process(name).await;
         let mut ev = make_audit_event(name, "", "", &result);
         ev.event = AuditEventKind::Process;
@@ -1624,16 +1642,19 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    async fn is_writable(&self, name: &str) -> bool {
+    async fn is_writable(&self, name: &[u8]) -> bool {
         self.inner.is_writable(name).await
     }
-    async fn subscribe(&self, name: &str) -> Option<MonitorStream<PvField>> {
+    async fn subscribe(&self, name: &[u8]) -> Option<MonitorStream<PvField>> {
         let result = self.inner.subscribe(name).await;
         if self.audit_subscribe {
             let outcome: Result<(), OpError> = if result.is_some() {
                 Ok(())
             } else {
-                Err(OpError::failed(format!("PV '{name}' not subscribable")))
+                Err(OpError::failed(format!(
+                    "PV '{}' not subscribable",
+                    String::from_utf8_lossy(name)
+                )))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
             ev.event = AuditEventKind::Subscribe;
@@ -1641,7 +1662,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
         }
         result
     }
-    async fn subscribe_raw(&self, name: &str) -> Option<MonitorStream<RawMonitorEvent>> {
+    async fn subscribe_raw(&self, name: &[u8]) -> Option<MonitorStream<RawMonitorEvent>> {
         // Audit on subscribe_raw too, since the zero-copy
         // path bypasses the typed `subscribe` and would otherwise
         // miss the audit event entirely.
@@ -1651,7 +1672,8 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
                 Ok(())
             } else {
                 Err(OpError::failed(format!(
-                    "PV '{name}' not subscribable (raw)"
+                    "PV '{}' not subscribable (raw)",
+                    String::from_utf8_lossy(name)
                 )))
             };
             let mut ev = make_audit_event(name, "", "", &outcome);
@@ -1794,7 +1816,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     }
     async fn rpc(
         &self,
-        name: &str,
+        name: &[u8],
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> Result<RpcReply, OpError> {
@@ -1850,7 +1872,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // which is what an audit log records.
     async fn channel_array_init(
         &self,
-        name: &str,
+        name: &[u8],
         ctx: ChannelContext,
     ) -> Result<FieldDesc, OpError> {
         self.inner.channel_array_init(name, ctx).await
@@ -1939,10 +1961,10 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // sees the trait default `None` and never fires the pause/resume
     // callbacks — the same wrapper-severs-override defect family as
     // FR-8's `has_pv_checked`/`get_introspection_checked`.
-    async fn monitor_watermarks(&self, name: &str) -> Option<(usize, usize)> {
+    async fn monitor_watermarks(&self, name: &[u8]) -> Option<(usize, usize)> {
         self.inner.monitor_watermarks(name).await
     }
-    fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent) {
+    fn notify_watermark(&self, name: &[u8], ctx: &ChannelContext, ev: WatermarkEvent) {
         self.inner.notify_watermark(name, ctx, ev);
     }
     // same wrapper-severs-override defect family as
@@ -1951,7 +1973,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // other would sever the inner source's monitor-start (onStart)
     // callback (e.g. a wrapped `SharedPV::set_on_start`). Forward the
     // Idle↔Executing edge unchanged.
-    fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
+    fn notify_monitor_start(&self, name: &[u8], ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
     }
     // Same wrapper-severs-override defect family as the `notify_*` and
@@ -1974,19 +1996,19 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     fn beacon_change(&self) -> u64 {
         self.inner.beacon_change()
     }
-    async fn searchable(&self, name: &str) -> bool {
+    async fn searchable(&self, name: &[u8]) -> bool {
         self.inner.searchable(name).await
     }
-    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+    async fn searchable_from(&self, name: &[u8], requester: SocketAddr) -> bool {
         self.inner.searchable_from(name, requester).await
     }
-    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+    async fn channel_report_info(&self, name: &[u8], ctx: ChannelContext) -> Option<String> {
         self.inner.channel_report_info(name, ctx).await
     }
-    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_open(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_open(name, ctx);
     }
-    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+    fn notify_channel_close(&self, name: &[u8], ctx: &ChannelContext) {
         self.inner.notify_channel_close(name, ctx);
     }
     // R17-33 (see `ReadOnly`): forward every method whose inner override
@@ -2000,7 +2022,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     }
     async fn revalidate_read(
         &self,
-        pv_name: &str,
+        pv_name: &[u8],
         ctx: ChannelContext,
     ) -> Option<epics_pva_rs::server_native::source::AccessChecked> {
         self.inner.revalidate_read(pv_name, ctx).await
@@ -2087,11 +2109,23 @@ mod tests {
 
     #[test]
     fn pattern_matching() {
-        assert!(matches_pattern("MOTOR:*", "MOTOR:VAL"));
-        assert!(matches_pattern("*VAL", "MOTOR:VAL"));
-        assert!(matches_pattern("EXACT", "EXACT"));
-        assert!(!matches_pattern("EXACT", "EXACT2"));
-        assert!(!matches_pattern("MOTOR:*", "OTHER:VAL"));
+        assert!(matches_pattern("MOTOR:*", b"MOTOR:VAL"));
+        assert!(matches_pattern("*VAL", b"MOTOR:VAL"));
+        assert!(matches_pattern("EXACT", b"EXACT"));
+        assert!(!matches_pattern("EXACT", b"EXACT2"));
+        assert!(!matches_pattern("MOTOR:*", b"OTHER:VAL"));
+    }
+
+    /// The ACL sees the name's bytes: a Latin-1 name is matched by its
+    /// literal segments and denied by a regex, never via a lossy spelling.
+    #[test]
+    fn a_latin1_name_is_matched_by_its_bytes() {
+        assert!(matches_pattern("M\u{b5}*", "M\u{b5}:VAL".as_bytes()));
+        assert!(!matches_pattern("M\u{b5}*", b"M\xb5:VAL"));
+        assert!(matches_pattern("M*VAL", b"M\xb5:VAL"));
+        let cfg = AclConfig::default().deny_regex(r"(?-u:M\xB5):.*").unwrap();
+        assert!(!cfg.allowed(b"M\xb5:VAL"));
+        assert!(cfg.allowed("M\u{b5}:VAL".as_bytes()));
     }
 
     #[test]
@@ -2099,23 +2133,23 @@ mod tests {
         // an interior `*` must behave as a wildcard, not a
         // literal. Previously `MOTOR:*:JOG` matched only the literal
         // string `MOTOR:*:JOG`.
-        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR:X:JOG"));
-        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR:AXIS1:JOG"));
+        assert!(matches_pattern("MOTOR:*:JOG", b"MOTOR:X:JOG"));
+        assert!(matches_pattern("MOTOR:*:JOG", b"MOTOR:AXIS1:JOG"));
         // `*` matches the empty run too.
-        assert!(matches_pattern("MOTOR:*:JOG", "MOTOR::JOG"));
+        assert!(matches_pattern("MOTOR:*:JOG", b"MOTOR::JOG"));
         // Trailing literal must still be present and pinned to the end.
-        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:X:VAL"));
-        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:X:JOGGER"));
+        assert!(!matches_pattern("MOTOR:*:JOG", b"MOTOR:X:VAL"));
+        assert!(!matches_pattern("MOTOR:*:JOG", b"MOTOR:X:JOGGER"));
         // The leading literal stays anchored to the start.
-        assert!(!matches_pattern("MOTOR:*:JOG", "PUMP:X:JOG"));
+        assert!(!matches_pattern("MOTOR:*:JOG", b"PUMP:X:JOG"));
         // Multiple `*`.
-        assert!(matches_pattern("A*B*C", "AxxByyC"));
-        assert!(matches_pattern("A*B*C", "ABC"));
-        assert!(!matches_pattern("A*B*C", "AxxByy"));
+        assert!(matches_pattern("A*B*C", b"AxxByyC"));
+        assert!(matches_pattern("A*B*C", b"ABC"));
+        assert!(!matches_pattern("A*B*C", b"AxxByy"));
         // The literal `*`-as-text meaning is gone: a pattern with `*`
         // no longer matches a name that literally contains `*` unless
         // the glob does.
-        assert!(!matches_pattern("MOTOR:*:JOG", "MOTOR:*:JOGX"));
+        assert!(!matches_pattern("MOTOR:*:JOG", b"MOTOR:*:JOGX"));
     }
 
     /// an interior-wildcard glob now works directly in the
@@ -2127,10 +2161,10 @@ mod tests {
             deny: vec!["MOTOR:*:JOG".into()],
             ..Default::default()
         };
-        assert!(cfg.allowed("MOTOR:X:VAL"));
+        assert!(cfg.allowed(b"MOTOR:X:VAL"));
         // Interior-glob deny now actually fires (was a literal before).
-        assert!(!cfg.allowed("MOTOR:X:JOG"));
-        assert!(!cfg.allowed("MOTOR:AXIS1:JOG"));
+        assert!(!cfg.allowed(b"MOTOR:X:JOG"));
+        assert!(!cfg.allowed(b"MOTOR:AXIS1:JOG"));
     }
 
     #[test]
@@ -2139,8 +2173,8 @@ mod tests {
             allow_only: vec!["BL10C:*".into()],
             ..Default::default()
         };
-        assert!(cfg.allowed("BL10C:VG-01:PRESSURE"));
-        assert!(!cfg.allowed("RFP:HV"));
+        assert!(cfg.allowed(b"BL10C:VG-01:PRESSURE"));
+        assert!(!cfg.allowed(b"RFP:HV"));
     }
 
     #[test]
@@ -2150,9 +2184,9 @@ mod tests {
             deny: vec!["MOTOR:JOG:*".into()],
             ..Default::default()
         };
-        assert!(cfg.allowed("MOTOR:VAL"));
-        assert!(!cfg.allowed("MOTOR:JOG:UP"));
-        assert!(!cfg.allowed("OTHER:PV"));
+        assert!(cfg.allowed(b"MOTOR:VAL"));
+        assert!(!cfg.allowed(b"MOTOR:JOG:UP"));
+        assert!(!cfg.allowed(b"OTHER:PV"));
     }
 
     // ── B7: regex ACL ────────────────────────────────────────────
@@ -2162,12 +2196,12 @@ mod tests {
     #[test]
     fn acl_regex_deny_anchored() {
         let cfg = AclConfig::default().deny_regex(r"BL10C:.*:HV").unwrap();
-        assert!(!cfg.allowed("BL10C:RFP:HV"));
-        assert!(!cfg.allowed("BL10C::HV"));
+        assert!(!cfg.allowed(b"BL10C:RFP:HV"));
+        assert!(!cfg.allowed(b"BL10C::HV"));
         // Anchored: the regex must match the WHOLE name.
-        assert!(cfg.allowed("X:BL10C:RFP:HV"));
-        assert!(cfg.allowed("BL10C:RFP:HV:SETPOINT"));
-        assert!(cfg.allowed("BL10D:RFP:HV"));
+        assert!(cfg.allowed(b"X:BL10C:RFP:HV"));
+        assert!(cfg.allowed(b"BL10C:RFP:HV:SETPOINT"));
+        assert!(cfg.allowed(b"BL10D:RFP:HV"));
     }
 
     /// A regex allow-only entry flips the policy to default-deny,
@@ -2175,12 +2209,12 @@ mod tests {
     #[test]
     fn acl_regex_allow_only_default_denies() {
         let cfg = AclConfig::default().allow_regex(r"(SR|BL)\d+:.*").unwrap();
-        assert!(cfg.allowed("SR01:CURRENT"));
-        assert!(cfg.allowed("BL10:SHUTTER"));
-        assert!(!cfg.allowed("RFP:HV"));
+        assert!(cfg.allowed(b"SR01:CURRENT"));
+        assert!(cfg.allowed(b"BL10:SHUTTER"));
+        assert!(!cfg.allowed(b"RFP:HV"));
         // Alternation stays anchored as ^(?:(SR|BL)\d+:.*)$ — a name
         // that merely contains a branch must not slip through.
-        assert!(!cfg.allowed("X-SR01:CURRENT"));
+        assert!(!cfg.allowed(b"X-SR01:CURRENT"));
     }
 
     /// Glob and regex patterns may be mixed in the same config;
@@ -2196,14 +2230,14 @@ mod tests {
         .deny_regex(r"MOTOR:.*:JOG")
         .unwrap();
         // Glob allow.
-        assert!(cfg.allowed("MOTOR:X:VAL"));
+        assert!(cfg.allowed(b"MOTOR:X:VAL"));
         // Regex allow.
-        assert!(cfg.allowed("TEMP:42"));
-        assert!(!cfg.allowed("TEMP:hot")); // \d+ requires digits
+        assert!(cfg.allowed(b"TEMP:42"));
+        assert!(!cfg.allowed(b"TEMP:hot")); // \d+ requires digits
         // Regex deny beats glob allow.
-        assert!(!cfg.allowed("MOTOR:X:JOG"));
+        assert!(!cfg.allowed(b"MOTOR:X:JOG"));
         // Not in any allow list → default-deny.
-        assert!(!cfg.allowed("RFP:HV"));
+        assert!(!cfg.allowed(b"RFP:HV"));
     }
 
     /// An invalid regex is reported at config-build time, not on the
@@ -2266,12 +2300,12 @@ mod tests {
 
         // Denied name short-circuits at the layer — has_pv is false
         // and no upstream search is triggered.
-        assert!(!acl.has_pv("SECRET:KEY").await);
+        assert!(!acl.has_pv(b"SECRET:KEY").await);
         // put_value on a denied name returns the ACL error without
         // reaching the upstream.
         let err = acl
             .put_value(
-                "SECRET:KEY",
+                b"SECRET:KEY",
                 PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(0.0)),
             )
             .await
@@ -2303,31 +2337,31 @@ mod tests {
         /// Advertises every name — so only the ACL's own gate can deny.
         struct AdvertisesEverything;
         impl ChannelSource for AdvertisesEverything {
-            async fn list_pvs(&self) -> Vec<String> {
+            async fn list_pvs(&self) -> Vec<RecordName> {
                 vec!["SECRET:KEY".into(), "PUBLIC:PV".into()]
             }
-            async fn has_pv(&self, _name: &str) -> bool {
+            async fn has_pv(&self, _name: &[u8]) -> bool {
                 true
             }
-            async fn searchable(&self, _name: &str) -> bool {
+            async fn searchable(&self, _name: &[u8]) -> bool {
                 true
             }
-            async fn searchable_from(&self, _name: &str, _requester: SocketAddr) -> bool {
+            async fn searchable_from(&self, _name: &[u8], _requester: SocketAddr) -> bool {
                 true
             }
-            async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
                 Some(FieldDesc::Scalar(ScalarType::Double))
             }
-            async fn get_value(&self, _name: &str) -> Option<PvField> {
+            async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
                 Some(PvField::Scalar(ScalarValue::Double(0.0)))
             }
-            async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+            async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
                 Ok(())
             }
-            async fn is_writable(&self, _name: &str) -> bool {
+            async fn is_writable(&self, _name: &[u8]) -> bool {
                 true
             }
-            async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+            async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
                 None
             }
         }
@@ -2337,23 +2371,25 @@ mod tests {
         let acl = AclLayer::new(cfg).layer(AdvertisesEverything);
 
         assert!(
-            !acl.searchable("SECRET:KEY").await,
+            !acl.searchable(b"SECRET:KEY").await,
             "a denied PV must not be UDP-search-advertised, even when the \
              inner source advertises it"
         );
         assert!(
-            !acl.searchable_from("SECRET:KEY", requester).await,
+            !acl.searchable_from(b"SECRET:KEY", requester).await,
             "a denied PV must not be TCP-circuit search-advertised either"
         );
         assert!(
-            !acl.list_pvs().await.contains(&"SECRET:KEY".to_string()),
+            !acl.list_pvs()
+                .await
+                .contains(&RecordName::from("SECRET:KEY")),
             "the sibling advertisement surface must stay filtered"
         );
 
         // An allowed name still reaches the inner's own answer — the gate
         // must deny, not blanket-suppress.
-        assert!(acl.searchable("PUBLIC:PV").await);
-        assert!(acl.searchable_from("PUBLIC:PV", requester).await);
+        assert!(acl.searchable(b"PUBLIC:PV").await);
+        assert!(acl.searchable_from(b"PUBLIC:PV", requester).await);
     }
 
     /// Audit-event classifier tags ACL/read-only error messages
@@ -2409,19 +2445,19 @@ mod tests {
     }
 
     impl ChannelSource for RecordingSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
-        async fn has_pv(&self, _name: &str) -> bool {
+        async fn has_pv(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
         async fn put_value_checked(
@@ -2448,14 +2484,14 @@ mod tests {
         // applies the `allows_write()` gate then delegates here, so a
         // wrapper that correctly forwards `process_checked` lands in
         // this method and flips `process_reached`.
-        async fn process(&self, _name: &str) -> Result<(), OpError> {
+        async fn process(&self, _name: &[u8]) -> Result<(), OpError> {
             self.process_reached.store(true, Ordering::SeqCst);
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -2652,39 +2688,39 @@ mod tests {
         checked_intro_account: Arc<std::sync::Mutex<Option<String>>>,
     }
     impl ChannelSource for ExistenceRecordingSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
-        async fn has_pv(&self, _name: &str) -> bool {
+        async fn has_pv(&self, _name: &[u8]) -> bool {
             self.plain_has_pv.store(true, Ordering::SeqCst);
             true
         }
-        async fn has_pv_checked(&self, _name: &str, ctx: ChannelContext) -> bool {
-            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.creds.account.clone());
+        async fn has_pv_checked(&self, _name: &[u8], ctx: ChannelContext) -> bool {
+            *self.checked_has_pv_account.lock().unwrap() = Some(ctx.creds.account.to_string());
             true
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             self.plain_intro.store(true, Ordering::SeqCst);
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
         async fn get_introspection_checked(
             &self,
-            _name: &str,
+            _name: &[u8],
             ctx: ChannelContext,
         ) -> Option<FieldDesc> {
-            *self.checked_intro_account.lock().unwrap() = Some(ctx.creds.account.clone());
+            *self.checked_intro_account.lock().unwrap() = Some(ctx.creds.account.to_string());
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
     }
@@ -2711,8 +2747,8 @@ mod tests {
         let stack = AuditLayer::new(NoopAudit)
             .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(inner)));
 
-        let found = stack.has_pv_checked("X", test_ctx()).await;
-        let intro = stack.get_introspection_checked("X", test_ctx()).await;
+        let found = stack.has_pv_checked(b"X", test_ctx()).await;
+        let intro = stack.get_introspection_checked(b"X", test_ctx()).await;
 
         assert!(
             found,
@@ -2749,28 +2785,28 @@ mod tests {
     /// callbacks — the same wrapper-severs-override defect family as FR-8.
     struct WatermarkSource;
     impl ChannelSource for WatermarkSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
-        async fn has_pv(&self, _name: &str) -> bool {
+        async fn has_pv(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
-        async fn monitor_watermarks(&self, _name: &str) -> Option<(usize, usize)> {
+        async fn monitor_watermarks(&self, _name: &[u8]) -> Option<(usize, usize)> {
             Some((2, 5))
         }
     }
@@ -2780,7 +2816,7 @@ mod tests {
         let stack = AuditLayer::new(NoopAudit)
             .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(WatermarkSource)));
         assert_eq!(
-            stack.monitor_watermarks("X").await,
+            stack.monitor_watermarks(b"X").await,
             Some((2, 5)),
             "monitor_watermarks must forward through every wrapper, not collapse to the default None"
         );
@@ -2800,45 +2836,45 @@ mod tests {
         closed: Arc<AtomicBool>,
     }
     impl ChannelSource for ReportInfoSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
-        async fn has_pv(&self, _name: &str) -> bool {
+        async fn has_pv(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
-        async fn channel_report_info(&self, _name: &str, _ctx: ChannelContext) -> Option<String> {
+        async fn channel_report_info(&self, _name: &[u8], _ctx: ChannelContext) -> Option<String> {
             Some("gw-upstream".into())
         }
         // Deliberately distinct from `has_pv` (true) so a wrapper that
         // collapses to the `searchable` default (→ has_pv) is caught.
-        async fn searchable(&self, _name: &str) -> bool {
+        async fn searchable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn searchable_from(&self, _name: &str, _requester: SocketAddr) -> bool {
+        async fn searchable_from(&self, _name: &[u8], _requester: SocketAddr) -> bool {
             false
         }
         fn beacon_change(&self) -> u64 {
             7
         }
-        fn notify_channel_open(&self, _name: &str, _ctx: &ChannelContext) {
+        fn notify_channel_open(&self, _name: &[u8], _ctx: &ChannelContext) {
             self.opened.store(true, Ordering::SeqCst);
         }
-        fn notify_channel_close(&self, _name: &str, _ctx: &ChannelContext) {
+        fn notify_channel_close(&self, _name: &[u8], _ctx: &ChannelContext) {
             self.closed.store(true, Ordering::SeqCst);
         }
     }
@@ -2857,7 +2893,7 @@ mod tests {
         // The named finding: per-channel report info captured at admission
         // must reach the inner through every wrapper, not collapse to None.
         assert_eq!(
-            stack.channel_report_info("X", test_ctx()).await,
+            stack.channel_report_info(b"X", test_ctx()).await,
             Some("gw-upstream".to_string()),
             "channel_report_info must forward through every wrapper, not collapse to None"
         );
@@ -2865,12 +2901,12 @@ mod tests {
         // Same family: SEARCH advertisement, beacon signal, and channel
         // open/close lifecycle callbacks must also forward to the inner.
         assert!(
-            !stack.searchable("X").await,
+            !stack.searchable(b"X").await,
             "searchable must forward the inner override, not collapse to the has_pv default"
         );
         let requester: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         assert!(
-            !stack.searchable_from("X", requester).await,
+            !stack.searchable_from(b"X", requester).await,
             "searchable_from must forward the inner override, not collapse to searchable/has_pv"
         );
         assert_eq!(
@@ -2878,8 +2914,8 @@ mod tests {
             7,
             "beacon_change must forward through every wrapper, not collapse to 0"
         );
-        stack.notify_channel_open("X", &test_ctx());
-        stack.notify_channel_close("X", &test_ctx());
+        stack.notify_channel_open(b"X", &test_ctx());
+        stack.notify_channel_close(b"X", &test_ctx());
         assert!(
             opened.load(Ordering::SeqCst),
             "notify_channel_open must reach the inner through every wrapper"
@@ -2973,7 +3009,7 @@ mod tests {
         );
         // The ctx-less `process` is rejected the same way.
         let err = ro
-            .process("X")
+            .process(b"X")
             .await
             .expect_err("read-only ctx-less PROCESS must be rejected");
         assert_eq!(
@@ -3019,7 +3055,7 @@ mod tests {
         assert!(err.message.contains("read-only"), "err: {err}");
 
         let err = ro
-            .rpc("X", desc, val)
+            .rpc(b"X", desc, val)
             .await
             .expect_err("read-only ctx-less RPC must be rejected");
         assert_eq!(
@@ -3146,25 +3182,25 @@ mod tests {
     }
 
     impl ChannelSource for OptsRecordingSource {
-        async fn list_pvs(&self) -> Vec<String> {
+        async fn list_pvs(&self) -> Vec<RecordName> {
             vec!["X".into()]
         }
-        async fn has_pv(&self, _name: &str) -> bool {
+        async fn has_pv(&self, _name: &[u8]) -> bool {
             true
         }
-        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+        async fn get_introspection(&self, _name: &[u8]) -> Option<FieldDesc> {
             Some(FieldDesc::Scalar(ScalarType::Double))
         }
-        async fn get_value(&self, _name: &str) -> Option<PvField> {
+        async fn get_value(&self, _name: &[u8]) -> Option<PvField> {
             Some(PvField::Scalar(ScalarValue::Double(0.0)))
         }
-        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+        async fn put_value(&self, _name: &[u8], _value: PvField) -> Result<(), OpError> {
             Ok(())
         }
-        async fn is_writable(&self, _name: &str) -> bool {
+        async fn is_writable(&self, _name: &[u8]) -> bool {
             false
         }
-        async fn subscribe(&self, _name: &str) -> Option<MonitorStream<PvField>> {
+        async fn subscribe(&self, _name: &[u8]) -> Option<MonitorStream<PvField>> {
             None
         }
         async fn subscribe_checked_opts_marked(

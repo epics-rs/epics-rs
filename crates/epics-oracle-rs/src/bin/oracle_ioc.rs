@@ -1,10 +1,9 @@
 //! The Rust side of the differential pair.
 //!
-//! Loads a `.db`, brings up a server on a kernel-assigned port, and prints
+//! Loads a `.db`, brings up a server on the claimed `--port`, and prints
 //! that port on stdout. The harness reads the number back rather than
-//! predicting it: `from_parts(db, 0, ..)` binds the sockets and *then* reports
-//! what it got, so nothing can take the port in between and no number is ever
-//! hard-coded.
+//! predicting it: `from_parts(db, port, ..)` binds the sockets and *then* reports
+//! what it got; the number is a claim the harness holds, never hard-coded.
 //!
 //! Two protocols, selected by `--pva`. The two server types are named in code
 //! spans rather than linked: both are `tokio_backend`-only and this doc block
@@ -44,7 +43,7 @@ use epics_oracle_rs::{port_ioc_builder, register_port_ioc_devices};
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser)]
-#[command(about = "Rust IOC under differential test: serves a .db on a bound :0 port")]
+#[command(about = "Rust IOC under differential test: serves a .db on a claimed port")]
 struct Args {
     /// The `.db` to serve — the same file the C IOC is given.
     #[arg(long)]
@@ -57,6 +56,47 @@ struct Args {
     /// so a reading is always attributable to the server that answered it.
     #[arg(long)]
     pva: bool,
+
+    /// The port to serve on (CA UDP+TCP, or PVA UDP+TCP). Required: the harness
+    /// claims it (`epics_oracle_rs::ioc::claim_port`) so that it is never drawn
+    /// from the kernel's ephemeral pool, where any other socket could be handed
+    /// the same number. The bound port is still reported back.
+    #[arg(long)]
+    port: u16,
+
+    /// A `NAME=VALUE` substitution for the `.db`, repeatable — the macro
+    /// string the C oracle's `st-*.cmd` hands `dbLoadRecords` (`P=`).
+    #[arg(long = "macro", value_parser = parse_macro)]
+    macros: Vec<(String, String)>,
+
+    /// `PORT,MAXCHANS,TEMPLATE`, repeatable — C st.cmd's
+    /// `drvScalerSoftConfigure("PORT", MAXCHANS, "TEMPLATE")`. The template
+    /// takes `--macro` substitutions as the st.cmd line takes iocsh's
+    /// (`$(P=)c%d`), and the channel number at `%d`.
+    #[cfg(feature = "scaler")]
+    #[arg(long = "scaler-soft", value_parser = parse_scaler_soft)]
+    scaler_soft: Vec<(String, usize, String)>,
+}
+
+#[cfg(feature = "scaler")]
+fn parse_scaler_soft(text: &str) -> Result<(String, usize, String), String> {
+    let mut parts = text.splitn(3, ',');
+    let (Some(port), Some(chans), Some(template)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("{text:?} is not PORT,MAXCHANS,TEMPLATE"));
+    };
+    let chans = chans
+        .trim()
+        .parse()
+        .map_err(|e| format!("MAXCHANS {chans:?}: {e}"))?;
+    Ok((port.trim().to_string(), chans, template.trim().to_string()))
+}
+
+fn parse_macro(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=VALUE"))?;
+    Ok((name.to_string(), value.to_string()))
 }
 
 #[cfg(tokio_backend)]
@@ -75,10 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1");
         std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1");
         std::env::set_var("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO");
+        // `PvaServer::from_parts(.., Some(port), ..)` names the TCP port only;
+        // the search port is the environment's (default 5076, a port shared
+        // with the host), so the claim is put there too.
+        std::env::set_var("EPICS_PVAS_BROADCAST_PORT", args.port.to_string());
     }
 
     let db_path = args.db.to_string_lossy().to_string();
-    let macros: HashMap<String, String> = HashMap::new();
+    let macros: HashMap<String, String> = args.macros.into_iter().collect();
 
     // Register the asyn port BEFORE `build()`. The asyn record's `init_record`
     // (pass 0) runs `connectDevice`, which resolves PORT ("ORACLEASYN") out of
@@ -91,29 +135,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same pair. A local copy here is how the two drift, and a denominator
     // measured against a different configuration than the one under test
     // reports record types unimplemented that the run measures perfectly well.
-    let _devices = register_port_ioc_devices()?;
+    let boot_db = std::sync::Arc::new(epics_base_rs::server::database::PvDatabase::new());
+    let _devices = register_port_ioc_devices(&boot_db)?;
 
-    let (db, _autosave) = port_ioc_builder()
-        .db_file(&db_path, &macros)?
-        .build()
-        .await?;
-
-    if args.pva {
-        return serve_pva(db).await;
+    // C st-scaler.cmd configures the ports before `dbLoadRecords`, because
+    // `devScalerAsyn`'s `init_record` connects to them.
+    #[cfg(feature = "scaler")]
+    for (port, chans, template) in &args.scaler_soft {
+        let template = epics_base_rs::runtime::mac_lib::substitute_macros(template, &macros);
+        epics_oracle_rs::scaler_soft_ports().configure(port, *chans, &template)?;
     }
 
-    // C iocInit owns scanInit/initialProcess — the CA server does not
-    // scan. The harness compares against a C softIoc whose iocInit runs
-    // initialProcess and scanRun, so the Rust IOC starts the core-owned
-    // scan owner (PINI pass + scan-%g threads) itself, before serving.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
+    // The network half of C's dbCa, libca, for names this IOC does not serve.
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
+    let ioc = match port_ioc_builder()
+        .register_link_type("ca", move |db| {
+            epics_ca_rs::calink::calink_link_set_install(db, reactor)
+        })
+        .with_database(boot_db)
+        .db_file(&db_path, &macros)?
+        .build_ioc()
+        .await
+    {
+        Ok(ioc) => ioc,
+        // `softIoc -d`: `dbLoadRecords` has printed its own lines, and
+        // `errIf` exits 2 with an empty message (`softMain.cpp:198`).
+        Err(epics_base_rs::error::CaError::DbLoadFailed(_)) => std::process::exit(2),
+        Err(e) => return Err(e.into()),
+    };
 
-    // Port 0 => the kernel assigns; `from_parts` binds first and reports the
-    // port it actually bound. This is the bind-and-read-back the harness
-    // requires, not a probe-then-rebind.
+    // C `connectPVs`, which waits for `interruptAccept`: the inputs are
+    // records of the database just loaded. A port missing an input fails on
+    // its own; the IOC keeps running.
+    #[cfg(feature = "scaler")]
+    epics_oracle_rs::scaler_soft_ports().connect(ioc.database());
+
+    // C iocInit owns scanInit/initialProcess — neither server scans. The
+    // harness compares against a C softIoc whose iocInit runs
+    // initialProcess and scanRun, so the Rust IOC runs its `iocRun` itself,
+    // before serving either protocol.
+    let db = Arc::clone(ioc.database());
+    ioc.run().await;
+
+    if args.pva {
+        return serve_pva(db, args.port).await;
+    }
+
+    // `from_parts` binds first and reports the port it actually bound, which
+    // the harness checks against the one it claimed.
     let server = CaServer::from_parts(
         db,
-        0,
+        args.port,
         None,
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
@@ -130,13 +203,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Serve `db` over PVA on kernel-assigned ports, reporting the UDP search
+/// Serve `db` over PVA on the claimed port, reporting the UDP search
 /// port once it is bound.
 ///
-/// `from_parts(db, 0, ..)` is the ephemeral sentinel: both TCP and UDP are
-/// bound by the kernel. The port cannot be known before the bind and is not
-/// guessed — `run_reporting` hands back a `ServerReportHandle` the instant
-/// the listeners are up, and the number is read off that.
+/// TCP is `Some(port)`, UDP search is `EPICS_PVAS_BROADCAST_PORT` (set in
+/// `main`). `run_reporting` hands back a `ServerReportHandle` the instant the
+/// listeners are up, and the number is read off that.
 ///
 /// Read-back is not a nicety here. A PVA search socket sets `SO_REUSEPORT`,
 /// so two servers on one port bind **without any error** and then answer
@@ -148,13 +220,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(tokio_backend)]
 async fn serve_pva(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
+    port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Same reasoning as the CA path: scanning is core-owned (C iocInit),
-    // not the PVA server's — the harness's Scanned drive records need it.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
     let server = PvaServer::from_parts(
         db,
-        0,
+        Some(port),
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
         None,
@@ -212,7 +282,8 @@ fn announce(key: &str, port: u16) -> std::io::Result<()> {
 /// would be read by the harness as a Rust-side deviation.
 #[cfg(exec_backend)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Err("oracle-ioc needs the tokio backend; this build selects \
-         EPICS_RS_BUILD_EXEC_BACKEND=thread"
-        .into())
+    epics_base_rs::runtime::task::refuse_backend(
+        "oracle-ioc needs the tokio backend; this build selects \
+         EPICS_RS_BUILD_EXEC_BACKEND=thread",
+    )
 }

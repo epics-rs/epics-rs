@@ -13,7 +13,7 @@ use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
 
 // ============================================================
-// Throttle: ReprocessAfter integration test
+// Throttle: ValuePutAfter integration test
 // ============================================================
 
 #[tokio::test]
@@ -97,7 +97,7 @@ record(throttle, "TEST:THR") {
         "Second value should NOT be sent yet"
     );
 
-    // Wait for DLY to expire — framework's ReprocessAfter will drain the pending value
+    // Wait for DLY to expire — framework's ValuePutAfter will drain the pending value
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
@@ -750,17 +750,13 @@ record(epid, "PID") {
     field(FLNK, "CTR")
 }
 "#;
+    std_rs::register_std_dbd();
     let macros = HashMap::new();
     let server = CaServerBuilder::new()
         .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("calc", || {
             Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
-        })
-        .register_device_support("Async Soft Channel", || {
-            Box::new(
-                std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
-            )
         })
         .db_string(db_str, &macros)
         .unwrap()
@@ -1308,4 +1304,475 @@ async fn test_throttle_sync_runs_at_once_after_a_failed_put_leaves_nothing_queue
         server.get("TEST:THRSYNCF.SYNC").await.unwrap(),
         EpicsValue::Short(0)
     );
+}
+
+/// The epid `E` (DTYP "Async Soft Channel", INP `CV`, CA TRIG) and the two
+/// records its INP names.
+async fn epid_ioc() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
+    let db_str = r#"
+record(ai, "CV") { field(VAL, "1") }
+record(ai, "CV2") { field(VAL, "2") }
+record(epid, "E") {
+    field(DTYP, "Async Soft Channel")
+    field(INP, "CV")
+    field(TRIG, "ca://REMOTE:READBACK")
+}
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db
+}
+
+/// epid stores INP itself, and a put to it is still `dbPutFieldLink`'s
+/// device-link put: oracleStdIoc reads `E.PACT 0` right after
+/// `dbpf E.INP CV2` lands mid-cycle (`dbAccess.c:1194`).
+#[tokio::test]
+async fn a_device_link_put_to_epid_inp_releases_pact() {
+    let db = epid_ioc().await;
+    let rec = db.get_record("E").unwrap();
+    rec.write().enter_pact();
+    db.put_record_field_from_ca("E", "INP", EpicsValue::String("CV2".into()))
+        .await
+        .unwrap();
+    assert!(!rec.read().is_processing(), "E.PACT");
+}
+
+/// The trigger in flight is device-private, and the put above drops it with
+/// the `dpvt` (`dbAccess.c:1192`), so the callback's process fires the
+/// trigger again, as oracleStdIoc does after `dbpf E.INP CV2` (see
+/// `epid_tests.rs`'s `a_device_link_put_mid_trigger_fires_the_trigger_again`).
+#[tokio::test]
+async fn a_device_link_put_drops_the_trigger_in_flight() {
+    use epics_base_rs::server::device_support::Dpvt;
+    let db = epid_ioc().await;
+    let rec = db.get_record("E").unwrap();
+    {
+        // The trigger pass, without the 1 ms callback timer behind it.
+        let mut guard = rec.write();
+        let inst = &mut *guard;
+        inst.record
+            .set_process_context(&epics_base_rs::server::record::ProcessContext {
+                udf: 0,
+                udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
+                nsev: epics_base_rs::server::record::AlarmSeverity::NoAlarm,
+                phas: 0,
+                tse: 0,
+                time: epics_base_rs::types::WallTime::UNIX_EPOCH,
+                soft: inst.common.dtyp.soft(),
+                callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
+            });
+        inst.record.pre_input_link_actions(false, &mut inst.dpvt);
+        let writes = inst
+            .record
+            .gate_after_pre_input_reads(&[], &mut inst.dpvt)
+            .unwrap();
+        assert!(!writes.is_empty());
+        assert!(matches!(inst.dpvt, Dpvt::Triggered));
+        inst.enter_pact();
+    }
+    db.put_record_field_from_ca("E", "INP", EpicsValue::String("CV2".into()))
+        .await
+        .unwrap();
+    assert!(matches!(rec.read().dpvt, Dpvt::Null));
+}
+
+// ============================================================
+// Throttle: the cooldown's forward link runs ahead of valuePut's reset.
+//
+// softIoc, `throttle(TC){SINP SS, OUT DST2, DLY 1, FLNK K}`,
+// `calc(K){CALC "C+1", INPC K, INPA "TC.SEVR NPP"}`, `dbpf TC 1; dbpf TC 2;
+// dbpf TC.SYNC 1`: K 2, K.A 0 and TC.SEVR INVALID after the first cooldown,
+// K 2 after the second. K.A 0 is `recGblFwdLink` (throttleRecord.c:578)
+// ahead of the reset that commits the deferred sync's failed SINP read;
+// K 2 after the empty second fire is FLNK on the write arm alone.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_cooldown_flnk_runs_ahead_of_the_reset() {
+    let db_str = r#"
+record(ao, "DST2") {}
+record(stringin, "SS") { field(VAL, "abc") }
+record(throttle, "TC") { field(SINP, "SS") field(OUT, "DST2") field(DLY, "1") field(FLNK, "K") }
+record(calc, "K") { field(CALC, "C+1") field(INPC, "K") field(INPA, "TC.SEVR NPP") }
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .register_record_type("stringin", || {
+            Box::new(epics_base_rs::server::records::stringin::StringinRecord::default())
+        })
+        .register_record_type("calc", || {
+            Box::new(epics_base_rs::server::records::calc::CalcRecord::new("C+1"))
+        })
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let put = |field: &'static str, v: i16| {
+        let db = db.clone();
+        async move {
+            db.put_record_field_from_ca("TC", field, EpicsValue::Short(v))
+                .await
+                .unwrap()
+        }
+    };
+    let get = |pv: &'static str| {
+        let server = &server;
+        async move { server.get(pv).await.unwrap() }
+    };
+    put("VAL", 1).await;
+    assert_eq!(get("K").await, EpicsValue::Double(1.0));
+    assert_eq!(get("K.A").await, EpicsValue::Double(3.0));
+    put("VAL", 2).await;
+    put("SYNC", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert_eq!(get("K").await, EpicsValue::Double(2.0));
+    assert_eq!(get("K.A").await, EpicsValue::Double(0.0));
+    assert_eq!(get("TC.SEVR").await, EpicsValue::Short(3));
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    assert_eq!(get("K").await, EpicsValue::Double(2.0));
+}
+
+// ============================================================
+// Throttle: valuePut posts STS after its forward link.
+//
+// softIoc, `throttle(TC){OUT DST, FLNK K}`, `ao(K){VAL 1, OUT "TC.SYNC NPP"}`,
+// `caput TC 5` under `camonitor -m v TC.STS`: Error, Error. K's SYNC put runs
+// valueSync (constant SINP: Error, posted) inside `recGblFwdLink`
+// (throttleRecord.c:578), then valuePut posts STS (:592). An STS post ahead
+// of the forward link would read Success first.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_posts_sts_after_the_forward_link() {
+    let db_str = r#"
+record(ao, "DST") {}
+record(throttle, "TC") { field(OUT, "DST") field(FLNK, "K") }
+record(ao, "K") { field(VAL, "1") field(OUT, "TC.SYNC NPP") }
+"#;
+    let (name, factory) = (
+        "throttle",
+        || -> Box<dyn epics_base_rs::server::record::Record> {
+            Box::new(std_rs::ThrottleRecord::default())
+        },
+    );
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut rx = {
+        let inst = db.get_record("TC").unwrap();
+        let mut g = inst.write();
+        g.add_subscriber(
+            "STS",
+            1,
+            epics_base_rs::types::DbFieldType::Short,
+            epics_base_rs::server::recgbl::EventMask::VALUE.bits(),
+        )
+        .unwrap()
+    };
+    while rx.try_recv().is_ok() {}
+    db.put_record_field_from_ca("TC", "VAL", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    let mut sts = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        sts.push(e.value().as_value().and_then(EpicsValue::to_f64).unwrap());
+    }
+    assert_eq!(sts, [1.0, 1.0]);
+}
+
+// ============================================================
+// Throttle: valuePut's checkAlarms is C's `udf == TRUE` test
+// (throttleRecord.c:479), and process() clears UDF (:239).
+//
+// softIoc, `throttle(TU|TV){OUT DST, DLY 1}`, `ao(W){OUT "TU.UDF NPP"}`,
+// `ao(W2){OUT "TV.UDF NPP"}`, `dbpf TU 1; dbpf TU 2; dbpf W 1; dbpf TV 1;
+// dbpf W2 2`: after the first cooldown TU reads INVALID/UDF, TV (UDF 2)
+// NO_ALARM; after the second TU still INVALID/UDF. `throttle(TX){OUT DST}`,
+// `ao(W3){OUT "TX.UDF NPP"}`, `ao(P){FLNK TX}`, `dbpf TX 1; dbpf W3 1;
+// dbpf P 1`: TX reads UDF 0 and NO_ALARM.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_udf_alarm_follows_check_alarms() {
+    let db_str = r#"
+record(ao, "DST") {}
+record(throttle, "TU") { field(OUT, "DST") field(DLY, "1") }
+record(throttle, "TV") { field(OUT, "DST") field(DLY, "1") }
+record(ao, "W") { field(OUT, "TU.UDF NPP") }
+record(ao, "W2") { field(OUT, "TV.UDF NPP") }
+record(throttle, "TX") { field(OUT, "DST") }
+record(ao, "W3") { field(OUT, "TX.UDF NPP") }
+record(ao, "P") { field(FLNK, "TX") }
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let put = |rec: &'static str, v: f64| {
+        let db = db.clone();
+        async move {
+            db.put_record_field_from_ca(rec, "VAL", EpicsValue::Double(v))
+                .await
+                .unwrap()
+        }
+    };
+    let alarm = |rec: &'static str| {
+        let server = &server;
+        async move {
+            let sevr = server.get(&format!("{rec}.SEVR")).await.unwrap();
+            let stat = server.get(&format!("{rec}.STAT")).await.unwrap();
+            (stat, sevr)
+        }
+    };
+    let udf_invalid = (EpicsValue::Short(17), EpicsValue::Short(3));
+    let no_alarm = (EpicsValue::Short(0), EpicsValue::Short(0));
+    put("TU", 1.0).await;
+    put("TU", 2.0).await;
+    put("W", 1.0).await;
+    put("TV", 1.0).await;
+    put("W2", 2.0).await;
+    put("TX", 1.0).await;
+    put("W3", 1.0).await;
+    put("P", 1.0).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(server.get("TX.UDF").await.unwrap(), EpicsValue::UChar(0));
+    assert_eq!(alarm("TX").await, no_alarm);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(alarm("TU").await, udf_invalid);
+    assert_eq!(alarm("TV").await, no_alarm);
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    assert_eq!(alarm("TU").await, udf_invalid);
+}
+
+/// softIoc, `epid(E1|E2){KP 1, INP CV, HIGH -1, HSV MINOR}`, `ao(W1){OUT
+/// "E1.UDF NPP"}`, `ao(W2){OUT "E2.UDF NPP"}`, `dbpf W1 1; dbpf W2 2; dbpf
+/// E1.PROC 1; dbpf E2.PROC 1`: E1 reads UDF 1, INVALID/UDF, P 0, ERR 0; E2
+/// reads UDF 2, HIGH/MINOR, P -0.5, ERR -0.5. P and ERR need the `:195` test
+/// exact, HIGH needs `:309`'s.
+#[tokio::test]
+async fn epid_tests_udf_exactly() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E1") { field(KP, "1") field(INP, "CV") field(HIGH, "-1") field(HSV, "MINOR") }
+record(epid, "E2") { field(KP, "1") field(INP, "CV") field(HIGH, "-1") field(HSV, "MINOR") }
+record(ao, "W1") { field(OUT, "E1.UDF NPP") }
+record(ao, "W2") { field(OUT, "E2.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (w, v) in [("W1", 1.0), ("W2", 2.0)] {
+        db.put_record_field_from_ca(w, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for e in ["E1", "E2"] {
+        db.put_record_field_from_ca(e, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let read = |e: &str| {
+        let num = |f: &str| db.get_pv(format!("{e}.{f}")).unwrap().to_f64().unwrap();
+        let rec = db.get_record(e).unwrap();
+        let g = rec.read();
+        let (udf, stat, sevr) = (g.common.udf, g.common.stat, g.common.sevr as u16);
+        drop(g);
+        (udf, stat, sevr, num("P"), num("ERR"))
+    };
+    assert_eq!(read("E1"), (1, 17, 3, 0.0, 0.0));
+    assert_eq!(read("E2"), (2, 4, 1, -0.5, -0.5));
+}
+
+/// The softIoc run above reads E1.CVAL 0 and E2.CVAL 0.5: C reads INP inside
+/// `do_pid` (`devEpidSoft.c:113`), which E1's `udf == TRUE` return skips.
+#[tokio::test]
+async fn epid_reads_inp_inside_do_pid() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E1") { field(KP, "1") field(INP, "CV") }
+record(epid, "E2") { field(KP, "1") field(INP, "CV") }
+record(ao, "W1") { field(OUT, "E1.UDF NPP") }
+record(ao, "W2") { field(OUT, "E2.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (w, v) in [("W1", 1.0), ("W2", 2.0)] {
+        db.put_record_field_from_ca(w, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for e in ["E1", "E2"] {
+        db.put_record_field_from_ca(e, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    let cval = |e: &str| db.get_pv(format!("{e}.CVAL")).unwrap().to_f64().unwrap();
+    assert_eq!((cval("E1"), cval("E2")), (0.0, 0.5));
+}
+
+/// softIoc, `ao(CV){VAL 0.5}`, `epid(E){KP 1, INP CV}`, `ao(W){OUT "E.UDF
+/// NPP"}`, `dbpf W 0; dbpf E.PROC 1; dbpf W 1; dbpf CV 0.7; dbpf E.PROC 1`: E
+/// reads NO_ALARM after both cycles and CVAL 0.5; then `dbpf W 0; dbpf E.PROC
+/// 1` reads UDF/INVALID and one more `dbpf E.PROC 1` NO_ALARM. The `udf ==
+/// TRUE` return (`epidRecord.c:201`) skips `recGblResetAlarms`, leaving its
+/// UDF raise (:199) for the next cycle to commit.
+#[tokio::test]
+async fn epid_skipped_cycle_commits_no_alarm() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(epid, "E") { field(KP, "1") field(INP, "CV") }
+record(ao, "W") { field(OUT, "E.UDF NPP") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let put = |rec: &'static str, field: &'static str, v: EpicsValue| {
+        let db = db.clone();
+        async move { db.put_record_field_from_ca(rec, field, v).await.unwrap() }
+    };
+    let alarm = || {
+        let rec = db.get_record("E").unwrap();
+        let g = rec.read();
+        (g.common.stat, g.common.sevr as u16)
+    };
+    put("W", "VAL", EpicsValue::Double(0.0)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+    put("W", "VAL", EpicsValue::Double(1.0)).await;
+    put("CV", "VAL", EpicsValue::Double(0.7)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+    assert_eq!(db.get_pv("E.CVAL").unwrap().to_f64().unwrap(), 0.5);
+    put("W", "VAL", EpicsValue::Double(0.0)).await;
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (17, 3));
+    put("E", "PROC", EpicsValue::Char(1)).await;
+    assert_eq!(alarm(), (0, 0));
+}
+
+/// One owner judges the UDF gate after the STPL read; INP and TRIG follow
+/// it. softIoc, all with `KP 1, INP CV` (CV 0.5), each PROCed once after
+/// `dbpf WD 0; dbpf WC 1`:
+/// EF{closed_loop, STPL NOSUCH}: UDF 1, UDF/INVALID, CVAL 0.
+/// ED{closed_loop, STPL NOSUCH}, UDF put 0: UDF 0, LINK/INVALID, CVAL 0.5.
+/// EA{Async Soft Channel, TRIG "T PP", TVAL 7} and EB{the same, closed_loop,
+/// STPL NOSUCH, TRIG "T2 PP"}: T and T2 stay 0.
+/// EC{STPL "2"}, UDF put 1: UDF 1, UDF/INVALID, CVAL 0.
+/// EE{closed_loop, STPL empty}: UDF 0, NO_ALARM, CVAL 0.5.
+#[tokio::test]
+async fn epid_gate_follows_the_stpl_read() {
+    let db_str = r#"
+record(ao, "CV") { field(VAL, "0.5") }
+record(ao, "T") { field(VAL, "0") }
+record(ao, "T2") { field(VAL, "0") }
+record(epid, "EF") { field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") }
+record(epid, "ED") { field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") }
+record(ao, "WD") { field(OUT, "ED.UDF NPP") }
+record(epid, "EA") { field(DTYP, "Async Soft Channel") field(KP, "1") field(INP, "CV") field(TRIG, "T PP") field(TVAL, "7") }
+record(epid, "EB") { field(DTYP, "Async Soft Channel") field(SMSL, "closed_loop") field(STPL, "NOSUCH") field(KP, "1") field(INP, "CV") field(TRIG, "T2 PP") field(TVAL, "7") }
+record(epid, "EC") { field(STPL, "2") field(KP, "1") field(INP, "CV") }
+record(ao, "WC") { field(OUT, "EC.UDF NPP") }
+record(epid, "EE") { field(SMSL, "closed_loop") field(KP, "1") field(INP, "CV") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (rec, v) in [("WD", 0.0), ("WC", 1.0)] {
+        db.put_record_field_from_ca(rec, "VAL", EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    for rec in ["EF", "ED", "EA", "EB", "EC", "EE"] {
+        db.put_record_field_from_ca(rec, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+    let num = |pv: &str| db.get_pv(pv).unwrap().to_f64().unwrap();
+    let read = |e: &str| {
+        let cval = num(&format!("{e}.CVAL"));
+        let rec = db.get_record(e).unwrap();
+        let g = rec.read();
+        (g.common.udf, g.common.stat, g.common.sevr as u16, cval)
+    };
+    use epics_base_rs::server::recgbl::alarm_status::{LINK_ALARM, UDF_ALARM};
+    assert_eq!(read("EF"), (1, UDF_ALARM, 3, 0.0));
+    assert_eq!(read("ED"), (0, LINK_ALARM, 3, 0.5));
+    assert_eq!((num("T"), num("T2")), (0.0, 0.0));
+    assert_eq!(read("EC"), (1, UDF_ALARM, 3, 0.0));
+    assert_eq!(read("EE"), (0, 0, 0, 0.5));
+}
+
+/// The softIoc sequence of `epid_skipped_cycle_commits_no_alarm` through
+/// `process_local` (`db.process_record`, QSRV group members): the skipped
+/// cycle's UDF raise is committed by the next cycle on this path too.
+#[tokio::test]
+async fn epid_skipped_cycle_raise_survives_process_local() {
+    let db_str = r#"
+record(epid, "E") { field(KP, "1") }
+"#;
+    let (name, factory) = std_rs::epid_record_factory();
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string(db_str, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let rec = db.get_record("E").unwrap();
+    let cycle = |udf: u8| {
+        let mut g = rec.write();
+        g.common.udf = udf;
+        g.process_local().unwrap();
+        (g.common.stat, g.common.sevr as u16)
+    };
+    assert_eq!(cycle(0), (0, 0));
+    assert_eq!(cycle(1), (0, 0));
+    assert_eq!(cycle(0), (17, 3));
+    assert_eq!(cycle(0), (0, 0));
 }

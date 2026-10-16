@@ -1,9 +1,25 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
 const SEL_MAX: usize = 12;
+
+/// The fields `selRecord.c::monitor` posts from its own copies, bit order.
+const SEL_MARKED: [&str; SEL_MAX + 1] = [
+    "SELN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L",
+];
+
+/// VAL and [`SEL_MARKED`]: everything `monitor()` posts.
+const SEL_MONITORED: [&str; SEL_MAX + 2] = [
+    "VAL", "SELN", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L",
+];
+
+const SEL_PREV_FIELDS: [&str; SEL_MAX] = [
+    "LA", "LB", "LC", "LD", "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
+];
 
 /// Choice labels for the SELM select-mechanism menu, in index order.
 /// C `menu(selSELM)` (selRecord.dbd.pod:21-26): 0=Specified, 1=High Signal,
@@ -38,20 +54,20 @@ pub struct SelRecord {
     /// (selRecord.dbd.pod:295): an unsigned 0..65535 index — `do_sel`
     /// rejects values ≥ SEL_MAX.
     pub seln: u16,
-    pub nvl: String, // NVL link (for SELN)
+    pub nvl: PvString, // NVL link (for SELN)
     // Input links
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
+    pub inpa: PvString,
+    pub inpb: PvString,
+    pub inpc: PvString,
+    pub inpd: PvString,
+    pub inpe: PvString,
+    pub inpf: PvString,
+    pub inpg: PvString,
+    pub inph: PvString,
+    pub inpi: PvString,
+    pub inpj: PvString,
+    pub inpk: PvString,
+    pub inpl: PvString,
     // Input values
     pub a: f64,
     pub b: f64,
@@ -83,6 +99,9 @@ pub struct SelRecord {
     /// treated every cycle as the first one.
     pub mlst: f64,
     pub alst: f64,
+    /// MDEL / ADEL, `DBF_DOUBLE`, the deadbands against MLST / ALST.
+    pub mdel: f64,
+    pub adel: f64,
     /// True when `do_sel` detected an out-of-range SELN in Specified
     /// mode — raises `SOFT_ALARM/INVALID` in `check_alarms`.
     soft_alarm: bool,
@@ -101,6 +120,12 @@ pub struct SelRecord {
     /// `fetch_values` failed (`:114`), leaves UDF frozen. Consumed by
     /// `check_alarms`, which owns the write.
     value_computed: bool,
+    /// LA..LL, C's `pprev` copies: the A..L `monitor()` last posted.
+    prev: [f64; SEL_MAX],
+    /// C `prec->nlst`: the SELN `monitor()` last posted.
+    nlst: u16,
+    /// This cycle's `advance_monitored` posts: bit 0 SELN, bits 1.. A..L.
+    monitored_changes: u16,
 }
 
 impl Default for SelRecord {
@@ -109,19 +134,19 @@ impl Default for SelRecord {
             val: 0.0,
             selm: 0,
             seln: 0,
-            nvl: String::new(),
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
+            nvl: PvString::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
             // C initializes inputs to epicsNAN; NaN values are skipped by algorithms
             a: f64::NAN,
             b: f64::NAN,
@@ -147,30 +172,170 @@ impl Default for SelRecord {
             lalm: 0.0,
             mlst: 0.0,
             alst: 0.0,
+            mdel: 0.0,
+            adel: 0.0,
             soft_alarm: false,
             fetch_gate_failed: false,
             value_computed: false,
+            prev: [0.0; SEL_MAX],
+            nlst: 0,
+            monitored_changes: 0,
         }
     }
 }
 
 impl SelRecord {
+    /// C `selRecord.c::monitor` (:325-338) advances NLST and LA..LL inside
+    /// each change test, outside `if (monitor_mask)`, on every cycle, the
+    /// failed-fetch one included.
+    fn advance_monitored(&mut self) {
+        let mut changes = 0;
+        if self.nlst != self.seln {
+            self.nlst = self.seln;
+            changes |= 1;
+        }
+        for (i, (new, prev)) in self.get_values().iter().zip(&mut self.prev).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 2 << i;
+            }
+        }
+        self.monitored_changes = changes;
+    }
+
     fn get_values(&self) -> [f64; SEL_MAX] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
             self.l,
         ]
     }
+
+    /// `A`..`L`, the fields `put_field` stores a number into.
+    fn var_mut(&mut self, name: &str) -> Option<&mut f64> {
+        Some(match name.as_bytes() {
+            b"A" => &mut self.a,
+            b"B" => &mut self.b,
+            b"C" => &mut self.c,
+            b"D" => &mut self.d,
+            b"E" => &mut self.e,
+            b"F" => &mut self.f,
+            b"G" => &mut self.g,
+            b"H" => &mut self.h,
+            b"I" => &mut self.i,
+            b"J" => &mut self.j,
+            b"K" => &mut self.k,
+            b"L" => &mut self.l,
+            _ => return None,
+        })
+    }
 }
 
 impl Record for SelRecord {
+    /// What `put_field` stores for `A`..`L`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match self.var_mut(field) {
+            Some(var) => {
+                *var = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::INPUT_FETCH
+    }
+
     /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and
     /// returns; it never touches LALM, whose only writes are in
     /// `checkAlarms` (:270-302).
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
+
+    /// `monitor()` posts VAL, SELN and A..L alone (`selRecord.c:321-338`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SEL_FIELDS,
+                    SEL_MONITORED,
+                )
+            },
+        )
+    }
+
+    /// SELN against NLST and A..L against LA..LL, with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` (`selRecord.c:325-338`); `advance_monitored` made
+    /// the comparisons.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask, uniform_post_table};
+        static POSTS: [(crate::server::record::FieldIx, CyclePostMask); SEL_MAX + 1] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::SEL_FIELDS,
+                &SEL_MARKED,
+                CyclePostMask::MonitorValueLog,
+            );
+        CycleMarks::of(
+            &POSTS,
+            u128::from(std::mem::take(&mut self.monitored_changes)),
+        )
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SEL_MARKED
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's SELN and
+    /// A..L marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.monitored_changes != 0;
+        classes
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
 
     fn record_type(&self) -> &'static str {
         "sel"
+    }
+
+    /// `selRecord.c:102-105` writes NaN into A..L in pass 1, before the
+    /// constant-link load, so a `.db` value survives only behind a
+    /// constant INPx.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 1 {
+            for v in [
+                &mut self.a,
+                &mut self.b,
+                &mut self.c,
+                &mut self.d,
+                &mut self.e,
+                &mut self.f,
+                &mut self.g,
+                &mut self.h,
+                &mut self.i,
+                &mut self.j,
+                &mut self.k,
+                &mut self.l,
+            ] {
+                *v = f64::NAN;
+            }
+        }
+        Ok(())
     }
 
     /// C `selRecord.c::do_sel` — pick VAL per SELM, updating SELN for
@@ -185,6 +350,7 @@ impl Record for SelRecord {
         // and raises none of `do_sel`'s own alarms. Consumed as a one-shot so
         // the by-name path, which files no fetch report, never freezes.
         if std::mem::take(&mut self.fetch_gate_failed) {
+            self.advance_monitored();
             return Ok(ProcessOutcome::complete());
         }
         let vals = self.get_values();
@@ -268,6 +434,7 @@ impl Record for SelRecord {
         if value_selected {
             self.value_computed = true;
         }
+        self.advance_monitored();
         Ok(ProcessOutcome::complete())
     }
 
@@ -371,25 +538,48 @@ impl Record for SelRecord {
     /// C reads `prec->inpa..inpl` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 12 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
             _ => return None,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Hyst => CycleRead::Value(CycleValue::Double(self.hyst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -436,7 +626,13 @@ impl Record for SelRecord {
             "LALM" => Some(EpicsValue::Double(self.lalm)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "ALST" => Some(EpicsValue::Double(self.alst)),
-            _ => None,
+            "MDEL" => Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => Some(EpicsValue::Double(self.adel)),
+            "NLST" => Some(EpicsValue::UShort(self.nlst)),
+            _ => SEL_PREV_FIELDS
+                .iter()
+                .position(|f| *f == name)
+                .map(|i| EpicsValue::Double(self.prev[i])),
         }
     }
 
@@ -480,7 +676,7 @@ impl Record for SelRecord {
             },
             "NVL" => match value {
                 EpicsValue::String(s) => {
-                    self.nvl = s.as_str_lossy().into_owned();
+                    self.nvl = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("NVL".into())),
@@ -488,7 +684,6 @@ impl Record for SelRecord {
             "INPA" | "INPB" | "INPC" | "INPD" | "INPE" | "INPF" | "INPG" | "INPH" | "INPI"
             | "INPJ" | "INPK" | "INPL" => match value {
                 EpicsValue::String(s) => {
-                    let s = s.as_str_lossy().into_owned();
                     match name {
                         "INPA" => self.inpa = s,
                         "INPB" => self.inpb = s,
@@ -529,7 +724,8 @@ impl Record for SelRecord {
                 }
                 Ok(())
             }
-            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MLST" | "ALST" => {
+            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MLST" | "ALST" | "MDEL"
+            | "ADEL" => {
                 let v = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
@@ -542,6 +738,8 @@ impl Record for SelRecord {
                     "LALM" => self.lalm = v,
                     "MLST" => self.mlst = v,
                     "ALST" => self.alst = v,
+                    "MDEL" => self.mdel = v,
+                    "ADEL" => self.adel = v,
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -587,18 +785,18 @@ impl Record for SelRecord {
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
         crate::server::record::input_link_slots_of(&[
-            self.inpa.as_str(),
-            self.inpb.as_str(),
-            self.inpc.as_str(),
-            self.inpd.as_str(),
-            self.inpe.as_str(),
-            self.inpf.as_str(),
-            self.inpg.as_str(),
-            self.inph.as_str(),
-            self.inpi.as_str(),
-            self.inpj.as_str(),
-            self.inpk.as_str(),
-            self.inpl.as_str(),
+            self.inpa.as_bytes(),
+            self.inpb.as_bytes(),
+            self.inpc.as_bytes(),
+            self.inpd.as_bytes(),
+            self.inpe.as_bytes(),
+            self.inpf.as_bytes(),
+            self.inpg.as_bytes(),
+            self.inph.as_bytes(),
+            self.inpi.as_bytes(),
+            self.inpj.as_bytes(),
+            self.inpk.as_bytes(),
+            self.inpl.as_bytes(),
         ])
     }
 

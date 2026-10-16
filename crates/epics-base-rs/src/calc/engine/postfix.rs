@@ -1,6 +1,7 @@
+use super::bytecode::Emitter;
 use super::error::CalcError;
 use super::opcodes::{ControlOp, CoreOp, Opcode};
-use super::token::{ConstName, FuncName, Token};
+use super::token::{ConstName, FuncName, Lexer, StoreRule, Terminator, Token};
 use super::{CompiledExpr, ExprKind};
 
 // Operator precedence levels.
@@ -27,8 +28,13 @@ enum StackEntry {
         in_stack_pri: u8,
     },
     /// C's `(` element (`sCalcPostfix.c:102`): a `UNARY_OPERATOR` with
-    /// `in_stack_pri` 0 and code `NOT_GENERATED`. A barrier that emits nothing.
-    LParen,
+    /// `in_stack_pri` 0 and code `NOT_GENERATED`. Each `,` charges -1 to it
+    /// (`:630`); `)` hands that to a vararg function below (`:657-660`). Only a
+    /// dynamic `:=` ever flushes it (`:532-544`), and then C writes its
+    /// `NOT_GENERATED` byte and adds its effect like any other entry.
+    LParen {
+        runtime_effect: i32,
+    },
     /// C's `[` and `{` elements (`sCalcPostfix.c:215-216`,
     /// `aCalcPostfix.c:212-213`). They are NOT parens: they are
     /// `BINARY_OPERATOR`s whose code IS generated — `CLOSE_BRACKET` /
@@ -56,13 +62,18 @@ enum StackEntry {
         /// (`:687`). So `AA[i,j]` is -2 — subject and two arguments in, one out.
         runtime_effect: i32,
     },
+    /// A `VARARG_OPERATOR`. `runtime_effect` is C's: 0 from the table until
+    /// `)` copies the paren's, and the count byte it writes is `1 - effect`.
     VarargFunc {
         func: FuncName,
         in_stack_pri: u8,
-        nargs: u8,
+        runtime_effect: i32,
     },
     CondEnd,
-    Store(StoreTarget),
+    Store {
+        target: StoreTarget,
+        in_stack_pri: u8,
+    },
     /// C's `UNTIL_END` element (`sCalcPostfix.c:779-783`): reading `UNTIL` PUSHES
     /// one of these onto the OPERATOR stack, carrying the in-stack priority of
     /// the `UNTIL` element itself (0) and an explicit `runtime_effect = 0`. It is
@@ -76,11 +87,7 @@ enum StackEntry {
     /// close the loop at the first `;` it met, which is the `;` between the body
     /// and the condition — so the condition was compiled outside the loop and
     /// `UNTIL_END` peeked an empty stack.
-    UntilEnd {
-        /// Where the paired `Until` placeholder sits in `output`; it is patched
-        /// with this entry's own position when the entry is flushed.
-        until_pc: usize,
-    },
+    UntilEnd,
 }
 
 /// What a `:=` on the operator stack will store into — C's four STORE codes,
@@ -111,15 +118,15 @@ impl StackEntry {
     fn in_stack_pri(&self) -> u8 {
         match self {
             StackEntry::Op { in_stack_pri, .. } => *in_stack_pri,
-            StackEntry::LParen => 0,
+            StackEntry::LParen { .. } => 0,
             // `[` / `{`: in_stack_pri 0, like `(` — a barrier nothing pops.
             StackEntry::Subrange { .. } => 0,
             StackEntry::VarargFunc { in_stack_pri, .. } => *in_stack_pri,
             StackEntry::CondEnd => 0,
-            StackEntry::Store(_) => 1,
+            StackEntry::Store { in_stack_pri, .. } => *in_stack_pri,
             // C: `{"UNTIL", 0, 10, 0, UNTIL_OPERATOR, UNTIL}` — in_stack_pri 0,
             // so no incoming operator ever pops it off the stack.
-            StackEntry::UntilEnd { .. } => 0,
+            StackEntry::UntilEnd => 0,
         }
     }
 }
@@ -200,11 +207,6 @@ fn is_vararg(func: &FuncName) -> bool {
 ///   - array ops: `array.rs` (`ConstIndex`..`FitMQ`)
 fn func_arity(func: &FuncName) -> u8 {
     match func {
-        // 0-arg: produce a value from ambient state, consume nothing.
-        //   ARndm  -> ArrayOp::ArrayRandom  (array.rs: pushes only)
-        //   Ix     -> ArrayOp::ConstIndex   (array.rs: pushes only)
-        FuncName::ARndm | FuncName::Ix => 0,
-
         // 2-arg core math (numeric.rs: Atan2/Fmod pop2).
         FuncName::Atan2 | FuncName::Fmod => 2,
 
@@ -244,12 +246,6 @@ fn func_arity(func: &FuncName) -> u8 {
         // Vararg funcs (Min, Max, Finite, IsNan) are unreachable here.
         _ => 1,
     }
-}
-
-/// True when a function takes no operands and therefore behaves like an
-/// operand itself (the next token must be an operator, not an operand).
-fn is_nullary_func(func: &FuncName) -> bool {
-    func_arity(func) == 0
 }
 
 fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
@@ -313,7 +309,6 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::IxZ => return Opcode::Array(super::opcodes::ArrayOp::IndexZero),
         FuncName::IxNz => return Opcode::Array(super::opcodes::ArrayOp::IndexNonZero),
         FuncName::Arr => return Opcode::Array(super::opcodes::ArrayOp::ToArray),
-        FuncName::Ix => return Opcode::Array(super::opcodes::ArrayOp::ConstIndex),
         FuncName::AToD => return Opcode::Array(super::opcodes::ArrayOp::ToDouble),
         FuncName::Smoo => return Opcode::Array(super::opcodes::ArrayOp::Smooth),
         FuncName::NSmoo => return Opcode::Array(super::opcodes::ArrayOp::NSmooth),
@@ -325,7 +320,6 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
         FuncName::FitMQ => return Opcode::Array(super::opcodes::ArrayOp::FitMQ(nargs)),
         FuncName::Cum => return Opcode::Array(super::opcodes::ArrayOp::Cum),
         FuncName::Cat => return Opcode::Array(super::opcodes::ArrayOp::Cat),
-        FuncName::ARndm => return Opcode::Array(super::opcodes::ArrayOp::ArrayRandom),
     };
     Opcode::Core(core)
 }
@@ -336,10 +330,10 @@ fn func_to_opcode(func: &FuncName, nargs: u8) -> Opcode {
 /// `kind` is needed because `[` and `{` carry a per-engine code: `[` is
 /// `SUBRANGE` in both synApps tables but `{` is `REPLACE` in sCalc
 /// (`sCalcPostfix.c:216`) and `SUBRANGE_IP` in aCalc (`aCalcPostfix.c:213`).
-fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKind) {
+fn flush_stack_entry(entry: &StackEntry, output: &mut Emitter, kind: ExprKind) {
     match entry {
         StackEntry::Subrange { in_place, .. } => {
-            output.push(match (kind, in_place) {
+            output.op(match (kind, in_place) {
                 (ExprKind::Array, false) => Opcode::Array(super::opcodes::ArrayOp::ArraySubrange),
                 (ExprKind::Array, true) => {
                     Opcode::Array(super::opcodes::ArrayOp::ArraySubrangeInPlace)
@@ -353,44 +347,44 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKin
             in_stack_pri: 9,
             ..
         } => {
-            output.push(Opcode::Core(CoreOp::Neg));
+            output.op(Opcode::Core(CoreOp::Neg));
         }
         StackEntry::Op {
             token: Token::Bang, ..
         } => {
-            output.push(Opcode::Core(CoreOp::Not));
+            output.op(Opcode::Core(CoreOp::Not));
         }
         StackEntry::Op {
             token: Token::Tilde,
             ..
         } => {
-            output.push(Opcode::Core(CoreOp::BitNot));
+            output.op(Opcode::Core(CoreOp::BitNot));
         }
         StackEntry::Op {
             token: Token::Func(f),
             ..
         } => {
-            output.push(func_to_opcode(f, 1));
+            output.op(func_to_opcode(f, 1));
         }
         StackEntry::Op { token, .. } => {
-            output.push(token_to_binary_opcode(token));
+            output.op(token_to_binary_opcode(token));
         }
-        StackEntry::VarargFunc { func, nargs, .. } => {
-            output.push(func_to_opcode(func, *nargs));
+        StackEntry::VarargFunc {
+            func,
+            runtime_effect,
+            ..
+        } => {
+            output.op(func_to_opcode(func, (1 - runtime_effect) as u8));
         }
         StackEntry::CondEnd => {
-            output.push(Opcode::Core(CoreOp::CondEnd));
+            output.op(Opcode::Core(CoreOp::CondEnd));
         }
-        StackEntry::UntilEnd { until_pc } => {
-            // The two halves of the loop learn each other's position here, the
-            // one moment both are known.
-            let end_pc = output.len();
-            output.push(Opcode::Control(ControlOp::UntilEnd(*until_pc)));
-            output[*until_pc] = Opcode::Control(ControlOp::Until(end_pc));
+        StackEntry::UntilEnd => {
+            output.op(Opcode::Control(ControlOp::UntilEnd));
         }
-        StackEntry::Store(target) => {
+        StackEntry::Store { target, .. } => {
             use super::opcodes::{ArrayOp, StringOp};
-            output.push(match target {
+            output.op(match target {
                 StoreTarget::Var(idx) => Opcode::Core(CoreOp::StoreVar(*idx)),
                 StoreTarget::DoubleVar(idx) => Opcode::Core(CoreOp::StoreDoubleVar(*idx)),
                 // `A_STORE` is spelled once per engine, like every other opcode
@@ -407,35 +401,34 @@ fn flush_stack_entry(entry: &StackEntry, output: &mut Vec<Opcode>, kind: ExprKin
                 },
             });
         }
-        StackEntry::LParen => {}
+        StackEntry::LParen { .. } => output.op(Opcode::Control(ControlOp::NotGenerated)),
     }
 }
 
-/// Compile a token stream for ONE engine.
+/// Compile `expr` for ONE engine, reading each element from that engine's
+/// `ELEMENT` table as C's `get_element(operand_needed, ...)` does — so the list
+/// searched, and the position a lexing error is reported at, follow the
+/// parser's state.
 ///
-/// `tokens` must come from `token::tokenize(_, kind)`: that is where the C
-/// compiler's `ELEMENT` table is applied, so every symbol here is one this
-/// engine has. The resulting `CompiledExpr` carries only opcodes its evaluator
-/// can execute.
-/// Compile a token stream. A source with no tokens is NOT special-cased: C only
+/// A source with no elements is NOT special-cased: C only
 /// short-circuits the literal empty string (`*psrc == '\0'`), and an expression
 /// that merely *lexes* to nothing — `"   "` — walks the normal path and comes
 /// out `CALC_ERR_INCOMPLETE`, because `operand_needed` is still set at the end.
 /// Compiled C, all three engines: `postfix("   ")` = -1, error 8. The empty
 /// SOURCE is handled by each engine's entry point in `calc::mod`, where C puts
 /// it.
-pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcError> {
-    let mut output: Vec<Opcode> = Vec::new();
+pub fn compile(expr: &str, kind: ExprKind) -> Result<CompiledExpr, CalcError> {
+    let mut lexer = Lexer::new(expr, kind);
+    let mut output = Emitter::new(kind);
     let mut stack: Vec<StackEntry> = Vec::new();
     let mut operand_needed = true;
     let mut runtime_depth: i32 = 0;
     let mut cond_count: i32 = 0;
-    let mut pos = 0;
     // C `*ppostfix = USES_STRING` (`sCalcPostfix.c:447-471`) — latched as each
     // element is LOOKED UP, which is the only moment the retract-and-rewrite of
     // `:=` has not yet erased the evidence. sCalc's marker only; the numeric and
-    // array compilers have none.
-    let mut uses_string = false;
+    // array compilers have none. The marker is the program's head byte, which
+    // the emitter owns.
     // The ceiling this flavour's `*Perform` can actually hold, from its own
     // element table (C `CALCPERFORM_STACK` 80 / `SCALC_STACKSIZE` 30 /
     // `ACALC_STACKSIZE` 20). One shared compiler, three C limits: a literal here
@@ -446,74 +439,81 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     // already answers "is one open, and which". A side counter was a second
     // record of the same fact and could disagree with the stack.
 
-    while pos < tokens.len() {
-        let token = &tokens[pos];
-        pos += 1;
+    while let Some(token) = lexer.next(operand_needed)? {
+        let token = &token;
 
         if kind == ExprKind::String && token_is_string_element(token) {
-            uses_string = true;
+            output.set_uses_string();
         }
 
         if operand_needed {
             match token {
                 Token::Number(v) => {
-                    output.push(Opcode::Core(CoreOp::PushConst(*v)));
+                    output.op(Opcode::Core(CoreOp::PushConst(*v)));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::Var(idx) => {
-                    output.push(Opcode::Core(CoreOp::PushVar(*idx)));
+                    output.op(Opcode::Core(CoreOp::PushVar(*idx)));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::DoubleVar(idx) => {
-                    output.push(Opcode::Core(CoreOp::PushDoubleVar(*idx)));
+                    output.op(Opcode::Core(CoreOp::PushDoubleVar(*idx)));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::FetchVal => {
-                    output.push(Opcode::Core(CoreOp::FetchVal));
+                    output.op(Opcode::Core(CoreOp::FetchVal));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::FetchAval => {
-                    output.push(Opcode::Array(super::opcodes::ArrayOp::FetchAval));
+                    output.op(Opcode::Array(super::opcodes::ArrayOp::FetchAval));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                }
+                Token::ConstIx => {
+                    output.op(Opcode::Array(super::opcodes::ArrayOp::ConstIndex));
+                    runtime_depth += 1;
+                    operand_needed = false;
+                }
+                Token::ARndm => {
+                    output.op(Opcode::Array(super::opcodes::ArrayOp::ArrayRandom));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::FetchSval => {
-                    output.push(Opcode::Core(CoreOp::FetchSval));
+                    output.op(Opcode::Core(CoreOp::FetchSval));
                     runtime_depth += 1;
                     operand_needed = false;
                     // C sCalcPostfix.c:452 lists FETCH_SVAL among the opcodes
                     // that mark the postfix USES_STRING.
                 }
                 Token::Rndm => {
-                    output.push(Opcode::Core(CoreOp::Random));
+                    output.op(Opcode::Core(CoreOp::Random));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::Nrndm => {
-                    output.push(Opcode::Core(CoreOp::NormalRandom));
+                    output.op(Opcode::Core(CoreOp::NormalRandom));
                     runtime_depth += 1;
                     operand_needed = false;
                 }
                 Token::Const(c) => {
                     match c {
-                        ConstName::Pi => output.push(Opcode::Core(CoreOp::Pi)),
-                        ConstName::D2R => output.push(Opcode::Core(CoreOp::D2R)),
-                        ConstName::R2D => output.push(Opcode::Core(CoreOp::R2D)),
-                        ConstName::S2R => output.push(Opcode::Core(CoreOp::S2R)),
-                        ConstName::R2S => output.push(Opcode::Core(CoreOp::R2S)),
+                        ConstName::Pi => output.op(Opcode::Core(CoreOp::Pi)),
+                        ConstName::D2R => output.op(Opcode::Core(CoreOp::D2R)),
+                        ConstName::R2D => output.op(Opcode::Core(CoreOp::R2D)),
+                        ConstName::S2R => output.op(Opcode::Core(CoreOp::S2R)),
+                        ConstName::R2S => output.op(Opcode::Core(CoreOp::R2S)),
                     }
                     runtime_depth += 1;
                     operand_needed = false;
                 }
 
                 Token::StringLiteral(s) => {
-                    output.push(Opcode::String(super::opcodes::StringOp::PushString(
-                        s.clone(),
-                    )));
+                    output.string(s);
                     runtime_depth += 1;
                     operand_needed = false;
                 }
@@ -542,7 +542,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 }
 
                 Token::LParen => {
-                    stack.push(StackEntry::LParen);
+                    stack.push(StackEntry::LParen { runtime_effect: 0 });
                 }
 
                 // C `UNTIL_OPERATOR` (`sCalcPostfix.c:759-784`): flush the
@@ -553,11 +553,8 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 // untouched — the loop body still owes an operand.
                 Token::UntilKeyword => {
                     pop_higher_or_equal(&mut stack, 10, &mut output, &mut runtime_depth, kind);
-                    let until_pc = output.len();
-                    // Patched by `flush_stack_entry` when the paired `UntilEnd`
-                    // entry comes off the stack.
-                    output.push(Opcode::Control(ControlOp::Until(0)));
-                    stack.push(StackEntry::UntilEnd { until_pc });
+                    output.op(Opcode::Control(ControlOp::Until));
+                    stack.push(StackEntry::UntilEnd);
                 }
 
                 Token::Func(func) => {
@@ -566,21 +563,13 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         stack.push(StackEntry::VarargFunc {
                             func: func.clone(),
                             in_stack_pri: 9,
-                            nargs: 1,
+                            runtime_effect: 0,
                         });
                     } else {
                         stack.push(StackEntry::Op {
                             token: token.clone(),
                             in_stack_pri: 9,
                         });
-                    }
-                    // A nullary function (ARNDM, IX) supplies its own
-                    // operand: it consumes nothing and pushes one value.
-                    // The next token must therefore be an operator, like
-                    // any other operand. Functions with arity >= 1 still
-                    // need an operand to follow.
-                    if !is_vararg(func) && is_nullary_func(func) {
-                        operand_needed = false;
                     }
                 }
 
@@ -619,13 +608,17 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 Token::RParen => loop {
                     match stack.last() {
                         None => return Err(CalcError::ParenNotOpen),
-                        Some(StackEntry::LParen) => {
+                        Some(StackEntry::LParen { runtime_effect }) => {
+                            let paren = *runtime_effect;
                             stack.pop();
                             // C `:651-662`: a VARARG_OPERATOR below the `(`
-                            // inherits the paren's accumulated argument count.
-                            // The port keeps that count on the entry itself and
-                            // has been maintaining it at each `,`, so there is
-                            // nothing to transfer — and, like C, nothing to emit.
+                            // inherits the paren's accumulated effect, and the
+                            // `(` itself emits nothing.
+                            if let Some(StackEntry::VarargFunc { runtime_effect, .. }) =
+                                stack.last_mut()
+                            {
+                                *runtime_effect = paren;
+                            }
                             break;
                         }
                         _ => {
@@ -659,18 +652,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                         // not three. Sharing one stack variant with `(` is what let
                         // the bracket's `,` bump the vararg's count.
                         Some(StackEntry::Subrange { runtime_effect, .. }) => *runtime_effect -= 1,
-                        // A `,` directly inside a vararg call's `(` is one more
-                        // argument to that function.
-                        Some(StackEntry::LParen) => {
-                            let lparen_idx = stack.len() - 1;
-                            if lparen_idx > 0 {
-                                if let StackEntry::VarargFunc { nargs, .. } =
-                                    &mut stack[lparen_idx - 1]
-                                {
-                                    *nargs += 1;
-                                }
-                            }
-                        }
+                        Some(StackEntry::LParen { runtime_effect }) => *runtime_effect -= 1,
                         _ => unreachable!("the loop above only breaks on a barrier"),
                     }
                     operand_needed = true;
@@ -678,7 +660,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
 
                 Token::Question => {
                     pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
-                    output.push(Opcode::Core(CoreOp::CondIf));
+                    output.op(Opcode::Core(CoreOp::CondIf));
                     runtime_depth -= 1;
                     cond_count += 1;
                     operand_needed = true;
@@ -686,7 +668,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
 
                 Token::Colon => {
                     pop_higher_strict(&mut stack, 0, &mut output, &mut runtime_depth, kind);
-                    output.push(Opcode::Core(CoreOp::CondElse));
+                    output.op(Opcode::Core(CoreOp::CondElse));
                     runtime_depth -= 1;
                     cond_count -= 1;
                     if cond_count < 0 {
@@ -697,8 +679,12 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 }
 
                 Token::Semicolon => {
+                    let rule = super::token::expr_terminator(kind);
                     while let Some(entry) = stack.last() {
-                        if matches!(entry, StackEntry::LParen) {
+                        if matches!(entry, StackEntry::LParen { .. }) {
+                            if rule == Terminator::Statement {
+                                return Err(CalcError::ParenOpen);
+                            }
                             break;
                         }
                         let entry = stack.pop().unwrap();
@@ -710,14 +696,13 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                     // above already flushed it if and only if it was above the
                     // innermost `(`. Inside `UNTIL(...)` it is not, which is why
                     // the condition ends up INSIDE the loop.
-                    //
-                    // C postfix.c:452-455 — at a `;` terminator the net runtime
-                    // depth must not exceed 1.
-                    if cond_count != 0 {
-                        return Err(CalcError::Conditional);
-                    }
-                    if runtime_depth > 1 {
-                        return Err(CalcError::TooMany);
+                    if rule == Terminator::Statement {
+                        if cond_count != 0 {
+                            return Err(CalcError::Conditional);
+                        }
+                        if runtime_depth > 1 {
+                            return Err(CalcError::TooMany);
+                        }
                     }
                     operand_needed = true;
                 }
@@ -743,6 +728,10 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 // `A:=B:=5` reaches the end at depth -1 and is CALC_ERR_INCOMPLETE
                 // rather than underflowing mid-parse.
                 Token::Assign => {
+                    let store = super::token::store_rule(kind);
+                    if store == StoreRule::TopLevel && !stack.is_empty() {
+                        return Err(CalcError::BadAssignment);
+                    }
                     let pending_dyn = stack.iter().rposition(|e| {
                         matches!(
                             e,
@@ -778,18 +767,24 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                                 FuncName::SDynFetch | FuncName::DynFetch => StoreTarget::Dyn,
                                 _ => StoreTarget::DynDouble,
                             };
-                            stack[at] = StackEntry::Store(target);
+                            stack[at] = StackEntry::Store {
+                                target,
+                                in_stack_pri: store.in_stack_pri(),
+                            };
                         }
                         None => {
                             let target = match output.last() {
-                                Some(Opcode::Core(CoreOp::PushVar(idx))) => StoreTarget::Var(*idx),
+                                Some(Opcode::Core(CoreOp::PushVar(idx))) => StoreTarget::Var(idx),
                                 Some(Opcode::Core(CoreOp::PushDoubleVar(idx))) => {
-                                    StoreTarget::DoubleVar(*idx)
+                                    StoreTarget::DoubleVar(idx)
                                 }
                                 _ => return Err(CalcError::BadAssignment),
                             };
-                            output.pop();
-                            stack.push(StackEntry::Store(target));
+                            output.retract_last();
+                            stack.push(StackEntry::Store {
+                                target,
+                                in_stack_pri: store.in_stack_pri(),
+                            });
                         }
                     }
                     // The `:=` element's own runtime_effect, -1, charged on both
@@ -879,7 +874,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
     // accumulates their runtime effect before the final well-formedness check.
     while let Some(entry) = stack.pop() {
         match entry {
-            StackEntry::LParen => return Err(CalcError::ParenOpen),
+            StackEntry::LParen { .. } => return Err(CalcError::ParenOpen),
             _ => {
                 runtime_depth += stack_effect(&entry);
                 flush_stack_entry(&entry, &mut output, kind);
@@ -913,19 +908,13 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
         return Err(CalcError::Incomplete);
     }
 
-    output.push(Opcode::Core(CoreOp::End));
-
     // No post-pass gate on which opcodes this engine may emit: `token::ElementTable`
     // is the single owner of that (one table per C compiler, applied while lexing,
     // exactly as C's `get_element` does), and every token it spells now compiles to
     // an opcode this engine's evaluator runs — including `[` and `{`, which are a
     // string slice in sCalc and an array subrange in aCalc.
 
-    Ok(CompiledExpr {
-        code: output,
-        kind,
-        uses_string,
-    })
+    Ok(CompiledExpr::new(output.finish()?, kind))
 }
 
 /// C's USES_STRING test, applied where C applies it: to the ELEMENT the lexer
@@ -993,10 +982,10 @@ fn stack_effect(entry: &StackEntry) -> i32 {
             1 - func_arity(f) as i32
         }
         StackEntry::Op { .. } => -1,
-        StackEntry::VarargFunc { nargs, .. } => 1 - (*nargs as i32),
+        StackEntry::VarargFunc { runtime_effect, .. } => *runtime_effect,
         StackEntry::CondEnd => 0,
-        StackEntry::Store(_) => -1,
-        StackEntry::LParen => 0,
+        StackEntry::Store { .. } => -1,
+        StackEntry::LParen { runtime_effect } => *runtime_effect,
         // The effect C accumulated on the `[` / `{` entry itself: -1 from the
         // table plus -1 per `,`.
         StackEntry::Subrange { runtime_effect, .. } => *runtime_effect,
@@ -1004,7 +993,7 @@ fn stack_effect(entry: &StackEntry) -> i32 {
         // element explicitly: the opcode only PEEKS the condition
         // (`sCalcPerform.c:1999`, `if (ps->d == 0)`), so the condition survives
         // as the value of the whole `UNTIL(...)`.
-        StackEntry::UntilEnd { .. } => 0,
+        StackEntry::UntilEnd => 0,
     }
 }
 
@@ -1013,13 +1002,16 @@ fn stack_effect(entry: &StackEntry) -> i32 {
 /// reach past it, and the explicit `while (pstacktop > stack)` guard keeps the
 /// bottom of the stack safe.
 fn is_barrier(entry: &StackEntry) -> bool {
-    matches!(entry, StackEntry::LParen | StackEntry::Subrange { .. })
+    matches!(
+        entry,
+        StackEntry::LParen { .. } | StackEntry::Subrange { .. }
+    )
 }
 
 fn pop_higher_or_equal(
     stack: &mut Vec<StackEntry>,
     incoming_pri: u8,
-    output: &mut Vec<Opcode>,
+    output: &mut Emitter,
     runtime_depth: &mut i32,
     kind: ExprKind,
 ) {
@@ -1036,7 +1028,7 @@ fn pop_higher_or_equal(
 fn pop_higher_strict(
     stack: &mut Vec<StackEntry>,
     incoming_pri: u8,
-    output: &mut Vec<Opcode>,
+    output: &mut Emitter,
     runtime_depth: &mut i32,
     kind: ExprKind,
 ) {

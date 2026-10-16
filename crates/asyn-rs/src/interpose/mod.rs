@@ -45,7 +45,7 @@ pub struct OctetReadResult {
 }
 
 /// The transfer an octet read completed *before* it failed — C's
-/// `*nbytesTransfered` / `*eomReason`, which `asynOctet::read` writes out
+/// `*nbytesTransferred` / `*eomReason`, which `asynOctet::read` writes out
 /// even when it returns a failing `asynStatus`
 /// (`asynInterposeEos.c:242-253`).
 ///
@@ -64,7 +64,7 @@ pub struct PartialOctetRead {
 }
 
 impl PartialOctetRead {
-    /// C's `*nbytesTransfered` for this failed read.
+    /// C's `*nbytesTransferred` for this failed read.
     pub fn nbytes_transferred(&self) -> usize {
         self.data.len()
     }
@@ -96,7 +96,7 @@ pub enum EosSet {
     /// A layer owns the terminator but C refuses this length: the `switch
     /// (eoslen)` in `setInputEos`/`setOutputEos` answers `"<port> illegal
     /// eoslen <n>"` *before* assigning anything (asynInterposeEos.c:299-310,
-    /// :352-362), so no layer state moved.
+    /// :353-363), so no layer state moved.
     IllegalLength,
 }
 
@@ -149,12 +149,12 @@ pub trait OctetInterpose: Send + Sync {
     /// `asynUser` addressed*. Default no-op; only EOS-aware layers
     /// (`eos::EosInterpose`) act on it. C asyn routes `setInputEos` through
     /// every interpose via `pasynOctet->setInputEos`, `asynUser` and all
-    /// (asynInterposeEos.c:288); this is the Rust equivalent so a runtime IEOS
+    /// (asynInterposeEos.c:289); this is the Rust equivalent so a runtime IEOS
     /// change reaches the installed EOS interpose on the right device.
     ///
     /// Returns what **this layer** did with the terminator. C's interpose does
     /// not answer with a flag — it either validates the length and stores the
-    /// value, or delegates *downwards* to the next `setInputEos` (:293-295)
+    /// value, or delegates *downwards* to the next `setInputEos` (:294-296)
     /// and ultimately to the driver's, which `initOverride` has replaced with
     /// `setInputEosFail` when the driver has none (asynOctetBase.c:115,
     /// :401-403). [`EosSet`] is that fall-through made explicit, so
@@ -178,8 +178,8 @@ pub trait OctetInterpose: Send + Sync {
     /// C parity: `asynInterposeEos.c:110` registers `eosInExceptionHandler`
     /// via `exceptionCallbackAdd`, and `:142-151` clears `inBufHead`,
     /// `inBufTail` and `eosInMatch` on `asynExceptionConnect` — which
-    /// `exceptionConnect` (asynManager.c:2158) *and* `exceptionDisconnect`
-    /// (asynManager.c:2185) both fire, so the reset happens on either edge.
+    /// `exceptionConnect` (asynManager.c:2161) *and* `exceptionDisconnect`
+    /// (asynManager.c:2187) both fire, so the reset happens on either edge.
     /// [`crate::port::PortDriverBase::set_connected`] is the Rust owner of
     /// that transition and drives this hook for the whole stack.
     fn connection_changed(&mut self) {}
@@ -187,21 +187,21 @@ pub trait OctetInterpose: Send + Sync {
 
 /// The key of the port's own interpose chain — C's `pport->dpc`, the
 /// `dpCommon` every addr that names no device resolves to
-/// (`findDpCommon`/`findInterface`, asynManager.c:536-551, 1493-1501).
+/// (`findDpCommon`/`findInterface`, asynManager.c:538-553, 1495-1503).
 pub const PORT_CHAIN: i32 = -1;
 
 /// The octet interpose layers of one port — C's `dpCommon.interposeInterfaceList`,
 /// which exists once per *device* as well as once per port.
 ///
-/// `interposeInterface` takes an `addr` (asynManager.c:2190-2220): `addr >= 0` on
-/// a multi-device port puts the layer on that DEVICE's list (:2202-2206), and
-/// `findInterface` resolves a request device-first, port-second (:1493-1501). So
+/// `interposeInterface` takes an `addr` (asynManager.c:2192-2222): `addr >= 0` on
+/// a multi-device port puts the layer on that DEVICE's list (:2204-2208), and
+/// `findInterface` resolves a request device-first, port-second (:1495-1503). So
 /// `asynInterposeDelay("gpib", 4, 0.01)` slows device 4 and nothing else — a
 /// single port-wide chain slowed every device on the bus (R15-48).
 ///
 /// A device's chain **shadows** the port's rather than extending it, because
 /// that is what C builds: a layer installed on a device whose list was empty
-/// takes its `pPrev` from the *driver's* `interfaceList` (:2211-2215), not from
+/// takes its `pPrev` from the *driver's* `interfaceList` (:2213-2217), not from
 /// the port's interposes, so it delegates straight down to the driver.
 pub struct OctetInterposeStack {
     /// [`PORT_CHAIN`] plus one entry per device that has an interpose of its own.
@@ -209,7 +209,7 @@ pub struct OctetInterposeStack {
     /// The port's device model, handed to every layer at install time
     /// ([`OctetInterpose::attach_port`]) and what decides whether an addr can
     /// name a device at all — C `locateDevice` returns none for a port that is
-    /// not `ASYN_MULTIDEVICE` (asynManager.c:574).
+    /// not `ASYN_MULTIDEVICE` (asynManager.c:576).
     multi_device: bool,
 }
 
@@ -222,15 +222,15 @@ impl OctetInterposeStack {
     }
 
     /// Install an interpose layer on the device `addr` names — C
-    /// `interposeInterface` (asynManager.c:2190-2220). `addr < 0`, or any addr on
+    /// `interposeInterface` (asynManager.c:2192-2222). `addr < 0`, or any addr on
     /// a port that is not multi-device, installs on the port itself
-    /// ([`crate::port::eos_device_key`], C's `locateDevice` at :574).
+    /// ([`crate::port::eos_device_key`], C's `locateDevice` at :576).
     ///
     /// The new layer *becomes* that `dpCommon`'s octet interface (C overwrites the
-    /// interpose node's `pasynInterface` with it, :2217) and the interface it
+    /// interpose node's `pasynInterface` with it, :2219) and the interface it
     /// displaced — the previously installed interpose at the same level, or the
     /// driver's own interface when there was none — becomes the one it delegates
-    /// down to (C hands it back as `pPrev`, :2209-2215).
+    /// down to (C hands it back as `pPrev`, :2211-2218).
     ///
     /// So the **last layer installed is the outermost**: a caller enters it first,
     /// and it calls down through the earlier layers to the driver. An
@@ -246,7 +246,7 @@ impl OctetInterposeStack {
     }
 
     /// The chain a request on `addr` runs through — C `findInterface`
-    /// (asynManager.c:1493-1501): the device's own interposes if it has any,
+    /// (asynManager.c:1494-1503): the device's own interposes if it has any,
     /// otherwise the port's.
     fn chain_key(&self, addr: i32) -> i32 {
         let key = crate::port::eos_device_key(self.multi_device, addr);
@@ -263,9 +263,9 @@ impl OctetInterposeStack {
     }
 
     /// Total number of interpose layers on the port, across every device's chain
-    /// — what `reportPrintInterfaceList` (asynManager.c:993-1005) prints, once
-    /// for the port's own `dpCommon` (:1077) and again for each device's
-    /// (:1105), under the `asynReport` iocsh command.
+    /// — what `reportPrintInterfaceList` (asynManager.c:995-1007) prints, once
+    /// for the port's own `dpCommon` (:1079) and again for each device's
+    /// (:1107), under the `asynReport` iocsh command.
     pub fn len(&self) -> usize {
         self.chains.values().map(Vec::len).sum()
     }
@@ -594,7 +594,7 @@ mod tests {
         assert!(base.flushed);
     }
 
-    /// R9-56. C `interposeInterface` (asynManager.c:2209-2217) makes each newly
+    /// R9-56. C `interposeInterface` (asynManager.c:2209-2219) makes each newly
     /// installed layer the port's octet interface and hands it the one it
     /// displaced to call down into, so the *last* install is the *outermost*.
     /// This stack appended and dispatched from index 0, so a later install landed
@@ -650,9 +650,9 @@ mod tests {
     /// whole port.
     ///
     /// C `interposeInterface(portName, addr, ...)` puts the layer on the device's
-    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2202-2206),
+    /// `dpCommon.interposeInterfaceList` when `addr >= 0` (asynManager.c:2204-2208),
     /// and `findInterface` resolves a request device-first, port-second
-    /// (:1493-1501). Both iocsh interposes pass their addr
+    /// (:1495-1503). Both iocsh interposes pass their addr
     /// (asynInterposeEcho.c:176, asynInterposeDelay.c:187) — so
     /// `asynInterposeDelay("gpib",4,0.01)` slows device 4 and nothing else. The
     /// stack was one port-wide chain, so it slowed every device on the bus.
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(stack.len_for(7), 0);
 
         // The port's own chain (addr < 0) is what every unaddressed device falls
-        // back to — C `findInterface`'s second lookup (:1499-1501).
+        // back to — C `findInterface`'s second lookup (:1500-1502).
         stack.install(PORT_CHAIN, Box::new(Tag(b'P')));
         assert_eq!(
             write_from(&mut stack, 7),
@@ -735,7 +735,7 @@ mod tests {
         );
 
         // A port that never declared ASYN_MULTIDEVICE has no devices to key by:
-        // C's `locateDevice` returns none for it (:574), so every addr — the
+        // C's `locateDevice` returns none for it (:576), so every addr — the
         // iocsh default 0 included — lands on the port itself.
         let mut single = OctetInterposeStack::new(false);
         single.install(0, Box::new(Tag(b'S')));

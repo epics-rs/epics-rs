@@ -18,10 +18,11 @@
 //! accepts the bytes → capture freezes them → default suite holds
 //! the encoder stable against the frozen artifacts.
 //!
-//! SKIPped if `pvxget` not found.
+//! Fails if `pvxget` is not found.
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::pv_builders::{PvBuild, complex_pv_matrix, encode_pv_fixture};
 use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
 
@@ -53,7 +54,7 @@ async fn pvxget_capture(
             .env("EPICS_PVA_NAME_SERVERS", &server_str)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        cmd.output().expect("pvxget exec")
+        cmd.pvxs_output().expect("pvxget exec")
     })
     .await
     .expect("join pvxget")
@@ -81,9 +82,7 @@ fn capture_golden(build: &PvBuild) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_complex_types_pvxget_against_rust_server() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     let pvs = complex_pv_matrix();
     let source = SharedSource::new();

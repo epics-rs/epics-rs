@@ -20,7 +20,7 @@ DEMO:GROUP  (demo:group/v1, atomic)
   temperature  NTScalar  "+channel": "DEMO:AI",  "+type": "scalar",  "+trigger": "*"
   setpoint     plain     "+channel": "DEMO:AO",  "+type": "plain",   "+trigger": "setpoint"
   status       NTEnum    "+channel": "DEMO:BI",  "+type": "scalar",  "+trigger": "status"
-  version      const     "+value": 1
+  version      const     "+const": 1
 ```
 
 - **scalar**: full Normative Type with alarm, timestamp, display, control

@@ -33,7 +33,7 @@ fn run(expr: &str, setup: impl FnOnce(&mut StringInputs)) -> (StringInputs, Stac
 /// land in the STRING args.
 #[test]
 fn a_rewritten_string_fetch_still_latches_the_marker() {
-    assert!(scalc_compile(r#"AA:="x";1"#).unwrap().uses_string);
+    assert!(scalc_compile(r#"AA:="x";1"#).unwrap().uses_string());
 
     let (inputs, top) = run(r#"AA:="xyz";1"#, |_| {});
     assert_eq!(inputs.str_vars[0].as_str_lossy(), "xyz");
@@ -48,7 +48,7 @@ fn a_rewritten_string_fetch_still_latches_the_marker() {
 #[test]
 fn storing_a_double_into_a_string_field_latches_too() {
     let (inputs, _) = run("AA:=12;1", |_| {});
-    assert!(scalc_compile("AA:=12;1").unwrap().uses_string);
+    assert!(scalc_compile("AA:=12;1").unwrap().uses_string());
     assert_eq!(inputs.str_vars[0].as_str_lossy(), "12.00000000");
 }
 
@@ -86,7 +86,7 @@ fn surviving_string_elements_still_latch() {
         "@@0",               // A_SFETCH
     ] {
         assert!(
-            scalc_compile(expr).unwrap().uses_string,
+            scalc_compile(expr).unwrap().uses_string(),
             "{expr} must be USES_STRING"
         );
     }
@@ -99,7 +99,7 @@ fn surviving_string_elements_still_latch() {
 fn the_elements_c_omits_still_do_not_latch() {
     for expr in ["DBL(A)", "BYTE(A)", "A|-B", "@1"] {
         assert!(
-            !scalc_compile(expr).unwrap().uses_string,
+            !scalc_compile(expr).unwrap().uses_string(),
             "{expr} must NOT be USES_STRING"
         );
     }

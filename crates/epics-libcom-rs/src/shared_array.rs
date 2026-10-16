@@ -40,6 +40,26 @@ impl<T> SharedArray<T> {
         self
     }
 
+    /// Write access in place, while this is the only holder and serves the
+    /// whole buffer; `None` where a write would have to copy.
+    #[inline]
+    pub fn get_mut(&mut self) -> Option<&mut [T]> {
+        if self.len != self.buf.len() {
+            return None;
+        }
+        Arc::get_mut(&mut self.buf)
+    }
+
+    /// Write access to the served elements in place, while this is the only
+    /// holder, whatever the view's length; `None` where a write would copy.
+    /// Unlike [`get_mut`](Self::get_mut), a [`head`](Self::head) view whose
+    /// source has gone qualifies, and the unused tail stays as it was.
+    #[inline]
+    pub fn head_mut(&mut self) -> Option<&mut [T]> {
+        let len = self.len;
+        Arc::get_mut(&mut self.buf).map(|buf| &mut buf[..len])
+    }
+
     /// Whether both views read the same buffer.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.buf, &other.buf)
@@ -64,6 +84,25 @@ impl<T: Clone> SharedArray<T> {
             self.buf = self.buf[..self.len].into();
         }
         Arc::make_mut(&mut self.buf)
+    }
+
+    /// Write access to `n` elements, the served length set to `n`: in place
+    /// while this is the only holder and the buffer holds `n`, else in one
+    /// fresh buffer of the larger of `n` and the old capacity, its new tail
+    /// `fill`.
+    #[inline]
+    pub fn make_mut_resized(&mut self, n: usize, fill: T) -> &mut [T] {
+        if n > self.buf.len() {
+            let grow = n - self.buf.len();
+            self.buf = self
+                .buf
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_n(fill, grow))
+                .collect();
+        }
+        self.len = n;
+        &mut Arc::make_mut(&mut self.buf)[..n]
     }
 
     /// Resize to `n` elements, filling with `value`; growth copies.
@@ -256,6 +295,20 @@ mod tests {
     }
 
     #[test]
+    fn make_mut_resized_copies_only_a_shared_or_short_buffer() {
+        let mut a: SharedArray<u8> = vec![1, 2, 3].into();
+        let p = a.as_ptr();
+        assert_eq!(a.make_mut_resized(1, 0), &mut [1][..]);
+        assert_eq!((&*a, a.as_ptr()), (&[1][..], p));
+        assert_eq!(a.make_mut_resized(3, 0), &mut [1, 2, 3][..]);
+        assert_eq!(a.as_ptr(), p);
+        assert_eq!(a.make_mut_resized(4, 0), &mut [1, 2, 3, 0][..]);
+        let b = a.clone();
+        a.make_mut_resized(2, 0)[0] = 9;
+        assert_eq!((&*a, &*b), (&[9, 2][..], &[1, 2, 3, 0][..]));
+    }
+
+    #[test]
     fn a_head_written_to_keeps_only_its_view() {
         let a: SharedArray<i32> = vec![1, 2, 3].into();
         let mut h = a.head(2);
@@ -263,6 +316,19 @@ mod tests {
         assert_eq!(&*h, &[7, 2]);
         assert_eq!(h.buffer().len(), 2);
         assert_eq!(&*a, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn head_mut_writes_a_sole_head_view_in_place() {
+        let full: SharedArray<u8> = vec![1, 2, 3, 4].into();
+        let mut head = full.head(2);
+        assert!(head.head_mut().is_none(), "the source still reads it");
+        drop(full);
+        let buf = Arc::as_ptr(head.buffer());
+        head.head_mut().expect("sole holder")[1] = 9;
+        assert_eq!(&*head, &[1, 9]);
+        assert_eq!(&head.buffer()[..], &[1, 9, 3, 4]);
+        assert_eq!(Arc::as_ptr(head.buffer()), buf, "no copy");
     }
 
     #[test]

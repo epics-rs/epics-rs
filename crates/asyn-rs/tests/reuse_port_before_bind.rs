@@ -1,8 +1,8 @@
 //! R18-62: `SO_REUSEPORT` is set on the fresh socket, before bind/connect.
 //!
-//! C `connectIt` creates the socket (drvAsynIPPort.c:442), sets `SO_BROADCAST`
-//! (:451-459) and `SO_REUSEPORT` (:464-477) on it, and only then binds the local
-//! address (:499-506) and connects (:513-523). The kernel honours `SO_REUSEPORT`
+//! C `connectIt` creates the socket (drvAsynIPPort.c:443), sets `SO_BROADCAST`
+//! (:453-462) and `SO_REUSEPORT` (:467-481) on it, and only then binds the local
+//! address (:499-506) and connects (:533-577). The kernel honours `SO_REUSEPORT`
 //! only on an unbound socket, so the order is the feature: `udp&` exists so two
 //! ports can share one local port.
 //!
@@ -40,7 +40,7 @@ fn free_udp_port() -> u16 {
 fn hold_reuseport_udp() -> (Socket, u16) {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
     // Same split as the driver's own bind (ip_port.rs `new_socket`, C
-    // drvAsynIPPort.c:465-469 USE_SO_REUSEADDR): SO_REUSEPORT where it
+    // drvAsynIPPort.c:468-472 USE_SO_REUSEADDR): SO_REUSEPORT where it
     // exists, SO_REUSEADDR on Windows — socket2 exposes `set_reuse_port`
     // only on unix, and Windows SO_REUSEADDR is what grants the co-bind.
     #[cfg(unix)]
@@ -64,7 +64,7 @@ fn hold_reuseport_udp() -> (Socket, u16) {
 fn two_udp_reuseport_ports_share_one_local_port() {
     // `local` is what both ports re-bind, so hold it race-proof with a REUSEPORT
     // socket the driver's own REUSEPORT binds can share. `peer` is only a
-    // destination address (the driver never binds it, C :513 does not connect a
+    // destination address (the driver never binds it, C :533 does not connect a
     // datagram socket), so a plain held socket keeps its number ours too. Holding
     // both across the whole test closes the probe-then-rebind window without
     // changing the honest path — the ports still bind `local`, now alongside our
@@ -109,10 +109,10 @@ fn plain_udp_still_refuses_a_second_bind_of_one_local_port() {
         let mut first = DrvAsynIPPort::new("R1862C", &spec).unwrap();
         match first.connect(&AsynUser::default()) {
             Ok(()) => {}
-            // The driver wraps the bind EADDRINUSE as "UDP bind '...' failed"
-            // (ip_port.rs::connect_udp). On the first bind that can only be a
+            // A bind EADDRINUSE is C's "unable to bind to local port"
+            // (drvAsynIPPort.c:500-505). On the first bind that can only be a
             // steal of the just-probed number — try a fresh one.
-            Err(e) if e.message().contains("UDP bind") => continue,
+            Err(e) if e.message().starts_with("unable to bind to local port: ") => continue,
             Err(e) => panic!(
                 "first udp bind failed for a non-steal reason: {:?}",
                 e.message()
@@ -124,7 +124,7 @@ fn plain_udp_still_refuses_a_second_bind_of_one_local_port() {
             .connect(&AsynUser::default())
             .expect_err("without the & suffix the local port is exclusive");
         assert!(
-            err.message().contains("UDP bind"),
+            err.message().starts_with("unable to bind to local port: "),
             "the refusal must come from the bind, got {:?}",
             err.message()
         );

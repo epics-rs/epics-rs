@@ -6690,7 +6690,8 @@ mod tests {
                 fields: vec![(
                     "value".to_string(),
                     FieldDesc::ScalarArray(ScalarType::Double),
-                )],
+                )]
+                .into(),
             }
         }
         fn tok(args: &[&str]) -> Vec<String> {
@@ -6756,13 +6757,14 @@ mod tests {
                 fields: vec![(
                     "value".to_string(),
                     FieldDesc::ScalarArray(ScalarType::Double),
-                )],
+                )]
+                .into(),
             }
         }
         fn nt_scalar() -> FieldDesc {
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".to_string(),
-                fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+                fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
             }
         }
         fn value_array(v: &PvField) -> Vec<f64> {
@@ -6848,10 +6850,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         fn t(args: &[&str]) -> Vec<String> {
@@ -6984,10 +6988,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         /// `{ value: <T>[], alarm: { severity: int, status: int } }`.
@@ -7003,10 +7009,12 @@ mod tests {
                             fields: vec![
                                 ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                                 ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         fn t(args: &[&str]) -> Vec<String> {
@@ -7170,7 +7178,8 @@ mod tests {
                                     "choices".to_string(),
                                     FieldDesc::ScalarArray(ScalarType::String),
                                 ),
-                            ],
+                            ]
+                            .into(),
                         },
                     ),
                     (
@@ -7180,10 +7189,12 @@ mod tests {
                             fields: vec![(
                                 "severity".to_string(),
                                 FieldDesc::Scalar(ScalarType::Int),
-                            )],
+                            )]
+                            .into(),
                         },
                     ),
-                ],
+                ]
+                .into(),
             }
         }
         /// A get-first snapshot whose `value.choices` are the given labels.
@@ -7363,7 +7374,8 @@ mod tests {
                         FieldDesc::ScalarArray(ScalarType::Double),
                     ),
                     ("gain".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-                ],
+                ]
+                .into(),
             }
         }
 
@@ -7603,7 +7615,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("flag".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "10; 20; 30").unwrap();
         match &v {
@@ -7631,11 +7644,12 @@ mod tests {
                     "meta".into(),
                     FieldDesc::Structure {
                         struct_id: "m_t".into(),
-                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))],
+                        fields: vec![("tag".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                     },
                 ),
                 ("n".into(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "5; 6").unwrap();
         match &v {
@@ -7659,7 +7673,7 @@ mod tests {
     fn put_structure_array_empty() {
         let desc = FieldDesc::StructureArray {
             struct_id: "elem_t".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         };
         let v = build_put_value(&desc, "").unwrap();
         assert!(matches!(&v, PvField::StructureArray(items) if items.is_empty()));
@@ -7729,10 +7743,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let v = build_put_value(&desc, "intValue=99").unwrap();
         match &v {
@@ -7773,7 +7789,8 @@ mod tests {
                             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
                 (
@@ -7786,10 +7803,12 @@ mod tests {
                                 FieldDesc::Scalar(ScalarType::Long),
                             ),
                             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
-                        ],
+                        ]
+                        .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
         let value = build_put_value(&desc, "42.5").unwrap();
 
@@ -8421,7 +8440,7 @@ mod tests {
     fn scalar_int_struct() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
         }
     }
 
@@ -8475,7 +8494,7 @@ mod tests {
     fn scalar_string_struct() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         }
     }
 

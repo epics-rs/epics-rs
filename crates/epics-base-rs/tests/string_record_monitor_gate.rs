@@ -196,13 +196,12 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
 /// unchanging stringin deliver ZERO VAL monitor events.
 #[epics_macros_rs::epics_test]
 async fn unchanging_stringin_posts_no_val_events_across_scan_cycles() {
-    // The first cycle is a real change (OVAL starts empty, as in C, where
-    // init_record leaves oval NUL and the first process posts once).
+    // `stringinRecord.c:66` seeds OVAL from VAL at init, so no cycle is a
+    // change — the oracle's `T:SI` posts nothing.
     let events = cycles_posted(0, "SI:ONCHANGE").await;
     assert_eq!(
-        events, 1,
-        "MPST=On Change: one event for the initial \"\" -> \"hello\", then silence \
-         across five unchanging cycles (the port posted six)"
+        events, 0,
+        "MPST=On Change: silence across six unchanging cycles (the port posted six)"
     );
 }
 

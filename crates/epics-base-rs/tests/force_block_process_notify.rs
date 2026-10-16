@@ -102,7 +102,7 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
     let dlya = sc_rec.read().record.get_field("DLYA");
     assert_eq!(
         dlya,
-        Some(EpicsValue::Short(1)),
+        Some(EpicsValue::UShort(1)),
         "ODLY cycle must arm DLYA (record held ACTIVE across the delay), got {dlya:?}"
     );
     let tgt = db.get_record("TGT1").unwrap();

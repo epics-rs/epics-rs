@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome,
     Record,
@@ -38,7 +39,7 @@ pub struct BusyRecord {
     // Output control — OMSL is DBF_MENU menu(menuOmsl) (busyRecord.dbd:18-23);
     // stored raw so an out-of-range ordinal round-trips (mirrors bo).
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     // Monitoring
     pub mlst: u16,
     // Raw value (Phase B)
@@ -55,8 +56,8 @@ pub struct BusyRecord {
     // it off these fields — without them the record looks unconfigured and a
     // simulated busy drives the real output.
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
@@ -82,7 +83,7 @@ impl Default for BusyRecord {
             ivoa: 0,
             ivov: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             mlst: 0,
             rval: 0,
             oraw: 0,
@@ -90,8 +91,8 @@ impl Default for BusyRecord {
             rbv: 0,
             orbv: 0,
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             skip_convert: false,
         }
@@ -111,12 +112,6 @@ impl BusyRecord {
             self.rval = self.val as u32;
         }
     }
-
-    /// Update monitoring fields.
-    fn monitor(&mut self) {
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
-    }
 }
 
 /// C `busyRecord.c:281` — `if(paddr->pfield == (void *)&prec->high) *precision=2;`
@@ -125,6 +120,60 @@ impl BusyRecord {
 const BUSY_HIGH_PRECISION: i16 = 2;
 
 impl Record for BusyRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::busy;
+        RVAL => rval;
+        read_only: RBV => rbv);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    /// C `busyRecord.c:371-380` posts RVAL and RBV with `monitor_mask |
+    /// DBE_VALUE | DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// `monitor()` decides RVAL and RBV from the record's own `oraw` and
+    /// `orbv`, so the framework keeps no published copy of them.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["RVAL", "RBV"]
+    }
+
+    /// `monitor()` posts VAL, RVAL and RBV alone (`busyRecord.c:357-383`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::BUSY_FIELDS,
+                    ["VAL", "RVAL", "RBV"],
+                )
+            },
+        )
+    }
+
+    /// C `if(prec->oraw!=prec->rval) { ...; prec->oraw = prec->rval; }` and
+    /// its RBV twin (`busyRecord.c:371-380`), minus the post. Outside init,
+    /// `monitor()` is the only writer of `oraw`/`orbv`.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if self.oraw == self.rval && self.orbv == self.rbv {
+            return crate::server::record::SecondaryTake::NONE;
+        }
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
+    }
+
     /// C `busyRecord.c:277-284` `get_precision`: `HIGH` — busy's only
     /// `DBF_DOUBLE` field, so the only one past `dbAccess.c:388-389`'s
     /// float/double gate — takes 2, everything else `recGblGetPrec`'s
@@ -174,7 +223,7 @@ impl Record for BusyRecord {
     /// default would try to seed them; that attempt is inert today only because
     /// busy's `put_field` binds no MLST/LALM arm, and this override is what
     /// keeps it inert if one is ever added.
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
@@ -266,9 +315,6 @@ impl Record for BusyRecord {
         // vs COS, raw menu ordinals), and the INVALID-output IVOA policy is
         // enforced by the framework which gates the OUT write on
         // common.sevr == Invalid.
-
-        // Step 5: Monitor
-        self.monitor();
 
         // Step 6: HIGH one-shot — C `busyRecord.c:258-262` arms
         // `callbackRequestDelayed` on every process that leaves VAL at 1, and
@@ -373,6 +419,15 @@ impl Record for BusyRecord {
         true
     }
 
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
     // NO `is_put_complete` override, and none is wanted: the gate above is the
     // whole of it. `is_put_complete` answers a different C question — did
     // device support take the cycle async (`busyRecord.c:254`) — and busy's
@@ -385,22 +440,43 @@ impl Record for BusyRecord {
     // `val == 0` here would be the same C fact written twice, which is how the
     // deleted `is_put_complete() == (self.val == 0)` came to say it in the one
     // place the framework then honoured without the forward-link half.
+    // C `busyRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
+    // simulation is always synchronous: the -1.0 `check_simulation_mode`
+    // takes for an undeclared SDLY.
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: -1.0,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Enum(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::ULong(u32::from(self.oval))),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::UShort(self.mlst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::UShort(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
-            "OVAL" => Some(EpicsValue::Enum(self.oval)),
+            "OVAL" => Some(EpicsValue::ULong(u32::from(self.oval))),
             "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
-            "LALM" => Some(EpicsValue::Enum(self.lalm)),
+            "LALM" => Some(EpicsValue::UShort(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::UShort(self.ivov)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
-            "MLST" => Some(EpicsValue::Enum(self.mlst)),
+            "MLST" => Some(EpicsValue::UShort(self.mlst)),
             // RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252,256,
             // 261,299,303; busyRecord.dbd:55,59,69,108,112) — serve the native
             // u32 as the unsigned carrier so a high-bit raw/mask value does not
@@ -433,11 +509,8 @@ impl Record for BusyRecord {
                     // any unmatched name to state 0, so `caput BUSY Opne` drove
                     // the record to Done and reported success.
                     EpicsValue::String(ref s) => {
-                        let resolved = crate::server::record::resolve_enum_state_string(
-                            "VAL",
-                            self.enum_state_strings().as_deref(),
-                            s,
-                        )?;
+                        let resolved =
+                            crate::server::record::resolve_enum_state_string("VAL", &*self, s)?;
                         match resolved {
                             EpicsValue::Enum(v) => v,
                             _ => return Err(CaError::TypeMismatch(name.to_string())),
@@ -539,7 +612,7 @@ impl Record for BusyRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(s) = value {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.dol = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -583,14 +656,14 @@ impl Record for BusyRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.to_string())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.to_string())),
@@ -625,14 +698,18 @@ impl Record for BusyRecord {
         ))
     }
 
+    fn enum_str_state(&self, name: &PvString) -> Option<u16> {
+        crate::server::record::binary_enum_str_state(&self.znam, &self.onam, name)
+    }
+
     /// C `get_enum_str` (busyRecord.c:286-306): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
     /// is the LABEL list's, not this read's.
-    fn enum_string_form(&self) -> Option<crate::server::snapshot::EnumStringForm> {
-        Some(crate::server::record::binary_enum_string_form(
+    fn enum_slots(&self) -> Option<crate::server::record::EnumSlots<'_>> {
+        Some(crate::server::record::EnumSlots::Binary([
             &self.znam, &self.onam,
-        ))
+        ]))
     }
 
     /// C `busyRecord.c:365-369` `monitor()`: `if (prec->mlst != prec->val) { events |=
@@ -956,10 +1033,8 @@ mod tests {
         rec.zsv = 1; // MINOR
         rec.val = 0;
         // Clear the default UDF to isolate the STATE path (as bo_state_alarm_osv).
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(
@@ -974,10 +1049,8 @@ mod tests {
         let mut rec = BusyRecord::new();
         rec.osv = 2; // MAJOR
         rec.val = 1;
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::Major);
         assert_eq!(
@@ -1021,20 +1094,16 @@ mod tests {
         // C `busyRecord.c:337` raises UDF_ALARM (at UDFS=INVALID) before COS;
         // `CommonFields::default()` has udf=1, so clear it to isolate the COS
         // path (as the bi/bo parity tests do).
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // COS alarm fires and advances lalm.
         assert_eq!(rec.lalm, 1);
         assert_eq!(common.nsev, crate::server::record::AlarmSeverity::Minor);
 
         // Same val — no COS change.
-        let mut common2 = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common2 = CommonFields::default();
+        common2.udf = 0;
         rec.check_alarms(&mut common2);
         assert_eq!(rec.lalm, 1);
         assert_eq!(common2.nsev, crate::server::record::AlarmSeverity::NoAlarm);
@@ -1049,10 +1118,8 @@ mod tests {
         rec.lalm = 0;
         rec.val = 1;
         // Clear the default UDF to isolate STATE/COS.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // COS (Major) > OSV (Minor), so the raised severity is Major, at COS.
         assert_eq!(common.nsev, AlarmSeverity::Major);
@@ -1199,10 +1266,8 @@ mod tests {
         rec.val = 1;
         // Clear the default UDF (udf=1) to isolate the STATE path; the UDF-first
         // precedence is covered by `check_alarms_udf_precedes_state`.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         // INVALID state severity propagates into common — the
         // framework's IVOA "Don't drive" then suppresses the OUT write.
@@ -1242,10 +1307,8 @@ mod tests {
         rec.val = 0;
         // Clear the default UDF (udf=1) so this exercises the "no severity set"
         // path rather than the UDF alarm.
-        let mut common = CommonFields {
-            udf: 0,
-            ..Default::default()
-        };
+        let mut common = CommonFields::default();
+        common.udf = 0;
         rec.check_alarms(&mut common);
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
     }

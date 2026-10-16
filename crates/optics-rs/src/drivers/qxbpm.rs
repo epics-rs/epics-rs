@@ -415,7 +415,7 @@ impl QxbpmHolder {
             "simQxbpmCreate(port, [xPos], [yPos], [pollMs]) - Create a simulated QXBPM",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("port must be a string".into()),
                 };
                 let x_pos = match &args[1] {
@@ -449,7 +449,10 @@ impl QxbpmHolder {
                     Err(e) => return Err(format!("failed to start QXBPM port: {e}")),
                 };
                 let port_handle = runtime.port_handle().clone();
-                if let Err(e) = asyn_rs::asyn_record::register_port(&port, port_handle.clone()) {
+                let owner = ctx.db().scan_control().interrupt_gate();
+                if let Err(e) =
+                    asyn_rs::asyn_record::register_port(&port, port_handle.clone(), owner)
+                {
                     runtime.shutdown();
                     return Err(format!("failed to register QXBPM port: {e}"));
                 }

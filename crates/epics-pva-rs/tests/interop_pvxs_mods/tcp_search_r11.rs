@@ -135,7 +135,7 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(epics_pva_rs::pvdata::PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
@@ -236,6 +236,7 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
 /// a SEARCH_RESPONSE on the TCP circuit and would time out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
+    use super::interop_helpers::PvxsOutput;
     use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
     use epics_pva_rs::server_native::PvaServer;
@@ -243,16 +244,14 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
 
     // Rust server hosting a PV with a known value.
     let pv = SharedPV::new();
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
@@ -281,7 +280,7 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
                 .env("EPICS_PVA_NAME_SERVERS", &server_str)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .output()
+                .pvxs_output()
         }
     })
     .await
@@ -360,7 +359,7 @@ async fn interop_r11_malformed_tcp_search_closes_circuit() {
     pv.open(
         FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),
-            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".to_string(), FieldDesc::Scalar(ScalarType::Double))].into(),
         },
         PvField::Structure(PvStructure {
             struct_id: "epics:nt/NTScalar:1.0".to_string(),

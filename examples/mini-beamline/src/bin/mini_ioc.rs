@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::iocsh::registry::*;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_ca_rs::server::ioc_app::IocApplication;
 
 use ad_core_rs::ioc::{PluginManager, register_noop_commands};
@@ -35,6 +36,22 @@ use mini_beamline::moving_dot::driver::{MovingDotRuntime, create_moving_dot_with
 use mini_beamline::physics::{BeamCurrentConfig, DetectorMode, MovingDotImageConfig};
 use mini_beamline::point_detector::{self, PointDetectorRuntime};
 use mini_beamline::random_waveform::ioc_support::RandomWaveformFactory;
+
+// The two DTYPs this binary serves, as the `device()` lines a C IOC's .dbd
+// would declare for them.
+static MINI_BEAM_CURRENT: DevSup = DevSup {
+    name: "devAiMiniBeamCurrent",
+    choice: "miniBeamCurrent",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 3, 4], false),
+};
+
+static MINI_RANDOM_WAVEFORM: DevSup = DevSup {
+    name: "devWfMiniRandom",
+    choice: "miniRandomWaveform",
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(5, &[2, 4], false),
+};
 
 // ============================================================================
 // Environment helpers
@@ -164,7 +181,7 @@ async fn main() -> CaResult<()> {
             "miniBeamlineConfig",
             vec![],
             "miniBeamlineConfig - Configure mini beamline IOC",
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
+            move |_args: &[ArgValue], ctx: &CommandContext| {
                 println!("miniBeamlineConfig: setting up beamline...");
 
                 // --- Beam current: background thread producing sine-wave values ---
@@ -197,8 +214,12 @@ async fn main() -> CaResult<()> {
                     let rt = point_detector::create_point_detector(port, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(port, port_handle)
-                        .map_err(|e| e.to_string())?;
+                    asyn_rs::asyn_record::register_port(
+                        port,
+                        port_handle,
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
                 }
@@ -234,8 +255,12 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port("DOT", dot_handle)
-                    .map_err(|e| e.to_string())?;
+                asyn_rs::asyn_record::register_port(
+                    "DOT",
+                    dot_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain
                 // (NDStdArraysConfigure etc. will call connect_downstream on this)
@@ -294,7 +319,7 @@ async fn main() -> CaResult<()> {
 
     {
         let h = holder.clone();
-        app = app.register_device_support("miniBeamCurrent", move || {
+        app = app.register_device_support("ai", &MINI_BEAM_CURRENT, move || {
             let rx = h
                 .beam_rx
                 .lock()
@@ -317,7 +342,8 @@ async fn main() -> CaResult<()> {
     {
         let factory = Arc::new(RandomWaveformFactory::new_with_count(10_000, 10));
         factory.register_pva_bundle("mini:wf:bundle", "wf");
-        app = app.register_device_support("miniRandomWaveform", move || factory.make());
+        app =
+            app.register_device_support("waveform", &MINI_RANDOM_WAVEFORM, move || factory.make());
     }
     // PointDetector and MovingDot records now use standard asyn DTYPs
     // (asynFloat64, asynInt32) with @asyn(PORT,...) links. The universal
@@ -393,11 +419,11 @@ async fn main() -> CaResult<()> {
         "seqStart program macros - Start an optics SNL program",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let program = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected program name".into()),
             };
             let macros = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("expected macros string".into()),
             };
             optics_rs::seq_runner::seq_start(&program, &macros, ctx.bridge(), ctx.db())?;
@@ -433,25 +459,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mini_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

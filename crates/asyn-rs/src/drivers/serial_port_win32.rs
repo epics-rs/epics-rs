@@ -468,7 +468,7 @@ impl DrvAsynSerialPort {
     /// `auto_connect = true` and `can_block = true`.
     pub fn new(port_name: &str, config_str: &str) -> AsynResult<Self> {
         let config = SerialConfig::parse(config_str)?;
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -478,7 +478,7 @@ impl DrvAsynSerialPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPortWin32.c:798-799): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -504,7 +504,7 @@ impl DrvAsynSerialPort {
     ) -> AsynResult<Self> {
         let mut driver = Self::new(port_name, config_str)?;
         if no_auto_connect {
-            driver.base.auto_connect = false;
+            driver.base.init_auto_connect(false);
         }
         if !no_process_eos {
             driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     /// R7-50: C-Win32 guards getOption AND setOption on the closed handle
-    /// (`drvAsynSerialPortWin32.c:96-101,180-185`) *before* the key is
+    /// (`drvAsynSerialPortWin32.c:96-101,178-182`) *before* the key is
     /// inspected, so every key — not just the flow-control subset — reports
     /// asynError "<device> disconnected:" while the port is closed, and no key
     /// may be stored to the cached config.

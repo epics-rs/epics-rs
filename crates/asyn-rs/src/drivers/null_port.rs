@@ -17,7 +17,7 @@
 //!   the record's `connectDevice` resolve a [`PortHandle`](crate::port_handle::PortHandle)
 //!   and latch PCNCT=1 (attached). That attachment is independent of the link
 //!   being open.
-//! * **`noAutoConnect`** (`base.auto_connect = false`) — the port actor never
+//! * **`noAutoConnect`** (`base.init_auto_connect(false)`) — the port actor never
 //!   fires the auto-reconnect cycle, so nothing drives the link toward
 //!   connected behind the record's back.
 //! * **Never connected** (`base.init_connected(false)`, and a [`connect`] that
@@ -48,10 +48,10 @@ impl NullOctetPort {
     pub fn new(port_name: &str) -> Self {
         // Single-device, blocking (ASYN_CANBLOCK, mirroring a real transport
         // port like drvAsynIPPort, whose `registerPort` attributes are exactly
-        // that — drvAsynIPPort.c:1028-1029). This driver has no C original, so
+        // that — drvAsynIPPort.c:1082-1083). This driver has no C original, so
         // that mirror is the whole of its flag model: it grants no shutdown
         // rights either, because drvAsynIPPort grants none.
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -63,7 +63,7 @@ impl NullOctetPort {
         // Disconnected link, noAutoConnect — the two properties that make CNCT
         // and AUCT deterministically 0.
         base.init_connected(false);
-        base.auto_connect = false;
+        base.init_auto_connect(false);
         Self { base }
     }
 }
@@ -84,7 +84,7 @@ impl PortDriver for NullOctetPort {
     // Observed on the C fat softIoc with a registered-disconnected octet port
     // (`drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`, noAutoConnect):
     // drvAsynIPPort advertises exactly asynCommon + asynOption + asynOctet
-    // (drvAsynIPPort.c:1037-1053), so C reads OCTETIV=1, OPTIONIV=1, and
+    // (drvAsynIPPort.c:1091-1109), so C reads OCTETIV=1, OPTIONIV=1, and
     // GPIBIV=I32IV=UI32IV=F64IV=0. `octet_transport_capabilities()`
     // ({OctetRead, OctetWrite, Option, Flush, Connect}) yields byte-exact those
     // readbacks — CNCT/AUCT/ENBL/PCNCT/REASON also matched. This is the pinned,
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn starts_disconnected_and_no_auto_connect() {
         let drv = NullOctetPort::new("ORACLEASYN");
-        assert_eq!(drv.base().port_name, "ORACLEASYN");
+        assert_eq!(&*drv.base().port_name, "ORACLEASYN");
         assert!(
             !drv.base().is_connected(),
             "null port must start disconnected"

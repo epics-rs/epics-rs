@@ -68,8 +68,12 @@ fn load(name: &str, body: &str) -> (Arc<PvDatabase>, String, String) {
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let line = format!("dbLoadRecords(\"{name}\")");
     let shell_db = Arc::clone(&db);
-    let ran =
-        std::thread::spawn(move || IocShell::new(shell_db, bridge).execute_line(&line)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(shell_db, bridge).execute_line(&line)
+    })
+    .join();
 
     // Restore BEFORE anything can panic, or the failure report has nowhere
     // to go.
@@ -90,7 +94,12 @@ fn load(name: &str, body: &str) -> (Arc<PvDatabase>, String, String) {
 
 /// The names `dbl` would list, in load order.
 async fn listed(db: &PvDatabase) -> Vec<String> {
-    let mut names = db.all_record_names().await;
+    let mut names: Vec<String> = db
+        .all_record_names()
+        .await
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
     names.sort();
     names
 }
@@ -126,13 +135,13 @@ async fn a_refused_noaccess_field_loses_the_field_and_keeps_the_record() {
     );
     drop(held);
 
-    // C's own sentence, minus the two slots this port cannot fill from a
-    // single error value — `pdbentry->message` and `errSymLookup(status)`,
-    // which C prints as `Can't set array field before iocInit() : Bad Field
-    // value`. The frame, the position and the source echo are C's.
+    // `pdbentry->message` is the arm's own `dbMsgPrint`.
     assert!(
-        err.starts_with("ERROR: Can't set 'N1.RSET' to '1' "),
-        "C names the record, the field and the value; got:\n{err}"
+        err.starts_with(
+            "ERROR: Can't set 'N1.RSET' to '1' Can't set array field before iocInit() : \
+             Bad Field value\n"
+        ),
+        "C's sentence; got:\n{err}"
     );
     assert!(
         err.contains(&format!(
@@ -177,7 +186,10 @@ async fn a_refused_json_link_loses_the_field_and_keeps_the_record() {
     drop(held);
 
     assert!(
-        err.starts_with("ERROR: Can't set 'J1.INP' to '{\"bogus\":}' "),
+        err.starts_with(
+            "dbJLinkInit: Link type 'bogus' not found\n\
+             ERROR: Can't set 'J1.INP' to '{\"bogus\":}'  : Bad Field value\n"
+        ),
         "C prints the value with its quotes stripped and escapes translated; got:\n{err}"
     );
     assert!(

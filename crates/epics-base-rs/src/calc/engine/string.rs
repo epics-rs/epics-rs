@@ -1,10 +1,11 @@
+use super::StringInputs;
+use super::bytecode::{self, SCALC, UntilScratch};
 use super::cast::{c_int, c_long, d2ui, imod, my_nint, nint};
 use super::cvt;
 use super::error::CalcError;
 use super::opcodes::{CoreOp, Opcode, StringOp};
 use super::random::local_random;
 use super::value::{SCALC_STRING_SIZE, ScalcString, StackValue};
-use super::{CompiledExpr, StringInputs};
 
 /// `sCalcPostfix.c` — `#define SCALC_STACKSIZE 30`, the ceiling the sCalc
 /// element table declares (`token.rs` `SCALC_TABLE.stack_size`).
@@ -13,39 +14,36 @@ const SCALC_STACKSIZE: usize = 30;
 /// C `sCalcPerform`'s frame-resident operand stack.
 type Stack = super::stack::Stack<StackValue, SCALC_STACKSIZE>;
 
-pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
+pub fn eval(code: &[u8], inputs: &mut StringInputs) -> Result<StackValue, CalcError> {
     // C `sCalcPerform.c:396` — `if (*post == END_EXPRESSION) return(-1);`,
     // checked before anything else, so an empty CALC (which sCalcPostfix
     // ACCEPTS, CLCV 0) and a failed one behave identically at run time: the
     // record alarms every process and VAL/SVAL keep their previous values.
-    if expr.is_empty() {
+    if bytecode::is_empty(code) {
         return Err(CalcError::EmptyProgram);
     }
 
-    // C's static UNTIL pre-scan (`:339-360`), which runs before any opcode does and
+    // C's static UNTIL pre-scan (`:339-375`), which runs before any opcode does and
     // fails the perform outright when the postfix holds more than nine of them —
-    // whether or not they are ever reached.
-    expr.check_until_ceiling()?;
+    // whether or not they are ever reached. `loopsDone` (`:331`) is ONE iteration
+    // budget for all of them together.
+    let mut untils = UntilScratch::scan(&SCALC, crate::calc::ExprKind::String, code)?;
+    let mut loops_done: i32 = 0;
 
     let mut stack = Stack::new();
-    let code = &expr.code;
-    let mut pc = 0;
-    // C's `until_scratch[]` (`sCalcPerform.c:330`) and `loopsDone` (`:331`) —
-    // one entry per UNTIL in the program, and ONE iteration budget for all of
-    // them together.
-    let mut until_marks: Vec<(usize, usize)> = Vec::new();
-    let mut loops_done: i32 = 0;
     // C compiles the USES_STRING marker into the postfix and `sCalcPerform`
     // switches on it ONCE (`sCalcPerform.c:399`) to pick a whole evaluator. The
-    // marker is the compiler's — `CompiledExpr::uses_string`, latched at element
-    // lookup — never re-derived from the finished opcodes here.
-    let string_path = expr.uses_string;
+    // marker is the compiler's, latched at element lookup — never re-derived
+    // from the finished opcodes here.
+    let string_path = bytecode::uses_string(code);
+    let mut pc = bytecode::body_start(crate::calc::ExprKind::String, code);
 
-    while pc < code.len() {
-        let op = &code[pc];
-        pc += 1;
+    loop {
+        let at = pc;
+        let (op, next) = bytecode::decode(&SCALC, code, pc)?;
+        pc = next;
 
-        match op {
+        match &op {
             Opcode::Core(core) => match core {
                 CoreOp::End => break,
 
@@ -382,11 +380,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::CondIf => {
                     let cond = pop1_f64(&mut stack)?;
                     if cond == 0.0 {
-                        pc = cond_search(code, pc, true)?;
+                        pc = bytecode::cond_search(&SCALC, code, pc, true)?;
                     }
                 }
                 CoreOp::CondElse => {
-                    pc = cond_search(code, pc, false)?;
+                    pc = bytecode::cond_search(&SCALC, code, pc, false)?;
                 }
                 CoreOp::CondEnd => {}
 
@@ -618,7 +616,8 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 if !string_path => {}
 
             Opcode::String(sop) => match sop {
-                StringOp::PushString(s) => {
+                StringOp::PushString { at, len } => {
+                    let s = &code[*at as usize..][..*len as usize];
                     // C LITERAL_STRING (sCalcPerform.c:1493-1502) copies the
                     // literal out of the postfix into the 40-byte element with
                     // `for (i=0; (i<SCALC_STRING_SIZE-1) && *post; )` — so an
@@ -883,19 +882,10 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 // remembers the stack pointer, so that a later `UNTIL_END` can
                 // wind the stack back to exactly this point before re-running the
                 // body (`ps = until_scratch[i].ps`, `:2004`). `until_loc` is the
-                // key C matches on, and `pc - 1` is that key here.
-                super::opcodes::ControlOp::Until(_end_pc) => {
-                    let until_pc = pc - 1;
-                    match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
-                        Some((_, depth)) => *depth = stack.len(),
-                        // No ceiling to enforce here: the program cannot hold more
-                        // than nine UNTILs, because `check_until_ceiling` refused it
-                        // before the first opcode ran. This table is a location map,
-                        // nothing more.
-                        None => until_marks.push((until_pc, stack.len())),
-                    }
-                }
-                super::opcodes::ControlOp::UntilEnd(start_pc) => {
+                // key C matches on, and `at` is that key here.
+                super::opcodes::ControlOp::NotGenerated => {}
+                super::opcodes::ControlOp::Until => untils.mark(at, stack.len())?,
+                super::opcodes::ControlOp::UntilEnd => {
                     // C `sCalcPerform.c:1995-2018`, in this order:
                     //
                     // ```c
@@ -950,13 +940,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                         // Wind the stack back to where the paired UNTIL saw it —
                         // C restores the saved `ps` wholesale, so everything the
                         // body pushed (the condition included) is discarded.
-                        let Some((_, depth)) = until_marks.iter().find(|(k, _)| k == start_pc)
-                        else {
+                        let Some((until, depth)) = untils.loop_back(at) else {
                             // C's `printf("sCalcPerform: UNTIL not found"); return(-1)`.
                             return Err(CalcError::Internal);
                         };
-                        stack.truncate(*depth);
-                        pc = *start_pc + 1;
+                        stack.truncate(depth);
+                        pc = until;
                     }
                     // Condition true: fall out of the loop with the condition value
                     // still on the stack. It is the value of the `UNTIL(...)`.
@@ -1713,7 +1702,7 @@ fn shift_chars(bytes: &[u8], count: f64, right: bool) -> Vec<u8> {
 /// `epicsStrSnPrintEscaped` resolves to. Raw bytes in, printable string out:
 /// the C escapes, `\0` for NUL, `\xNN` (lower-case) for anything else
 /// unprintable, and the byte itself when `isprint`.
-fn escaped_from_raw(src: &[u8]) -> String {
+pub(crate) fn escaped_from_raw(src: &[u8]) -> String {
     let mut out = String::new();
     for &c in src {
         match c {
@@ -1871,13 +1860,13 @@ pub struct ScalcResult {
 /// set PREC to 8.
 ///
 /// (`lenSresult > 15` always holds: scalcout's buffer is `STRING_SIZE` = 40.)
-pub fn epilogue(expr: &CompiledExpr, top: &StackValue, precision: i16) -> ScalcResult {
+pub fn epilogue(code: &[u8], top: &StackValue, precision: i16) -> ScalcResult {
     let val = top.to_double();
     // C's last line, evaluated on the `*presult` this epilogue just wrote —
     // for a STRING result that is `to_double(ps)` (`sCalcPerform.c:2046-2050`),
     // which is exactly `val` here.
     let non_finite = !val.is_finite();
-    if expr.uses_string {
+    if bytecode::uses_string(code) {
         ScalcResult {
             val,
             sval: top.clone().into_string_value(),
@@ -2120,38 +2109,6 @@ fn pop2_f64(stack: &mut Stack) -> Result<(f64, f64), CalcError> {
     Ok((a, b))
 }
 
-/// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
-/// (calcPerform.c:520-557): `count` starts at 1, the target opcode decrements
-/// it (return when 0), `COND_IF` increments it.
-fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, CalcError> {
-    let mut count: i32 = 1;
-    let mut pc = start;
-
-    while pc < code.len() {
-        let op = &code[pc];
-        if matches!(op, Opcode::Core(CoreOp::End)) {
-            break;
-        }
-        let is_match = match op {
-            Opcode::Core(CoreOp::CondElse) => find_else,
-            Opcode::Core(CoreOp::CondEnd) => !find_else,
-            _ => false,
-        };
-        if is_match {
-            count -= 1;
-            if count == 0 {
-                return Ok(pc + 1);
-            }
-        }
-        if matches!(op, Opcode::Core(CoreOp::CondIf)) {
-            count += 1;
-        }
-        pc += 1;
-    }
-
-    Err(CalcError::Conditional)
-}
-
 #[cfg(test)]
 mod parity_tests {
     //! C-parity regression tests for the string evaluator.
@@ -2221,24 +2178,30 @@ mod parity_tests {
 mod stack_depth_invariant {
     use super::*;
     use crate::calc::engine::ExprKind;
+    use crate::calc::engine::bytecode::Emitter;
 
-    fn run(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
-        let expr = CompiledExpr {
-            code,
-            ..CompiledExpr::empty(ExprKind::String)
-        };
-        eval(&expr, &mut StringInputs::new())
+    fn assemble(ops: &[Opcode], strings: &[&[u8]], uses_string: bool) -> Vec<u8> {
+        let mut e = Emitter::new(ExprKind::String);
+        if uses_string {
+            e.set_uses_string();
+        }
+        for s in strings {
+            e.string(s);
+        }
+        for op in ops {
+            e.op(*op);
+        }
+        e.finish().unwrap()
+    }
+
+    fn run(ops: Vec<Opcode>) -> Result<StackValue, CalcError> {
+        eval(&assemble(&ops, &[], false), &mut StringInputs::new())
     }
 
     /// The same, on the evaluator C picks for a USES_STRING program — the marker
     /// is the compiler's, so a hand-built program must state it.
-    fn run_string(code: Vec<Opcode>) -> Result<StackValue, CalcError> {
-        let expr = CompiledExpr {
-            code,
-            uses_string: true,
-            ..CompiledExpr::empty(ExprKind::String)
-        };
-        eval(&expr, &mut StringInputs::new())
+    fn run_string(strings: &[&[u8]]) -> Result<StackValue, CalcError> {
+        eval(&assemble(&[], strings, true), &mut StringInputs::new())
     }
 
     #[test]
@@ -2250,7 +2213,6 @@ mod stack_depth_invariant {
         let leaked = vec![
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::PushConst(2.0)),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(leaked), Err(CalcError::StackLeak));
     }
@@ -2263,7 +2225,6 @@ mod stack_depth_invariant {
         let consumed = vec![
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::StoreVar(0)),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(consumed), Err(CalcError::StackLeak));
     }
@@ -2272,12 +2233,7 @@ mod stack_depth_invariant {
     fn a_leaked_string_operand_is_an_error_too() {
         // The string path has its own copy of the check (`:2023-2032`), and it is the
         // same rule: depth 1, whatever the type of the value.
-        let leaked = vec![
-            Opcode::String(StringOp::PushString(b"a".to_vec())),
-            Opcode::String(StringOp::PushString(b"b".to_vec())),
-            Opcode::Core(CoreOp::End),
-        ];
-        assert_eq!(run_string(leaked), Err(CalcError::StackLeak));
+        assert_eq!(run_string(&[b"a", b"b"]), Err(CalcError::StackLeak));
     }
 
     #[test]
@@ -2286,7 +2242,6 @@ mod stack_depth_invariant {
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::PushConst(2.0)),
             Opcode::Core(CoreOp::Add),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(balanced), Ok(StackValue::Double(3.0)));
     }

@@ -39,11 +39,15 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
         .stdin(Stdio::null())
         .output()
         .expect("spawn realtime-ca-ioc");
-    assert!(!out.status.success(), "expected a refusal exit status");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("EPICS_RS_BUILD_EXEC_BACKEND"),
-        "the refusal must name the variable that fixes it; got: {stderr}"
+    // `runtime::task::refuse_backend`: the text on stderr, exit status 1.
+    assert_eq!(out.status.code(), Some(1), "a refusal is a failed start");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "realtime-ca-ioc: built with the tokio task backend, which this entry point \
+         does not start a runtime for.\n\
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread.\n"
     );
 }
 
@@ -52,37 +56,19 @@ fn entry_point_refuses_a_build_with_no_runtime_to_run_on() {
 /// helpers cannot drift out of step with the test that uses them.
 #[cfg(exec_backend)]
 mod exec_model {
+    use named_port::verdict::rs_ioc_port_was_taken;
     use std::io::Read as _;
     use std::net::TcpListener;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// How long the IOC gets to reach the "resolver installed" line.
-    const INIT_BUDGET: Duration = crate::budget::FACT_BUDGET;
+    const INIT_BUDGET: Duration = fact_budget::FACT_BUDGET;
 
     /// How long the IOC then gets to attempt its first name-server dial. That
     /// happens on the first search tick, well under a second; the margin is for a
     /// loaded CI box.
-    const DIAL_BUDGET: Duration = crate::budget::FACT_BUDGET;
-
-    /// `realtime-ca-ioc`'s report that the number it was told to use belonged
-    /// to somebody else.
-    ///
-    /// Both bind arms name the port and exit 1 (`realtime-ca-ioc.rs:1212` for
-    /// the TCP listener, `:1220` for the UDP search responder), so either can
-    /// be the one that loses the race — the server binds both on the same
-    /// number. The errno text is part of the discriminator on purpose: the TCP
-    /// arm also covers `local_addr` failing, which is the one that fails on
-    /// RTEMS, and treating that as a steal would spend every candidate and
-    /// then report a race that never happened.
-    fn port_was_taken(console: &str, port: u16) -> bool {
-        let tcp = format!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: ");
-        let udp =
-            format!("realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: ");
-        console.lines().any(|l| {
-            (l.starts_with(&tcp) || l.starts_with(&udp)) && l.contains("Address already in use")
-        })
-    }
+    const DIAL_BUDGET: Duration = fact_budget::FACT_BUDGET;
 
     /// An IOC that came up on the port it was told to use, and the console it
     /// is still writing to.
@@ -109,7 +95,7 @@ mod exec_model {
     /// The tests below cannot ask the kernel for the port: two of them assert
     /// that the number the boot line named is the number served, which no
     /// kernel pick can express. So the number is a candidate, and losing it is
-    /// a retry — see the `named-port` crate. [`port_was_taken`] is the only
+    /// a retry — see the `named-port` crate. [`rs_ioc_port_was_taken`] is the only
     /// thing that retries; a panic, any other exit, and the budget expiring all
     /// fail here, with the console, because none of them gets better on a
     /// different port.
@@ -153,7 +139,7 @@ mod exec_model {
                     "realtime-ca-ioc panicked during init:\n{console}"
                 );
                 if booted.child.0.try_wait().expect("poll the child").is_some() {
-                    if port_was_taken(&console, port) {
+                    if rs_ioc_port_was_taken(&console, port) {
                         return None;
                     }
                     panic!("realtime-ca-ioc exited during init:\n{console}");
@@ -285,6 +271,40 @@ mod exec_model {
         }
     }
 
+    /// The C6 search topology is the built-in database's: a probe build
+    /// booted on a site database must not be pointed at the SLIRP host.
+    #[cfg(feature = "bringup-probes")]
+    #[test]
+    fn a_site_db_keeps_the_site_search_configuration() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("site.db");
+        std::fs::write(&db, "record(ai, \"SITE:AI\") {}\n").expect("write the db");
+        let booted = boot_on_a_named_port(
+            dir.path(),
+            |cmd, port| {
+                cmd.arg(&db)
+                    .env_remove("EPICS_CA_NAME_SERVERS")
+                    .env_remove("EPICS_CA_ADDR_LIST")
+                    .env_remove("EPICS_CA_AUTO_ADDR_LIST")
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
+            },
+            |console| console.contains("C6 probe: EPICS_CA_NAME_SERVERS"),
+        );
+        let console = booted.console();
+        let banner = console
+            .lines()
+            .find(|l| l.starts_with("C6 probe: EPICS_CA_NAME_SERVERS"))
+            .expect("the ready line");
+        assert_eq!(
+            banner,
+            "C6 probe: EPICS_CA_NAME_SERVERS=(unset), EPICS_CA_ADDR_LIST=(unset), \
+             EPICS_CA_AUTO_ADDR_LIST=(unset); reporting every 10 s"
+        );
+    }
+
     struct Killed(Child);
 
     impl Drop for Killed {
@@ -292,6 +312,62 @@ mod exec_model {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    /// c1ca882a5 pinned `rs_ioc_port_was_taken` to this console but kept
+    /// the getsockname shim that measured it out of the tree; this rebuilds
+    /// the shim and re-measures. The number is a named candidate, so the
+    /// recorded console is compared with its port substituted.
+    #[test]
+    fn a_local_addr_failure_prints_the_measured_stderr() {
+        use named_port::verdict::{LOCAL_ADDR_FAILED, LOCAL_ADDR_FAILED_PORT};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shim = named_port::getsockname_einval_shim(dir.path());
+        // A link-free db, not the built-in one: under `bringup-probes` that
+        // brings the C6 probe links, whose dial to the compiled-in name server
+        // (C dials it too, `cac.cpp:250-281`) logs DIALPROBE racing the exit.
+        // No name servers as well, so the pin does not rest on the client
+        // being made at the first remote link (C: `dbContext.cpp:99-102`).
+        let db = dir.path().join("plain.db");
+        std::fs::write(&db, "record(ai, \"LOCAL:AI\") {}\n").expect("write the db");
+        let (port, stderr) = named_port::on_a_named_port(|port| {
+            let err_path = dir.path().join(format!("stderr-{port}.log"));
+            let err = std::fs::File::create(&err_path).expect("create the stderr log");
+            let mut child = Killed(
+                Command::new(env!("CARGO_BIN_EXE_realtime-ca-ioc"))
+                    .arg(&db)
+                    .env("EPICS_CA_NAME_SERVERS", "")
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("LD_PRELOAD", &shim)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(err))
+                    .spawn()
+                    .expect("spawn realtime-ca-ioc"),
+            );
+            let deadline = Instant::now() + INIT_BUDGET;
+            let status = loop {
+                if let Some(status) = child.0.try_wait().expect("poll the child") {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "realtime-ca-ioc is still running under the shim after {INIT_BUDGET:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let stderr = std::fs::read_to_string(&err_path).expect("read the stderr log");
+            if rs_ioc_port_was_taken(&stderr, port) {
+                return None;
+            }
+            assert_eq!(status.code(), Some(1), "{stderr}");
+            Some((port, stderr))
+        });
+        assert_eq!(
+            stderr,
+            LOCAL_ADDR_FAILED.replace(&LOCAL_ADDR_FAILED_PORT.to_string(), &port.to_string())
+        );
     }
 
     #[test]
@@ -377,7 +453,7 @@ mod exec_model {
         // race.
         #[cfg(feature = "bringup-probes")]
         {
-            let deadline = Instant::now() + crate::budget::FACT_BUDGET;
+            let deadline = Instant::now() + fact_budget::FACT_BUDGET;
             while !console.contains("C6 probe") {
                 assert!(
                     Instant::now() < deadline,
@@ -551,7 +627,273 @@ mod exec_model {
             "the fallback must actually be the demo database:\n{bare_log}"
         );
     }
-}
 
-#[path = "common/budget.rs"]
-mod budget;
+    /// `realtime-ca-ioc` serving one record, booted for a raw client.
+    fn boot_one_record(dir: &std::path::Path) -> Booted {
+        let db = dir.join("one.db");
+        std::fs::write(&db, "record(ai, \"MIS:A\") {}\n").expect("write the db");
+        boot_on_a_named_port(
+            dir,
+            |cmd, port| {
+                cmd.arg(format!("EPICS_CA_NAME_SERVERS=127.0.0.1:{}", closed_port()))
+                    .arg(format!("EPICS_CA_SERVER_PORT={port}"))
+                    .arg(format!("EPICS_CAS_SERVER_PORT={port}"))
+                    .arg("EPICS_CAS_INTF_ADDR_LIST=127.0.0.1")
+                    .arg("EPICS_CAS_BEACON_ADDR_LIST=127.0.0.1")
+                    .arg("EPICS_CA_AUTO_ADDR_LIST=NO")
+                    .arg(&db);
+            },
+            |console| boot_report(console).is_some(),
+        )
+    }
+
+    fn ca_hdr(cmmd: u16, size: u16, dt: u16, count: u16, p1: u32, p2: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(16);
+        for v in [cmmd, size, dt, count] {
+            h.extend_from_slice(&v.to_be_bytes());
+        }
+        h.extend_from_slice(&p1.to_be_bytes());
+        h.extend_from_slice(&p2.to_be_bytes());
+        h
+    }
+
+    /// Send `handshake` on a fresh circuit and read `answered` bytes of reply,
+    /// then send `frames` and read to the server's close; return the client's
+    /// address and every console line naming it, once the disconnect line has
+    /// been written.
+    fn console_for_a_closed_circuit(
+        booted: &Booted,
+        handshake: &[u8],
+        answered: usize,
+        frames: &[u8],
+    ) -> (String, String) {
+        use std::io::Write as _;
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let peer = c.local_addr().unwrap().to_string();
+        c.write_all(handshake).unwrap();
+        let mut answer = vec![0u8; answered];
+        c.read_exact(&mut answer).expect("the handshake's replies");
+        c.write_all(frames).unwrap();
+        let mut rest = Vec::new();
+        c.read_to_end(&mut rest)
+            .expect("the server closes the circuit");
+
+        let disconnect = format!("CAS: forcing disconnect from {peer}\n");
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let console = loop {
+            let console = booted.console();
+            if console.contains(&disconnect) {
+                break console;
+            }
+            assert!(Instant::now() < deadline, "no disconnect line:\n{console}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let about_the_client = console
+            .split_inclusive('\n')
+            .filter(|l| l.contains(&peer))
+            .collect();
+        (peer, about_the_client)
+    }
+
+    /// The blocking driver's console for a misaligned request is softIoc's:
+    /// `log_header`'s three lines and the disconnect (`camessage.c:2452-2463`,
+    /// `camsgtask.c`), which softIoc 8f5015b66 printed on stderr for this
+    /// frame after an ECHO round trip, and nothing else naming the client.
+    #[test]
+    fn a_misaligned_request_prints_softiocs_lines_and_no_others() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        // VERSION, then an ECHO whose reply proves both were read: softIoc's
+        // greeting VERSION and the ECHO reply are the 32 bytes before it.
+        let handshake = [ca_hdr(0, 0, 0, 13, 0, 0), ca_hdr(23, 0, 0, 0, 0, 0)].concat();
+        let mut frame = ca_hdr(23, 4, 7, 3, 0x1234, 0x55);
+        frame.extend_from_slice(b"abcd");
+        let (peer, console) = console_for_a_closed_circuit(&booted, &handshake, 32, &frame);
+        assert_eq!(
+            console,
+            format!(
+                "CAS: request from {peer} => CAS: Missaligned protocol rejected\n\
+                 CAS: Request from {peer} => cmmd=23 cid=0x1234 type=7 count=3 postsize=4\n\
+                 CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n\
+                 CAS: forcing disconnect from {peer}\n"
+            )
+        );
+    }
+
+    /// The receive gate's other arm, a refusal that keeps the circuit: a
+    /// message before any VERSION is from a client too old to serve
+    /// (`camessage.c:2491-2501`), and softIoc 8f5015b66 printed `log_header`'s
+    /// three lines on stderr for this ECHO, then nothing once the client
+    /// closed.
+    #[test]
+    fn a_too_old_client_prints_softiocs_lines_and_no_others() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", booted.port)).expect("connect");
+        c.set_read_timeout(Some(fact_budget::FACT_BUDGET)).unwrap();
+        let peer = c.local_addr().unwrap().to_string();
+        c.write_all(&ca_hdr(23, 0, 0, 0, 0x1234, 0x55)).unwrap();
+        // The greeting VERSION, then the ECA_DEFUNCT frame: its header, the
+        // echoed request and "CAS: Client version 0 too old" padded to 32.
+        let mut answer = [0u8; 80];
+        c.read_exact(&mut answer).expect("VERSION and the refusal");
+        drop(c);
+
+        let last = format!("CAS: Request from {peer} =>   available=0x55 \tN=0 paddr=(nil)\n");
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        let console = loop {
+            let console = booted.console();
+            if console.contains(&last) {
+                break console;
+            }
+            assert!(Instant::now() < deadline, "no log_header:\n{console}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let about_the_client: String = console
+            .split_inclusive('\n')
+            .filter(|l| l.contains(&peer))
+            .collect();
+        assert_eq!(
+            about_the_client,
+            format!(
+                "CAS: request from {peer} => CAS: Client version too old\n\
+                 CAS: Request from {peer} => cmmd=23 cid=0x1234 type=0 count=0 postsize=0\n\
+                 {last}"
+            )
+        );
+    }
+
+    /// `tcp_version_action` refuses a minor version below 4 and a priority
+    /// above 99 with `RSRV_ERROR` and no line (`camessage.c:368-375`, the
+    /// first under `DLOG(2)` only): softIoc 8f5015b66 printed the disconnect
+    /// alone for each.
+    #[test]
+    fn a_refused_version_prints_only_the_disconnect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let booted = boot_one_record(dir.path());
+        for (minor, priority) in [(3, 0), (13, 100)] {
+            let (peer, console) =
+                console_for_a_closed_circuit(&booted, &[], 0, &ca_hdr(0, 0, priority, minor, 0, 0));
+            assert_eq!(
+                console,
+                format!("CAS: forcing disconnect from {peer}\n"),
+                "minor {minor}, priority {priority}"
+            );
+        }
+    }
+
+    /// `build_ioc`'s link passes open the external links at init, before
+    /// anything processes: `setup_cp_links` warms the CP link of a Passive
+    /// holder, whose monitor is then the only thing that processes it, and
+    /// `setup_external_link_opens` opens a link no record ever reads.
+    ///
+    /// The upstream is an in-process database behind [`BlockingCaServer`], so
+    /// both facts are read off it: DOWN:CP's OUT lands the CP value in
+    /// UPSTREAM:ECHO, and the open of DOWN:IN's link is a monitor on
+    /// UPSTREAM:IN.
+    #[test]
+    fn build_ioc_opens_external_links_before_anything_processes() {
+        use epics_base_rs::runtime::task::{background_init, block_on_sync};
+        use epics_base_rs::server::ioc_builder::IocBuilder;
+        use epics_base_rs::types::EpicsValue;
+        use epics_ca_rs::server::blocking::BlockingCaServer;
+        use std::sync::Arc;
+
+        background_init();
+        let (upstream, _) = block_on_sync(
+            IocBuilder::new()
+                .db_string(
+                    "record(ao, \"UPSTREAM:CP\") { field(VAL, \"42.5\") }\n\
+                     record(ao, \"UPSTREAM:IN\") { field(VAL, \"7\") }\n\
+                     record(ao, \"UPSTREAM:ECHO\") {}\n",
+                    &std::collections::HashMap::new(),
+                )
+                .expect("load the upstream db")
+                .build(),
+        )
+        .expect("no async runtime entered on this test thread")
+        .expect("build the upstream");
+        let server = Arc::new(
+            BlockingCaServer::bind(
+                "127.0.0.1:0",
+                Arc::clone(&upstream),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+            )
+            .expect("bind the upstream CA server"),
+        );
+        let upstream_port = server.local_addr().expect("local_addr").port();
+        let srv = Arc::clone(&server);
+        let accept = std::thread::spawn(move || srv.serve());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("down.db");
+        std::fs::write(
+            &db,
+            "record(calcout, \"DOWN:CP\") { field(INPA, \"UPSTREAM:CP CP\") \
+             field(CALC, \"A\") field(OUT, \"UPSTREAM:ECHO\") }\n\
+             record(ai, \"DOWN:IN\") { field(INP, \"UPSTREAM:IN\") }\n",
+        )
+        .expect("write the db");
+        let booted = boot_on_a_named_port(
+            dir.path(),
+            |cmd, port| {
+                cmd.arg(&db)
+                    .env(
+                        "EPICS_CA_NAME_SERVERS",
+                        format!("127.0.0.1:{upstream_port}"),
+                    )
+                    .env("EPICS_CA_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                    .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+                    .env("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            },
+            |console| boot_report(console).is_some(),
+        );
+
+        let read = |name: &str| {
+            let rec = upstream.get_record(name).expect("upstream record");
+            let rec = rec.read();
+            (
+                rec.record.get_field("VAL"),
+                !rec.field_subscribers().is_empty(),
+            )
+        };
+        let deadline = Instant::now() + fact_budget::FACT_BUDGET;
+        // The first monitor event can process DOWN:CP before its OUT link has
+        // connected, which C drops too; each new CP value is another event.
+        let mut sent = 42.5;
+        loop {
+            let (echo, _) = read("UPSTREAM:ECHO");
+            let (_, in_opened) = read("UPSTREAM:IN");
+            if echo == Some(EpicsValue::Double(sent)) && in_opened {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "UPSTREAM:ECHO is {echo:?} (CP value {sent}), UPSTREAM:IN \
+                 monitored: {in_opened}:\n{}",
+                booted.console()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            // Only while nothing has crossed: once ECHO moves, the chain is
+            // live and the last value sent must arrive.
+            if echo.is_none() || echo == Some(EpicsValue::Double(0.0)) {
+                sent += 1.0;
+                block_on_sync(upstream.put_record_field_from_ca(
+                    "UPSTREAM:CP",
+                    "VAL",
+                    EpicsValue::Double(sent),
+                ))
+                .expect("no async runtime entered on this test thread")
+                .expect("put UPSTREAM:CP");
+            }
+        }
+
+        drop(booted);
+        server.shutdown();
+        accept.join().expect("the accept thread exits on shutdown");
+    }
+}

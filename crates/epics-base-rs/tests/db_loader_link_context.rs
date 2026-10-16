@@ -12,7 +12,7 @@
 //! not disambiguate two boards by their OUT link.
 //!
 //! The two halves of the invariant are pinned separately below, because they are
-//! deliberately distinct: `common.out` is the link *text* (always populated),
+//! deliberately distinct: `common.text.out` is the link *text* (always populated),
 //! while `parsed_out` is the *framework's* dispatch of that link (armed only for
 //! a record type that does not declare the field, so a record driving its own
 //! link is not driven twice per cycle).
@@ -132,7 +132,7 @@ record(ownsOut, "SCALER:1") {{
         instance.record.get_field("OUT"),
         Some(EpicsValue::String(OUT_LINK.into()))
     );
-    assert_eq!(instance.common.out, OUT_LINK);
+    assert_eq!(instance.common.text.out, OUT_LINK);
 }
 
 /// The other half of the invariant: mirroring the link *text* must not arm the
@@ -164,12 +164,12 @@ record(ownsOut, "SCALER:2") {
     let instance = instance.read();
 
     // Link text: populated, so device support sees it.
-    assert_eq!(instance.common.out, "TARGET:PV PP");
+    assert_eq!(instance.common.text.out, "TARGET:PV PP");
     // Framework dispatch: unarmed, because the record type owns the field.
     assert!(
-        matches!(instance.parsed_out, ParsedLink::None),
+        matches!(instance.parsed_out.link(), ParsedLink::None),
         "framework OUT dispatch must stay unarmed for a record that owns OUT, \
          got {:?}",
-        instance.parsed_out
+        instance.parsed_out.link()
     );
 }

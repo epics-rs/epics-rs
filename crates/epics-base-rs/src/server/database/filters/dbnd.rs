@@ -148,7 +148,7 @@ impl SubscriptionFilter for DeadbandFilter {
         // state. C reaches this by way of its `send = 1` initialiser
         // and the `pfl->type == dbfl_type_val` gate a non-scalar skips
         // (`dbnd.c:69, 75`).
-        let Some(cur) = event.event.snapshot.value.to_f64() else {
+        let Some(cur) = event.event.value().as_value().and_then(EpicsValue::to_f64) else {
             return Some(event);
         };
 
@@ -175,7 +175,7 @@ impl SubscriptionFilter for DeadbandFilter {
         // LOG here too is what stops the widened `VALUE|LOG` emission
         // mask from defeating the `.{dbnd}` filter on every value change.
         let bypass = EventMask::from_bits(
-            event.event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits(),
+            event.event.mask().bits() & !(EventMask::VALUE | EventMask::LOG).bits(),
         );
         let send = supra || !bypass.is_empty();
         if send && self.mode == DeadbandMode::Relative {
@@ -205,16 +205,10 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: std::sync::Arc::new(Snapshot::new(
-                EpicsValue::Double(v),
-                0,
-                0,
-                SystemTime::UNIX_EPOCH,
-            )),
-            origin: 0,
+        FilteredMonitorEvent::new(MonitorEvent::read_log(
+            &mut Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
             mask,
-        })
+        ))
     }
 
     /// First event always passes — there is no `last_sent` baseline yet.
@@ -422,17 +416,13 @@ mod tests {
     #[test]
     fn non_numeric_passes() {
         let f = DeadbandFilter::absolute(1.0);
-        let snap = Snapshot::new(
+        let mut snap = Snapshot::new(
             EpicsValue::String("hello".into()),
             0,
             0,
             SystemTime::UNIX_EPOCH,
         );
-        let event = FilteredMonitorEvent::new(MonitorEvent {
-            snapshot: std::sync::Arc::new(snap),
-            origin: 0,
-            mask: EventMask::VALUE,
-        });
+        let event = FilteredMonitorEvent::new(MonitorEvent::read_log(&mut snap, EventMask::VALUE));
         assert!(f.apply(event).is_some());
     }
 }

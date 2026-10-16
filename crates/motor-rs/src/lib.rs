@@ -68,14 +68,13 @@ pub const MOTOR_IOC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ioc");
 
 /// Return the motor record type factory (name, factory) for injection into IocBuilder.
 pub fn motor_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    epics_base_rs::server::record::register_contributed_dbd(&record::dbd_generated::DBD);
     ("motor", Box::new(|| Box::new(MotorRecord::default())))
 }
 
 /// Register the "motor" record type via the global registry (legacy).
 /// Prefer `motor_record_factory()` with `IocBuilder::register_record_type()`.
 pub fn register_motor_record_type() {
-    epics_base_rs::server::db_loader::register_record_type(
-        "motor",
-        Box::new(|| Box::new(MotorRecord::default())),
-    );
+    let (name, factory) = motor_record_factory();
+    epics_base_rs::server::db_loader::register_record_type(name, factory);
 }

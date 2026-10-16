@@ -1,0 +1,352 @@
+menu(waveformPOST) {
+	choice(waveformPOST_Always,"Always")
+	choice(waveformPOST_OnChange,"On Change")
+}
+menu(transformIVLA) {
+	choice(transformIVLA_IGNORE,"Ignore error")
+	choice(transformIVLA_DO_NOTHING,"Do Nothing")
+}
+menu(transformIAV) {
+	choice(transformIAV_EXT_NC,"Ext PV NC")
+	choice(transformIAV_EXT,"Ext PV OK")
+	choice(transformIAV_LOC,"Local PV")
+	choice(transformIAV_CON,"Constant")
+}
+menu(transformCOPT) {
+	choice(transformCOPT_CONDITIONAL,"Conditional")
+	choice(transformCOPT_ALWAYS,"Always")
+}
+menu(timestampTST) {
+	choice(timestampTST_YY_MM_DD_HH_MM_SS,"YY/MM/DD HH:MM:SS")
+	choice(timestampTST_MM_DD_YY_HH_MM_SS,"MM/DD/YY HH:MM:SS")
+	choice(timestampTST_MM_DD_HH_MM_SS_YY,"Mon DD HH:MM:SS YY")
+	choice(timestampTST_MM_DD_HH_MM_SS,"Mon DD HH:MM:SS")
+	choice(timestampTST_HH_MM_SS,"HH:MM:SS")
+	choice(timestampTST_HH_MM,"HH:MM")
+	choice(timestampTST_DD_MM_YY_HH_MM_SS,"DD/MM/YY HH:MM:SS")
+	choice(timestampTST_DD_MM_HH_MM_SS_YY,"DD Mon HH:MM:SS YY")
+	choice(timestampTST_VMS,"DD-Mon-YYYY HH:MM:SS")
+	choice(timestampTST_MM_DD_YYYY,"Mon DD, YYYY HH:MM:SS.ns")
+	choice(timestampTST_MM_DD_YY,"MM/DD/YY HH:MM:SS.ns")
+}
+menu(throttleWAIT) {
+	choice(throttleWAIT_FALSE,"False")
+	choice(throttleWAIT_TRUE,"True")
+}
+menu(throttleSYNC) {
+	choice(throttleSYNC_IDLE,"Idle")
+	choice(throttleSYNC_PROC,"Process")
+}
+menu(throttleSTS) {
+	choice(throttleSTS_UNK,"Unknown")
+	choice(throttleSTS_ERR,"Error")
+	choice(throttleSTS_SUC,"Success")
+}
+menu(throttleOV) {
+	choice(throttleOV_EXT_NC,"Ext PV NC")
+	choice(throttleOV_EXT,"Ext PV OK")
+	choice(throttleOV_LOC,"Local PV")
+	choice(throttleOV_CON,"Constant")
+}
+menu(throttleDRVLS) {
+	choice(throttleDRVLS_NORM,"Normal")
+	choice(throttleDRVLS_LOW,"Low Limit")
+	choice(throttleDRVLS_HIGH,"High Limit")
+}
+menu(throttleDRVLC) {
+	choice(throttleDRVLC_OFF,"Off")
+	choice(throttleDRVLC_ON,"On")
+}
+menu(stringoutPOST) {
+	choice(stringoutPOST_OnChange,"On Change")
+	choice(stringoutPOST_Always,"Always")
+}
+menu(stringinPOST) {
+	choice(stringinPOST_OnChange,"On Change")
+	choice(stringinPOST_Always,"Always")
+}
+menu(sseqWAIT) {
+	choice(sseqWAIT_NoWait,"NoWait")
+	choice(sseqWAIT_Wait,"Wait")
+	choice(sseqWAIT_Wait1,"After1")
+	choice(sseqWAIT_Wait2,"After2")
+	choice(sseqWAIT_Wait3,"After3")
+	choice(sseqWAIT_Wait4,"After4")
+	choice(sseqWAIT_Wait5,"After5")
+	choice(sseqWAIT_Wait6,"After6")
+	choice(sseqWAIT_Wait7,"After7")
+	choice(sseqWAIT_Wait8,"After8")
+	choice(sseqWAIT_Wait9,"After9")
+	choice(sseqWAIT_Wait10,"AfterA")
+}
+menu(sseqSELM) {
+	choice(sseqSELM_All,"All")
+	choice(sseqSELM_Specified,"Specified")
+	choice(sseqSELM_Mask,"Mask")
+}
+menu(sseqLNKV) {
+	choice(sseqLNKV_EXT_NC,"Ext PV NC")
+	choice(sseqLNKV_EXT,"Ext PV OK")
+	choice(sseqLNKV_LOC,"Local PV")
+	choice(sseqLNKV_CON,"Constant")
+}
+menu(seqSELM) {
+	choice(seqSELM_All,"All")
+	choice(seqSELM_Specified,"Specified")
+	choice(seqSELM_Mask,"Mask")
+}
+menu(selSELM) {
+	choice(selSELM_Specified,"Specified")
+	choice(selSELM_High_Signal,"High Signal")
+	choice(selSELM_Low_Signal,"Low Signal")
+	choice(selSELM_Median_Signal,"Median Signal")
+}
+menu(scalcoutWAIT) {
+	choice(scalcoutWAIT_NoWait,"NoWait")
+	choice(scalcoutWAIT_Wait,"Wait")
+}
+menu(scalcoutOOPT) {
+	choice(scalcoutOOPT_Every_Time,"Every Time")
+	choice(scalcoutOOPT_On_Change,"On Change")
+	choice(scalcoutOOPT_When_Zero,"When Zero")
+	choice(scalcoutOOPT_When_Non_zero,"When Non-zero")
+	choice(scalcoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(scalcoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+	choice(scalcoutOOPT_Never,"Never")
+}
+menu(scalcoutINAV) {
+	choice(scalcoutINAV_EXT_NC,"Ext PV NC")
+	choice(scalcoutINAV_EXT,"Ext PV OK")
+	choice(scalcoutINAV_LOC,"Local PV")
+	choice(scalcoutINAV_CON,"Constant")
+}
+menu(scalcoutINAP) {
+	choice(scalcoutINAP_No,"No PROC on Change")
+	choice(scalcoutINAP_Yes,"PROC on Change")
+}
+menu(scalcoutDOPT) {
+	choice(scalcoutDOPT_Use_VAL,"Use CALC")
+	choice(scalcoutDOPT_Use_OVAL,"Use OCAL")
+}
+menu(menuYesNo) {
+	choice(menuYesNoNO,"NO")
+	choice(menuYesNoYES,"YES")
+}
+menu(menuSimm) {
+	choice(menuSimmNO,"NO")
+	choice(menuSimmYES,"YES")
+	choice(menuSimmRAW,"RAW")
+}
+menu(menuScan) {
+	choice(menuScanPassive,"Passive")
+	choice(menuScanEvent,"Event")
+	choice(menuScanI_O_Intr,"I/O Intr")
+	choice(menuScan10_second,"10 second")
+	choice(menuScan5_second,"5 second")
+	choice(menuScan2_second,"2 second")
+	choice(menuScan1_second,"1 second")
+	choice(menuScan_5_second,".5 second")
+	choice(menuScan_2_second,".2 second")
+	choice(menuScan_1_second,".1 second")
+}
+menu(menuPriority) {
+	choice(menuPriorityLOW,"LOW")
+	choice(menuPriorityMEDIUM,"MEDIUM")
+	choice(menuPriorityHIGH,"HIGH")
+}
+menu(menuPost) {
+	choice(menuPost_OnChange,"On Change")
+	choice(menuPost_Always,"Always")
+}
+menu(menuPini) {
+	choice(menuPiniNO,"NO")
+	choice(menuPiniYES,"YES")
+	choice(menuPiniRUN,"RUN")
+	choice(menuPiniRUNNING,"RUNNING")
+	choice(menuPiniPAUSE,"PAUSE")
+	choice(menuPiniPAUSED,"PAUSED")
+}
+menu(menuOmsl) {
+	choice(menuOmslsupervisory,"supervisory")
+	choice(menuOmslclosed_loop,"closed_loop")
+}
+menu(menuIvoa) {
+	choice(menuIvoaContinue_normally,"Continue normally")
+	choice(menuIvoaDon_t_drive_outputs,"Don't drive outputs")
+	choice(menuIvoaSet_output_to_IVOV,"Set output to IVOV")
+}
+menu(menuFtype) {
+	choice(menuFtypeSTRING,"STRING")
+	choice(menuFtypeCHAR,"CHAR")
+	choice(menuFtypeUCHAR,"UCHAR")
+	choice(menuFtypeSHORT,"SHORT")
+	choice(menuFtypeUSHORT,"USHORT")
+	choice(menuFtypeLONG,"LONG")
+	choice(menuFtypeULONG,"ULONG")
+	choice(menuFtypeINT64,"INT64")
+	choice(menuFtypeUINT64,"UINT64")
+	choice(menuFtypeFLOAT,"FLOAT")
+	choice(menuFtypeDOUBLE,"DOUBLE")
+	choice(menuFtypeENUM,"ENUM")
+}
+menu(menuConvert) {
+	choice(menuConvertNO_CONVERSION,"NO CONVERSION")
+	choice(menuConvertSLOPE,"SLOPE")
+	choice(menuConvertLINEAR,"LINEAR")
+	choice(menuConverttypeKdegF,"typeKdegF")
+	choice(menuConverttypeKdegC,"typeKdegC")
+	choice(menuConverttypeJdegF,"typeJdegF")
+	choice(menuConverttypeJdegC,"typeJdegC")
+	choice(menuConverttypeEdegF,"typeEdegF(ixe only)")
+	choice(menuConverttypeEdegC,"typeEdegC(ixe only)")
+	choice(menuConverttypeTdegF,"typeTdegF")
+	choice(menuConverttypeTdegC,"typeTdegC")
+	choice(menuConverttypeRdegF,"typeRdegF")
+	choice(menuConverttypeRdegC,"typeRdegC")
+	choice(menuConverttypeSdegF,"typeSdegF")
+	choice(menuConverttypeSdegC,"typeSdegC")
+}
+menu(menuAlarmStat) {
+	choice(menuAlarmStatNO_ALARM,"NO_ALARM")
+	choice(menuAlarmStatREAD,"READ")
+	choice(menuAlarmStatWRITE,"WRITE")
+	choice(menuAlarmStatHIHI,"HIHI")
+	choice(menuAlarmStatHIGH,"HIGH")
+	choice(menuAlarmStatLOLO,"LOLO")
+	choice(menuAlarmStatLOW,"LOW")
+	choice(menuAlarmStatSTATE,"STATE")
+	choice(menuAlarmStatCOS,"COS")
+	choice(menuAlarmStatCOMM,"COMM")
+	choice(menuAlarmStatTIMEOUT,"TIMEOUT")
+	choice(menuAlarmStatHWLIMIT,"HWLIMIT")
+	choice(menuAlarmStatCALC,"CALC")
+	choice(menuAlarmStatSCAN,"SCAN")
+	choice(menuAlarmStatLINK,"LINK")
+	choice(menuAlarmStatSOFT,"SOFT")
+	choice(menuAlarmStatBAD_SUB,"BAD_SUB")
+	choice(menuAlarmStatUDF,"UDF")
+	choice(menuAlarmStatDISABLE,"DISABLE")
+	choice(menuAlarmStatSIMM,"SIMM")
+	choice(menuAlarmStatREAD_ACCESS,"READ_ACCESS")
+	choice(menuAlarmStatWRITE_ACCESS,"WRITE_ACCESS")
+}
+menu(menuAlarmSevr) {
+	choice(menuAlarmSevrNO_ALARM,"NO_ALARM")
+	choice(menuAlarmSevrMINOR,"MINOR")
+	choice(menuAlarmSevrMAJOR,"MAJOR")
+	choice(menuAlarmSevrINVALID,"INVALID")
+}
+menu(longoutOOPT) {
+	choice(longoutOOPT_Every_Time,"Every Time")
+	choice(longoutOOPT_On_Change,"On Change")
+	choice(longoutOOPT_When_Zero,"When Zero")
+	choice(longoutOOPT_When_Non_zero,"When Non-zero")
+	choice(longoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(longoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+}
+menu(histogramCMD) {
+	choice(histogramCMD_Read,"Read")
+	choice(histogramCMD_Clear,"Clear")
+	choice(histogramCMD_Start,"Start")
+	choice(histogramCMD_Stop,"Stop")
+}
+menu(fanoutSELM) {
+	choice(fanoutSELM_All,"All")
+	choice(fanoutSELM_Specified,"Specified")
+	choice(fanoutSELM_Mask,"Mask")
+}
+menu(epidFeedbackState) {
+	choice(epidFeedbackState_Off,"Off")
+	choice(epidFeedbackState_On,"On")
+}
+menu(epidFeedbackMode) {
+	choice(epidFeedbackMode_PID,"PID")
+	choice(epidFeedbackMode_MaxMin,"Max/Min")
+}
+menu(dfanoutSELM) {
+	choice(dfanoutSELM_All,"All")
+	choice(dfanoutSELM_Specified,"Specified")
+	choice(dfanoutSELM_Mask,"Mask")
+}
+menu(compressALG) {
+	choice(compressALG_N_to_1_Low_Value,"N to 1 Low Value")
+	choice(compressALG_N_to_1_High_Value,"N to 1 High Value")
+	choice(compressALG_N_to_1_Average,"N to 1 Average")
+	choice(compressALG_Average,"Average")
+	choice(compressALG_Circular_Buffer,"Circular Buffer")
+	choice(compressALG_N_to_1_Median,"N to 1 Median")
+}
+menu(calcoutOOPT) {
+	choice(calcoutOOPT_Every_Time,"Every Time")
+	choice(calcoutOOPT_On_Change,"On Change")
+	choice(calcoutOOPT_When_Zero,"When Zero")
+	choice(calcoutOOPT_When_Non_zero,"When Non-zero")
+	choice(calcoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(calcoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+}
+menu(calcoutINAV) {
+	choice(calcoutINAV_EXT_NC,"Ext PV NC")
+	choice(calcoutINAV_EXT,"Ext PV OK")
+	choice(calcoutINAV_LOC,"Local PV")
+	choice(calcoutINAV_CON,"Constant")
+}
+menu(calcoutDOPT) {
+	choice(calcoutDOPT_Use_VAL,"Use CALC")
+	choice(calcoutDOPT_Use_OVAL,"Use OCAL")
+}
+menu(bufferingALG) {
+	choice(bufferingALG_FIFO,"FIFO Buffer")
+	choice(bufferingALG_LIFO,"LIFO Buffer")
+}
+menu(aoOIF) {
+	choice(aoOIF_Full,"Full")
+	choice(aoOIF_Incremental,"Incremental")
+}
+menu(acalcoutWAIT) {
+	choice(acalcoutWAIT_NoWait,"NoWait")
+	choice(acalcoutWAIT_Wait,"Wait")
+}
+menu(acalcoutSIZE) {
+	choice(acalcoutSIZE_NELM,"NELM")
+	choice(acalcoutSIZE_NUSE,"NUSE")
+}
+menu(acalcoutOOPT) {
+	choice(acalcoutOOPT_Every_Time,"Every Time")
+	choice(acalcoutOOPT_On_Change,"On Change")
+	choice(acalcoutOOPT_When_Zero,"When Zero")
+	choice(acalcoutOOPT_When_Non_zero,"When Non-zero")
+	choice(acalcoutOOPT_Transition_To_Zero,"Transition To Zero")
+	choice(acalcoutOOPT_Transition_To_Non_zero,"Transition To Non-zero")
+	choice(acalcoutOOPT_Never,"Never")
+}
+menu(acalcoutINAV) {
+	choice(acalcoutINAV_EXT_NC,"Ext PV NC")
+	choice(acalcoutINAV_EXT,"Ext PV OK")
+	choice(acalcoutINAV_LOC,"Local PV")
+	choice(acalcoutINAV_CON,"Constant")
+}
+menu(acalcoutINAP) {
+	choice(acalcoutINAP_No,"No PROC on Change")
+	choice(acalcoutINAP_Yes,"PROC on Change")
+}
+menu(acalcoutDOPT) {
+	choice(acalcoutDOPT_Use_VAL,"Use CALC")
+	choice(acalcoutDOPT_Use_OVAL,"Use OCAL")
+}
+menu(aaoPOST) {
+	choice(aaoPOST_Always,"Always")
+	choice(aaoPOST_OnChange,"On Change")
+}
+menu(aaiPOST) {
+	choice(aaiPOST_Always,"Always")
+	choice(aaiPOST_OnChange,"On Change")
+}
+menu(aSubLFLG) {
+	choice(aSubLFLG_IGNORE,"IGNORE")
+	choice(aSubLFLG_READ,"READ")
+}
+menu(aSubEFLG) {
+	choice(aSubEFLG_NEVER,"NEVER")
+	choice(aSubEFLG_ON_CHANGE,"ON CHANGE")
+	choice(aSubEFLG_ALWAYS,"ALWAYS")
+}

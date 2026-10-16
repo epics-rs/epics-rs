@@ -138,7 +138,7 @@ fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity, String) {
     (
         inst.common.stat,
         inst.common.sevr,
-        inst.common.amsg.as_str().to_owned(),
+        String::from(&inst.common.amsg),
     )
 }
 

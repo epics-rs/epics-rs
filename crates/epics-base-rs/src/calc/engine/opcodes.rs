@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoreOp {
     // Operands
     PushConst(f64),
@@ -104,13 +104,17 @@ pub enum CoreOp {
     End,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StringOp {
     // Phase 2A: Core
-    /// C `LITERAL_STRING`. The bytes the compiler copied out of the source
-    /// verbatim (`sCalcPostfix.c:808`) — raw, un-decoded, backslashes intact.
-    /// `$T` / `TR_ESC` is the only translator.
-    PushString(Vec<u8>),
+    /// C `LITERAL_STRING`: the `len` bytes at offset `at` of the program, which
+    /// the compiler copied out of the source verbatim (`sCalcPostfix.c:808`) —
+    /// raw, un-decoded, backslashes intact. `$T` / `TR_ESC` is the only
+    /// translator.
+    PushString {
+        at: u32,
+        len: u32,
+    },
     ToString, // STR: number→string
     ToDouble, // DBL: string→number
     Len,      // string length
@@ -161,13 +165,19 @@ pub enum StringOp {
     DynSStore,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ControlOp {
-    Until(usize),    // jump target = UntilEnd pc
-    UntilEnd(usize), // jump target = Until pc
+    /// Paired with its `UntilEnd` by position, as C pairs them
+    /// (`bytecode::UntilScratch`); the bytes carry no jump target.
+    Until,
+    UntilEnd,
+    /// sCalc/aCalc `NOT_GENERATED`, written when a dynamic `:=` flushes a `(`
+    /// (`sCalcPostfix.c:532-544`). Both performs run it as `default: break`
+    /// (`sCalcPerform.c:2018`, `aCalcPerform.c:1595`); base never writes it.
+    NotGenerated,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ArrayOp {
     ConstIndex, // IX: [0,1,...,n-1]
     ToArray,    // ARR: scalar→array
@@ -237,7 +247,7 @@ pub enum ArrayOp {
     LenNoop,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Opcode {
     Core(CoreOp),
     String(StringOp),

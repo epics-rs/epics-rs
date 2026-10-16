@@ -28,8 +28,9 @@ pub struct IfaceInfo {
     pub ip: Ipv4Addr,
     /// IPv4 netmask.
     pub netmask: Ipv4Addr,
-    /// Subnet broadcast address (when reported by the OS), e.g.
-    /// `10.0.0.255`. `None` for point-to-point links.
+    /// `ifa_broadaddr` as the OS reported it, e.g. `10.0.0.255`: where C
+    /// and pvxs send to reach this NIC's segment. `None` for point-to-point
+    /// links. Not necessarily a local address — see [`Self::rx_broadcast`].
     pub broadcast: Option<Ipv4Addr>,
     /// `true` when the interface carries the OS `IFF_UP` flag **and**
     /// is not loopback — the eligibility test for SEARCH/beacon
@@ -41,6 +42,31 @@ pub struct IfaceInfo {
     /// platform's enumerator already excludes operationally-down
     /// adapters.
     pub up_non_loopback: bool,
+}
+
+impl IfaceInfo {
+    /// The local address this NIC's subnet broadcasts arrive at, which a
+    /// socket can bind to receive them.
+    ///
+    /// Not [`Self::broadcast`] on Linux: with `IFF_BROADCAST` set, glibc
+    /// fills `ifa_broadaddr` with the peer of a `peer` address, or with the
+    /// NIC's own address when no `brd` was given, and binding either fails.
+    /// The kernel installs a local broadcast route for `prefix | ~mask` on
+    /// every prefix shorter than /31 (`fib_add_ifaddr`), so that is the
+    /// address there.
+    pub fn rx_broadcast(&self) -> Option<Ipv4Addr> {
+        if self.ip.is_loopback() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mask = u32::from(self.netmask);
+            (mask != 0 && mask.leading_ones() < 31)
+                .then(|| Ipv4Addr::from(u32::from(self.ip) | !mask))
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.broadcast.filter(|b| !b.is_unspecified())
+    }
 }
 
 /// Refreshable cache of IPv4 interfaces.
@@ -325,6 +351,51 @@ fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn nic(ip: [u8; 4], prefix: u32, broadcast: Option<[u8; 4]>) -> IfaceInfo {
+        IfaceInfo {
+            index: 2,
+            name: "d0".to_string(),
+            ip: ip.into(),
+            netmask: Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix).unwrap_or(0)),
+            broadcast: broadcast.map(Ipv4Addr::from),
+            up_non_loopback: true,
+        }
+    }
+
+    /// One case per `ifa_broadaddr` shape `getifaddrs` gives an
+    /// `IFF_BROADCAST` NIC on Linux, as `ip addr add` configured it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rx_broadcast_is_the_kernel_local_broadcast() {
+        let cases = [
+            // `brd +`
+            (
+                nic([10, 6, 0, 1], 24, Some([10, 6, 0, 255])),
+                Some([10, 6, 0, 255]),
+            ),
+            // no `brd`: glibc reports the NIC's own address
+            (
+                nic([10, 7, 0, 1], 24, Some([10, 7, 0, 1])),
+                Some([10, 7, 0, 255]),
+            ),
+            // `peer 10.8.0.2`: the peer, and no subnet broadcast at /32
+            (nic([10, 8, 0, 1], 32, Some([10, 8, 0, 2])), None),
+            // `peer 10.5.0.2/24`: the peer, and the kernel's /24 broadcast
+            (
+                nic([10, 5, 0, 1], 24, Some([10, 5, 0, 2])),
+                Some([10, 5, 0, 255]),
+            ),
+            // /31 has no broadcast (RFC 3021)
+            (nic([10, 4, 0, 0], 31, Some([10, 4, 0, 1])), None),
+            (nic([10, 3, 0, 1], 0, Some([255, 255, 255, 255])), None),
+            (nic([127, 0, 0, 1], 8, None), None),
+        ];
+        for (info, want) in cases {
+            assert_eq!(info.rx_broadcast(), want.map(Ipv4Addr::from), "{info:?}");
+        }
+    }
 
     #[test]
     fn enumerate_returns_loopback_at_minimum() {

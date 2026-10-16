@@ -1,10 +1,11 @@
+use super::ArrayInputs;
 use super::array_value::ArrayStackValue::Double;
 use super::array_value::{ArrayCell, ArrayStackValue, zip_map};
+use super::bytecode::{self, ACALC, UntilScratch};
 use super::cast::{c_int, c_long, d2ui, imod, my_nint, nint};
 use super::error::CalcError;
 use super::opcodes::{ArrayOp, ControlOp, CoreOp, Opcode};
 use super::random::local_random;
-use super::{ArrayInputs, CompiledExpr};
 use crate::calc::math::{derivative, fitting, stats};
 
 /// C `myMAXFLOAT` (`aCalcPerform.c:49`): `((float)1e+35)`, widened back to a
@@ -69,17 +70,19 @@ const ACALC_STACKSIZE: usize = 20;
 /// C `aCalcPerform`'s frame-resident operand stack.
 type Stack = super::stack::Stack<Cell, ACALC_STACKSIZE>;
 
-pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
+pub fn eval(code: &[u8], inputs: &mut ArrayInputs) -> Result<ArrayStackValue, CalcError> {
     // C `aCalcPerform.c:312-314` — `if (*postfix == END_EXPRESSION) return(-1);`,
     // ahead of even the value-stack allocation. Same contract as the other two
     // engines: an empty or failed compile is a program that fails every run.
-    if expr.is_empty() {
+    if bytecode::is_empty(code) {
         return Err(CalcError::EmptyProgram);
     }
 
     // C's static UNTIL pre-scan (`:355-390`), which runs before any opcode does and
     // fails the perform outright when the postfix holds more than nine of them.
-    expr.check_until_ceiling()?;
+    // `loopsDone` (`:308`) is shared by all of them.
+    let mut untils = UntilScratch::scan(&ACALC, crate::calc::ExprKind::Array, code)?;
+    let mut loops_done: i32 = 0;
 
     // C `:326` — `*amask = 0`, before a single opcode runs. The mask means "array
     // fields THIS run stored into", so the engine that runs it is its only owner: no
@@ -87,21 +90,16 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     inputs.amask = 0;
 
     let mut stack = Stack::new();
-    let code = &expr.code;
     let mut pc = 0;
 
     let mut status = Status::default();
 
-    // C's `until_scratch[MAX_UNTIL_OP]` (`aCalcPerform.c:307`): for each UNTIL, the
-    // stack pointer it last saw. `loopsDone` (`:308`) is shared by all of them.
-    let mut until_marks: Vec<(usize, usize)> = Vec::new();
-    let mut loops_done: i32 = 0;
+    loop {
+        let at = pc;
+        let (op, next) = bytecode::decode(&ACALC, code, pc)?;
+        pc = next;
 
-    while pc < code.len() {
-        let op = &code[pc];
-        pc += 1;
-
-        match op {
+        match &op {
             Opcode::Core(core) => match core {
                 CoreOp::End => break,
 
@@ -354,11 +352,11 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 CoreOp::CondIf => {
                     let cond = pop_f64(&mut stack)?;
                     if cond == 0.0 {
-                        pc = cond_search(code, pc, true)?;
+                        pc = bytecode::cond_search(&ACALC, code, pc, true)?;
                     }
                 }
                 CoreOp::CondElse => {
-                    pc = cond_search(code, pc, false)?;
+                    pc = bytecode::cond_search(&ACALC, code, pc, false)?;
                 }
                 CoreOp::CondEnd => {}
 
@@ -1034,17 +1032,9 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 // C `aCalcPerform.c:1551-1567` — UNTIL only records where the
                 // stack was, so that
                 // UNTIL_END can wind it back before re-running the body. `until_loc`
-                // is the key C matches on, and `pc - 1` is that key here.
-                ControlOp::Until(_end_pc) => {
-                    let until_pc = pc - 1;
-                    match until_marks.iter_mut().find(|(k, _)| *k == until_pc) {
-                        Some((_, depth)) => *depth = stack.len(),
-                        // No ceiling to enforce here — `check_until_ceiling` refused
-                        // a program with more than nine UNTILs before the first
-                        // opcode ran. This table is a location map, nothing more.
-                        None => until_marks.push((until_pc, stack.len())),
-                    }
-                }
+                // is the key C matches on, and `at` is that key here.
+                ControlOp::NotGenerated => {}
+                ControlOp::Until => untils.mark(at, stack.len())?,
                 // C `:1569-1590`, in this order:
                 //
                 // ```c
@@ -1056,7 +1046,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                 // all the UNTILs in one program; when it runs out C simply STOPS
                 // LOOPING — the perform continues and returns 0. There is no
                 // loop-limit error and the record does not alarm.
-                ControlOp::UntilEnd(start_pc) => {
+                ControlOp::UntilEnd => {
                     loops_done += 1;
                     if loops_done > acalc_loop_max() {
                         continue;
@@ -1079,13 +1069,12 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
                         // Wind the stack back to where the paired UNTIL saw it — C
                         // restores the saved `ps` wholesale, so everything the body
                         // pushed (the condition included) is discarded.
-                        let Some((_, depth)) = until_marks.iter().find(|(k, _)| k == start_pc)
-                        else {
+                        let Some((until, depth)) = untils.loop_back(at) else {
                             // C's `printf("aCalcPerform: UNTIL not found"); return(-1)`.
                             return Err(CalcError::Internal);
                         };
-                        stack.truncate(*depth);
-                        pc = *start_pc + 1;
+                        stack.truncate(depth);
+                        pc = until;
                     }
                     // Condition true: fall out with the condition value still on the
                     // stack. It is the value of the `UNTIL(...)`.
@@ -1726,36 +1715,6 @@ fn pop_f64(stack: &mut Stack) -> Result<f64, CalcError> {
     pop(stack)?.v.as_f64()
 }
 
-/// Forward-scan for a matching conditional opcode, mirroring C `cond_search`
-/// (calcPerform.c:520-557): `count` starts at 1, the target opcode decrements
-/// it (return when 0), `COND_IF` increments it.
-fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, CalcError> {
-    let mut count: i32 = 1;
-    let mut pc = start;
-    while pc < code.len() {
-        let op = &code[pc];
-        if matches!(op, Opcode::Core(CoreOp::End)) {
-            break;
-        }
-        let is_match = match op {
-            Opcode::Core(CoreOp::CondElse) => find_else,
-            Opcode::Core(CoreOp::CondEnd) => !find_else,
-            _ => false,
-        };
-        if is_match {
-            count -= 1;
-            if count == 0 {
-                return Ok(pc + 1);
-            }
-        }
-        if matches!(op, Opcode::Core(CoreOp::CondIf)) {
-            count += 1;
-        }
-        pc += 1;
-    }
-    Err(CalcError::Conditional)
-}
-
 /// The end-of-expression depth invariant — C's `if (ps != top) return(-1)`
 /// (`aCalcPerform.c:1607-1618`).
 ///
@@ -1772,13 +1731,14 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
 mod stack_depth_invariant {
     use super::*;
     use crate::calc::engine::ExprKind;
+    use crate::calc::engine::bytecode::Emitter;
 
-    fn run(code: Vec<Opcode>) -> Result<ArrayStackValue, CalcError> {
-        let expr = CompiledExpr {
-            code,
-            ..CompiledExpr::empty(ExprKind::Array)
-        };
-        eval(&expr, &mut ArrayInputs::new(4))
+    fn run(ops: Vec<Opcode>) -> Result<ArrayStackValue, CalcError> {
+        let mut e = Emitter::new(ExprKind::Array);
+        for op in ops {
+            e.op(op);
+        }
+        eval(&e.finish().unwrap(), &mut ArrayInputs::new(4))
     }
 
     #[test]
@@ -1789,7 +1749,6 @@ mod stack_depth_invariant {
         let leaked = vec![
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::PushConst(2.0)),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(leaked), Err(CalcError::StackLeak));
     }
@@ -1802,7 +1761,6 @@ mod stack_depth_invariant {
         let consumed = vec![
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::StoreVar(0)),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(consumed), Err(CalcError::StackLeak));
     }
@@ -1813,7 +1771,6 @@ mod stack_depth_invariant {
             Opcode::Core(CoreOp::PushConst(1.0)),
             Opcode::Core(CoreOp::PushConst(2.0)),
             Opcode::Core(CoreOp::Add),
-            Opcode::Core(CoreOp::End),
         ];
         assert_eq!(run(balanced), Ok(Double(3.0)));
     }

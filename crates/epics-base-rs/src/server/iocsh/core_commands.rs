@@ -73,7 +73,7 @@ fn update_pwd() {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    super::iocsh_env_clear("PWD");
+    super::iocsh_env_clear(b"PWD");
     // SAFETY: same single-threaded-shell rationale as `epicsEnvSet`.
     unsafe { std::env::set_var("PWD", cwd) };
 }
@@ -81,6 +81,12 @@ fn update_pwd() {
 /// The only way the shell changes its working directory. Routing every
 /// caller through here is what keeps `$(PWD)` equal to the process cwd
 /// by construction rather than by each command remembering to update it.
+/// `epicsThreadGetId`'s `strcmp`: every thread name is text, so a
+/// non-UTF-8 one names no thread.
+fn thread_by_name(name: &IocshString) -> Option<crate::runtime::task::ThreadInfo> {
+    crate::runtime::task::thread_by_name(name.to_str().ok()?)
+}
+
 pub(super) fn set_working_dir(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
     std::env::set_current_dir(dir)?;
     update_pwd();
@@ -291,7 +297,7 @@ fn cmd_errlog_init() -> CommandDef {
         }],
         concat!(
             "Initialize error log client buffer size\n",
-            "  bufSize - size of circular buffer (default = 1280 bytes)",
+            "  bufSize - size of circular buffer (default = 2560 bytes)",
         ),
         |args: &[ArgValue], _ctx: &CommandContext| {
             let bufsize = int_arg(args.first()).max(0) as usize;
@@ -317,8 +323,8 @@ fn cmd_errlog_init2() -> CommandDef {
         ],
         concat!(
             "Initialize error log client buffer size and maximum message size\n",
-            "  bufSize    - size of circular buffer       (default = 1280 bytes)\n",
-            "  maxMsgSize - maximum size of error message (default =  256 bytes)",
+            "  bufSize    - size of circular buffer       (default = 2560 bytes)\n",
+            "  maxMsgSize - maximum size of error message (default =  512 bytes)",
         ),
         |args: &[ArgValue], _ctx: &CommandContext| {
             let bufsize = int_arg(args.first()).max(0) as usize;
@@ -334,9 +340,7 @@ fn cmd_errlog_init2() -> CommandDef {
 /// asking an IOC what its error log is doing got `Command 'errlogShow' not
 /// registered.`
 ///
-/// The three level bands and their help text are C's;
-/// [`crate::runtime::log::errlog_show`] states where the level-2 dump departs
-/// from C's arena bytes and why.
+/// The three level bands, their help text and the level-2 arena dump are C's.
 fn cmd_errlog_show() -> CommandDef {
     CommandDef::new(
         "errlogShow",
@@ -374,10 +378,10 @@ fn cmd_errlog() -> CommandDef {
         "Send message to errlog",
         |args: &[ArgValue], _ctx: &CommandContext| {
             let message = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
-                _ => String::new(),
+                Some(ArgValue::String(s)) => s.to_str_lossy(),
+                _ => Default::default(),
             };
-            crate::runtime::log::errlog_printf_no_console(&format!("{message}\n"));
+            crate::runtime::log::errlog_printf_no_console(format_args!("{message}\n"));
             crate::runtime::log::errlog_flush();
             Ok(CommandOutcome::Continue)
         },
@@ -416,7 +420,7 @@ fn cmd_ioc_log_prefix() -> CommandDef {
         "Create the prefix for all messages going into IOC log",
         |args: &[ArgValue], _ctx: &CommandContext| {
             if let Some(ArgValue::String(prefix)) = args.first() {
-                crate::runtime::log_client::ioc_log_prefix(prefix);
+                crate::runtime::log_client::ioc_log_prefix(&prefix.to_str_lossy());
             }
             Ok(CommandOutcome::Continue)
         },
@@ -501,7 +505,7 @@ fn cmd_echo() -> CommandDef {
         |args: &[ArgValue], ctx: &CommandContext| {
             match &args[0] {
                 ArgValue::String(s) => {
-                    ctx.println_bytes(&crate::runtime::epics_string::raw_from_escaped(s))
+                    ctx.println_bytes(&crate::runtime::epics_string::raw_from_escaped_bytes(s))
                 }
                 _ => ctx.println(""),
             }
@@ -602,11 +606,14 @@ fn cmd_date() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             let fmt = match &args[0] {
-                ArgValue::String(f) if !f.is_empty() => f.as_str(),
-                _ => "%Y/%m/%d %H:%M:%S.%06f",
+                ArgValue::String(f) if !f.is_empty() => f.to_str_lossy(),
+                _ => "%Y/%m/%d %H:%M:%S.%06f".into(),
             };
             let now = chrono::Local::now();
-            ctx.println(&now.format(&epics_strftime_to_chrono(fmt, &now)).to_string());
+            ctx.println(
+                &now.format(&epics_strftime_to_chrono(&fmt, &now))
+                    .to_string(),
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -650,7 +657,7 @@ fn chdir_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // that failed, and that return value IS what `iocshSetError` is handed,
     // so that line — and only that line — is errored.
     let changed = match &args[0] {
-        ArgValue::String(dir) => Some(set_working_dir(dir).is_ok()),
+        ArgValue::String(dir) => Some(dir.to_path().is_ok_and(|dir| set_working_dir(dir).is_ok())),
         _ => None,
     };
     if changed == Some(true) {
@@ -714,7 +721,7 @@ fn cmd_epics_env_unset() -> CommandDef {
             super::iocsh_env_clear(name);
             // SAFETY: matches C iocsh behaviour; mutated only from the
             // single-threaded REPL thread.
-            unsafe { std::env::remove_var(name) };
+            unsafe { std::env::remove_var(name.to_os_str()?) };
             Ok(CommandOutcome::Continue)
         },
     )
@@ -744,20 +751,19 @@ fn cmd_epics_env_show() -> CommandDef {
         ),
         |args: &[ArgValue], ctx: &CommandContext| {
             let pattern = match &args[0] {
-                ArgValue::String(p) => Some(p.as_str()),
+                ArgValue::String(p) => Some(p.as_bytes()),
                 _ => None,
             };
-            for (k, v) in std::env::vars() {
+            // `vars()` panics on an entry that is not UTF-8; C matches and
+            // prints its bytes.
+            for (k, v) in std::env::vars_os() {
+                let key = k.as_encoded_bytes();
                 if let Some(pattern) = pattern
-                    && !super::commands::epics_strn_glob_match(
-                        k.as_bytes(),
-                        k.len(),
-                        pattern.as_bytes(),
-                    )
+                    && !super::commands::epics_strn_glob_match(key, key.len(), pattern)
                 {
                     continue;
                 }
-                ctx.println(&format!("{k}={v}"));
+                ctx.println_bytes(&[key, b"=", v.as_encoded_bytes()].concat());
             }
             Ok(CommandOutcome::Continue)
         },
@@ -903,7 +909,7 @@ fn cmd_epics_thread_show() -> CommandDef {
             // takes it and reads it on no POSIX target
             // (`os/Linux/osdThreadExtra.c:31-55`). Consuming it is what keeps
             // `-2` from being read as a thread handle.
-            if rest.first().is_some_and(|token| token.starts_with('-')) {
+            if rest.first().is_some_and(|token| token.starts_with(b"-")) {
                 rest = &rest[1..];
             }
             if rest.is_empty() {
@@ -916,9 +922,9 @@ fn cmd_epics_thread_show() -> CommandDef {
             for token in rest {
                 // C `strtoull(cp, &endp, 0)`; a non-empty remainder means the
                 // argument was a name, not a handle.
-                let id = match super::registry::parse_iocsh_int(token) {
+                let id = match super::registry::parse_iocsh_int(&token.to_str_lossy()) {
                     Ok(value) => value as u64,
-                    Err(_) => match crate::runtime::task::thread_by_name(token) {
+                    Err(_) => match thread_by_name(token) {
                         Some(thread) => thread.id(),
                         None => {
                             ctx.eprintln(&format!("\t'{token}' is not a known thread name"));
@@ -985,9 +991,9 @@ fn cmd_epics_thread_resume() -> CommandDef {
             };
             let mut failed = false;
             for token in argv {
-                let (kind, found) = match super::registry::parse_iocsh_int(token) {
+                let (kind, found) = match super::registry::parse_iocsh_int(&token.to_str_lossy()) {
                     Ok(id) => ("thread id", crate::runtime::task::thread_by_id(id as u64)),
-                    Err(_) => ("thread name", crate::runtime::task::thread_by_name(token)),
+                    Err(_) => ("thread name", thread_by_name(token)),
                 };
                 let Some(thread) = found else {
                     ctx.eprintln(&format!("'{token}' is not a valid {kind}"));
@@ -1131,18 +1137,18 @@ mod tests {
         ctx
     }
 
-    fn run_env_show(ctx: &CommandContext, tokens: &[&str]) -> String {
+    fn run_env_show(ctx: &CommandContext, tokens: &[&str]) -> Vec<u8> {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get("epicsEnvShow").unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&path).unwrap(), || {
             cmd.handler.call(&args, ctx).unwrap();
         });
-        std::fs::read_to_string(&path).unwrap()
+        std::fs::read(&path).unwrap()
     }
 
     /// Both streams a command writes, kept apart: C sends the thread listing
@@ -1152,7 +1158,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get(name).unwrap();
-        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
         let out_file = tempfile::NamedTempFile::new().unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
@@ -1337,11 +1343,35 @@ mod tests {
     }
 
     /// The three parts of C's `epicsThreadShowAll`, and which stream each
-    /// lands on.
+    /// lands on. Unix only: the OSSPRI it expects is `pthread_getschedparam`'s.
+    #[cfg(unix)]
     #[test]
     fn epics_thread_show_all_prints_the_header_the_rows_and_a_stderr_trailer() {
         let ctx = make_ctx();
-        let (finish, join) = parked_ioc_thread("cbShowAllRow");
+        // The OSSPRI column is the kernel's live `sched_priority`, as C reads
+        // it (`osdThreadExtra.c:39`): 0 off SCHED_FIFO, the mapped band on it.
+        let (sched_tx, sched_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish, finish_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::Builder::new()
+            .name("cbShowAllRow".to_string())
+            .spawn(move || {
+                let _ = crate::runtime::task::enter_ioc_thread(
+                    crate::runtime::task::ThreadPriority::ScanLow,
+                );
+                let mut policy = 0;
+                let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+                // SAFETY: the calling thread, with stack-local out-params.
+                unsafe {
+                    libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                };
+                sched_tx.send(param.sched_priority).unwrap();
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        let ossprio = sched_rx.recv().unwrap();
 
         let (out, err, failed) = run_split(&ctx, "epicsThreadShowAll", &[]);
         assert!(!failed);
@@ -1358,7 +1388,7 @@ mod tests {
             row.ends_with(&format!(
                 "{:3}{:8} {:>8.8}",
                 crate::runtime::task::ThreadPriority::ScanLow.value(),
-                0,
+                ossprio,
                 "OK"
             )),
             "{row}"
@@ -1701,7 +1731,10 @@ mod tests {
     fn epics_mutex_show_all_prints_the_count_the_protocol_and_the_rows() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (out, err, failed) = run_split(&ctx, "epicsMutexShowAll", &["0", "0"]);
         assert!(!failed);
@@ -1728,7 +1761,10 @@ mod tests {
     fn a_level_above_zero_adds_the_osd_line_under_every_row() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (plain, _, _) = run_split(&ctx, "epicsMutexShowAll", &["0", "0"]);
         for level in ["1", "-1"] {
@@ -1757,7 +1793,10 @@ mod tests {
     fn only_locked_filters_the_rows_but_not_the_count() {
         let ctx = make_ctx();
         let gate: crate::runtime::sync::PriorityInheritanceMutex<()> =
-            crate::runtime::sync::PriorityInheritanceMutex::new(());
+            crate::runtime::sync::PriorityInheritanceMutex::new(
+                (),
+                crate::runtime::sync::CMutex::LockSet,
+            );
 
         let (idle, _, _) = run_split(&ctx, "epicsMutexShowAll", &["1", "0"]);
         let total = crate::runtime::sync::mutex_report(false).total;
@@ -1813,10 +1852,10 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get("eltc").unwrap();
-        let args = parse_args(&["0".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["0".into()], &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
         assert!(!crate::runtime::log::errlog_to_console());
-        let args = parse_args(&["1".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["1".into()], &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
         assert!(crate::runtime::log::errlog_to_console());
     }
@@ -1826,14 +1865,9 @@ mod tests {
     /// ```text
     /// errlogShow 0 -> Error log: / buffer size: N / max message size: M
     /// errlogShow 1 -> ... + "  number of listeners: 0"
-    /// errlogShow 2 -> ... + "  buffer(log) contents:" and the print pair
+    /// errlogShow 2 -> ... + "  buffer(log) contents:" / "" / "^" and the
+    ///                  print triple, both arenas empty after the shell's flush
     /// ```
-    ///
-    /// The two SIZES differ from that binary — it is built from the 7.0
-    /// branch, where `MIN_BUFFER_SIZE` is 2560 and the default max message
-    /// size 512 (`errlog.c:44-45`, unreleased); released R7.0.10, which this
-    /// port carries, has 1280 and 256. So the numbers here are the port's own
-    /// constants and the LAYOUT is C's.
     #[test]
     fn errlog_show_reports_the_three_level_bands() {
         let ctx = make_ctx();
@@ -1843,7 +1877,7 @@ mod tests {
             let cmd = reg
                 .get("errlogShow")
                 .expect("errlogShow must be registered");
-            let args = parse_args(&[level.to_string()], &cmd.args).unwrap();
+            let args = parse_args(&[level.to_string().into()], &cmd.args).unwrap();
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_path_buf();
             ctx.with_output(std::fs::File::create(&path).unwrap(), || {
@@ -1855,7 +1889,7 @@ mod tests {
         let sizes = format!(
             "Error log:\n  buffer size: {}\n  max message size: {}\n",
             crate::runtime::log::MIN_BUFFER_SIZE,
-            crate::runtime::log::MIN_MESSAGE_SIZE
+            crate::runtime::log::DEFAULT_MAX_MSG_SIZE
         );
         assert_eq!(show("0"), sizes);
 
@@ -1869,17 +1903,15 @@ mod tests {
         );
         assert!(crate::runtime::log::errlog_remove_listener(id));
 
-        // Level 2 adds both buffers. The port names the write position
-        // instead of drawing C's caret into an arena it does not keep.
+        // Level 2 adds both arenas: C's `%s` of the base, empty here, and the
+        // caret at `pos` 0.
+        crate::runtime::log::errlog_flush();
         assert_eq!(
             show("2"),
             format!(
                 "{sizes}  number of listeners: 0\n\
-                 \x20 buffer(log) contents:\n\
-                 \x20 buffer(log) position: 0 of {size} bytes\n\
-                 \x20 buffer(print) contents:\n\
-                 \x20 buffer(print) position: 0 of {size} bytes\n",
-                size = crate::runtime::log::MIN_BUFFER_SIZE
+                 \x20 buffer(log) contents:\n\n^\n\
+                 \x20 buffer(print) contents:\n\n^\n"
             )
         );
     }
@@ -1898,7 +1930,7 @@ mod tests {
             sink.lock().expect("sink").push(m.to_string());
         });
         let cmd = reg.get("errlog").unwrap();
-        let args = parse_args(&["disk nearly full".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[("disk nearly full".to_string()).into()], &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
         let lines = seen.lock().expect("sink").clone();
         crate::runtime::log::errlog_remove_listener(id);
@@ -1971,7 +2003,7 @@ mod tests {
         register(&mut reg);
         let cmd = reg.get("epicsThreadSleep").unwrap();
         for arg in ["1e300", "inf", "nan", "-5", "0"] {
-            let tokens = vec![arg.to_string()];
+            let tokens: Vec<IocshString> = vec![arg.to_string().into()];
             let args = parse_args(&tokens, &cmd.args).unwrap();
             let t = std::time::Instant::now();
             cmd.handler.call(&args, &ctx).unwrap();
@@ -1995,23 +2027,47 @@ mod tests {
             std::env::set_var("EPICS_RS_SHOW_TWO", "2");
         }
 
-        let globbed = run_env_show(&ctx, &["EPICS_RS_SHOW_*"]);
+        let globbed = String::from_utf8(run_env_show(&ctx, &["EPICS_RS_SHOW_*"])).unwrap();
         let mut lines: Vec<&str> = globbed.lines().collect();
         lines.sort();
         assert_eq!(lines, ["EPICS_RS_SHOW_ONE=1", "EPICS_RS_SHOW_TWO=2"]);
 
         assert_eq!(
             run_env_show(&ctx, &["EPICS_RS_SHOW_ONE"]),
-            "EPICS_RS_SHOW_ONE=1\n"
+            b"EPICS_RS_SHOW_ONE=1\n"
         );
         // No match, no output — C invents no "is not set" line.
-        assert_eq!(run_env_show(&ctx, &["EPICS_RS_NO_SUCH_VAR"]), "");
+        assert!(run_env_show(&ctx, &["EPICS_RS_NO_SUCH_VAR"]).is_empty());
 
         // SAFETY: same serial group.
         unsafe {
             std::env::remove_var("EPICS_RS_SHOW_ONE");
             std::env::remove_var("EPICS_RS_SHOW_TWO");
         }
+    }
+
+    /// An entry that is not UTF-8 is listed and matched by its bytes, as C
+    /// prints `environ`; `std::env::vars` would panic on it.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(epics_env)]
+    fn epics_env_show_lists_an_entry_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let ctx = make_ctx();
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe {
+            std::env::set_var(
+                "EPICS_RS_SHOW_BYTES",
+                std::ffi::OsStr::from_bytes(b"a\xffb"),
+            )
+        };
+        assert_eq!(
+            run_env_show(&ctx, &["EPICS_RS_SHOW_B*"]),
+            b"EPICS_RS_SHOW_BYTES=a\xffb\n"
+        );
+        assert!(!run_env_show(&ctx, &[]).is_empty());
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var("EPICS_RS_SHOW_BYTES") };
     }
 
     /// C `date` takes a format (`libComRegister.c:74`,
@@ -2025,7 +2081,7 @@ mod tests {
         let cmd = reg.get("date").unwrap();
         assert_eq!(cmd.args.len(), 1, "C declares one argument");
 
-        let args = parse_args(&["%Y".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["%Y".into()], &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&path).unwrap(), || {
@@ -2063,7 +2119,7 @@ mod tests {
         let mut reg = CommandRegistry::new();
         register(&mut reg);
         let cmd = reg.get("date").unwrap();
-        let args = parse_args(&["%Q".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["%Q".into()], &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&path).unwrap(), || {
@@ -2112,7 +2168,7 @@ mod tests {
         );
 
         let cmd = reg.get("cd").unwrap();
-        let args = parse_args(&[target.to_str().unwrap().to_string()], &cmd.args).unwrap();
+        let args = parse_args(&[target.to_str().unwrap().to_string().into()], &cmd.args).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let out_path = tmp.path().to_path_buf();
         ctx.with_output(std::fs::File::create(&out_path).unwrap(), || {
@@ -2186,7 +2242,7 @@ mod tests {
         assert_eq!(cmd.args.len(), 1, "C declares one argument");
 
         for level in ["0", "1"] {
-            let args = parse_args(&[level.to_string()], &cmd.args).unwrap();
+            let args = parse_args(&[level.to_string().into()], &cmd.args).unwrap();
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_path_buf();
             ctx.with_output(std::fs::File::create(&path).unwrap(), || {
@@ -2218,7 +2274,7 @@ mod tests {
         register(&mut reg);
         unsafe { std::env::set_var("_CORECMD_TEST", "x") };
         let cmd = reg.get("epicsEnvUnset").unwrap();
-        let args = parse_args(&["_CORECMD_TEST".to_string()], &cmd.args).unwrap();
+        let args = parse_args(&["_CORECMD_TEST".into()], &cmd.args).unwrap();
         cmd.handler.call(&args, &ctx).unwrap();
         assert!(std::env::var("_CORECMD_TEST").is_err());
     }

@@ -21,11 +21,9 @@
 
 #![cfg(tokio_backend)]
 
-mod common;
-
 use std::process::{Command, Stdio};
 
-use common::LineCollector;
+use c_ca_tools::LineCollector;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
@@ -43,6 +41,8 @@ async fn first_line(port: u16, args: &[&str]) -> String {
     let port_env = port.to_string();
     tokio::task::spawn_blocking(move || {
         let mut child = Command::new(env!("CARGO_BIN_EXE_camonitor-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
@@ -51,7 +51,7 @@ async fn first_line(port: u16, args: &[&str]) -> String {
             .spawn()
             .expect("spawn camonitor-rs");
         let collector = LineCollector::spawn(child.stdout.take().expect("piped stdout"));
-        let got = collector.wait_for(budget::FACT_BUDGET, |text| text.contains('\n'));
+        let got = collector.wait_for(fact_budget::FACT_BUDGET, |text| text.contains('\n'));
         child.kill().expect("kill camonitor-rs");
         let _ = child.wait();
         let text = collector.into_text();
@@ -113,5 +113,3 @@ async fn a_missing_timestamp_does_not_swallow_the_value_separator() {
         "NO_ALARM prints two empties"
     );
 }
-
-use common::budget;

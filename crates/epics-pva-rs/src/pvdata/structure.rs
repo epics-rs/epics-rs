@@ -347,7 +347,7 @@ impl PvField {
                 }
                 FieldDesc::Structure {
                     struct_id: s.struct_id.clone(),
-                    fields,
+                    fields: fields.into(),
                 }
             }
             Self::StructureArray(arr) => {
@@ -360,7 +360,7 @@ impl PvField {
                 }
                 FieldDesc::StructureArray {
                     struct_id: first.struct_id.clone(),
-                    fields,
+                    fields: fields.into(),
                 }
             }
             // Sibling variants / per-item selector indices are not

@@ -23,19 +23,6 @@ use epics_pva_rs::codec::PvaCodec;
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
 use serial_test::serial;
 
-/// Allocate two ephemeral UDP ports by binding+dropping. There's a
-/// micro-window where another process could grab them, but for a
-/// single-test loopback scenario the chance is negligible.
-fn alloc_two_ports() -> (u16, u16) {
-    let a = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let b = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let pa = a.local_addr().unwrap().port();
-    let pb = b.local_addr().unwrap().port();
-    drop(a);
-    drop(b);
-    (pa, pb)
-}
-
 struct ChildGuard(Option<Child>);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -43,6 +30,59 @@ impl Drop for ChildGuard {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+/// mshim on `listen_port` forwarding to a receiver this test holds.
+///
+/// The receiver is bound on 0 and kept, so its port is held for the whole
+/// run and handed to mshim as `-F`: no number is guessed on that side. The
+/// listen port is the one number the test has to name, and mshim reports a
+/// lost one itself.
+struct Mshim {
+    guard: ChildGuard,
+    console: tempfile::NamedTempFile,
+    listen_port: u16,
+    receiver: UdpSocket,
+}
+
+impl Mshim {
+    fn start(bin: &str, listen_port: u16, recv_timeout: Duration) -> Mshim {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind receiver");
+        receiver.set_read_timeout(Some(recv_timeout)).unwrap();
+        let forward_port = receiver.local_addr().unwrap().port();
+        let console = tempfile::NamedTempFile::new().expect("console file");
+        let child = Command::new(bin)
+            .arg("-L")
+            .arg(format!("127.0.0.1:{listen_port}"))
+            .arg("-F")
+            .arg(format!("127.0.0.1:{forward_port}"))
+            .stdout(Stdio::null())
+            .stderr(console.reopen().expect("console handle"))
+            .spawn()
+            .expect("spawn mshim-rs");
+        Mshim {
+            guard: ChildGuard(Some(child)),
+            console,
+            listen_port,
+            receiver,
+        }
+    }
+
+    /// mshim's own report that `listen_port` belonged to somebody else:
+    /// `mshim-rs: bind <addr>: Address already in use`, then exit 1.
+    fn lost_its_port(&mut self) -> bool {
+        let exited = self
+            .guard
+            .0
+            .as_mut()
+            .is_some_and(|c| c.try_wait().ok().flatten().is_some());
+        let text = std::fs::read_to_string(self.console.path()).unwrap_or_default();
+        let prefix = format!("mshim-rs: bind 127.0.0.1:{}: ", self.listen_port);
+        exited
+            && text
+                .lines()
+                .any(|l| l.starts_with(&prefix) && l.contains("Address already in use"))
     }
 }
 
@@ -56,27 +96,12 @@ fn mshim_forwards_search_and_drops_unrecognized() {
     // scores an early return as a pass.
     let bin = env!("CARGO_BIN_EXE_mshim-rs");
 
-    let (listen_port, forward_port) = alloc_two_ports();
+    named_port::on_a_named_port(|listen_port| forwards_via(bin, listen_port));
+}
 
-    // Start the receiver socket FIRST so we don't miss the forwarded
-    // packet.
-    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, forward_port)).expect("bind receiver");
-    receiver
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-
-    // Spawn mshim-rs. Inherit stderr so a binding failure surfaces
-    // in the test log instead of silently failing the wait loop.
-    let child = Command::new(bin)
-        .arg("-L")
-        .arg(format!("127.0.0.1:{listen_port}"))
-        .arg("-F")
-        .arg(format!("127.0.0.1:{forward_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn mshim-rs");
-    let _guard = ChildGuard(Some(child));
+/// One run; `None` when mshim could not bind `listen_port`.
+fn forwards_via(bin: &str, listen_port: u16) -> Option<()> {
+    let mut mshim = Mshim::start(bin, listen_port, Duration::from_secs(2));
 
     // Give mshim-rs ≥500ms to bind before the first probe so the
     // initial datagrams aren't tossed at a not-yet-listening port.
@@ -100,9 +125,12 @@ fn mshim_forwards_search_and_drops_unrecognized() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut received = false;
     while Instant::now() < deadline {
+        if mshim.lost_its_port() {
+            return None;
+        }
         sender.send_to(&search, listen_addr).expect("send");
         let mut buf = [0u8; 256];
-        if let Ok((n, _)) = receiver.recv_from(&mut buf) {
+        if let Ok((n, _)) = mshim.receiver.recv_from(&mut buf) {
             let msgs = ForwardableDatagram::decode_all(&buf[..n]);
             assert_eq!(msgs.len(), 1, "forwarded datagram must hold one message");
             assert!(
@@ -115,19 +143,23 @@ fn mshim_forwards_search_and_drops_unrecognized() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    if !received && mshim.lost_its_port() {
+        return None;
+    }
     assert!(received, "mshim-rs did not forward the SEARCH datagram");
 
     // Negative contract: an unrecognized datagram is decoded as nothing
     // and therefore forwarded NOWHERE. mshim is proven up by the positive
     // path above, so a short window with no arrival is conclusive.
-    receiver
+    mshim
+        .receiver
         .set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     sender
         .send_to(b"PVXS-TEST-FRAME", listen_addr)
         .expect("send garbage");
     let mut buf = [0u8; 256];
-    match receiver.recv_from(&mut buf) {
+    match mshim.receiver.recv_from(&mut buf) {
         Ok((n, _)) => panic!(
             "mshim-rs forwarded an unrecognized datagram: {:?}",
             &buf[..n]
@@ -137,6 +169,7 @@ fn mshim_forwards_search_and_drops_unrecognized() {
                 || e.kind() == std::io::ErrorKind::TimedOut => {}
         Err(e) => panic!("unexpected recv error: {e}"),
     }
+    Some(())
 }
 
 /// A single received datagram that chains two SEARCHes (`A || B`) must be
@@ -156,27 +189,16 @@ fn mshim_forwards_search_and_drops_unrecognized() {
 fn mshim_forwards_only_first_chained_message() {
     let bin = env!("CARGO_BIN_EXE_mshim-rs");
 
+    named_port::on_a_named_port(|listen_port| chained_via(bin, listen_port));
+}
+
+/// One run; `None` when mshim could not bind `listen_port`.
+fn chained_via(bin: &str, listen_port: u16) -> Option<()> {
     const PVA_HEADER_SIZE: usize = 8;
     const SEQ_A: u32 = 0x0000_0011;
     const SEQ_B: u32 = 0x0000_0022;
 
-    let (listen_port, forward_port) = alloc_two_ports();
-
-    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, forward_port)).expect("bind receiver");
-    receiver
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-
-    let child = Command::new(bin)
-        .arg("-L")
-        .arg(format!("127.0.0.1:{listen_port}"))
-        .arg("-F")
-        .arg(format!("127.0.0.1:{forward_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn mshim-rs");
-    let _guard = ChildGuard(Some(child));
+    let mut mshim = Mshim::start(bin, listen_port, Duration::from_millis(300));
 
     std::thread::sleep(Duration::from_millis(500));
 
@@ -198,9 +220,12 @@ fn mshim_forwards_only_first_chained_message() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut saw_a = false;
     while Instant::now() < deadline && !saw_a {
+        if mshim.lost_its_port() {
+            return None;
+        }
         sender.send_to(&chained, listen_addr).expect("send chained");
         let mut buf = [0u8; 256];
-        while let Ok((n, _)) = receiver.recv_from(&mut buf) {
+        while let Ok((n, _)) = mshim.receiver.recv_from(&mut buf) {
             if n >= PVA_HEADER_SIZE + 4 {
                 let seq = u32::from_le_bytes(
                     buf[PVA_HEADER_SIZE..PVA_HEADER_SIZE + 4]
@@ -217,6 +242,9 @@ fn mshim_forwards_only_first_chained_message() {
             }
         }
     }
+    if !saw_a && mshim.lost_its_port() {
+        return None;
+    }
     assert!(saw_a, "the first chained SEARCH(A) must be forwarded");
 
     // Final drain: after A is seen, give a B datagram a chance to surface
@@ -224,7 +252,7 @@ fn mshim_forwards_only_first_chained_message() {
     let drain_until = Instant::now() + Duration::from_millis(600);
     let mut buf = [0u8; 256];
     while Instant::now() < drain_until {
-        match receiver.recv_from(&mut buf) {
+        match mshim.receiver.recv_from(&mut buf) {
             Ok((n, _)) if n >= PVA_HEADER_SIZE + 4 => {
                 let seq = u32::from_le_bytes(
                     buf[PVA_HEADER_SIZE..PVA_HEADER_SIZE + 4]
@@ -240,6 +268,7 @@ fn mshim_forwards_only_first_chained_message() {
             Err(_) => {}
         }
     }
+    Some(())
 }
 
 #[test]

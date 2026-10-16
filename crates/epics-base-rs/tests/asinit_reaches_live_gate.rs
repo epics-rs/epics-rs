@@ -45,7 +45,7 @@ async fn script_asinit_lands_in_the_run_config_cell() {
                  live policy cell, not a shell-local copy",
             );
             assert!(
-                policy.uag.contains_key("ops"),
+                policy.uag.contains_key(b"ops".as_slice()),
                 "the cell must hold the script's parsed ACF"
             );
             // The policy is enforceable exactly as the servers will

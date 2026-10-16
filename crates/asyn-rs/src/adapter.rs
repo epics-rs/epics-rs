@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(49): checked, not waived — all 49 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(54): checked, not waived — all 54 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1117/1117). asyn-rs became a census subject when its
+// --all-features`, 1158/1158). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -9,19 +9,22 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::{WriteDone, WriteDoneSource};
 use epics_base_rs::server::device_support::WriteStart;
 use epics_base_rs::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost, WriteCompletion,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
 };
-use epics_base_rs::server::record::{Record, ScanType};
+use epics_base_rs::server::record::{DevSup, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
-use crate::error::{AsynError, AsynStatus};
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
-use crate::interrupt::{InterruptFilter, InterruptSubscription};
-use crate::port::DrvUserRequest;
+use crate::interrupt::{
+    ENUM_ENTRY_BYTES, InterruptFilter, InterruptSubscription, MAX_ENUM_STATES, clamp_enum_table,
+};
+use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
-use crate::request::{RequestOp, RequestResult};
+use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
@@ -307,6 +310,9 @@ impl Int32Mask {
 /// Adapter bridging an asyn-rs PortDriver to epics-base-rs DeviceSupport.
 pub struct AsynDeviceSupport {
     handle: PortHandle,
+    /// The record's one output request on a blocking port — see [`WriteJob`].
+    write_job: Arc<WriteJob>,
+    write_cell: Option<Arc<RequestCell>>,
     addr: i32,
     /// `None` is the link's "wait forever" — see [`AsynLink::timeout`].
     timeout: Option<Duration>,
@@ -324,7 +330,7 @@ pub struct AsynDeviceSupport {
     int32_mask: Option<Int32Mask>,
     last_alarm_status: u16,
     last_alarm_severity: u16,
-    last_ts: Option<SystemTime>,
+    last_ts: Option<epics_base_rs::types::WallTime>,
     /// C `pPvt->lastStatus`: the status of the last record process, so the
     /// `ASYN_TRACE_ERROR` line for a failing read/write prints once per
     /// change of status, not once per scan (devAsynInt32.c:494-500, :519-525).
@@ -415,6 +421,8 @@ pub struct AsynDeviceSupport {
     /// **only** sent on a fresh-entry add (not on overflow
     /// overwrite) so the dbScan queue does not flood.
     interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
+    /// The `interruptAccept` the ring/average callbacks drop on.
+    gate: Arc<RecordGate>,
     /// C `devAsynInt32.c::newOutputCallbackValue` (asyn devEpics, the
     /// `devPvt` flag). Set when a driver-callback readback cycle is armed
     /// (`arm_readback_callback`, mirrors `outputCallbackCallback` setting
@@ -625,6 +633,28 @@ struct CachedInterrupt {
     aux_status: crate::error::AsynStatus,
 }
 
+/// The `interruptAccept` a record's callbacks read: the gate of the database
+/// that bound the record (`bind_interrupt_gate`), or the port's own
+/// `accepting()` while none has. Both reads are lock- and allocation-free;
+/// the callbacks run inline in the driver's notify under a record's hold.
+///
+/// C's callbacks return before the ring push while the gate is closed
+/// (`devAsynInt32.c:545-556`, `:663`; `devAsynOctet.c:526-532`;
+/// `devAsynUInt32Digital.c:449-460`; `devAsynXXXArray.cpp:407-410`).
+struct RecordGate {
+    bound: std::sync::OnceLock<Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>>,
+    port: Arc<crate::interrupt::InterruptManager>,
+}
+
+impl RecordGate {
+    fn open(&self) -> bool {
+        match self.bound.get() {
+            Some(gate) => gate.is_open(),
+            None => self.port.accepting(),
+        }
+    }
+}
+
 /// Per-record ring buffer for I/O Intr callbacks. Mirrors C
 /// `devAsynInt32.c::ringBuffer` + `ringSize` + `ringBufferOverflows`.
 struct InterruptFifo {
@@ -683,7 +713,12 @@ impl AsynDeviceSupport {
     /// Create from a [`PortHandle`].
     pub fn from_handle(handle: PortHandle, link: AsynLink, iface_type: &str) -> Self {
         let iface = InterfaceType::from_asyn_name(iface_type);
+        let gate = Arc::new(RecordGate {
+            bound: std::sync::OnceLock::new(),
+            port: handle.interrupts().clone(),
+        });
         Self {
+            gate,
             handle,
             addr: link.addr,
             timeout: link.timeout,
@@ -719,12 +754,69 @@ impl AsynDeviceSupport {
             enum_shape: None,
             enum_choices: None,
             enum_interrupt_sub: None,
+            write_job: Arc::new(WriteJob::default()),
+            write_cell: None,
         }
+    }
+
+    /// The record's request at process time, queued at C devAsyn's priority
+    /// for its interface: devAsynOctet.c:764 queues at Medium; devAsynInt32
+    /// (:838), devAsynInt64 (:657), devAsynFloat64 (:583), devAsynUInt32Digital
+    /// (:678) and devAsynXXXArray.cpp:295 at Low.
+    fn process_user(&self) -> AsynUser {
+        let priority = match self.iface {
+            Some(InterfaceType::Octet) => QueuePriority::Medium,
+            _ => QueuePriority::Low,
+        };
+        self.request_user(priority)
+    }
+
+    /// The record's request at `init`: C device support reads there through
+    /// SyncIO, whose `queueLockPort` queues at Low (asynManager.c:1896).
+    fn init_user(&self) -> AsynUser {
+        self.request_user(QueuePriority::Low)
+            .locking_port(self.handle.queue_lock_port_timeout())
+    }
+
+    fn request_user(&self, priority: QueuePriority) -> AsynUser {
+        AsynUser::new(self.reason)
+            .with_addr(self.addr)
+            .with_timeout_opt(self.timeout)
+            .with_priority(priority)
     }
 
     /// Create with a typed interface from a [`PortHandle`].
     pub fn with_interface_handle(handle: PortHandle, link: AsynLink, iface: InterfaceType) -> Self {
         Self::from_handle(handle, link, iface.asyn_name())
+    }
+
+    /// The record's output request on this port, made once — at `init`, so the
+    /// first put allocates no more than the next.
+    fn write_cell(&mut self) -> Arc<RequestCell> {
+        match &self.write_cell {
+            Some(cell) if self.handle.owns_cell(cell) => Arc::clone(cell),
+            _ => {
+                let job: Arc<dyn CellBody> = self.write_job.clone();
+                let cell = self.handle.new_cell(job);
+                self.write_cell = Some(Arc::clone(&cell));
+                cell
+            }
+        }
+    }
+
+    /// C `queueRequest` of the output request (devAsynFloat64.c:661): its gate,
+    /// then the link. A write still queued from an earlier put is refused, as
+    /// C refuses an `asynUser` that `isQueued` (asynManager.c:1586-1591).
+    fn queue_write(&mut self, op: RequestOp, user: AsynUser) -> AsynResult<()> {
+        let cell = self.write_cell();
+        self.handle.queue_gate(&user)?;
+        // The port takes this slot before it records or lands a result, so
+        // holding it across the queue keeps the new one from being cleared.
+        let mut slot = self.write_job.request.lock();
+        cell.queue(&user)?;
+        self.write_job.ran.lock().take();
+        *slot = Some((op, user));
+        Ok(())
     }
 
     /// Set the bit mask for UInt32Digital read/write operations.
@@ -1033,20 +1125,62 @@ fn convert_param_array_to_iface(
     }
 }
 
-/// Bridges async `AsyncCompletionHandle` to epics-base-rs `WriteCompletion`.
-struct AsynAsyncWriteCompletion {
-    handle: parking_lot::Mutex<Option<AsyncCompletionHandle>>,
+/// C devAsyn's `processCallbackOutput` request: the record's one `asynUser`,
+/// queued from `process` (devAsynFloat64.c:661). Queued as a [`RequestCell`],
+/// whose queue slot is reserved when the cell is made, so a put on a blocking
+/// port queues its write under the record's hold without allocating.
+#[derive(Default)]
+struct WriteJob {
+    request: parking_lot::Mutex<Option<(RequestOp, AsynUser)>>,
+    /// The write's result while its cell is still queued.
+    ran: parking_lot::Mutex<Option<AsynResult<()>>>,
+    /// The record's completion and its band, C `pPvt->processCallback` and
+    /// `pr->prio`; set by the put that queued the write.
+    reentry:
+        parking_lot::Mutex<Option<(WriteDone, epics_libcom_rs::runtime::task::CallbackPriority)>>,
 }
 
-impl WriteCompletion for AsynAsyncWriteCompletion {
-    fn wait(&self, timeout: Duration) -> CaResult<()> {
-        if let Some(h) = self.handle.lock().take() {
-            match h.wait_blocking(timeout) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(CaError::Protocol(e.to_string())),
+impl WriteJob {
+    fn ran(&self, result: AsynResult<()>) {
+        *self.ran.lock() = Some(result);
+    }
+}
+
+impl CellBody for WriteJob {
+    fn process(&self, port: &mut dyn PortCalls) {
+        let (op, user) = self
+            .request
+            .lock()
+            .take()
+            .expect("a write is queued with its request");
+        self.ran(port.call(op, user).map(|_| ()));
+    }
+
+    fn unrun(&self, why: Unrun) {
+        self.request.lock().take();
+        self.ran(Err(match why {
+            Unrun::Refused(e) => e,
+            // Nothing cancels the write, and its user arms no queue timer:
+            // this is the device-not-connected exit (asynManager.c:878-888).
+            Unrun::TimedOut | Unrun::Canceled => AsynError::QueueTimeout {
+                port: String::new(),
+            },
+        }));
+    }
+
+    /// C `processCallbackOutput`'s last line,
+    /// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)`,
+    /// on the port thread: devAsynInt32.c:526, devAsynInt64.c:418,
+    /// devAsynUInt32Digital.c:434, devAsynFloat64.c:351, devAsynOctet.c:830.
+    /// Under the request slot, so a put queued meanwhile has already cleared
+    /// this request's result rather than receiving it.
+    fn done(self: Arc<Self>) {
+        let _slot = self.request.lock();
+        if let Some(result) = self.ran.lock().take() {
+            if let Some((reentry, prio)) = &*self.reentry.lock() {
+                let _ =
+                    reentry.complete(*prio, result.map_err(|e| CaError::Protocol(e.to_string())));
             }
-        } else {
-            Ok(())
         }
     }
 }
@@ -1122,6 +1256,26 @@ impl EnumRecordShape {
     }
 }
 
+/// The status and `udf` write of the C asyn `init*` function for this record
+/// type and interface, given whether its initial read succeeded.
+fn init_status(record_type: &str, iface_type: &str, read_back: bool) -> DeviceInitOutcome {
+    use epics_base_rs::server::device_support::DeviceUdf::{Defined, Untouched};
+    match (record_type, iface_type) {
+        // initAo (devAsynInt32.c:955-959), initBo, initMbbo: 0 lets the record
+        // convert the RVAL read back, 2 otherwise.
+        ("ao", "asynInt32") | ("bo" | "mbbo", _) if read_back => DeviceInitOutcome::ok(),
+        // devAsynFloat64.c initAo sets VAL and `udf = 0`; initMbboDirect sets
+        // VAL, B0-B15 and `udf = FALSE`; devAsynInt64.c initAo sets VAL only.
+        ("ao", "asynFloat64") | ("mbboDirect", _) if read_back => {
+            DeviceInitOutcome::DoNotConvert(Defined)
+        }
+        ("ao" | "bo" | "mbbo" | "mbboDirect", _) => DeviceInitOutcome::DoNotConvert(Untouched),
+        // initLo/initLLo and devAsynOctet.c initCommon: `udf = 0`, INIT_OK.
+        _ if read_back => DeviceInitOutcome::Ok(Defined),
+        _ => DeviceInitOutcome::ok(),
+    }
+}
+
 /// Build the `(field, value)` list C `setEnums` (devAsynInt32.c:415-435)
 /// writes for `entries` onto a record of the given `shape` — the single
 /// producer shared by init (apply directly to the record) and the runtime
@@ -1177,9 +1331,7 @@ impl AsynDeviceSupport {
             } else {
                 RequestOp::GetBoundsInt32
             };
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.init_user();
             let result = match self.handle.submit_blocking(op, user) {
                 Ok(r) => r,
                 Err(_) => return,
@@ -1504,7 +1656,7 @@ impl AsynDeviceSupport {
 
     /// C `asynPrint(pPvt->pasynUser, …)` from device support: the record's
     /// user is connected to this port and address, so the print resolves the
-    /// device's trace config (`findTracePvt`, asynManager.c:546-551).
+    /// device's trace config (`findTracePvt`, asynManager.c:548-553).
     fn dev_print(
         &self,
         mask: crate::trace::TraceMask,
@@ -1573,9 +1725,7 @@ impl AsynDeviceSupport {
     /// non-blocking branch of `write_begin` end here, so the trace line and
     /// the alarm mapping cannot differ between them.
     fn write_now(&mut self, op: RequestOp, val: &EpicsValue) -> CaResult<()> {
-        let user = AsynUser::new(self.reason)
-            .with_addr(self.addr)
-            .with_timeout_opt(self.timeout);
+        let user = self.process_user();
         match self.handle.submit_blocking(op, user) {
             Ok(_) => {
                 self.trace_process(
@@ -1590,6 +1740,19 @@ impl AsynDeviceSupport {
                 self.trace_process("processCallbackOutput", "write", e.status(), Err(&e));
                 Err(asyn_to_ca_error(e))
             }
+        }
+    }
+
+    /// The RVAL C's dset stores from a raw readback. `asynUInt32Digital`
+    /// (`processBo`, `processMbbiDirect`, …) and the `asynInt32` mbbi/mbbo
+    /// (devAsynInt32.c:1270, :1296, :1311) AND it with the record's MASK; the
+    /// `asynInt32` bi/bo/ao store it as read (:1162, :1187, :1202, :956).
+    fn dset_rval(&self, record: &dyn Record, raw: i32) -> i32 {
+        let masks = self.iface_type == "asynUInt32Digital"
+            || (self.iface_type == "asynInt32" && record.get_field("NOBT").is_some());
+        match record.get_field("MASK") {
+            Some(EpicsValue::ULong(mask)) if masks => raw & mask as i32,
+            _ => raw,
         }
     }
 
@@ -1619,8 +1782,9 @@ impl AsynDeviceSupport {
     ///   convert, which would otherwise recompute RVAL from the stale VAL and
     ///   discard the readback. Outputs: ao (engineering inverse), mbbo/bo/
     ///   mbboDirect (state table / 0-1 / bit map). Inputs: bi (0/1 map,
-    ///   `processBi`), mbbi (mask/shift/state index, `processMbbi`), mbbiDirect
-    ///   (mask/shift/bits, `processMbbiDirect`). The hook is the *device-distinct*
+    ///   `processBi`), mbbi (shift/state index, `processMbbi`), mbbiDirect
+    ///   (shift/bits, `processMbbiDirect`), each given the RVAL from
+    ///   [`Self::dset_rval`]. The hook is the *device-distinct*
     ///   entry — the Soft Channel path stays on `set_val`, so it does not
     ///   collide with a soft-link value write.
     /// - everything else (longin/longout): set VAL directly, return `true`
@@ -1650,7 +1814,7 @@ impl AsynDeviceSupport {
                 // Records own their `raw -> record-value` mapping: ao's
                 // engineering inverse, mbbo/bo/mbboDirect's state-table / 0-1 /
                 // bit map (outputs), and bi's 0/1 map + mbbi's state index +
-                // mbbiDirect's mask/shift/bits (inputs). `apply_raw_readback`
+                // mbbiDirect's shift/bits (inputs). `apply_raw_readback`
                 // stores RVAL and computes VAL, and we return `true` (computed)
                 // so the framework skips the record's forward convert, which
                 // would recompute RVAL from the stale VAL and discard the
@@ -1664,10 +1828,10 @@ impl AsynDeviceSupport {
                 // and `processMbbiDirect` (devAsynUInt32Digital.c:1031) all set
                 // both fields from the callback and return without re-converting.
                 // The hook is iface-agnostic (it uses the record's own
-                // MASK/SHFT/state table), so the one dispatch covers both the
+                // SHFT/state table), so the one dispatch covers both the
                 // asynInt32 and the asynUInt32Digital readback. ai routes via
                 // the ESLO branch below; longin declines (default `false`).
-                if record.apply_raw_readback(raw) {
+                if record.apply_raw_readback(self.dset_rval(record, raw)) {
                     return true;
                 }
                 // asynInt32 ai linear convert: raw -> RVAL, then the framework
@@ -1844,19 +2008,11 @@ impl DeviceSupport for AsynDeviceSupport {
         // before `findInterface`/`drvUser->create`, and it is that call which
         // creates the device on a multi-device port (`locateDevice(..., TRUE)`,
         // asynManager.c:1349-1352) - so `asynReport` counts an address the
-        // moment a record binds to it. C fails the record when the connect
-        // fails (:255-259, `goto bad`); here the connect fails only when the
-        // port's actor is gone.
-        if let Err(e) = self.handle.connect_device_blocking(self.addr) {
-            eprintln!(
-                "[asyn] init FAILED: port='{}' addr={} connectDevice failed, {e}",
-                self.handle.port_name(),
-                self.addr
-            );
-            return Ok(DeviceInitOutcome::dead_with_alarm(
-                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                epics_base_rs::server::record::AlarmSeverity::Invalid,
-            ));
+        // moment a record binds to it. C's failures (:255-259) are a port it
+        // cannot find, and this handle is that port.
+        self.handle.connect_device(self.addr);
+        if self.handle.can_block() {
+            self.write_cell();
         }
         if !self.reason_set {
             // C calls drvUser->create only when the port registered asynDrvUser
@@ -2105,11 +2261,12 @@ impl DeviceSupport for AsynDeviceSupport {
         // an enum table makes EnumRead fail and the record keeps its .db
         // strings.
         if let Some(shape) = EnumRecordShape::of_record(record) {
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
+                    // The table setEnums leaves in the record, which is also
+                    // what a ring slot carries back.
+                    let entries = clamp_enum_table(&entries);
                     self.apply_enum_table(record, &entries);
                     // Capture the shape + table so the runtime callback
                     // (property_post_receiver) can re-propagate on change.
@@ -2122,11 +2279,10 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
+        let mut read_back = false;
         if self.initial_readback {
             if let Some(op) = self.read_op() {
-                let user = AsynUser::new(self.reason)
-                    .with_addr(self.addr)
-                    .with_timeout_opt(self.timeout);
+                let user = self.init_user();
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
                     // Seed the output record's value only on a successful read,
                     // mirroring C initAo/initLongout/initMbbo: `if (status ==
@@ -2151,13 +2307,17 @@ impl DeviceSupport for AsynDeviceSupport {
                             // (C `initAo`, devAsynFloat64.c:628-630) via the
                             // float64 readback hook.
                             let seeded = match val {
-                                EpicsValue::Long(raw) => record.apply_raw_readback(raw),
+                                EpicsValue::Long(raw) => {
+                                    let rval = self.dset_rval(&*record, raw);
+                                    record.apply_raw_readback(rval)
+                                }
                                 EpicsValue::Double(raw) => record.apply_float64_readback(raw),
                                 _ => false,
                             };
                             if !seeded {
                                 let _ = record.set_val(val);
                             }
+                            read_back = true;
                         }
                     }
                 }
@@ -2170,7 +2330,11 @@ impl DeviceSupport for AsynDeviceSupport {
         if self.scan == ScanType::IoIntr {
             self.refresh_average_decimation_threshold(record);
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(init_status(
+            record.record_type(),
+            &self.iface_type,
+            read_back,
+        ))
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -2272,9 +2436,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     self.write_op(&val)
                 };
                 if let Some(op) = op {
-                    let user = AsynUser::new(self.reason)
-                        .with_addr(self.addr)
-                        .with_timeout_opt(self.timeout);
+                    let user = self.process_user();
                     // Apply the write result's alarm, mirroring the read path
                     // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
                     // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
@@ -2379,7 +2541,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     }
                     // Transport success: store the mean and define the
                     // record — C `processAiAverage` ends `pr->rval = rval;
-                    // pr->udf = 0; return 0` (devAsynInt32.c:1082-1085).
+                    // pr->udf = 0; return 0` (devAsynInt32.c:920-922).
                     let wrote_val = self.store_read_value(record, val);
                     return Ok(stored(wrote_val));
                 }
@@ -2387,7 +2549,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     // No samples since the last process. C `processAiAverage`
                     // sets UDF_ALARM/INVALID, sets the record's `udf = 1` and
                     // returns -2 with VAL untouched — devAsynInt32.c:900-904,
-                    // devAsynFloat64.c:721-725, devAsynInt64.c:827-831.
+                    // devAsynFloat64.c:721-725, devAsynInt64.c:829-833.
                     // `undefined()` is that -2: it skips the RVAL→VAL convert
                     // so VAL keeps its previous value, suppresses the framework's
                     // per-cycle UDF re-derive (which `aiRecord.c:161` gates on
@@ -2458,8 +2620,8 @@ impl DeviceSupport for AsynDeviceSupport {
                 // (C devAsynInt32.c:844-847; sample EPICS alarm wins, transport
                 // status fills only NO_ALARM fields). Unconditional, like the
                 // pop/overflow/output_callback_pending/timestamp above and here
-                // — C sets `time` even on a transport error (devAsynXXXArray.c:
-                // 327) and always recGblSetSevr's the mapped alarm.
+                // — C sets `time` even on a transport error
+                // (devAsynXXXArray.cpp:327) and always recGblSetSevr's the mapped alarm.
                 let (status, severity) = resolve_intr_alarm(
                     (ci.alarm_status, ci.alarm_severity),
                     ci.aux_status,
@@ -2467,7 +2629,7 @@ impl DeviceSupport for AsynDeviceSupport {
                 );
                 self.last_alarm_status = status;
                 self.last_alarm_severity = severity;
-                self.last_ts = Some(ci.timestamp);
+                self.last_ts = Some(ci.timestamp.into());
                 // C gates the value store on the transport status:
                 // `if (result.status == asynSuccess) { pr->rval = … } else
                 // return -1` (processAi devAsynInt32.c:844-855; processBo
@@ -2519,9 +2681,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // re-derives UDF.
         let mut read_outcome = DeviceReadOutcome::failed();
         if let Some(op) = self.read_op() {
-            let user = AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout_opt(self.timeout);
+            let user = self.process_user();
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
                     // Gate the value store on the device read status, mirroring
@@ -2552,7 +2712,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
-                    self.last_ts = result.timestamp;
+                    self.last_ts = result.timestamp.map(Into::into);
                 }
                 Err(e) => {
                     // A failed octet read that still transferred bytes hands
@@ -2611,15 +2771,19 @@ impl DeviceSupport for AsynDeviceSupport {
         &self.iface_type
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
         if self.last_alarm_status == 0 && self.last_alarm_severity == 0 {
             None
         } else {
-            Some((self.last_alarm_status, self.last_alarm_severity))
+            Some(DeviceAlarm {
+                stat: self.last_alarm_status,
+                sevr: self.last_alarm_severity,
+                msg: "",
+            })
         }
     }
 
-    fn last_timestamp(&self) -> Option<SystemTime> {
+    fn last_timestamp(&self) -> Option<epics_base_rs::types::WallTime> {
         self.last_ts
     }
 
@@ -2662,7 +2826,11 @@ impl DeviceSupport for AsynDeviceSupport {
         }
     }
 
-    fn write_begin(&mut self, record: &mut dyn Record) -> CaResult<WriteStart> {
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
         // Same raw-output anchor as the synchronous write() — the async path
         // (blocking ports, e.g. motors) must not bypass the RVAL/OVAL anchor.
         let val = match self.device_output_value(record) {
@@ -2686,13 +2854,25 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(WriteStart::Completed);
         }
 
-        let user = AsynUser::new(self.reason)
-            .with_addr(self.addr)
-            .with_timeout_opt(self.timeout);
-        let completion = self.handle.try_submit(op, user).map_err(asyn_to_ca_error)?;
-        Ok(WriteStart::Pending(Box::new(AsynAsyncWriteCompletion {
-            handle: parking_lot::Mutex::new(Some(completion)),
-        })))
+        {
+            let mut reentry = self.write_job.reentry.lock();
+            match &mut *reentry {
+                Some((_, prio)) => *prio = done.priority(),
+                None => *reentry = Some((done.write_done(), done.priority())),
+            }
+        }
+        let user = self.process_user();
+        self.queue_write(op, user).map_err(asyn_to_ca_error)?;
+        Ok(WriteStart::Pending)
+    }
+
+    /// The record's own database: the ring drops while it is closed. The
+    /// port's flush and its seed follow the port's owner, not this gate.
+    fn bind_interrupt_gate(
+        &mut self,
+        gate: &Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
+    ) {
+        let _ = self.gate.bound.set(gate.clone());
     }
 
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
@@ -2816,11 +2996,15 @@ impl DeviceSupport for AsynDeviceSupport {
             if self.scan == ScanType::IoIntr {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 let fifo = self.interrupt_fifo.clone();
+                let gate = self.gate.clone();
                 let sub = self
                     .handle
                     .interrupts()
                     .register_sync_callback(filter, move |iv| {
                         use std::sync::atomic::Ordering;
+                        if !gate.open() {
+                            return;
+                        }
                         let sample = match &iv.value {
                             crate::param::ParamValue::Int32(v) => {
                                 Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
@@ -2887,10 +3071,14 @@ impl DeviceSupport for AsynDeviceSupport {
             // once any sample is non-success the period stays a transport error
             // (asynSuccess == 0, so the OR is sticky). Return None: no
             // per-callback reprocess wakeup (the record scans on its own period).
+            let gate = self.gate.clone();
             let sub = self
                 .handle
                 .interrupts()
                 .register_sync_callback(filter, move |iv| {
+                    if !gate.open() {
+                        return;
+                    }
                     let sample = match &iv.value {
                         crate::param::ParamValue::Int32(v) => {
                             Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
@@ -2948,10 +3136,14 @@ impl DeviceSupport for AsynDeviceSupport {
         // scanIoRequest wakeup that setup_io_intr() consumes.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let fifo = self.interrupt_fifo.clone();
+        let gate = self.gate.clone();
         let sub = self
             .handle
             .interrupts()
             .register_sync_callback(filter, move |iv| {
+                if !gate.open() {
+                    return;
+                }
                 // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
@@ -3103,7 +3295,18 @@ impl DeviceSupport for AsynDeviceSupport {
             // filter.
             iface: Some(crate::interfaces::InterfaceType::Enum),
         };
-        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
+        // C's enum callbacks return before `setEnums` and the DBE_PROPERTY
+        // post while `interruptAccept` is false (devAsynInt32.c:718/:732/
+        // :746/:760, devAsynUInt32Digital.c:553/:567/:581/:595): the table
+        // is dropped, and the next one after the gate opens is applied. The
+        // gate is read when the callback fires, in the mailbox write, not
+        // when the task below drains it.
+        let gate = self.gate.clone();
+        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user_when(
+            filter,
+            MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
+            move || gate.open(),
+        );
         self.enum_interrupt_sub = Some(sub);
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -3253,7 +3456,9 @@ pub fn universal_asyn_factory(
     // instead of binding a dset the record type never calls (a calcout
     // never invokes write(), so the record loaded, computed OVAL and wrote
     // nothing to the driver).
-    if !asyn_device_menu(ctx.record_type).is_some_and(|menu| menu.contains(&ctx.dtyp)) {
+    if !asyn_device_menu(ctx.record_type)
+        .is_some_and(|menu| menu.iter().any(|row| row.choice == ctx.dtyp))
+    {
         return None;
     }
 
@@ -3430,8 +3635,8 @@ pub fn register_asyn_device_support(
 /// call suffices for every IOC in the process.
 pub fn register_asyn_device_menus() {
     for &record_type in ASYN_DEVICE_MENU_RECORD_TYPES {
-        if let Some(choices) = asyn_device_menu(record_type) {
-            epics_base_rs::server::record::register_device_menu(record_type, choices);
+        if let Some(rows) = asyn_device_menu(record_type) {
+            epics_base_rs::server::record::register_device_menu(record_type, rows);
         }
     }
 }
@@ -3460,12 +3665,19 @@ static ASYN_DEVICE_MENU_RECORD_TYPES: &[&str] = &{
 /// "asynInt32")`), so it is added here rather than in the generated table.
 /// The binding itself is the universal factory + the unconditional readback
 /// forced in `init` (devBusyAsyn.c parity).
-fn asyn_device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+fn asyn_device_menu(record_type: &str) -> Option<&'static [DevSup]> {
     if record_type == "busy" {
-        return Some(&["asynInt32"]);
+        return Some(BUSY_DEVICES);
     }
-    crate::dbd_generated::device_menu(record_type)
+    crate::dbd_generated::devices(record_type)
 }
+
+static BUSY_DEVICES: &[DevSup] = &[DevSup {
+    name: "asynBusyInt32",
+    choice: "asynInt32",
+    link_type: epics_base_rs::server::record::DbLinkType::InstIo,
+    dset: crate::dsets::ASYNBUSYINT32,
+}];
 
 /// IocBuilder companion to [`register_asyn_device_support`] —
 /// installs the universal asyn factory on the pure-Rust build path
@@ -3486,7 +3698,54 @@ pub fn register_asyn_device_support_for_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port_actor::ActorId;
+    use crate::port_actor::ActorLink;
+
+    /// C asyn `init*` status per output record: 0 (convert) only where the
+    /// dset returns it after a successful read back, 2 on every miss.
+    #[test]
+    fn init_status_matches_c_asyn_init_return() {
+        use epics_base_rs::server::device_support::DeviceUdf::{Defined, Untouched};
+        let ok = DeviceInitOutcome::ok();
+        let no_convert = DeviceInitOutcome::DoNotConvert(Untouched);
+        let cases = [
+            ("ao", "asynInt32", true, ok),
+            (
+                "ao",
+                "asynFloat64",
+                true,
+                DeviceInitOutcome::DoNotConvert(Defined),
+            ),
+            ("ao", "asynInt64", true, no_convert),
+            ("bo", "asynUInt32Digital", true, ok),
+            ("mbbo", "asynInt32", true, ok),
+            (
+                "mbboDirect",
+                "asynUInt32Digital",
+                true,
+                DeviceInitOutcome::DoNotConvert(Defined),
+            ),
+            ("ao", "asynInt32", false, no_convert),
+            ("bo", "asynInt32", false, no_convert),
+            ("mbbo", "asynUInt32Digital", false, no_convert),
+            ("mbboDirect", "asynInt32", false, no_convert),
+            ("longout", "asynInt32", true, DeviceInitOutcome::Ok(Defined)),
+            (
+                "stringout",
+                "asynOctetWrite",
+                true,
+                DeviceInitOutcome::Ok(Defined),
+            ),
+            ("longout", "asynInt32", false, ok),
+            ("ai", "asynInt32", false, ok),
+        ];
+        for (rtype, iface, read_back, want) in cases {
+            assert_eq!(
+                init_status(rtype, iface, read_back),
+                want,
+                "{rtype} {iface} {read_back}"
+            );
+        }
+    }
 
     /// The generated asyn device menus match the C `asyn.dbd` load, in the exact
     /// order (the DTYP index is wire-visible): `mbbo` gets `asynInt32` then
@@ -3919,14 +4178,14 @@ mod tests {
         // interface; a UInt32Digital adapter keeps the raw mask, no nbits.
         // No submit happens here, so the channels need no actor.
         let mk_handle = |name: &str| {
-            let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let interrupts = Arc::new(InterruptManager::new());
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             (
                 PortHandle::new(
                     tx,
                     name.into(),
                     interrupts,
-                    ActorId::new(),
+                    ActorLink::unowned(),
                     std::sync::Arc::new(crate::trace::TraceManager::new()),
                 ),
                 _rx,
@@ -3955,13 +4214,13 @@ mod tests {
     fn result_to_value_masks_and_sign_extends_int32() {
         // The polled read path (result_to_value) must apply the nbits mask +
         // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -3991,13 +4250,13 @@ mod tests {
         use epics_base_rs::server::records::int64in::Int64inRecord;
         use epics_base_rs::server::records::longin::LonginRecord;
 
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4045,13 +4304,13 @@ mod tests {
     fn io_intr_masks_and_sign_extends_int32_like_the_polled_read() {
         use crate::param::ParamValue;
 
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = PortHandle::new(
             tx,
             "p".into(),
             interrupts,
-            ActorId::new(),
+            ActorLink::unowned(),
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4194,10 +4453,10 @@ mod tests {
 
     fn make_bounded_adapter(low: i32, high: i32, iface: &str) -> AsynDeviceSupport {
         let driver = BoundedPort::new(low, high);
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-bounds-actor".into())
             .spawn(move || actor.run())
@@ -4206,7 +4465,7 @@ mod tests {
             tx,
             "test_bounds".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4220,12 +4479,62 @@ mod tests {
         ads
     }
 
+    /// C devAsyn queues a record's process-time request at Low for every
+    /// interface but asynOctet (devAsynOctet.c:764, Medium), and reads at init
+    /// through `queueLockPort` at Low (asynManager.c:1896).
+    #[test]
+    fn device_support_queues_at_the_c_dsets_priority() {
+        for (iface, process) in [
+            ("asynInt32", QueuePriority::Low),
+            ("asynInt64", QueuePriority::Low),
+            ("asynFloat64", QueuePriority::Low),
+            ("asynUInt32Digital", QueuePriority::Low),
+            ("asynInt32Array", QueuePriority::Low),
+            ("asynFloat64Array", QueuePriority::Low),
+            ("asynOctet", QueuePriority::Medium),
+        ] {
+            let ads = make_bounded_adapter(0, 0, iface);
+            assert_eq!(ads.process_user().priority, process, "{iface} at process");
+            assert_eq!(
+                ads.init_user().priority,
+                QueuePriority::Low,
+                "{iface} at init"
+            );
+        }
+    }
+
+    /// The dset, not the record, applies MASK to a readback: asynInt32 bo
+    /// stores the read raw (devAsynInt32.c:1187), asynInt32 mbbi and every
+    /// asynUInt32Digital record AND it (:1296, devAsynUInt32Digital.c).
+    #[test]
+    fn readback_mask_is_the_dsets() {
+        use epics_base_rs::server::records::{bo::BoRecord, mbbi::MbbiRecord};
+
+        let mut ads = make_adapter(ScanType::Passive);
+        let mut bo = BoRecord::new(0);
+        bo.mask = 0x04;
+        assert!(ads.store_read_value(&mut bo, EpicsValue::Long(0x02)));
+        assert_eq!((bo.rval, bo.val), (0x02, 1), "asynInt32 bo keeps the raw");
+
+        let mut mbbi = MbbiRecord::new(0);
+        mbbi.nobt = 4;
+        mbbi.mask = 0x0F;
+        assert!(ads.store_read_value(&mut mbbi, EpicsValue::Long(0x32)));
+        assert_eq!(mbbi.rval, 0x02, "asynInt32 mbbi masks");
+
+        ads.set_iface_type("asynUInt32Digital");
+        let mut bo = BoRecord::new(0);
+        bo.mask = 0x04;
+        assert!(ads.store_read_value(&mut bo, EpicsValue::Long(0x02)));
+        assert_eq!((bo.rval, bo.val), (0, 0), "asynUInt32Digital bo masks");
+    }
+
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-adapter-actor".into())
             .spawn(move || actor.run())
@@ -4234,7 +4543,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
 
@@ -4264,10 +4573,10 @@ mod tests {
             .params
             .set_param_status(0, 0, status, 0, 0)
             .unwrap();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-seeded-actor".into())
             .spawn(move || actor.run())
@@ -4276,7 +4585,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4298,10 +4607,10 @@ mod tests {
     /// gate in production); the port is never read by the average path.
     fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-average-actor".into())
             .spawn(move || actor.run())
@@ -4310,7 +4619,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4342,10 +4651,10 @@ mod tests {
     /// shape the factory produces for `asynXxxTimeSeries`.
     fn make_timeseries_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-ts-actor".into())
             .spawn(move || actor.run())
@@ -4354,7 +4663,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4736,7 +5045,7 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
         let mut ads = make_timeseries_adapter("asynInt32");
         let mut rec = WaveformRecord::new(4, DbFieldType::Long);
-        assert_eq!(ads.init(&mut rec).unwrap(), DeviceInitOutcome::Live);
+        assert_eq!(ads.init(&mut rec).unwrap(), DeviceInitOutcome::ok());
         assert!(
             ads.time_series
                 .as_ref()
@@ -4759,10 +5068,10 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("ts-factory-actor".into())
             .spawn(move || actor.run())
@@ -4771,10 +5080,11 @@ mod tests {
             tx,
             "ts_factory".into(),
             interrupts,
-            actor_id,
+            actor_link,
             Arc::new(crate::trace::TraceManager::new()),
         );
-        crate::asyn_record::register_port("ts_factory", handle).unwrap();
+        crate::asyn_record::register_port("ts_factory", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -4813,10 +5123,10 @@ mod tests {
     /// interface with the given record `@asynMask`.
     fn make_uint32_io_intr_adapter(mask: u32) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-u32-actor".into())
             .spawn(move || actor.run())
@@ -4825,7 +5135,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -4838,6 +5148,14 @@ mod tests {
             AsynDeviceSupport::from_handle(handle, link, "asynUInt32Digital").with_mask(mask);
         ads.set_record_info("TEST:U32", ScanType::IoIntr);
         ads
+    }
+
+    /// An open database gate the test binds to its record (`bind_interrupt_gate`
+    /// is what `iocInit` does): the callbacks drop before `interruptAccept`
+    /// (C parity), and a record with no gate reads its port's owner, which a
+    /// hand-built port has none of.
+    fn open_gate() -> Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate> {
+        epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened()
     }
 
     /// Poll the interrupt FIFO until an entry arrives (bridge runs on a
@@ -4856,11 +5174,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_intr_uint32_masks_delivered_value_to_record_mask() {
+        let gate = open_gate();
         // C uint32Callback delivers `pInterrupt->mask & value`
         // (asynPortDriver.cpp:729); the @asynMask=0x0F record must see
         // a 0xFF param value masked to 0x0F, matching the polled read.
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut ads = make_uint32_io_intr_adapter(0x0F);
+        ads.bind_interrupt_gate(&gate);
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -4888,12 +5208,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_intr_uint32_gates_out_non_overlapping_change() {
+        let gate = open_gate();
         // C uint32Callback fires only when `pInterrupt->mask &
         // interruptMask` (asynPortDriver.cpp:720): a change confined to
         // bits outside the @asynMask=0x0F record (changed=0xF0) must be
         // gated out, while an overlapping change still arrives.
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut ads = make_uint32_io_intr_adapter(0x0F);
+        ads.bind_interrupt_gate(&gate);
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -4935,11 +5257,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_intr_non_uint32_not_gated_by_default_mask() {
+        let gate = open_gate();
         // Guard: the default 0xFFFFFFFF mask must NOT gate a non-UInt32
         // interrupt (uint32_changed_mask == 0). An asynInt32 I/O-Intr
         // record must receive its interrupt unchanged.
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut ads = make_adapter(ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -4964,6 +5288,188 @@ mod tests {
         );
     }
 
+    /// C `interruptCallbackInput` returns before the ring push while
+    /// `interruptAccept` is false (devAsynInt32.c:556): a callback before
+    /// the database runs leaves the ring empty and queues no wakeup, and the
+    /// same callback after it rings once.
+    /// C's average callbacks return before accumulating while `interruptAccept`
+    /// is false (devAsynInt32.c:545-556, `:663`): a sample fired before the
+    /// gate opens is dropped, not averaged, in both modes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_average_sample_before_the_gate_opens_is_dropped_in_both_modes() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        for mode1 in [false, true] {
+            let gate = InterruptGate::new();
+            let mut ads = make_average_adapter("asynInt32");
+            ads.bind_interrupt_gate(&gate);
+            if mode1 {
+                ads.set_record_info("TEST:AVG", ScanType::IoIntr);
+            }
+            let mut rec = AiRecord::new(0.0);
+            rec.sval = 4.0;
+            ads.init(&mut rec).unwrap();
+            let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
+            let acc = ads.average.clone().unwrap();
+            let fifo = ads.interrupt_fifo.clone();
+            let _rx = ads.io_intr_receiver();
+            let fire = |vals: &[i32]| {
+                for v in vals {
+                    interrupts.notify(InterruptValue {
+                        reason,
+                        addr: 0,
+                        value: crate::param::ParamValue::Int32(*v),
+                        timestamp: SystemTime::now(),
+                        ..Default::default()
+                    });
+                }
+            };
+
+            fire(&[10, 20, 30, 40]);
+            assert_eq!(acc.averager.count(), 0, "mode1={mode1}: closed: dropped");
+            assert!(fifo.lock().unwrap().pop().is_none(), "mode1={mode1}");
+
+            gate.set(true);
+            fire(&[10, 20, 30, 40]);
+            if mode1 {
+                let v = await_fifo_value(&fifo).await;
+                assert!(
+                    matches!(v, crate::param::ParamValue::Int32(25)),
+                    "open: the four samples average into the ring, got {v:?}"
+                );
+            } else {
+                assert_eq!(acc.averager.count(), 4, "open: averaged");
+            }
+        }
+    }
+
+    /// C's enum callbacks return before `setEnums` and the DBE_PROPERTY post
+    /// while `interruptAccept` is false (devAsynInt32.c:718/:732/:746/:760,
+    /// devAsynUInt32Digital.c:553/:567/:581/:595). The gate is read when the
+    /// callback fires: on a current-thread runtime the consumer task cannot
+    /// drain before the gate opens, so a drain-time read would post it.
+    #[tokio::test]
+    async fn an_enum_table_before_the_gate_opens_is_not_applied_or_posted() {
+        use crate::interrupt::InterruptValue;
+        use crate::param::{EnumEntry, ParamValue};
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+        let gate = InterruptGate::new();
+        let init: Arc<[EnumEntry]> =
+            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
+        let mut ads = make_enum_adapter(init);
+        ads.bind_interrupt_gate(&gate);
+        let mut rec = MbbiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let mut rx = ads.property_post_receiver().expect("armed");
+        let table: Arc<[EnumEntry]> =
+            Arc::from(vec![enum_entry("LOW", 0, 0), enum_entry("HIGH", 1, 1)]);
+        let (reason, addr, interrupts) = (ads.reason, ads.addr, ads.handle.interrupts().clone());
+        let fire = || {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr,
+                value: ParamValue::Enum {
+                    index: 0,
+                    choices: table.clone(),
+                },
+                ..Default::default()
+            });
+        };
+
+        fire();
+        gate.set(true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "fired closed, drained open: the table is not posted"
+        );
+
+        fire();
+        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("open: the table is applied and posted")
+            .expect("channel open");
+        assert_eq!(post.post_field, "VAL");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callback_before_the_records_gate_opens_leaves_the_ring_empty() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        let gate = InterruptGate::new();
+        let mut ads = make_uint32_io_intr_adapter(0xFF);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.bind_interrupt_gate(&gate);
+        let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
+        let fifo = ads.interrupt_fifo.clone();
+        let mut rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let fire = |v: u32| {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::UInt32Digital(v),
+                timestamp: SystemTime::now(),
+                uint32_changed_mask: 0x01,
+                ..Default::default()
+            });
+        };
+
+        fire(1);
+        assert!(fifo.lock().unwrap().entries.is_empty(), "closed: no push");
+        assert!(rx.try_recv().is_err(), "closed: no wakeup");
+
+        gate.set(true);
+        fire(2);
+        assert_eq!(fifo.lock().unwrap().entries.len(), 1, "open: one entry");
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "open: one wakeup");
+    }
+
+    /// Two records of two databases on one port: A's gate closed, B's open.
+    /// A's callback leaves A's ring empty; B's delivers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_database_drops_its_records_callback_while_the_other_delivers() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        let (gate_a, gate_b) = (InterruptGate::new(), InterruptGate::opened());
+        let mut a = make_uint32_io_intr_adapter(0xFF);
+        let mut b = AsynDeviceSupport::from_handle(
+            a.handle.clone(),
+            AsynLink {
+                port_name: "test".into(),
+                addr: 0,
+                timeout: Some(Duration::from_secs(1)),
+                drv_info: "VAL".into(),
+            },
+            "asynUInt32Digital",
+        )
+        .with_mask(0xFF);
+        b.set_record_info("TEST:U32B", ScanType::IoIntr);
+        a.init(&mut LonginRecord::new(0)).unwrap();
+        b.init(&mut LonginRecord::new(0)).unwrap();
+        a.bind_interrupt_gate(&gate_a);
+        b.bind_interrupt_gate(&gate_b);
+        let interrupts = a.handle.interrupts().clone();
+        let (reason, fifo_a, fifo_b) =
+            (a.reason, a.interrupt_fifo.clone(), b.interrupt_fifo.clone());
+        let _rx_a = a.io_intr_receiver().expect("A receiver");
+        let _rx_b = b.io_intr_receiver().expect("B receiver");
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::UInt32Digital(7),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0x01,
+            ..Default::default()
+        });
+        assert!(fifo_a.lock().unwrap().entries.is_empty(), "A is closed");
+        assert_eq!(fifo_b.lock().unwrap().entries.len(), 1, "B is open");
+    }
+
     /// C `interruptCallbackInput` (devAsynInt32.c:564-576): every callback
     /// the record has not processed yet sits in the ring, in order, and only
     /// a full ring drops one - counted in `overflows`. The mailbox that used
@@ -4971,8 +5477,10 @@ mod tests {
     /// record-process and dropped the rest without a count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn io_intr_rings_every_callback_before_the_record_reads() {
+        let gate = open_gate();
         use epics_base_rs::server::records::longin::LonginRecord;
         let mut ads = make_uint32_io_intr_adapter(0xFF);
+        ads.bind_interrupt_gate(&gate);
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -5338,8 +5846,10 @@ mod tests {
     /// (LINR=NO_CONVERSION). The drain resets the accumulator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_int32_drains_rounded_mean_to_rval_and_resets() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynInt32");
+        ads.bind_interrupt_gate(&gate);
         let mut rec = AiRecord::new(0.0);
         rec.linr = 0; // NO_CONVERSION: VAL == RVAL after convert
         ads.init(&mut rec).unwrap();
@@ -5396,8 +5906,10 @@ mod tests {
     /// leave the mean unscaled. The drain resets the accumulator.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_float64_drains_mean_to_val_and_resets() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynFloat64");
+        ads.bind_interrupt_gate(&gate);
         let mut rec = AiRecord::new(0.0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -5452,7 +5964,7 @@ mod tests {
             "zero-samples skips the convert so VAL is not overwritten from RVAL"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -5475,8 +5987,10 @@ mod tests {
     /// (recGblSetSevr, :915-918). A COMM/INVALID sample must surface on read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_propagates_last_sample_driver_alarm() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynFloat64");
+        ads.bind_interrupt_gate(&gate);
         let mut rec = AiRecord::new(0.0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -5497,7 +6011,7 @@ mod tests {
 
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 3)),
             "the sample's driver alarm (COMM/INVALID) must propagate on read"
         );
@@ -5511,8 +6025,10 @@ mod tests {
     /// reset before the status check), so the next read sees no samples.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_transport_error_discards_value_and_raises_mapped_alarm() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynFloat64");
+        ads.bind_interrupt_gate(&gate);
         let mut rec = AiRecord::new(42.0); // pre-existing VAL
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -5545,7 +6061,7 @@ mod tests {
             "transport error must discard the averaged value (VAL stays stale), got {val}"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((10, 3)),
             "transport Timeout must map to TIMEOUT_ALARM/INVALID"
         );
@@ -5560,7 +6076,7 @@ mod tests {
         let outcome2 = ads.read(&mut rec).unwrap();
         assert!(outcome2.did_compute());
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -5576,8 +6092,10 @@ mod tests {
     /// while the transport error still gates the store off.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_sample_epics_alarm_wins_over_transport_mapping() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynFloat64");
+        ads.bind_interrupt_gate(&gate);
         let mut rec = AiRecord::new(42.0);
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
@@ -5599,7 +6117,7 @@ mod tests {
 
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 2)),
             "the sample's EPICS alarm (COMM/MAJOR) must win over the transport Timeout mapping"
         );
@@ -5623,8 +6141,10 @@ mod tests {
     /// per-decimation reprocess wakeup (`io_intr_receiver` → `Some`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_mode1_io_intr_decimates_every_sval_samples_into_ring() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynInt32");
+        ads.bind_interrupt_gate(&gate);
         ads.set_record_info("TEST:AVG", ScanType::IoIntr); // Mode 1
         let mut rec = AiRecord::new(0.0);
         rec.sval = 4.0; // numToAverage = round(4.0) = 4
@@ -5682,8 +6202,10 @@ mod tests {
     /// SVAL=0 every single sample decimates (the mean of one sample is itself).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_mode1_sval_below_one_floors_to_one_sample() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynInt32");
+        ads.bind_interrupt_gate(&gate);
         ads.set_record_info("TEST:AVG", ScanType::IoIntr);
         let mut rec = AiRecord::new(0.0);
         rec.sval = 0.0; // round(0.0) = 0 → floored to 1
@@ -5714,8 +6236,10 @@ mod tests {
     /// entry's status: only the triggering (4th) sample's status rides the ring.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_mode1_decimated_entry_carries_triggering_sample_status() {
+        let gate = open_gate();
         use epics_base_rs::server::records::ai::AiRecord;
         let mut ads = make_average_adapter("asynInt32");
+        ads.bind_interrupt_gate(&gate);
         ads.set_record_info("TEST:AVG", ScanType::IoIntr);
         let mut rec = AiRecord::new(0.0);
         rec.sval = 4.0;
@@ -5811,10 +6335,10 @@ mod tests {
         base.set_enum_choices_param(0, 0, choices).unwrap();
         let driver = EnumPort { base };
 
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-enum-actor".into())
             .spawn(move || actor.run())
@@ -5823,7 +6347,7 @@ mod tests {
             tx,
             "test_enum".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -5988,6 +6512,68 @@ mod tests {
         assert_eq!(get("OSV"), Some(EpicsValue::Short(1)));
     }
 
+    /// C `setEnums` keeps 16 states of 25-byte strings (devAsynInt32.c:65-66),
+    /// so a driver table past either limit equals what the ring carries back:
+    /// a value-only interrupt posts nothing, and a real change still does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_driver_table_past_the_setenums_limits_posts_nothing_on_a_value_change() {
+        use crate::interrupt::InterruptValue;
+        use crate::param::{EnumEntry, ParamValue};
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+        let long = "A_VERY_LONG_STATE_NAME_OF_THIRTY";
+        let mut table = vec![enum_entry(long, 0, 0), enum_entry("ON", 1, 0)];
+        for i in 2..30 {
+            table.push(enum_entry(&format!("S{i}"), i, 0));
+        }
+        let table: Arc<[EnumEntry]> = Arc::from(table);
+        let mut ads = make_enum_adapter(table.clone());
+        let gate = open_gate();
+        ads.bind_interrupt_gate(&gate);
+        let mut rec = MbbiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let mut rx = ads.property_post_receiver().expect("armed");
+
+        let notify = |ads: &AsynDeviceSupport, index, choices: Arc<[EnumEntry]>| {
+            ads.handle.interrupts().notify(InterruptValue {
+                reason: ads.reason,
+                addr: ads.addr,
+                value: ParamValue::Enum { index, choices },
+                ..Default::default()
+            });
+        };
+        notify(&ads, 1, table.clone());
+        // The mailbox keeps the latest value, so let the receiver drain this
+        // one before the change replaces it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a value-only interrupt posts no DBE_PROPERTY"
+        );
+        let changed: Arc<[EnumEntry]> = Arc::from(vec![enum_entry("LOW", 0, 0)]);
+        notify(&ads, 0, changed);
+        // The value-only interrupt was consumed before the change arrived; a
+        // coalesce would mean the change replaced it unread and the silence
+        // above proved nothing.
+        assert_eq!(
+            ads.handle.interrupts().coalesce_count(),
+            0,
+            "the value-only interrupt must be drained before the change"
+        );
+        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the table change posts")
+            .expect("channel open");
+        assert!(
+            post.writes
+                .iter()
+                .any(|(f, v)| f == "ZRST" && *v == EpicsValue::String("LOW".into())),
+            "the first post is the real change, not the value-only interrupt: {:?}",
+            post.writes
+        );
+    }
+
     /// Runtime asynEnum re-propagation: after init captures the table, a
     /// driver enum-table change delivered through the interrupt path must
     /// surface on the `property_post_receiver` channel as the new mbb field
@@ -6003,6 +6589,8 @@ mod tests {
         let init_choices: Arc<[EnumEntry]> =
             Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
         let mut ads = make_enum_adapter(init_choices.clone());
+        let gate = open_gate();
+        ads.bind_interrupt_gate(&gate);
         let mut rec = MbbiRecord::new(0);
         ads.init(&mut rec).unwrap();
 
@@ -6309,10 +6897,10 @@ mod tests {
             let mut base = PortDriverBase::new("capport", 1, PortFlags::default());
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
-            let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let interrupts = Arc::new(InterruptManager::new());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("cap-actor".into())
                 .spawn(move || actor.run())
@@ -6321,7 +6909,7 @@ mod tests {
                 tx,
                 "capport".into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 std::sync::Arc::new(crate::trace::TraceManager::new()),
             );
             let link = AsynLink {
@@ -6423,9 +7011,84 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"HELLO".to_vec().into())),
+            Some(EpicsValue::CharArray(b"HELLO\0".to_vec().into())),
             "the record is bound and reads from the transport"
         );
+    }
+
+    /// C devAsyn queues its output on the record's own `asynUser`, which
+    /// `queueRequest` links onto the port queue without allocating
+    /// (asynManager.c:1605-1628), and requests the record's `processCallback`
+    /// it made at init (devAsynFloat64.c:351). A put on a blocking port queues
+    /// and completes the same way: nothing past the first put allocates.
+    #[test]
+    fn a_put_on_a_blocking_port_queues_its_write_without_allocating() {
+        epics_libcom_rs::runtime::task::test_ioc_thread(|| {
+            use crate::asyn_record::errs_alloc_tests::thread_allocs;
+            use crate::param::ParamType;
+            use crate::runtime::{RuntimeConfig, create_port_runtime};
+            use epics_base_rs::server::records::ao::AoRecord;
+
+            struct Port(PortDriverBase);
+            impl PortDriver for Port {
+                fn base(&self) -> &PortDriverBase {
+                    &self.0
+                }
+                fn base_mut(&mut self) -> &mut PortDriverBase {
+                    &mut self.0
+                }
+            }
+
+            let mut base = PortDriverBase::new(
+                "WRITEALLOC",
+                1,
+                PortFlags {
+                    can_block: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.create_param("VAL", ParamType::Float64).unwrap();
+            let (rt, _jh) = create_port_runtime(Port(base), RuntimeConfig::default()).unwrap();
+            let link = AsynLink {
+                port_name: "WRITEALLOC".into(),
+                addr: 0,
+                timeout: Some(Duration::from_secs(1)),
+                drv_info: "VAL".into(),
+            };
+            let mut ads =
+                AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynFloat64");
+            ads.set_record_info("TEST:WRITEALLOC", ScanType::Passive);
+            let mut rec = AoRecord::new(1.5);
+            ads.init(&mut rec).unwrap();
+
+            let db = epics_base_rs::server::database::PvDatabase::new();
+            let cell = WriteDone::new(&db, "TEST:WRITEALLOC".into(), 0);
+            let source = WriteDoneSource::new(&cell);
+            let mut put = || {
+                let before = thread_allocs();
+                let start = ads.write_begin(&mut rec, &source).unwrap();
+                let allocs = thread_allocs() - before;
+                assert!(
+                    matches!(start, WriteStart::Pending),
+                    "a blocking port queues the write"
+                );
+                // Queued behind the write at its band: back once the write ran
+                // and its cell is free for the next put.
+                rt.port_handle()
+                    .submit_blocking(
+                        RequestOp::Float64Read,
+                        AsynUser::new(0).with_priority(QueuePriority::Low),
+                    )
+                    .unwrap();
+                allocs
+            };
+            assert_eq!(
+                put(),
+                0,
+                "the record's cell is built at add_record, not by a put"
+            );
+            assert_eq!(put(), 0, "a put after the first allocates nothing");
+        });
     }
 
     /// R11-48 negative control: on a port that DOES register asynDrvUser, an
@@ -6515,10 +7178,10 @@ mod tests {
                 base: PortDriverBase::new("ondemand", 1, PortFlags::default()),
                 binds: Arc::clone(&binds),
             };
-            let interrupts = Arc::new(InterruptManager::new(256));
-            let (tx, rx) = tokio::sync::mpsc::channel(256);
+            let interrupts = Arc::new(InterruptManager::new());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(Box::new(driver), rx);
-            let actor_id = actor.id();
+            let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("ondemand-actor".into())
                 .spawn(move || actor.run())
@@ -6527,7 +7190,7 @@ mod tests {
                 tx,
                 "ondemand".into(),
                 interrupts,
-                actor_id,
+                actor_link,
                 std::sync::Arc::new(crate::trace::TraceManager::new()),
             );
             let link = AsynLink {
@@ -6696,7 +7359,7 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(7)));
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((3, 1)),
             "IoIntr read must surface the driver alarm carried by the ring entry"
         );
@@ -6714,7 +7377,11 @@ mod tests {
         }
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
-        assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
+        assert_eq!(
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
+            None,
+            "clean entry => no alarm"
+        );
     }
 
     /// A transport-error I/O Intr sample (`aux_status != Success`): C `processAi`
@@ -6734,7 +7401,7 @@ mod tests {
             .push_with_overflow(intr_entry(11, 0));
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(11)));
-        assert_eq!(ads.last_alarm(), None);
+        assert_eq!(ads.last_alarm().map(|a| (a.stat, a.sevr)), None);
         // Now a transport-error interrupt carrying a different value.
         ads.interrupt_fifo
             .lock()
@@ -6753,7 +7420,7 @@ mod tests {
             "transport error must keep the prior value (C return -1), not store 99"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((10, 3)),
             "transport Timeout maps to TIMEOUT_ALARM(10)/INVALID(3)"
         );
@@ -6780,7 +7447,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "input asynError default => READ_ALARM(1)/INVALID(3)"
         );
@@ -6808,7 +7475,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((2, 3)),
             "scalar output readback asynError default => WRITE_ALARM(2)/INVALID(3)"
         );
@@ -6835,7 +7502,7 @@ mod tests {
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((7, 2)),
             "sample STATE_ALARM/MAJOR must win over the transport Timeout mapping"
         );
@@ -6870,7 +7537,7 @@ mod tests {
             "error value discarded"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((9, 3)),
             "Disconnected maps to COMM_ALARM(9)/INVALID(3)"
         );
@@ -6882,7 +7549,7 @@ mod tests {
         // Second read: the clean entry is the value stored.
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(50)));
-        assert_eq!(ads.last_alarm(), None);
+        assert_eq!(ads.last_alarm().map(|a| (a.stat, a.sevr)), None);
     }
 
     /// Array dsets gate the same way (devAsynXXXArray.cpp:317 copies bptr/nord
@@ -6896,10 +7563,10 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
         // Build an asynInt32Array adapter on the readback (output) path.
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-arr-actor".into())
             .spawn(move || actor.run())
@@ -6908,7 +7575,7 @@ mod tests {
             tx,
             "test".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -6957,7 +7624,7 @@ mod tests {
             "transport error must keep the prior array (C devAsynXXXArray.cpp:317)"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "array dset uses READ_ALARM(1) even for aao output, not WRITE_ALARM"
         );
@@ -6982,7 +7649,7 @@ mod tests {
             "non-success device read must keep the prior VAL (C return -1), not store 5"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((1, 3)),
             "the alarm is still raised: READ_ALARM(1)/INVALID(3)"
         );
@@ -7002,7 +7669,11 @@ mod tests {
             Some(EpicsValue::Long(5)),
             "a success device read stores the value"
         );
-        assert_eq!(ads.last_alarm(), None, "success read raises no alarm");
+        assert_eq!(
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
+            None,
+            "success read raises no alarm"
+        );
     }
 
     /// Init-time output readback (asyn:READBACK) seeds the record's value only on
@@ -7322,6 +7993,10 @@ mod tests {
             rec.val, 0x0F,
             "VAL = (raw & mask) >> SHFT, not the raw 0x3C"
         );
+        // The bits are the record's, derived once in C monitor().
+        rec.set_device_did_compute(true);
+        rec.process().unwrap();
+        rec.monitor_value_changed();
         assert_eq!(rec.bits[0], 1);
         assert_eq!(rec.bits[3], 1);
     }
@@ -7492,10 +8167,10 @@ mod tests {
         }
 
         let driver = F64Port::new();
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-f64-actor".into())
             .spawn(move || actor.run())
@@ -7504,7 +8179,7 @@ mod tests {
             tx,
             "test_f64".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         let link = AsynLink {
@@ -7657,7 +8332,7 @@ mod tests {
             "asynFloat64 ai applies ASLO/AOFF: 5*2 + 1 = 11"
         );
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             None,
             "a well-typed sample raises no alarm"
         );
@@ -7675,7 +8350,7 @@ mod tests {
         }
         ads.read(&mut rec).unwrap();
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((READ_ALARM, AlarmSeverity::Invalid as u16)),
             "an Int32 sample on an asynFloat64 record is a TypeMismatch: READ/INVALID, \
              the same alarm the polled read raises"
@@ -7942,10 +8617,10 @@ mod tests {
             writes: writes.clone(),
             fail,
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("binwrite-actor".into())
             .spawn(move || actor.run())
@@ -7954,7 +8629,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, writes)
@@ -7970,7 +8645,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_wb");
-        crate::asyn_record::register_port("binwrite_wb", handle).unwrap();
+        crate::asyn_record::register_port("binwrite_wb", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8006,7 +8682,12 @@ mod tests {
         use epics_base_rs::server::records::stringout::StringoutRecord;
 
         let (handle, _writes) = spawn_binary_write_port("octet_no_initrb");
-        crate::asyn_record::register_port("octet_no_initrb", handle).unwrap();
+        crate::asyn_record::register_port(
+            "octet_no_initrb",
+            handle,
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "stringout",
@@ -8033,7 +8714,8 @@ mod tests {
         use epics_base_rs::server::records::longout::LongoutRecord;
 
         let (handle, _writes) = spawn_binary_write_port("int32_initrb");
-        crate::asyn_record::register_port("int32_initrb", handle).unwrap();
+        crate::asyn_record::register_port("int32_initrb", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "longout",
@@ -8060,7 +8742,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_binary_write_port("binwrite_text");
-        crate::asyn_record::register_port("binwrite_text", handle).unwrap();
+        crate::asyn_record::register_port("binwrite_text", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8094,7 +8777,8 @@ mod tests {
         use epics_base_rs::server::ioc_app::DeviceSupportContext;
 
         let (handle, _writes) = spawn_binary_write_port("undeclared_rt");
-        crate::asyn_record::register_port("undeclared_rt", handle).unwrap();
+        crate::asyn_record::register_port("undeclared_rt", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let bind = |record_type: &str, dtyp: &str| {
             universal_asyn_factory(&DeviceSupportContext {
@@ -8132,10 +8816,20 @@ mod tests {
     #[test]
     fn asyn_device_menu_is_the_generated_table_plus_busy() {
         for &rt in crate::dbd_generated::DEVICE_MENU_RECORD_TYPES {
-            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::device_menu(rt));
+            assert_eq!(asyn_device_menu(rt), crate::dbd_generated::devices(rt));
             assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&rt));
         }
-        assert_eq!(asyn_device_menu("busy"), Some(&["asynInt32"][..]));
+        let busy = asyn_device_menu("busy").unwrap();
+        assert_eq!(
+            busy.iter()
+                .map(|row| (row.name, row.choice, row.link_type))
+                .collect::<Vec<_>>(),
+            [(
+                "asynBusyInt32",
+                "asynInt32",
+                epics_base_rs::server::record::DbLinkType::InstIo
+            )]
+        );
         assert!(ASYN_DEVICE_MENU_RECORD_TYPES.contains(&"busy"));
         assert_eq!(
             ASYN_DEVICE_MENU_RECORD_TYPES.len(),
@@ -8180,10 +8874,10 @@ mod tests {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             writes: writes.clone(),
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("f32array-actor".into())
             .spawn(move || actor.run())
@@ -8192,7 +8886,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, writes)
@@ -8212,7 +8906,8 @@ mod tests {
         use epics_base_rs::types::DbFieldType;
 
         let (handle, writes) = spawn_float32_array_port("f32arr_out");
-        crate::asyn_record::register_port("f32arr_out", handle).unwrap();
+        crate::asyn_record::register_port("f32arr_out", handle, &crate::registry::open_owner())
+            .unwrap();
 
         let ctx = DeviceSupportContext {
             record_type: "waveform",
@@ -8335,7 +9030,7 @@ mod tests {
         // Generic asynError on an output record -> WRITE_ALARM/INVALID (NOT
         // READ_ALARM, which the path used before the direction fix).
         assert_eq!(
-            ads.last_alarm(),
+            ads.last_alarm().map(|a| (a.stat, a.sevr)),
             Some((
                 epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
@@ -8392,10 +9087,10 @@ mod tests {
             sequence: sequence.clone(),
             reply: reply.to_vec(),
         };
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(port), rx);
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::Builder::new()
             .name("cmdresp-actor".into())
             .spawn(move || actor.run())
@@ -8404,7 +9099,7 @@ mod tests {
             tx,
             name.into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
         (handle, (writes, sequence))
@@ -8573,8 +9268,8 @@ mod tests {
             }
         }
 
-        let interrupts = Arc::new(InterruptManager::new(256));
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PartialThenTimeout(PortDriverBase::new(
                 "octet_partial",
@@ -8583,13 +9278,13 @@ mod tests {
             ))),
             rx,
         );
-        let actor_id = actor.id();
+        let actor_link = actor.link();
         std::thread::spawn(move || actor.run());
         let handle = PortHandle::new(
             tx,
             "octet_partial".into(),
             interrupts,
-            actor_id,
+            actor_link,
             std::sync::Arc::new(crate::trace::TraceManager::new()),
         );
 
@@ -8632,7 +9327,12 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
-        crate::asyn_record::register_port("cmdresp_factory", handle).unwrap();
+        crate::asyn_record::register_port(
+            "cmdresp_factory",
+            handle,
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
 
         // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
         // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
@@ -8685,7 +9385,8 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
-        crate::asyn_record::register_port("cmdresp_nul", handle).unwrap();
+        crate::asyn_record::register_port("cmdresp_nul", handle, &crate::registry::open_owner())
+            .unwrap();
 
         // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
         // NUL, so only "AB" reaches the wire.
@@ -8720,7 +9421,8 @@ mod tests {
         use epics_base_rs::server::records::stringin::StringinRecord;
 
         let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
-        crate::asyn_record::register_port("cmdresp_lnul", handle).unwrap();
+        crate::asyn_record::register_port("cmdresp_lnul", handle, &crate::registry::open_owner())
+            .unwrap();
 
         // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
         // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty
@@ -8751,7 +9453,7 @@ mod tests {
             "0-byte write then read: {seq:?}"
         );
         assert_eq!(
-            dev.last_alarm(),
+            dev.last_alarm().map(|a| (a.stat, a.sevr)),
             None,
             "a leading-NUL command must NOT raise LINK_ALARM (C does not reject it)"
         );
@@ -8822,7 +9524,7 @@ mod tests {
         // CharArray (matching the waveform CHAR shape, not a fixed String).
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec().into())),
+            Some(EpicsValue::CharArray(b"STATUS=OK\0".to_vec().into())),
             "reply must populate the lsi VAL"
         );
     }
@@ -8857,7 +9559,7 @@ mod tests {
 
         assert_eq!(
             rec.get_field("VAL"),
-            Some(EpicsValue::CharArray(reply.clone().into())),
+            Some(EpicsValue::CharArray([&reply[..], b"\0"].concat().into())),
             "all 50 reply bytes must land — SIZV is the bound, not MAX_STRING_SIZE"
         );
         assert_eq!(
@@ -8926,6 +9628,8 @@ mod tests {
         let init_choices: Arc<[EnumEntry]> =
             Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
         let mut ads = make_enum_adapter_as(init_choices, "asynInt32");
+        let gate = open_gate();
+        ads.bind_interrupt_gate(&gate);
         let mut rec = MbbiRecord::new(0);
         ads.init(&mut rec).unwrap();
         let mut rx = ads

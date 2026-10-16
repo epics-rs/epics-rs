@@ -28,7 +28,9 @@ impl MotorRecord {
             // latched motion button, so the halted axis is not
             // re-commanded by a jog/home still held high.
             self.clear_buttons();
+            self.mark(m::STOP);
             self.stat.mip.insert(MipFlags::STOP);
+            self.mark(m::MIP);
             // An error stop post-processes like a commanded stop (sync at
             // completion), not like a Pause (resume armed).
             self.internal.pp = true;
@@ -53,6 +55,7 @@ impl MotorRecord {
         // pass returns before check_completion (do_process_inner).
         if self.stat.mip.contains(MipFlags::DELAY_ACK) {
             self.stat.mip.remove(MipFlags::DELAY_ACK);
+            self.mark(m::MIP);
             if self
                 .stat
                 .mip
@@ -91,6 +94,7 @@ impl MotorRecord {
                 && !self.stat.mip.contains(MipFlags::STOP)
             {
                 self.stat.mip.insert(MipFlags::STOP);
+                self.mark(m::MIP);
                 self.internal.pp = false;
                 effects.commands.push(MotorCommand::Stop {
                     acceleration: self.move_accel_egu(),
@@ -103,6 +107,8 @@ impl MotorRecord {
             // stops the axis and releases the buttons in the same pass
             // (1475-1484 sets stop=1, the do_work top block consumes it).
             if self.recompute_lvio_during_motion() {
+                // C 1480-1481 sets stop and the do_work top block clears it.
+                self.mark(m::STOP);
                 self.stop_axis(&mut effects);
                 return effects;
             }
@@ -115,6 +121,7 @@ impl MotorRecord {
             if let Some(new_target) = self.internal.pending_retarget.take() {
                 // Replan motion to new target
                 self.stat.mip = MipFlags::empty();
+                self.mark(m::MIP);
                 self.pos.dval = new_target;
                 self.pos.val = coordinate::dial_to_user(new_target, self.conv.dir, self.pos.off);
                 if let Ok(rval) = coordinate::dial_to_raw(new_target, self.conv.mres) {
@@ -149,10 +156,12 @@ impl MotorRecord {
                 if !held {
                     self.internal.queued_motion = None;
                     self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
+                    self.mark(m::MIP);
                 }
             }
             if let Some(queued) = self.internal.queued_motion.take() {
                 self.stat.mip.remove(MipFlags::STOP);
+                self.mark(m::MIP);
                 // C: the queued request armed pp=TRUE (2025/2110), so this
                 // stop completion runs postProcess first — VAL/DVAL/RVAL
                 // sync to the rest position (827-849) — and only then
@@ -169,6 +178,7 @@ impl MotorRecord {
                         // C 869: the postProcess home re-fire resets the
                         // retry counter, like the direct dispatch (2069).
                         self.retry.rcnt = 0;
+                        self.mark(m::RCNT);
                         let hw_forward = if self.conv.mres >= 0.0 {
                             forward
                         } else {
@@ -220,7 +230,9 @@ impl MotorRecord {
                     // (finalize_motion's lval/ldvl sync matches 1067-1069).
                     // The give-up pass still counts (`++rcnt > rtry`).
                     self.retry.rcnt += 1;
+                    self.mark(m::RCNT);
                     self.retry.miss = true;
+                    self.mark(m::MISS);
                     self.finalize_or_delay(&mut effects);
                     // C maybeRetry give-up (1063-1065) re-arms MIP_JOG_REQ
                     // from the held field and do_work re-fires same-pass —
@@ -241,7 +253,9 @@ impl MotorRecord {
                     // and re-fires immediately — the poll-time NTM stop
                     // resumes toward the intact target this way.
                     self.retry.rcnt += 1;
+                    self.mark(m::RCNT);
                     self.stat.mip = MipFlags::RETRY;
+                    self.mark(m::MIP);
                     if self.can_accept_command() {
                         self.plan_absolute_move(&mut effects);
                     } else {
@@ -260,7 +274,9 @@ impl MotorRecord {
                 // M_DMOV mark): an idle Pause convergence pass (dmov
                 // already true) finalizes quietly.
                 if diff < self.retry.rdbd || ls_blocks {
-                    self.retry.miss = false;
+                    if std::mem::take(&mut self.retry.miss) {
+                        self.mark(m::MISS);
+                    }
                     self.restore_spmg_move_to_pause();
                 }
                 if self.stat.dmov {
@@ -346,8 +362,12 @@ impl MotorRecord {
                 // button latched (it reads back 1 for the whole home), so
                 // this is the lifecycle owner for the done path; stops
                 // and pauses clear via clear_buttons (1893/1899-1900).
-                self.ctrl.homf = false;
-                self.ctrl.homr = false;
+                if std::mem::take(&mut self.ctrl.homf) {
+                    self.mark(m::HOMF);
+                }
+                if std::mem::take(&mut self.ctrl.homr) {
+                    self.mark(m::HOMR);
+                }
                 // C 1387-1397: a VAL written while homing could not
                 // dispatch (handle_retarget ignores HOMF/HOMR) — replay
                 // it instead of syncing it away. The button clear above
@@ -386,7 +406,8 @@ impl MotorRecord {
                     && !self.stat.movn
                 {
                     self.stat.mip = MipFlags::empty();
-                    self.stat.dmov = true;
+                    self.mark(m::MIP);
+                    self.set_dmov(true);
                 }
                 // C process (1382-1402): a done status callback with pp
                 // armed and no motion runs postProcess, whose first
@@ -438,6 +459,7 @@ impl MotorRecord {
         if self.timing.dly > 0.0 {
             self.set_phase(MotionPhase::DelayWait);
             self.stat.mip.insert(MipFlags::DELAY_REQ);
+            self.mark(m::MIP);
             effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
                 self.timing.dly,
             ));
@@ -450,8 +472,9 @@ impl MotorRecord {
     pub(crate) fn finalize_motion(&mut self, effects: &mut ProcessEffects) {
         self.set_phase(MotionPhase::Idle);
         self.stat.mip = MipFlags::empty();
-        self.stat.dmov = true;
-        self.stat.movn = false;
+        self.mark(m::MIP);
+        self.set_dmov(true);
+        self.set_movn(false);
         // RCNT is NOT zeroed at completion: C resets it only at dispatch
         // sites — a non-retry move (2352-2356), home (2069, 869), and a
         // Move-resume (1931). After a give-up it stays at rtry+1 (the
@@ -535,6 +558,7 @@ impl MotorRecord {
     fn restore_spmg_move_to_pause(&mut self) {
         if self.ctrl.spmg == SpmgMode::Move {
             self.ctrl.spmg = SpmgMode::Pause;
+            self.mark(m::SPMG);
             // Keep the latent-SPMG tracker in step: the restore is not
             // a user transition and must not replay through the
             // Go/Stop machinery.
@@ -557,6 +581,7 @@ impl MotorRecord {
         if self.pos.val == self.internal.lval {
             return false;
         }
+        // C 1395 leaves MIP unmarked; do_work's dispatch marks it (2462).
         self.stat.mip = MipFlags::empty();
         self.set_phase(MotionPhase::Idle);
         self.plan_absolute_move(effects);
@@ -586,6 +611,9 @@ impl MotorRecord {
                 || (self.limits.dllm > self.limits.dhlm);
         } else if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
             self.limits.lvio = false;
+        }
+        if self.limits.lvio != old_lvio {
+            self.mark(m::LVIO);
         }
         self.limits.lvio && !old_lvio && !self.conv.set && !self.conv.igset
     }
@@ -635,6 +663,7 @@ impl MotorRecord {
         if self.timing.dly > 0.0 {
             self.set_phase(MotionPhase::DelayWait);
             self.stat.mip.insert(MipFlags::DELAY_REQ);
+            self.mark(m::MIP);
             effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
                 self.timing.dly,
             ));
@@ -715,7 +744,9 @@ impl MotorRecord {
                 // so RCNT reads rtry+1 until the next dispatch resets it.
                 // The retry branches below never touch miss.
                 self.retry.rcnt += 1;
+                self.mark(m::RCNT);
                 self.retry.miss = true;
+                self.mark(m::MISS);
                 self.finalize_motion(effects);
                 // C maybeRetry give-up (motorRecord.cc:1063-1065):
                 // `mip = MIP_DONE` then re-arm `MIP_JOG_REQ` from the held
@@ -741,7 +772,9 @@ impl MotorRecord {
                 // 1077-1080); only the close-enough or give-up branch
                 // ends it.
                 self.retry.rcnt += 1;
+                self.mark(m::RCNT);
                 self.stat.mip = MipFlags::RETRY | MipFlags::DELAY_REQ;
+                self.mark(m::MIP);
                 self.set_phase(MotionPhase::DelayWait);
                 effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
                     self.timing.dly,
@@ -758,7 +791,9 @@ impl MotorRecord {
             // Routing through plan_absolute_move replays that block; its
             // dispatch keeps the RETRY bit (C 2461 mip |= MIP_MOVE).
             self.retry.rcnt += 1;
+            self.mark(m::RCNT);
             self.stat.mip = MipFlags::RETRY;
+            self.mark(m::MIP);
             self.plan_absolute_move(effects);
         } else {
             // Close enough, LS-blocked, or RTRY disabled. C maybeRetry:
@@ -767,7 +802,9 @@ impl MotorRecord {
             // rtry==0 branch (1054-1056) leaves both untouched —
             // retry-disabled never latches a miss.
             if diff < self.retry.rdbd || ls_blocks_retry {
-                self.retry.miss = false;
+                if std::mem::take(&mut self.retry.miss) {
+                    self.mark(m::MISS);
+                }
                 self.restore_spmg_move_to_pause();
             }
             self.finalize_motion(effects);
@@ -791,7 +828,8 @@ impl MotorRecord {
         self.internal.backlash_pending = false;
         self.set_phase(MotionPhase::BacklashFinal);
         self.stat.mip = MipFlags::MOVE_BL;
-        let frac = self.retry.frac;
+        self.mark(m::MIP);
+        let frac = f64::from(self.retry.frac);
         if self.use_relative_moves() {
             // C relative: relpos = (dval - drbv) * frac / mres
             let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
@@ -810,7 +848,7 @@ impl MotorRecord {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             // C 967: the FRAC-scaled commanded raw position is posted to
             // RVAL; 973 derives CDIR from the unscaled raw error.
-            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
@@ -833,6 +871,7 @@ impl MotorRecord {
         let pretarget = self.pos.dval - self.retry.bdst;
         self.set_phase(MotionPhase::JogBacklash);
         self.stat.mip = MipFlags::JOG_BL1;
+        self.mark(m::MIP);
         self.internal.backlash_pending = true;
         // CDIR is the sign of the stroke this leg actually commands, in raw
         // units — the same rule every other leg here follows.
@@ -868,8 +907,9 @@ impl MotorRecord {
 
     /// Start jog backlash phase 2 (final approach at backlash velocity).
     fn start_jog_backlash_final(&mut self, effects: &mut ProcessEffects) {
-        let frac = self.retry.frac;
+        let frac = f64::from(self.retry.frac);
         self.stat.mip = MipFlags::JOG_BL2;
+        self.mark(m::MIP);
         self.internal.backlash_pending = false;
         let pretarget = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
         if self.use_relative_moves() {
@@ -892,7 +932,7 @@ impl MotorRecord {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             // C 1016: the FRAC-scaled commanded raw position is posted to
             // RVAL; 1020 derives CDIR from the unscaled raw error.
-            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,

@@ -281,7 +281,10 @@ struct PickyReader {
 
 static PICKY_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Double, false),
-    FieldDesc::new("INP", DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Inlink,
+        ..FieldDesc::new("SRC", DbFieldType::String, false)
+    },
 ];
 
 impl Record for PickyReader {
@@ -298,16 +301,16 @@ impl Record for PickyReader {
     }
     fn pre_process_actions(&mut self) -> ProcessActions {
         ProcessActions::from(vec![ProcessAction::ReadDbLink {
-            link_field: "INP",
+            link_field: "SRC",
             target_field: "VAL",
         }])
     }
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            // The link string lives in `common.inp`; the record answers with the
-            // configured source so the framework's read seam can resolve it.
-            "INP" => Some(EpicsValue::String("SS_REJECT_SRC.VAL".into())),
+            // The record answers with the configured source so the framework's
+            // read seam can resolve it.
+            "SRC" => Some(EpicsValue::String("SS_REJECT_SRC.VAL".into())),
             _ => None,
         }
     }
@@ -318,7 +321,7 @@ impl Record for PickyReader {
                 Ok(())
             }
             ("VAL", _) => Err(CaError::TypeMismatch("VAL".into())),
-            ("INP", _) => Ok(()),
+            ("SRC", _) => Ok(()),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -343,6 +346,7 @@ impl Record for PickyReader {
 async fn rejected_link_store_raises_link_invalid() {
     let db = PvDatabase::new();
 
+    epics_base_rs::server::record::register_declared_fields("picky", PICKY_FIELDS);
     db.add_record(
         "SS_REJECT_SRC",
         Box::new(StringoutRecord::new("not a number")),

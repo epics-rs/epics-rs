@@ -18,7 +18,7 @@
 // `exec_backend` lands it on a callback-pool worker that has none. A hosted
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread` build had `feature = "client"` on and
 // panicked on both of those sockets at `realtime-ca-ioc` boot, measured.
-// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the full CA client over
+// RTEMS-EXEC-MODEL-ALLOW(9): the flavored tests drive the full CA client over
 // tokio::net or pin a specific tokio runtime flavor. These run and pass in the
 // exec-backend suite on the tokio driver.
 #[cfg(ca_beacon_monitor)]
@@ -63,6 +63,7 @@ use epics_base_rs::types::{
     DBR_STRING, DBR_TIME_INT, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, decode_dbr,
 };
 
+pub(crate) use state::ConnFold;
 pub use state::{ChannelState, ConnectionEvent};
 
 /// DBR type code to request for an ENUM field's *default* readback,
@@ -280,18 +281,18 @@ const ONE_SHOT_CHANNEL_CACHE_CAPACITY: usize = 4096;
 
 #[derive(Default)]
 struct OneShotChannelCache {
-    channels: HashMap<String, CaChannel>,
-    order: VecDeque<String>,
+    channels: HashMap<PvString, CaChannel>,
+    order: VecDeque<PvString>,
 }
 
 impl OneShotChannelCache {
-    fn get_or_create(&mut self, client: &CaClient, pv_name: String) -> CaChannel {
+    fn get_or_create(&mut self, client: &CaClient, pv_name: PvString) -> CaChannel {
         if let Some(channel) = self.channels.get(&pv_name) {
             return channel.clone();
         }
 
         // Legacy one-shot API has no priority knob — default (0).
-        let channel = client.create_channel_expanded(pv_name.clone(), 0);
+        let channel = client.create_channel_expanded(pv_name.clone(), 0).0;
         self.channels.insert(pv_name.clone(), channel.clone());
         self.order.push_back(pv_name);
 
@@ -469,7 +470,7 @@ pub struct CaClient {
     /// Every task the client owns — search engine, transport manager,
     /// coordinator, beacon monitor, the graceful drain in `Drop` — opens a
     /// socket or arms a timer, and several of them are started from plain
-    /// `fn`s (`Drop::drop`, `CaChannel::on_connection_change`) where no
+    /// `fn`s (`Drop::drop`) where no
     /// runtime is entered. Carrying the capability is what makes those sites
     /// legal by construction instead of by the caller happening to be on a
     /// runtime thread.
@@ -509,12 +510,12 @@ pub struct CaClient {
 enum CoordRequest {
     RegisterChannel {
         cid: u32,
-        pv_name: String,
+        pv_name: PvString,
         /// CA priority the channel was created at; stored on
         /// the coordinator's `ChannelInner` and threaded into every
         /// `TransportCommand` the coordinator builds for this channel.
         priority: u8,
-        conn_tx: broadcast::Sender<ConnectionEvent>,
+        conn_tx: state::ConnEvents,
     },
     WaitConnected {
         cid: u32,
@@ -673,7 +674,7 @@ impl CaClient {
             // for hostname-bound certs. Without this, the SNI falls back
             // to the server's IP literal — which only validates against
             // IP-bound certs.
-            c.tls_server_name = epics_base_rs::runtime::env::get("EPICS_CA_TLS_SERVER_NAME");
+            c.tls_server_name = epics_base_rs::runtime::env::get_lossy("EPICS_CA_TLS_SERVER_NAME");
             c
         };
         #[cfg(not(feature = "experimental-rust-tls"))]
@@ -962,7 +963,7 @@ impl CaClient {
         let server_writers: DirectServerWriters = Arc::new(dashmap::DashMap::new());
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let client_identity: types::ClientIdentitySlot =
-            Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
+            Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_os()));
         // Built before the transport, because the circuit's receive path — not
         // the coordinator — is what raises server exceptions (C ref:
         // `cac::exceptionRespAction`, `cac.cpp:1079-1117`, runs inside
@@ -1097,8 +1098,9 @@ impl CaClient {
     }
 
     /// Override the user name this client advertises to servers
-    /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from `$USER`
-    /// at context creation; this lets it be changed at runtime.
+    /// (`CA_PROTO_CLIENT_NAME`). libca takes the user name from
+    /// `osiGetUserName` at context creation; this lets it be changed at
+    /// runtime.
     ///
     /// Applies to circuits opened **after** this call: the shared
     /// identity slot is read when each new circuit handshakes (before its
@@ -1108,7 +1110,7 @@ impl CaClient {
     /// channel (`rsrv/camessage.c` `client_name_action`: `chanCount != 0`
     /// → `ECA_INTERNAL`, name ignored), so there is no in-band way to
     /// rename a live circuit.
-    pub fn set_user_name(&self, user: impl Into<String>) {
+    pub fn set_user_name(&self, user: impl Into<Vec<u8>>) {
         self.client_identity.write().user = user.into();
     }
 
@@ -1118,7 +1120,7 @@ impl CaClient {
     /// circuits keep their host name (the EPICS server ignores
     /// `CA_PROTO_HOST_NAME` after the first channel — `host_name_action`,
     /// `chanCount != 0` → `ECA_INTERNAL`).
-    pub fn set_host_name(&self, host: impl Into<String>) {
+    pub fn set_host_name(&self, host: impl Into<Vec<u8>>) {
         self.client_identity.write().host = host.into();
     }
 
@@ -1159,8 +1161,22 @@ impl CaClient {
     ///
     /// Uses CA `priorityDefault` (0). To request a specific virtual-circuit
     /// priority, use [`Self::create_channel_with_priority`].
-    pub fn create_channel(&self, name: &str) -> CaChannel {
-        self.create_channel_expanded(expand_pv_name(name), 0)
+    pub fn create_channel(&self, name: impl AsRef<[u8]>) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), 0)
+            .0
+    }
+
+    /// [`Self::create_channel_with_priority`] plus a
+    /// [`CaChannel::connection_events`] receiver that exists before the
+    /// search starts — libca's `ca_create_channel` connection callback. A
+    /// receiver taken after the channel is created misses a connect that wins
+    /// the race, together with the access rights it carries.
+    pub fn create_channel_with_events(
+        &self,
+        name: impl AsRef<[u8]>,
+        priority: u8,
+    ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), priority.min(99))
     }
 
     /// Create a persistent channel at a specific CA priority (`0..=99`,
@@ -1174,15 +1190,21 @@ impl CaClient {
     /// `CA_PROTO_VERSION` message's data-type field. Values above 99 are
     /// clamped to 99 to match libca's range check
     /// (`cac.cpp:512-520`).
-    pub fn create_channel_with_priority(&self, name: &str, priority: u8) -> CaChannel {
-        self.create_channel_expanded(expand_pv_name(name), priority.min(99))
+    pub fn create_channel_with_priority(&self, name: impl AsRef<[u8]>, priority: u8) -> CaChannel {
+        self.create_channel_expanded(expand_pv_name(name.as_ref()), priority.min(99))
+            .0
     }
 
-    fn create_channel_expanded(&self, pv_name: String, priority: u8) -> CaChannel {
+    fn create_channel_expanded(
+        &self,
+        pv_name: PvString,
+        priority: u8,
+    ) -> (CaChannel, broadcast::Receiver<ConnectionEvent>) {
         // reserve the cid against the live-set. Released by the
         // coordinator at `DropChannel` (the single channel-removal site).
         let cid = self.cid_alloc.allocate();
-        let (conn_tx, _) = broadcast::channel(16);
+        let (conn_tx, conn_rx) = state::ConnEvents::new(16);
+        let conn_view = conn_tx.view();
 
         // C `cac::createChannel` rejects empty names with
         // ECA_BADSTR, and `tcpiiu::createChannelRequest` rejects
@@ -1197,7 +1219,7 @@ impl CaClient {
         // CaChannel sits in Disconnected and times out naturally
         // when callers await connect, matching libca's client-side
         // reject semantic.
-        let padded_len = crate::protocol::pad_string(&pv_name).len();
+        let padded_len = crate::protocol::pad_bytes(pv_name.as_bytes()).len();
         let name_empty = pv_name.is_empty();
         let name_too_long = padded_len >= 0xFFFF;
         let valid = !name_empty && !name_too_long;
@@ -1217,7 +1239,7 @@ impl CaClient {
             cid,
             pv_name: pv_name.clone(),
             priority,
-            conn_tx: conn_tx.clone(),
+            conn_tx,
         });
 
         if valid {
@@ -1232,8 +1254,8 @@ impl CaClient {
             cid,
             coord_tx: self.coord_tx.clone(),
         });
-        let channel_pv_name: Arc<str> = Arc::from(pv_name.as_str());
-        CaChannel {
+        let channel_pv_name: Arc<[u8]> = Arc::from(pv_name.as_bytes());
+        let channel = CaChannel {
             cid,
             pv_name: channel_pv_name,
             priority,
@@ -1242,16 +1264,17 @@ impl CaClient {
             in_flight: self.in_flight.clone(),
             snapshots: self.snapshots.clone(),
             server_writers: self.server_writers.clone(),
-            conn_tx,
+            conn_tx: conn_view,
             cached_read: Arc::new(Mutex::new(None)),
             search_attempts: self.search_attempts.clone(),
             user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
             reactor: self.reactor.clone(),
-        }
+        };
+        (channel, conn_rx)
     }
 
-    fn cached_one_shot_channel(&self, name: &str) -> CaChannel {
+    fn cached_one_shot_channel(&self, name: &[u8]) -> CaChannel {
         let pv_name = expand_pv_name(name);
         self.one_shot_channels.lock().get_or_create(self, pv_name)
     }
@@ -1282,7 +1305,7 @@ impl CaClient {
         let _ = self.search_tx.send(SearchRequest::SetAddressList(list));
     }
 
-    pub async fn caget(&self, pv_name: &str) -> CaResult<(DbFieldType, EpicsValue)> {
+    pub async fn caget(&self, pv_name: impl AsRef<[u8]>) -> CaResult<(DbFieldType, EpicsValue)> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
         let result = ch.get().await;
@@ -1302,7 +1325,7 @@ impl CaClient {
     /// Results are returned in input order.
     pub async fn caget_many<S>(&self, pv_names: &[S]) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
-        S: AsRef<str> + Sync,
+        S: AsRef<[u8]> + Sync,
     {
         self.caget_many_with_timeout(pv_names, Duration::from_secs(30))
             .await
@@ -1315,7 +1338,7 @@ impl CaClient {
         timeout: Duration,
     ) -> Vec<CaResult<(DbFieldType, EpicsValue)>>
     where
-        S: AsRef<str> + Sync,
+        S: AsRef<[u8]> + Sync,
     {
         let channels: Vec<CaChannel> = pv_names
             .iter()
@@ -1394,13 +1417,12 @@ impl CaClient {
     }
 
     /// Fire-and-forget write (CA_PROTO_WRITE). Matches C `caput` behavior.
-    pub async fn caput(&self, pv_name: &str, value_str: &str) -> CaResult<()> {
+    pub async fn caput(&self, pv_name: impl AsRef<[u8]>, value_str: &str) -> CaResult<()> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
-        let snap = ch.snapshot()?;
-        let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put_nowait(&value).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        ch.put_as_dbr_nowait(dbr_type, &value).await?;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
@@ -1410,7 +1432,7 @@ impl CaClient {
     /// Write with completion callback (CA_PROTO_WRITE_NOTIFY). Matches C `caput -c`.
     pub async fn caput_callback(
         &self,
-        pv_name: &str,
+        pv_name: impl AsRef<[u8]>,
         value_str: &str,
         timeout_secs: f64,
     ) -> CaResult<()> {
@@ -1421,16 +1443,16 @@ impl CaClient {
         let timeout = crate::estdlib::duration_from_secs(timeout_secs);
         ch.wait_connected(timeout).await?;
 
-        let snap = ch.snapshot()?;
-        let value = EpicsValue::parse(snap.native_type, value_str)?;
-        ch.put_with_timeout(&value, timeout).await?;
+        let (dbr_type, value) = caput_wire_value(&ch, value_str).await?;
+        ch.put_as_dbr_with_timeout(dbr_type, &value, timeout)
+            .await?;
         let _ = self
             .coord_tx
             .send(CoordRequest::DropChannel { cid: ch.cid });
         Ok(())
     }
 
-    pub async fn cainfo(&self, pv_name: &str) -> CaResult<ChannelInfo> {
+    pub async fn cainfo(&self, pv_name: impl AsRef<[u8]>) -> CaResult<ChannelInfo> {
         let ch = self.create_channel(pv_name);
         ch.wait_connected(Duration::from_secs(3)).await?;
 
@@ -1442,7 +1464,7 @@ impl CaClient {
     }
 
     /// Monitor a PV with callback (legacy API).
-    pub async fn camonitor<F>(&self, pv_name: &str, mut callback: F) -> CaResult<()>
+    pub async fn camonitor<F>(&self, pv_name: impl AsRef<[u8]>, mut callback: F) -> CaResult<()>
     where
         F: FnMut(EpicsValue),
     {
@@ -1696,7 +1718,7 @@ fn validate_put_strings(value: &EpicsValue) -> CaResult<()> {
 #[derive(Clone)]
 pub struct CaChannel {
     cid: u32,
-    pv_name: Arc<str>,
+    pv_name: Arc<[u8]>,
     /// CA priority (0..=99) this channel was created at. With
     /// the channel's resolved `server_addr` it forms the
     /// [`types::CircuitKey`] every hot-path `TransportCommand` targets,
@@ -1716,7 +1738,7 @@ pub struct CaChannel {
     /// Per-server writer sidecar (Option C, Phase E). Read/write hot
     /// paths use this after `snapshot()` proves the channel is active.
     server_writers: DirectServerWriters,
-    conn_tx: broadcast::Sender<ConnectionEvent>,
+    conn_tx: state::ConnEventsView,
     /// Warm-read fast path. `None` until the first successful default
     /// GET; refilled (with a fresh Sender) on every subsequent
     /// `get_many_with_timeout` call. See `CachedRead`.
@@ -1736,11 +1758,52 @@ pub struct CaChannel {
     user_data: Arc<Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
-    /// The reactor the owning [`CaClient`] was created on, carried so the
-    /// plain-`fn` watcher registrations ([`Self::on_connection_change`],
-    /// [`Self::on_access_rights_change`]) can start their tasks from a thread
-    /// that has entered no runtime.
+    /// The reactor the owning [`CaClient`] was created on, carried so a
+    /// channel's own tasks (`sync_group`) start from a thread that has
+    /// entered no runtime.
     reactor: epics_base_rs::runtime::task::Reactor,
+}
+
+/// The value C `caput` puts for one scalar token (`caput.c:455-552`): every
+/// non-ENUM type goes out as the escape-decoded `DBR_STRING`, so the server's
+/// `putString*` (`epicsParse*`) decides what it means and refuses what does
+/// not fit; an ENUM goes by menu name as a string, else as a `DBR_DOUBLE`
+/// number, each under its own wire type. The client never parses a number into
+/// the field's width.
+async fn caput_wire_value(ch: &CaChannel, token: &str) -> CaResult<(u16, EpicsValue)> {
+    // C `EpicsStr`: one `DBR_STRING` is at most 39 bytes plus the NUL.
+    const DBR_STRING_PAYLOAD_MAX: usize = 39;
+    let native = ch.snapshot()?.native_type;
+    let mut escaped = epics_base_rs::runtime::epics_string::raw_from_escaped(token);
+    escaped.truncate(DBR_STRING_PAYLOAD_MAX);
+    if native == DbFieldType::Enum {
+        let menu = ch
+            .get_with_metadata(DbrClass::Gr)
+            .await?
+            .enums
+            .map(|e| e.strings)
+            .unwrap_or_default();
+        if menu
+            .iter()
+            .any(|name| name.as_bytes() == escaped.as_slice())
+        {
+            return Ok((
+                DbFieldType::String as u16,
+                EpicsValue::String(PvString::from_bytes(escaped)),
+            ));
+        }
+        let text = String::from_utf8_lossy(&escaped);
+        return match text.trim().parse::<f64>() {
+            Ok(index) => Ok((DbFieldType::Double as u16, EpicsValue::Double(index))),
+            Err(_) => Err(CaError::InvalidValue(format!(
+                "Enum string value '{text}' invalid."
+            ))),
+        };
+    }
+    Ok((
+        DbFieldType::String as u16,
+        EpicsValue::String(PvString::from_bytes(escaped)),
+    ))
 }
 
 #[cfg(test)]
@@ -1750,7 +1813,7 @@ impl CaChannel {
     /// itself. Wires the provided `coord_tx` (so the lifecycle guard
     /// targets a live receiver) and leaves every sidecar empty.
     fn for_test(coord_tx: mpsc::UnboundedSender<CoordRequest>) -> Self {
-        let (conn_tx, _) = broadcast::channel(1);
+        let conn_tx = state::ConnEvents::new(1).0.view();
         let (transport_tx, _) = mpsc::unbounded_channel();
         let cid = 0;
         let lifecycle = Arc::new(ChannelLifecycle {
@@ -1759,7 +1822,7 @@ impl CaChannel {
         });
         CaChannel {
             cid,
-            pv_name: Arc::from("test:pv"),
+            pv_name: Arc::from(b"test:pv".as_slice()),
             priority: 0,
             coord_tx,
             transport_tx,
@@ -1843,7 +1906,11 @@ impl CaChannel {
         });
         epics_base_rs::runtime::task::timeout(timeout, reply_rx)
             .await
-            .map_err(|_| CaError::ChannelNotFound(self.pv_name.to_string()))?
+            .map_err(|_| {
+                // Display text only: `CaError` carries `String`, and libca has
+                // no counterpart message whose bytes this would have to match.
+                CaError::ChannelNotFound(String::from_utf8_lossy(&self.pv_name).into_owned())
+            })?
             .map_err(|_| CaError::Shutdown)
     }
 
@@ -1852,7 +1919,7 @@ impl CaChannel {
     pub async fn info(&self) -> CaResult<ChannelInfo> {
         let snap = self.snapshot()?;
         Ok(ChannelInfo {
-            pv_name: self.pv_name.to_string(),
+            pv_name: PvString::from(&*self.pv_name),
             server_addr: snap.server_addr,
             native_type: snap.native_type,
             element_count: snap.element_count,
@@ -1927,7 +1994,7 @@ impl CaChannel {
         } else {
             hdr.count = count as u16;
         }
-        Ok(hdr.to_bytes_extended())
+        Ok(hdr.to_bytes_extended().to_vec())
     }
 
     fn decode_plain_read_reply(reply: ReadReply) -> CaResult<(DbFieldType, EpicsValue)> {
@@ -2527,6 +2594,20 @@ impl CaChannel {
             .collect()
     }
 
+    /// The rights the channel's last `AccessRightsChanged` reported, read
+    /// from the coordinator's state rather than a receiver: none unless
+    /// `Connected`, so an unresponsive channel answers no-rights like the
+    /// event C sends at that edge (`nciu.cpp:170-177`), not its held
+    /// permits as `ca_write_access` would. The coordinator stores a frame's
+    /// rights before it dispatches the frames after it, so a monitor event
+    /// never sees older rights here than the stream carried ahead of it.
+    pub fn access_rights(&self) -> AccessRights {
+        match self.snapshots.get(&self.cid) {
+            Some(s) if s.state == ChannelState::Connected => s.access_rights,
+            _ => AccessRights::from_u32(0),
+        }
+    }
+
     /// The channel's native field type, known once connected. Mirrors
     /// libca `ca_field_type(chid)` — the CLI tools read it after connect
     /// to decide the readback DBR type (e.g. ENUM → STRING by default,
@@ -3122,7 +3203,7 @@ impl CaChannel {
         float_as_string: bool,
         req_count: Option<u32>,
     ) -> CaResult<MonitorHandle> {
-        let env = epics_base_rs::runtime::env::get("EPICS_CA_MONITOR_QUEUE")
+        let env = epics_base_rs::runtime::env::get_lossy("EPICS_CA_MONITOR_QUEUE")
             .and_then(|s| s.parse::<usize>().ok());
         let queue_size = resolve_monitor_queue_size(env);
         let (callback_tx, callback_rx) = mpsc::channel(queue_size);
@@ -3171,53 +3252,15 @@ impl CaChannel {
         self.conn_tx.subscribe()
     }
 
+    /// The fold of every connection event this channel has sent — what a
+    /// receiver that lost nothing holds (see [`state::ConnFold`]).
+    pub(crate) fn conn_fold(&self) -> state::ConnFold {
+        self.conn_tx.fold()
+    }
+
     /// The reactor the owning client was created on.
     pub(crate) fn reactor(&self) -> &epics_base_rs::runtime::task::Reactor {
         &self.reactor
-    }
-
-    /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb` on every `AccessRightsChanged`. Returns an
-    /// [`EventWatcher`] guard — drop it (or call `.abort()`) to stop
-    /// watching; the watcher task is aborted on drop. Mirrors libca
-    /// `ca_replace_access_rights_event` at the callback-registration
-    /// shape.
-    pub fn on_access_rights_change<F>(&self, mut cb: F) -> EventWatcher
-    where
-        F: FnMut(AccessRights) + Send + 'static,
-    {
-        let mut rx = self.conn_tx.subscribe();
-        let handle = self.reactor.spawn(async move {
-            while let Ok(evt) = rx.recv().await {
-                if let ConnectionEvent::AccessRightsChanged { read, write } = evt {
-                    cb(AccessRights { read, write });
-                }
-            }
-        });
-        EventWatcher { handle }
-    }
-
-    /// Convenience wrapper around [`Self::connection_events`] that
-    /// invokes `cb(true)` on `Connected` and `cb(false)` on
-    /// `Disconnected`. Mirrors libca
-    /// `ca_change_connection_event(chid, callback)` (oldChannelNotify.cpp:229).
-    /// Returns an [`EventWatcher`] guard — drop it (or call `.abort()`)
-    /// to stop watching; the watcher task is aborted on drop.
-    pub fn on_connection_change<F>(&self, mut cb: F) -> EventWatcher
-    where
-        F: FnMut(bool) + Send + 'static,
-    {
-        let mut rx = self.conn_tx.subscribe();
-        let handle = self.reactor.spawn(async move {
-            while let Ok(evt) = rx.recv().await {
-                match evt {
-                    ConnectionEvent::Connected => cb(true),
-                    ConnectionEvent::Disconnected => cb(false),
-                    _ => {}
-                }
-            }
-        });
-        EventWatcher { handle }
     }
 
     /// The server's host NAME, as libca `ca_host_name(chid)`
@@ -3237,7 +3280,7 @@ impl CaChannel {
     /// Returns `Err` if the channel hasn't connected yet — pvxs
     /// returns `"<disconnected>"` for the same case; we surface
     /// the typed error instead so callers can decide.
-    pub async fn host_name(&self) -> CaResult<String> {
+    pub async fn host_name(&self) -> CaResult<Vec<u8>> {
         let info = self.info().await?;
         let addr = info.server_addr;
         Ok(types::peer_resolved_name(addr).await)
@@ -3437,35 +3480,6 @@ impl Drop for MonitorHandle {
     }
 }
 
-/// Abort-on-drop guard for a connection / access-rights watcher task.
-///
-/// A bare `tokio::task::JoinHandle` *detaches* on drop — it does not
-/// abort the spawned task. Returning one from
-/// [`CaChannel::on_connection_change`] / [`CaChannel::on_access_rights_change`]
-/// while documenting "drop to stop" would leak a running task. This
-/// guard mirrors the `ServerConnection` abort-on-drop pattern: dropping
-/// it aborts the inner watcher task.
-#[must_use = "dropping the EventWatcher immediately stops the watcher task; \
-              bind it to a variable to keep watching"]
-pub struct EventWatcher {
-    // Spawned via `runtime::task::spawn`; seam handle (see `ServerConnection`).
-    handle: epics_base_rs::runtime::task::TaskHandle<()>,
-}
-
-impl EventWatcher {
-    /// Stop watching now. Equivalent to dropping the guard; provided
-    /// for callers that want an explicit, named teardown.
-    pub fn abort(self) {
-        // Drop runs `handle.abort()`.
-    }
-}
-
-impl Drop for EventWatcher {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
-
 // --- Coordinator ---
 
 /// Floor for the per-subscription bounded monitor channel. A queue this
@@ -3519,9 +3533,10 @@ async fn run_coordinator(
                 match req {
                     CoordRequest::RegisterChannel { cid, pv_name, priority, conn_tx } => {
                         // Drain any waiters that arrived before registration.
-                        let early_waiters = pending_wait_connected
-                            .remove(&cid)
-                            .unwrap_or_default();
+                        let mut conn_tx = conn_tx;
+                        for waiter in pending_wait_connected.remove(&cid).unwrap_or_default() {
+                            conn_tx.add_waiter(waiter);
+                        }
                         channels.insert(cid, ChannelInner {
                             cid,
                             pv_name: pv_name.clone(),
@@ -3532,7 +3547,6 @@ async fn run_coordinator(
                             element_count: 0,
                             server_addr: None,
                             access_rights: AccessRights::from_u32(0),
-                            connect_waiters: early_waiters,
                             conn_tx,
                             reconnect_count: 0,
                             last_connected_at: None,
@@ -3556,7 +3570,7 @@ async fn run_coordinator(
                             if ch.state == ChannelState::Connected {
                                 let _ = reply.send(());
                             } else {
-                                ch.connect_waiters.push(reply);
+                                ch.conn_tx.add_waiter(reply);
                             }
                         } else {
                             // Channel not yet registered — stash the waiter
@@ -3573,7 +3587,12 @@ async fn run_coordinator(
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
                             });
                             let priority = ch.priority;
-                            let connected = ch.state == ChannelState::Connected;
+                            // C `nciu::subscribe` installs the subscription when
+                            // the channel `isInstalledInServer` (`nciu.h:370-377`),
+                            // which includes an unresponsive circuit's channels:
+                            // the EVENT_ADD queues on the live socket and the
+                            // server answers it when the circuit recovers.
+                            let installed = ch.state.is_operational();
                             // Single owner of the subscribe-time readback
                             // derivation: ENUM substituted per enum_readback
                             // (Label→DBR_TIME_STRING, Numeric→DBR_TIME_INT,
@@ -3635,14 +3654,14 @@ async fn run_coordinator(
                                 deadband,
                                 callback_tx,
                                 coalesce_slot,
-                                needs_restore: !connected,
+                                needs_restore: !installed,
                                 last_value: None,
                                 nreplace: 0,
                             });
 
-                            if connected {
+                            if installed {
                                 let data_type =
-                                    data_type.expect("connected channel has native type");
+                                    data_type.expect("installed channel has native type");
                                 // C `tcpiiu::subscriptionRequest`
                                 // (`tcpiiu.cpp:1572-1585`): resolve the wire
                                 // count, then bound it against what the circuit
@@ -3650,7 +3669,7 @@ async fn run_coordinator(
                                 // never installed and `ca_create_subscription`
                                 // returns ECA_TOLARGE.
                                 let wire_count = crate::protocol::subscription_wire_count(
-                                    count.expect("connected channel has element count"),
+                                    count.expect("installed channel has element count"),
                                     ch.element_count,
                                     data_type,
                                     peer_minor,
@@ -3682,7 +3701,10 @@ async fn run_coordinator(
                         if let Some(rec) = subscriptions.get(subid) {
                             let cid = rec.cid;
                             if let Some(ch) = channels.get(&cid) {
-                                if ch.state == ChannelState::Connected {
+                                // Same predicate as the EVENT_ADD: the server
+                                // holds the subscription while the circuit is
+                                // unresponsive.
+                                if ch.state.is_operational() {
                                     if let Some(data_type) = rec.data_type {
                                         let server_addr = ch.server_addr.unwrap();
                                         // C `tcpiiu::subscriptionCancelRequest`
@@ -3719,7 +3741,7 @@ async fn run_coordinator(
                         for subid in sub_ids {
                             if let Some(rec) = subscriptions.get(subid) {
                                 if let Some(ch) = channels.get(&cid) {
-                                    if ch.state == ChannelState::Connected {
+                                    if ch.state.is_operational() {
                                         if let Some(data_type) = rec.data_type {
                                             let server_addr = ch.server_addr.unwrap();
                                             let peer_minor = server_minor_version
@@ -3914,7 +3936,7 @@ async fn run_coordinator(
                             {
                                 let _ = search_tx.send(SearchRequest::Schedule {
                                     cid: ch.cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: ch.pv_name.clone(),
                                     reason: SearchReason::BeaconAnomaly,
                                 });
                             }
@@ -3957,7 +3979,7 @@ async fn run_coordinator(
                                 server_channels.entry((server_addr, priority)).or_default().insert(cid);
                                 let _ = transport_tx.send(TransportCommand::CreateChannel {
                                     cid,
-                                    pv_name: ch.pv_name.to_string(),
+                                    pv_name: ch.pv_name.clone(),
                                     server_addr,
                                     priority,
                                 });
@@ -4074,17 +4096,12 @@ async fn run_coordinator(
                             // for cleanup.
                             search_attempts.remove(&cid);
 
-                            // Wake connect waiters
-                            for waiter in ch.connect_waiters.drain(..) {
-                                let _ = waiter.send(());
-                            }
-
-                            // Broadcast connected + access rights events
-                            let _ = ch.conn_tx.send(ConnectionEvent::Connected);
-                            let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                read: access.read,
-                                write: access.write,
-                            });
+                            // Rights, then Connected: rsrv sends ACCESS_RIGHTS
+                            // before the CREATE_CHAN reply (`camessage.c:1180`,
+                            // `:1201`) and `nciu::connect` notifies in that order
+                            // (`nciu.cpp:145-158`), so dbCa's rights handler sees
+                            // the channel unconnected and dispatches nothing.
+                            ch.announce_connected(&snapshots);
                             // epics-base `16877577` parity: surface native
                             // DBR type changes so consumers can react before
                             // the next event flows. Only a transition from a
@@ -4102,10 +4119,13 @@ async fn run_coordinator(
                             // event is gated on a real prior type.
                             if native_changed && previous_native.is_some() {
                                 if let Some(cur) = dbr_type {
-                                    let _ = ch.conn_tx.send(ConnectionEvent::NativeTypeChanged {
-                                        previous: previous_native,
-                                        current: cur,
-                                    });
+                                    ch.announce(
+                                        &snapshots,
+                                        ConnectionEvent::NativeTypeChanged {
+                                            previous: previous_native,
+                                            current: cur,
+                                        },
+                                    );
                                     tracing::info!(
                                         pv = %ch.pv_name,
                                         previous = ?previous_native,
@@ -4245,13 +4265,13 @@ async fn run_coordinator(
                     TransportEvent::AccessRightsChanged { cid, access } => {
                         if let Some(ch) = channels.get_mut(&cid) {
                             ch.access_rights = access;
-                            let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-                                read: access.read,
-                                write: access.write,
-                            });
-                            if let Some(mut snap) = snapshots.get_mut(&cid) {
-                                snap.access_rights = access;
-                            }
+                            ch.announce(
+                                &snapshots,
+                                ConnectionEvent::AccessRightsChanged {
+                                    read: access.read,
+                                    write: access.write,
+                                },
+                            );
                         }
                     }
                     TransportEvent::ChannelCreateFailed { cid } => {
@@ -4262,11 +4282,10 @@ async fn run_coordinator(
                             // the channel will immediately re-search and may
                             // still connect before the caller's timeout.
                             ch.state = ChannelState::Disconnected;
-                            snapshots.remove(&cid);
-                            let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
+                            ch.announce(&snapshots, ConnectionEvent::Disconnected);
                             let _ = search_tx.send(SearchRequest::Schedule {
                                 cid,
-                                pv_name: ch.pv_name.to_string(),
+                                pv_name: ch.pv_name.clone(),
                                 reason: SearchReason::Reconnect,
                             });
                             // Notify search engine of failed connect (penalty box).
@@ -4365,10 +4384,15 @@ async fn run_coordinator(
                                 && ch.state == ChannelState::Unresponsive
                             {
                                 ch.state = ChannelState::Connected;
-                                if let Some(mut snap) = snapshots.get_mut(&ch.cid) {
-                                    snap.state = ChannelState::Connected;
-                                }
-                                let _ = ch.conn_tx.send(ConnectionEvent::Connected);
+                                // The down edge told the receiver no-rights;
+                                // C's connect handlers re-read the held
+                                // permits (`dbCa.c:875-876`,
+                                // `gatePv.cc:395-396`), a receiver has only
+                                // this event to read them from. Ahead of
+                                // `Connected`, as on a first connect; a
+                                // `wait_connected` begun in the window
+                                // returns here too.
+                                ch.announce_connected(&snapshots);
                                 recovered_cids.push(ch.cid);
                             }
                         }
@@ -4469,8 +4493,8 @@ async fn run_coordinator(
 }
 
 /// Which way a channel leaves the connected set. The two variants differ
-/// only in the terminal [`ChannelState`] and the snapshot treatment — i.e.
-/// in how the channel *recovers*. What the application sees is identical
+/// only in the terminal [`ChannelState`], the snapshot treatment and the
+/// cached rights — i.e. in how the channel *recovers*. The events are identical
 /// and deliberately so: C reaches `nciu::disconnectNotify` (`CA_OP_CONN_DOWN`)
 /// from both, so [`ConnectionEvent::Disconnected`] is the only event either
 /// path can emit.
@@ -4501,9 +4525,11 @@ impl DisconnectKind {
 /// **Invariant (MUST):** a channel that leaves the connected set — by TCP
 /// close, by `CA_PROTO_SERVER_DISCONN`, or by echo timeout — has its
 /// pending get/put IOs and its subscriptions failed with `ECA_DISCONN`,
-/// its cached access rights reset to no-rights, and emits the connection
-/// event followed by `AccessRightsChanged { read: false, write: false }`.
+/// and emits the connection event followed by
+/// `AccessRightsChanged { read: false, write: false }`.
 /// **MUST NOT:** any of those steps happen on one path and not another.
+/// The cached rights are the one difference, and it is C's: only a channel
+/// that leaves its circuit is reset to no-rights.
 ///
 /// In C all three paths converge on `nciu::unresponsiveCircuitNotify`
 /// (`nciu.cpp:161-182`), reached from `tcpiiu::disconnectAllChannels`
@@ -4559,29 +4585,26 @@ fn disconnect_channels(
         // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:184-195`)
         // clears both permits as the channel leaves the circuit, before any
         // callback runs, so a handler that reads the rights sees no-rights.
+        // An unresponsive channel stays on its circuit
+        // (`tcpiiu.cpp:929-937` only moves it to `unrespCircuit`), so its
+        // permits are held and `ca_write_access` keeps answering them.
         ch.state = kind.terminal_state();
-        ch.access_rights = NO_RIGHTS;
-        match kind {
-            DisconnectKind::CircuitGone => {
-                snapshots.remove(cid);
-            }
-            DisconnectKind::Unresponsive => {
-                if let Some(mut snap) = snapshots.get_mut(cid) {
-                    snap.state = ChannelState::Unresponsive;
-                    snap.access_rights = NO_RIGHTS;
-                }
-            }
+        if kind == DisconnectKind::CircuitGone {
+            ch.access_rights = NO_RIGHTS;
         }
         // Steps 3 and 4 — C `disconnectNotify` then
         // `accessRightsNotify(noRights)` (`nciu.cpp:170-177`), in that
         // order. Both kinds emit `Disconnected`: C has no third connection
         // state, and an event only the port can emit is an event no
         // consumer handles.
-        let _ = ch.conn_tx.send(ConnectionEvent::Disconnected);
-        let _ = ch.conn_tx.send(ConnectionEvent::AccessRightsChanged {
-            read: false,
-            write: false,
-        });
+        ch.announce(snapshots, ConnectionEvent::Disconnected);
+        ch.announce(
+            snapshots,
+            ConnectionEvent::AccessRightsChanged {
+                read: false,
+                write: false,
+            },
+        );
         per_channel(ch);
     }
 
@@ -4606,7 +4629,7 @@ fn handle_server_disconnect(
     snapshots: &ChannelSnapshots,
     exception_slot: &types::CaExceptionSlot,
 ) {
-    let mut pv_name = String::new();
+    let mut pv_name = PvString::default();
     let affected = disconnect_channels(
         channels,
         subscriptions,
@@ -4615,10 +4638,10 @@ fn handle_server_disconnect(
         DisconnectKind::CircuitGone,
         |ch| ch.cid == cid && ch.server_addr == Some(server_addr),
         |ch| {
-            pv_name = ch.pv_name.to_string();
+            pv_name = ch.pv_name.clone();
             let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
-                pv_name: ch.pv_name.to_string(),
+                pv_name: ch.pv_name.clone(),
                 reason: SearchReason::Reconnect,
             });
         },
@@ -4631,7 +4654,7 @@ fn handle_server_disconnect(
         exception_slot,
         types::CaException {
             kind: types::CaExceptionKind::ServerDisconnect,
-            message: "server-initiated channel close".to_string(),
+            message: b"server-initiated channel close".to_vec(),
             server_addr: Some(server_addr),
             pv_name: Some(pv_name),
             status: None,
@@ -4711,7 +4734,7 @@ fn handle_disconnect(
             // `initial_lane = reconnect_count.clamp(1, 8)`.
             let _ = search_tx.send(SearchRequest::Schedule {
                 cid: ch.cid,
-                pv_name: ch.pv_name.to_string(),
+                pv_name: ch.pv_name.clone(),
                 reason: SearchReason::Reconnect,
             });
         },
@@ -5228,6 +5251,37 @@ mod enum_readback_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod expand_shell_vars_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    #[serial(epics_env)]
+    fn a_value_is_spliced_in_as_bytes() {
+        let key = "EPICS_RS_TEST_SHELL_VAR_BYTES";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, std::ffi::OsStr::from_bytes(b"\xffb")) };
+        let out = expand_shell_vars(format!("é:${{{key}}}:$({key})").as_bytes());
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(out, b"\xc3\xa9:\xffb:\xffb");
+    }
+
+    #[test]
+    #[serial(epics_env)]
+    fn a_non_utf8_name_and_variable_name_expand_as_bytes() {
+        let key = std::ffi::OsStr::from_bytes(b"EPICS_RS_TEST_SHELL_VAR_\xff");
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, "v") };
+        let out = expand_shell_vars(b"a\xfe:${EPICS_RS_TEST_SHELL_VAR_\xff}");
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(out, b"a\xfe:v");
+    }
+}
+
 #[cfg(test)]
 mod ignore_servers_tests {
     use super::*;
@@ -5393,29 +5447,26 @@ mod addr_entry_tests {
     }
 }
 
-/// Apply libca-compatible PV-name expansion when
-/// `EPICS_CA_USE_SHELL_VARS=YES`.
-fn expand_pv_name(name: &str) -> String {
-    // EPICS_CA_USE_SHELL_VARS=YES expands ${VAR}/$(VAR) tokens in PV
-    // names against the process environment, matching libca behaviour.
+/// Apply PV-name expansion when `EPICS_CA_USE_SHELL_VARS=YES`. libca has no
+/// such variable; the name stays the caller's bytes either way.
+fn expand_pv_name(name: &[u8]) -> PvString {
     // Not an EPICS Base `ENV_PARAM` — it is in no `envDefs.h`, so there is no
     // compiled default and the caller owns the fallback (`getenv`-shaped).
     if epics_base_rs::runtime::env::get("EPICS_CA_USE_SHELL_VARS")
         .is_some_and(|v| v.eq_ignore_ascii_case("YES"))
     {
-        expand_shell_vars(name)
+        expand_shell_vars(name).into()
     } else {
-        name.to_string()
+        name.into()
     }
 }
 
-/// Expand shell-style `${VAR}` and `$(VAR)` references in `s` against the
-/// process environment. Unknown variables expand to the empty string,
-/// matching libca's expandedClient behaviour. Plain `$` and unmatched
-/// braces/parens are left intact.
-fn expand_shell_vars(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
+/// Expand shell-style `${VAR}` and `$(VAR)` references in `bytes` against
+/// the process environment. Unknown variables expand to the empty string.
+/// Plain `$` and unmatched braces/parens are left intact. A value is
+/// `getenv`'s bytes, spliced in unchecked.
+fn expand_shell_vars(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'$' && i + 1 < bytes.len() {
@@ -5426,18 +5477,27 @@ fn expand_shell_vars(s: &str) -> String {
             };
             if let Some(end) = close {
                 if let Some(j) = bytes[i + 2..].iter().position(|&b| b == end) {
-                    let name = &s[i + 2..i + 2 + j];
-                    let value = epics_base_rs::runtime::env::get(name).unwrap_or_default();
-                    out.push_str(&value);
+                    if let Some(value) = env_var_bytes(&bytes[i + 2..i + 2 + j]) {
+                        out.extend_from_slice(&value);
+                    }
                     i += 3 + j;
                     continue;
                 }
             }
         }
-        out.push(s.as_bytes()[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
+}
+
+/// `getenv` on a variable name given as bytes.
+fn env_var_bytes(name: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    let name = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(name);
+    #[cfg(not(unix))]
+    let name = std::str::from_utf8(name).ok()?;
+    epics_base_rs::runtime::env::get(name).map(|v| v.into_encoded_bytes())
 }
 
 /// Live SNI / cert-verification-name registry, shared between the
@@ -5522,7 +5582,7 @@ impl SniOverrides {
 /// the client.
 #[cfg(feature = "experimental-rust-tls")]
 fn parse_tls_sni_map() -> Vec<(SocketAddr, String)> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_CA_TLS_SNI_MAP") else {
+    let Some(list) = epics_base_rs::runtime::env::get_lossy("EPICS_CA_TLS_SNI_MAP") else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -5643,7 +5703,7 @@ pub(crate) fn parse_nameserver_list() -> Vec<AddrEntry> {
 /// unparseable entries. Reads at every call site so tests that mutate
 /// the env see the updated list without a process restart.
 pub(crate) fn epics_rs_client_ignore() -> Vec<Ipv4Addr> {
-    let Some(list) = epics_base_rs::runtime::env::get("EPICS_RS_CLIENT_IGNORE") else {
+    let Some(list) = epics_base_rs::runtime::env::get_lossy("EPICS_RS_CLIENT_IGNORE") else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -6039,86 +6099,6 @@ mod waiter_drain_tests {
 }
 
 #[cfg(test)]
-mod event_watcher_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    /// Wait for a condition driven by *another* executor.
-    ///
-    /// These tests run on a `current_thread` tokio runtime but the watcher
-    /// task runs on whatever backend the `runtime::task` seam selects — a
-    /// tokio worker by default, a background-executor band worker under
-    /// `exec_backend`. `yield_now()` only reschedules on *this* runtime,
-    /// so it establishes no happens-before edge with the other executor:
-    /// spinning on it is a race, not a wait. Poll with a real time budget
-    /// instead, which is a correct wait on either backend.
-    async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
-        for _ in 0..2_000 {
-            if cond() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("{label} (waited 2s)");
-    }
-
-    /// Dropping an `EventWatcher` must abort the spawned watcher task
-    /// (a bare `JoinHandle` would only detach, leaking the task). The
-    /// task here loops forever; after the guard drops, `is_finished()`
-    /// must become true.
-    #[tokio::test(flavor = "current_thread")]
-    async fn drop_aborts_watcher_task() {
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_in_task = ran.clone();
-        let handle = epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor")
-            .spawn(async move {
-                ran_in_task.store(true, Ordering::SeqCst);
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            });
-        let abort_handle = handle.abort_handle();
-        let watcher = EventWatcher { handle };
-        wait_for("watcher task should have started", || {
-            ran.load(Ordering::SeqCst)
-        })
-        .await;
-        assert!(
-            !abort_handle.is_finished(),
-            "task still running before drop"
-        );
-        drop(watcher);
-        wait_for("EventWatcher::drop must abort the watcher task", || {
-            abort_handle.is_finished()
-        })
-        .await;
-    }
-
-    /// `EventWatcher::abort()` is an explicit, named teardown that
-    /// behaves identically to dropping the guard.
-    #[tokio::test(flavor = "current_thread")]
-    async fn explicit_abort_stops_watcher_task() {
-        let handle = epics_base_rs::runtime::task::Reactor::current()
-            .expect("the test driver enters an executor")
-            .spawn(async move {
-                loop {
-                    tokio::task::yield_now().await;
-                }
-            });
-        let abort_handle = handle.abort_handle();
-        let watcher = EventWatcher { handle };
-        watcher.abort();
-        wait_for("EventWatcher::abort must stop the watcher task", || {
-            abort_handle.is_finished()
-        })
-        .await;
-    }
-}
-
-#[cfg(test)]
 mod typed_string_put_tests {
     use super::*;
 
@@ -6401,10 +6381,10 @@ mod disconnect_transition_tests {
         cid: u32,
         priority: u8,
     ) -> (ChannelInner, broadcast::Receiver<ConnectionEvent>) {
-        let (conn_tx, conn_rx) = broadcast::channel(16);
+        let (conn_tx, conn_rx) = state::ConnEvents::new(16);
         let ch = ChannelInner {
             cid,
-            pv_name: format!("TEST:PV{cid}"),
+            pv_name: format!("TEST:PV{cid}").into(),
             priority,
             state: ChannelState::Connected,
             sid: 7,
@@ -6415,7 +6395,6 @@ mod disconnect_transition_tests {
                 read: true,
                 write: true,
             },
-            connect_waiters: Vec::new(),
             conn_tx,
             reconnect_count: 0,
             last_connected_at: None,
@@ -6453,7 +6432,7 @@ mod disconnect_transition_tests {
             let in_flight = types::InFlightOps::new();
             let snapshots: ChannelSnapshots = Arc::new(dashmap::DashMap::new());
 
-            let raised: Arc<parking_lot::Mutex<Vec<(u32, String, types::ExceptionSite)>>> =
+            let raised: Arc<parking_lot::Mutex<Vec<(u32, Vec<u8>, types::ExceptionSite)>>> =
                 Arc::new(parking_lot::Mutex::new(Vec::new()));
             let sink = raised.clone();
             let slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
@@ -6488,8 +6467,8 @@ mod disconnect_transition_tests {
                 // sentence; `Source File:` is present because `genLocalExcep`
                 // always passes `__FILE__`/`__LINE__`.
                 assert!(
-                    !ctx.is_empty() && !ctx.contains("circuit"),
-                    "context: {ctx}"
+                    !ctx.is_empty() && !ctx.windows(7).any(|w| w == b"circuit"),
+                    "context: {ctx:?}"
                 );
                 assert_eq!(*source, types::LIBCA_CIRCUIT_DISCONNECT_SITE);
             }
@@ -6630,7 +6609,10 @@ mod disconnect_transition_tests {
 
         let ch = channels.get(&42).unwrap();
         assert_eq!(ch.state, ChannelState::Unresponsive);
-        assert!(!ch.access_rights.read && !ch.access_rights.write);
+        assert!(
+            ch.access_rights.read && ch.access_rights.write,
+            "an unresponsive channel keeps its permits (no setServerAddressUnknown)"
+        );
         assert_eq!(
             drain_events(&mut conn_rx),
             vec![

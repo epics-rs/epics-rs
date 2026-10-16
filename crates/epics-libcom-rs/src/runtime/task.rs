@@ -11,7 +11,7 @@ use tokio::runtime::RuntimeFlavor;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
 
-pub use crate::runtime::background::CallbackPriority;
+pub use crate::runtime::background::{CallbackPriority, OnBand};
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound.
@@ -51,28 +51,127 @@ impl std::fmt::Display for NotBlockable {
 
 impl std::error::Error for NotBlockable {}
 
-/// A [`Waker`] that unparks the thread that built it. The single owner of the
-/// "poll-then-park" wake mechanism in this crate: both [`park_on`] (the sync
-/// bridge) and the RTEMS future executor
-/// ([`crate::runtime::background::future_exec`]) drive a future by polling on a
-/// thread and parking it between polls, so both build one of these on their own
-/// thread and rely on the future's cross-thread waker to unpark them.
-pub(crate) struct ThreadWaker(std::thread::Thread);
+/// A [`Waker`] that unparks the thread that built it — the wake half of every
+/// "poll-then-park" driver ([`park_on`], asyn-rs's port reply wait). Get it
+/// through [`ThreadDrive`].
+///
+/// `woken` is what the driver waits on, not the thread's unpark token: a
+/// `thread::park`-based wait inside the driven future (a std `mpsc` receive,
+/// an [`Event`](crate::runtime::sync::Event)) consumes that token, and a driver
+/// that trusted it would park through the wake it was owed.
+struct ThreadWaker {
+    thread: std::thread::Thread,
+    woken: std::sync::atomic::AtomicBool,
+}
 
 impl ThreadWaker {
-    /// A waker over the *current* thread — call this on the thread that will
-    /// park.
-    pub(crate) fn for_current_thread() -> Waker {
-        Waker::from(Arc::new(ThreadWaker(std::thread::current())))
+    fn current() -> Self {
+        Self {
+            thread: std::thread::current(),
+            woken: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Park until this waker fires, `deadline` passes, or `should_cancel`
+    /// holds after an unpark. Consumes the wake.
+    fn wait(&self, deadline: Option<std::time::Instant>, mut should_cancel: impl FnMut() -> bool) {
+        use std::sync::atomic::Ordering;
+        while !self.woken.swap(false, Ordering::Acquire) {
+            match deadline {
+                None => std::thread::park(),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    std::thread::park_timeout(left);
+                }
+            }
+            if should_cancel() {
+                return;
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Built once per thread, so a park costs a refcount, not an allocation:
+    /// C's `periodicTask` waits on an `epicsEvent` it created once.
+    static DRIVE: Arc<ThreadWaker> = Arc::new(ThreadWaker::current());
+}
+
+/// The waker over the *current* thread. Drivers get it through
+/// [`ThreadDrive`], which owns the re-arm a nested drive needs.
+fn current_thread_waker() -> Waker {
+    // Only a park from another thread-local's destructor finds it gone.
+    DRIVE
+        .try_with(|drive| Waker::from(Arc::clone(drive)))
+        .unwrap_or_else(|_| Waker::from(Arc::new(ThreadWaker::current())))
+}
+
+/// One poll-then-park drive on this thread: the waker to poll with and the
+/// wait between polls.
+///
+/// Every drive on a thread shares that thread's one `woken` flag, so a drive
+/// run inside another's poll can consume the wake owed to the outer one. A
+/// completed inner drive never leaves the outer drive's wake consumed: drop
+/// re-arms the flag, which costs the outer drive at most one spurious re-poll.
+pub struct ThreadDrive {
+    waker: Waker,
+}
+
+impl ThreadDrive {
+    /// Start a drive on the calling thread.
+    pub fn enter() -> Self {
+        Self {
+            waker: current_thread_waker(),
+        }
+    }
+
+    /// The waker to poll the driven future with.
+    pub fn waker(&self) -> &Waker {
+        &self.waker
+    }
+
+    /// Park until this thread's waker has been woken since the last return,
+    /// or `deadline` passes. A spurious return only costs a re-poll.
+    pub fn park(&self, deadline: Option<std::time::Instant>) {
+        wait_for_wake(deadline, || false);
+    }
+}
+
+impl Drop for ThreadDrive {
+    fn drop(&mut self) {
+        let _ = DRIVE.try_with(|drive| {
+            drive
+                .woken
+                .store(true, std::sync::atomic::Ordering::Release)
+        });
+    }
+}
+
+fn wait_for_wake(deadline: Option<std::time::Instant>, should_cancel: impl FnMut() -> bool) {
+    if DRIVE
+        .try_with(|drive| drive.wait(deadline, should_cancel))
+        .is_err()
+    {
+        // The fallback waker's flag is not reachable from here: one park.
+        match deadline {
+            None => std::thread::park(),
+            Some(deadline) => std::thread::park_timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            ),
+        }
     }
 }
 
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
-        self.0.unpark();
+        self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
+        self.woken.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.unpark();
     }
 }
 
@@ -95,8 +194,8 @@ pub(crate) fn park_on_interruptible<F: Future>(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Option<F::Output> {
     let mut fut = std::pin::pin!(fut);
-    let waker = ThreadWaker::for_current_thread();
-    let mut cx = Context::from_waker(&waker);
+    let drive = ThreadDrive::enter();
+    let mut cx = Context::from_waker(drive.waker());
     loop {
         if should_cancel() {
             return None;
@@ -104,7 +203,7 @@ pub(crate) fn park_on_interruptible<F: Future>(
         if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
             return Some(value);
         }
-        std::thread::park();
+        wait_for_wake(None, &mut should_cancel);
     }
 }
 
@@ -303,7 +402,10 @@ pub fn test_block_on<F: Future>(fut: F) -> F::Output {
         .enable_all()
         .build()
         .expect("failed to build tokio test runtime")
-        .block_on(fut)
+        .block_on(async {
+            adopt_current_runtime();
+            fut.await
+        })
 }
 
 /// `exec_backend` twin of [`test_block_on`]: see the `tokio_backend` copy for
@@ -314,6 +416,38 @@ pub fn test_block_on<F: Future>(fut: F) -> F::Output {
 #[cfg(exec_backend)]
 pub fn test_block_on<F: Future>(fut: F) -> F::Output {
     park_on(fut)
+}
+
+thread_local! {
+    static TEST_IOC_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` on a fresh IOC thread, the kind a record processes on, and hand
+/// back its result or its panic. A test that counts allocations counts here:
+/// [`enter_ioc_thread`] built this thread's park and drive state, which a
+/// libtest thread builds inside the count — on its first contended park
+/// `parking_lot_core` also grows its table at live-thread thresholds
+/// (6, 11, 22, 43, 86, …), so the count depends on how many tests run beside
+/// it.
+pub fn test_ioc_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joined = MandatoryThread::new("scan-test", ThreadPriority::ScanLow, StackSizeClass::Big)
+        .spawn(move || {
+            TEST_IOC_THREAD.with(|t| t.set(true));
+            let _ = tx.send(f());
+        })
+        .join();
+    match joined {
+        Ok(()) => rx.recv().expect("the IOC thread returned"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// `true` inside [`test_ioc_thread`]. A counting test asserts it where it
+/// reads its count, so a count taken on any other thread fails rather than
+/// flakes.
+pub fn in_test_ioc_thread() -> bool {
+    TEST_IOC_THREAD.with(std::cell::Cell::get)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +577,14 @@ pub fn background_scan_once_start() {
     background().scan_once().start();
 }
 
+/// Stop and join the `scanOnce` worker — the end of C `scanStop`
+/// (`dbScan.c:178-180`). A process that never built the executor has none.
+pub fn background_scan_once_stop() {
+    if let Some(exec) = BACKGROUND.get() {
+        exec.scan_once().stop();
+    }
+}
+
 /// Ring statistics for the `scanOnce` facility, or `None` before the
 /// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
 /// and its `if (!onceQ) return -1` guard.
@@ -496,14 +638,30 @@ where
 }
 
 /// [`spawn_background`] for a blocking closure — runs it on a callback-pool
-/// worker of the named band.
+/// worker of the named band, holding that worker for the whole run. For work
+/// that belongs on the band (C `callbackRequest`); `f` gets the [`OnBand`]
+/// such work takes. Blocking work that merely must not block a task is
+/// [`spawn_blocking`]'s.
 pub fn spawn_blocking_background<F, R>(priority: CallbackPriority, f: F) -> BackgroundTaskHandle<R>
 where
-    F: FnOnce() -> R + Send + 'static,
+    F: FnOnce(OnBand) -> R + Send + 'static,
     R: Send + 'static,
 {
     use crate::runtime::background::spawn_blocking_on;
     spawn_blocking_on(&background().callbacks().handle(), priority, f)
+}
+
+/// Queue a requester-owned [`CallbackCell`] on the process-global pool's
+/// `priority` band — C `callbackRequest` (`callback.c:341`). Unlike
+/// [`spawn_background`] this allocates nothing per request; a cell already
+/// queued is taken by its pending run.
+///
+/// [`CallbackCell`]: crate::runtime::background::CallbackCell
+pub fn request_cell<B: crate::runtime::background::CallbackBody>(
+    priority: CallbackPriority,
+    cell: &Arc<crate::runtime::background::CallbackCell<B>>,
+) -> Result<(), crate::runtime::background::CallbackError> {
+    background().callbacks().request_cell(priority, cell)
 }
 
 /// Sleep on the process-global delayed-callback timer — C
@@ -678,22 +836,15 @@ impl Reactor {
         }
     }
 
-    /// [`Reactor::spawn`] for a blocking closure. A bound executor takes it on
-    /// one of its own workers; with none bound this is
-    /// [`spawn_blocking_background`] verbatim, middle band.
+    /// [`Reactor::spawn`] for a blocking closure: [`spawn_blocking`], bound
+    /// executor or not, because a closure that blocks on an executor's worker
+    /// or a band's stalls every future queued behind it.
     pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        match &self.exec {
-            Some(exec) => crate::runtime::background::spawn_blocking_on(
-                &exec.handle(),
-                CallbackPriority::Medium,
-                f,
-            ),
-            None => spawn_blocking_background(CallbackPriority::Medium, f),
-        }
+        spawn_blocking(f)
     }
 }
 
@@ -730,36 +881,81 @@ pub async fn yield_now() {
 /// Run a blocking closure on a worker thread.
 ///
 /// **Not the reactor capability.** What this needs is a pool of threads that
-/// may block, not the I/O and time drivers, and the two are different
-/// requirements even though tokio happens to hang both off one runtime: on a
-/// hosted build this is `tokio::task::spawn_blocking`, which does require a
-/// runtime entered on the calling thread, and on `exec_backend` it is the
-/// callback pool, which requires nothing. That residual dual meaning is why
-/// [`Reactor::spawn_blocking`] exists beside it — a site that already holds a
-/// [`Reactor`] should use that one and say so in its signature. This free
-/// function stays for the callers whose work is reactor-free by nature
-/// (`runtime::fs`, `waitpid`, a name lookup) and for whom a process-global
-/// blocking pool, which this crate does not yet have, would be the right
-/// destination.
+/// may block, not the I/O and time drivers. On a hosted build that is the
+/// blocking pool of the runtime entered on this thread, or, from a thread with
+/// none (a callback band, a plain thread), of the runtime
+/// [`adopt_current_runtime`] last named; on `exec_backend` it is
+/// [`offload::BLOCKING`]. Neither needs the caller to be on a runtime. A site
+/// that already holds a [`Reactor`] uses [`Reactor::spawn_blocking`] and says
+/// so in its signature.
+///
+/// [`offload::BLOCKING`]: crate::runtime::offload::BLOCKING
 #[cfg(tokio_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    blocking_runtime().spawn_blocking(f)
 }
 
-/// RTEMS: the callback pool, which needs no runtime — see the `tokio_backend`
-/// copy for why this one is not the reactor capability. Middle band: this is
-/// the ambient `spawn_blocking`, which no record reaches.
+/// The runtime [`spawn_blocking`] uses from a thread with none entered.
+#[cfg(tokio_backend)]
+static BLOCKING_RUNTIME: std::sync::Mutex<Option<RuntimeHandle>> = std::sync::Mutex::new(None);
+
+/// Name the runtime entered on this thread as the one whose blocking pool
+/// [`spawn_blocking`] uses from threads with none: called where a runtime
+/// starts (`#[epics_main]`, [`test_block_on`], the IOC's `run`). The latest
+/// call wins. A no-op with no runtime entered, and on `exec_backend`, whose
+/// blocking pool needs no runtime.
+pub fn adopt_current_runtime() {
+    #[cfg(tokio_backend)]
+    if let Ok(handle) = RuntimeHandle::try_current() {
+        *BLOCKING_RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+}
+
+/// The current runtime; else the adopted one; else, when nothing has adopted
+/// one, the first runtime a call was made on; else a runtime of this crate's
+/// own, kept for blocking work only, so the seam never panics.
+#[cfg(tokio_backend)]
+fn blocking_runtime() -> RuntimeHandle {
+    let current = RuntimeHandle::try_current().ok();
+    let mut adopted = BLOCKING_RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = current {
+        adopted.get_or_insert_with(|| current.clone());
+        return current;
+    }
+    adopted
+        .get_or_insert_with(|| {
+            static OWN: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+            OWN.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("blockingRt")
+                    .enable_all()
+                    .build()
+                    .expect("the blocking-work runtime starts")
+            })
+            .handle()
+            .clone()
+        })
+        .clone()
+}
+
+/// RTEMS: the process-global [`offload::BLOCKING`] pool, which needs no
+/// runtime and holds no callback band — see the `tokio_backend` copy for why
+/// this one is not the reactor capability. Work that belongs on a band (C
+/// `callbackRequest`) is [`spawn_blocking_background`]'s.
+///
+/// [`offload::BLOCKING`]: crate::runtime::offload::BLOCKING
 #[cfg(exec_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    spawn_blocking_background(CallbackPriority::Medium, f)
+    crate::runtime::background::spawn_blocking_offloaded(&crate::runtime::offload::BLOCKING, f)
 }
 
 /// A set of spawned tasks, joined as they complete — the seam replacement for
@@ -1138,17 +1334,14 @@ pub fn runtime_handle() -> tokio::runtime::Handle {
 // threads). `apply_to_current_thread` reports whether the OS actually
 // honoured the request.
 //
-// (c) is opt-in and off by default — see `RT_PRIORITY_ENV`. C's switch
-// (`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`) defaults to YES because
-// a C IOC is deployed onto a machine chosen for it; this crate is just as
-// often linked into a desktop tool, where a silent SCHED_FIFO request is
-// either a guaranteed failure or a way to starve the box.
+// (c) is on by default, as C's `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`
+// is — see `C_RT_PRIORITY_ENV`.
 // ---------------------------------------------------------------------------
 
 /// Minimum EPICS thread priority (`epicsThreadPriorityMin`).
-pub const PRIORITY_MIN: u8 = 0;
+pub const PRIORITY_MIN: u32 = 0;
 /// Maximum EPICS thread priority (`epicsThreadPriorityMax`).
-pub const PRIORITY_MAX: u8 = 99;
+pub const PRIORITY_MAX: u32 = 99;
 
 /// EPICS thread priority — an integer `0..=99` with the named levels
 /// from `epicsThreadPriority*` (`epicsThread.h:73-83`). Lower values
@@ -1172,21 +1365,22 @@ pub enum ThreadPriority {
     High,
     /// `epicsThreadPriorityIocsh` = 91.
     Iocsh,
-    /// An explicit priority value, clamped to `0..=99` on use.
-    Custom(u8),
+    /// An explicit priority value, kept as given: C stores any `unsigned
+    /// int` as `osiPriority` (`osdThread.c:219`) and scales it unclamped.
+    Custom(u32),
 }
 
 impl ThreadPriority {
-    /// The raw EPICS priority value `0..=99`, matching the
-    /// `epicsThreadPriority*` constants in `epicsThread.h`.
+    /// The raw EPICS priority value, matching the `epicsThreadPriority*`
+    /// constants in `epicsThread.h`; a [`Custom`](Self::Custom) one as given.
     ///
     /// `const` so a server can *derive* its band from the named one C derives
     /// it from — `CaServerLow - 2` rather than a bare `18` with a comment
     /// asserting the two are the same number. C builds exactly that ladder at
     /// `caservertask.c:563-575`; restating its output as a literal is how the
     /// ladder and its constants come to disagree.
-    pub const fn value(self) -> u8 {
-        let v = match self {
+    pub const fn value(self) -> u32 {
+        match self {
             ThreadPriority::Low => 10,
             ThreadPriority::CaServerLow => 20,
             ThreadPriority::CaServerHigh => 40,
@@ -1196,9 +1390,7 @@ impl ThreadPriority {
             ThreadPriority::High => 90,
             ThreadPriority::Iocsh => 91,
             ThreadPriority::Custom(v) => v,
-        };
-        // `Ord::min` is not `const`; the clamp is the same one.
-        if v > PRIORITY_MAX { PRIORITY_MAX } else { v }
+        }
     }
 }
 
@@ -1262,14 +1454,128 @@ impl StackSizeClass {
     }
 }
 
+/// A thread's stack: a class, or the byte count a C driver passes to
+/// `epicsThreadCreate` (asyn's port threads, FTDI's 500000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackSpec {
+    Class(StackSizeClass),
+    Bytes(usize),
+}
+
+impl StackSpec {
+    /// C `epicsThreadCreateOpt`'s reading of its `stackSize`
+    /// (`osdThread.c:602-603`): 0, 1, 2 are `epicsThreadStackSmall`, `Medium`,
+    /// `Big` (`epicsThread.h:92`), anything else is bytes.
+    pub fn from_c(raw: usize) -> Self {
+        match raw {
+            0 => Self::Class(StackSizeClass::Small),
+            1 => Self::Class(StackSizeClass::Medium),
+            2 => Self::Class(StackSizeClass::Big),
+            n => Self::Bytes(n),
+        }
+    }
+
+    /// The bytes the builder gets: a class as [`StackSizeClass::bytes`], a
+    /// byte count as given. A count `pthread_attr_setstacksize` refuses
+    /// (below `PTHREAD_STACK_MIN`) gets the attr's default, as C's thread does
+    /// when it prints the `EINVAL` and goes on (`osdThread.c:213-214`).
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Class(class) => class.bytes(),
+            Self::Bytes(n) => pthread_refused_stack(n).unwrap_or(n),
+        }
+    }
+
+    fn refused(self) -> bool {
+        matches!(self, Self::Bytes(n) if pthread_refused_stack(n).is_some())
+    }
+}
+
+/// C's `checkStatusOnce(status, message)` line (`osdThread.c:116-118`), which
+/// C writes to stderr: `"%s error %s\n"` with `strerror(status)`. Every status
+/// the port reports is EINVAL, so the errno stays behind this one cfg boundary.
+fn einval_status_line(message: &str) -> String {
+    #[cfg(unix)]
+    // SAFETY: `strerror` returns a NUL-terminated string that stays valid
+    // until the next `strerror` call; it is copied out at once.
+    let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(libc::EINVAL)) }
+        .to_string_lossy()
+        .into_owned();
+    // The MSVC and MinGW CRTs' `strerror(EINVAL)`.
+    #[cfg(not(unix))]
+    let text = "Invalid argument";
+    format!("{message} error {text}")
+}
+
+/// The stack a fresh `pthread_attr_t` carries, which is what a C thread keeps
+/// when its `stackSize` is refused.
+#[cfg(unix)]
+fn pthread_default_stack_bytes() -> usize {
+    // SAFETY: `attr` is initialised by `pthread_attr_init` before it is read
+    // and destroyed once; `bytes` is a valid out-pointer.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        libc::pthread_attr_init(&mut attr);
+        let mut bytes = 0;
+        libc::pthread_attr_getstacksize(&attr, &mut bytes);
+        libc::pthread_attr_destroy(&mut attr);
+        bytes
+    }
+}
+
+/// The stack a thread asking for `n` bytes gets instead, when
+/// `pthread_attr_setstacksize` refuses `n` (below `PTHREAD_STACK_MIN`).
+#[cfg(unix)]
+fn pthread_refused_stack(n: usize) -> Option<usize> {
+    // libc gives rtems a minimum of 0: nothing is refused there.
+    match libc::PTHREAD_STACK_MIN {
+        0 => None,
+        min => (n < min).then(pthread_default_stack_bytes),
+    }
+}
+
+/// No pthread attr off unix, so no size is refused.
+#[cfg(not(unix))]
+fn pthread_refused_stack(_n: usize) -> Option<usize> {
+    None
+}
+
+impl From<StackSizeClass> for StackSpec {
+    fn from(class: StackSizeClass) -> Self {
+        Self::Class(class)
+    }
+}
+
+/// The calling thread's stack size as `pthread_getattr_np` reports it — the
+/// readback a test needs to see what [`StackSpec`] a thread was given.
+/// `None` where glibc's call is unavailable.
+pub fn current_thread_stack_bytes() -> Option<usize> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `attr` is initialised by `pthread_getattr_np` before it is read
+    // and destroyed once; both out-pointers are valid locals.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        (rc == 0).then_some(size)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    None
+}
+
 /// Outcome of a best-effort OS-scheduler priority change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityApplied {
     /// The OS scheduler honoured the requested priority (real-time
     /// SCHED_FIFO band applied).
     Realtime,
-    /// Real-time scheduling was never requested: the opt-in switch
-    /// [`RT_PRIORITY_ENV`] is off, so **no scheduler call was made at
+    /// Real-time scheduling was never requested: the switch
+    /// ([`C_RT_PRIORITY_ENV`]) is off, so **no scheduler call was made at
     /// all** and the thread keeps the process default policy.
     Disabled,
     /// The platform does not expose a portable scheduler priority API
@@ -1290,30 +1596,23 @@ impl PriorityApplied {
     }
 }
 
-/// Environment switch that opts this process in to real-time (SCHED_FIFO)
-/// scheduling for the IOC threads that carry an EPICS priority.
-///
-/// The switch is read in both directions on every target; what differs is
-/// what it defaults to when unset — see [`DEFAULT_POLICY`].
-///
-/// Accepted "on" values, case-insensitive: `YES`, `TRUE`, `ON`, `1`.
-/// Any other *explicit* value is off.
-///
-/// # Relationship to the C switch
-///
-/// C base has the same concept under
-/// `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` (`envDefs.h:80`, read at
-/// `osdThread.c:389`), and `envGetBoolConfigParam` (`envSubr.c:331`) accepts
-/// only case-insensitive `yes`. We deliberately do **not** reuse that name:
-/// its base default is `YES` on every target (`configure/CONFIG_ENV:57`)
-/// while ours is `YES` only on RTEMS, so one name would carry two different
-/// defaults on a hosted build depending on which implementation read it.
+/// C's switch for real-time (SCHED_FIFO) scheduling of the IOC threads that
+/// carry an EPICS priority (`envDefs.h:80`, read once at `osdThread.c:389`).
+/// Unset it is `YES` (`configure/CONFIG_ENV:57`); set, only a case-insensitive
+/// `yes` turns it on (`envSubr.c:331`), and an empty value leaves it off
+/// (`envSubr.c:92-95` hands `envGetBoolConfigParam` no value, so
+/// `wantPrioScheduling` keeps its initial 0, `osdThread.c:97`).
+pub const C_RT_PRIORITY_ENV: &str = "EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING";
+
+/// This port's earlier name for [`C_RT_PRIORITY_ENV`], honoured only when C's
+/// is unset. Accepted "on" values, case-insensitive and trimmed: `YES`,
+/// `TRUE`, `ON`, `1`; any other value is off.
 pub const RT_PRIORITY_ENV: &str = "EPICS_RS_ALLOW_RT_PRIORITY";
 
 /// Whether this process may ask the OS for real-time scheduling.
 ///
-/// Resolved from [`RT_PRIORITY_ENV`] exactly once per process by
-/// [`RtPolicy::current`]. It is a *parameter* of
+/// Resolved from [`C_RT_PRIORITY_ENV`] and [`RT_PRIORITY_ENV`] exactly once per
+/// process by [`RtPolicy::current`]. It is a *parameter* of
 /// [`apply_to_current_thread_under`] rather than a check buried inside the
 /// syscall wrapper, so "switch off ⟹ no scheduler call" is a property of
 /// the call graph and not of a runtime branch some future caller can skip.
@@ -1325,89 +1624,52 @@ pub enum RtPolicy {
     AllowRealtime,
 }
 
-/// What [`RT_PRIORITY_ENV`] means when it is **unset**, for the target this
-/// was compiled for.
-///
-/// `AllowRealtime` on RTEMS, `Disabled` everywhere else. The asymmetry is
-/// deliberate and is a property of the default itself — not a `setenv` the
-/// boot shim performs before `main()`. A `setenv` is a runtime side effect any
-/// later caller can undo or reorder, and a variable one component writes for
-/// another to read is the dual-meaning shape this code keeps removing.
-///
-/// Why the embedded targets differ from hosted:
-///
-///   - Base's own equivalent switch,
-///     `EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING`, defaults to `YES`
-///     (`configure/CONFIG_ENV:57`). An IOC that honours its priorities is
-///     upstream's default posture, not an opt-in.
-///   - The opt-in gate exists for RT-Linux, where asking for SCHED_FIFO needs
-///     `CAP_SYS_NICE` or a non-zero `RLIMIT_RTPRIO` (so on a desktop the
-///     request merely fails), and where a runaway RT band on a box that
-///     *grants* it can wedge a developer's machine. Neither failure mode
-///     exists on RTEMS or VxWorks: there is no RLIMIT_RTPRIO, no
-///     `CAP_SYS_NICE` gate, and no desktop to wedge on either.
-///   - The band invariant is now a test rather than a hope —
-///     `rtems_priority_map_stays_below_the_libbsd_network_band` proves every
-///     u8 input lands in core 100..199, at or below libbsd's default band and
-///     strictly less urgent than IRQS(96)/TIME(98).
-///   - **VxWorks is measurement-backed, not assumed.** On the bring-up box
-///     (VxWorks 7, `x86_64-wrs-vxworks`), 11 of 11 measured threads landed
-///     `PriorityApplied::Realtime` via `SCHED_FIFO`, exactly one scheduler
-///     call each, at `posix = 56 + epics` — the same POSIX value RTEMS gets
-///     (see `map_epics_priority_rtems`) — which VxWorks's own POSIX layer
-///     then inverts into its native task-priority space at `vx = 199 -
-///     epics`, exact: EPICS base's own vxWorks-port formula
-///     (`vxWorks/osdThread.c:99`), reached by construction rather than by
-///     restating it (see `map_epics_priority_vxworks`).
-///
-/// An explicit value still wins in **both** directions on every target, so
-/// `EPICS_RS_ALLOW_RT_PRIORITY=NO` turns it off on RTEMS or VxWorks.
-pub const DEFAULT_POLICY: RtPolicy = default_policy(cfg!(epics_embedded_target));
-
-/// [`DEFAULT_POLICY`] as a pure function of the one target fact it depends
-/// on, so both arms are reachable from a host test run. A host CI will never
-/// execute the RTEMS arm otherwise, and an untested default is exactly the
-/// kind that drifts.
-const fn default_policy(on_rtems: bool) -> RtPolicy {
-    if on_rtems {
-        RtPolicy::AllowRealtime
-    } else {
-        RtPolicy::Disabled
-    }
-}
+/// What an unset switch means: on, on every target, as C's
+/// `configure/CONFIG_ENV:57` default is. Where the process may not use
+/// SCHED_FIFO the request falls back to the default policy silently, as C's
+/// does (`osdThread.c:276-288`, `:646-647`).
+pub const DEFAULT_POLICY: RtPolicy = RtPolicy::AllowRealtime;
 
 impl RtPolicy {
-    /// Parse a raw switch value (`None` = unset ⇒ [`DEFAULT_POLICY`]).
-    pub fn from_env_value(raw: Option<&str>) -> RtPolicy {
-        Self::resolve(raw, DEFAULT_POLICY)
-    }
-
-    /// [`Self::from_env_value`] with the unset-default injected, so a host
-    /// test can ask what an RTEMS process would do with the same input.
-    pub fn resolve(raw: Option<&str>, default: RtPolicy) -> RtPolicy {
-        let Some(raw) = raw else {
-            return default;
-        };
-        let v = raw.trim();
-        let on = v.eq_ignore_ascii_case("yes")
-            || v.eq_ignore_ascii_case("true")
-            || v.eq_ignore_ascii_case("on")
-            || v == "1";
-        if on {
-            RtPolicy::AllowRealtime
-        } else {
-            RtPolicy::Disabled
+    /// Resolve the two switches: C's name wins whenever it is set, the alias
+    /// only when C's is unset, and [`DEFAULT_POLICY`] when neither is.
+    ///
+    /// The values are raw bytes, as C's `getenv` hands them over: a value that
+    /// is not UTF-8 is set, and not `yes`.
+    pub fn from_env(
+        c_switch: Option<&std::ffi::OsStr>,
+        alias: Option<&std::ffi::OsStr>,
+    ) -> RtPolicy {
+        match (c_switch.map(|c| c.as_encoded_bytes()), alias) {
+            (Some(c), _) if c.eq_ignore_ascii_case(b"yes") => RtPolicy::AllowRealtime,
+            (Some(_), _) => RtPolicy::Disabled,
+            (None, Some(alias)) => {
+                let v = alias.as_encoded_bytes().trim_ascii();
+                let on = v.eq_ignore_ascii_case(b"yes")
+                    || v.eq_ignore_ascii_case(b"true")
+                    || v.eq_ignore_ascii_case(b"on")
+                    || v == b"1";
+                if on {
+                    RtPolicy::AllowRealtime
+                } else {
+                    RtPolicy::Disabled
+                }
+            }
+            (None, None) => DEFAULT_POLICY,
         }
     }
 
-    /// The process-wide policy, read from [`RT_PRIORITY_ENV`] on first use
-    /// and cached. Caching matches C, which resolves its switch once in
+    /// The process-wide policy, read from the environment on first use and
+    /// cached. Caching matches C, which resolves its switch once in
     /// `epicsThreadInit` (`osdThread.c:389`), and keeps later `set_var`
     /// calls from changing the scheduling of threads already running.
     pub fn current() -> RtPolicy {
         static POLICY: std::sync::OnceLock<RtPolicy> = std::sync::OnceLock::new();
         *POLICY.get_or_init(|| {
-            RtPolicy::from_env_value(std::env::var(RT_PRIORITY_ENV).ok().as_deref())
+            RtPolicy::from_env(
+                super::env::get(C_RT_PRIORITY_ENV).as_deref(),
+                super::env::get(RT_PRIORITY_ENV).as_deref(),
+            )
         })
     }
 }
@@ -1436,8 +1698,8 @@ impl RtPolicy {
 /// On other targets the priority enum + API surface still exist but `apply`
 /// reports [`PriorityApplied::Unsupported`] — no band has been measured there.
 ///
-/// Opt-in: real-time scheduling is only ever requested when
-/// [`RT_PRIORITY_ENV`] is set (see [`RtPolicy`]). With the switch off this
+/// Real-time scheduling is requested only while the switch is on (see
+/// [`RtPolicy`]); it is on unless turned off. With the switch off this
 /// returns [`PriorityApplied::Disabled`] without calling the OS at all.
 pub fn apply_to_current_thread(priority: ThreadPriority) -> PriorityApplied {
     apply_to_current_thread_under(RtPolicy::current(), priority)
@@ -1463,13 +1725,24 @@ pub fn apply_to_current_thread_under(
 thread_local! {
     /// C `epicsThreadOSD::isOkToBlock` (`osdThread.c`).
     ///
-    /// `true` here and `false` set by [`enter_ioc_thread`] reproduces C's two
-    /// defaults without a second registry: `create_threadInfo` `calloc`s the
-    /// field to 0 for every `epicsThreadCreate` thread, and `createImplicit`
-    /// (`osdThread.c:710`) sets it to 1 for every thread that reaches the
-    /// epicsThread API without having been created by it. Our EPICS threads are
-    /// exactly the ones that pass the prologue.
-    static OK_TO_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// `false` for every thread, as C leaves it for every `epicsThreadCreate`
+    /// thread and for `_main_`, which is `calloc`ed (`osdThread.c:406`); only
+    /// an iocsh scope and `iocInit` raise it, as in C. C's `createImplicit`
+    /// default of 1 (`osdThread.c:710`) is deliberately not taken: it is for
+    /// foreign OS threads, which do not exist here, and the only threads this
+    /// port did not create are async executor workers, where an `errlog_flush`
+    /// wait would block the executor.
+    static OK_TO_BLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The refusal of a binary that cannot run on the backend this build selects:
+/// `message` on stderr, then exit status 1, because a binary that refuses to
+/// start has failed to start. Every such refusal goes through here, which is
+/// how `target-cfg-gate` finds them: a test that runs the binary must be
+/// declared under a cfg where the call is compiled out.
+pub fn refuse_backend(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1)
 }
 
 /// C `epicsThreadIsOkToBlock` (`osdThread.c:1145-1150`).
@@ -1486,10 +1759,8 @@ pub fn thread_is_ok_to_block() -> bool {
 /// C `epicsThreadSetOkToBlock` (`osdThread.c:1152-1157`).
 ///
 /// C's callers are `iocsh` around a script (`iocsh.cpp:1122`, restored at
-/// `:1327`) and `iocInit` (`iocInit.c:126`): both raise a thread that WAS
-/// created by `epicsThreadCreate` back to blocking for the duration of a boot,
-/// because a boot is not real-time work. A thread that never passed
-/// [`enter_ioc_thread`] is already blocking and needs no call.
+/// `:1327`) and `iocInit` (`iocInit.c:126`): both raise their thread to
+/// blocking for the duration of a boot, because a boot is not real-time work.
 pub fn set_thread_ok_to_block(ok: bool) {
     OK_TO_BLOCK.with(|c| c.set(ok));
 }
@@ -1498,7 +1769,7 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// its role: publish its name to the OS, then request its scheduling band.
 ///
 /// Two things a thread owes the operator, and they have different gates.
-/// The band is opt-in ([`RT_PRIORITY_ENV`]) and best effort. The **name** is
+/// The band follows the switch ([`C_RT_PRIORITY_ENV`]) and is best effort. The **name** is
 /// unconditional: a thread that cannot be identified in a task listing
 /// cannot be diagnosed, and on RTEMS that listing is often the only
 /// instrument there is — bring-up had to measure libbsd's priority band by
@@ -1528,20 +1799,41 @@ pub fn set_thread_ok_to_block(ok: bool) {
 /// invisible to that census, and the census output says so in its own header.
 pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
-    // C `create_threadInfo` leaves `isOkToBlock` at 0 for every thread
-    // `epicsThreadCreate` makes, and `iocsh` raises it back to 1 for the
-    // thread running a shell (`iocsh.cpp:1122`, restored at `:1327`) — as
-    // does `iocInit` for the thread that boots (`iocInit.c:126`), which here
-    // is that same thread running the script's `iocInit` line. The band is
-    // the identity: `ThreadPriority::Iocsh` is taken by the three iocsh
-    // threads and by nothing else, which `ioc_app.rs`'s
-    // `iocsh_threads_take_the_iocsh_band` pins. Deciding it here rather than
-    // at those three spawns keeps one owner for the flag, so a fourth shell
-    // cannot start without it.
-    set_thread_ok_to_block(priority == ThreadPriority::Iocsh);
+    build_park_state();
+    build_drive_state();
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
     band_and_register(priority)
+}
+
+/// `parking_lot_core` builds a thread's park state on its first park, and
+/// that thread grows the process-wide table whenever live threads outgrow it:
+/// two allocations, inside whichever lock acquire first met contention — a
+/// record hold's errlog post, say. Building it at entry keeps them there.
+fn build_park_state() {
+    let key = 0u8;
+    // SAFETY: the key is this frame's address, which no other thread parks
+    // on, and `validate` refuses, so the call returns without sleeping and
+    // without running the other callbacks.
+    unsafe {
+        parking_lot_core::park(
+            std::ptr::from_ref(&key) as usize,
+            || false,
+            || {},
+            |_, _| {},
+            parking_lot_core::DEFAULT_PARK_TOKEN,
+            None,
+        );
+    }
+}
+
+/// A thread's first [`block_on_sync`] builds the thread-locals it reads: the
+/// [`current_thread_waker`] (an `Arc`) and tokio's runtime context, each with
+/// the node glibc callocs to drop it at thread exit — inside a scan thread's
+/// first pass. Building them at entry keeps all three here.
+fn build_drive_state() {
+    drop(current_thread_waker());
+    let _ = RuntimeHandle::try_current();
 }
 
 /// C `epicsThreadSetPriority(epicsThreadGetIdSelf(), prio)` on a thread that
@@ -1787,13 +2079,114 @@ pub fn resume_thread(id: u64) -> bool {
         .is_some_and(|t| t.resume())
 }
 
+/// The calling thread's OS id, read without `std` thread-local state — the
+/// identity that still works in a process `atexit` handler, after macOS has
+/// destroyed the main thread's locals.
+pub(crate) use thread_registry::os_thread_id;
+
 mod thread_registry {
-    use super::{PriorityApplied, ThreadPriority};
-    use std::sync::Mutex;
+    use super::{PriorityApplied, Suspension, ThreadPriority};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Creation order, as C's `ellAdd` appends.
-    static THREADS: Mutex<Vec<super::ThreadInfo>> = Mutex::new(Vec::new());
+    static THREADS: Mutex<Vec<Row>> = Mutex::new(Vec::new());
+
+    /// One listed thread: the [`super::ThreadInfo`] columns, less the `OSSPRI`
+    /// a snapshot reads, plus what that read needs.
+    struct Row {
+        id: u64,
+        name: String,
+        os_id: u64,
+        priority: ThreadPriority,
+        sched: Sched,
+        suspension: Arc<Suspension>,
+    }
+
+    /// Where `OSSPRI` comes from. Hosted POSIX reads it from the thread, as C
+    /// does (`posix/osdThreadExtra.c:36-40`): the default policy's
+    /// `sched_priority` is 0 on Linux but 31 on Darwin, so no constant can
+    /// stand in for it. The `pthread_t` is kept as an integer because Darwin's
+    /// is a pointer, which would make the list `!Send`.
+    #[cfg(all(unix, not(epics_embedded_target)))]
+    struct Sched(usize);
+
+    /// The embedded targets and Windows recompute it from the band the
+    /// prologue applied — the only scheduling change this workspace makes.
+    #[cfg(not(all(unix, not(epics_embedded_target))))]
+    struct Sched(PriorityApplied);
+
+    impl Sched {
+        #[cfg(all(unix, not(epics_embedded_target)))]
+        fn current(_applied: PriorityApplied) -> Self {
+            // SAFETY: `pthread_self` takes no arguments and cannot fail.
+            Sched(unsafe { libc::pthread_self() } as usize)
+        }
+
+        #[cfg(not(all(unix, not(epics_embedded_target))))]
+        fn current(applied: PriorityApplied) -> Self {
+            Sched(applied)
+        }
+    }
+
+    impl Row {
+        fn info(&self) -> super::ThreadInfo {
+            super::ThreadInfo {
+                id: self.id,
+                name: self.name.clone(),
+                os_id: self.os_id,
+                priority: self.priority,
+                os_priority: self.os_priority(),
+                suspension: Arc::clone(&self.suspension),
+            }
+        }
+
+        /// Called only under the list lock. A row leaves the list from its
+        /// thread's own TLS destructor, so the thread is alive here — C's
+        /// `listLock` gives `epicsThreadShowInfo` the same guarantee.
+        #[cfg(all(unix, not(epics_embedded_target)))]
+        fn os_priority(&self) -> i32 {
+            let mut policy = 0;
+            // SAFETY: plain-integer struct, valid zeroed.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            // SAFETY: a live thread (above), with stack-local out-params.
+            let status = unsafe {
+                libc::pthread_getschedparam(
+                    self.sched.0 as libc::pthread_t,
+                    &mut policy,
+                    &mut param,
+                )
+            };
+            if status == 0 { param.sched_priority } else { 0 }
+        }
+
+        /// Any outcome but [`PriorityApplied::Realtime`] left the thread on
+        /// the default policy, whose `sched_priority` C's live read returns as
+        /// 0 on these targets.
+        #[cfg(not(all(unix, not(epics_embedded_target))))]
+        fn os_priority(&self) -> i32 {
+            if self.sched.0 != PriorityApplied::Realtime {
+                return 0;
+            }
+            self.mapped_os_priority()
+        }
+
+        #[cfg(target_os = "rtems")]
+        fn mapped_os_priority(&self) -> i32 {
+            super::map_epics_priority_rtems(self.priority.value())
+        }
+
+        #[cfg(target_os = "vxworks")]
+        fn mapped_os_priority(&self) -> i32 {
+            super::map_epics_priority_vxworks(self.priority.value())
+        }
+
+        #[cfg(not(any(unix, epics_embedded_target)))]
+        fn mapped_os_priority(&self) -> i32 {
+            // No band is applied on these targets, so `Realtime` never occurs.
+            0
+        }
+    }
 
     /// C hands out the address of the thread's `epicsThreadOSD` as the
     /// `EPICS ID`; a counter serves the same purpose — an opaque handle
@@ -1821,7 +2214,7 @@ mod thread_registry {
 
     /// A poisoned list is still a readable list: a panic while formatting one
     /// row must not make the IOC's thread listing permanently unavailable.
-    fn lock() -> std::sync::MutexGuard<'static, Vec<super::ThreadInfo>> {
+    fn lock() -> std::sync::MutexGuard<'static, Vec<Row>> {
         THREADS.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1854,12 +2247,12 @@ mod thread_registry {
     /// The one place a row is built, so which entry point made a row cannot
     /// change the row's shape or how it is reaped.
     fn push(name: String, priority: ThreadPriority, applied: PriorityApplied) {
-        let info = super::ThreadInfo {
+        let info = Row {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             os_id: os_thread_id(),
             priority,
-            applied,
+            sched: Sched::current(applied),
             // The same cell the thread's own `suspend_self` blocks on, so
             // the row cannot report a state the thread is not in.
             suspension: super::current_suspension(),
@@ -1906,9 +2299,10 @@ mod thread_registry {
     /// A copy rather than a borrow because C walks the live list under
     /// `listLock` while calling `epicsThreadShowInfo`, which does I/O; taking
     /// the rows out first keeps the lock off the write path of whatever
-    /// stream the shell is printing to.
+    /// stream the shell is printing to. `OSSPRI` is read here, under the
+    /// lock, which is what keeps every listed thread alive for the read.
     pub(super) fn snapshot() -> Vec<super::ThreadInfo> {
-        lock().clone()
+        lock().iter().map(Row::info).collect()
     }
 
     /// Linux prints `LWP ID` because that is the number `top`, `ps -L` and
@@ -1916,19 +2310,19 @@ mod thread_registry {
     /// POSIX defines. C makes the same split, in two `osdThreadExtra.c`
     /// files.
     #[cfg(target_os = "linux")]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `gettid` takes no arguments and cannot fail.
         unsafe { libc::syscall(libc::SYS_gettid) as u64 }
     }
 
     #[cfg(target_os = "rtems")]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `pthread_self` takes no arguments and cannot fail.
         unsafe { super::rtems_sched::pthread_self() as u64 }
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "rtems"))))]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `pthread_self` takes no arguments and cannot fail.
         unsafe { libc::pthread_self() as u64 }
     }
@@ -1941,7 +2335,7 @@ mod thread_registry {
     /// `epicsThreadShow 0` to print a stranger's row and for
     /// `epicsThreadResume 0` to report on it instead of rejecting the id.
     #[cfg(windows)]
-    fn os_thread_id() -> u64 {
+    pub(crate) fn os_thread_id() -> u64 {
         // SAFETY: `GetCurrentThreadId` takes no arguments and cannot fail.
         unsafe { GetCurrentThreadId() }.into()
     }
@@ -1960,7 +2354,7 @@ pub struct ThreadInfo {
     name: String,
     os_id: u64,
     priority: ThreadPriority,
-    applied: PriorityApplied,
+    os_priority: i32,
     suspension: Arc<Suspension>,
 }
 
@@ -1982,55 +2376,15 @@ impl ThreadInfo {
         self.os_id
     }
 
-    /// The `OSIPRI` column: the EPICS priority, 0..=99.
-    pub fn epics_priority(&self) -> u8 {
+    /// The `OSIPRI` column: the EPICS priority as given (C `osiPriority`).
+    pub fn epics_priority(&self) -> u32 {
         self.priority.value()
     }
 
-    /// The `OSSPRI` column: the OS scheduling priority the thread runs at.
-    ///
-    /// C reads this live with `pthread_getschedparam` (`osdThreadExtra.c:39`).
-    /// This recomputes it from the outcome the prologue recorded, through the
-    /// same map that produced it, which is the same number: nothing in this
-    /// workspace re-bands a thread after the prologue
-    /// (`only_the_prologue_reaches_the_banding_call`), and the map's other
-    /// input — the probed range — is fixed for the life of the process.
-    ///
-    /// Any outcome but [`PriorityApplied::Realtime`] left the thread on the
-    /// default policy, whose `sched_priority` is 0 by POSIX. That is what C's
-    /// live read returns for those threads too, and what a non-privileged
-    /// Linux IOC shows in this column for every row.
+    /// The `OSSPRI` column: the thread's `sched_priority`, read when the
+    /// snapshot was taken, as C reads it per row (`osdThreadExtra.c:36-40`).
     pub fn os_priority(&self) -> i32 {
-        if self.applied != PriorityApplied::Realtime {
-            return 0;
-        }
-        self.mapped_os_priority()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn mapped_os_priority(&self) -> i32 {
-        match permitted_fifo_range() {
-            RtRange::Available { min, max } => map_epics_priority(self.priority.value(), min, max),
-            // Not reachable while the recorded outcome is `Realtime`: the
-            // other two range states return before the map.
-            RtRange::Unsupported | RtRange::Denied => 0,
-        }
-    }
-
-    #[cfg(target_os = "rtems")]
-    fn mapped_os_priority(&self) -> i32 {
-        map_epics_priority_rtems(self.priority.value())
-    }
-
-    #[cfg(target_os = "vxworks")]
-    fn mapped_os_priority(&self) -> i32 {
-        map_epics_priority_vxworks(self.priority.value())
-    }
-
-    #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
-    fn mapped_os_priority(&self) -> i32 {
-        // No band is applied on these targets, so `Realtime` never occurs.
-        0
+        self.os_priority
     }
 
     /// C `epicsThreadIsSuspended` (`osdThread.c:910-914`) — the `STATE`
@@ -2248,47 +2602,88 @@ fn probe_fifo_range() -> RtRange {
     // The probe *changes the scheduling of the thread that runs it*, so it
     // runs on a throwaway thread — exactly why C hands `find_pri_range` to
     // its own `pthread_create`/`pthread_join` pair (`osdThread.c:316-334`).
+    // On a stack we own: glibc caches the stack of an exited thread it
+    // allocated and hands it to the next request up to 4x smaller, so a
+    // probe stack of its making would become some later thread's stack. A
+    // caller-supplied stack is never cached.
+    let bytes = StackSizeClass::Small.bytes();
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(StackSizeClass::Small);
-    let probe = std::thread::Builder::new()
-        .name("cbRtProbe".to_string())
-        // Two `sched_get_priority_*` calls and a `sched_setscheduler`; nothing
-        // recurses. Linux-only, so this is not the RTEMS ceiling — but there is
-        // no reason for a throwaway probe to reserve 2 MiB on any target.
-        .stack_size(StackSizeClass::Small.bytes())
-        .spawn(move || {
-            let _charge = charge;
-            // `osdThread.c:277-287`: failing at the minimum means no
-            // permission for SCHED_FIFO at all.
-            if set_fifo_priority(min) != 0 {
-                return RtRange::Denied;
-            }
-            // `osdThread.c:296-307`: binary-search the real ceiling.
-            let (mut low, mut high) = (min, max);
-            while low < high {
-                let mid = (high + low) / 2;
-                if set_fifo_priority(mid) != 0 {
-                    high = mid;
-                } else {
-                    low = mid + 1;
-                }
-            }
-            // `osdThread.c:310`: `max_pri = try_pri(max) ? max-1 : max`.
-            let top = if set_fifo_priority(high) != 0 {
-                high - 1
-            } else {
-                high
-            };
-            RtRange::Available { min, max: top }
-        });
-    match probe.map(std::thread::JoinHandle::join) {
-        Ok(Ok(range)) => range,
-        // Cannot spawn, or the probe died: treat as no RT rather than
-        // guessing a range we have not shown to be settable.
-        _ => RtRange::Denied,
+    // SAFETY: an anonymous private mapping with no fixed address.
+    let stack = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        )
+    };
+    // Cannot spawn, or the probe never ran: treat as no RT rather than
+    // guessing a range we have not shown to be settable.
+    if stack == libc::MAP_FAILED {
+        return RtRange::Denied;
     }
+    let mut probe = (min, max, RtRange::Denied);
+    let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    let mut tid: libc::pthread_t = 0;
+    // SAFETY: `attr` is initialised before use and destroyed after; `stack`
+    // is a page-aligned mapping of `bytes`, unmapped only once the thread is
+    // joined; `probe` outlives the joined thread.
+    unsafe {
+        if libc::pthread_attr_init(attr.as_mut_ptr()) == 0 {
+            if libc::pthread_attr_setstack(attr.as_mut_ptr(), stack, bytes) == 0
+                && libc::pthread_create(
+                    &mut tid,
+                    attr.as_ptr(),
+                    probe_thread,
+                    (&raw mut probe).cast(),
+                ) == 0
+            {
+                libc::pthread_join(tid, std::ptr::null_mut());
+            }
+            libc::pthread_attr_destroy(attr.as_mut_ptr());
+        }
+        libc::munmap(stack, bytes);
+    }
+    drop(charge);
+    probe.2
 }
 
-/// Map an EPICS priority `0..=99` onto the permitted SCHED_FIFO range.
+/// C `find_pri_range` (`osdThread.c:270-312`): the thread body of
+/// `probe_fifo_range`, which passes `(min, max, out)`.
+#[cfg(target_os = "linux")]
+extern "C" fn probe_thread(arg: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: `probe_fifo_range` joins this thread before touching the tuple.
+    let (min, max, out) = unsafe { &mut *arg.cast::<(i32, i32, RtRange)>() };
+    let (min, max) = (*min, *max);
+    // `osdThread.c:277-287`: failing at the minimum means no permission for
+    // SCHED_FIFO at all.
+    if set_fifo_priority(min) != 0 {
+        return std::ptr::null_mut();
+    }
+    // `osdThread.c:296-307`: binary-search the real ceiling.
+    let (mut low, mut high) = (min, max);
+    while low < high {
+        let mid = (high + low) / 2;
+        if set_fifo_priority(mid) != 0 {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    // `osdThread.c:310`: `max_pri = try_pri(max) ? max-1 : max`.
+    let top = if set_fifo_priority(high) != 0 {
+        high - 1
+    } else {
+        high
+    };
+    *out = RtRange::Available { min, max: top };
+    std::ptr::null_mut()
+}
+
+/// Map an EPICS priority onto the permitted SCHED_FIFO range. Above 99 it lands
+/// past `max`, unclamped as C's is, and the scheduler refuses it.
 ///
 /// C parity: `epicsThreadGetPosixPriority` (`osdThread.c:129-144`) — the
 /// POSIX counterpart of the `epicsThreadGetOssPriorityValue` used on
@@ -2299,17 +2694,14 @@ fn probe_fifo_range() -> RtRange {
 /// arm of the cfg exists so the two maps can be compared in one process
 /// on the host; without it the divergence test would silently vanish.
 #[cfg(any(target_os = "linux", test))]
-fn map_epics_priority(epics_priority: u8, min: i32, max: i32) -> i32 {
+fn map_epics_priority(epics_priority: u32, min: i32, max: i32) -> i32 {
     // `osdThread.c:133-134`: a degenerate range collapses to one level.
     if max == min {
         return max;
     }
     let slope = (max - min) as f64 / 100.0;
     let oss = epics_priority as f64 * slope + min as f64;
-    // `ThreadPriority::value` caps at 99 and the slope is over 100, so this
-    // cannot exceed `max`; the clamp guards the probed bounds, which are
-    // runtime values rather than compile-time constants.
-    (oss as i32).clamp(min, max)
+    oss as i32
 }
 
 /// The highest RTEMS *core* priority number, i.e. the least urgent level.
@@ -2339,7 +2731,7 @@ const RTEMS_MAXIMUM_PRIORITY: i32 = 255;
 /// occupies core `100..=199` and nothing else can be reached — which is the
 /// property [`map_epics_priority_rtems`] is chosen for.
 #[cfg(any(target_os = "rtems", test))]
-const fn rtems_core_priority(epics_priority: u8) -> i32 {
+const fn rtems_core_priority(epics_priority: u32) -> i32 {
     if epics_priority > 99 {
         100
     } else {
@@ -2386,7 +2778,7 @@ const fn rtems_core_priority(epics_priority: u8) -> i32 {
 /// see `rtems_priority_map_stays_below_the_libbsd_network_band`, which
 /// asserts the non-strict `core >= 100` this tie actually produces.
 #[cfg(any(target_os = "rtems", test))]
-pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_rtems(epics_priority: u32) -> i32 {
     RTEMS_MAXIMUM_PRIORITY - rtems_core_priority(epics_priority)
 }
 
@@ -2412,8 +2804,46 @@ pub(crate) fn map_epics_priority_rtems(epics_priority: u8) -> i32 {
 /// change to the RTEMS core-priority mechanism cannot silently move the
 /// VxWorks value with it.
 #[cfg(any(target_os = "vxworks", test))]
-pub(crate) fn map_epics_priority_vxworks(epics_priority: u8) -> i32 {
+pub(crate) fn map_epics_priority_vxworks(epics_priority: u32) -> i32 {
+    // C's own vxWorks `getOssPriorityValue` takes anything above 99 as 99
+    // (`vxWorks/osdThread.c:99-105`).
     56 + epics_priority.min(99) as i32
+}
+
+/// C's refusal to create a thread whose priority maps past the SCHED_FIFO
+/// range: `setSchedulingPolicy`'s `pthread_attr_setschedparam` fails EINVAL,
+/// the attr keeps FIFO with `sched_priority` 0, and `pthread_create` refuses
+/// it too, so `epicsThreadCreate` returns NULL after printing both statuses
+/// (`osdThread.c:160-162`, `:672-680`). Every thread constructor that can
+/// report failure asks here before it creates anything.
+#[cfg(target_os = "linux")]
+fn fifo_attr_refusal(priority: ThreadPriority) -> Option<std::io::Error> {
+    if RtPolicy::current() != RtPolicy::AllowRealtime {
+        return None;
+    }
+    let RtRange::Available { min, max } = permitted_fifo_range() else {
+        return None;
+    };
+    let oss = map_epics_priority(priority.value(), min, max);
+    // glibc's `pthread_attr_setschedparam` checks the policy's nominal range,
+    // not the RLIMIT_RTPRIO ceiling the probe found.
+    // SAFETY: both take only an int policy and have no preconditions.
+    let nominal = unsafe {
+        libc::sched_get_priority_min(libc::SCHED_FIFO)
+            ..=libc::sched_get_priority_max(libc::SCHED_FIFO)
+    };
+    if nominal.contains(&oss) {
+        return None;
+    }
+    eprintln!("{}", einval_status_line("pthread_attr_setschedparam"));
+    eprintln!("{}", einval_status_line("pthread_create"));
+    Some(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// No target but Linux maps a priority outside its settable range.
+#[cfg(not(target_os = "linux"))]
+fn fifo_attr_refusal(_priority: ThreadPriority) -> Option<std::io::Error> {
+    None
 }
 
 /// Ask the OS for SCHED_FIFO at `oss` on the **calling** thread. The single
@@ -2570,34 +3000,12 @@ fn set_fifo_priority_raw(oss: i32) -> i32 {
     unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) }
 }
 
-/// The unprivileged-fallback message. Emitted **once per process**: the
-/// denial is a property of the process, not of the thread that happened to
-/// notice it first, and an IOC creates a thread per CA client.
 #[cfg(target_os = "linux")]
-fn warn_rt_denied_once() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        #[cfg(test)]
-        DENIED_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(
-            target: "epics_base_rs::runtime",
-            switch = RT_PRIORITY_ENV,
-            "{RT_PRIORITY_ENV} asked for real-time scheduling, but this process may not \
-             use SCHED_FIFO (needs CAP_SYS_NICE or a non-zero RLIMIT_RTPRIO). Every IOC \
-             thread stays at the default scheduling policy; timing is not real-time. \
-             Logged once per process."
-        );
-    });
-}
-
-#[cfg(target_os = "linux")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let (min, max) = match permitted_fifo_range() {
         RtRange::Unsupported => return PriorityApplied::Unsupported,
-        RtRange::Denied => {
-            warn_rt_denied_once();
-            return PriorityApplied::BestEffortFailed;
-        }
+        // C's `usePolicy == 0`: no FIFO attr, no message (`osdThread.c:151`).
+        RtRange::Denied => return PriorityApplied::BestEffortFailed,
         RtRange::Available { min, max } => (min, max),
     };
     let oss = map_epics_priority(epics_priority, min, max);
@@ -2605,8 +3013,8 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
     if rc == 0 {
         PriorityApplied::Realtime
     } else {
-        // The probe proved this range settable, so a failure here is not
-        // the permission case the warning covers — keep it at debug.
+        // C's EPERM retry without SCHED_FIFO prints nothing
+        // (`osdThread.c:646-670`); the thread stays at the default policy.
         tracing::debug!(
             target: "epics_base_rs::runtime",
             epics_priority,
@@ -2619,7 +3027,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 }
 
 #[cfg(target_os = "rtems")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     // Without this, every IOC thread runs at one level just above idle:
     // `cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins) sets
     // `inheritsched = PTHREAD_INHERIT_SCHED` in the default attribute set and
@@ -2661,7 +3069,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 /// [`map_epics_priority_vxworks`]'s fixed image is inside the settable range
 /// by construction. There is nothing to discover on this target either.
 #[cfg(target_os = "vxworks")]
-fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(epics_priority: u32) -> PriorityApplied {
     let oss = map_epics_priority_vxworks(epics_priority);
     let rc = set_fifo_priority(oss);
     if rc == 0 {
@@ -2679,7 +3087,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 }
 
 #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
-fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
+fn apply_priority_impl(_epics_priority: u32) -> PriorityApplied {
     // No OS-scheduler priority API is wired on other targets. The three that
     // are wired each needed a *measured* target band before they could be:
     // Linux probes for its settable ceiling at runtime, RTEMS's map is
@@ -2694,8 +3102,8 @@ fn apply_priority_impl(_epics_priority: u8) -> PriorityApplied {
 /// How many times this process has asked the OS scheduler for SCHED_FIFO,
 /// across every thread — including the one-off range probe.
 ///
-/// The observable form of the opt-in guarantee: with [`RT_PRIORITY_ENV`]
-/// unset, a process can run its whole life and this stays `0`. Also answers
+/// The observable form of the switch-off guarantee: with the switch off, a
+/// process can run its whole life and this stays `0`. Also answers
 /// "did this IOC ever actually try to go real-time?" from a log line.
 ///
 /// Always `0` off Linux, where no scheduler call is wired at all.
@@ -2719,10 +3127,6 @@ thread_local! {
     static SCHED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times the once-per-process denial warning was emitted.
-#[cfg(all(test, target_os = "linux"))]
-static DENIED_WARNINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Spawn a blocking closure on a dedicated thread and apply the given
 /// EPICS [`ThreadPriority`] to that thread before running `f`.
 ///
@@ -2737,31 +3141,24 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         let _ = enter_ioc_thread(priority);
         f()
     })
 }
 
-/// RTEMS: run the blocking closure on a callback-pool worker.
+/// RTEMS: [`spawn_blocking`], at that pool's priority.
 ///
-/// The requested EPICS [`ThreadPriority`] is **not** yet mapped onto a callback
-/// band here: the pool workers are long-lived and shared, so re-prioritising the
-/// running worker per task would leak that priority into the next callback it
-/// drains. The closure runs at the pool's default Medium band; mapping
-/// `ThreadPriority` to a `CallbackPriority` band is deferred to RTEMS bring-up.
+/// The requested EPICS [`ThreadPriority`] is **not** applied: the pool workers
+/// are long-lived and shared, so re-prioritising the running worker per job
+/// would leak that priority into the next job it takes.
 #[cfg(exec_backend)]
 pub fn spawn_blocking_with_priority<F, R>(_priority: ThreadPriority, f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
-    spawn_blocking_on(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        f,
-    )
+    spawn_blocking(f)
 }
 
 /// Spawn a **dedicated OS thread** that runs `f` at `priority` with a `stack`
@@ -2785,8 +3182,9 @@ where
 ///
 /// Not [`spawn_blocking_with_priority`], and the difference is the point.
 /// That one hands the closure to a *pool*: tokio's blocking pool on the host,
-/// and on RTEMS a shared callback-pool worker that also drops the priority
-/// (see its `exec_backend` arm). Both are right for work that finishes. A
+/// and on RTEMS [`offload::BLOCKING`](crate::runtime::offload::BLOCKING),
+/// whose shared workers ignore the requested priority (see its
+/// `exec_backend` arm). Both are right for work that finishes. A
 /// server thread that lives as long as its connection would occupy a pool
 /// worker for that whole time, so the pool is the wrong home for it — an IOC
 /// thread that a C IOC would create with `epicsThreadCreate` wants a thread of
@@ -2846,7 +3244,39 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    let ambient = InheritedRuntime::capture();
+    spawn_entered(InheritedRuntime::capture(), name, priority, stack, f)
+}
+
+/// [`spawn_dedicated_thread`] for a permanent worker that runs jobs from many
+/// callers: the thread enters no runtime of its own, because each job brings
+/// the one it was submitted from (see [`InheritedRuntime`]).
+#[cfg(tokio_backend)]
+pub(crate) fn spawn_pool_worker<F>(
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_entered(InheritedRuntime(None), name, priority, stack, f)
+}
+
+#[cfg(tokio_backend)]
+fn spawn_entered<F>(
+    ambient: InheritedRuntime,
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
@@ -2870,8 +3300,8 @@ where
 /// **One owner for the question `spawn_dedicated_thread`'s docs above answer at
 /// length.** Two callers need it and they differ in *when* they capture:
 /// `spawn_dedicated_thread` captures once, at spawn, because the thread it
-/// creates serves exactly one body; `runtime::worker_pool` captures per **job**,
-/// because a pooled worker outlives the runtime that first used it. A pooled
+/// creates serves exactly one body; `runtime::worker_pool` and
+/// `runtime::offload` capture per **job**, because a pooled worker outlives the runtime that first used it. A pooled
 /// worker that inherited its ambient at creation would hold a `Handle` to a
 /// runtime that has since been dropped — every `#[tokio::test]` builds and drops
 /// its own — and enter it for every later connection.
@@ -2931,6 +3361,9 @@ pub fn spawn_dedicated_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
     let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
     std::thread::Builder::new()
         .name(name)
@@ -2940,6 +3373,49 @@ where
             let _ = enter_ioc_thread(priority);
             f()
         })
+}
+
+/// [`spawn_dedicated_thread`] on a [`std::thread::Scope`], for a body that
+/// borrows from the thread that spawns it.
+pub fn spawn_dedicated_thread_scoped<'scope, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, ()>>
+where
+    F: FnOnce() + Send + 'scope,
+{
+    if let Some(refused) = fifo_attr_refusal(priority) {
+        return Err(refused);
+    }
+    let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
+    let ambient = InheritedRuntime::capture();
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(stack.bytes())
+        .spawn_scoped(scope, move || {
+            let _charge = charge;
+            ambient.run(move || {
+                let _ = enter_ioc_thread(priority);
+                f()
+            })
+        })
+}
+
+/// RTEMS: no thread enters a runtime, so a pool worker is a dedicated thread.
+#[cfg(exec_backend)]
+pub(crate) fn spawn_pool_worker<F>(
+    name: String,
+    priority: ThreadPriority,
+    stack: StackSizeClass,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_dedicated_thread(name, priority, stack, f)
 }
 
 /// A thread the IOC **cannot correctly run without** — the scan rates, the
@@ -3002,8 +3478,17 @@ impl MandatoryThread {
     where
         F: FnOnce() + Send + 'static,
     {
+        let stack = StackSpec::Class(self.stack);
+        self.spawn_sized(stack, f)
+    }
+
+    /// [`spawn`](Self::spawn) on `stack` in place of the declared class.
+    pub fn spawn_sized<F>(self, stack: StackSpec, f: F) -> std::thread::JoinHandle<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let name = self.name.clone();
-        match self.try_spawn(f) {
+        match self.try_spawn_sized(stack, f) {
             Ok(handle) => handle,
             Err(e) => mandatory_thread_unavailable(&name, &e),
         }
@@ -3021,16 +3506,43 @@ impl MandatoryThread {
     where
         F: FnOnce() + Send + 'static,
     {
+        let stack = StackSpec::Class(self.stack);
+        self.try_spawn_sized(stack, f)
+    }
+
+    /// [`try_spawn`](Self::try_spawn) on `stack` in place of the declared
+    /// class, under the same obligation.
+    pub fn try_spawn_sized<F>(
+        self,
+        stack: StackSpec,
+        f: F,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let priority = self.priority;
-        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(self.stack);
-        std::thread::Builder::new()
+        if stack.refused() {
+            eprintln!("{}", einval_status_line("pthread_attr_setstacksize"));
+        }
+        if let Some(refused) = fifo_attr_refusal(priority) {
+            return Err(refused);
+        }
+        let charge = crate::runtime::worker_pool::ThreadCharge::fixed(stack);
+        // Returns once the thread is through its prologue, so what std and
+        // `enter_ioc_thread` allocate there happens before the spawner goes
+        // on, not in whatever its caller does next.
+        let (started, wait) = crate::runtime::sync::start_latch();
+        let handle = std::thread::Builder::new()
             .name(self.name)
-            .stack_size(self.stack.bytes())
+            .stack_size(stack.bytes())
             .spawn(move || {
                 let _charge = charge;
                 let _ = enter_ioc_thread(priority);
+                drop(started);
                 f()
-            })
+            })?;
+        wait.wait();
+        Ok(handle)
     }
 }
 
@@ -3087,6 +3599,164 @@ fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A future that is pending until `ready` is set, keeping the last waker
+    /// it was polled with in `waker` and reporting every poll on `polled`.
+    struct Gate {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<Waker>>>,
+        polled: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            // Reported after `ready` is read, so a poll that saw it clear
+            // returns Pending and the wake that follows is the drive's to take.
+            let ready = self.ready.load(std::sync::atomic::Ordering::Acquire);
+            let _ = self.polled.send(());
+            if ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// An inner drive run inside the outer drive's poll, with the outer's wake
+    /// firing while the inner waits: the outer still completes.
+    #[test]
+    fn an_inner_drive_keeps_the_outer_drives_wake() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (inner_polled_tx, inner_polled_rx) = std::sync::mpsc::channel();
+        let outer_waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let inner_waker = Arc::new(std::sync::Mutex::new(None::<Waker>));
+        let inner_ready = Arc::new(AtomicBool::new(false));
+
+        let (ow, iw, ir) = (
+            outer_waker.clone(),
+            inner_waker.clone(),
+            inner_ready.clone(),
+        );
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            let mut inner_polled = Some(inner_polled_tx);
+
+            let outer = std::future::poll_fn(move |cx| {
+                *ow.lock().unwrap() = Some(cx.waker().clone());
+                polls += 1;
+                if polls > 1 {
+                    return Poll::Ready(());
+                }
+                park_on(Gate {
+                    ready: ir.clone(),
+                    waker: iw.clone(),
+                    polled: inner_polled.take().unwrap(),
+                });
+                Poll::Pending
+            });
+            park_on(outer);
+            let _ = done_tx.send(());
+        });
+
+        inner_polled_rx.recv().unwrap();
+        outer_waker.lock().unwrap().take().unwrap().wake();
+        // The inner drive has taken the outer's wake and re-polled; only then
+        // can the inner complete, so no later wake rescues the outer.
+        inner_polled_rx.recv().unwrap();
+        inner_ready.store(true, Ordering::Release);
+        inner_waker.lock().unwrap().take().unwrap().wake();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "the outer drive parked through the wake it was owed"
+        );
+    }
+
+    /// A canceller that unparks the thread without waking the future ends the
+    /// wait, though the `woken` flag is clear (future_exec.rs and
+    /// timer_sleep.rs cancel this way).
+    #[test]
+    fn a_raw_unpark_with_cancel_ends_the_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let c = cancel.clone();
+        let driver = std::thread::spawn(move || {
+            let gate = Gate {
+                ready: Arc::new(AtomicBool::new(false)),
+                waker: Arc::new(std::sync::Mutex::new(None)),
+                polled: polled_tx,
+            };
+            let out = park_on_interruptible(gate, || c.load(Ordering::Acquire));
+            let _ = done_tx.send(out.is_none());
+        });
+        polled_rx.recv().unwrap();
+        cancel.store(true, Ordering::Release);
+        driver.thread().unpark();
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "a cancelled, unparked drive must return None"
+        );
+    }
+
+    /// A future whose poll blocks in a `thread::park`-based wait (an `mpsc`
+    /// receive here) while its own wake fires has had the unpark token eaten;
+    /// the drive still re-polls, because it waits on the waker's flag.
+    #[test]
+    fn a_wake_eaten_by_a_park_inside_the_poll_still_reaches_the_drive() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            park_on(std::future::poll_fn(|cx| {
+                polls += 1;
+                if polls > 1 {
+                    return Poll::Ready(());
+                }
+                let waker = cx.waker().clone();
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    waker.wake();
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = tx.send(());
+                });
+                let _ = rx.recv();
+                Poll::Pending
+            }));
+            let _ = done.send(());
+        });
+        assert!(
+            result.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the drive parked through a wake an inner park consumed"
+        );
+    }
+
+    /// What a thread allocates starting up — std's name copy, the registry
+    /// row, the first park's `ThreadData` — is done before `try_spawn` hands
+    /// back, so it cannot land in whatever the spawner does next.
+    #[test]
+    fn a_mandatory_thread_is_through_its_prologue_when_spawn_returns() {
+        for i in 0..50 {
+            let name = format!("prologue-pin-{i}");
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let handle = MandatoryThread::new(&name, ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn(move || {
+                    let _ = gate.recv();
+                })
+                .unwrap();
+            assert!(
+                thread_by_name(&name).is_some(),
+                "{name} was not registered when try_spawn returned"
+            );
+            release.send(()).unwrap();
+            handle.join().unwrap();
+        }
+    }
 
     /// The band binding, end to end: a reactor with an executor bound puts its
     /// spawned future on that executor's worker, and one without still uses the
@@ -3250,14 +3920,14 @@ mod tests {
             }
         }
 
-        // Five: `spawn_dedicated_thread`'s two `cfg` arms, `MandatoryThread`,
-        // the RT-policy probe, and `worker_pool`'s pooled worker. The floor was
-        // seven until the three background facilities moved onto
+        // Four: `spawn_dedicated_thread`'s two `cfg` arms, `MandatoryThread`,
+        // and `worker_pool`'s pooled worker (the RT-policy probe is a raw
+        // `pthread_create` on its own stack). The floor was seven until the three background facilities moved onto
         // `MandatoryThread`, which states the class in its constructor —
         // `every_background_facility_thread_is_mandatory` is what keeps that
         // move from being a hole rather than a hand-off.
         assert!(
-            checked >= 5,
+            checked >= 4,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
@@ -3333,6 +4003,142 @@ mod tests {
     async fn test_spawn_blocking() {
         let handle = spawn_blocking(|| 123);
         assert_eq!(handle.await.unwrap(), 123);
+    }
+
+    /// A job that blocks until released, and the receiver that says it has
+    /// started, so a probe queued after it cannot run first by luck.
+    fn held_job() -> (
+        impl FnOnce() + Send + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let job = move || {
+            let _ = started_tx.send(());
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        };
+        (job, started, release)
+    }
+
+    /// Every band, and `reactor`'s executor when given, runs a future while a
+    /// job blocks through a blocking seam. Releases the job either way, so a
+    /// failure does not wedge the pool.
+    async fn bands_run_beside(
+        started: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        reactor: Option<&Reactor>,
+    ) {
+        // Awaited, not blocked on: on a current-thread test runtime the job's
+        // spawner runs only when this task yields.
+        timeout(Duration::from_secs(3), async {
+            while started.try_recv().is_err() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the held job started");
+        let mut parked = Vec::new();
+        for prio in [
+            CallbackPriority::Low,
+            CallbackPriority::Medium,
+            CallbackPriority::High,
+        ] {
+            let beside = spawn_background(prio, async { 7 });
+            if timeout(Duration::from_secs(3), beside).await.is_err() {
+                parked.push(format!("{prio:?}"));
+            }
+        }
+        if let Some(r) = reactor {
+            let beside = r.spawn(async { 7 });
+            if timeout(Duration::from_secs(3), beside).await.is_err() {
+                parked.push("the reactor's executor".into());
+            }
+        }
+        let _ = release.send(());
+        assert!(parked.is_empty(), "a blocked job parked {parked:?}");
+    }
+
+    /// reviewer3's probe: a cbMedium future awaiting the blocking seam. On a
+    /// hosted build that thread has no runtime entered, where
+    /// `tokio::task::spawn_blocking` panics; the job lands on the runtime the
+    /// test driver adopted, not one of the seam's own.
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_awaited_from_a_band_future() {
+        let ran = spawn_background(CallbackPriority::Medium, async {
+            spawn_blocking(|| {
+                #[cfg(tokio_backend)]
+                assert_eq!(
+                    RuntimeHandle::current().runtime_flavor(),
+                    RuntimeFlavor::CurrentThread,
+                    "the job ran on a runtime other than the adopted one"
+                );
+                5
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(
+            timeout(Duration::from_secs(3), ran).await.unwrap().unwrap(),
+            5
+        );
+    }
+
+    /// A process that never started a runtime still gets a blocking pool.
+    #[test]
+    fn spawn_blocking_from_a_thread_with_no_runtime() {
+        let job = std::thread::spawn(|| spawn_blocking(|| 9)).join().unwrap();
+        assert_eq!(park_on_interruptible(job, || false).unwrap().unwrap(), 9);
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = spawn_blocking(job);
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap();
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn spawn_blocking_with_priority_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = spawn_blocking_with_priority(ThreadPriority::Low, job);
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap();
+    }
+
+    /// Bound or not, a reactor's blocking job holds neither a band nor the
+    /// executor's own worker.
+    #[epics_macros_rs::epics_test]
+    async fn reactor_spawn_blocking_leaves_the_bands_and_executor_free() {
+        let exec = Arc::new(
+            crate::runtime::background::DedicatedExecutor::new(
+                "BLKEXEC",
+                ThreadPriority::Custom(18),
+                1,
+            )
+            .expect("executor starts"),
+        );
+        let reactor = Reactor::current().expect("the test driver enters an executor");
+        for r in [reactor.clone(), reactor.with_executor(&exec)] {
+            let (job, started, release) = held_job();
+            let held = r.spawn_blocking(job);
+            bands_run_beside(started, release, Some(&r)).await;
+            held.await.unwrap();
+        }
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn fs_blocking_leaves_the_bands_free() {
+        let (job, started, release) = held_job();
+        let held = Reactor::current()
+            .expect("the test driver enters an executor")
+            .spawn(crate::runtime::fs::blocking(move || {
+                job();
+                Ok(())
+            }));
+        bands_run_beside(started, release, None).await;
+        held.await.unwrap().unwrap();
     }
 
     /// The property `spawn_dedicated_thread` exists for. A future written for
@@ -3513,7 +4319,7 @@ mod tests {
         let (release, mut park_here) = tokio::sync::mpsc::channel::<()>(1);
         let (report, outcome) = std::sync::mpsc::channel();
 
-        let _handle = spawn_blocking_on(&pool.handle(), DEFAULT_SPAWN_PRIORITY, move || {
+        let _handle = spawn_blocking_on(&pool.handle(), DEFAULT_SPAWN_PRIORITY, move |_| {
             let _ = report.send(block_on_sync(async move { park_here.recv().await }));
         });
 
@@ -3666,11 +4472,156 @@ mod tests {
         assert!(ThreadPriority::CaServerLow.value() < ThreadPriority::ScanLow.value());
     }
 
+    /// C keeps any `unsigned int` priority as given (`osdThread.c:219`).
     #[test]
-    fn priority_custom_clamps_to_max() {
-        assert_eq!(ThreadPriority::Custom(200).value(), PRIORITY_MAX);
-        assert_eq!(ThreadPriority::Custom(99).value(), 99);
+    fn a_custom_priority_is_kept_as_given() {
+        assert_eq!(ThreadPriority::Custom(200).value(), 200);
+        assert_eq!(ThreadPriority::Custom(u32::MAX).value(), u32::MAX);
         assert_eq!(ThreadPriority::Custom(0).value(), PRIORITY_MIN);
+        // Scaled unclamped (`osdThread.c:139`): past the FIFO maximum.
+        assert_eq!(map_epics_priority(200, 1, 99), (200.0 * 0.98 + 1.0) as i32);
+    }
+
+    /// C's two lines for a priority the FIFO scheduler refuses
+    /// (`osdThread.c:160-162`, `:672-680`).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const ABOVE_99_LINES: [&str; 2] = [
+        "pthread_attr_setschedparam error Invalid argument",
+        "pthread_create error Invalid argument",
+    ];
+
+    /// In the child, spawn at 200, 200 and 101 and print what each got, then
+    /// `None`; in the parent, re-run `test` as that child with
+    /// [`RT_PRIORITY_ENV`] `rt`, and return its stdout and C's lines from its
+    /// stderr.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn above_99_run(test: &str, rt: &str) -> Option<(String, Vec<String>)> {
+        const CHILD: &str = "EPICS_RS_PRIORITY_200_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let fifo = matches!(permitted_fifo_range(), RtRange::Available { .. });
+            println!("FIFO={fifo}");
+            for priority in [200, 200, 101] {
+                let name = format!("prio-{priority}");
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawned = MandatoryThread::new(
+                    name.clone(),
+                    ThreadPriority::Custom(priority),
+                    StackSizeClass::Small,
+                )
+                .try_spawn(move || {
+                    let mut policy = 0;
+                    let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+                    // SAFETY: the calling thread, with stack-local out-params.
+                    unsafe {
+                        libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                    };
+                    let osipri = thread_report()
+                        .into_iter()
+                        .find(|t| t.name() == name)
+                        .map(|t| t.epics_priority());
+                    tx.send((policy, param.sched_priority, osipri)).unwrap();
+                });
+                match spawned {
+                    Ok(thread) => {
+                        let (policy, sched, osipri) = rx.recv().unwrap();
+                        thread.join().unwrap();
+                        let fifo = policy == libc::SCHED_FIFO;
+                        println!("{priority}: THREAD fifo={fifo} sched={sched} osipri={osipri:?}");
+                    }
+                    Err(e) => println!("{priority}: NONE {:?}", e.raw_os_error()),
+                }
+            }
+            return None;
+        }
+        let out =
+            std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                .args(["--exact", test, "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove(C_RT_PRIORITY_ENV)
+                .env(RT_PRIORITY_ENV, rt)
+                .output()
+                .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{RT_PRIORITY_ENV}={rt}: {stdout}{stderr}"
+        );
+        let printed = stderr
+            .lines()
+            .filter(|l| ABOVE_99_LINES.contains(l))
+            .map(str::to_owned)
+            .collect();
+        Some((stdout, printed))
+    }
+
+    /// A priority above 99 is kept as given without RT.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn an_above_99_priority_is_kept_without_rt() {
+        assert_eq!(
+            einval_status_line("pthread_attr_setschedparam"),
+            ABOVE_99_LINES[0]
+        );
+        assert_eq!(einval_status_line("pthread_create"), ABOVE_99_LINES[1]);
+        let Some((stdout, printed)) = above_99_run(
+            "runtime::task::tests::an_above_99_priority_is_kept_without_rt",
+            "NO",
+        ) else {
+            return;
+        };
+        let said = |l: &str| stdout.lines().filter(|o| *o == l).count();
+        assert_eq!(
+            said("200: THREAD fifo=false sched=0 osipri=Some(200)"),
+            2,
+            "{stdout}"
+        );
+        assert_eq!(
+            said("101: THREAD fifo=false sched=0 osipri=Some(101)"),
+            1,
+            "{stdout}"
+        );
+        assert!(printed.is_empty(), "{printed:?}");
+    }
+
+    /// With RT allowed, a priority that maps past the FIFO range creates no
+    /// thread and prints C's two lines on every attempt; 101 maps to 99 and
+    /// runs FIFO there. Excluded from `profile.ci` by name: it fails, not
+    /// skips, where the process may not have SCHED_FIFO.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn an_above_99_priority_is_refused_by_the_fifo_scheduler() {
+        let Some((stdout, printed)) = above_99_run(
+            "runtime::task::tests::an_above_99_priority_is_refused_by_the_fifo_scheduler",
+            "YES",
+        ) else {
+            return;
+        };
+        let said = |l: &str| stdout.lines().filter(|o| *o == l).count();
+        assert!(
+            stdout.contains("FIFO=true"),
+            "this box cannot obtain SCHED_FIFO, so the RT branch is unverified: {stdout}"
+        );
+        assert_eq!(
+            said(&format!("200: NONE Some({})", libc::EINVAL)),
+            2,
+            "{stdout}"
+        );
+        assert_eq!(
+            said("101: THREAD fifo=true sched=99 osipri=Some(101)"),
+            1,
+            "{stdout}"
+        );
+        assert_eq!(
+            printed,
+            [
+                ABOVE_99_LINES[0],
+                ABOVE_99_LINES[1],
+                ABOVE_99_LINES[0],
+                ABOVE_99_LINES[1]
+            ],
+            "{printed:?}"
+        );
     }
 
     #[test]
@@ -3711,6 +4662,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_c_reads_0_1_2_as_classes_and_the_rest_as_bytes() {
+        assert_eq!(
+            StackSpec::from_c(0),
+            StackSpec::Class(StackSizeClass::Small)
+        );
+        assert_eq!(
+            StackSpec::from_c(1),
+            StackSpec::Class(StackSizeClass::Medium)
+        );
+        assert_eq!(StackSpec::from_c(2), StackSpec::Class(StackSizeClass::Big));
+        assert_eq!(StackSpec::from_c(3), StackSpec::Bytes(3));
+        assert_eq!(StackSpec::from_c(500_000), StackSpec::Bytes(500_000));
+    }
+
+    /// A sized thread gets its bytes, the attr's default below
+    /// `PTHREAD_STACK_MIN`, and a class gets exactly what `try_spawn` gives it.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_sized_thread_reports_the_stack_its_spec_asks_for() {
+        for (stack, asked) in [
+            (StackSpec::Bytes(1), pthread_default_stack_bytes()),
+            (
+                StackSpec::Bytes(libc::PTHREAD_STACK_MIN),
+                libc::PTHREAD_STACK_MIN,
+            ),
+            (StackSpec::Bytes(500_000), 500_000),
+            (
+                StackSpec::Class(StackSizeClass::Medium),
+                StackSizeClass::Medium.bytes(),
+            ),
+        ] {
+            assert_eq!(stack.bytes(), asked, "{stack:?}");
+            let (tx, rx) = std::sync::mpsc::channel();
+            MandatoryThread::new("stack-sized", ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn_sized(stack, move || {
+                    let _ = tx.send(current_thread_stack_bytes().unwrap());
+                })
+                .expect("sized thread spawned")
+                .join()
+                .expect("thread joined");
+            let got = rx.recv().expect("the thread reported its stack");
+            // glibc aligns a byte count down to its stack alignment, as it
+            // does C's same `pthread_attr_setstacksize` (500000 reads 499968).
+            assert!(
+                got + 64 > asked && got < asked + 64 * 1024,
+                "{stack:?}: asked for {asked} bytes, thread reports {got}"
+            );
+        }
+    }
+
+    /// A refused byte count prints C's line once per thread, an accepted one
+    /// prints nothing (`osdThread.c:213-214`).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_refused_stack_size_prints_c_s_line() {
+        const CHILD: &str = "EPICS_RS_STACK_REFUSED_CHILD";
+        const TEST: &str = "runtime::task::tests::a_refused_stack_size_prints_c_s_line";
+
+        // glibc's `strerror(EINVAL)`.
+        let line = "pthread_attr_setstacksize error Invalid argument";
+        assert_eq!(einval_status_line("pthread_attr_setstacksize"), line);
+
+        if let Some(bytes) = std::env::var_os(CHILD) {
+            let bytes: usize = bytes.to_str().unwrap().parse().unwrap();
+            MandatoryThread::new("stack-refused", ThreadPriority::Low, StackSizeClass::Small)
+                .try_spawn_sized(StackSpec::Bytes(bytes), || {})
+                .expect("sized thread spawned")
+                .join()
+                .expect("thread joined");
+            return;
+        }
+
+        for (bytes, printed) in [
+            (1, 1),
+            (libc::PTHREAD_STACK_MIN - 1, 1),
+            (libc::PTHREAD_STACK_MIN, 0),
+        ] {
+            let out =
+                std::process::Command::new(std::env::current_exe().expect("the test binary path"))
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, bytes.to_string())
+                    .output()
+                    .expect("re-exec the test binary");
+            assert!(out.status.success(), "child for {bytes} failed");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.lines().filter(|l| *l == line).count(),
+                printed,
+                "{bytes} bytes; stderr: {stderr}"
+            );
+        }
+    }
+
     /// The stack a caller *states* is the stack the thread *reports*.
     ///
     /// The source guard above only proves a number reached the builder. This
@@ -3729,26 +4774,6 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dedicated_thread_reports_the_stack_it_was_asked_for() {
-        fn reported_stack_bytes() -> usize {
-            unsafe {
-                let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-                assert_eq!(
-                    libc::pthread_getattr_np(libc::pthread_self(), &mut attr),
-                    0,
-                    "pthread_getattr_np"
-                );
-                let mut addr: *mut libc::c_void = std::ptr::null_mut();
-                let mut size: libc::size_t = 0;
-                assert_eq!(
-                    libc::pthread_attr_getstack(&attr, &mut addr, &mut size),
-                    0,
-                    "pthread_attr_getstack"
-                );
-                libc::pthread_attr_destroy(&mut attr);
-                size
-            }
-        }
-
         for class in [
             StackSizeClass::Small,
             StackSizeClass::Medium,
@@ -3760,7 +4785,7 @@ mod tests {
                 ThreadPriority::CaServerLow,
                 class,
                 move || {
-                    let _ = tx.send(reported_stack_bytes());
+                    let _ = tx.send(current_thread_stack_bytes().unwrap());
                 },
             )
             .expect("dedicated thread spawned");
@@ -3805,76 +4830,41 @@ mod tests {
         ));
     }
 
-    /// Both defaults, and both override directions against each default.
-    ///
-    /// The RTEMS arm is unreachable from a host test run unless the default
-    /// is a function of the target rather than a `cfg` block, which is why
-    /// `default_policy`/`resolve` take their input explicitly.
+    /// C's name wins whenever it is set, with C's parse; the alias counts
+    /// only when C's is unset; neither set is on.
     #[test]
-    fn the_rt_default_is_on_for_rtems_and_off_for_hosted() {
-        // (1) the two defaults themselves
-        assert_eq!(
-            default_policy(true),
-            RtPolicy::AllowRealtime,
-            "RTEMS honours its priorities by default, as base does \
-             (EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING=YES, CONFIG_ENV:57)"
-        );
-        assert_eq!(
-            default_policy(false),
-            RtPolicy::Disabled,
-            "hosted stays opt-in: RLIMIT_RTPRIO makes the request fail on a \
-             desktop, and where it succeeds a runaway band wedges the machine"
-        );
-
-        // (2) the compiled-in default is wired to the target, not to a guess
-        assert_eq!(DEFAULT_POLICY, default_policy(cfg!(epics_embedded_target)));
-        assert_eq!(RtPolicy::from_env_value(None), DEFAULT_POLICY);
-
-        // (3) an explicit value wins over EITHER default, in BOTH directions.
-        //     The RTEMS-off case is the one an operator needs: turning RT
-        //     scheduling off on a target that defaults to on.
-        for default in [RtPolicy::AllowRealtime, RtPolicy::Disabled] {
+    fn the_c_switch_wins_and_the_default_is_on() {
+        use RtPolicy::{AllowRealtime as On, Disabled as Off};
+        assert_eq!(DEFAULT_POLICY, On);
+        assert_eq!(RtPolicy::from_env(None, None), On);
+        let os = |v: Option<&'static str>| v.map(std::ffi::OsStr::new);
+        for (c, alias, want) in [
+            (Some("YES"), None, On),
+            (Some("yes"), Some("NO"), On),
+            (Some("NO"), Some("YES"), Off),
+            (Some(""), Some("YES"), Off),
+            (Some("true"), None, Off),
+            (Some(" yes"), None, Off),
+            (None, Some("NO"), Off),
+            (None, Some("1"), On),
+            (None, Some(" on "), On),
+            (None, Some(""), Off),
+        ] {
             assert_eq!(
-                RtPolicy::resolve(Some("NO"), default),
-                RtPolicy::Disabled,
-                "explicit NO must turn it off even where the default is {default:?}"
-            );
-            assert_eq!(
-                RtPolicy::resolve(Some("YES"), default),
-                RtPolicy::AllowRealtime,
-                "explicit YES must turn it on even where the default is {default:?}"
-            );
-            assert_eq!(
-                RtPolicy::resolve(None, default),
-                default,
-                "unset must resolve to the default and nothing else"
+                RtPolicy::from_env(os(c), os(alias)),
+                want,
+                "C {c:?}, alias {alias:?}"
             );
         }
-    }
-
-    #[test]
-    fn rt_switch_explicit_values_win_over_the_default() {
-        // Unset takes the target's default; that is
-        // `the_rt_default_is_on_for_rtems_and_off_for_hosted`'s subject.
-        assert_eq!(RtPolicy::from_env_value(None), DEFAULT_POLICY);
-        // C's `envGetBoolConfigParam` (envSubr.c:331) accepts only
-        // case-insensitive "yes"; we also take the spellings a hand-written
-        // startup script is likely to use.
-        for on in ["YES", "yes", "Yes", "true", "TRUE", "on", "1", " yes "] {
-            assert_eq!(
-                RtPolicy::from_env_value(Some(on)),
-                RtPolicy::AllowRealtime,
-                "{on:?} should turn the switch on"
-            );
-        }
-        // Everything else is off. Silence is the safe direction: a
-        // misspelling must never grant a process RT scheduling.
-        for off in ["", "NO", "no", "false", "off", "0", "y", "yes please", "2"] {
-            assert_eq!(
-                RtPolicy::from_env_value(Some(off)),
-                RtPolicy::Disabled,
-                "{off:?} should leave the switch off"
-            );
+        // Not UTF-8 is a set value that is not `yes`, as C's byte compare
+        // (`envSubr.c:331`) sees it — never "unset, so on".
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"y\xffes");
+            assert_eq!(RtPolicy::from_env(Some(raw), None), Off);
+            assert_eq!(RtPolicy::from_env(Some(raw), os(Some("YES"))), Off);
+            assert_eq!(RtPolicy::from_env(None, Some(raw)), Off);
         }
     }
 
@@ -3929,7 +4919,7 @@ mod tests {
             assert_eq!(2 + 2, 4);
 
             let mut policy = 0i32;
-            let mut param = libc::sched_param { sched_priority: 0 };
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
             // SAFETY: reads the calling thread's own scheduling into
             // stack-local outputs.
             let rc = unsafe {
@@ -3973,31 +4963,6 @@ mod tests {
         .join()
         .expect("probe thread panicked");
         eprintln!("host RT outcome: {outcome:?}");
-    }
-
-    /// The unprivileged fallback is logged once, not once per thread.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn denial_is_reported_once_not_per_thread() {
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                std::thread::spawn(|| {
-                    for _ in 0..8 {
-                        let _ = apply_to_current_thread_under(
-                            RtPolicy::AllowRealtime,
-                            ThreadPriority::Low,
-                        );
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().expect("worker panicked");
-        }
-        assert!(
-            DENIED_WARNINGS.load(std::sync::atomic::Ordering::Relaxed) <= 1,
-            "64 denied requests across 8 threads must not produce more than one warning"
-        );
     }
 
     /// The mapping itself, against `epicsThreadGetPosixPriority`
@@ -4044,8 +5009,7 @@ mod tests {
     /// thread, and strictly less urgent than `IRQS`/`TIME`. That is a
     /// property of the map's construction (fixed offsets over a 100-wide
     /// EPICS space), not of the endpoints, which is why no input — including
-    /// the out-of-range ones `ThreadPriority::value` cannot currently produce
-    /// — can escape it.
+    /// the above-99 ones a `ThreadPriority::Custom` carries — can escape it.
     #[test]
     fn rtems_priority_map_stays_below_the_libbsd_network_band() {
         /// libbsd's most urgent network thread on the measured guest.
@@ -4056,7 +5020,7 @@ mod tests {
         const POSIX_MIN: i32 = 1;
         const POSIX_MAX: i32 = 254;
 
-        for epics in 0..=u8::MAX {
+        for epics in 0..=255u32 {
             let posix = map_epics_priority_rtems(epics);
             let core = RTEMS_MAXIMUM_PRIORITY - posix;
             assert!(
@@ -4081,7 +5045,7 @@ mod tests {
         assert_eq!(map_epics_priority_rtems(0), 56);
         assert_eq!(map_epics_priority_rtems(99), 155);
         assert_eq!(map_epics_priority_rtems(100), 155);
-        assert_eq!(map_epics_priority_rtems(u8::MAX), 155);
+        assert_eq!(map_epics_priority_rtems(255), 155);
         // Ordering still holds: a higher EPICS priority is a more urgent core.
         assert!(
             RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(ThreadPriority::ScanLow.value())
@@ -4097,7 +5061,7 @@ mod tests {
     /// nothing else pins the two together if one of them drifts.
     #[test]
     fn vxworks_priority_map_matches_the_rtems_posix_values() {
-        for epics in 0..=u8::MAX {
+        for epics in 0..=255u32 {
             assert_eq!(
                 map_epics_priority_vxworks(epics),
                 map_epics_priority_rtems(epics),
@@ -4110,7 +5074,7 @@ mod tests {
         assert_eq!(map_epics_priority_vxworks(0), 56);
         assert_eq!(map_epics_priority_vxworks(99), 155);
         assert_eq!(map_epics_priority_vxworks(100), 155);
-        assert_eq!(map_epics_priority_vxworks(u8::MAX), 155);
+        assert_eq!(map_epics_priority_vxworks(255), 155);
     }
 
     /// The RTEMS map is not the hosted map with retuned endpoints, and the
@@ -4129,19 +5093,19 @@ mod tests {
         // What `find_pri_range` yields on the guest (osdThread.c:295-311).
         let (min, max) = (1, 254);
 
-        let hosted_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority(epics, min, max);
-        let rtems_core = |epics: u8| RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(epics);
+        let hosted_core = |epics: u32| RTEMS_MAXIMUM_PRIORITY - map_epics_priority(epics, min, max);
+        let rtems_core = |epics: u32| RTEMS_MAXIMUM_PRIORITY - map_epics_priority_rtems(epics);
 
-        let hosted_above_irqs: Vec<u8> = (0..=99)
+        let hosted_above_irqs: Vec<u32> = (0..=99)
             .filter(|&e| hosted_core(e) < LIBBSD_IRQS_CORE)
             .collect();
-        let rtems_above_irqs: Vec<u8> = (0..=99)
+        let rtems_above_irqs: Vec<u32> = (0..=99)
             .filter(|&e| rtems_core(e) < LIBBSD_IRQS_CORE)
             .collect();
 
         assert_eq!(
             rtems_above_irqs,
-            Vec::<u8>::new(),
+            Vec::<u32>::new(),
             "the RTEMS map must place no EPICS priority above libbsd's IRQS"
         );
         assert_eq!(
@@ -4219,12 +5183,6 @@ mod tests {
     /// `name_current_thread` for one that deliberately has none.
     #[test]
     fn every_thread_in_this_crate_publishes_its_name() {
-        // The one exemption, named rather than pattern-matched: the
-        // SCHED_FIFO range probe is `#[cfg(target_os = "linux")]`, exists for
-        // two `sched_*` calls and a join, and never runs on the target whose
-        // task listing this guard is about.
-        const EXEMPT: &str = ".name(\"cbRtProbe\".to_string())";
-
         let mut anonymous = Vec::new();
         let mut checked = 0usize;
         for (label, src) in censused_files() {
@@ -4233,10 +5191,8 @@ mod tests {
                 .skip(1)
                 .enumerate()
             {
-                let (chain, body) = after.split_once(".spawn(").unwrap_or((after, ""));
-                if chain.contains(EXEMPT) {
-                    continue;
-                }
+                // `.spawn(` and `.spawn_scoped(` both.
+                let (_, body) = after.split_once(".spawn").unwrap_or((after, ""));
                 checked += 1;
                 // The prologue is the closure's first work, so look at the
                 // closure, not the builder chain.
@@ -4246,13 +5202,13 @@ mod tests {
             }
         }
 
-        // Three: `spawn_dedicated_thread`'s two `cfg` arms and
-        // `MandatoryThread::try_spawn`, all of which run the prologue for the
-        // caller. The floor was five until the three background facilities
+        // Four: `spawn_dedicated_thread`'s two `cfg` arms,
+        // `spawn_dedicated_thread_scoped` and `MandatoryThread::try_spawn`, all
+        // of which run the prologue for the caller. The floor was five until the three background facilities
         // moved onto `MandatoryThread`, whose constructor takes the band —
         // `every_background_facility_thread_is_mandatory` covers those files.
         assert!(
-            checked >= 3,
+            checked >= 4,
             "expected to find the crate's Builder sites, found {checked} — \
              did a file move? update this guard's file list"
         );
@@ -4357,45 +5313,32 @@ mod tests {
         );
     }
 
-    /// Both of C's `isOkToBlock` defaults, and they differ by exactly one
-    /// thing: whether the thread passed the prologue.
-    ///
-    /// C sets 1 in `createImplicit` (`osdThread.c:710`) for a thread that
-    /// reaches the epicsThread API without having been created by it, and
-    /// leaves the `calloc`ed 0 for every `epicsThreadCreate` thread. A test
-    /// thread is the first kind; anything spawned through this module is the
-    /// second. `runtime::log`'s errlog reads it to decide whether a producer
-    /// may wait for the log drain, so getting this backwards either stalls a
-    /// scan thread on the log or lets the log's own worker wait for itself.
+    /// No thread may block on the errlog drain until it says so: not a banded
+    /// thread, not an iocsh-band one (its `iocshBody` scope raises it), and
+    /// not a thread the port did not create — the tokio workers process
+    /// records too. The flag is per-thread.
     #[test]
-    fn only_a_thread_that_ran_the_prologue_is_not_ok_to_block() {
-        assert!(
-            thread_is_ok_to_block(),
-            "a thread this module did not create is C's implicit context"
-        );
-        let banded = std::thread::spawn(|| {
-            let _ = enter_ioc_thread(ThreadPriority::ScanLow);
-            let after_prologue = thread_is_ok_to_block();
+    fn no_thread_is_ok_to_block_until_it_says_so() {
+        assert!(!thread_is_ok_to_block(), "a thread the port did not create");
+        for band in [ThreadPriority::ScanLow, ThreadPriority::Iocsh] {
+            let after_prologue = std::thread::spawn(move || {
+                let _ = enter_ioc_thread(band);
+                thread_is_ok_to_block()
+            })
+            .join()
+            .expect("the banded thread");
+            assert!(!after_prologue, "{band:?}");
+        }
+        let raised = std::thread::spawn(|| {
             set_thread_ok_to_block(true);
-            (after_prologue, thread_is_ok_to_block())
-        })
-        .join()
-        .expect("the banded thread");
-        assert_eq!(banded, (false, true));
-
-        // The one band that is a shell, so the prologue does what C's
-        // `iocsh`/`iocInit` do to their own thread rather than leaving it at
-        // the `epicsThreadCreate` default.
-        let shell = std::thread::spawn(|| {
-            let _ = enter_ioc_thread(ThreadPriority::Iocsh);
             thread_is_ok_to_block()
         })
         .join()
-        .expect("the shell thread");
-        assert!(shell, "an iocsh thread boots a database and may block");
+        .expect("the raised thread");
+        assert!(raised);
         assert!(
-            thread_is_ok_to_block(),
-            "the flag is per-thread: the child's prologue must not clear ours"
+            !thread_is_ok_to_block(),
+            "the flag is per-thread: the child's raise must not reach ours"
         );
     }
 
@@ -4468,7 +5411,6 @@ mod tests {
         registered_rx.recv().unwrap();
         let row = thread_by_name("_main_").expect("listed while the shell runs");
         assert_eq!(row.epics_priority(), 0, "C's `_main_` is EPICS priority 0");
-        assert_eq!(row.os_priority(), 0, "C changes no scheduling for `_main_`");
         assert_eq!(
             sched_calls_made(),
             before,
@@ -4549,28 +5491,38 @@ mod tests {
         join.join().unwrap();
     }
 
-    /// The `OSSPRI` boundary: a thread that never entered the real-time band
-    /// reads 0, which is the `sched_priority` a SCHED_OTHER thread has and
-    /// what C's live `pthread_getschedparam` returns for it. Every row on a
-    /// default hosted IOC is this case.
+    /// `OSSPRI` is the thread's own `sched_priority`, whatever the platform's
+    /// default policy reads — 0 on Linux, 31 on Darwin — as C's live
+    /// `pthread_getschedparam` prints it.
+    #[cfg(all(unix, not(epics_embedded_target)))]
     #[test]
-    fn os_priority_is_zero_for_every_outcome_but_realtime() {
-        for applied in [
-            PriorityApplied::Disabled,
-            PriorityApplied::Unsupported,
-            PriorityApplied::BestEffortFailed,
-        ] {
-            let row = ThreadInfo {
-                id: 1,
-                name: "cbOss".to_string(),
-                os_id: 7,
-                priority: ThreadPriority::High,
-                applied,
-                suspension: Arc::default(),
-            };
-            assert_eq!(row.os_priority(), 0, "{applied:?}");
-            assert_eq!(row.epics_priority(), ThreadPriority::High.value());
-        }
+    fn os_priority_is_the_threads_own_sched_priority() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::Builder::new()
+            .name("cbOssLive".to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::High);
+                let mut policy = 0;
+                // SAFETY: plain-integer struct, valid zeroed.
+                let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+                // SAFETY: the calling thread, with stack-local out-params.
+                unsafe {
+                    libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param)
+                };
+                tx.send(param.sched_priority).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+        let own = rx.recv().unwrap();
+        let row = thread_report()
+            .into_iter()
+            .find(|t| t.name() == "cbOssLive")
+            .expect("listed while it runs");
+        assert_eq!(row.os_priority(), own);
+        assert_eq!(row.epics_priority(), ThreadPriority::High.value());
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
     }
 
     /// C's `%16.16s %14p %8lu    %3d%8d %8.8s%s`, against two rows copied from
@@ -4585,7 +5537,7 @@ mod tests {
             name: "_main_".to_string(),
             os_id: 3_650_070,
             priority: ThreadPriority::Custom(0),
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -4598,7 +5550,7 @@ mod tests {
             name: "errlog".to_string(),
             os_id: 3_650_072,
             priority: ThreadPriority::Low,
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -4623,7 +5575,7 @@ mod tests {
             name: "_main_".to_string(),
             os_id: 3_650_070,
             priority: ThreadPriority::Custom(0),
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         assert_eq!(
@@ -4730,7 +5682,7 @@ mod tests {
             name: "aVeryLongThreadNameIndeed".to_string(),
             os_id: 7,
             priority: ThreadPriority::Low,
-            applied: PriorityApplied::Disabled,
+            os_priority: 0,
             suspension: Arc::default(),
         };
         let short = ThreadInfo {

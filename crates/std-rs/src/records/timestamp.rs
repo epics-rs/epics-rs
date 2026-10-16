@@ -188,6 +188,9 @@ fn round_subsec_to_millis(nsec: u32) -> u32 {
 }
 
 impl Record for TimestampRecord {
+    epics_base_rs::slot_map!(crate::records::dbd_generated::slots::timestamp;
+        RVAL => rval);
+
     fn record_type(&self) -> &'static str {
         "timestamp"
     }
@@ -253,6 +256,10 @@ impl Record for TimestampRecord {
         dbd_generated::TIMESTAMP_FIELDS
     }
 
+    fn declared_dbaddr_fields(&self) -> Option<&'static [&'static str]> {
+        Some(dbd_generated::TIMESTAMP_DBADDR)
+    }
+
     /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
     /// owns `dbCommon.tse`; this hook captures it so `process()` can
     /// take the device-time branch.
@@ -260,27 +267,10 @@ impl Record for TimestampRecord {
         self.tse = ctx.tse;
     }
 
-    /// The timestamp record has NO value deadband: its monitored
-    /// quantity is the formatted `VAL` string, and `timestampRecord.dbd`
-    /// declares no MDEL/ADEL. C `monitor()` (`timestampRecord.c:152-163`)
-    /// posts `VAL` (and `RVAL`) only inside
-    /// `if (strncmp(oval, val, sizeof(val)))` — i.e. exactly when the
-    /// formatted string changed since the previous process — then copies
-    /// `val` into `oval`. That is plain change-detection, not a deadband.
-    ///
-    /// The framework's snapshot builders force-post the deadband field on
-    /// every cycle the deadband gate fires (and the gate always fires for
-    /// a non-numeric value — see [`epics_base_rs::server::record::RecordInstance::check_deadband_ext`],
-    /// whose `to_f64()` returns `None` for a string `VAL`). Returning the
-    /// default `"VAL"` here would therefore re-post `VAL` on every scan,
-    /// even when the rendered string is unchanged — diverging from C's
-    /// `strncmp` gate. Returning `""` (a name no field resolves to)
-    /// suppresses that force-post (`resolve_field("")` is `None`, so the
-    /// `if let Some(val) = dval` push is skipped) and routes `VAL`
-    /// through the generic change-detection loop, which posts it only
-    /// when it differs from the last posted value — matching C exactly.
-    fn monitor_deadband_field(&self) -> &'static str {
-        ""
+    /// C `monitor()` posts VAL only inside its `strncmp(oval, val)` gate
+    /// (`timestampRecord.c:158`), so an alarm alone posts nothing.
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
     }
 
     /// C `monitor()`'s single gate: the `strncmp(oval, val)` string change
@@ -294,7 +284,7 @@ impl Record for TimestampRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }
@@ -315,6 +305,18 @@ impl Record for TimestampRecord {
 
     fn clears_udf(&self) -> bool {
         true
+    }
+
+    /// C `monitor()` posts VAL and RVAL alone (`timestampRecord.c:158-162`).
+    fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
+        Some(
+            &const {
+                epics_base_rs::server::record::declared_set(
+                    dbd_generated::TIMESTAMP_FIELDS,
+                    ["VAL", "RVAL"],
+                )
+            },
+        )
     }
 }
 
@@ -361,7 +363,7 @@ mod menu_choice_tests {
     fn timestamp_tst_snapshot_is_enum_with_labels() {
         let mut rec = TimestampRecord::default();
         rec.put_field("TST", EpicsValue::Short(4)).unwrap(); // HH:MM:SS
-        let inst = RecordInstance::new("TS:TST".into(), rec);
+        let inst = RecordInstance::new("TS:TST", rec);
 
         let snap = inst.snapshot_for_field("TST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(4));
@@ -390,26 +392,5 @@ mod menu_choice_tests {
             .find(|f| f.name == "VAL")
             .expect("VAL is declared");
         assert_eq!(val.menu, None);
-    }
-
-    // C `timestampRecord.c:152-163`: `monitor()` posts VAL (and RVAL)
-    // only inside `if (strncmp(oval, val))` — when the formatted string
-    // changed. There is no value deadband. The record routes VAL through
-    // the framework's generic change-detection loop by reporting an
-    // empty deadband field; the framework's deadband force-post is then
-    // skipped because that name resolves to nothing.
-    #[test]
-    fn timestamp_has_no_deadband_field_so_val_change_detects() {
-        let rec = TimestampRecord::default();
-        // No numeric value deadband — the sentinel routes VAL to the
-        // change-detection loop (cf. motor's "RBV").
-        assert_eq!(rec.monitor_deadband_field(), "");
-
-        // The framework's deadband force-post fires only
-        // `if let Some(val) = resolve_field(deadband_field)`. The "" name
-        // must resolve to None so VAL is never force-posted on an
-        // unchanged-string cycle.
-        let inst = RecordInstance::new("TS:DB".into(), TimestampRecord::default());
-        assert_eq!(inst.resolve_field(""), None);
     }
 }

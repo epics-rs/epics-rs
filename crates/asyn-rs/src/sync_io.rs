@@ -47,10 +47,11 @@ impl SyncIOHandle {
         })
     }
 
-    fn user(&self, reason: usize) -> AsynUser {
+    pub(crate) fn user(&self, reason: usize) -> AsynUser {
         AsynUser::new(reason)
             .with_addr(self.addr)
             .with_timeout(self.timeout)
+            .locking_port(self.handle.queue_lock_port_timeout())
     }
 
     /// Read the configured per-call timeout. The handle is `&self`-only
@@ -112,7 +113,7 @@ impl SyncIOHandle {
     }
 
     /// Returns the number of bytes transferred (C `asynOctet::write`'s
-    /// `*nbytesTransfered`).
+    /// `*nbytesTransferred`).
     pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<usize> {
         let user = self.user(reason);
         let result = self.handle.submit_blocking(
@@ -403,7 +404,8 @@ mod tests {
     #[test]
     fn test_sync_io_via_manager() {
         let mgr = PortManager::new();
-        mgr.register_port(TestPort::new()).unwrap();
+        mgr.register_port(TestPort::new(), &crate::registry::open_owner())
+            .unwrap();
         let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);
@@ -432,7 +434,7 @@ mod tests {
         assert_eq!(sio.timeout(), before, "10× r/w must preserve timeout");
     }
 
-    /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransfered`
+    /// R7-46: C `asynOctetSyncIO::read` hands the caller `*nbytesTransferred`
     /// alongside the failing status — `pasynOctet->read` fills the caller's
     /// buffer before returning `asynTimeout`, so a partial line is not lost to
     /// a SyncIO caller. `read_octet`'s `Err` must therefore carry the transfer:

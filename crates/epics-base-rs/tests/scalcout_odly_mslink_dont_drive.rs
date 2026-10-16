@@ -78,7 +78,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
-        Some(EpicsValue::Short(1)),
+        Some(EpicsValue::UShort(1)),
         "ODLY>0 cycle sets DLYA and defers"
     );
     assert_eq!(

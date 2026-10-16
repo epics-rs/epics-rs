@@ -44,7 +44,7 @@ fn an_input_channel_advertises_noa_not_nea() {
     r.put_field("A", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
         .unwrap();
 
-    assert_eq!(r.get_field("NEA").unwrap(), EpicsValue::Long(3));
+    assert_eq!(r.get_field("NEA").unwrap(), EpicsValue::ULong(3));
     assert_eq!(served_len(&r, "A"), 3);
     assert_eq!(r.field_native_count("A"), Some(8));
 }
@@ -57,7 +57,7 @@ fn an_output_channel_advertises_nova_not_neva() {
     r.put_field("VALA", EpicsValue::DoubleArray(vec![7.0, 8.0].into()))
         .unwrap();
 
-    assert_eq!(r.get_field("NEVA").unwrap(), EpicsValue::Long(2));
+    assert_eq!(r.get_field("NEVA").unwrap(), EpicsValue::ULong(2));
     assert_eq!(served_len(&r, "VALA"), 2);
     assert_eq!(r.field_native_count("VALA"), Some(6));
 }

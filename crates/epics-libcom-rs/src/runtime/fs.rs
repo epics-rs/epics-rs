@@ -25,7 +25,8 @@
 //!
 //! These wrappers do the same thing tokio does — `std::fs` on a blocking
 //! worker — but through [`crate::runtime::task::spawn_blocking`], which both
-//! backends implement. On the RTEMS backend that is a callback-pool worker.
+//! backends implement. On the RTEMS backend that is the `offload::BLOCKING`
+//! pool, never a callback band.
 //!
 //! # Composite operations belong in one closure
 //!

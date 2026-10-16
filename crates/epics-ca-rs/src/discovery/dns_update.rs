@@ -60,7 +60,9 @@ pub struct DnsRegistration {
     /// Hostname target for the SRV record. Must already have an A record
     /// in the same zone (or another resolvable zone). Example: `motor-host`.
     pub host: String,
-    /// CA TCP port.
+    /// UDP search port a client sends SEARCH to; a discovering client adds the
+    /// SRV `host:port` to its SEARCH destinations. `CaServer` overwrites it
+    /// with the port it serves.
     pub port: u16,
     /// TXT records (key=value).
     pub txt: Vec<(String, String)>,

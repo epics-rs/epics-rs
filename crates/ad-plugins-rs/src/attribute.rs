@@ -127,6 +127,7 @@ impl AttributeProcessor {
 }
 
 impl NDPluginProcess for AttributeProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
@@ -232,6 +233,7 @@ pub fn create_attribute_runtime(
     wiring: std::sync::Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
     ts_registry: &crate::time_series::TsReceiverRegistry,
     max_attributes: i32,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     ad_core_rs::plugin::runtime::PluginRuntimeHandle,
     std::thread::JoinHandle<()>,
@@ -255,6 +257,7 @@ pub fn create_attribute_runtime(
         ndarray_port,
         wiring,
         num_addr,
+        threads,
     );
 
     ts_registry.store(port_name, ts_rx, attr_ts_channel_names(num_channels));

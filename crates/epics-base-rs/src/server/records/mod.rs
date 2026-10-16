@@ -11,11 +11,11 @@ use crate::types::{DbFieldType, EpicsValue};
 /// integer source reaches `getLongUlong` and converts MODULO 2^32, which C
 /// defines (C17 6.3.1.3p2) — `0xdeadbeef` read from a signed `DBF_LONG` lands in
 /// RVAL as `0xdeadbeef` — while a float source reaches `getDoubleUlong` and hits
-/// the UB cast that CBUG-E2 saturates.
+/// the UB cast, which `c_cast` takes as x86-64's `cvttsd2si`.
 ///
 /// [`EpicsValue::convert_to`] is the owner of that split. Reaching for
 /// `c_cast::f64_to_*(value.to_f64())` instead — as all four dsets once did —
-/// forces the FLOAT rule onto integer sources and saturates what C wraps.
+/// forces the FLOAT rule onto integer sources and clamps what C wraps.
 ///
 /// `convert_to` coerces rather than fails, so the not-numeric rejection has to
 /// stay explicit: without this gate a string INP would land in RVAL as a silent
@@ -37,6 +37,15 @@ pub(crate) fn raw_soft_rval_i32(record: &str, value: &EpicsValue) -> CaResult<i3
             format!("{record} Raw Soft Channel: INP value not a scalar ({other:?})").into(),
         )),
     }
+}
+
+/// The MASK the multibit `devXxxSoftRaw::init_record` leaves
+/// (`devMbbiSoftRaw.c:45-48` and its three twins): NOBT 0 overrides a
+/// configured MASK, then `mask <<= shft`. C stores it back into MASK, so a
+/// later client put to MASK is used as written.
+pub(crate) fn raw_soft_dset_mask(mask: u32, nobt_is_zero: bool, shft: u16) -> u32 {
+    let base = if nobt_is_zero { u32::MAX } else { mask };
+    base.checked_shl(u32::from(shft)).unwrap_or(0)
 }
 
 /// [`raw_soft_rval`] for the dsets whose `RVAL` is `epicsUInt32` (bi, mbbi,

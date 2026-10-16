@@ -2,36 +2,21 @@
 //! as the synchronous `write()` branch does and as C's `processCallbackOutput`
 //! reports through `pPvt->result.status` (devAsynFloat64.c:668-671).
 //!
-//! The completion task used to drop the result of `WriteCompletion::wait` and
-//! call `complete_async_record` with no outcome, so a write the driver refused
-//! on an `ASYN_CANBLOCK` port completed `NO_ALARM`.
+//! The completion task used to drop the write's result and call
+//! `complete_async_record` with no outcome, so a write the driver refused on an
+//! `ASYN_CANBLOCK` port completed `NO_ALARM`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::device_support::{DeviceSupport, WriteCompletion, WriteStart};
+use epics_base_rs::server::database::{PvDatabase, WriteDoneSource};
+use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
-
-/// The round trip: `wait` reports what the device did with the write.
-struct Completion {
-    fails: bool,
-}
-
-impl WriteCompletion for Completion {
-    fn wait(&self, _timeout: Duration) -> CaResult<()> {
-        if self.fails {
-            Err(CaError::Protocol("asynError".into()))
-        } else {
-            Ok(())
-        }
-    }
-}
 
 /// A blocking-port device support: every write goes out asynchronously.
 struct AsyncDevice {
@@ -42,10 +27,22 @@ impl DeviceSupport for AsyncDevice {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         unreachable!("write_begin always submits")
     }
-    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
-        Ok(WriteStart::Pending(Box::new(Completion {
-            fails: self.fails.load(Ordering::SeqCst),
-        })))
+    /// The write lands at once; its outcome reaches the record through the
+    /// completion, as `pPvt->result.status` does.
+    fn write_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        done: &WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        let outcome = if self.fails.load(Ordering::SeqCst) {
+            Err(CaError::Protocol("asynError".into()))
+        } else {
+            Ok(())
+        };
+        done.write_done()
+            .complete(done.priority(), outcome)
+            .unwrap();
+        Ok(WriteStart::Pending)
     }
     fn dtyp(&self) -> &str {
         "AsyncDev"

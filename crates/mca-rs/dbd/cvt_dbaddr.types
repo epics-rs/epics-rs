@@ -4,7 +4,7 @@
 # reasoning; this one covers only the record types declared in THIS crate's
 # `dbd/` directory.
 #
-# record.FIELD          DBF type        special     dyn         C source
+# record.FIELD          DBF type        special     dyn         size    C source
 
 # mca: the spectrum (VAL) and the ROI background curve (BG) are both allocated
 # `NMAX` deep with the element width of `FTVL`, and `cvt_dbaddr` re-points the
@@ -18,5 +18,5 @@
 # not the served type. `dyn = FTVL` marks both as runtime-typed: the declared
 # type below is only FTVL's own `initial("5")` default (DBF_LONG), and the
 # record's stored element type wins at serve time.
-mca.VAL                 DBF_LONG        SPC_DBADDR  FTVL        mcaRecord.c:847-863
-mca.BG                  DBF_LONG        SPC_DBADDR  FTVL        mcaRecord.c:847-863
+mca.VAL                 DBF_LONG        SPC_DBADDR  FTVL        -       mcaRecord.c:847-863
+mca.BG                  DBF_LONG        SPC_DBADDR  FTVL        -       mcaRecord.c:847-863

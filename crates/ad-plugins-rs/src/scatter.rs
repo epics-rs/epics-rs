@@ -49,6 +49,7 @@ impl Default for ScatterProcessor {
 }
 
 impl NDPluginProcess for ScatterProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::scatter(array)
     }

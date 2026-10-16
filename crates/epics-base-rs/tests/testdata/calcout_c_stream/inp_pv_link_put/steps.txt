@@ -1,0 +1,3 @@
+monitor CO.B CO.INBV CO.VAL
+caput CO.INPB SRC
+caput CO.PROC 1

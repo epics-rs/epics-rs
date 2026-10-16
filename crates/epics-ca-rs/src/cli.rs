@@ -8,7 +8,8 @@ use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
-use crate::client::{CaChannel, CaClient};
+use crate::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_base_rs::runtime::sync::broadcast;
 
 /// Default CA CLI timeout in seconds when neither `-w` nor a usable
 /// `EPICS_CLI_TIMEOUT` env var is set.
@@ -73,7 +74,7 @@ pub const EXPIRED_TIMEOUT: std::time::Duration = std::time::Duration::ZERO;
 /// documents (C's `nan` hangs forever), and C's own scan accepts them silently,
 /// so no warning is raised for them either.
 pub fn env_default_timeout() -> f64 {
-    let Ok(raw) = std::env::var("EPICS_CLI_TIMEOUT") else {
+    let Some(raw) = epics_base_rs::runtime::env::get_lossy("EPICS_CLI_TIMEOUT") else {
         return DEFAULT_CLI_TIMEOUT_SECS;
     };
     let Some(secs) = crate::copt::scan_double(&raw) else {
@@ -137,14 +138,17 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
 /// (`tool_lib.c:630-636`). It depends only on the *number* of PVs asked
 /// for, never on which of them failed: more than one PV collapses to
 /// "some PV(s)", a lone PV is named.
-pub fn connect_timeout_message(names: &[String]) -> String {
+pub fn connect_timeout_message(names: &[PvString]) -> Vec<u8> {
     if names.len() > 1 {
-        "Channel connect timed out: some PV(s) not found.".to_string()
+        b"Channel connect timed out: some PV(s) not found.".to_vec()
     } else {
-        format!(
-            "Channel connect timed out: '{}' not found.",
-            names.first().map(String::as_str).unwrap_or("")
-        )
+        let name = names.first().map(PvString::as_bytes).unwrap_or_default();
+        [
+            b"Channel connect timed out: '".as_slice(),
+            name,
+            b"' not found.",
+        ]
+        .concat()
     }
 }
 
@@ -158,12 +162,23 @@ pub fn connect_timeout_message(names: &[String]) -> String {
 /// rejected name and a connect timeout to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectPvsFailure {
-    message: String,
+    message: Vec<u8>,
+}
+
+impl ConnectPvsFailure {
+    /// C's `fprintf(stderr, ...)` of the names' bytes, then `return 1`.
+    pub fn exit(&self) -> ! {
+        use std::io::Write as _;
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(&self.message);
+        let _ = err.write_all(b"\n");
+        std::process::exit(1)
+    }
 }
 
 impl std::fmt::Display for ConnectPvsFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&String::from_utf8_lossy(&self.message))
     }
 }
 
@@ -189,14 +204,17 @@ impl std::error::Error for ConnectPvsFailure {}
 /// comes first and, when it fires, the wait never runs.
 pub async fn connect_pvs(
     client: &CaClient,
-    names: &[String],
+    names: &[PvString],
     priority: u8,
     timeout: std::time::Duration,
 ) -> Result<Vec<CaChannel>, ConnectPvsFailure> {
     // C `connect_pvs:625-626`: `create_pvs` first, and its non-zero return
     // is returned WITHOUT entering `ca_pend_io` — so a rejected name costs
     // no timeout and emits no "Channel connect timed out" line.
-    let channels = create_pvs(client, names, priority)?;
+    let channels: Vec<CaChannel> = create_pvs(client, names, priority)?
+        .into_iter()
+        .map(|(channel, _)| channel)
+        .collect();
     let all_connected =
         futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
             .await
@@ -233,32 +251,41 @@ pub async fn connect_pvs(
 ///
 /// Every rejected name gets its own line, in argv order, because C's loop
 /// reports each one and only then returns 1.
+///
+/// Each channel comes with the connection-event receiver it was created
+/// with, as C's `create_pvs` installs `connection_handler` in
+/// `ca_create_channel`.
 pub fn create_pvs(
     client: &CaClient,
-    names: &[String],
+    names: &[PvString],
     priority: u8,
-) -> Result<Vec<CaChannel>, ConnectPvsFailure> {
+) -> Result<Vec<(CaChannel, broadcast::Receiver<ConnectionEvent>)>, ConnectPvsFailure> {
     if let Some(message) = uncreatable_names_message(names) {
         return Err(ConnectPvsFailure { message });
     }
     Ok(names
         .iter()
-        .map(|name| client.create_channel_with_priority(name, priority))
+        .map(|name| client.create_channel_with_events(name, priority))
         .collect())
 }
 
 /// The diagnostic [`create_pvs`] fails with, or `None` when every name is
 /// creatable. Split out so the gate is testable without a live client — it
 /// is pure text over the names, exactly as C's loop is.
-fn uncreatable_names_message(names: &[String]) -> Option<String> {
-    let rejected: Vec<String> = names
+fn uncreatable_names_message(names: &[PvString]) -> Option<Vec<u8>> {
+    let rejected: Vec<Vec<u8>> = names
         .iter()
-        .filter(|name| !channel_name_is_creatable(name))
+        .filter(|name| !channel_name_is_creatable(name.as_bytes()))
         .map(|name| {
-            format!("CA error Invalid string occurred while trying to create channel '{name}'.")
+            [
+                b"CA error Invalid string occurred while trying to create channel '".as_slice(),
+                name.as_bytes(),
+                b"'.",
+            ]
+            .concat()
         })
         .collect();
-    (!rejected.is_empty()).then(|| rejected.join("\n"))
+    (!rejected.is_empty()).then(|| rejected.join(b"\n".as_slice()))
 }
 
 /// C `MAX_UDP_SEND - sizeof(caHdr)` (`caProto.h:66` = 1024, minus the
@@ -266,7 +293,7 @@ fn uncreatable_names_message(names: &[String]) -> Option<String> {
 /// carry, and the bound `nciu`'s constructor tests (`nciu.cpp:56`).
 const MAX_CHANNEL_NAME_BYTES: usize = 1024 - 16;
 
-fn channel_name_is_creatable(name: &str) -> bool {
+fn channel_name_is_creatable(name: &[u8]) -> bool {
     // C tests `strlen(name) + 1 > bound` because the NUL travels on the
     // wire with the name; the same bound without the NUL is `len < bound`.
     !name.is_empty() && name.len() < MAX_CHANNEL_NAME_BYTES
@@ -277,6 +304,31 @@ fn channel_name_is_creatable(name: &str) -> bool {
 /// 30 chars left-aligned, then one space before the value. Mirrors
 /// `epics-base/modules/ca/src/tools/tool_lib.c::print_value`'s width.
 pub const PV_NAME_WIDTH: usize = 30;
+
+/// A PV name argument: C's tools take `argv[i]` as the name's bytes.
+pub fn pv_name_arg(arg: std::ffi::OsString) -> PvString {
+    arg.into_encoded_bytes().into()
+}
+
+/// The name column: `%-30s` when `pad`, which pads to 30 BYTES, else the
+/// bare name.
+pub fn name_column(name: &[u8], pad: bool) -> Vec<u8> {
+    let mut col = name.to_vec();
+    if pad && col.len() < PV_NAME_WIDTH {
+        col.resize(PV_NAME_WIDTH, b' ');
+    }
+    col
+}
+
+/// `printf("%s...\n", name, ...)`: the name's bytes, then `rest`, in one
+/// stdout write.
+pub fn println_named(name: &[u8], rest: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut line = name.to_vec();
+    let _ = line.write_fmt(rest);
+    line.push(b'\n');
+    let _ = std::io::stdout().lock().write_all(&line);
+}
 
 /// `epicsAlarmConditionStrings` (`libcom/src/misc/alarmString.c:27-50`) —
 /// the alarm-status mnemonics the CA tools print. Index is the wire `stat`
@@ -2007,8 +2059,12 @@ mod tests {
         assert_eq!(format_c_g(f64::NEG_INFINITY), "-inf");
     }
 
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn names(v: &[&str]) -> Vec<PvString> {
+        v.iter().map(|&s| s.into()).collect()
+    }
+
+    fn text(msg: Option<Vec<u8>>) -> Option<String> {
+        msg.map(|m| String::from_utf8(m).expect("UTF-8 names"))
     }
 
     /// Measured against C `caget ''` (rc=1, this exact stderr line, no
@@ -2017,7 +2073,7 @@ mod tests {
     #[test]
     fn an_empty_name_is_refused_before_any_search() {
         assert_eq!(
-            uncreatable_names_message(&names(&[""])).as_deref(),
+            text(uncreatable_names_message(&names(&[""]))).as_deref(),
             Some("CA error Invalid string occurred while trying to create channel ''.")
         );
     }
@@ -2028,8 +2084,8 @@ mod tests {
     /// 1007-char name and refuses the 1008-char one instantly.
     #[test]
     fn the_name_length_bound_is_the_search_datagrams_room() {
-        assert!(channel_name_is_creatable(&"X".repeat(1007)));
-        assert!(!channel_name_is_creatable(&"X".repeat(1008)));
+        assert!(channel_name_is_creatable("X".repeat(1007).as_bytes()));
+        assert!(!channel_name_is_creatable("X".repeat(1008).as_bytes()));
     }
 
     /// C's loop reports EVERY rejected name and only then returns 1, so a
@@ -2037,7 +2093,11 @@ mod tests {
     /// — and does not earn a connect wait either.
     #[test]
     fn every_rejected_name_gets_its_own_line_in_argv_order() {
-        let msg = uncreatable_names_message(&names(&["", "T:ai", &"X".repeat(1008)]));
+        let msg = text(uncreatable_names_message(&names(&[
+            "",
+            "T:ai",
+            &"X".repeat(1008),
+        ])));
         let long = "X".repeat(1008);
         assert_eq!(
             msg.as_deref(),
@@ -2054,5 +2114,16 @@ mod tests {
     #[test]
     fn creatable_names_produce_no_diagnostic() {
         assert_eq!(uncreatable_names_message(&names(&["T:ai", "T:ao"])), None);
+    }
+
+    /// `tool_lib.c` prints the names with `%s`: their bytes, not a decode.
+    #[test]
+    fn diagnostics_carry_a_non_utf8_name_as_its_bytes() {
+        let bad = PvString::from(b"T:\xff".as_slice());
+        assert_eq!(
+            connect_timeout_message(std::slice::from_ref(&bad)),
+            b"Channel connect timed out: 'T:\xff' not found."
+        );
+        assert_eq!(name_column(b"T:\xc3\xa9", true).len(), PV_NAME_WIDTH);
     }
 }

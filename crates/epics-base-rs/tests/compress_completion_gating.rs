@@ -60,6 +60,8 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
         inst.put_common_field("FLNK", EpicsValue::String("cnt".into()))
             .unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
 
     // Feed four samples; the FLNK must stay silent until the emit cycle.
     for i in 1..=4 {

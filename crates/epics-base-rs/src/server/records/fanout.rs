@@ -1,9 +1,15 @@
+use crate::types::PvString;
 use epics_macros_rs::EpicsRecord;
 
 /// Choice labels for the `fanout` select-mechanism menu, in index order.
 /// C `menu(fanoutSELM)` (`fanoutRecord.dbd.pod:30-33`): 0=All,
 /// 1=Specified, 2=Mask.
 const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
+
+static FANOUT_POSTED: [crate::server::record::FieldIx; 2] = crate::server::record::declared_set(
+    crate::server::record::dbd_generated::FANOUT_FIELDS,
+    ["VAL", "SELN"],
+);
 
 /// `fanout` record — forward-link fan-out.
 ///
@@ -21,7 +27,14 @@ const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 // posts VAL only with alarm events (`if (events) db_post_events(&prec->val,
 // events)`, fanoutRecord.c:148-150), never DBE_VALUE/DBE_LOG. So a run of
 // `caput VAL` posts no per-put value monitor (only the connect-time snapshot).
-#[record(type = "fanout", constant_init = "SELL:SELN", no_value_monitor)]
+// `process_posted_fields`: `process()` posts VAL and SELN alone
+// (`fanoutRecord.c:147-152`; fanout has no `monitor()`).
+#[record(
+    type = "fanout",
+    constant_init = "SELL:SELN",
+    no_value_monitor,
+    process_posted_fields = FANOUT_POSTED
+)]
 pub struct FanoutRecord {
     // VAL is `field(VAL,DBF_LONG){ pp(TRUE) }` (fanoutRecord.dbd:21-25) — the
     // "Used to trigger" field. It carries no output value: C `process`
@@ -41,40 +54,40 @@ pub struct FanoutRecord {
     // SELN is `DBF_USHORT` (fanoutRecord.dbd.pod:117): unsigned 0..65535.
     #[field(type = "UShort")]
     pub seln: u16,
-    #[field(type = "String")]
-    pub lnk0: String,
-    #[field(type = "String")]
-    pub lnk1: String,
-    #[field(type = "String")]
-    pub lnk2: String,
-    #[field(type = "String")]
-    pub lnk3: String,
-    #[field(type = "String")]
-    pub lnk4: String,
-    #[field(type = "String")]
-    pub lnk5: String,
-    #[field(type = "String")]
-    pub lnk6: String,
-    #[field(type = "String")]
-    pub lnk7: String,
-    #[field(type = "String")]
-    pub lnk8: String,
-    #[field(type = "String")]
-    pub lnk9: String,
-    #[field(type = "String")]
-    pub lnka: String,
-    #[field(type = "String")]
-    pub lnkb: String,
-    #[field(type = "String")]
-    pub lnkc: String,
-    #[field(type = "String")]
-    pub lnkd: String,
-    #[field(type = "String")]
-    pub lnke: String,
-    #[field(type = "String")]
-    pub lnkf: String,
-    #[field(type = "String")]
-    pub sell: String,
+    #[field(type = "PvStr", link)]
+    pub lnk0: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk1: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk2: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk3: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk4: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk5: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk6: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk7: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk8: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnk9: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnka: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkb: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkc: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkd: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnke: PvString,
+    #[field(type = "PvStr", link)]
+    pub lnkf: PvString,
+    #[field(type = "PvStr", link)]
+    pub sell: PvString,
     #[field(type = "Short")]
     pub offs: i16,
     #[field(type = "Short")]
@@ -90,23 +103,23 @@ impl Default for FanoutRecord {
             // an unset SELN defaults to 1, not 0. Only observable when the
             // .db omits SELN and SELM is Specified/Mask (All ignores SELN).
             seln: 1,
-            lnk0: String::new(),
-            lnk1: String::new(),
-            lnk2: String::new(),
-            lnk3: String::new(),
-            lnk4: String::new(),
-            lnk5: String::new(),
-            lnk6: String::new(),
-            lnk7: String::new(),
-            lnk8: String::new(),
-            lnk9: String::new(),
-            lnka: String::new(),
-            lnkb: String::new(),
-            lnkc: String::new(),
-            lnkd: String::new(),
-            lnke: String::new(),
-            lnkf: String::new(),
-            sell: String::new(),
+            lnk0: PvString::new(),
+            lnk1: PvString::new(),
+            lnk2: PvString::new(),
+            lnk3: PvString::new(),
+            lnk4: PvString::new(),
+            lnk5: PvString::new(),
+            lnk6: PvString::new(),
+            lnk7: PvString::new(),
+            lnk8: PvString::new(),
+            lnk9: PvString::new(),
+            lnka: PvString::new(),
+            lnkb: PvString::new(),
+            lnkc: PvString::new(),
+            lnkd: PvString::new(),
+            lnke: PvString::new(),
+            lnkf: PvString::new(),
+            sell: PvString::new(),
             offs: 0,
             // C `fanoutRecord.dbd.pod:133` `field(SHFT,DBF_SHORT){ initial("-1") }`:
             // when SHFT is not set in the .db file it defaults to -1, so in
@@ -124,7 +137,7 @@ impl FanoutRecord {
     }
 
     /// Get all non-empty link targets, in `LNK0..LNKF` order.
-    pub fn links(&self) -> Vec<&str> {
+    pub fn links(&self) -> Vec<&[u8]> {
         [
             &self.lnk0, &self.lnk1, &self.lnk2, &self.lnk3, &self.lnk4, &self.lnk5, &self.lnk6,
             &self.lnk7, &self.lnk8, &self.lnk9, &self.lnka, &self.lnkb, &self.lnkc, &self.lnkd,
@@ -132,7 +145,7 @@ impl FanoutRecord {
         ]
         .iter()
         .filter(|s| !s.is_empty())
-        .map(|s| s.as_str())
+        .map(|s| s.as_bytes())
         .collect()
     }
 }
@@ -150,7 +163,7 @@ mod tests {
         let rec = FanoutRecord::default();
         assert_eq!(rec.shft, -1);
         // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → LNK1.
-        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
-        assert_eq!(sel.indices, vec![1]);
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft);
+        assert_eq!(sel.indices().collect::<Vec<_>>(), vec![1]);
     }
 }

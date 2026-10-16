@@ -19,9 +19,20 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalCpProcess, LinkSet, PvDatabase};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
+
+/// One request taken by the link's worker, polled until it waits for the
+/// next: the only way a holder of an external CP link processes.
+fn process_holders(db: &PvDatabase) {
+    use std::future::Future as _;
+    let process = ExternalCpProcess::new("UP:PV".to_string());
+    process.request();
+    let worker = std::pin::pin!(process.run_worker(|| Some(db.clone())));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(worker.poll(&mut cx).is_pending());
+}
 
 /// An lset with a switchable circuit, modelling `CaLink`'s servability
 /// gate: while `up` is false every value-derived accessor reports `None`,
@@ -53,19 +64,20 @@ impl SwitchableLset {
 
 #[async_trait::async_trait]
 impl LinkSet for SwitchableLset {
-    fn is_connected(&self, _: &str) -> bool {
+    fn is_connected(&self, _: &[u8]) -> bool {
         self.servable()
     }
 
-    async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.servable().then(|| self.cached.clone())
     }
 
-    fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
         self.servable().then(|| self.cached.clone())
     }
 
-    async fn connect_link(&self, _: &str) {}
+    async fn connect_link(&self, _: &[u8], _: Option<epics_base_rs::server::database::CaLinkInit>) {
+    }
 }
 
 fn alarm_of(db: &PvDatabase, name: &str) -> (u16, u16) {
@@ -83,11 +95,19 @@ async fn holder_db(lset: Arc<SwitchableLset>) -> PvDatabase {
     {
         let rec = db.get_record("HOLDER").unwrap();
         let mut inst = rec.write();
-        inst.common.inp = "ca://UP:PV CP".to_string();
-        inst.parsed_inp = epics_base_rs::server::record::parse_link_v2("ca://UP:PV CP");
+        inst.common.text.inp = "ca://UP:PV CP".into();
+        inst.install_link_cache(
+            "INP",
+            std::sync::Arc::new(epics_base_rs::server::record::parse_link_v2(
+                "ca://UP:PV CP",
+            )),
+        )
+        .expect("a common link");
     }
     db.initialize_link_locality().await;
     db.setup_cp_links().await;
+    // C `dbCaRun`: the CP workers run from here.
+    db.process_cp_links_on_connect().await;
     db
 }
 
@@ -102,7 +122,7 @@ async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
     let db = holder_db(lset.clone()).await;
 
     // Circuit up: the CP dispatch is the ordinary monitor-event path.
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         db.get_pv("HOLDER").ok(),
         Some(EpicsValue::Double(42.5)),
@@ -119,7 +139,7 @@ async fn a_dispatch_on_a_dropped_link_commits_link_invalid() {
     // processed again, and reports its last good value with SEVR=0 for
     // the whole outage.
     lset.set_up(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
 
     assert_eq!(
         alarm_of(&db, "HOLDER"),
@@ -142,11 +162,11 @@ async fn the_link_alarm_clears_on_the_next_event_after_recovery() {
     let db = holder_db(lset.clone()).await;
 
     lset.set_up(false);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(alarm_of(&db, "HOLDER").1, 3, "outage must raise INVALID");
 
     lset.set_up(true);
-    db.dispatch_external_cp_targets("UP:PV");
+    process_holders(&db);
     assert_eq!(
         alarm_of(&db, "HOLDER"),
         (0, 0),

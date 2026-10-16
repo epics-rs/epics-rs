@@ -17,6 +17,7 @@
 
 #![cfg(tokio_backend)]
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::pv_builders::complex_pv_matrix;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
@@ -29,9 +30,7 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
     let pvs = complex_pv_matrix();
 
     let source = SharedSource::new();
@@ -42,12 +41,6 @@ async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
     let cfg = epics_pva_rs::server_native::PvaServerConfig {
         emit_type_cache: true,
         tcp_port: 0,
-        udp_port: {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        },
         ..epics_pva_rs::server_native::PvaServerConfig::isolated()
     };
     let server = PvaServer::start(Arc::new(source), cfg).expect("server start");
@@ -82,7 +75,7 @@ async fn interop_type_cache_emit_pvxget_accepts_backrefs() {
             .env(env_key, lib)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await

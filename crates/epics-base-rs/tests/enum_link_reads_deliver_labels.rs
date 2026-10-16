@@ -120,7 +120,7 @@ async fn lsi_inp_at_char_array_source_reads_the_bytes() {
         let rec = db.get_record("WFC").unwrap();
         let mut inst = rec.write();
         inst.record
-            .put_field_internal("VAL", EpicsValue::CharArray(b"hello".to_vec().into()))
+            .put_field_internal("VAL", EpicsValue::CharArray(b"hello\0".to_vec().into()))
             .unwrap();
     }
     process(&db, "LIC").await;
@@ -214,25 +214,25 @@ struct EnumLset {
 
 #[epics_base_rs::async_trait]
 impl LinkSet for EnumLset {
-    fn is_connected(&self, _name: &str) -> bool {
+    fn is_connected(&self, _name: &[u8]) -> bool {
         true
     }
-    fn get_cached_value(&self, _name: &str) -> Option<EpicsValue> {
+    fn get_cached_value(&self, _name: &[u8]) -> Option<EpicsValue> {
         Some(self.value.clone())
     }
-    async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+    async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
         self.get_cached_value(name)
     }
     async fn put_value(
         &self,
-        _name: &str,
+        _name: &[u8],
         value: EpicsValue,
         _op: LinkPutOp,
     ) -> Result<(), String> {
         *self.last_put.lock().unwrap() = Some(value);
         Ok(())
     }
-    fn link_metadata(&self, _name: &str) -> Option<LinkMetadata> {
+    fn link_metadata(&self, _name: &[u8]) -> Option<LinkMetadata> {
         Some(self.metadata.clone())
     }
 }

@@ -107,7 +107,7 @@ async fn the_sink_arms_the_sdel_watchdog() {
         .await
         .expect("a record born with SDEL > 0 must have its watchdog armed at creation")
         .expect("subscription alive");
-    match &event.snapshot.value {
+    match &event.delivered_value(&rec.read(), "VAL").unwrap() {
         EpicsValue::ULongArray(v) => assert_eq!(v, &vec![1, 0]),
         other => panic!("VAL must be ULongArray (C DBF_ULONG), got {other:?}"),
     }

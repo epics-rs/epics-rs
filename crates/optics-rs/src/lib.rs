@@ -51,3 +51,12 @@ pub mod snl;
 
 /// Path to the bundled database template directory.
 pub const OPTICS_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
+
+/// Return the table record type factory for injection into IocBuilder.
+pub fn table_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    epics_base_rs::server::record::register_contributed_dbd(&records::dbd_generated::DBD);
+    (
+        "table",
+        Box::new(|| Box::new(records::table::TableRecord::default())),
+    )
+}

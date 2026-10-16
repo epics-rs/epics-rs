@@ -15,23 +15,29 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
@@ -121,13 +127,14 @@ pub static VARIABLES: &[(&str, &str)] = &[];
 // modelled separately (see the module docs).
 // ---------------------------------------------------------------------
 
-/// `recordtype(mca)` — 317 CA-visible own fields from `dbd/mcaRecord.dbd` (3 `DBF_NOACCESS` internals dropped).
+/// `recordtype(mca)` — 320 CA-visible own fields from `dbd/mcaRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MCA_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -149,12 +156,13 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::NoAccess,
         runtime_typed: true,
+        long_string: false,
         read_only: false,
         special: Special::DbAddr,
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *val"),
         menu: None,
         initial: None,
@@ -164,18 +172,40 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         promptgroup: None,
         base: Base::Decimal,
     },
+    FieldDesc {
+        name: "BPTR",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *bptr"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Buffer Pointer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
     // DBF_LONG from cvt_dbaddr.types; re-typed at runtime by `FTVL`.
     FieldDesc {
         name: "BG",
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::NoAccess,
         runtime_typed: true,
+        long_string: false,
         read_only: false,
         special: Special::DbAddr,
         declared_special: Special::DbAddr,
         pp: true,
         asl: Asl::Asl1,
-        size: 4,
+        size: core::mem::size_of::<*const ()>() as u16,
         extra: Some("void *bg"),
         menu: None,
         initial: None,
@@ -186,10 +216,53 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "PBG",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *pbg"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Background buffer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
+        name: "PSTATUS",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *pstatus"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Status buffer"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "HOPR",
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -210,6 +283,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -230,6 +304,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -250,6 +325,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -270,6 +346,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -290,6 +367,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -310,6 +388,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -330,6 +409,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -350,6 +430,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -370,6 +451,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -390,6 +472,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -410,6 +493,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -430,6 +514,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -450,6 +535,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -470,6 +556,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -490,6 +577,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -510,6 +598,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -530,6 +619,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -550,6 +640,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -570,6 +661,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -590,6 +682,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -610,6 +703,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -630,6 +724,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -650,6 +745,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -670,6 +766,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -690,6 +787,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -710,6 +808,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -730,6 +829,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -750,6 +850,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -770,6 +871,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -790,6 +892,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -810,6 +913,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -830,6 +934,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -850,6 +955,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -870,6 +976,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -890,6 +997,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -910,6 +1018,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -930,6 +1039,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -950,6 +1060,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -970,6 +1081,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -990,6 +1102,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1010,6 +1123,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1030,6 +1144,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1050,6 +1165,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1070,6 +1186,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1090,6 +1207,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1110,6 +1228,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1130,6 +1249,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1150,6 +1270,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1170,6 +1291,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1190,6 +1312,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1210,6 +1333,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1230,6 +1354,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1250,6 +1375,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1270,6 +1396,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1290,6 +1417,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1310,6 +1438,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1330,6 +1459,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1350,6 +1480,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1370,6 +1501,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1390,6 +1522,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1410,6 +1543,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1430,6 +1564,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1450,6 +1585,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1470,6 +1606,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1490,6 +1627,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1510,6 +1648,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1530,6 +1669,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1550,6 +1690,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1570,6 +1711,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1590,6 +1732,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1610,6 +1753,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1630,6 +1774,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1650,6 +1795,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1670,6 +1816,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1690,6 +1837,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1710,6 +1858,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1730,6 +1879,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1750,6 +1900,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1770,6 +1921,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1790,6 +1942,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1810,6 +1963,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1830,6 +1984,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1850,6 +2005,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1870,6 +2026,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1890,6 +2047,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1910,6 +2068,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1930,6 +2089,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1950,6 +2110,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1970,6 +2131,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1990,6 +2152,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2010,6 +2173,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2030,6 +2194,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2050,6 +2215,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2070,6 +2236,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2090,6 +2257,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2110,6 +2278,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2130,6 +2299,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2150,6 +2320,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2170,6 +2341,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2190,6 +2362,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2210,6 +2383,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2230,6 +2404,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2250,6 +2425,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2270,6 +2446,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2290,6 +2467,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2310,6 +2488,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2330,6 +2509,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2350,6 +2530,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2370,6 +2551,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2390,6 +2572,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2410,6 +2593,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2430,6 +2614,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2450,6 +2635,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2470,6 +2656,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2490,6 +2677,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2510,6 +2698,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2530,6 +2719,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2550,6 +2740,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2570,6 +2761,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2590,6 +2782,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2610,6 +2803,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2630,6 +2824,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2650,6 +2845,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2670,6 +2866,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2690,6 +2887,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2710,6 +2908,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2730,6 +2929,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2750,6 +2950,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2770,6 +2971,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2790,6 +2992,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2810,6 +3013,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2830,6 +3034,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2850,6 +3055,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2870,6 +3076,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2890,6 +3097,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2910,6 +3118,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2930,6 +3139,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2950,6 +3160,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2970,6 +3181,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2990,6 +3202,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3010,6 +3223,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3030,6 +3244,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3050,6 +3265,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3070,6 +3286,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3090,6 +3307,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3110,6 +3328,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3130,6 +3349,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3150,6 +3370,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3170,6 +3391,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3190,6 +3412,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3210,6 +3433,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3230,6 +3454,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3250,6 +3475,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3270,6 +3496,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3290,6 +3517,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3310,6 +3538,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3330,6 +3559,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3350,6 +3580,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3370,6 +3601,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3390,6 +3622,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3410,6 +3643,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3430,6 +3664,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3450,6 +3685,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3470,6 +3706,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3490,6 +3727,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3510,6 +3748,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3530,6 +3769,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3550,6 +3790,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3570,6 +3811,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3590,6 +3832,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3610,6 +3853,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3630,6 +3874,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3650,6 +3895,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3670,6 +3916,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3690,6 +3937,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3710,6 +3958,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3730,6 +3979,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3750,6 +4000,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3770,6 +4021,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3790,6 +4042,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3810,6 +4063,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3830,6 +4084,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3850,6 +4105,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3870,6 +4126,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3890,6 +4147,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3910,6 +4168,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -3930,6 +4189,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -3950,6 +4210,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3970,6 +4231,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -3990,6 +4252,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4010,6 +4273,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4030,6 +4294,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4050,6 +4315,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4070,6 +4336,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4090,6 +4357,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4110,6 +4378,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4130,6 +4399,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4150,6 +4420,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4170,6 +4441,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4190,6 +4462,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4210,6 +4483,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4230,6 +4504,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4250,6 +4525,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4270,6 +4546,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4290,6 +4567,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4310,6 +4588,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4330,6 +4609,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4350,6 +4630,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4370,6 +4651,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4390,6 +4672,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4410,6 +4693,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4430,6 +4714,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4450,6 +4735,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4470,6 +4756,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4490,6 +4777,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4510,6 +4798,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4530,6 +4819,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4550,6 +4840,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4570,6 +4861,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4590,6 +4882,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4610,6 +4903,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4630,6 +4924,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4650,6 +4945,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4670,6 +4966,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4690,6 +4987,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4710,6 +5008,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4730,6 +5029,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4750,6 +5050,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4770,6 +5071,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4790,6 +5092,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4810,6 +5113,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4830,6 +5134,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4850,6 +5155,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4870,6 +5176,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4890,6 +5197,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4910,6 +5218,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4930,6 +5239,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4950,6 +5260,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4970,6 +5281,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4990,6 +5302,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5010,6 +5323,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5030,6 +5344,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5050,6 +5365,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5070,6 +5386,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5090,6 +5407,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5110,6 +5428,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5130,6 +5449,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5150,6 +5470,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5170,6 +5491,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5190,6 +5512,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5210,6 +5533,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5230,6 +5554,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5250,6 +5575,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5270,6 +5596,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5290,6 +5617,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5310,6 +5638,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5330,6 +5659,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5350,6 +5680,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5370,6 +5701,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5390,6 +5722,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5410,6 +5743,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5430,6 +5764,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5450,6 +5785,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5470,6 +5806,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5490,6 +5827,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5510,6 +5848,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5530,6 +5869,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5550,6 +5890,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5570,6 +5911,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5590,6 +5932,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5610,6 +5953,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5630,6 +5974,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5650,6 +5995,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5670,6 +6016,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5690,6 +6037,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5710,6 +6058,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5730,6 +6079,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5750,6 +6100,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5770,6 +6121,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5790,6 +6142,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5810,6 +6163,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -5830,6 +6184,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5850,6 +6205,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5870,6 +6226,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5890,6 +6247,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5910,6 +6268,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5930,6 +6289,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5950,6 +6310,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5970,6 +6331,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5990,6 +6352,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6010,6 +6373,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6030,6 +6394,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6050,6 +6415,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6070,6 +6436,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6090,6 +6457,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6110,6 +6478,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6130,6 +6499,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6150,6 +6520,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6170,6 +6541,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6190,6 +6562,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6210,6 +6583,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6230,6 +6604,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6250,6 +6625,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6270,6 +6646,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6290,6 +6667,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6310,6 +6688,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6330,6 +6709,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6350,6 +6730,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6370,6 +6751,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6390,6 +6772,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6410,6 +6793,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6430,6 +6814,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6450,6 +6835,7 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6469,7 +6855,10 @@ pub static MCA_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(mca)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MCA_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MCA_NOACCESS: &[&str] = &["BPTR", "PBG", "PSTATUS"];
+pub static MCA_NOACCESS: &[&str] = &[];
+
+/// `recordtype(mca)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MCA_DBADDR: &[&str] = &["VAL", "BG"];
 
 /// `recordtype(mca)` — C's `papFldDes` order, all 368 declarations
 /// including the internals [`MCA_FIELDS`] drops. The index into this is
@@ -6530,6 +6919,15 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
     })
 }
 
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "mca" => MCA_DBADDR,
+        _ => return None,
+    })
+}
+
 /// Every field a record type declares, in C's `papFldDes` order — the order
 /// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`
 /// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`
@@ -6555,3 +6953,345 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["mca"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod mca {
+        use super::FieldSlot;
+        pub const VERS: FieldSlot = FieldSlot(0);
+        pub const VAL: FieldSlot = FieldSlot(1);
+        pub const BPTR: FieldSlot = FieldSlot(2);
+        pub const BG: FieldSlot = FieldSlot(3);
+        pub const PBG: FieldSlot = FieldSlot(4);
+        pub const PSTATUS: FieldSlot = FieldSlot(5);
+        pub const HOPR: FieldSlot = FieldSlot(6);
+        pub const LOPR: FieldSlot = FieldSlot(7);
+        pub const NMAX: FieldSlot = FieldSlot(8);
+        pub const NORD: FieldSlot = FieldSlot(9);
+        pub const PREC: FieldSlot = FieldSlot(10);
+        pub const FTVL: FieldSlot = FieldSlot(11);
+        pub const STRT: FieldSlot = FieldSlot(12);
+        pub const ERST: FieldSlot = FieldSlot(13);
+        pub const STOP: FieldSlot = FieldSlot(14);
+        pub const ACQG: FieldSlot = FieldSlot(15);
+        pub const READ: FieldSlot = FieldSlot(16);
+        pub const RDNG: FieldSlot = FieldSlot(17);
+        pub const RDNS: FieldSlot = FieldSlot(18);
+        pub const ERAS: FieldSlot = FieldSlot(19);
+        pub const CHAS: FieldSlot = FieldSlot(20);
+        pub const NUSE: FieldSlot = FieldSlot(21);
+        pub const SEQ: FieldSlot = FieldSlot(22);
+        pub const DWEL: FieldSlot = FieldSlot(23);
+        pub const PSCL: FieldSlot = FieldSlot(24);
+        pub const PRTM: FieldSlot = FieldSlot(25);
+        pub const PLTM: FieldSlot = FieldSlot(26);
+        pub const PCT: FieldSlot = FieldSlot(27);
+        pub const PCTL: FieldSlot = FieldSlot(28);
+        pub const PCTH: FieldSlot = FieldSlot(29);
+        pub const PSWP: FieldSlot = FieldSlot(30);
+        pub const MODE: FieldSlot = FieldSlot(31);
+        pub const CALO: FieldSlot = FieldSlot(32);
+        pub const CALS: FieldSlot = FieldSlot(33);
+        pub const CALQ: FieldSlot = FieldSlot(34);
+        pub const EGU: FieldSlot = FieldSlot(35);
+        pub const TTH: FieldSlot = FieldSlot(36);
+        pub const ERTM: FieldSlot = FieldSlot(37);
+        pub const ELTM: FieldSlot = FieldSlot(38);
+        pub const DTIM: FieldSlot = FieldSlot(39);
+        pub const IDTIM: FieldSlot = FieldSlot(40);
+        pub const STIM: FieldSlot = FieldSlot(41);
+        pub const RTIM: FieldSlot = FieldSlot(42);
+        pub const ACT: FieldSlot = FieldSlot(43);
+        pub const NACK: FieldSlot = FieldSlot(44);
+        pub const INP: FieldSlot = FieldSlot(45);
+        pub const HIHI: FieldSlot = FieldSlot(46);
+        pub const LOLO: FieldSlot = FieldSlot(47);
+        pub const HIGH: FieldSlot = FieldSlot(48);
+        pub const LOW: FieldSlot = FieldSlot(49);
+        pub const HHSV: FieldSlot = FieldSlot(50);
+        pub const LLSV: FieldSlot = FieldSlot(51);
+        pub const HSV: FieldSlot = FieldSlot(52);
+        pub const LSV: FieldSlot = FieldSlot(53);
+        pub const HYST: FieldSlot = FieldSlot(54);
+        pub const LALM: FieldSlot = FieldSlot(55);
+        pub const SIOL: FieldSlot = FieldSlot(56);
+        pub const SIML: FieldSlot = FieldSlot(57);
+        pub const SIMM: FieldSlot = FieldSlot(58);
+        pub const SIMS: FieldSlot = FieldSlot(59);
+        pub const MMAP: FieldSlot = FieldSlot(60);
+        pub const RMAP: FieldSlot = FieldSlot(61);
+        pub const NEWV: FieldSlot = FieldSlot(62);
+        pub const NEWR: FieldSlot = FieldSlot(63);
+        pub const R0LO: FieldSlot = FieldSlot(64);
+        pub const R0HI: FieldSlot = FieldSlot(65);
+        pub const R0BG: FieldSlot = FieldSlot(66);
+        pub const R0IP: FieldSlot = FieldSlot(67);
+        pub const R1LO: FieldSlot = FieldSlot(68);
+        pub const R1HI: FieldSlot = FieldSlot(69);
+        pub const R1BG: FieldSlot = FieldSlot(70);
+        pub const R1IP: FieldSlot = FieldSlot(71);
+        pub const R2LO: FieldSlot = FieldSlot(72);
+        pub const R2HI: FieldSlot = FieldSlot(73);
+        pub const R2BG: FieldSlot = FieldSlot(74);
+        pub const R2IP: FieldSlot = FieldSlot(75);
+        pub const R3LO: FieldSlot = FieldSlot(76);
+        pub const R3HI: FieldSlot = FieldSlot(77);
+        pub const R3BG: FieldSlot = FieldSlot(78);
+        pub const R3IP: FieldSlot = FieldSlot(79);
+        pub const R4LO: FieldSlot = FieldSlot(80);
+        pub const R4HI: FieldSlot = FieldSlot(81);
+        pub const R4BG: FieldSlot = FieldSlot(82);
+        pub const R4IP: FieldSlot = FieldSlot(83);
+        pub const R5LO: FieldSlot = FieldSlot(84);
+        pub const R5HI: FieldSlot = FieldSlot(85);
+        pub const R5BG: FieldSlot = FieldSlot(86);
+        pub const R5IP: FieldSlot = FieldSlot(87);
+        pub const R6LO: FieldSlot = FieldSlot(88);
+        pub const R6HI: FieldSlot = FieldSlot(89);
+        pub const R6BG: FieldSlot = FieldSlot(90);
+        pub const R6IP: FieldSlot = FieldSlot(91);
+        pub const R7LO: FieldSlot = FieldSlot(92);
+        pub const R7HI: FieldSlot = FieldSlot(93);
+        pub const R7BG: FieldSlot = FieldSlot(94);
+        pub const R7IP: FieldSlot = FieldSlot(95);
+        pub const R8LO: FieldSlot = FieldSlot(96);
+        pub const R8HI: FieldSlot = FieldSlot(97);
+        pub const R8BG: FieldSlot = FieldSlot(98);
+        pub const R8IP: FieldSlot = FieldSlot(99);
+        pub const R9LO: FieldSlot = FieldSlot(100);
+        pub const R9HI: FieldSlot = FieldSlot(101);
+        pub const R9BG: FieldSlot = FieldSlot(102);
+        pub const R9IP: FieldSlot = FieldSlot(103);
+        pub const R10LO: FieldSlot = FieldSlot(104);
+        pub const R10HI: FieldSlot = FieldSlot(105);
+        pub const R10BG: FieldSlot = FieldSlot(106);
+        pub const R10IP: FieldSlot = FieldSlot(107);
+        pub const R11LO: FieldSlot = FieldSlot(108);
+        pub const R11HI: FieldSlot = FieldSlot(109);
+        pub const R11BG: FieldSlot = FieldSlot(110);
+        pub const R11IP: FieldSlot = FieldSlot(111);
+        pub const R12LO: FieldSlot = FieldSlot(112);
+        pub const R12HI: FieldSlot = FieldSlot(113);
+        pub const R12BG: FieldSlot = FieldSlot(114);
+        pub const R12IP: FieldSlot = FieldSlot(115);
+        pub const R13LO: FieldSlot = FieldSlot(116);
+        pub const R13HI: FieldSlot = FieldSlot(117);
+        pub const R13BG: FieldSlot = FieldSlot(118);
+        pub const R13IP: FieldSlot = FieldSlot(119);
+        pub const R14LO: FieldSlot = FieldSlot(120);
+        pub const R14HI: FieldSlot = FieldSlot(121);
+        pub const R14BG: FieldSlot = FieldSlot(122);
+        pub const R14IP: FieldSlot = FieldSlot(123);
+        pub const R15LO: FieldSlot = FieldSlot(124);
+        pub const R15HI: FieldSlot = FieldSlot(125);
+        pub const R15BG: FieldSlot = FieldSlot(126);
+        pub const R15IP: FieldSlot = FieldSlot(127);
+        pub const R16LO: FieldSlot = FieldSlot(128);
+        pub const R16HI: FieldSlot = FieldSlot(129);
+        pub const R16BG: FieldSlot = FieldSlot(130);
+        pub const R16IP: FieldSlot = FieldSlot(131);
+        pub const R17LO: FieldSlot = FieldSlot(132);
+        pub const R17HI: FieldSlot = FieldSlot(133);
+        pub const R17BG: FieldSlot = FieldSlot(134);
+        pub const R17IP: FieldSlot = FieldSlot(135);
+        pub const R18LO: FieldSlot = FieldSlot(136);
+        pub const R18HI: FieldSlot = FieldSlot(137);
+        pub const R18BG: FieldSlot = FieldSlot(138);
+        pub const R18IP: FieldSlot = FieldSlot(139);
+        pub const R19LO: FieldSlot = FieldSlot(140);
+        pub const R19HI: FieldSlot = FieldSlot(141);
+        pub const R19BG: FieldSlot = FieldSlot(142);
+        pub const R19IP: FieldSlot = FieldSlot(143);
+        pub const R20LO: FieldSlot = FieldSlot(144);
+        pub const R20HI: FieldSlot = FieldSlot(145);
+        pub const R20BG: FieldSlot = FieldSlot(146);
+        pub const R20IP: FieldSlot = FieldSlot(147);
+        pub const R21LO: FieldSlot = FieldSlot(148);
+        pub const R21HI: FieldSlot = FieldSlot(149);
+        pub const R21BG: FieldSlot = FieldSlot(150);
+        pub const R21IP: FieldSlot = FieldSlot(151);
+        pub const R22LO: FieldSlot = FieldSlot(152);
+        pub const R22HI: FieldSlot = FieldSlot(153);
+        pub const R22BG: FieldSlot = FieldSlot(154);
+        pub const R22IP: FieldSlot = FieldSlot(155);
+        pub const R23LO: FieldSlot = FieldSlot(156);
+        pub const R23HI: FieldSlot = FieldSlot(157);
+        pub const R23BG: FieldSlot = FieldSlot(158);
+        pub const R23IP: FieldSlot = FieldSlot(159);
+        pub const R24LO: FieldSlot = FieldSlot(160);
+        pub const R24HI: FieldSlot = FieldSlot(161);
+        pub const R24BG: FieldSlot = FieldSlot(162);
+        pub const R24IP: FieldSlot = FieldSlot(163);
+        pub const R25LO: FieldSlot = FieldSlot(164);
+        pub const R25HI: FieldSlot = FieldSlot(165);
+        pub const R25BG: FieldSlot = FieldSlot(166);
+        pub const R25IP: FieldSlot = FieldSlot(167);
+        pub const R26LO: FieldSlot = FieldSlot(168);
+        pub const R26HI: FieldSlot = FieldSlot(169);
+        pub const R26BG: FieldSlot = FieldSlot(170);
+        pub const R26IP: FieldSlot = FieldSlot(171);
+        pub const R27LO: FieldSlot = FieldSlot(172);
+        pub const R27HI: FieldSlot = FieldSlot(173);
+        pub const R27BG: FieldSlot = FieldSlot(174);
+        pub const R27IP: FieldSlot = FieldSlot(175);
+        pub const R28LO: FieldSlot = FieldSlot(176);
+        pub const R28HI: FieldSlot = FieldSlot(177);
+        pub const R28BG: FieldSlot = FieldSlot(178);
+        pub const R28IP: FieldSlot = FieldSlot(179);
+        pub const R29LO: FieldSlot = FieldSlot(180);
+        pub const R29HI: FieldSlot = FieldSlot(181);
+        pub const R29BG: FieldSlot = FieldSlot(182);
+        pub const R29IP: FieldSlot = FieldSlot(183);
+        pub const R30LO: FieldSlot = FieldSlot(184);
+        pub const R30HI: FieldSlot = FieldSlot(185);
+        pub const R30BG: FieldSlot = FieldSlot(186);
+        pub const R30IP: FieldSlot = FieldSlot(187);
+        pub const R31LO: FieldSlot = FieldSlot(188);
+        pub const R31HI: FieldSlot = FieldSlot(189);
+        pub const R31BG: FieldSlot = FieldSlot(190);
+        pub const R31IP: FieldSlot = FieldSlot(191);
+        pub const R0: FieldSlot = FieldSlot(192);
+        pub const R0N: FieldSlot = FieldSlot(193);
+        pub const R0P: FieldSlot = FieldSlot(194);
+        pub const R1: FieldSlot = FieldSlot(195);
+        pub const R1N: FieldSlot = FieldSlot(196);
+        pub const R1P: FieldSlot = FieldSlot(197);
+        pub const R2: FieldSlot = FieldSlot(198);
+        pub const R2N: FieldSlot = FieldSlot(199);
+        pub const R2P: FieldSlot = FieldSlot(200);
+        pub const R3: FieldSlot = FieldSlot(201);
+        pub const R3N: FieldSlot = FieldSlot(202);
+        pub const R3P: FieldSlot = FieldSlot(203);
+        pub const R4: FieldSlot = FieldSlot(204);
+        pub const R4N: FieldSlot = FieldSlot(205);
+        pub const R4P: FieldSlot = FieldSlot(206);
+        pub const R5: FieldSlot = FieldSlot(207);
+        pub const R5N: FieldSlot = FieldSlot(208);
+        pub const R5P: FieldSlot = FieldSlot(209);
+        pub const R6: FieldSlot = FieldSlot(210);
+        pub const R6N: FieldSlot = FieldSlot(211);
+        pub const R6P: FieldSlot = FieldSlot(212);
+        pub const R7: FieldSlot = FieldSlot(213);
+        pub const R7N: FieldSlot = FieldSlot(214);
+        pub const R7P: FieldSlot = FieldSlot(215);
+        pub const R8: FieldSlot = FieldSlot(216);
+        pub const R8N: FieldSlot = FieldSlot(217);
+        pub const R8P: FieldSlot = FieldSlot(218);
+        pub const R9: FieldSlot = FieldSlot(219);
+        pub const R9N: FieldSlot = FieldSlot(220);
+        pub const R9P: FieldSlot = FieldSlot(221);
+        pub const R10: FieldSlot = FieldSlot(222);
+        pub const R10N: FieldSlot = FieldSlot(223);
+        pub const R10P: FieldSlot = FieldSlot(224);
+        pub const R11: FieldSlot = FieldSlot(225);
+        pub const R11N: FieldSlot = FieldSlot(226);
+        pub const R11P: FieldSlot = FieldSlot(227);
+        pub const R12: FieldSlot = FieldSlot(228);
+        pub const R12N: FieldSlot = FieldSlot(229);
+        pub const R12P: FieldSlot = FieldSlot(230);
+        pub const R13: FieldSlot = FieldSlot(231);
+        pub const R13N: FieldSlot = FieldSlot(232);
+        pub const R13P: FieldSlot = FieldSlot(233);
+        pub const R14: FieldSlot = FieldSlot(234);
+        pub const R14N: FieldSlot = FieldSlot(235);
+        pub const R14P: FieldSlot = FieldSlot(236);
+        pub const R15: FieldSlot = FieldSlot(237);
+        pub const R15N: FieldSlot = FieldSlot(238);
+        pub const R15P: FieldSlot = FieldSlot(239);
+        pub const R16: FieldSlot = FieldSlot(240);
+        pub const R16N: FieldSlot = FieldSlot(241);
+        pub const R16P: FieldSlot = FieldSlot(242);
+        pub const R17: FieldSlot = FieldSlot(243);
+        pub const R17N: FieldSlot = FieldSlot(244);
+        pub const R17P: FieldSlot = FieldSlot(245);
+        pub const R18: FieldSlot = FieldSlot(246);
+        pub const R18N: FieldSlot = FieldSlot(247);
+        pub const R18P: FieldSlot = FieldSlot(248);
+        pub const R19: FieldSlot = FieldSlot(249);
+        pub const R19N: FieldSlot = FieldSlot(250);
+        pub const R19P: FieldSlot = FieldSlot(251);
+        pub const R20: FieldSlot = FieldSlot(252);
+        pub const R20N: FieldSlot = FieldSlot(253);
+        pub const R20P: FieldSlot = FieldSlot(254);
+        pub const R21: FieldSlot = FieldSlot(255);
+        pub const R21N: FieldSlot = FieldSlot(256);
+        pub const R21P: FieldSlot = FieldSlot(257);
+        pub const R22: FieldSlot = FieldSlot(258);
+        pub const R22N: FieldSlot = FieldSlot(259);
+        pub const R22P: FieldSlot = FieldSlot(260);
+        pub const R23: FieldSlot = FieldSlot(261);
+        pub const R23N: FieldSlot = FieldSlot(262);
+        pub const R23P: FieldSlot = FieldSlot(263);
+        pub const R24: FieldSlot = FieldSlot(264);
+        pub const R24N: FieldSlot = FieldSlot(265);
+        pub const R24P: FieldSlot = FieldSlot(266);
+        pub const R25: FieldSlot = FieldSlot(267);
+        pub const R25N: FieldSlot = FieldSlot(268);
+        pub const R25P: FieldSlot = FieldSlot(269);
+        pub const R26: FieldSlot = FieldSlot(270);
+        pub const R26N: FieldSlot = FieldSlot(271);
+        pub const R26P: FieldSlot = FieldSlot(272);
+        pub const R27: FieldSlot = FieldSlot(273);
+        pub const R27N: FieldSlot = FieldSlot(274);
+        pub const R27P: FieldSlot = FieldSlot(275);
+        pub const R28: FieldSlot = FieldSlot(276);
+        pub const R28N: FieldSlot = FieldSlot(277);
+        pub const R28P: FieldSlot = FieldSlot(278);
+        pub const R29: FieldSlot = FieldSlot(279);
+        pub const R29N: FieldSlot = FieldSlot(280);
+        pub const R29P: FieldSlot = FieldSlot(281);
+        pub const R30: FieldSlot = FieldSlot(282);
+        pub const R30N: FieldSlot = FieldSlot(283);
+        pub const R30P: FieldSlot = FieldSlot(284);
+        pub const R31: FieldSlot = FieldSlot(285);
+        pub const R31N: FieldSlot = FieldSlot(286);
+        pub const R31P: FieldSlot = FieldSlot(287);
+        pub const R0NM: FieldSlot = FieldSlot(288);
+        pub const R1NM: FieldSlot = FieldSlot(289);
+        pub const R2NM: FieldSlot = FieldSlot(290);
+        pub const R3NM: FieldSlot = FieldSlot(291);
+        pub const R4NM: FieldSlot = FieldSlot(292);
+        pub const R5NM: FieldSlot = FieldSlot(293);
+        pub const R6NM: FieldSlot = FieldSlot(294);
+        pub const R7NM: FieldSlot = FieldSlot(295);
+        pub const R8NM: FieldSlot = FieldSlot(296);
+        pub const R9NM: FieldSlot = FieldSlot(297);
+        pub const R10NM: FieldSlot = FieldSlot(298);
+        pub const R11NM: FieldSlot = FieldSlot(299);
+        pub const R12NM: FieldSlot = FieldSlot(300);
+        pub const R13NM: FieldSlot = FieldSlot(301);
+        pub const R14NM: FieldSlot = FieldSlot(302);
+        pub const R15NM: FieldSlot = FieldSlot(303);
+        pub const R16NM: FieldSlot = FieldSlot(304);
+        pub const R17NM: FieldSlot = FieldSlot(305);
+        pub const R18NM: FieldSlot = FieldSlot(306);
+        pub const R19NM: FieldSlot = FieldSlot(307);
+        pub const R20NM: FieldSlot = FieldSlot(308);
+        pub const R21NM: FieldSlot = FieldSlot(309);
+        pub const R22NM: FieldSlot = FieldSlot(310);
+        pub const R23NM: FieldSlot = FieldSlot(311);
+        pub const R24NM: FieldSlot = FieldSlot(312);
+        pub const R25NM: FieldSlot = FieldSlot(313);
+        pub const R26NM: FieldSlot = FieldSlot(314);
+        pub const R27NM: FieldSlot = FieldSlot(315);
+        pub const R28NM: FieldSlot = FieldSlot(316);
+        pub const R29NM: FieldSlot = FieldSlot(317);
+        pub const R30NM: FieldSlot = FieldSlot(318);
+        pub const R31NM: FieldSlot = FieldSlot(319);
+    }
+}
+
+/// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
+pub static DBD: epics_base_rs::server::record::ContributedDbd =
+    epics_base_rs::server::record::ContributedDbd {
+        record_types: RECORD_TYPES,
+        record_declaration_order,
+        record_fields,
+        record_no_prompt,
+        menus: MENUS,
+    };

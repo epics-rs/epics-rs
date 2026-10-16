@@ -1,15 +1,10 @@
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::walltime::WallTime;
 
-/// Current wall-clock time as a [`WallTime`].
-///
-/// Returns [`WallTime`] rather than [`SystemTime`] so a snapshot built from
-/// "now" shares one timestamp type with snapshots built from exact wire
-/// integers. The OS clock is still read via [`SystemTime::now`]; on Windows
-/// that clock is itself 100 ns-granular, which `WallTime` does not change.
+/// Current wall-clock time; see [`WallTime::now`].
 pub fn now_wall() -> WallTime {
-    SystemTime::now().into()
+    WallTime::now()
 }
 
 pub fn now_mono() -> Instant {

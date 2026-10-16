@@ -152,7 +152,7 @@ fn cmd_zoneset() -> CommandDef {
             // C reads `args[0].sval`, which is NULL when the line ended
             // before this argument — that is the branch that unsets TZ.
             let zone = match args.first() {
-                Some(ArgValue::String(s)) => Some(s.as_str()),
+                Some(ArgValue::String(s)) => Some(s.to_str()?),
                 _ => None,
             };
             // SAFETY: `zoneset` writes the environment, which is unsound while
@@ -190,7 +190,7 @@ fn cmd_rt() -> CommandDef {
         ],
         "run rtems shell command",
         |args: &[ArgValue], _ctx: &CommandContext| {
-            let argv = rt_argv(args);
+            let argv = rt_argv(args)?;
             match shell::run_shell_command(&argv) {
                 // C `iocshSetError(ret)` plus `if(ret) fprintf(stderr, ...)`.
                 Ok(0) => Ok(CommandOutcome::Continue),
@@ -210,15 +210,17 @@ fn cmd_rt() -> CommandDef {
 /// Its own function so the reconstruction is testable without a shell — this
 /// is the one place the two argv conventions meet, and a handler that got it
 /// wrong would silently drop the shell command's first argument.
-fn rt_argv(args: &[ArgValue]) -> Vec<String> {
+fn rt_argv(args: &[ArgValue]) -> Result<Vec<String>, String> {
     let mut argv = Vec::new();
     if let Some(ArgValue::String(cmd)) = args.first() {
-        argv.push(cmd.clone());
+        argv.push(cmd.to_str()?.to_owned());
     }
     if let Some(ArgValue::Argv(rest)) = args.get(1) {
-        argv.extend(rest.iter().cloned());
+        for arg in rest {
+            argv.push(arg.to_str()?.to_owned());
+        }
     }
-    argv
+    Ok(argv)
 }
 
 /// `setlogmask <level name>` — C `setlogmaskFuncDef`/`setlogmaskCallFunc`
@@ -242,7 +244,7 @@ fn cmd_setlogmask() -> CommandDef {
                 ));
                 return Ok(CommandOutcome::Continue);
             };
-            match shell::set_log_priority(name) {
+            match shell::set_log_priority(&name.to_str_lossy()) {
                 Ok(()) => Ok(CommandOutcome::Continue),
                 // C prints this and calls `iocshSetError(-1)`.
                 Err(ShellError::UnknownLevel) => Err("Error: unknown log level.".to_string()),
@@ -372,21 +374,18 @@ mod tests {
     #[test]
     fn rt_puts_the_command_name_back_at_argv_zero() {
         let args = vec![
-            ArgValue::String("stackuse".to_string()),
-            ArgValue::Argv(vec!["-v".to_string(), "2".to_string()]),
+            ArgValue::String("stackuse".into()),
+            ArgValue::Argv(vec!["-v".into(), "2".into()]),
         ];
-        assert_eq!(rt_argv(&args), vec!["stackuse", "-v", "2"]);
+        assert_eq!(rt_argv(&args).unwrap(), vec!["stackuse", "-v", "2"]);
     }
 
     /// A shell command with no arguments still gets its own name, so `ac` is
     /// 1 and not 0 — C's `aval.ac` counts the name too.
     #[test]
     fn rt_with_no_arguments_still_passes_the_name() {
-        let args = vec![
-            ArgValue::String("stackuse".to_string()),
-            ArgValue::Argv(vec![]),
-        ];
-        assert_eq!(rt_argv(&args), vec!["stackuse"]);
+        let args = vec![ArgValue::String("stackuse".into()), ArgValue::Argv(vec![])];
+        assert_eq!(rt_argv(&args).unwrap(), vec!["stackuse"]);
     }
 
     /// A bare `rt` has no name to look up. C hands `rtems_shell_lookup_cmd` a
@@ -394,7 +393,11 @@ mod tests {
     /// reaches the same answer here.
     #[test]
     fn a_bare_rt_produces_an_empty_argv() {
-        assert!(rt_argv(&[ArgValue::Missing, ArgValue::Argv(vec![])]).is_empty());
+        assert!(
+            rt_argv(&[ArgValue::Missing, ArgValue::Argv(vec![])])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// C's usage block, indentation included (`rtems_init.c:665-671`).

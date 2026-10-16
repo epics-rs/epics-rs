@@ -1,6 +1,10 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
+use crate::server::record::{
+    CycleHooks, CycleMarks, CyclePostMask, MENU_SIMM, ProcessOutcome, Record, uniform_post_table,
+};
 use crate::types::EpicsValue;
+use crate::types::PvString;
 
 use super::mbbi_direct::BIT_NAMES;
 
@@ -24,14 +28,20 @@ pub struct MbboDirectRecord {
     pub shft: u16,
     pub nobt: i16,
     pub mlst: u32,
+    /// OBIT: the bits `monitor()` last posted, moved with VAL by a bit put's
+    /// `special` because `dbPut` posts that bit itself.
+    pub obit: u32,
+    /// `obit ^ val` as of this cycle's `monitor()`, drained by
+    /// `take_cycle_posted_fields`.
+    bits_changed: u32,
     pub ivoa: i16,
     pub ivov: u32,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub bits: [u8; 32], // B0-B1F
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// Set by `set_device_did_compute(true)` when a device readback has
@@ -55,14 +65,16 @@ impl Default for MbboDirectRecord {
             shft: 0,
             nobt: 0,
             mlst: 0,
+            obit: 0,
+            bits_changed: 0,
             ivoa: 0,
             ivov: 0,
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             bits: [0; 32],
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
@@ -80,7 +92,7 @@ impl MbboDirectRecord {
     fn bits_to_val(&mut self) {
         self.val = 0;
         for i in 0..32 {
-            self.val |= (self.bits[i] as u32 & 1) << i;
+            self.val |= u32::from(self.bits[i] != 0) << i;
         }
     }
 
@@ -115,6 +127,27 @@ impl MbboDirectRecord {
 }
 
 impl Record for MbboDirectRecord {
+    // VAL/IVOV/MLST/OBIT are DBF_LONG held as `u32`, B0..B1F rewrite VAL,
+    // and the menus are `i16` served as ENUM: none of them maps.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::mbboDirect;
+        SHFT => shft,
+        SDLY => sdly;
+        read_only:
+        NOBT => nobt,
+        RVAL => rval,
+        ORAW => oraw,
+        RBV => rbv,
+        ORBV => orbv,
+        MASK => mask);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::CYCLE_POSTED
+    }
+
     fn record_type(&self) -> &'static str {
         "mbboDirect"
     }
@@ -125,21 +158,22 @@ impl Record for MbboDirectRecord {
         true
     }
 
+    /// `devXxxSoftRaw::init_record`'s mask (see `raw_soft_dset_mask`).
+    fn init_soft_dset(&mut self, soft: crate::server::device_support::SoftDtyp) {
+        if soft == crate::server::device_support::SoftDtyp::Raw {
+            self.mask = super::raw_soft_dset_mask(self.mask, self.nobt == 0, self.shft);
+        }
+    }
+
     /// C `devMbboDirectSoftRaw::write_mbbo` (`devMbboDirectSoftRaw.c:40-46`):
     /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
-    /// 1)`, with the same dset-init mask (`nobt == 0` ⇒ `0xffffffff`, then
-    /// `<<= shft`).
-    /// C `devMbboDirectSoftRaw.c::write_mbbo` (71-75): `data = prec->rval &
-    /// prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data, 1)`, with the dset's
-    /// `init_record` mask rule (`nobt == 0 -> 0xffffffff`, then `<<= shft`).
+    /// 1)`.
     fn raw_soft_output_value(&self) -> Option<EpicsValue> {
-        let base = if self.nobt == 0 {
-            0xffff_ffff
-        } else {
-            self.mask
-        };
-        let mask = base.checked_shl(u32::from(self.shft)).unwrap_or(0);
-        Some(EpicsValue::ULong(self.rval & mask))
+        Some(EpicsValue::ULong(self.rval & self.mask))
+    }
+
+    fn raw_soft_output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(CycleValue::ULong(self.rval & self.mask)))
     }
 
     fn set_device_did_compute(&mut self, did: bool) {
@@ -163,13 +197,28 @@ impl Record for MbboDirectRecord {
     /// `caput M.B3 1` on a closed-loop record moved VAL until the next process
     /// cycle overwrote it, which is the confusion C is refusing to allow.
     ///
-    /// Only the pass-0 arm is a refusal. The pass-1 arm (`:271-291`, the bit
-    /// into VAL plus OBIT and `convert`) is the framework's `put_field` +
-    /// `bits_to_val`, which is why this hook has nothing to do when `after`.
+    /// The pass-1 arm (`:271-291`) folds the one bit written into VAL and
+    /// converts. It is here and not in `put_field` because a `.db` load
+    /// stores B0-B1F with no special, so VAL keeps what the file set.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
-        if !after && self.omsl == 1 && BIT_NAMES.contains(&field) {
-            return Err(CaError::ReadOnlyField(field.to_string()));
+        let Some(idx) = BIT_NAMES.iter().position(|&n| n == field) else {
+            return Ok(());
+        };
+        if !after {
+            if self.omsl == 1 {
+                return Err(CaError::ReadOnlyField(field.to_string()));
+            }
+            return Ok(());
         }
+        let bit = 1u32 << idx;
+        if self.bits[idx] != 0 {
+            self.val |= bit;
+            self.obit |= bit;
+        } else {
+            self.val &= !bit;
+            self.obit &= !bit;
+        }
+        self.convert();
         Ok(())
     }
 
@@ -200,24 +249,19 @@ impl Record for MbboDirectRecord {
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and set VAL to the shifted masked value, mirroring C
     /// `processMbboDirect`/`initMbboDirect` (devAsynUInt32Digital.c:1084-1090,
-    /// 1058-1065). RVAL keeps the masked-but-unshifted raw; VAL is the shifted
-    /// value (no state table — Direct is the raw value). The B0..B1F bits are
-    /// re-derived from the new VAL. Returns `true` so the store reports
+    /// 1058-1065). RVAL is the unshifted value the dset stores; VAL is the shifted
+    /// value (no state table — Direct is the raw value). B0..B1F are derived
+    /// by C's own `bitsFromVAL` sites, `init_record_tail` and
+    /// `monitor_value_changed`. Returns `true` so the store reports
     /// `computed` and the framework skips the forward convert (via
     /// `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        let masked = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
-        self.rval = masked;
+        self.rval = raw as u32;
         self.val = if self.shft > 0 {
-            masked.checked_shr(self.shft as u32).unwrap_or(0)
+            self.rval.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            masked
+            self.rval
         };
-        self.val_to_bits();
         true
     }
 
@@ -290,12 +334,53 @@ impl Record for MbboDirectRecord {
     /// C `mbboDirectRecord.c:311-314` `monitor()`: `if (prec->mlst != prec->val) { events |=
     /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
     /// committed HERE, at C's position, never captured during `process()`.
+    /// `:240` re-derives the bits first, for any VAL the dset changed.
+    /// `:320-328` then posts the bits in `obit ^ val` and commits `obit = val`.
     fn monitor_value_changed(&mut self) -> Option<bool> {
+        self.val_to_bits();
         let changed = self.mlst != self.val;
         if changed {
             self.mlst = self.val;
         }
+        self.bits_changed = self.obit ^ self.val;
+        self.obit = self.val;
         Some(changed)
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> CycleMarks {
+        static BIT_POSTS: [(crate::server::record::FieldIx, CyclePostMask); 32] =
+            uniform_post_table(
+                crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+                &BIT_NAMES,
+                CyclePostMask::MonitorValueLog,
+            );
+        CycleMarks::of(&BIT_POSTS, std::mem::take(&mut self.bits_changed) as u128)
+    }
+
+    /// C `:323` posts a bit on `bitsChanged` or an alarm event, never on a
+    /// compare against what a client was last sent: a bit put is posted by
+    /// `dbPut` and must not post again from the next `monitor()`. RVAL and
+    /// RBV likewise answer from the record's own `oraw`/`orbv`.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        static CLAIMED: [&str; 34] = [
+            "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB",
+            "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18",
+            "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ];
+        &CLAIMED
+    }
+
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+                BIT_NAMES,
+            )
+        }
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -356,16 +441,28 @@ impl Record for MbboDirectRecord {
         self.orbv = self.rbv;
     }
 
+    /// `devMbboDirectSoft` has no `init_record` and `devMbboDirectSoftRaw`
+    /// returns 2.
+    fn soft_dset_init(&self) -> crate::server::device_support::DsetInit {
+        crate::server::device_support::DsetInit::DoNotConvert
+    }
+
+    /// C `mbboDirectRecord.c:128-136`: `val = rval >> shft; udf = FALSE`.
+    fn dset_init_convert(&mut self) -> Option<bool> {
+        self.val = self.rval.checked_shr(u32::from(self.shft)).unwrap_or(0);
+        Some(false)
+    }
+
     /// C `mbboDirectRecord.c:160` — `mlst = val`, and that is the whole tracker
     /// half: mbboDirect has neither ADEL nor LALM.
-    fn seed_deadband_tracking(&mut self) {
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
         self.mlst = self.val;
     }
 
     /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
     /// UNCONDITIONALLY on every non-pact process — the VAL→RVAL output
     /// translation. A CA put to `mbboDirect.VAL` must therefore
-    /// recompute `RVAL`/`ORAW`. `mbboDirect` is an output record, so it
+    /// recompute `RVAL`. `mbboDirect` is an output record, so it
     /// does NOT override `set_device_did_compute` or
     /// `soft_channel_skips_convert` — the soft-channel convert-skip
     /// applies only to INPUT records.
@@ -375,16 +472,75 @@ impl Record for MbboDirectRecord {
         // when a failed closed-loop DOL read took C's `goto CONTINUE`
         // (`closed_loop_dol_read_failed`).
         if !self.skip_convert {
+            // `mbboDirectRecord.c:196-198`.
+            self.val_to_bits();
             self.convert();
         }
         self.skip_convert = false;
-        // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
-        // (the hardware read-back); record support never assigns it.
-        // Forcing `RBV = RVAL` here would mask hardware disagreement,
-        // so we only roll `orbv` forward and leave `rbv` untouched.
-        self.orbv = self.rbv;
-        self.oraw = self.rval;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `mbboDirectRecord.c:331-339` posts RVAL and RBV with `events |
+    /// DBE_VALUE | DBE_LOG` outside the `if (events)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        use crate::server::record::ValuePostGate::OnChangeForced;
+        &[("RVAL", OnChangeForced), ("RBV", OnChangeForced)]
+    }
+
+    /// `monitor()` posts VAL, B0-B1F, RVAL and RBV alone
+    /// (`mbboDirectRecord.c:305-340`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        static POSTED: [crate::server::record::FieldIx; 35] = crate::server::record::declared_set(
+            crate::server::record::dbd_generated::MBBO_DIRECT_FIELDS,
+            [
+                "VAL", "RVAL", "RBV", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9",
+                "BA", "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15",
+                "B16", "B17", "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+            ],
+        );
+        Some(&POSTED)
+    }
+
+    /// C `if (prec->oraw != prec->rval) { ...; prec->oraw = prec->rval; }`
+    /// (`mbboDirectRecord.c:332-339`) and its RBV twin, minus the post.
+    /// Outside init, `monitor()` is the only writer of `oraw`/`orbv`.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        if self.oraw == self.rval && self.orbv == self.rbv {
+            return crate::server::record::SecondaryTake::NONE;
+        }
+        let rval = crate::server::record::SecondaryTake::advance(&mut self.oraw, self.rval);
+        let rbv = crate::server::record::SecondaryTake::advance(&mut self.orbv, self.rbv);
+        crate::server::record::SecondaryTake::unguarded(u64::from(rval) | u64::from(rbv) << 1)
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Long(self.val as i32)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Long(self.mlst as i32)),
+            _ => CycleRead::Absent,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -398,6 +554,7 @@ impl Record for MbboDirectRecord {
             "SHFT" => Some(EpicsValue::UShort(self.shft)),
             "NOBT" => Some(EpicsValue::Short(self.nobt)),
             "MLST" => Some(EpicsValue::Long(self.mlst as i32)),
+            "OBIT" => Some(EpicsValue::Long(self.obit as i32)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov as i32)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -424,15 +581,12 @@ impl Record for MbboDirectRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => {
-                match value {
-                    EpicsValue::Long(v) => self.val = v as u32,
-                    EpicsValue::Short(v) => self.val = v as u32,
-                    EpicsValue::Char(v) => self.val = v as u32,
-                    _ => return Err(CaError::TypeMismatch("VAL".into())),
-                }
-                self.val_to_bits();
-            }
+            "VAL" => match value {
+                EpicsValue::Long(v) => self.val = v as u32,
+                EpicsValue::Short(v) => self.val = v as u32,
+                EpicsValue::Char(v) => self.val = v as u32,
+                _ => return Err(CaError::TypeMismatch("VAL".into())),
+            },
             // RVAL/RBV/MASK are DBF_ULONG: accept the native ULong and
             // tolerate the legacy signed Long (device support / autosave).
             "RVAL" => {
@@ -495,7 +649,7 @@ impl Record for MbboDirectRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -509,14 +663,14 @@ impl Record for MbboDirectRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }
@@ -537,23 +691,18 @@ impl Record for MbboDirectRecord {
             }
             _ => {
                 if let Some(idx) = BIT_NAMES.iter().position(|&n| n == name) {
-                    // B0..B1F are DBF_UCHAR (mbboDirectRecord.dbd.pod), so a
-                    // numeric CA put coerces to the native `UChar`; accept it
-                    // alongside the signed variants device support / autosave
-                    // may send. C `mbboDirectRecord.c::special` (after==1, line
-                    // 282) sets the bit with `if (*pBn)` — the coerced value
-                    // defines the bit when NONZERO, not by its low bit — and
-                    // `bitsFromVAL` (line 96) then normalizes it to 0/1. So the
-                    // store rule is `value != 0`, uniform across all 32 bits.
+                    // B0..B1F are DBF_UCHAR: C stores the cast byte, which
+                    // `special()` (`mbboDirectRecord.c:281-287`) and the init
+                    // fold (`:150-152`) test only for nonzero; `bitsFromVAL`
+                    // normalises it on the next cycle.
                     let bit = match value {
-                        EpicsValue::UChar(v) => u8::from(v != 0),
-                        EpicsValue::Char(v) => u8::from(v != 0),
-                        EpicsValue::Short(v) => u8::from(v != 0),
-                        EpicsValue::Long(v) => u8::from(v != 0),
+                        EpicsValue::UChar(v) => v,
+                        EpicsValue::Char(v) => v as u8,
+                        EpicsValue::Short(v) => v as u8,
+                        EpicsValue::Long(v) => v as u8,
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     };
                     self.bits[idx] = bit;
-                    self.bits_to_val();
                 } else {
                     return Err(CaError::FieldNotFound(name.to_string()));
                 }

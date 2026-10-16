@@ -1,5 +1,5 @@
-//! `interruptAccept` — the process-global gate that says record processing and
-//! I/O Intr callbacks are live.
+//! `interruptAccept` — the gate that says record processing and I/O Intr
+//! callbacks are live, one per database.
 //!
 //! # Why this exists
 //!
@@ -22,81 +22,86 @@
 //! `asyn-rs`'s `PortDriverBase::call_param_callbacks` consults and that the
 //! scan facility drives.
 //!
-//! # The default, and its single owner
+//! # One gate per database
 //!
-//! C initialises the flag `FALSE` (`dbAccess.c:67`); so does this port. The gate
-//! is thus closed at process start by construction, and the scan facility is its
-//! single owner thereafter: `scan_run` sets it true (C `scanRun`,
-//! `dbScan.c:218`), `scan_pause`/`scan_stop` set it false (`dbScan.c:241,165`).
-//! No other code writes it, so the seeds a port sets at construction are
-//! guaranteed to survive to the `scan_run` boot flush without depending on any
-//! bring-up path having lowered a gate first.
+//! C has one database per process, so one `interruptAccept` serves as both
+//! the database's gate and the process's. Here each database's scan facility
+//! owns an [`InterruptGate`] and is its single writer: `scan_run` opens it
+//! (C `scanRun`, `dbScan.c:218`), `scan_pause`/`scan_stop` close it
+//! (`dbScan.c:241,165`). A gate is closed at creation, as C's flag is
+//! (`dbAccess.c:67`).
 //!
-//! C's non-IOC translation unit compiles `static int interruptAccept = 1`
-//! instead (`asynPortDriver.cpp:23-25`) so a bare `asynPortDriver` used outside
-//! an IOC still delivers. This port does not take that convenience default: it
-//! serves IOCs, where the gate is opened by `scan_run` at `iocRun`. A unit test
-//! that exercises `call_param_callbacks` without an `iocInit` must therefore
-//! open the gate itself with [`set_interrupts_accepted`], the precondition that
-//! always holds by the time records process in a running IOC.
+//! A port reads one gate: its owner's, set at `register_port`. A record of
+//! another database on that port adds no reading — C has one
+//! `interruptAccept` per port's IOC — and its own database's running check
+//! decides whether it processes. There is no process-wide reading: a port
+//! with no owner reads closed.
 //!
 //! # The one-shot flush
 //!
-//! [`set_interrupts_accepted`] invokes the callbacks registered through
-//! [`on_interrupts_accepted`] on each `false → true` edge — never when the flag
-//! is written `true` while already `true`, so a pause→resume does not re-flush.
-//! `asyn-rs` registers one such callback that sweeps every port's changed
-//! params once; it is this crate's stand-in for C's per-port `callbackThread`.
-
-use std::sync::Mutex;
+//! A gate's `false → true` edge runs its [`InterruptGate::on_open`]
+//! callbacks, never a `true`-while-`true`, so a pause→resume that never
+//! lowered the flag does not re-flush. `asyn-rs` registers one such callback
+//! per registered port that flushes its changed params once; it is this
+//! crate's stand-in for C's per-port `callbackThread`.
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// C `volatile int interruptAccept`. Defaults `false` (`dbAccess.c:67`); the
-/// scan facility is its single owner thereafter — see the module docs.
-static ACCEPTED: AtomicBool = AtomicBool::new(false);
+type OnOpen = Arc<dyn Fn() + Send + Sync + 'static>;
 
-/// Callbacks fired on the `false → true` edge — the crate-level analogue of the
-/// per-port `callbackThread` C creates in every `asynPortDriver` constructor.
-/// `Arc` so the list can be snapshotted and the lock dropped before any
-/// callback runs (a callback that registers another must not deadlock), the
-/// same discipline as `init_hook_announce`.
-type OnAccept = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
-static ON_ACCEPT: Mutex<Vec<OnAccept>> = Mutex::new(Vec::new());
-
-/// Whether record processing / I/O Intr callbacks are live — C `interruptAccept`.
-///
-/// The single reader is `asyn-rs`'s `PortDriverBase::call_param_callbacks`,
-/// which returns without consuming its changed-flags while this is `false`.
-pub fn interrupts_accepted() -> bool {
-    ACCEPTED.load(Ordering::Acquire)
+/// One database's `interruptAccept`: closed at creation, written only by that
+/// database's scan facility.
+pub struct InterruptGate {
+    open: AtomicBool,
+    on_open: Mutex<Vec<OnOpen>>,
 }
 
-/// Set the gate, and on a `false → true` edge run every [`on_interrupts_accepted`]
-/// callback once.
-///
-/// C reaches the true edge inside `scanRun` (`dbScan.c:218`) and the false edge
-/// inside `scanPause`/`scanStop` (`dbScan.c:241,165`); the IOC's scan facility
-/// is the single owner that calls this. The edge guard means a redundant
-/// `true`-while-`true` (a pause→resume that never lowered the flag, or two scan
-/// starts) fires nothing, matching C's once-per-process `callbackThread`.
-pub fn set_interrupts_accepted(accepted: bool) {
-    let was = ACCEPTED.swap(accepted, Ordering::AcqRel);
-    if accepted && !was {
-        let snapshot: Vec<OnAccept> = ON_ACCEPT.lock().unwrap().clone();
-        for cb in snapshot {
-            cb();
+impl InterruptGate {
+    /// A closed gate.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: AtomicBool::new(false),
+            on_open: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A gate that is already open: for a program or test that has no scan
+    /// facility to open one.
+    pub fn opened() -> Arc<Self> {
+        let gate = Self::new();
+        gate.set(true);
+        gate
+    }
+
+    /// C `interruptAccept`, for the database that owns this gate.
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Set the gate; on a `false → true` edge run its callbacks. The scan
+    /// facility of the owning database is the only caller.
+    pub fn set(&self, open: bool) {
+        let was = self.open.swap(open, Ordering::AcqRel);
+        if open && !was {
+            let own: Vec<OnOpen> = self
+                .on_open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for cb in own {
+                cb();
+            }
         }
     }
-}
 
-/// Register a callback for the next `false → true` edge of the gate.
-///
-/// Registration does **not** fire the callback, even if the flag is already
-/// `true`: the caller (`asyn-rs`'s boot-flush arm) registers this once, and a
-/// port that appears after the flag is already up is that caller's concern, not
-/// this edge's. Process-global, matching C's single per-port thread list.
-pub fn on_interrupts_accepted<F: Fn() + Send + Sync + 'static>(cb: F) {
-    ON_ACCEPT.lock().unwrap().push(std::sync::Arc::new(cb));
+    /// Register a callback for this gate's next `false → true` edges.
+    /// Registration does not fire it, even if the gate is already open.
+    pub fn on_open<F: Fn() + Send + Sync + 'static>(&self, cb: F) {
+        self.on_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(cb));
+    }
 }
 
 #[cfg(test)]
@@ -104,43 +109,60 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    // These tests mutate process-global state; nextest runs each in its own
-    // process, so they do not race. Under `cargo test` they would share the
-    // flag, which is why each restores it.
-
     #[test]
-    fn edge_fires_the_callback_exactly_once_per_false_to_true() {
-        set_interrupts_accepted(false);
-        static HITS: AtomicUsize = AtomicUsize::new(0);
-        on_interrupts_accepted(|| {
-            HITS.fetch_add(1, Ordering::SeqCst);
+    fn a_gate_starts_closed_and_its_edge_fires_once_per_false_to_true() {
+        let gate = InterruptGate::new();
+        assert!(!gate.is_open());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        gate.on_open(move || {
+            h.fetch_add(1, Ordering::SeqCst);
         });
 
-        // false -> true: one fire.
-        set_interrupts_accepted(true);
-        assert_eq!(HITS.load(Ordering::SeqCst), 1);
-        assert!(interrupts_accepted());
+        gate.set(true);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(gate.is_open());
 
-        // true -> true: no fire (C's callbackThread is once-per-process).
-        set_interrupts_accepted(true);
-        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        // true -> true: no fire.
+        gate.set(true);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        // false -> true again: fires again (a resume delivers what changed).
-        set_interrupts_accepted(false);
-        set_interrupts_accepted(true);
-        assert_eq!(HITS.load(Ordering::SeqCst), 2);
-
-        set_interrupts_accepted(true);
+        // false -> true again: a resume delivers what changed.
+        gate.set(false);
+        assert!(!gate.is_open());
+        gate.set(true);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn registration_alone_does_not_fire() {
-        set_interrupts_accepted(true);
-        static HITS: AtomicUsize = AtomicUsize::new(0);
-        on_interrupts_accepted(|| {
-            HITS.fetch_add(1, Ordering::SeqCst);
+        let gate = InterruptGate::new();
+        gate.set(true);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        gate.on_open(move || {
+            h.fetch_add(1, Ordering::SeqCst);
         });
-        // Already true, no edge — must not have fired.
-        assert_eq!(HITS.load(Ordering::SeqCst), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Boundary — one gate's edge does not run another gate's callbacks.
+    #[test]
+    fn an_edge_runs_only_its_own_gates_callbacks() {
+        let a = InterruptGate::new();
+        let b = InterruptGate::new();
+        let (ha, hb) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (xa, xb) = (ha.clone(), hb.clone());
+        a.on_open(move || {
+            xa.fetch_add(1, Ordering::SeqCst);
+        });
+        b.on_open(move || {
+            xb.fetch_add(1, Ordering::SeqCst);
+        });
+        a.set(true);
+        assert_eq!(
+            (ha.load(Ordering::SeqCst), hb.load(Ordering::SeqCst)),
+            (1, 0)
+        );
     }
 }

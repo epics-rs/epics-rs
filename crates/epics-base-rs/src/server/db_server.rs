@@ -88,7 +88,7 @@ fn registry() -> &'static Mutex<Registry> {
 /// character after is the end or a space. So `EPICS_IOC_IGNORE_SERVERS=qsrv2`
 /// does not suppress `qsrv`, and `...=rsrv qsrv2` suppresses both.
 fn ignored_by_env(name: &str) -> bool {
-    let Ok(ignore) = std::env::var("EPICS_IOC_IGNORE_SERVERS") else {
+    let Some(ignore) = crate::runtime::env::get_lossy("EPICS_IOC_IGNORE_SERVERS") else {
         return false;
     };
     ignore.split(' ').any(|tok| tok == name)

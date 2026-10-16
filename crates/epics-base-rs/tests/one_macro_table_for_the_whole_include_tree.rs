@@ -50,16 +50,21 @@ fn expand_and_notices(path: &Path, macros: impl Into<MacroDefs>) -> (String, Str
         ..DbLoadConfig::default()
     };
     let macros = macros.into();
+    // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+    let was = epics_base_rs::runtime::task::thread_is_ok_to_block();
+    epics_base_rs::runtime::task::set_thread_ok_to_block(true);
     let ran = std::panic::catch_unwind(move || {
         expand_includes(path, &macros, &config, &mut DbFaults::default())
     });
 
+    epics_base_rs::runtime::task::set_thread_ok_to_block(was);
     // Restore BEFORE anything can panic on the assertion, or the failure
     // report has nowhere to go.
     assert!(unsafe { libc::dup2(saved, 2) } >= 0, "restore fd 2 failed");
     unsafe { libc::close(saved) };
 
-    let text = ran.expect("the expansion").expect("the flattened text");
+    let text =
+        String::from_utf8(ran.expect("the expansion").expect("the flattened text")).expect("ASCII");
     let notices = strip_ansi(&std::fs::read_to_string(sink.path()).expect("read the capture"));
     (text, notices)
 }

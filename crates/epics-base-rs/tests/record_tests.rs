@@ -265,15 +265,14 @@ fn test_mbbo_readback_unknown_state_is_65535() {
 #[test]
 fn test_bo_readback_maps_raw_to_binary_both_mask_modes() {
     use epics_base_rs::server::records::bo::BoRecord;
-    // mask != 0 (digital): rval = raw & mask, val = (rval != 0).
+    // The MASK is the dset's to apply (asyn `processBo`), not the record's:
+    // C Int32 `initBo` stores the read raw whatever MASK holds.
     let mut rec = BoRecord::new(0);
     rec.mask = 0x04;
-    assert!(rec.apply_raw_readback(0x04));
-    assert_eq!(rec.rval, 0x04);
-    assert_eq!(rec.val, 1);
-    // Out-of-mask bits only → masked 0 → val 0.
     assert!(rec.apply_raw_readback(0x02));
-    assert_eq!(rec.rval, 0);
+    assert_eq!(rec.rval, 0x02);
+    assert_eq!(rec.val, 1);
+    assert!(rec.apply_raw_readback(0));
     assert_eq!(rec.val, 0);
     // mask == 0 (asynInt32 bo): rval = raw (unmasked), val = (raw != 0).
     let mut rec2 = BoRecord::new(0);
@@ -323,14 +322,16 @@ fn test_mbbo_direct_readback_maps_raw_and_skip_convert_preserves_low_bits() {
     assert!(rec.apply_raw_readback(0x0F));
     assert_eq!(rec.rval, 0x0F, "RVAL keeps the masked (unshifted) raw");
     assert_eq!(rec.val, 3, "VAL = masked raw >> SHFT");
-    assert_eq!(rec.bits[0], 1);
-    assert_eq!(rec.bits[1], 1);
     rec.set_device_did_compute(true);
     let _ = rec.process().unwrap();
     assert_eq!(
         rec.rval, 0x0F,
         "skip_convert preserves the readback RVAL with its sub-SHFT bits"
     );
+    // C `bitsFromVAL` before monitor() (mbboDirectRecord.c:240).
+    rec.monitor_value_changed();
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[1], 1);
     // One-shot: the next normal process forward-converts, which truncates the
     // low bits: (3 << 2) & 0x0F = 0x0C — proving the gate mattered.
     let _ = rec.process().unwrap();
@@ -357,19 +358,12 @@ fn test_bi_readback_maps_raw_to_binary_both_mask_modes() {
     assert_eq!(rec.val, 1, "VAL is 0/1, not the raw count");
     assert!(rec.apply_raw_readback(0));
     assert_eq!(rec.val, 0);
-    // asynUInt32Digital bi (mask != 0): rval = raw & mask, val = (rval != 0).
+    // The MASK is the dset's to apply (asyn `processBi`), not the record's.
     let mut rec2 = BiRecord::new(0);
     rec2.mask = 0x80;
-    assert!(rec2.apply_raw_readback(0x80));
-    assert_eq!(rec2.rval, 0x80);
-    assert_eq!(
-        rec2.val, 1,
-        "high-bit mask hit → val 1 (C gives 1, not 128)"
-    );
-    // A raw whose set bits are all outside the mask → masked 0 → val 0.
-    assert!(rec2.apply_raw_readback(0x01));
-    assert_eq!(rec2.rval, 0);
-    assert_eq!(rec2.val, 0, "bits outside MASK do not set VAL");
+    assert!(rec2.apply_raw_readback(0x81));
+    assert_eq!(rec2.rval, 0x81);
+    assert_eq!(rec2.val, 1, "a set RVAL is 1 (C gives 1, not 129)");
 }
 
 // INPUT twin of the mbboDirect readback (asynUInt32Digital only). C
@@ -390,9 +384,6 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     );
     assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
     assert_eq!(rec.val, 0x0F, "VAL = masked raw >> SHFT");
-    assert_eq!(rec.bits[0], 1);
-    assert_eq!(rec.bits[3], 1);
-    assert_eq!(rec.bits[4], 0);
     // The skip_convert gate preserves the readback RVAL (incl. sub-SHFT bits a
     // forward convert would truncate) — C processMbbiDirect returns 0 from its
     // readback without re-converting.
@@ -400,10 +391,11 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     let _ = rec.process().unwrap();
     assert_eq!(rec.rval, 0x3C, "skip_convert preserves the readback RVAL");
     assert_eq!(rec.val, 0x0F);
-    // Bits outside MASK are dropped: raw 0xC0 (bits 6-7) & 0x3C = 0 → val 0.
-    assert!(rec.apply_raw_readback(0xC0));
-    assert_eq!(rec.rval, 0);
-    assert_eq!(rec.val, 0, "out-of-mask bits do not reach VAL");
+    // C derives the bits in monitor() (mbbiDirectRecord.c:218-226).
+    rec.monitor_value_changed();
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[3], 1);
+    assert_eq!(rec.bits[4], 0);
 }
 
 // Family boundary: longin's VAL *is* the raw (C processLi sets pr->val, no
@@ -437,14 +429,8 @@ fn test_mbbi_readback_masks_shifts_and_maps_state() {
         rec.apply_raw_readback(0x08),
         "mbbi claims the device readback"
     );
-    assert_eq!(rec.rval, 0x08, "RVAL = raw & mask (C processMbbi)");
+    assert_eq!(rec.rval, 0x08, "RVAL is the dset's (C processMbbi masks)");
     assert_eq!(rec.val, 2, "shifted raw 2 -> state index 2 (TWVL)");
-    // Mask gating: an out-of-mask 0x80 bit is stripped, NOT leaked. Before the
-    // fix set_val left rval unmasked, so 0x88 would have shifted to 0x22 and
-    // missed the state table (val 65535).
-    assert!(rec.apply_raw_readback(0x88));
-    assert_eq!(rec.rval, 0x08, "out-of-mask 0x80 bit masked away");
-    assert_eq!(rec.val, 2, "still resolves to TWVL, not an unknown state");
 }
 
 // mbbi Soft Channel set_val is now a pass-through (C devMbbiSoft read_mbbi
@@ -600,7 +586,7 @@ fn test_val_and_set_val() {
 #[test]
 fn test_record_instance() {
     let rec = AiRecord::new(25.0);
-    let instance = RecordInstance::new("TEMP".into(), rec);
+    let instance = RecordInstance::new("TEMP", rec);
     assert_eq!(instance.name, "TEMP");
     match instance.record.get_field("VAL") {
         Some(EpicsValue::Double(v)) => assert!((v - 25.0).abs() < 1e-10),
@@ -612,8 +598,9 @@ fn test_record_instance() {
 fn test_read_only_field() {
     use epics_macros_rs::EpicsRecord;
 
+    // A real type: the derive maps `VAL` to `slots::ai::VAL`.
     #[derive(EpicsRecord)]
-    #[record(type = "test", crate_path = "epics_base_rs")]
+    #[record(type = "ai", crate_path = "epics_base_rs")]
     struct TestRecord {
         #[field(type = "Double")]
         pub val: f64,
@@ -643,22 +630,22 @@ fn test_read_only_field() {
     // No `field_list()` assertion here: `#[derive(EpicsRecord)]` is not a
     // declaration source. `#[field(read_only)]` drives this record's own
     // `put_field` refusal (asserted above); the wire-visible SPC_NOMOD
-    // declaration comes from the `.dbd`, and record type "test" has none.
+    // declaration comes from the `.dbd`, not from the derive.
 }
 
 #[test]
 fn test_parse_pv_name() {
     use epics_base_rs::server::database::parse_pv_name;
-    assert_eq!(parse_pv_name("TEMP"), ("TEMP", "VAL"));
-    assert_eq!(parse_pv_name("TEMP.EGU"), ("TEMP", "EGU"));
-    assert_eq!(parse_pv_name("TEMP.HOPR"), ("TEMP", "HOPR"));
-    assert_eq!(parse_pv_name("A.B.C"), ("A.B", "C"));
+    assert_eq!(parse_pv_name("TEMP"), (&b"TEMP"[..], "VAL"));
+    assert_eq!(parse_pv_name("TEMP.EGU"), (&b"TEMP"[..], "EGU"));
+    assert_eq!(parse_pv_name("TEMP.HOPR"), (&b"TEMP"[..], "HOPR"));
+    assert_eq!(parse_pv_name("A.B.C"), (&b"A.B"[..], "C"));
 }
 
 #[test]
 fn test_resolve_field_priority() {
     let rec = AiRecord::new(25.0);
-    let instance = RecordInstance::new("TEMP".into(), rec);
+    let instance = RecordInstance::new("TEMP", rec);
 
     assert!(matches!(
         instance.resolve_field("VAL"),
@@ -687,7 +674,7 @@ fn test_resolve_field_priority() {
 #[test]
 fn test_common_field_put() {
     let rec = AiRecord::new(25.0);
-    let mut instance = RecordInstance::new("TEMP".into(), rec);
+    let mut instance = RecordInstance::new("TEMP", rec);
 
     let result = instance
         .put_common_field("SCAN", EpicsValue::String("1 second".into()))
@@ -699,7 +686,12 @@ fn test_common_field_put() {
         .put_common_field("HIHI", EpicsValue::Double(100.0))
         .unwrap();
     assert_eq!(
-        instance.common.analog_alarm.as_ref().unwrap().hihi,
+        instance
+            .common
+            .analog_alarm
+            .as_ref()
+            .unwrap()
+            .limit(epics_base_rs::server::record::AlarmLimitField::Hihi),
         AlarmLimit::Double(100.0)
     );
 }
@@ -708,7 +700,7 @@ fn test_common_field_put() {
 fn test_evaluate_alarms() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP".into(), rec);
+    let mut instance = RecordInstance::new("TEMP", rec);
     instance.common.udf = 0;
 
     instance
@@ -744,15 +736,9 @@ fn test_parse_link_v2() {
     assert_eq!(parse_link_v2(""), ParsedLink::None);
     assert_eq!(parse_link_v2("  "), ParsedLink::None);
 
-    assert_eq!(parse_link_v2("42"), ParsedLink::Constant("42".to_string()));
-    assert_eq!(
-        parse_link_v2("3.14"),
-        ParsedLink::Constant("3.14".to_string())
-    );
-    assert_eq!(
-        parse_link_v2("-1.5"),
-        ParsedLink::Constant("-1.5".to_string())
-    );
+    assert_eq!(parse_link_v2("42"), ParsedLink::constant("42"));
+    assert_eq!(parse_link_v2("3.14"), ParsedLink::constant("3.14"));
+    assert_eq!(parse_link_v2("-1.5"), ParsedLink::constant("-1.5"));
 
     // A modifier-less DB link defaults to NPP (`NoProcess`), matching
     // C `dbParseLink` (memset→0; `pvlOptPP` only on explicit ` PP`).
@@ -809,7 +795,7 @@ fn test_parse_link_v2() {
     );
     assert_eq!(
         parse_link_v2("pva://PV:NAME"),
-        ParsedLink::Pva("PV:NAME".to_string())
+        ParsedLink::Pva("PV:NAME".into())
     );
 
     // A quoted string is not a number, so C's `dbParseLink` falls through to
@@ -826,13 +812,13 @@ fn test_parse_link_v2() {
 #[test]
 fn test_link_cache_invalidation() {
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP".into(), rec);
+    let mut instance = RecordInstance::new("TEMP", rec);
 
-    assert_eq!(instance.parsed_inp, ParsedLink::None);
+    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
     instance
         .put_common_field("INP", EpicsValue::String("SOURCE.VAL".into()))
         .unwrap();
-    if let ParsedLink::Db(ref db) = instance.parsed_inp {
+    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
         assert_eq!(db.target().record, "SOURCE");
     } else {
         panic!("expected Db link");
@@ -841,7 +827,7 @@ fn test_link_cache_invalidation() {
     instance
         .put_common_field("INP", EpicsValue::String("OTHER".into()))
         .unwrap();
-    if let ParsedLink::Db(ref db) = instance.parsed_inp {
+    if let ParsedLink::Db(db) = instance.parsed_inp.link() {
         assert_eq!(db.pvname(), "OTHER");
     } else {
         panic!("expected Db link");
@@ -850,7 +836,7 @@ fn test_link_cache_invalidation() {
     instance
         .put_common_field("INP", EpicsValue::String("".into()))
         .unwrap();
-    assert_eq!(instance.parsed_inp, ParsedLink::None);
+    assert_eq!(*instance.parsed_inp.link(), ParsedLink::None);
 }
 
 #[test]
@@ -921,7 +907,7 @@ fn test_ai_no_conversion() {
 #[test]
 fn test_common_fields_desc() {
     let rec = AiRecord::new(25.0);
-    let mut instance = RecordInstance::new("TEMP".into(), rec);
+    let mut instance = RecordInstance::new("TEMP", rec);
 
     instance
         .put_common_field("DESC", EpicsValue::String("Temperature".into()))
@@ -939,7 +925,7 @@ fn test_common_fields_desc() {
 #[test]
 fn test_common_fields_new() {
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
 
     assert_eq!(instance.common.phas, 0);
     instance
@@ -959,7 +945,7 @@ fn test_common_fields_new() {
 fn test_hyst_alarm_hysteresis() {
     use epics_base_rs::server::recgbl;
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEMP".into(), rec);
+    let mut instance = RecordInstance::new("TEMP", rec);
     instance.common.udf = 0;
 
     instance
@@ -1001,6 +987,19 @@ fn test_hyst_alarm_hysteresis() {
     assert_eq!(instance.common.sevr, AlarmSeverity::NoAlarm);
 }
 
+/// A VAL subscriber of every class, so the cycle's VAL post carries its value.
+fn watch_val(instance: &mut RecordInstance) -> epics_base_rs::server::event_queue::EventReader {
+    use epics_base_rs::server::recgbl::EventMask;
+    instance
+        .add_subscriber(
+            "VAL",
+            1,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .unwrap()
+}
+
 #[test]
 fn test_deadband_mdel() {
     // MDEL gates the DBE_VALUE class only. ADEL=0 archives every
@@ -1011,7 +1010,9 @@ fn test_deadband_mdel() {
     let mut rec = AiRecord::default();
     rec.mdel = 5.0;
     rec.adel = 0.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
     let val_mask = |snap: &epics_base_rs::server::record::ProcessSnapshot| {
         snap.iter()
             .find(|(k, _, _)| k == "VAL")
@@ -1059,7 +1060,9 @@ fn test_deadband_mdel_zero() {
     use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 0.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
 
     // MDEL=0 does not fire on a zero delta; the VAL post this first process
     // does carry is the born-UDF -> NO_ALARM transition (DBE_ALARM), which C
@@ -1083,7 +1086,9 @@ fn test_deadband_mdel_zero() {
 fn test_deadband_mdel_negative() {
     let mut rec = AiRecord::default();
     rec.mdel = -1.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
 
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1098,7 +1103,7 @@ fn test_bi_state_alarm() {
     rec.zsv = AlarmSeverity::Major as i16;
     rec.osv = AlarmSeverity::Minor as i16;
 
-    let mut instance = RecordInstance::new("SW".into(), rec);
+    let mut instance = RecordInstance::new("SW", rec);
     instance.common.udf = 0;
 
     // bi STATE alarm lives in the `Record::check_alarms` hook (C
@@ -1125,7 +1130,7 @@ fn test_mbbi_state_alarm() {
     rec.onsv = AlarmSeverity::Minor as i16;
     rec.twsv = AlarmSeverity::Major as i16;
 
-    let mut instance = RecordInstance::new("SEL".into(), rec);
+    let mut instance = RecordInstance::new("SEL", rec);
     instance.common.udf = 0;
 
     // mbbi STATE alarm lives in the `Record::check_alarms` hook (C
@@ -1156,7 +1161,7 @@ fn test_mbbi_unsv() {
     let mut rec = MbbiRecord::new(0);
     rec.unsv = AlarmSeverity::Invalid as i16;
 
-    let mut instance = RecordInstance::new("SEL".into(), rec);
+    let mut instance = RecordInstance::new("SEL", rec);
 
     instance.record.set_val(EpicsValue::Enum(15)).unwrap();
     instance.evaluate_alarms();
@@ -1182,19 +1187,25 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 100.0; // VAL change of 1.0 is below the value deadband.
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
+    // The VAL post carries a value only to a subscriber.
+    let _val_sub = watch_val(&mut instance);
     // HIGH=0.5/Major so VAL=1.0 trips a HIGH alarm — a real
     // NoAlarm -> Major SEVR transition.
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1271,7 +1282,7 @@ fn test_per_field_masks_narrow_deadband_and_aux_posts() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0; // VALUE class stays deadband-throttled
     rec.adel = 0.5; // LOG class fires on |delta| > 0.5
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
         .expect("RVAL subscriber");
@@ -1324,22 +1335,26 @@ fn test_acks_posts_once_with_dbe_value_only() {
     use epics_base_rs::types::DbFieldType;
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     let _acks_rx = instance
         .add_subscriber("ACKS", 1, DbFieldType::Enum, EventMask::VALUE.bits())
         .expect("ACKS subscriber");
     // HIGH=0.5/Major so VAL=1.0 raises a NoAlarm -> Major transition, which
     // makes `recGblResetAlarms` fire the ack rule and move ACKS 0 -> 2.
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
@@ -1374,7 +1389,7 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     // record-wide snapshot nor in the per-field `alarm_posts` list.
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     // The FIRST process is an alarm transition — a record is born
     // `STAT=UDF` (dbCommon.dbd `initial("UDF")`) and clears it here — so it
     // posts STAT/SEVR in C too. The no-transition cycle is the next one.
@@ -1410,17 +1425,21 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
     use epics_base_rs::types::DbFieldType;
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    let mut instance = RecordInstance::new("TEST", rec);
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
         .expect("RVAL subscriber");
@@ -1453,7 +1472,7 @@ fn test_ai_rval_not_posted_when_val_within_deadband() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     rec.adel = 100.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
         .expect("RVAL subscriber");
@@ -1490,17 +1509,21 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
     let mut rec = AiRecord::default();
     rec.mdel = 100.0;
     rec.adel = 100.0;
-    let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1000.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    let mut instance = RecordInstance::new("TEST", rec);
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1000.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     let _rval_rx = instance
         .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
         .expect("RVAL subscriber");
@@ -1537,17 +1560,21 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
     // undefined cycle) and filtering AFVL.
     let mut rec = AiRecord::default();
     rec.aftc = 10.0; // AFTC-capable filter enabled (ai carries AFVL)
-    let mut instance = RecordInstance::new("TEST".into(), rec);
-    instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(1.0),
-        high: AlarmLimit::Double(0.5),
-        low: AlarmLimit::Double(-1000.0),
-        lolo: AlarmLimit::Double(-2000.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Major as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    let mut instance = RecordInstance::new("TEST", rec);
+    instance.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(1.0),
+            AlarmLimit::Double(0.5),
+            AlarmLimit::Double(-1000.0),
+            AlarmLimit::Double(-2000.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
     // Seed LALM/AFVL to sentinels, then force a UDF cycle.
     instance
         .record
@@ -1593,7 +1620,7 @@ fn test_waveform_onchange_gates_val_and_posts_hash() {
     let mut rec = WaveformRecord::new(10, DbFieldType::Long);
     rec.mpst = 1; // On Change
     rec.apst = 1; // On Change
-    let mut instance = RecordInstance::new("WF".into(), rec);
+    let mut instance = RecordInstance::new("WF", rec);
     let _val_rx = instance
         .add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
         .expect("VAL subscriber");
@@ -1667,7 +1694,7 @@ fn test_waveform_always_mode_never_posts_hash() {
     use epics_base_rs::types::DbFieldType;
     // mpst=apst=0 (Always) by default.
     let rec = WaveformRecord::new(10, DbFieldType::Long);
-    let mut instance = RecordInstance::new("WF".into(), rec);
+    let mut instance = RecordInstance::new("WF", rec);
     let _hash_rx = instance
         .add_subscriber("HASH", 1, DbFieldType::ULong, EventMask::VALUE.bits())
         .expect("HASH subscriber");
@@ -1690,7 +1717,7 @@ fn test_waveform_always_mode_never_posts_hash() {
 
 #[test]
 fn test_pact_reads_zero_when_idle() {
-    let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     match instance.get_common_field("PACT") {
         Some(EpicsValue::Char(0)) => {}
         other => panic!("expected Char(0), got {:?}", other),
@@ -1699,14 +1726,14 @@ fn test_pact_reads_zero_when_idle() {
 
 #[test]
 fn test_pact_write_rejected() {
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     let result = instance.put_common_field("PACT", EpicsValue::Char(1));
     assert!(matches!(result, Err(CaError::ReadOnlyField(_))));
 }
 
 #[test]
 fn test_lcnt_zero_after_process() {
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     instance.common.lcnt = 5;
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 0);
@@ -1714,7 +1741,7 @@ fn test_lcnt_zero_after_process() {
 
 #[test]
 fn test_lcnt_increments_on_reentrance() {
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     instance.enter_pact();
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 1);
@@ -1727,7 +1754,7 @@ fn test_lcnt_alarm_threshold() {
     // C `dbProcess` (dbAccess.c:543-556): the SCAN_ALARM raise fires on
     // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
     // the 11th consecutive reentrant attempt, not the 10th.
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
@@ -1756,7 +1783,7 @@ fn test_lcnt_alarm_posts_exactly_once() {
     // reentrant attempts bail on `stat == SCAN_ALARM` / `sevr >=
     // INVALID_ALARM` (dbAccess.c:544-546). The pre-fix guard re-posted
     // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     instance.enter_pact();
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
@@ -1779,7 +1806,7 @@ fn test_lcnt_alarm_posts_exactly_once() {
 
 #[test]
 fn test_lcnt_reset_on_success() {
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     instance.common.lcnt = 5;
     let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.lcnt, 0);
@@ -1791,7 +1818,7 @@ fn test_proc_get_put() {
     // in `prec->proc` and served back as `DBF_UCHAR` (`UChar`), like DISP. A
     // fresh record reads the default 0; a stored byte round-trips. (The
     // `pp(TRUE)` force-process is orthogonal and driven by the put path.)
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     match instance.get_common_field("PROC") {
         Some(EpicsValue::UChar(0)) => {}
         other => panic!("expected UChar(0), got {:?}", other),
@@ -1808,7 +1835,7 @@ fn test_proc_get_put() {
 
 #[test]
 fn test_disp_get_put() {
-    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    let mut instance = RecordInstance::new("TEST", AoRecord::new(0.0));
     // DISP is `DBF_UCHAR`: served as `UChar` (its declared type).
     match instance.get_common_field("DISP") {
         Some(EpicsValue::UChar(0)) => {}
@@ -1896,7 +1923,7 @@ fn test_special_called_on_common_put() {
         on_put_count: Arc::new(AtomicU32::new(0)),
         reject_field: None,
     };
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     instance
         .put_common_field("DESC", EpicsValue::String("hello".into()))
         .unwrap();
@@ -1913,7 +1940,7 @@ fn test_validate_put_rejects_common_field() {
         on_put_count: Arc::new(AtomicU32::new(0)),
         reject_field: Some("SCAN".into()),
     };
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     let result = instance.put_common_field("SCAN", EpicsValue::String("1 second".into()));
     assert!(result.is_err());
 }
@@ -1928,7 +1955,7 @@ fn test_on_put_called_for_common_field() {
         on_put_count: on_put.clone(),
         reject_field: None,
     };
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     instance
         .put_common_field("DESC", EpicsValue::String("test".into()))
         .unwrap();
@@ -1940,7 +1967,7 @@ fn test_on_put_called_for_common_field() {
 #[test]
 fn test_phas_change_returns_result() {
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     instance
         .put_common_field("SCAN", EpicsValue::String("1 second".into()))
         .unwrap();
@@ -1960,7 +1987,7 @@ fn test_phas_change_returns_result() {
 #[test]
 fn test_phas_change_passive_no_result() {
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     let result = instance
         .put_common_field("PHAS", EpicsValue::Short(5))
         .unwrap();
@@ -1970,7 +1997,7 @@ fn test_phas_change_passive_no_result() {
 #[test]
 fn test_scan_change_includes_phas() {
     let rec = AiRecord::new(0.0);
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     instance
         .put_common_field("PHAS", EpicsValue::Short(3))
         .unwrap();
@@ -2022,7 +2049,7 @@ impl Record for NoUdfClearRecord {
 #[test]
 fn test_udf_cleared_after_process() {
     let rec = AiRecord::new(1.0);
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
     assert!(instance.common.udf == 0);
@@ -2031,7 +2058,7 @@ fn test_udf_cleared_after_process() {
 #[test]
 fn test_udf_not_cleared_when_clears_udf_false() {
     let rec = NoUdfClearRecord { val: 1.0 };
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     assert!(instance.common.udf != 0);
     instance.process_local().unwrap();
     assert!(instance.common.udf != 0);
@@ -2041,7 +2068,7 @@ fn test_udf_not_cleared_when_clears_udf_false() {
 fn test_udf_alarm_persists() {
     use epics_base_rs::server::recgbl;
     let rec = NoUdfClearRecord { val: 1.0 };
-    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let mut instance = RecordInstance::new("TEST", rec);
     instance.common.udf = 1;
     instance.process_local().unwrap();
     assert!(instance.common.udf != 0);
@@ -2059,17 +2086,21 @@ fn test_snapshot_ai_with_display_metadata() {
     rec.prec = 3;
     rec.hopr = 100.0;
     rec.lopr = -50.0;
-    let mut inst = RecordInstance::new("AI:TEST".into(), rec);
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(90.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    let mut inst = RecordInstance::new("AI:TEST", rec);
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(90.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     assert_eq!(snap.value, EpicsValue::Double(42.0));
@@ -2096,7 +2127,7 @@ fn test_snapshot_ao_with_drvh_drvl() {
     rec.lopr = 0.0;
     rec.drvh = 50.0;
     rec.drvl = 5.0;
-    let inst = RecordInstance::new("AO:TEST".into(), rec);
+    let inst = RecordInstance::new("AO:TEST", rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     let ctrl = snap.control.as_ref().unwrap();
@@ -2111,7 +2142,7 @@ fn test_snapshot_bi_enum_strings() {
     let mut rec = BiRecord::new(0);
     rec.znam = "Off".into();
     rec.onam = "On".into();
-    let inst = RecordInstance::new("BI:TEST".into(), rec);
+    let inst = RecordInstance::new("BI:TEST", rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     // bi has no display source beyond dbCommon DESC (UI-106): the block
@@ -2134,7 +2165,7 @@ fn test_snapshot_mbbi_16_strings() {
     rec.onst = "One".into();
     rec.twst = "Two".into();
     rec.ffst = "Fifteen".into();
-    let inst = RecordInstance::new("MBBI:TEST".into(), rec);
+    let inst = RecordInstance::new("MBBI:TEST", rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     let enums = snap.enums.as_ref().unwrap();
@@ -2155,7 +2186,7 @@ fn test_snapshot_sel_selm_menu_choices() {
     use epics_base_rs::server::records::sel::SelRecord;
     let mut rec = SelRecord::default();
     rec.selm = 2; // Low Signal
-    let inst = RecordInstance::new("SEL:TEST".into(), rec);
+    let inst = RecordInstance::new("SEL:TEST", rec);
 
     let snap = inst.snapshot_for_field("SELM").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(2));
@@ -2175,7 +2206,7 @@ fn test_snapshot_sel_selm_menu_choices() {
 fn test_snapshot_ai_simm_is_menusimm_three_choices() {
     let mut rec = AiRecord::new(1.0);
     rec.simm = 2; // RAW — only present in menuSimm
-    let inst = RecordInstance::new("AI:SIMM".into(), rec);
+    let inst = RecordInstance::new("AI:SIMM", rec);
 
     let snap = inst.snapshot_for_field("SIMM").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(2));
@@ -2190,7 +2221,7 @@ fn test_snapshot_longout_simm_is_menuyesno_two_choices() {
     use epics_base_rs::server::records::longout::LongoutRecord;
     let mut rec = LongoutRecord::new(0);
     rec.simm = 1; // YES
-    let inst = RecordInstance::new("LO:SIMM".into(), rec);
+    let inst = RecordInstance::new("LO:SIMM", rec);
 
     let snap = inst.snapshot_for_field("SIMM").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(1));
@@ -2223,7 +2254,7 @@ fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
     // OMSL/IVOA match arms are unaffected.
     assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
     assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(2)));
-    let inst = RecordInstance::new("DFAN:MENU".into(), rec);
+    let inst = RecordInstance::new("DFAN:MENU", rec);
 
     let omsl = inst.snapshot_for_field("OMSL").unwrap();
     assert_eq!(omsl.value, EpicsValue::Enum(1));
@@ -2253,7 +2284,7 @@ fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
 fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
     use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
 
-    let mut inst = RecordInstance::new("COMMON:MENU".into(), AiRecord::new(1.0));
+    let mut inst = RecordInstance::new("COMMON:MENU", AiRecord::new(1.0));
     inst.common.sevr = AlarmSeverity::Major; // menuAlarmSevr index 2
     inst.common.stat = 14; // menuAlarmStat LINK
     inst.common.nsev = AlarmSeverity::Minor;
@@ -2318,7 +2349,7 @@ fn test_snapshot_dbcommon_menu_fields_serve_as_enum() {
 fn test_put_dbcommon_menu_field_resolves_label() {
     use epics_base_rs::server::record::{AlarmSeverity, PiniMode};
 
-    let mut inst = RecordInstance::new("COMMON:PUT".into(), AiRecord::new(1.0));
+    let mut inst = RecordInstance::new("COMMON:PUT", AiRecord::new(1.0));
     inst.put_common_field("DISS", EpicsValue::String("MAJOR".into()))
         .unwrap();
     assert_eq!(inst.common.diss, AlarmSeverity::Major as i16);
@@ -2361,7 +2392,7 @@ fn test_snapshot_lsi_mpst_menupost_order() {
     use epics_base_rs::server::records::lsi::LsiRecord;
     let mut rec = LsiRecord::new("x");
     rec.mpst = 1; // Always
-    let inst = RecordInstance::new("LSI:MPST".into(), rec);
+    let inst = RecordInstance::new("LSI:MPST", rec);
 
     let snap = inst.snapshot_for_field("MPST").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(1));
@@ -2378,7 +2409,7 @@ fn test_snapshot_lsi_mpst_menupost_order() {
 fn test_snapshot_ai_sims_alarm_severity_choices() {
     let mut rec = AiRecord::new(1.0);
     rec.sims = 3; // INVALID
-    let inst = RecordInstance::new("AI:SIMS".into(), rec);
+    let inst = RecordInstance::new("AI:SIMS", rec);
 
     let snap = inst.snapshot_for_field("SIMS").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(3));
@@ -2393,7 +2424,7 @@ fn test_snapshot_ai_sims_alarm_severity_choices() {
 fn test_snapshot_ao_oif_menu_choices() {
     let mut rec = AoRecord::new(0.0);
     rec.oif = 1; // Incremental
-    let inst = RecordInstance::new("AO:OIF".into(), rec);
+    let inst = RecordInstance::new("AO:OIF", rec);
 
     let snap = inst.snapshot_for_field("OIF").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(1));
@@ -2408,7 +2439,7 @@ fn test_snapshot_histogram_cmd_menu_choices() {
     use epics_base_rs::server::records::histogram::HistogramRecord;
     let mut rec = HistogramRecord::default();
     rec.cmd = 2; // Start
-    let inst = RecordInstance::new("HIST:CMD".into(), rec);
+    let inst = RecordInstance::new("HIST:CMD", rec);
 
     let snap = inst.snapshot_for_field("CMD").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(2));
@@ -2425,7 +2456,7 @@ fn test_snapshot_scalcout_oopt_includes_never() {
     use epics_base_rs::server::records::scalcout::ScalcoutRecord;
     let mut rec = ScalcoutRecord::default();
     rec.oopt = 6; // Never
-    let inst = RecordInstance::new("SCALC:OOPT".into(), rec);
+    let inst = RecordInstance::new("SCALC:OOPT", rec);
 
     let snap = inst.snapshot_for_field("OOPT").unwrap();
     assert_eq!(snap.value, EpicsValue::Enum(6));
@@ -2442,7 +2473,7 @@ fn test_snapshot_longin_display() {
     rec.egu = "counts".into();
     rec.hopr = 10000;
     rec.lopr = 0;
-    let inst = RecordInstance::new("LONGIN:TEST".into(), rec);
+    let inst = RecordInstance::new("LONGIN:TEST", rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     let disp = snap.display.as_ref().unwrap();
@@ -2458,7 +2489,7 @@ fn test_snapshot_longin_display() {
 #[test]
 fn test_snapshot_stringin_no_metadata() {
     let rec = StringinRecord::new("hello");
-    let inst = RecordInstance::new("SI:TEST".into(), rec);
+    let inst = RecordInstance::new("SI:TEST", rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
     assert_eq!(snap.value, EpicsValue::String("hello".into()));
@@ -2474,14 +2505,14 @@ fn test_snapshot_stringin_no_metadata() {
 #[test]
 fn test_snapshot_field_not_found() {
     let rec = AiRecord::new(1.0);
-    let inst = RecordInstance::new("AI:TEST".into(), rec);
+    let inst = RecordInstance::new("AI:TEST", rec);
     assert!(inst.snapshot_for_field("NONEXISTENT").is_none());
 }
 
 #[test]
 fn test_snapshot_alarm_state() {
     let rec = AiRecord::new(1.0);
-    let mut inst = RecordInstance::new("AI:TEST".into(), rec);
+    let mut inst = RecordInstance::new("AI:TEST", rec);
     inst.common.stat = 7;
     inst.common.sevr = AlarmSeverity::Minor;
 
@@ -2544,7 +2575,7 @@ fn test_bi_aftc_filter_seeds_afvl() {
     rec.osv = AlarmSeverity::Major as i16;
     rec.aftc = 5.0;
     rec.afvl = 0.0; // first sample
-    let mut inst = RecordInstance::new("BI:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("BI:AFTC", rec);
     inst.common.udf = 0;
 
     inst.record.check_alarms(&mut inst.common);
@@ -2564,7 +2595,7 @@ fn test_bi_udf_cycle_leaves_afvl_untouched() {
 
     let mut rec = BiRecord::new(1);
     rec.aftc = 10.0;
-    let mut inst = RecordInstance::new("BI:UDF".into(), rec);
+    let mut inst = RecordInstance::new("BI:UDF", rec);
     // Seed AFVL to a sentinel, then force a UDF cycle.
     inst.record
         .put_field("AFVL", EpicsValue::Double(3.0))
@@ -2597,7 +2628,7 @@ fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     rec.aftc = 2.0;
     rec.afvl = 0.0;
 
-    let mut inst = RecordInstance::new("MBBI:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("MBBI:AFTC", rec);
     inst.common.udf = 0;
 
     // AFTC alarm filter runs inside `Record::check_alarms` (C
@@ -2647,18 +2678,22 @@ fn test_ai_aftc_filter_engages_and_seeds() {
     let mut rec = AiRecord::new(150.0); // above HIHI
     rec.aftc = 5.0;
     rec.afvl = 0.0; // first sample
-    let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("AI:AFTC", rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2688,18 +2723,22 @@ fn test_longin_aftc_filter_engages_and_seeds() {
     let mut rec = LonginRecord::new(150); // above HIHI
     rec.aftc = 5.0;
     rec.afvl = 0.0;
-    let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("LONGIN:AFTC", rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2725,18 +2764,22 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
     let mut rec = Int64inRecord::new(150); // above HIHI
     rec.aftc = 5.0;
     rec.afvl = 0.0;
-    let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("INT64IN:AFTC", rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
     epics_base_rs::server::recgbl::rec_gbl_reset_alarms(&mut inst.common);
@@ -2763,18 +2806,22 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     let mut rec = AiRecord::new(0.0); // normal range, no alarm
     rec.aftc = 0.0; // filter disabled
     rec.afvl = 3.0; // stale accumulator left from a prior AFTC>0 run
-    let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
+    let mut inst = RecordInstance::new("AI:AFTC", rec);
     inst.common.udf = 0;
-    inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: AlarmLimit::Double(100.0),
-        high: AlarmLimit::Double(80.0),
-        low: AlarmLimit::Double(-20.0),
-        lolo: AlarmLimit::Double(-40.0),
-        hhsv: AlarmSeverity::Major as i16,
-        hsv: AlarmSeverity::Minor as i16,
-        lsv: AlarmSeverity::Minor as i16,
-        llsv: AlarmSeverity::Major as i16,
-    });
+    inst.common.analog_alarm = Some(analog_alarm_config(
+        [
+            AlarmLimit::Double(100.0),
+            AlarmLimit::Double(80.0),
+            AlarmLimit::Double(-20.0),
+            AlarmLimit::Double(-40.0),
+        ],
+        [
+            AlarmSeverity::Major as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Minor as i16,
+            AlarmSeverity::Major as i16,
+        ],
+    ));
 
     inst.evaluate_alarms();
 
@@ -2811,7 +2858,7 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
     rec.cosv = AlarmSeverity::Major as i16; // COSV raises COS_ALARM
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
-    let mut inst = RecordInstance::new("MBBI:LALM".into(), rec);
+    let mut inst = RecordInstance::new("MBBI:LALM", rec);
     inst.common.udf = 0;
 
     // Transition 0 → 2: COS_ALARM fires (cosv=Major), LALM must
@@ -2877,7 +2924,7 @@ fn test_bi_lalm_updates_when_cosv_set() {
     rec.cosv = AlarmSeverity::Major as i16;
     rec.put_field("LALM", EpicsValue::Enum(0)).unwrap();
 
-    let mut inst = RecordInstance::new("BI:LALM".into(), rec);
+    let mut inst = RecordInstance::new("BI:LALM", rec);
     inst.common.udf = 0;
 
     // COS/LALM logic lives in `Record::check_alarms` (C
@@ -2907,7 +2954,7 @@ fn test_bi_lalm_updates_when_cosv_set() {
 #[test]
 fn desc_preserves_non_utf8_bytes() {
     let rec = AiRecord::new(0.0);
-    let mut inst = RecordInstance::new("DESC:NONUTF8".into(), rec);
+    let mut inst = RecordInstance::new("DESC:NONUTF8", rec);
     let raw = vec![0xffu8, 0x00, 0x80];
     inst.put_common_field(
         "DESC",
@@ -2959,7 +3006,7 @@ fn mbbi_with_states() -> epics_base_rs::server::records::mbbi::MbbiRecord {
 fn r21_enum_val_defined_slot_renders_its_state() {
     let mut rec = mbbi_with_states();
     rec.val = 1;
-    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    let inst = RecordInstance::new("MBBI:R21", rec);
     assert_eq!(dbr_string_of(&inst, "VAL"), "one");
 }
 
@@ -2971,7 +3018,7 @@ fn r21_enum_val_defined_slot_renders_its_state() {
 fn r21_enum_val_undefined_slot_in_range_renders_empty() {
     let mut rec = mbbi_with_states();
     rec.val = 5;
-    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    let inst = RecordInstance::new("MBBI:R21", rec);
     assert_eq!(dbr_string_of(&inst, "VAL"), "");
 }
 
@@ -2981,7 +3028,7 @@ fn r21_enum_val_undefined_slot_in_range_renders_empty() {
 fn r21_enum_val_past_the_slots_renders_illegal_value() {
     let mut rec = mbbi_with_states();
     rec.val = 20;
-    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    let inst = RecordInstance::new("MBBI:R21", rec);
     assert_eq!(dbr_string_of(&inst, "VAL"), "Illegal Value");
 }
 
@@ -2990,7 +3037,7 @@ fn r21_enum_val_past_the_slots_renders_illegal_value() {
 #[test]
 fn r21_enum_val_with_no_states_renders_empty_not_zero() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
-    let inst = RecordInstance::new("MBBI:R21".into(), MbbiRecord::default());
+    let inst = RecordInstance::new("MBBI:R21", MbbiRecord::default());
     assert_eq!(dbr_string_of(&inst, "VAL"), "");
 }
 
@@ -3002,7 +3049,7 @@ fn r21_binary_enum_val_empty_onam_renders_empty() {
     let mut rec = BiRecord::new(0);
     rec.znam = "off".into();
     rec.val = 1;
-    let inst = RecordInstance::new("BI:R21".into(), rec);
+    let inst = RecordInstance::new("BI:R21", rec);
     assert_eq!(
         inst.snapshot_for_field("VAL")
             .unwrap()
@@ -3020,6 +3067,18 @@ fn r21_binary_enum_val_empty_onam_renders_empty() {
 #[test]
 fn r21_menu_field_renders_its_own_choice_not_the_records_states() {
     let rec = mbbi_with_states();
-    let inst = RecordInstance::new("MBBI:R21".into(), rec);
+    let inst = RecordInstance::new("MBBI:R21", rec);
     assert_eq!(dbr_string_of(&inst, "SCAN"), "Passive");
+}
+
+/// A `DBF_DOUBLE` analog-alarm slot: limits `[HIHI, HIGH, LOW, LOLO]`, then
+/// severities `[HHSV, HSV, LSV, LLSV]`.
+fn analog_alarm_config(limits: [AlarmLimit; 4], sevs: [i16; 4]) -> AnalogAlarmConfig {
+    use epics_base_rs::server::record::AlarmLimitField::{High, Hihi, Lolo, Low};
+    let mut cfg = AnalogAlarmConfig::double();
+    for (field, limit) in [Hihi, High, Low, Lolo].into_iter().zip(limits) {
+        cfg.set_limit(field, limit);
+    }
+    [cfg.hhsv, cfg.hsv, cfg.lsv, cfg.llsv] = sevs;
+    cfg
 }

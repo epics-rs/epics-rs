@@ -22,10 +22,8 @@ use epics_base_rs::server::record::CommonFields;
 /// The band a record with this `PRIO` hands to `spawn_background`, and the
 /// pool worker that actually ran the tail.
 async fn band_and_worker_for_prio(prio: i16) -> (CallbackPriority, String) {
-    let common = CommonFields {
-        prio,
-        ..Default::default()
-    };
+    let mut common = CommonFields::default();
+    common.prio = prio;
     // Exactly the hop every record-support deferral site takes: the framework
     // snapshots `common` before `process()`, the record stashes the band, and
     // the band is what reaches the pool.
@@ -89,10 +87,8 @@ async fn a_prio_outside_the_menu_still_runs_the_work_on_the_low_band() {
 /// pushes before each `process()` is what carries that here.
 #[epics_macros_rs::epics_test]
 async fn a_prio_written_between_cycles_moves_the_next_cycles_band() {
-    let mut common = CommonFields {
-        prio: 0,
-        ..Default::default()
-    };
+    let mut common = CommonFields::default();
+    common.prio = 0;
     assert_eq!(
         common.process_context().callback_priority,
         CallbackPriority::Low

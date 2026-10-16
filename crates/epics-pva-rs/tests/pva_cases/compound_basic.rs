@@ -31,7 +31,8 @@ fn golden_pvxs_sub_structure_two_fields_be() {
         fields: vec![
             ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
-        ],
+        ]
+        .into(),
     };
     let val = PvField::Structure(PvStructure {
         struct_id: String::new(),

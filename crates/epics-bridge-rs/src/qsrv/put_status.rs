@@ -45,7 +45,7 @@ pub(crate) const UNABLE_PUT_DISABLED: &str =
 /// exactly as pvxs does; only the contract text reaches the client.
 pub(crate) async fn check_preconditions(
     db: &PvDatabase,
-    record_name: &str,
+    record_name: &[u8],
     field_name: &str,
 ) -> BridgeResult<()> {
     db.check_external_put_preconditions(record_name, field_name)
@@ -59,7 +59,10 @@ pub(crate) async fn check_preconditions(
                 // value: <detail>"` shape rather than inventing a new one.
                 other => format!("Unable to put value: {other}"),
             };
-            tracing::debug!("QSRV PUT rejected on {record_name}.{field_name}: {msg} ({e})");
+            tracing::debug!(
+                "QSRV PUT rejected on {}.{field_name}: {msg} ({e})",
+                String::from_utf8_lossy(record_name)
+            );
             BridgeError::PutRejected(msg)
         })
 }

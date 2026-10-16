@@ -835,7 +835,7 @@ fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Option<Instant>) -> 
 
 /// C `writeIt`'s poll/write loop on the same deadline.
 ///
-/// `transferred` is C's `*nbytesTransfered` (drvAsynSerialPort.c:843): it is
+/// `transferred` is C's `*nbytesTransferred` (drvAsynSerialPort.c:843): it is
 /// advanced in place so the count the port took survives every exit — timeout
 /// and fatal errno alike — instead of being dropped by the error.
 fn write_until(
@@ -1051,7 +1051,7 @@ impl DrvAsynSerialPort {
     /// The driver starts disconnected with `auto_connect = true` and `can_block = true`.
     pub fn new(port_name: &str, config_str: &str) -> AsynResult<Self> {
         let config = SerialConfig::parse(config_str)?;
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             1,
             PortFlags {
@@ -1061,7 +1061,7 @@ impl DrvAsynSerialPort {
             },
         );
         base.init_connected(false);
-        base.auto_connect = true;
+        base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPort.c:1125-1126): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
@@ -1096,7 +1096,7 @@ impl DrvAsynSerialPort {
     ) -> AsynResult<Self> {
         let mut driver = Self::new(port_name, config_str)?;
         if no_auto_connect {
-            driver.base.auto_connect = false;
+            driver.base.init_auto_connect(false);
         }
         if !no_process_eos {
             driver.install_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -1513,7 +1513,7 @@ impl PortDriver for DrvAsynSerialPort {
                     }
                     _ => {
                         // C's text for this key is not of the "Invalid <key>
-                        // value." shape (drvAsynSerialPort.c:394-395).
+                        // value." shape (drvAsynSerialPort.c:392-394).
                         return Err(AsynError::Status {
                             status: AsynStatus::Error,
                             message: "Invalid parity.".into(),
@@ -1823,7 +1823,7 @@ impl DrvAsynSerialPort {
                 }
             }
             // C reports *this* key's bad value as "Invalid rs485_rts_on_send
-            // value." (drvAsynSerialPort.c:566) — a copy-paste of the previous
+            // value." (drvAsynSerialPort.c:568) — a copy-paste of the previous
             // arm's text. Deliberate deviation: the key names itself here, since
             // an operator told "rs485_rts_on_send" while writing
             // rs485_rts_after_send is being misdirected by a C typo.
@@ -1937,7 +1937,7 @@ mod tests {
     fn test_driver_initial_state() {
         let drv = DrvAsynSerialPort::new("serial1", "/dev/ttyUSB0").unwrap();
         assert!(!drv.base().is_connected());
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
         assert!(drv.base().flags.can_block);
         // `new` is parse-only: no EOS interpose (DRV-45).
         assert_eq!(drv.base().interpose_octet.len(), 0);
@@ -1954,7 +1954,7 @@ mod tests {
             1,
             "default serial port must auto-install the EOS interpose"
         );
-        assert!(default_port.base().auto_connect);
+        assert!(default_port.base().is_auto_connect());
 
         let suppressed =
             DrvAsynSerialPort::configure("s_eos_off", "/dev/ttyS0", true, true).unwrap();
@@ -1963,7 +1963,7 @@ mod tests {
             0,
             "noProcessEos must suppress the EOS interpose"
         );
-        assert!(!suppressed.base().auto_connect);
+        assert!(!suppressed.base().is_auto_connect());
     }
 
     #[test]
@@ -2175,7 +2175,7 @@ mod tests {
             .set_option(&mut AsynUser::default(), "parity", "mark")
             .unwrap_err();
         // R11-49: C has one text for every unrecognised parity value —
-        // "Invalid parity." (drvAsynSerialPort.c:394-395). Mark/space are not a
+        // "Invalid parity." (drvAsynSerialPort.c:392-394). Mark/space are not a
         // separate case in C, and were never a separate case here either.
         assert_eq!(err.message(), "Invalid parity.");
     }
@@ -2256,14 +2256,14 @@ mod tests {
 
         assert_eq!(err("baud", "fast"), "Bad number", "C :264");
         assert_eq!(err("bits", "9"), "Invalid number of bits.", "C :374");
-        assert_eq!(err("parity", "mark"), "Invalid parity.", "C :395");
+        assert_eq!(err("parity", "mark"), "Invalid parity.", "C :393");
         assert_eq!(err("stop", "3"), "Invalid number of stop bits.", "C :406");
         assert_eq!(err("clocal", "maybe"), "Invalid clocal value.", "C :419");
         assert_eq!(err("crtscts", "maybe"), "Invalid crtscts value.", "C :440");
         assert_eq!(err("ixon", "maybe"), "Invalid ixon value.", "C :464");
         assert_eq!(err("ixany", "maybe"), "Invalid ixany value.", "C :481");
-        assert_eq!(err("ixoff", "maybe"), "Invalid ixoff value.", "C :502");
-        assert_eq!(err("break", "soon"), "Bad number", "C :513");
+        assert_eq!(err("ixoff", "maybe"), "Invalid ixoff value.", "C :501");
+        assert_eq!(err("break", "soon"), "Bad number", "C :515");
         assert_eq!(err("nosuch", "x"), "Unsupported key \"nosuch\"", "C :595");
     }
 
@@ -2346,7 +2346,8 @@ mod tests {
 
     // --- PTY integration tests ---
 
-    fn create_pty_pair() -> Option<(RawFd, RawFd, String)> {
+    /// Panics when the host has no pty: an early return would score as a pass.
+    fn create_pty_pair() -> (RawFd, RawFd, String) {
         let mut master: RawFd = 0;
         let mut slave: RawFd = 0;
         let mut name_buf = [0u8; 256];
@@ -2360,9 +2361,11 @@ mod tests {
                 std::ptr::null_mut(),
             )
         };
-        if ret < 0 {
-            return None;
-        }
+        assert!(
+            ret >= 0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
 
         let name = unsafe {
             std::ffi::CStr::from_ptr(name_buf.as_ptr() as *const libc::c_char)
@@ -2370,7 +2373,7 @@ mod tests {
                 .into_owned()
         };
 
-        Some((master, slave, name))
+        (master, slave, name)
     }
 
     struct PtyGuard {
@@ -2389,13 +2392,7 @@ mod tests {
 
     #[test]
     fn test_pty_connect_disconnect() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         // Close slave — driver will reopen it
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
@@ -2417,13 +2414,7 @@ mod tests {
     /// down a live serial port. The connection must stay up.
     #[test]
     fn pty_zero_length_read_rejected_not_eof_teardown() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2461,13 +2452,7 @@ mod tests {
     /// reject).
     #[test]
     fn pty_empty_key_reapplies_configured_termios() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2518,13 +2503,7 @@ mod tests {
 
     #[test]
     fn test_pty_write_read_roundtrip() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2553,13 +2532,7 @@ mod tests {
 
     #[test]
     fn test_pty_read_timeout() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2585,13 +2558,7 @@ mod tests {
         // DRV-31: a fatal read error / EOF must tear the connection down so
         // the actor's auto-reconnect re-opens the device. Without it the port
         // stays `connected` with a dead fd and never self-heals.
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
@@ -2621,13 +2588,7 @@ mod tests {
         // tear the connection down so the actor's auto-reconnect re-opens the
         // device — same closeConnection contract C applies in writeIt
         // (drvAsynSerialPort.c:837).
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
 
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
@@ -2713,13 +2674,7 @@ mod tests {
     fn test_pty_eos_interpose() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
 
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2741,7 +2696,7 @@ mod tests {
         let mut buf = [0u8; 32];
         // The EOS layer is the port's, not the driver's: a caller enters the
         // chain at the top and the driver is its base (C findInterface,
-        // asynManager.c:1493-1501). `PortActor` does exactly this.
+        // asynManager.c:1494-1503). `PortActor` does exactly this.
         let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf).unwrap();
         // EOS should strip the terminator
         assert_eq!(&buf[..n], b"OK");
@@ -2749,13 +2704,7 @@ mod tests {
 
     #[test]
     fn test_pty_set_option_baud() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2785,13 +2734,7 @@ mod tests {
     /// and could not be set at all while the line was down.
     #[test]
     fn clocal_survives_reconnect_and_can_be_set_while_disconnected() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2861,13 +2804,7 @@ mod tests {
     /// `FlowControl` enum, which cannot express "ixon without ixoff" or ixany.
     #[test]
     fn iflag_family_reads_back_per_flag_from_the_cache() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2936,13 +2873,7 @@ mod tests {
     /// is `clocal_survives_reconnect_and_can_be_set_while_disconnected`.
     #[test]
     fn cflag_options_set_while_disconnected_apply_at_connect() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -2986,13 +2917,7 @@ mod tests {
         // C drvAsynSerialPort.c::connectIt (694-698) returns asynError
         // "Link already open!" on a connect to an already-open link,
         // rather than opening a second fd and leaking the first.
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3013,13 +2938,7 @@ mod tests {
     fn test_pty_runtime_integration() {
         use crate::runtime::{RuntimeConfig, create_port_runtime};
 
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3060,13 +2979,7 @@ mod tests {
 
     #[test]
     fn test_pty_termios_restored_on_disconnect() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3133,13 +3046,7 @@ mod tests {
     /// and never sets IGNPAR, so the driver must restore them after cfmakeraw.
     #[test]
     fn pty_termios_sets_ignbrk_ignpar() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3165,13 +3072,7 @@ mod tests {
     /// software flow control would use NUL instead of ^Q/^S.
     #[test]
     fn pty_termios_sets_xon_xoff_chars() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3193,13 +3094,7 @@ mod tests {
     /// you looked from*, and only a per-boundary check catches that.
     #[test]
     fn pty_fd_is_non_blocking_at_every_boundary() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3405,13 +3300,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3449,7 +3338,7 @@ mod tests {
             other => panic!("expected total-deadline Timeout, got {other:?}"),
         };
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
-        // R8-48: C `writeIt` publishes `*nbytesTransfered = numchars - nleft`
+        // R8-48: C `writeIt` publishes `*nbytesTransferred = numchars - nleft`
         // on the timeout break (drvAsynSerialPort.c:843) — the bytes the port
         // already took ride out *with* the timeout instead of being dropped.
         // This write drained part of the payload into the pty before the
@@ -3481,13 +3370,7 @@ mod tests {
     fn pty_read_timeout_bounds_total_not_per_poll() {
         extern "C" fn absorb_sigusr1(_sig: libc::c_int) {}
 
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         let _guard = PtyGuard { master, slave };
 
         let mut drv = DrvAsynSerialPort::new("pty_read_total", &slave_name).unwrap();
@@ -3707,13 +3590,7 @@ mod tests {
     /// in the few microseconds the truncated `poll(fd, 1, 0)` took.
     #[test]
     fn pty_sub_millisecond_read_timeout_waits_for_the_device() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         let _guard = PtyGuard { master, slave };
 
         let mut drv = DrvAsynSerialPort::new("pty_subms", &slave_name).unwrap();
@@ -3742,13 +3619,7 @@ mod tests {
     /// serial fd right after open so it is not inherited across exec.
     #[test]
     fn pty_connect_sets_cloexec() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
@@ -3769,13 +3640,7 @@ mod tests {
     /// every level without panicking.
     #[test]
     fn pty_report_tracks_byte_counters() {
-        let (master, slave, slave_name) = match create_pty_pair() {
-            Some(v) => v,
-            None => {
-                eprintln!("openpty not available, skipping test");
-                return;
-            }
-        };
+        let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 

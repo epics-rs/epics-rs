@@ -12,16 +12,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
+use epics_base_rs::server::database::db_access::{DbAttachment, SubscriptionActivation};
+use epics_base_rs::server::pv::{MonitorEvent, SubscribeRefused};
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::server::snapshot::PropertySupport;
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, RecordName};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 use epics_pva_rs::server_native::source::RemoteLog;
+use epics_pva_rs::server_native::{MonitorRing, MonitorUpdate};
 
 use super::channel::MemberChannel;
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
-use super::monitor::BridgeMonitor;
 use super::pvif::{self, FieldMapping, NtType};
 use crate::convert::dbf_to_scalar_type;
 use crate::error::{BridgeError, BridgeResult};
@@ -311,7 +312,8 @@ fn record_options_inner_field_desc() -> FieldDesc {
         fields: vec![
             ("queueSize".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("atomic".into(), FieldDesc::Scalar(ScalarType::Boolean)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -538,7 +540,7 @@ fn set_nested_field_desc_recursive(
             // element type.
             let (struct_id, elem_fields) = match leaf {
                 FieldDesc::Structure { struct_id, fields } => (struct_id, fields),
-                _ => (String::new(), Vec::new()),
+                _ => (String::new(), Vec::new().into()),
             };
             let sa = FieldDesc::StructureArray {
                 struct_id,
@@ -551,80 +553,43 @@ fn set_nested_field_desc_recursive(
             }
             return;
         }
-        let elem_fields = get_or_create_struct_array_desc(fields, &comp.name);
-        set_nested_field_desc_recursive(elem_fields, &components[1..], leaf);
+        // A field that exists but is not a `StructureArray` is replaced.
+        let pos = member_slot(fields, &comp.name);
+        let (struct_id, mut elem) = match std::mem::replace(&mut fields[pos].1, FieldDesc::Variant)
+        {
+            FieldDesc::StructureArray { struct_id, fields } => (struct_id, fields.into_vec()),
+            _ => (String::new(), Vec::new()),
+        };
+        set_nested_field_desc_recursive(&mut elem, &components[1..], leaf);
+        fields[pos].1 = FieldDesc::StructureArray {
+            struct_id,
+            fields: elem.into(),
+        };
         return;
     }
 
-    // Find or create the intermediate structure descriptor
-    let sub_fields: &mut Vec<(String, FieldDesc)> =
-        if let Some(pos) = fields.iter().position(|(n, _)| n == &comp.name) {
-            match &mut fields[pos].1 {
-                FieldDesc::Structure { fields: f, .. } => f,
-                other => {
-                    *other = FieldDesc::Structure {
-                        struct_id: String::new(),
-                        fields: Vec::new(),
-                    };
-                    if let FieldDesc::Structure { fields: f, .. } = &mut fields[pos].1 {
-                        f
-                    } else {
-                        unreachable!()
-                    }
-                }
-            }
-        } else {
-            fields.push((
-                comp.name.clone(),
-                FieldDesc::Structure {
-                    struct_id: String::new(),
-                    fields: Vec::new(),
-                },
-            ));
-            if let FieldDesc::Structure { fields: f, .. } = &mut fields.last_mut().unwrap().1 {
-                f
-            } else {
-                unreachable!()
-            }
-        };
-
-    set_nested_field_desc_recursive(sub_fields, &components[1..], leaf);
+    // Find or create the intermediate structure descriptor. It is rebuilt
+    // around the grown member list so its bit count covers the new leaf.
+    let pos = member_slot(fields, &comp.name);
+    let (struct_id, mut sub) = match std::mem::replace(&mut fields[pos].1, FieldDesc::Variant) {
+        FieldDesc::Structure { struct_id, fields } => (struct_id, fields.into_vec()),
+        _ => (String::new(), Vec::new()),
+    };
+    set_nested_field_desc_recursive(&mut sub, &components[1..], leaf);
+    fields[pos].1 = FieldDesc::Structure {
+        struct_id,
+        fields: sub.into(),
+    };
 }
 
-/// Find or create a named `StructureArray` descriptor within `fields`,
-/// returning its element field list. Symmetric with
-/// [`get_or_create_struct_array_field`] on the value side; a field that
-/// exists but is not a `StructureArray` is replaced.
-fn get_or_create_struct_array_desc<'a>(
-    fields: &'a mut Vec<(String, FieldDesc)>,
-    name: &str,
-) -> &'a mut Vec<(String, FieldDesc)> {
+/// Index of the member `name` in `fields`, appending a placeholder member
+/// (overwritten by the caller) when there is none.
+fn member_slot(fields: &mut Vec<(String, FieldDesc)>, name: &str) -> usize {
     if let Some(pos) = fields.iter().position(|(n, _)| n == name) {
-        if !matches!(fields[pos].1, FieldDesc::StructureArray { .. }) {
-            fields[pos].1 = FieldDesc::StructureArray {
-                struct_id: String::new(),
-                fields: Vec::new(),
-            };
-        }
-        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields[pos].1 {
-            f
-        } else {
-            unreachable!()
-        }
-    } else {
-        fields.push((
-            name.to_string(),
-            FieldDesc::StructureArray {
-                struct_id: String::new(),
-                fields: Vec::new(),
-            },
-        ));
-        if let FieldDesc::StructureArray { fields: f, .. } = &mut fields.last_mut().unwrap().1 {
-            f
-        } else {
-            unreachable!()
-        }
+        return pos;
     }
+    fields.push((name.to_string(), FieldDesc::Variant));
+    fields.len() - 1
 }
 
 // ---------------------------------------------------------------------------
@@ -641,9 +606,9 @@ fn get_or_create_struct_array_desc<'a>(
 async fn lock_group_records_read(
     db: &PvDatabase,
     members: &[MemberChannel],
-) -> Vec<(String, Arc<epics_base_rs::server::record::RecordCell>)> {
+) -> Vec<(RecordName, Arc<epics_base_rs::server::record::RecordCell>)> {
     // Collect unique record names and sort for deterministic lock order.
-    let mut record_names: Vec<String> = members
+    let mut record_names: Vec<RecordName> = members
         .iter()
         .filter(|m| m.has_channel())
         .map(|m| m.record.clone())
@@ -670,8 +635,8 @@ async fn lock_group_records_read(
 /// set. Names are resolved through the alias map so the gate key
 /// matches the one a direct CA/PVA write would take in
 /// `put_record_field_from_ca` / `put_pv` / `process_record`.
-fn group_member_record_names(db: &PvDatabase, members: &[MemberChannel]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+fn group_member_record_names(db: &PvDatabase, members: &[MemberChannel]) -> Vec<RecordName> {
+    let mut names: Vec<RecordName> = Vec::new();
     for m in members {
         if !m.has_channel() {
             continue; // Structure / Const — no backing record
@@ -837,7 +802,16 @@ impl GroupChannel {
     /// truthful by construction. A `+atomic:false` group's non-atomic reads
     /// remain reachable only through GET's `read_group_atomic(false)`.
     pub(crate) async fn read_group(&self) -> BridgeResult<PvStructure> {
-        self.read_group_atomic(self.is_monitor() || self.def.atomic)
+        self.read_group_logged(None).await
+    }
+
+    /// [`Self::read_group`] for a value event of member `log.0`, whose leaf
+    /// is served from the event's log.
+    pub(crate) async fn read_group_logged(
+        &self,
+        log: Option<(usize, &MonitorEvent)>,
+    ) -> BridgeResult<PvStructure> {
+        self.read_group_with(self.is_monitor() || self.def.atomic, log)
             .await
     }
 
@@ -860,7 +834,16 @@ impl GroupChannel {
     /// the group default. Used by `Channel::get` when the operation
     /// pvRequest carries `record._options.atomic`.
     pub(crate) async fn read_group_atomic(&self, atomic: bool) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name).await {
+        self.read_group_with(atomic, None).await
+    }
+
+    async fn read_group_with(
+        &self,
+        atomic: bool,
+        log: Option<(usize, &MonitorEvent)>,
+    ) -> BridgeResult<PvStructure> {
+        let log_of = |idx: usize| log.filter(|(at, _)| *at == idx).map(|(_, ev)| ev);
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -931,11 +914,11 @@ impl GroupChannel {
             // can still take its link target's lock). Once the guards below
             // exist, no member may reach for a second record's lock.
             let member_backings: HashMap<
-                &str,
+                &[u8],
                 std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
             > = member_guards
                 .iter()
-                .map(|(name, rec)| (name.as_str(), self.db.resolve_link_backed_metadata(rec)))
+                .map(|(name, rec)| (&name[..], self.db.resolve_link_backed_metadata(rec)))
                 .collect();
 
             // Acquire every backing record's read guard synchronously, in the
@@ -944,15 +927,15 @@ impl GroupChannel {
             // out of its write guard for this window, so this acquisition is
             // uncontended and deadlock-free; the guards are consumed synchronously
             // by `read_member_locked` below and never held across an await.
-            let guards: Vec<(&str, epics_base_rs::server::record::RecordRef<'_>)> = member_guards
+            let guards: Vec<(&[u8], epics_base_rs::server::record::RecordRef<'_>)> = member_guards
                 .iter()
-                .map(|(name, rec)| (name.as_str(), rec.read()))
+                .map(|(name, rec)| (&name[..], rec.read()))
                 .collect();
             // Build a name→guard lookup so each member resolves
             // against the already-held guard for its backing record.
-            let guard_map: HashMap<&str, &epics_base_rs::server::record::RecordInstance> =
+            let guard_map: HashMap<&[u8], &epics_base_rs::server::record::RecordInstance> =
                 guards.iter().map(|(name, g)| (*name, &**g)).collect();
-            for member in self.def.channels.iter() {
+            for (idx, member) in self.def.channels.iter().enumerate() {
                 // Only `proc` places no value field. A `+type:"structure"`
                 // member emits an empty struct branch (resolved by
                 // read_member -> read_member_channelless), matching the
@@ -963,11 +946,12 @@ impl GroupChannel {
                 if member.def.mapping == FieldMapping::Proc {
                     continue;
                 }
-                let field = self.read_member_locked(member, &guard_map, &member_backings)?;
+                let field =
+                    self.read_member_locked(member, &guard_map, &member_backings, log_of(idx))?;
                 set_member_field(&mut pv, &member.def, field);
             }
         } else {
-            for member in self.def.channels.iter() {
+            for (idx, member) in self.def.channels.iter().enumerate() {
                 // Only `proc` places no value field. A `+type:"structure"`
                 // member emits an empty struct branch (resolved by
                 // read_member -> read_member_channelless), matching the
@@ -978,7 +962,7 @@ impl GroupChannel {
                 if member.def.mapping == FieldMapping::Proc {
                     continue;
                 }
-                let field = self.read_member(member).await?;
+                let field = self.read_member(member, log_of(idx)).await?;
                 set_member_field(&mut pv, &member.def, field);
             }
         }
@@ -1024,17 +1008,20 @@ impl GroupChannel {
     /// itself (no pre-held guard exists). The atomic path MUST use
     /// [`Self::read_member_locked`] instead — see the deadlock note
     /// in `read_group`.
-    async fn read_member(&self, member: &MemberChannel) -> BridgeResult<PvField> {
+    async fn read_member(
+        &self,
+        member: &MemberChannel,
+        log: Option<&MonitorEvent>,
+    ) -> BridgeResult<PvField> {
         if let Some(field) = Self::read_member_channelless(member) {
             return Ok(field);
         }
 
         let (record_name, field_name) = member.names();
 
-        let rec = self
-            .db
-            .get_record(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let rec = self.db.get_record(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
 
         // Resolved before the record's own guard: a link-backed member
         // (`CALC.A`) answers its units/precision from the LINK TARGET's
@@ -1043,7 +1030,7 @@ impl GroupChannel {
         let backing = epics_base_rs::server::database::LinkBacking::resolved(&backing);
 
         let instance = rec.read();
-        Self::decode_member(member, record_name, field_name, &instance, backing)
+        Self::decode_member(member, record_name, field_name, &instance, backing, log)
     }
 
     /// Read a single member's value against a record instance that the
@@ -1053,11 +1040,12 @@ impl GroupChannel {
     fn read_member_locked(
         &self,
         member: &MemberChannel,
-        guard_map: &HashMap<&str, &epics_base_rs::server::record::RecordInstance>,
+        guard_map: &HashMap<&[u8], &epics_base_rs::server::record::RecordInstance>,
         backings: &HashMap<
-            &str,
+            &[u8],
             std::collections::HashMap<String, epics_base_rs::server::database::LinkMetadata>,
         >,
+        log: Option<&MonitorEvent>,
     ) -> BridgeResult<PvField> {
         if let Some(field) = Self::read_member_channelless(member) {
             return Ok(field);
@@ -1065,9 +1053,9 @@ impl GroupChannel {
 
         let (record_name, field_name) = member.names();
 
-        let instance = *guard_map
-            .get(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let instance = *guard_map.get(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
         // Resolved by the caller before it took any member guard — the atomic
         // path holds every member's read guard at once, so nothing here may
         // reach for a link target's lock.
@@ -1075,60 +1063,40 @@ impl GroupChannel {
             .get(record_name)
             .map(epics_base_rs::server::database::LinkBacking::resolved)
             .unwrap_or_else(epics_base_rs::server::database::LinkBacking::none);
-        Self::decode_member(member, record_name, field_name, instance, backing)
+        Self::decode_member(member, record_name, field_name, instance, backing, log)
     }
 
     /// Decode one member's value from an already-borrowed record
     /// instance. Shared by the locked (atomic) and self-locking
     /// (non-atomic) read paths so both produce identical output.
-    /// Run the member's VALUE-channel filter chain in READ context.
     ///
     /// pvxs reads a group member through `dbChannelGet` on that member's own
     /// `dbChannel` (`iocsource.cpp:79,127,175,268` under `IOCSource::get`),
     /// so `arr` slicing and `ts` tagging reach a group GET exactly as they
-    /// reach a single-record one.
-    ///
-    /// A chain that DROPS the read yields the unfiltered value, not an
-    /// error. C builds a read log with a zero `mask`
-    /// (`db_create_read_log` → `db_create_field_log`'s `freeListCalloc`,
-    /// `dbEvent.c:702,760-770`), so a value-gating filter's
-    /// `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)` starts at 0 and
-    /// `recGblCheckDeadband`'s zero `add_mask` can never raise it
-    /// (`filters/dbnd.c:83-88`) — the log is deleted and `NULL` reaches
-    /// `IOCSource::get`. pvxs passes that `NULL` straight into
-    /// `dbChannelGet` (`iocsource.cpp:79`, `localfieldlog.cpp:15-27`),
-    /// which then reads the live record (`dbAccess.c:924-930`). So a
-    /// `{"dbnd":…}` member serves every GET; only the event stream is
-    /// gated.
-    fn filter_read_value(
-        member: &MemberChannel,
-        value: epics_base_rs::types::EpicsValue,
-    ) -> epics_base_rs::types::EpicsValue {
-        if member.value_filters.is_empty() {
-            return value;
-        }
-        member
-            .value_filters
-            .apply_to_read_value(value.clone())
-            .unwrap_or(value)
-    }
-
+    /// reach a single-record one: every value comes through
+    /// [`MemberChannel::read_with`] or [`MemberChannel::snapshot_in`], or for
+    /// the member a value event `log` came from, from that log.
     fn decode_member(
         member: &MemberChannel,
-        record_name: &str,
+        record_name: &[u8],
         field_name: &str,
         instance: &epics_base_rs::server::record::RecordInstance,
         backing: epics_base_rs::server::database::LinkBacking<'_>,
+        log: Option<&MonitorEvent>,
     ) -> BridgeResult<PvField> {
         match member.def.mapping {
             FieldMapping::Scalar => {
-                let mut snapshot = member.snapshot_in(instance, backing).ok_or_else(|| {
-                    BridgeError::FieldNotFound {
-                        record: record_name.to_string(),
-                        field: field_name.to_string(),
-                    }
-                })?;
-                snapshot.value = Self::filter_read_value(member, snapshot.value);
+                let not_found = || BridgeError::FieldNotFound {
+                    record: String::from_utf8_lossy(record_name).into_owned(),
+                    field: field_name.to_string(),
+                };
+                let view = member.view_in(instance).ok_or_else(not_found)?;
+                let mut snapshot = member
+                    .snapshot_in(instance, view, backing)
+                    .ok_or_else(not_found)?;
+                if let Some(log) = log {
+                    member.write_log_over(&mut snapshot, log, instance, view);
+                }
                 // Derive the NT shape from the configured field's resolved
                 // value (record → common → virtual), not from the owning
                 // record type: a `REC.SCAN` member is NTEnum and a
@@ -1138,20 +1106,21 @@ impl GroupChannel {
                 // enum choices (e.g. `.SCAN`). Matches the single-record
                 // path and pvxs's per-channel `getChannelValueType`
                 // (groupconfigprocessor.cpp:960-974).
-                let nt_type = member.nt_type_in(instance, Some(&snapshot.value));
+                let nt_type = member.nt_type_in(instance, Some(&snapshot.value), view);
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
             }
             FieldMapping::Plain => {
-                let value =
-                    member
-                        .value_in(instance)
-                        .ok_or_else(|| BridgeError::FieldNotFound {
-                            record: record_name.to_string(),
-                            field: field_name.to_string(),
-                        })?;
-                let value = Self::filter_read_value(member, value);
+                let not_found = || BridgeError::FieldNotFound {
+                    record: String::from_utf8_lossy(record_name).into_owned(),
+                    field: field_name.to_string(),
+                };
+                let view = member.view_in(instance).ok_or_else(not_found)?;
+                let value = log
+                    .and_then(|log| member.log_value(log, view))
+                    .or_else(|| member.read_with(instance, view))
+                    .ok_or_else(not_found)?;
                 // The bare leaf renders through the same classifier the
                 // introspection uses, so the value can never be a shape the
                 // advertised descriptor does not describe (R18-26: a
@@ -1162,17 +1131,25 @@ impl GroupChannel {
                     &member.field,
                     Some(&value),
                     value.db_field_type(),
-                    member.string_view,
+                    view,
+                    &member.value_filters,
                 )
                 .value(&value))
             }
             FieldMapping::Meta => {
-                let snapshot = member.snapshot_in(instance, backing).ok_or_else(|| {
-                    BridgeError::FieldNotFound {
-                        record: record_name.to_string(),
+                let snapshot = member
+                    .view_in(instance)
+                    .and_then(|view| {
+                        let mut snapshot = member.snapshot_in(instance, view, backing)?;
+                        if let Some(log) = log {
+                            member.write_log_over(&mut snapshot, log, instance, view);
+                        }
+                        Some(snapshot)
+                    })
+                    .ok_or_else(|| BridgeError::FieldNotFound {
+                        record: String::from_utf8_lossy(record_name).into_owned(),
                         field: field_name.to_string(),
-                    }
-                })?;
+                    })?;
                 // Same unnamed enclosing structure the descriptor
                 // advertises (see `meta_desc`), so the two cannot drift.
                 let mut meta = PvStructure::new("");
@@ -1187,14 +1164,16 @@ impl GroupChannel {
                 Ok(PvField::Structure(meta))
             }
             FieldMapping::Any => {
-                let value =
-                    member
-                        .value_in(instance)
-                        .ok_or_else(|| BridgeError::FieldNotFound {
-                            record: record_name.to_string(),
-                            field: field_name.to_string(),
-                        })?;
-                let value = Self::filter_read_value(member, value);
+                let value = member
+                    .view_in(instance)
+                    .and_then(|view| {
+                        log.and_then(|log| member.log_value(log, view))
+                            .or_else(|| member.read_with(instance, view))
+                    })
+                    .ok_or_else(|| BridgeError::FieldNotFound {
+                        record: String::from_utf8_lossy(record_name).into_owned(),
+                        field: field_name.to_string(),
+                    })?;
                 // pvxs serves `+type:"any"` as a PVA `any` slot whose
                 // payload carries the concrete DB field type: `IOCSource::
                 // get` allocates `anyType.cloneEmpty()` and writes the
@@ -1208,8 +1187,13 @@ impl GroupChannel {
                 // asked of the classifier rather than read off the stored
                 // variant — a one-element array field's `any` payload is a
                 // scalar, exactly as its plain and scalar members are.
-                let pv = pvif::BareLeaf::any_payload_of_channel(instance, &member.field, &value)
-                    .value(&value);
+                let pv = pvif::BareLeaf::any_payload_of_channel(
+                    instance,
+                    &member.field,
+                    &value,
+                    &member.value_filters,
+                )
+                .value(&value);
                 let desc = pv.wire_descriptor();
                 Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }
@@ -1234,21 +1218,29 @@ impl GroupChannel {
         &self,
         member: &MemberChannel,
     ) -> BridgeResult<(NtType, ScalarType)> {
-        let record_name = member.record.as_str();
+        let record_name = &member.record[..];
 
-        let rec = self
-            .db
-            .get_record(record_name)
-            .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
+        let rec = self.db.get_record(record_name).ok_or_else(|| {
+            BridgeError::RecordNotFound(String::from_utf8_lossy(record_name).into_owned())
+        })?;
 
         let instance = rec.read();
-        let resolved = member.value_in(&instance);
-        let nt_type = member.nt_type_in(&instance, resolved.as_ref());
-        let value_dbf = resolved
-            .as_ref()
-            .map(|v| v.db_field_type())
-            .or_else(|| instance.declared_field_type(&member.field))
-            .unwrap_or(DbFieldType::Double);
+        // A member whose `$` is refused never passes group creation.
+        let view = member
+            .view_in(&instance)
+            .ok_or_else(|| BridgeError::FieldNotFound {
+                record: String::from_utf8_lossy(record_name).into_owned(),
+                field: member.field.clone(),
+            })?;
+        let resolved = member.value_with(&instance, view);
+        let nt_type = member.nt_type_in(&instance, resolved.as_ref(), view);
+        let value_dbf = member.value_filters.final_field_type(
+            resolved
+                .as_ref()
+                .map(|v| v.db_field_type())
+                .or_else(|| instance.declared_field_type(&member.field))
+                .unwrap_or(DbFieldType::Double),
+        );
 
         Ok((nt_type, dbf_to_scalar_type(value_dbf)))
     }
@@ -1295,7 +1287,7 @@ impl GroupChannel {
             return false;
         }
         // Through the shared classifier so the put gate and the group
-        // CREATION gate (`BridgeProvider::group_creation_error`) answer
+        // CREATION gate (`BridgeProvider::group_creation_errors`) answer
         // "is this a link field" from one table.
         super::channel::channel_link_class(&self.db, member).is_some()
     }
@@ -1384,6 +1376,13 @@ impl GroupChannel {
         // `IOCSource::put` does; the incoming node's own shape never
         // decides this.
         let pv_field = Self::put_leaf(member.def.mapping, pv_field)?;
+        if member.string_view {
+            // `dbPut(DBR_CHAR)` through the char address, as the
+            // single-record `$` channel puts.
+            return epics_base_rs::server::database::char_view::pva_char_request(
+                &crate::convert::pv_field_to_epics(pv_field)?,
+            );
+        }
         match pv_field {
             // A string into a `DBF_CHAR` array member is pvxs's
             // `putLongString`: `dbPut(DBR_CHAR, str, strlen+1)`, the same
@@ -1439,7 +1438,7 @@ impl GroupChannel {
     /// which pvxs leaves on `forceProcessing`.
     fn member_process_it(
         &self,
-        record_name: &str,
+        record_name: &[u8],
         field_name: &str,
         mapping: FieldMapping,
         process: super::channel::ProcessMode,
@@ -1463,9 +1462,9 @@ impl GroupChannel {
     }
 
     /// [`Self::member_process_it`], applied — the atomic-PUT entry. This
-    /// transaction already owns every member-record gate via `lock_records`
-    /// (the gate is not reentrant), so the transition below MUST use
-    /// the `_already_locked` entry. Synchronous: after H6,
+    /// transaction already owns every member-record gate via `lock_records`,
+    /// so the transition below MUST use the `_already_locked` entry, which
+    /// runs under that hold instead of taking and settling its own. Synchronous: after H6,
     /// `put_driven_process_already_locked` is a plain `fn`, so this reaches
     /// the end of the atomic PUT's
     /// `lock_records` window with zero `.await`s (§1.1 H9, §5 step 6).
@@ -1543,19 +1542,25 @@ impl GroupChannel {
     /// here). The member `grant` gates emission; `dbr_type` is the value's
     /// final field type — `convert_member_value` already typed it to the
     /// member DBF.
-    fn apply_member_value_already_locked(
+    ///
+    /// The member's put goes through `puts`, which settles it once the
+    /// caller's gate drops.
+    fn apply_member_value_already_locked<'m, 'h>(
         &self,
-        record_name: &str,
-        field_name: &str,
+        record: epics_base_rs::server::database::LockedRecord<'m, 'h>,
+        member: &'m MemberChannel,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         grant: super::provider::WriteGrant,
+        puts: &mut epics_base_rs::server::database::HeldPuts<'m, 'h>,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
-        let pv_name = format!("{record_name}.{field_name}");
+        let (record_name, field_name) = member.names();
+        let pv_name = [record_name, b".", field_name.as_bytes()].concat();
+        let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
             pv_name: &pv_name,
-            user: &self.access.creds.user,
+            user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
@@ -1567,8 +1572,7 @@ impl GroupChannel {
             let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
             match process {
                 ProcessMode::Inhibit => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    puts.put_pv(record, field_name, value).map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
                     // Group member puts never await completion — use the
@@ -1576,19 +1580,13 @@ impl GroupChannel {
                     // parked on the member record (a dropped receiver
                     // would occupy its notify slot until async
                     // processing settles).
-                    self.db
-                        .put_record_field_from_ca_no_notify_already_locked(
-                            record_name,
-                            field_name,
-                            value,
-                        )
+                    puts.put_record_field_from_ca_no_notify(record, field_name, value)
                         .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
-                    let pv = format!("{record_name}.{field_name}");
                     // Any PACT park this put releases replays on the cycle two
                     // lines down, from its tail — C's only restart owner.
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    puts.put_pv(record, field_name, value).map_err(to_err)?;
                     let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited)
@@ -1605,17 +1603,19 @@ impl GroupChannel {
     /// awaits it.
     async fn apply_member_value(
         &self,
-        record_name: &str,
-        field_name: &str,
+        member: &MemberChannel,
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         grant: super::provider::WriteGrant,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
-        let pv_name = format!("{record_name}.{field_name}");
+        let (record_name, field_name) = member.names();
+        let pv_name = [record_name, b".", field_name.as_bytes()].concat();
+        let pv_name = &pv_name[..];
+        let field_name = member.put_field();
         let meta = super::trap_write::TrapWriteMeta {
-            pv_name: &pv_name,
-            user: &self.access.creds.user,
+            pv_name,
+            user: self.access.creds.user.as_bytes(),
             host: &self.access.creds.host,
             peer: &self.access.creds.host,
             dbr_type: value.dbr_type() as u16,
@@ -1624,8 +1624,7 @@ impl GroupChannel {
             let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
             match process {
                 ProcessMode::Inhibit => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
+                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
                     self.db
@@ -1634,8 +1633,7 @@ impl GroupChannel {
                         .map_err(to_err)?;
                 }
                 ProcessMode::Force => {
-                    let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv(&pv, value).await.map_err(to_err)?;
+                    self.db.put_pv(pv_name, value).await.map_err(to_err)?;
                     let mut visited = epics_base_rs::server::database::ProcStack::new();
                     self.db
                         .process_record_with_links(record_name, &mut visited)
@@ -1674,7 +1672,7 @@ impl GroupChannel {
         atomic_override: Option<bool>,
         log: &RemoteLog,
     ) -> BridgeResult<()> {
-        if !self.access.can_write(&self.def.name).await {
+        if !self.access.can_write(self.def.name.as_bytes()).await {
             // Group-level ACF gate (the per-member gate below mirrors pvxs's
             // per-field SecurityClient). Both are write-ACF denials, so both
             // carry pvxs's `doFieldPreProcessing` text (iocsource.cpp:385).
@@ -1797,7 +1795,9 @@ impl GroupChannel {
             {
                 return Err(super::put_status::links_not_supported(&format!(
                     "group {} PUT: member '{}' targets link field '{}'",
-                    self.def.name, m.def.field_name, m.def.channel
+                    self.def.name,
+                    m.def.field_name,
+                    String::from_utf8_lossy(&m.def.channel)
                 )));
             }
         }
@@ -1850,7 +1850,7 @@ impl GroupChannel {
                      user='{}' host='{}' (per-member ACF)",
                     self.def.name,
                     m.def.field_name,
-                    m.def.channel,
+                    String::from_utf8_lossy(&m.def.channel),
                     self.access.creds.user,
                     self.access.creds.host
                 )));
@@ -1894,10 +1894,13 @@ impl GroupChannel {
             // callees (`member_is_char_array`, `member_dbf_type`) do not
             // await anything, so this whole phase runs, and can fail,
             // before any member-record gate is even requested.
+            // A written member carries its record's index in `member_records`,
+            // resolved here because the alias lookup may not run under the hold.
+            let member_records = group_member_record_names(&self.db, &self.def.channels);
             let mut writes: Vec<(
                 &MemberChannel,
                 MemberPutAction,
-                Option<epics_base_rs::types::EpicsValue>,
+                Option<(usize, epics_base_rs::types::EpicsValue)>,
             )> = Vec::new();
 
             for member in &ordered {
@@ -1922,13 +1925,22 @@ impl GroupChannel {
                         // the all-or-nothing guarantee holds.
                         let pv_field = get_nested_field(value, &member.def.field_name)
                             .expect("classifier returned Write only for a supplied field");
+                        let canonical = self
+                            .db
+                            .resolve_alias(&member.record)
+                            .unwrap_or_else(|| member.record.clone());
+                        let slot = member_records
+                            .binary_search(&canonical)
+                            .expect("group_member_record_names lists every channel's record");
                         match self.convert_member_value(member, &pv_field) {
-                            Some(v) => Some(v),
+                            Some(v) => Some((slot, v)),
                             None => {
                                 return Err(BridgeError::PutRejected(format!(
                                     "group {} PUT: member '{}' value is not convertible \
                                      to backing field '{}'",
-                                    self.def.name, member.def.field_name, member.def.channel
+                                    self.def.name,
+                                    member.def.field_name,
+                                    String::from_utf8_lossy(&member.def.channel)
                                 )));
                             }
                         }
@@ -1958,52 +1970,61 @@ impl GroupChannel {
             // `atomic_write_lock`-only design left open.
             //
             // The member writes below MUST use the `_already_locked`
-            // helper variants: this transaction already owns every
-            // member-record gate, and the per-record gate is
-            // not reentrant. From here to the end of this block is
-            // synchronous — zero `.await`s reached while `_many_guard`
-            // is held.
-            let member_records = group_member_record_names(&self.db, &self.def.channels);
-            let _many_guard = self.db.lock_records(&member_records);
-
-            for (member, action, val) in writes {
-                let (record_name, field_name) = member.names();
-
-                match action {
-                    MemberPutAction::ProcessOnly { .. } => {
-                        // pvxs skips `IOCSource::put` for this member and goes
-                        // straight to `doPostProcessing` (groupsource.cpp:568),
-                        // which decides whether the record actually processes.
-                        // The gate lives in one owner — never inline here.
-                        self.post_process_member_already_locked(member, opts.process)?;
+            // helper variants: the gate re-enters on this thread, but only
+            // they defer each put's settle until the whole set drops.
+            // From here to the end of this block is
+            // synchronous — zero `.await`s reached while the member
+            // gates are held.
+            // The database holds every member gate across the closure and
+            // settles each member put once they drop.
+            let applied = self.db.put_many_locked(
+                &member_records,
+                writes.len(),
+                |puts| -> BridgeResult<()> {
+                    for (member, action, val) in writes {
+                        match action {
+                            MemberPutAction::ProcessOnly { .. } => {
+                                // pvxs skips `IOCSource::put` for this member and goes
+                                // straight to `doPostProcessing` (groupsource.cpp:568),
+                                // which decides whether the record actually processes.
+                                // The gate lives in one owner — never inline here.
+                                self.post_process_member_already_locked(member, opts.process)?;
+                            }
+                            MemberPutAction::Write => {
+                                // `_already_locked` — this atomic PUT owns every
+                                // member-record gate via `lock_records`. The member's
+                                // trap grant (resolved in the per-member ACF pass)
+                                // gates `asTrapWrite` emission for this write.
+                                let (slot, epics_val) = val
+                                    .expect("classifier returned Write, so a value was converted");
+                                let record = puts
+                                    .record(slot)
+                                    .expect("slot indexes member_records, the locked set");
+                                self.apply_member_value_already_locked(
+                                    record,
+                                    member,
+                                    epics_val,
+                                    opts.process,
+                                    member_grants
+                                        .get(member.def.field_name.as_str())
+                                        .copied()
+                                        .unwrap_or_default(),
+                                    puts,
+                                )?;
+                            }
+                            MemberPutAction::Skip => continue,
+                        }
+                        // pvxs sets `didSomething` from `putGroupField` RETURNING true
+                        // — `changing || type==Proc` (groupsource.cpp:568-571) — not
+                        // from a write having landed or doPostProcessing's gate having
+                        // fired. A participating member that wrote nothing still keeps
+                        // the PUT out of "No fields changed".
+                        did_something = true;
                     }
-                    MemberPutAction::Write => {
-                        // `_already_locked` — this atomic PUT owns every
-                        // member-record gate via `lock_records`. The member's
-                        // trap grant (resolved in the per-member ACF pass)
-                        // gates `asTrapWrite` emission for this write.
-                        let epics_val =
-                            val.expect("classifier returned Write, so a value was converted");
-                        self.apply_member_value_already_locked(
-                            record_name,
-                            field_name,
-                            epics_val,
-                            opts.process,
-                            member_grants
-                                .get(member.def.field_name.as_str())
-                                .copied()
-                                .unwrap_or_default(),
-                        )?;
-                    }
-                    MemberPutAction::Skip => continue,
-                }
-                // pvxs sets `didSomething` from `putGroupField` RETURNING true
-                // — `changing || type==Proc` (groupsource.cpp:568-571) — not
-                // from a write having landed or doPostProcessing's gate having
-                // fired. A participating member that wrote nothing still keeps
-                // the PUT out of "No fields changed".
-                did_something = true;
-            }
+                    Ok(())
+                },
+            );
+            applied?;
         } else {
             // Non-atomic put: write each member individually.
             // IMPORTANT: Proc members are checked BEFORE the request-field
@@ -2011,8 +2032,6 @@ impl GroupChannel {
             // must run regardless of whether the request contains that field
             // (matches C++ pdbgroup.cpp:300+ allowProc semantics).
             for member in ordered {
-                let (record_name, field_name) = member.names();
-
                 // Same classifier as the atomic loop, same three outcomes.
                 let action = classify(member);
                 match action {
@@ -2045,7 +2064,9 @@ impl GroupChannel {
                                 return Err(BridgeError::PutRejected(format!(
                                     "group {} PUT: member '{}' value is not convertible \
                                      to backing field '{}'",
-                                    self.def.name, member.def.field_name, member.def.channel
+                                    self.def.name,
+                                    member.def.field_name,
+                                    String::from_utf8_lossy(&member.def.channel)
                                 )));
                             }
                         };
@@ -2054,8 +2075,7 @@ impl GroupChannel {
                         // The member's trap grant (resolved in the per-member
                         // ACF pass) gates `asTrapWrite` emission for this write.
                         self.apply_member_value(
-                            record_name,
-                            field_name,
+                            member,
                             epics_val,
                             opts.process,
                             member_grants
@@ -2094,12 +2114,12 @@ impl GroupChannel {
 }
 
 impl super::provider::Channel for GroupChannel {
-    fn channel_name(&self) -> &str {
-        &self.def.name
+    fn channel_name(&self) -> &[u8] {
+        self.def.name.as_bytes()
     }
 
     async fn get(&self, request: &PvStructure) -> BridgeResult<PvStructure> {
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -2140,7 +2160,7 @@ impl super::provider::Channel for GroupChannel {
                     let sid = member.def.struct_id.as_deref().unwrap_or("");
                     FieldDesc::Structure {
                         struct_id: sid.into(),
-                        fields: Vec::new(),
+                        fields: Vec::new().into(),
                     }
                 }
                 FieldMapping::Const => {
@@ -2207,7 +2227,7 @@ impl super::provider::Channel for GroupChannel {
         // `hoist_record_member` owns.
         hoist_record_member(&mut fields, || FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         });
         set_nested_field_desc(
             &mut fields,
@@ -2217,24 +2237,25 @@ impl super::provider::Channel for GroupChannel {
 
         Ok(FieldDesc::Structure {
             struct_id: struct_id.into(),
-            fields,
+            fields: fields.into(),
         })
     }
+}
 
-    async fn create_monitor(&self) -> BridgeResult<AnyMonitor> {
+impl GroupChannel {
+    /// Create a monitor for this group.
+    pub async fn create_monitor(&self) -> BridgeResult<GroupMonitor> {
         // Read enforcement: deny monitor creation when the client lacks
         // read access. start() also re-checks defensively.
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor create denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
             )));
         }
-        Ok(AnyMonitor::Group(Box::new(
-            GroupMonitor::new(self.db.clone(), self.def.clone())
-                .with_access(self.access.clone())
-                .with_pump(self.pump.clone()),
-        )))
+        Ok(GroupMonitor::new(self.db.clone(), self.def.clone())
+            .with_access(self.access.clone())
+            .with_pump(self.pump.clone()))
     }
 }
 
@@ -2246,53 +2267,47 @@ impl super::provider::Channel for GroupChannel {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MemberEventKind {
     /// Value or alarm change (DBE_VALUE | DBE_ALARM).
-    Value,
+    Value = 0,
     /// Property change — display limits, enum choices, etc. (DBE_PROPERTY).
-    Property,
+    Property = 1,
 }
 
 /// A PVA monitor for a group PV that subscribes to all member records.
 ///
 /// Corresponds to C++ QSRV's `PDBGroupMonitor` + `pdb_group_event()`.
-/// `PvaMonitor::start` opens the member subscriptions and registers them
-/// with the server-wide `group_pump::GroupPump` — the
-/// port of pvxs's single `qsrvGroup` event pump (`ioc/groupsource.cpp:96`).
-/// The pump is the only consumer of member events: it resolves the marked
-/// leaves, assembles the atomic snapshot and posts the assembled update
-/// into this monitor's bounded update queue, which `PvaMonitor::poll`
-/// drains. No per-member task exists anywhere — the task cost of a group
-/// tick is O(1), not O(members).
+/// `PvaMonitor::start` attaches the member subscriptions to the
+/// server-wide `group_pump::GroupPump` — the port of pvxs's single
+/// `qsrvGroup` event pump (`ioc/groupsource.cpp:96`). The pump's drain is
+/// the only consumer of member events: it resolves the marked leaves,
+/// assembles the atomic snapshot and posts the assembled update into this
+/// monitor's bounded update ring, which `PvaMonitor::poll` (or the PVA
+/// server, after `Self::take_updates`) reads. No per-member task exists
+/// anywhere — the task cost of a group tick is O(1), not O(members).
 pub struct GroupMonitor {
     db: Arc<PvDatabase>,
     def: GroupPvDef,
     running: bool,
     /// Reusable GroupChannel for the monitor-stamped `seed()` read. The
-    /// pump's registration carries a clone, so the seed and every drained
-    /// update share one stamping by construction.
+    /// drain's [`super::group_pump::GroupDelivery`] carries a clone, so the
+    /// seed and every drained update share one stamping by construction.
     group_channel: Option<GroupChannel>,
-    /// The server-wide drain this monitor registers with on `start()`.
+    /// The server-wide drain this monitor attaches to on `start()`.
     /// Injected by `GroupChannel::create_monitor` (the provider's shared
     /// pump); a directly-constructed monitor gets a private pump.
     pump: Arc<super::group_pump::GroupPump>,
-    /// This subscription's registration finalizer. `Some` ⟺ the pump is
-    /// draining this monitor's member subscriptions. Dropping it (in
-    /// [`super::provider::PvaMonitor::stop`] or on monitor drop) is THE teardown path: it
-    /// queues the pump's `Deregister`, which releases the member
-    /// `DbSubscription`s and this monitor's update-queue producer.
-    registration: Option<super::group_pump::RegistrationHandle>,
-    /// Consumer half of the pump→monitor update queue. `poll()` parks on
-    /// it; `None` from its `recv()` ⟺ the registration left the pump ⟺
-    /// teardown. Never "no member events left" — a quiet group parks
+    /// Every member subscription (value + PROPERTY) opened in
+    /// [`super::provider::PvaMonitor::start`]. Dropping them is THE
+    /// teardown path: it detaches the members from the pump.
+    members: Vec<DbAttachment>,
+    /// This subscription's state on the drain. Held here so the update
+    /// ring stays open while the monitor lives — a quiet group parks
     /// (pvxs keeps an all-const subscription open until the client
-    /// cancels, `groupsource.cpp:241-298`).
-    update_rx: Option<super::group_pump::UpdatePoller>,
-    /// Detachable enable/disable handles for every member `DbSubscription`
-    /// (value + PROPERTY) opened in [`super::provider::PvaMonitor::start`]. Collected before each
-    /// subscription is moved into the pump's registration so the per-op
-    /// MONITOR START/STOP gate can `db_event_disable`/`enable` the
-    /// whole group's upstream on a client STOP/RESUME — pvxs
-    /// `groupsource.cpp` `onStart` toggles every member `dbChannel`.
-    activation_handles: Vec<SubscriptionActivation>,
+    /// cancels, `groupsource.cpp:241-298`) — and ends once the monitor and
+    /// its members are gone.
+    delivery: Option<Arc<super::group_pump::GroupDelivery>>,
+    /// The ring the drain posts assembled updates into, until
+    /// [`Self::take_updates`] hands it to the PVA server.
+    updates: Option<MonitorRing<MonitorUpdate>>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
     /// The NEGOTIATED monitor queue limit the PVA server resolved for this
@@ -2326,9 +2341,9 @@ impl GroupMonitor {
             running: false,
             group_channel: None,
             pump: super::group_pump::GroupPump::new(),
-            registration: None,
-            update_rx: None,
-            activation_handles: Vec::new(),
+            members: Vec::new(),
+            delivery: None,
+            updates: None,
             access: super::provider::AccessContext::allow_all(),
             queue_limit: epics_pva_rs::server_native::source::DEFAULT_MONITOR_QUEUE_LIMIT,
         }
@@ -2365,7 +2380,18 @@ impl GroupMonitor {
     /// a client STOP suspends the whole group's upstream event flow.
     /// Empty before `start()`.
     pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
-        self.activation_handles.clone()
+        self.members
+            .iter()
+            .map(DbAttachment::activation_handle)
+            .collect()
+    }
+
+    /// The update ring, for a consumer that reads it in place of
+    /// [`super::provider::PvaMonitor::poll`]; `poll` returns `None` after.
+    /// The ring ends when this monitor is gone, so its reader must keep
+    /// the monitor alive.
+    pub(crate) fn take_updates(&mut self) -> Option<MonitorRing<MonitorUpdate>> {
+        self.updates.take()
     }
 
     /// Monitor-stamped seed snapshot for the MONITOR INIT DATA frame.
@@ -2558,7 +2584,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
 
         // Read enforcement: refuse to spin up upstream subscriptions
         // for a client that lacks read permission on this group.
-        if !self.access.can_read(&self.def.name).await {
+        if !self.access.can_read(self.def.name.as_bytes()).await {
             return Err(BridgeError::PutRejected(format!(
                 "monitor read denied for group {} (user='{}' host='{}')",
                 self.def.name, self.access.creds.user, self.access.creds.host
@@ -2578,13 +2604,36 @@ impl super::provider::PvaMonitor for GroupMonitor {
             props
         };
 
-        // Member subscriptions collect HERE and move into the pump's
-        // registration below — no task is spawned per member. The pump is
-        // the single consumer (pvxs's one `qsrvGroup` event thread,
-        // `ioc/groupsource.cpp:96`); member events queue in each
-        // subscription's own EvQue (C dbEvent ring, replace-in-place under
-        // pressure) until the drain takes them.
-        let mut member_subs: Vec<super::group_pump::MemberSub> = Vec::new();
+        // Create a reusable GroupChannel once (instead of per-event in the
+        // drain). Propagate the same access context so any subsequent reads
+        // triggered by trigger evaluation also honor read enforcement.
+        //
+        // The monitor stamp carries the per-operation negotiated queue limit,
+        // so every monitor value stamps `record._options.queueSize` with the
+        // depth the subscription actually got (pvxs `groupsource.cpp:404`
+        // `stats.limitQueue`). The drain's delivery clones this channel, so
+        // the seed and every drained update share one stamping by
+        // construction.
+        let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
+            .with_access(self.access.clone())
+            .with_monitor_stamp(self.queue_limit);
+
+        // The update ring's capacity is the negotiated queue limit; on
+        // overflow the newest update replaces the tail in place (C monitor
+        // latest-value coalescing). Built before the first member attaches,
+        // since an entry can reach the drain from then on.
+        let (updates, ring) = MonitorRing::bounded(self.queue_limit.max(1) as usize);
+        let delivery = Arc::new(super::group_pump::GroupDelivery::new(
+            self.def.clone(),
+            member_props,
+            group_channel.clone(),
+            updates,
+        ));
+
+        // Every member attaches to the pump's one `event_user` — no task is
+        // spawned per member. Its drain is the single consumer (pvxs's one
+        // `qsrvGroup` event thread, `ioc/groupsource.cpp:96`).
+        let mut members: Vec<DbAttachment> = Vec::new();
 
         // Subscribe to ALL members with channels, regardless of trigger
         // setting — pvxs subscribes every field with a dbChannel
@@ -2637,28 +2686,38 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // gates this member's events exactly as it gates a
             // single-record monitor's. Re-parsing the suffix here would
             // hand every resubscribe a fresh baseline and never filter.
-            if let Some(sub) = DbSubscription::subscribe_with_mask_and_filters(
+            // pvxs throws out of `onSubscribe` when a member's
+            // `db_add_event` fails (subscriptionctx.h:48): the whole group
+            // monitor fails, it does not open without that member.
+            let refused = |why| {
+                (why == SubscribeRefused::CapReached).then_some(BridgeError::SubscriptionFailed)
+            };
+            // The member's `$` render runs on its entries as on a
+            // single-record monitor's, so a value event's log is served as is.
+            let dollar = self
+                .db
+                .get_record(&member.record)
+                .and_then(|rec| member.view_in(&rec.read()))
+                .and_then(pvif::View::dollar);
+            match self.pump.attach(
                 &self.db,
                 &member.pv_name,
-                0,
                 value_mask,
-                Some(&member.value_filters),
-            )
-            .await
-            {
-                // Capture the enable/disable handle BEFORE the subscription
-                // moves into the pump's registration, so the per-op gate
-                // can toggle this member's event flow without owning the sub.
-                // The pump drains with `poll_recv_event` (not a snapshot
-                // read) so the per-event DBE mask reaches the mark
-                // resolution — pvxs reads `pDbFieldLog->mask` for the
-                // self-trigger narrowing.
-                self.activation_handles.push(sub.activation_handle());
-                member_subs.push(super::group_pump::MemberSub {
+                &member.value_filters,
+                dollar,
+                super::group_pump::MemberDelivery {
+                    group: delivery.clone(),
                     member_index: idx,
                     kind: MemberEventKind::Value,
-                    sub,
-                });
+                },
+            ) {
+                Ok(attached) => members.push(attached),
+                Err(why) => {
+                    if let Some(e) = refused(why) {
+                        return Err(e);
+                    }
+                    delivery.not_subscribed(idx, MemberEventKind::Value);
+                }
             }
 
             // Property subscription (DBE_PROPERTY) — only for Scalar/Meta
@@ -2674,60 +2733,33 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 let prop_mask = epics_base_rs::server::recgbl::EventMask::PROPERTY.bits();
                 // The property channel's INDEPENDENT chain — see
                 // `MemberChannel::property_filters`.
-                if let Some(sub) = DbSubscription::subscribe_with_mask_and_filters(
+                match self.pump.attach(
                     &self.db,
                     &member.pv_name,
-                    0,
                     prop_mask,
-                    Some(&member.property_filters),
-                )
-                .await
-                {
-                    self.activation_handles.push(sub.activation_handle());
-                    member_subs.push(super::group_pump::MemberSub {
+                    &member.property_filters,
+                    dollar,
+                    super::group_pump::MemberDelivery {
+                        group: delivery.clone(),
                         member_index: idx,
                         kind: MemberEventKind::Property,
-                        sub,
-                    });
+                    },
+                ) {
+                    Ok(attached) => members.push(attached),
+                    Err(why) => {
+                        if let Some(e) = refused(why) {
+                            return Err(e);
+                        }
+                        delivery.not_subscribed(idx, MemberEventKind::Property);
+                    }
                 }
             }
         }
 
-        // Create a reusable GroupChannel once (instead of per-event in the
-        // drain). Propagate the same access context so any subsequent reads
-        // triggered by trigger evaluation also honor read enforcement.
-        //
-        // The monitor stamp carries the per-operation negotiated queue limit,
-        // so every monitor value stamps `record._options.queueSize` with the
-        // depth the subscription actually got (pvxs `groupsource.cpp:404`
-        // `stats.limitQueue`). The pump's registration clones this channel,
-        // so the seed and every drained update share one stamping by
-        // construction.
-        let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
-            .with_access(self.access.clone())
-            .with_monitor_stamp(self.queue_limit);
-
-        // Register with the server-wide drain. The update queue's producer
-        // lives in the pump's registration for this monitor's whole
-        // subscribed life, so `poll()` *parks* on a quiet stream (all-const
-        // group, every member quiet) instead of reading end-of-stream —
-        // pvxs keeps an all-const subscription open until the client
-        // cancels (groupsource.cpp:241-298). Its capacity is the negotiated
-        // queue limit; on overflow the newest update replaces the tail in
-        // place (C monitor latest-value coalescing).
-        let (update_tx, update_rx) =
-            super::group_pump::update_queue(self.queue_limit.max(1) as usize);
-        let registration = self.pump.register(super::group_pump::RegistrationSpec {
-            def: self.def.clone(),
-            member_props,
-            group_channel: group_channel.clone(),
-            subs: member_subs,
-            update_tx,
-        });
-
         self.group_channel = Some(group_channel);
-        self.update_rx = Some(update_rx);
-        self.registration = Some(registration);
+        self.members = members;
+        self.delivery = Some(delivery);
+        self.updates = Some(ring);
         self.running = true;
         Ok(())
     }
@@ -2742,107 +2774,40 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // `read_group()` snapshot, enum-leaf narrowing, the skip on a
         // markless event or a per-event read failure (pvxs
         // `groupsource.cpp:350-352` parity) — happens in the server-wide
-        // drain (`group_pump::process_event`), which posts assembled
-        // updates into this monitor's bounded update queue. This method
-        // only parks on that queue.
+        // drain (`group_pump::MemberDelivery`), which posts assembled
+        // updates into this monitor's bounded update ring. This method
+        // only parks on that ring.
         //
-        // A quiet group (all-const, every member idle) parks here: the
-        // queue's producer lives in the pump's registration for the whole
-        // subscribed life, so `recv()` cannot read end-of-stream early —
-        // pvxs keeps an all-const subscription open until the client
-        // cancels (groupsource.cpp:241-298). `None` therefore means
-        // teardown (`stop()` cleared `update_rx`, or the registration left
-        // the pump) — never "no member events left to forward".
-        self.update_rx.as_mut()?.recv().await
+        // A quiet group (all-const, every member idle) parks here: this
+        // monitor holds the ring's producer for its whole subscribed life,
+        // so `recv()` cannot read end-of-stream early — pvxs keeps an
+        // all-const subscription open until the client cancels
+        // (groupsource.cpp:241-298). `None` therefore means teardown
+        // (`stop()` / `take_updates()`) — never "no member events left".
+        let update = self.updates.as_mut()?.recv().await?;
+        let PvField::Structure(value) = update.value.into_owned() else {
+            unreachable!("the group drain posts the group structure");
+        };
+        Some(super::provider::MonitorPoll {
+            value,
+            marked: update
+                .marked
+                .map(epics_pva_rs::server_native::Marks::into_vec),
+        })
     }
 
     async fn stop(&mut self) {
-        // The ONE teardown path. Dropping `update_rx` marks the consumer
-        // side closed (a drain push after this fails visibly and routes the
-        // registration out through the pump's removal path); dropping
-        // `registration` queues the pump's `Deregister` finalizer, which
-        // releases the member `DbSubscription`s and the update-queue
-        // producer — and terminates the drain task when this was the last
-        // group subscription. A later poll() sees `update_rx == None` and
-        // reports teardown.
-        self.update_rx = None;
-        self.registration = None;
+        // The ONE teardown path. Dropping the members detaches them from
+        // the pump — and ends its drain when they were the last attached —
+        // and dropping the delivery ends the ring once no member route
+        // holds it. A later poll() sees `updates == None` and reports
+        // teardown.
+        self.updates = None;
+        self.members.clear();
+        self.delivery = None;
 
         self.running = false;
         self.group_channel = None;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AnyMonitor
-// ---------------------------------------------------------------------------
-
-/// Enum dispatch for monitor types (single record vs group).
-pub enum AnyMonitor {
-    Single(Box<BridgeMonitor>),
-    Group(Box<GroupMonitor>),
-}
-
-impl AnyMonitor {
-    /// apply the per-operation negotiated monitor queue limit the PVA
-    /// server resolved (`MonitorOptions::queue_size`). Only a group monitor
-    /// stamps `record._options.queueSize` into its values — a single-record
-    /// monitor has no group-style `record._options` branch, so this is a
-    /// no-op for the `Single` variant.
-    pub fn with_queue_size(self, limit: u32) -> Self {
-        match self {
-            Self::Group(m) => Self::Group(Box::new(m.with_queue_size(limit))),
-            single => single,
-        }
-    }
-
-    /// Monitor-stamped seed snapshot for the MONITOR INIT DATA frame, or
-    /// `None` to fall back to the GET seed. Only a group monitor returns a
-    /// value: its initial frame must share the monitor `record._options`
-    /// stamping (`atomic = true`, negotiated `queueSize`) with its update
-    /// stream — see [`GroupMonitor::seed`] and pvxs `groupsource.cpp:401-405`
-    /// vs the GET path `:480-485`. A single-record monitor has no group-style
-    /// `record._options` branch, so its GET seed and monitor frames already
-    /// carry identical options; it returns `None` and the adapter keeps the
-    /// GET seed. Valid after [`super::provider::PvaMonitor::start`].
-    pub async fn seed(&self) -> Option<PvField> {
-        match self {
-            Self::Single(_) => None,
-            Self::Group(m) => m.seed().await.map(PvField::Structure),
-        }
-    }
-
-    /// Detachable enable/disable handles for this monitor's backing
-    /// `DbSubscription`s, for the per-op MONITOR START/STOP gate.
-    /// Valid after [`super::provider::PvaMonitor::start`].
-    pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
-        match self {
-            Self::Single(m) => m.activation_handles(),
-            Self::Group(m) => m.activation_handles(),
-        }
-    }
-}
-
-impl super::provider::PvaMonitor for AnyMonitor {
-    async fn poll(&mut self) -> Option<super::provider::MonitorPoll> {
-        match self {
-            Self::Single(m) => m.poll().await,
-            Self::Group(m) => m.poll().await,
-        }
-    }
-
-    async fn start(&mut self) -> BridgeResult<()> {
-        match self {
-            Self::Single(m) => m.start().await,
-            Self::Group(m) => m.start().await,
-        }
-    }
-
-    async fn stop(&mut self) {
-        match self {
-            Self::Single(m) => m.stop().await,
-            Self::Group(m) => m.stop().await,
-        }
     }
 }
 
@@ -2873,7 +2838,8 @@ fn meta_desc() -> FieldDesc {
                         ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
             (
@@ -2887,10 +2853,12 @@ fn meta_desc() -> FieldDesc {
                         ),
                         ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
                         ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-                    ],
+                    ]
+                    .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -2950,7 +2918,7 @@ fn pv_field_to_field_desc(field: &PvField) -> FieldDesc {
         | PvField::VariantArray(_)
         | PvField::Null => FieldDesc::Structure {
             struct_id: String::new(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
         },
     }
 }
@@ -2985,8 +2953,8 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
 /// Build a `timeStamp` PvStructure directly from the record snapshot.
 ///
 /// The nanosecond / userTag split for `info(Q:time:tag, "nsec:lsb:N")`
-/// is applied once, at the record level, when the snapshot is built
-/// (`epics_base_rs` `record_instance.rs` via `apply_nsec_mask`), so
+/// is applied once, when the member's snapshot is read
+/// (`MemberChannel::snapshot_in` via `apply_nsec_mask`), so
 /// `snapshot.timestamp` already carries the masked nanoseconds and
 /// `snapshot.user_tag` already carries the split bits / `common.utag`.
 /// The group encoder therefore serves them verbatim and must not remask
@@ -3031,7 +2999,7 @@ mod tests {
     /// through this helper keeps the C polarity in ONE place.
     async fn has_processed(db: &Arc<PvDatabase>, rec: &str) -> bool {
         use epics_base_rs::types::EpicsValue;
-        match db.get_pv(&format!("{rec}.INIT")).unwrap() {
+        match db.get_pv(format!("{rec}.INIT")).unwrap() {
             EpicsValue::Short(v) => v == 0,
             other => panic!("unexpected INIT type: {other:?}"),
         }
@@ -3066,7 +3034,7 @@ mod tests {
 
     /// a group `meta` timeStamp serves the record snapshot's userTag and
     /// nanoseconds verbatim. The `Q:time:tag` nsec-LSB split is applied
-    /// once at the record level (`record_instance.rs`
+    /// once, by the member read (`MemberChannel::snapshot_in`
     /// `apply_nsec_mask`), so the group encoder must not remask —
     /// pvxs derives the split from the record, never from group JSON
     /// (`ioc/iocsource.cpp:240-248`). `Snapshot.user_tag` defaults to the
@@ -3579,11 +3547,12 @@ mod tests {
                     "a".into(),
                     FieldDesc::StructureArray {
                         struct_id: "structure".into(),
-                        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+                        fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
                     },
                 ),
                 ("p".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         };
         let mask = BitSet::all_set(intro.total_bits());
         let changed = epics_pva_rs::pvdata::encode::marked_wire_changed_bitset(&intro, &v, &mask);
@@ -3857,6 +3826,52 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
+    fn nested_desc_rebuilds_every_ancestor_count() {
+        use epics_pva_rs::pvdata::ScalarType;
+
+        fn recount(d: &FieldDesc) -> usize {
+            match d {
+                FieldDesc::Structure { fields, .. } => {
+                    1 + fields.iter().map(|(_, c)| recount(c)).sum::<usize>()
+                }
+                _ => 1,
+            }
+        }
+        let mut fields: Vec<(String, FieldDesc)> = Vec::new();
+        for path in ["a.b.x", "a.b.y", "a.c", "s[0].p.q", "s[1].r"] {
+            set_nested_field_desc(&mut fields, path, FieldDesc::Scalar(ScalarType::Double));
+        }
+        let root = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: fields.into(),
+        };
+        fn walk(d: &FieldDesc, recount: fn(&FieldDesc) -> usize) {
+            assert_eq!(d.total_bits(), recount(d), "{d}");
+            if let FieldDesc::Structure { fields, .. } | FieldDesc::StructureArray { fields, .. } =
+                d
+            {
+                for (_, c) in fields {
+                    walk(c, recount);
+                }
+            }
+        }
+        walk(&root, recount);
+        // root, a, b, x, y, c, s (an array is one bit)
+        assert_eq!(root.total_bits(), 7);
+        let FieldDesc::Structure { fields, .. } = &root else {
+            unreachable!()
+        };
+        let FieldDesc::StructureArray { fields: elem, .. } = &fields[1].1 else {
+            panic!("s is not a structure array")
+        };
+        // element: p { q }, r
+        assert_eq!(
+            elem.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["p", "r"]
+        );
+    }
+
+    #[test]
     fn nested_desc_simple() {
         use epics_pva_rs::pvdata::ScalarType;
 
@@ -4060,7 +4075,7 @@ mod tests {
     impl ExternalLockHolder {
         /// Returns once the lock is genuinely held — no sleep-and-hope.
         fn take(
-            lock: Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+            lock: Arc<epics_base_rs::runtime::sync::UnlistedPriorityInheritanceMutex<()>>,
         ) -> ExternalLockHolder {
             let (release, release_rx) = std::sync::mpsc::channel();
             let (held, held_rx) = std::sync::mpsc::channel();
@@ -4620,8 +4635,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _: &str, _: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _: &[u8], _: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -4931,16 +4946,16 @@ mod tests {
         {
             let plain_inst = plain.read();
             assert!(
-                plain_inst.subscribers.contains_key("RVAL"),
+                plain_inst.has_subscriber("RVAL"),
                 "plain member must subscribe its configured field RVAL"
             );
             assert!(
-                !plain_inst.subscribers.contains_key("VAL"),
+                !plain_inst.has_subscriber("VAL"),
                 "plain member must NOT subscribe the record-default VAL"
             );
             // FR-7: a plain (non-meta) member has exactly one value
             // subscription (no property sub) with VALUE|ALARM|LOG.
-            let rval_subs = &plain_inst.subscribers["RVAL"];
+            let rval_subs: Vec<_> = plain_inst.subscribers_of("RVAL").collect();
             assert_eq!(
                 rval_subs.len(),
                 1,
@@ -4957,8 +4972,7 @@ mod tests {
         // PROPERTY subscription is retained on the same field.
         let meta = db.get_record("R:meta").unwrap();
         let meta_inst = meta.read();
-        let val_subs = &meta_inst.subscribers["VAL"];
-        let masks: Vec<u16> = val_subs.iter().map(|s| s.mask).collect();
+        let masks: Vec<u16> = meta_inst.subscribers_of("VAL").map(|s| s.mask).collect();
         assert!(
             masks.contains(&EventMask::ALARM.bits()),
             "meta value subscription must be ALARM-only, got {masks:?}"
@@ -5069,7 +5083,7 @@ mod tests {
         }
 
         // The drain must consume the event, hit the read failure, log+skip,
-        // and poll() must PARK on the still-open update queue — never
+        // and poll() must PARK on the still-open update ring — never
         // return `None` (FINISH). A bounded poll therefore TIMES OUT;
         // pre-fix it returned `None` (Some(None)) immediately.
         let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
@@ -5088,7 +5102,7 @@ mod tests {
     /// read from the GET path (`Channel::get` → GET-stamped `read_group`),
     /// which stamps the *operation* atomicity and `queueSize = 0`
     /// (`groupsource.cpp:480-485`), so the first frame disagreed with the
-    /// stream the client then received. `AnyMonitor::seed` reads through the
+    /// stream the client then received. `GroupMonitor::seed` reads through the
     /// monitor's own `group_channel`, so the seed and the deltas share one
     /// stamping by construction.
     #[tokio::test]
@@ -5136,16 +5150,12 @@ mod tests {
         // monitor stamp, so the initial frame must report atomic = true and
         // queueSize = 32 — matching the update stream poll() drains from the
         // same group_channel.
-        let mut mon = AnyMonitor::Group(Box::new(GroupMonitor::new(db.clone(), def.clone())))
-            .with_queue_size(32);
+        let mut mon = GroupMonitor::new(db.clone(), def.clone()).with_queue_size(32);
         mon.start().await.expect("group monitor starts");
         let seed = mon
             .seed()
             .await
             .expect("group monitor must expose a stamped seed");
-        let PvField::Structure(seed) = seed else {
-            panic!("group seed must be a structure: {seed:?}");
-        };
         let (seed_atomic, seed_queue) = read_options(&seed);
         assert!(
             seed_atomic,
@@ -5757,8 +5767,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _user: &[u8], _host: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -5841,8 +5851,8 @@ mod tests {
         struct DenyChannel(&'static str);
         #[async_trait::async_trait]
         impl AccessControl for DenyChannel {
-            async fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
-                channel != self.0
+            async fn can_write(&self, channel: &[u8], _user: &[u8], _host: &str) -> bool {
+                channel != self.0.as_bytes()
             }
         }
 
@@ -5993,7 +6003,7 @@ mod tests {
             .unwrap();
         // The member bound the suffix once, at `finalize()`.
         assert_eq!(def.channels.len(), 1);
-        assert_eq!(def.channels[0].names(), ("FLT:wf", "VAL"));
+        assert_eq!(def.channels[0].names(), (&b"FLT:wf"[..], "VAL"));
         assert_eq!(def.channels[0].value_filters.len(), 1);
 
         let channel = GroupChannel::new(db.clone(), def);
@@ -6008,25 +6018,14 @@ mod tests {
         }
     }
 
-    /// A `$` `+channel` is served, not refused: the group surface reaches
-    /// the same long-string view the single-record one does.
-    ///
-    /// pvxs has one getter for both surfaces — `groupsource.cpp:344,377` and
-    /// `singlesource.cpp:59,289` both call `IOCSource::get`, whose
-    /// `final_type == DBR_CHAR && value.type() == TypeCode::String` branch
-    /// (`iocsource.cpp:133-136`) collapses a char buffer to a NUL-terminated
-    /// string — this port hands a `$` member that leaf type for the
-    /// `DBF_STRING` half too, which pvxs does not
-    /// (`qsrv::pvif::nt_type_for_channel`). The port had the group path resolve the BARE
-    /// field name, which cannot see the view and therefore cannot apply the
-    /// eligibility test either, so the only safe thing left was to refuse
-    /// `$` at bind time — the parser accepted a name the decode path could
-    /// not serve. Asking the view is what restores both halves at once, and
-    /// both mappings are checked here because they render through different
-    /// builders (`snapshot_to_pv_structure` vs `BareLeaf`) with the NT owner
-    /// making them agree.
+    /// A `$` `+channel` is served, not refused, as the single-record channel
+    /// serves it: `softIocPVX` 1.5.3 serves a group's `DESC$` members as
+    /// `int8_t[]` (`d int8_t[] = {1}[0]` plain, `vs.value int8_t[]` inside an
+    /// `NTScalarArray` scalar) and a link's `$` as its text. Both mappings
+    /// are checked because they render through different builders
+    /// (`snapshot_to_pv_structure` vs `BareLeaf`).
     #[tokio::test]
-    async fn a_dollar_group_member_serves_the_long_string_view() {
+    async fn a_dollar_group_member_serves_what_softiocpvx_serves() {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
         use epics_pva_rs::ScalarValue;
@@ -6080,23 +6079,14 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
         let pv = channel.read_group().await.expect("`$` group GET");
 
+        let image = crate::convert::epics_to_pv_field(&EpicsValue::CharArray(
+            b"a description longer than a byte\0".to_vec().into(),
+        ));
         match get_nested_field(&pv, "d").as_deref() {
-            Some(PvField::Structure(nt)) => match nt.get_field("value") {
-                Some(PvField::Scalar(ScalarValue::String(v))) => {
-                    assert_eq!(v, "a description longer than a byte");
-                }
-                other => panic!("scalar `$` member must carry a string value, got {other:?}"),
-            },
-            other => panic!("member 'd' must be an NTScalar structure, got {other:?}"),
+            Some(PvField::Structure(nt)) => assert_eq!(nt.get_field("value"), Some(&image)),
+            other => panic!("member 'd' must be an NT structure, got {other:?}"),
         }
-        match get_nested_field(&pv, "p").as_deref() {
-            Some(PvField::Scalar(ScalarValue::String(v))) => {
-                assert_eq!(v, "a description longer than a byte");
-            }
-            other => panic!(
-                "plain `$` member must be a bare string leaf, not a byte array, got {other:?}"
-            ),
-        }
+        assert_eq!(get_nested_field(&pv, "p").as_deref(), Some(&image));
         assert_eq!(
             get_nested_field(&pv, "f").as_deref(),
             Some(&PvField::Scalar(ScalarValue::String("LS:other".into()))),
@@ -6121,18 +6111,16 @@ mod tests {
                 .1
         };
         match leaf("d") {
-            FieldDesc::Structure { fields, .. } => assert_eq!(
-                &fields.iter().find(|(n, _)| n == "value").unwrap().1,
-                &FieldDesc::Scalar(ScalarType::String),
-                "a scalar `$` member advertises an NTScalar string"
-            ),
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTScalarArray:1.0");
+                assert_eq!(
+                    &fields.iter().find(|(n, _)| n == "value").unwrap().1,
+                    &FieldDesc::ScalarArray(ScalarType::Byte),
+                );
+            }
             other => panic!("member 'd' descriptor must be an NT structure, got {other:?}"),
         }
-        assert_eq!(
-            leaf("p"),
-            &FieldDesc::Scalar(ScalarType::String),
-            "a plain `$` member advertises a bare string, not a byte array"
-        );
+        assert_eq!(leaf("p"), &FieldDesc::ScalarArray(ScalarType::Byte));
         assert_eq!(
             leaf("f"),
             &FieldDesc::Scalar(ScalarType::String),
@@ -6176,13 +6164,12 @@ mod tests {
 
     /// A `$` member is writable, and the write goes to the field the view is
     /// of. pvxs puts a group member through the same `IOCSource::put` as a
-    /// single-record channel (`groupsource.cpp:564-567`), so the conversion
-    /// target must be the VIEWED type — a string — not the raw field's.
+    /// single-record channel (`groupsource.cpp:564-567`), so its `int8_t[]`
+    /// is a `dbPut(DBR_CHAR)` through the char address.
     #[tokio::test]
     async fn a_dollar_group_member_round_trips_a_put() {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::types::EpicsValue;
-        use epics_pva_rs::ScalarValue;
 
         let db = Arc::new(PvDatabase::new());
         db.add_record("LS:rt", Box::new(AiRecord::new(0.0)))
@@ -6202,10 +6189,9 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
 
         let mut top = PvStructure::new("structure");
-        top.fields.push((
-            "d".into(),
-            PvField::Scalar(ScalarValue::String("after".into())),
-        ));
+        let image =
+            crate::convert::epics_to_pv_field(&EpicsValue::CharArray(b"after\0".to_vec().into()));
+        top.fields.push(("d".into(), image.clone()));
         channel
             .put_with_options(
                 &top,
@@ -6223,7 +6209,7 @@ mod tests {
         );
         assert_eq!(
             get_nested_field(&channel.read_group().await.unwrap(), "d").as_deref(),
-            Some(&PvField::Scalar(ScalarValue::String("after".into()))),
+            Some(&image),
         );
     }
 
@@ -6308,10 +6294,7 @@ mod tests {
         let rec = db.get_record("SUBF:ai").expect("record exists");
         let filters_installed = {
             let inst = rec.read();
-            inst.subscribers
-                .get("VAL")
-                .map(|subs| subs.iter().any(|s| !s.filters.is_empty()))
-                .unwrap_or(false)
+            inst.subscribers_of("VAL").any(|s| s.has_filters())
         };
         assert!(
             filters_installed,

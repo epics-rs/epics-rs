@@ -160,7 +160,7 @@ mod tests {
     /// `epics_ca_rs::server::blocking` is `CaServerLow - 4`, and no serving
     /// thread in this workspace sits lower. Restated rather than imported
     /// because that crate is above this one.
-    const CLIENT_SERVICE_FLOOR: u8 = ThreadPriority::CaServerLow.value() - 4;
+    const CLIENT_SERVICE_FLOOR: u32 = ThreadPriority::CaServerLow.value() - 4;
 
     /// Every role is placed on one side of client service, deliberately.
     ///

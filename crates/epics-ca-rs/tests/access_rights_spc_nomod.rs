@@ -73,7 +73,7 @@ async fn serve() -> u16 {
 /// `(read, write)` as the connected channel's ACCESS_RIGHTS reports them.
 async fn access(client: &CaClient, pv: &str) -> (bool, bool) {
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{pv} must connect: {e:?}"));
     let info = ch.info().await.expect("channel info");
@@ -135,7 +135,7 @@ async fn a_put_to_a_nomod_field_is_still_refused() {
     let client = CaClient::new().await.expect("client");
 
     let ch = client.create_channel("N1.SEVR");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -145,6 +145,3 @@ async fn a_put_to_a_nomod_field_is_still_refused() {
         "SPC_NOMOD refuses the write on every route; got {put:?}"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

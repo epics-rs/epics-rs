@@ -78,9 +78,12 @@ async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
         .unwrap();
 
     let e = do_rx.try_recv().expect("dbPut posts the field written");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(3.7));
     assert_eq!(
-        e.mask,
+        e.delivered_value(&inst.read(), "DO1").unwrap(),
+        EpicsValue::Double(3.7)
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE | EventMask::LOG,
         "the WRITTEN view is posted by the put path, DBE_VALUE|DBE_LOG"
     );
@@ -88,9 +91,12 @@ async fn r17_4_a_do_put_posts_the_derived_string_with_a_bare_value_mask() {
     let e = str_rx
         .try_recv()
         .expect("special() re-rendered STR1 from the new DO1, so it posts");
-    assert_eq!(e.snapshot.value, EpicsValue::String("3.70".into()));
     assert_eq!(
-        e.mask,
+        e.delivered_value(&inst.read(), "STR1").unwrap(),
+        EpicsValue::String("3.70".into())
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE,
         "sseqRecord.c:1115 posts the DERIVED view with a bare DBE_VALUE — \
          no DBE_LOG, so an archiver-only client is NOT notified"
@@ -151,9 +157,12 @@ async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
         .unwrap();
 
     let e = do_rx.try_recv().expect("atof(\"5\") moved DO1 0 -> 5");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(5.0));
     assert_eq!(
-        e.mask,
+        e.delivered_value(&inst.read(), "DO1").unwrap(),
+        EpicsValue::Double(5.0)
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE,
         "sseqRecord.c:1139 posts the derived dov with a bare DBE_VALUE"
     );
@@ -221,17 +230,23 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
     }
 
     let e = do_rx.try_recv().expect("the DOL read moved DO1 0 -> 7.25");
-    assert_eq!(e.snapshot.value, EpicsValue::Double(7.25));
     assert_eq!(
-        e.mask,
+        e.delivered_value(&inst.read(), "DO1").unwrap(),
+        EpicsValue::Double(7.25)
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE | EventMask::LOG,
         "sseqRecord.c:676 posts the view the link was READ into with DBE_VALUE|DBE_LOG"
     );
 
     let e = str_rx.try_recv().expect("STR1 was re-rendered to \"7.25\"");
-    assert_eq!(e.snapshot.value, EpicsValue::String("7.25".into()));
     assert_eq!(
-        e.mask,
+        e.delivered_value(&inst.read(), "STR1").unwrap(),
+        EpicsValue::String("7.25".into())
+    );
+    assert_eq!(
+        e.mask(),
         EventMask::VALUE,
         "sseqRecord.c:679 posts the DERIVED string with a bare DBE_VALUE"
     );

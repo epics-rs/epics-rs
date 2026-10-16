@@ -1087,7 +1087,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut intro_bytes = Vec::new();
         crate::pvdata::encode::encode_type_desc(&intro, order, &mut intro_bytes);
@@ -1243,10 +1243,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // Frame A (ioid 1): server's first emission — carries 0xFD define.
@@ -1327,7 +1329,7 @@ mod tests {
         // GET introspection: a structure with one `any` (Variant) leaf.
         let intro = FieldDesc::Structure {
             struct_id: "x".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
 
         // GET DATA frame: ioid + subcmd(0x00) + changed bitset (bit 0 marks
@@ -1403,7 +1405,7 @@ mod tests {
         // GET introspection: a structure with one `any` (Variant) leaf.
         let intro = FieldDesc::Structure {
             struct_id: "x".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
 
         // Reader-owned state, threaded across frames in strict wire order.
@@ -1494,11 +1496,11 @@ mod tests {
         let order = ByteOrder::Little;
         let intro_a = FieldDesc::Structure {
             struct_id: "a".into(),
-            fields: vec![("v".into(), FieldDesc::Variant)],
+            fields: vec![("v".into(), FieldDesc::Variant)].into(),
         };
         let intro_b = FieldDesc::Structure {
             struct_id: "b".into(),
-            fields: vec![("u".into(), FieldDesc::Variant)],
+            fields: vec![("u".into(), FieldDesc::Variant)].into(),
         };
 
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
@@ -1592,7 +1594,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
 
         let build = |overrun: &BitSet| -> Frame {
@@ -1643,7 +1645,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut payload = Vec::new();
         payload.put_u32(7, order); // ioid
@@ -1695,7 +1697,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
 
         let mut payload = Vec::new();
@@ -1792,7 +1794,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalar:1.0".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
         s.fields
@@ -1910,7 +1912,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "s".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         // Inline (marker-free) encoding — the wire form a server emits
         // with the type cache disabled.
@@ -1974,10 +1976,12 @@ mod tests {
                     "alarm".into(),
                     FieldDesc::Structure {
                         struct_id: "alarm_t".into(),
-                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))],
+                        fields: vec![("severity".into(), FieldDesc::Scalar(ScalarType::Int))]
+                            .into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         };
 
         // Frame A (ioid 1): server's first emission — carries 0xFD define.
@@ -2050,7 +2054,7 @@ mod tests {
         let order = ByteOrder::Little;
         let intro = FieldDesc::Structure {
             struct_id: "s".into(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let mut payload = Vec::new();
         payload.put_u32(7, order); // ioid

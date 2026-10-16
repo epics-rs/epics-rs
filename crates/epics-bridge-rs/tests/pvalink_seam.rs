@@ -1,13 +1,13 @@
 //! The `pva` link set (pvalink) must install at the base
 //! `AfterCaLinkInit` seam via
-//! [`IocApplication::register_link_set_installer`], so a `pva://` link
+//! [`IocApplication::register_link_type`], so a `pva://` link
 //! loaded before iocInit has its link set registered and its CP link
 //! opened (background connect started) while iocInit is still running —
 //! matching pvxs opening pvalink channels at `initHookAfterIocBuilt`
 //! (`linkGlobal_t::init`).
 //!
 //! Pre-fix, pvalink installed inside the Phase-3 protocol runner
-//! (`run_ca_pva_qsrv_ioc`), AFTER iocInit. This test drives the
+//! (`run_ca_pva_qsrv_ioc_app`'s), AFTER iocInit. This test drives the
 //! PRODUCTION `IocApplication::run` path with a CUSTOM runner that
 //! installs nothing itself: the registered seam installer is therefore
 //! the ONLY thing that can make the `pva` scheme appear, so a pre-fix
@@ -60,7 +60,7 @@ async fn pvalink_installs_at_iocinit_seam_and_not_in_external_link_wait() {
     // pvxs JSON longhand. The install scan walks `record_link_fields`,
     // which surfaces every link-bearing field — the record-specific
     // INPA–INPU used here as well as a device-support `ai`'s/`ao`'s
-    // `common.inp`/`common.out`. `proc: 'CP'` keeps it a `PvaJson` link,
+    // `common.text.inp`/`common.text.out`. `proc: 'CP'` keeps it a `PvaJson` link,
     // which the install scan always pre-opens (no bare-PV early-out) — so
     // its monitor identity is in the registry before the iocInit wait
     // runs. PINI=NO / SCAN=Passive so the record never self-processes.
@@ -88,7 +88,7 @@ async fn pvalink_installs_at_iocinit_seam_and_not_in_external_link_wait() {
     // this is the only path that can register the `pva` scheme.
     let result = IocApplication::new()
         .startup_script(stcmd_path.to_str().unwrap())
-        .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install)
+        .register_link_type("pva", epics_bridge_rs::qsrv::pvalink_link_set_install)
         .run(|config| async move {
             // By here iocInit has fired the seam installer (which
             // registered the `pva` lset and pre-opened the CP link) and

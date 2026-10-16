@@ -609,6 +609,99 @@ mod tests {
         drop(held);
     }
 
+    /// A `run_repeater_with_debug(debug)` on a port nothing else holds, sent
+    /// REGISTERs until it CONFIRMs, with the streams that one daemon wrote and
+    /// the registered client's port.
+    ///
+    /// No port can be reserved for the daemon: the probe has to be dropped
+    /// before the daemon binds, and in that window another socket on the box
+    /// can take the number, after which the daemon's exclusive bind loses and
+    /// it returns (`repeater.cpp:505-510`). That daemon finishing before any
+    /// CONFIRM is the lost bind, and the attempt is made again on a fresh
+    /// port. The client is bound first so the probe cannot hand it the port.
+    ///
+    /// `verifyClients` bind-tests the client's own address, and C's order is
+    /// confirm-then-sweep (`repeater.cpp:443-476`) — so the socket stays open
+    /// past the CONFIRM, for 250 ms in which the sweep prints its line.
+    // RTEMS-EXEC-MODEL-ALLOW(1): the runtime both callers share; the
+    // module is tokio_backend-only (lib.rs), so it never builds on the
+    // exec backend.
+    fn registered_repeater(debug: u8) -> (bool, String, String, u16) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let client = Arc::new(StdUdpSocket::bind("127.0.0.1:0").expect("client bind"));
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client read timeout");
+        let client_port = client.local_addr().expect("client addr").port();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        for _ in 0..5 {
+            let free_port = StdUdpSocket::bind("127.0.0.1:0")
+                .expect("probe bind")
+                .local_addr()
+                .expect("probe addr")
+                .port();
+            // `run_repeater_with_debug` binds `repeater_port()`, C
+            // `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)`, so this
+            // is the only way to keep the test off a host repeater on 5065.
+            // SAFETY: nextest runs each test in its own process.
+            unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
+
+            let (attempt, out, err) = stream_capture::capture_streams(|| {
+                let client = Arc::clone(&client);
+                rt.block_on(async move {
+                    let mut repeater = tokio::spawn(run_repeater_with_debug(debug));
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let stopped = Arc::clone(&stop);
+                    // Re-send until the CONFIRM arrives: the first REGISTER
+                    // can predate the daemon's bind, and a lost datagram must
+                    // not turn into a flake.
+                    let mut confirm = tokio::task::spawn_blocking(move || {
+                        let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let mut buf = [0u8; 64];
+                        while Instant::now() < deadline && !stopped.load(Ordering::Relaxed) {
+                            let _ = client.send_to(&register, ("127.0.0.1", free_port));
+                            if let Ok((n, _)) = client.recv_from(&mut buf)
+                                && n >= CaHeader::SIZE
+                                && let Ok(h) = CaHeader::from_bytes(&buf[..n])
+                                && h.cmmd == CA_PROTO_REPEATER_CONFIRM
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    });
+                    tokio::select! {
+                        // Stopped before the next attempt, whose CONFIRM it
+                        // would otherwise read off the shared client.
+                        _ = &mut repeater => {
+                            stop.store(true, Ordering::Relaxed);
+                            let _ = confirm.await;
+                            None
+                        }
+                        confirmed = &mut confirm => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            repeater.abort();
+                            Some(confirmed.unwrap_or(false))
+                        }
+                    }
+                })
+            });
+            if let Some(confirmed) = attempt {
+                return (confirmed, out, err, client_port);
+            }
+        }
+        panic!("the repeater lost its port bind five times");
+    }
+
     /// The `debugPrintf` facility is shut at debug 0, on the path where
     /// that matters: a full registration, which fires the banner, `New
     /// client on port %u` and `Verified %u active clients` — the three
@@ -622,62 +715,9 @@ mod tests {
     /// `e271752158dd` `caRepeater.cpp` `dup2`s stdout to `/dev/null`
     /// unless `-d`/`-v`. C's `fprintf(stderr, …)` sites are ungated and
     /// stay ungated here, so only stdout is asserted.
-    // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
-    // runtime rather than taking an ambient one; green on the exec
-    // backend.
     #[test]
     fn repeater_is_silent_at_debug_zero() {
-        use std::time::{Duration, Instant};
-
-        let free_port = StdUdpSocket::bind("127.0.0.1:0")
-            .expect("probe bind")
-            .local_addr()
-            .expect("probe addr")
-            .port();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
-
-        let client = std::sync::Arc::new(StdUdpSocket::bind("127.0.0.1:0").expect("client bind"));
-        client
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("client read timeout");
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("test runtime");
-
-        let (confirmed, out, err) = stream_capture::capture_streams(|| {
-            let held = std::sync::Arc::clone(&client);
-            rt.block_on(async move {
-                let repeater = tokio::spawn(run_repeater_with_debug(0));
-                let confirmed = tokio::task::spawn_blocking(move || {
-                    let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    let mut buf = [0u8; 64];
-                    while Instant::now() < deadline {
-                        let _ = client.send_to(&register, ("127.0.0.1", free_port));
-                        if let Ok((n, _)) = client.recv_from(&mut buf) {
-                            if n >= CaHeader::SIZE {
-                                if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
-                                    if h.cmmd == CA_PROTO_REPEATER_CONFIRM {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    false
-                })
-                .await
-                .unwrap_or(false);
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                repeater.abort();
-                drop(held);
-                confirmed
-            })
-        });
+        let (confirmed, out, err, _) = registered_repeater(0);
 
         assert!(
             confirmed,
@@ -705,77 +745,9 @@ mod tests {
     ///   R7.0.10), and that is the only function in the file that prints
     ///   it; the port also printed it from `fanOut` and from a
     ///   registration wrapper.
-    // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
-    // runtime rather than taking an ambient one; green on the exec
-    // backend.
     #[test]
     fn repeater_diagnostics_carry_c_bytes_on_c_streams() {
-        use std::time::{Duration, Instant};
-
-        // A port nothing holds: bind, read it back, drop.
-        let free_port = StdUdpSocket::bind("127.0.0.1:0")
-            .expect("probe bind")
-            .local_addr()
-            .expect("probe addr")
-            .port();
-        // `run_repeater_with_debug` binds `repeater_port()`, C
-        // `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)`, so this is
-        // the only way to keep the test off a host repeater on 5065.
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
-
-        // `verifyClients` bind-tests the client's own address, and C's
-        // order is confirm-then-sweep (`repeater.cpp:443-476`) — so the
-        // socket has to stay open past the CONFIRM or the sweep correctly
-        // reaps it. Share it rather than moving it into the blocking task,
-        // whose return would close it.
-        let client = std::sync::Arc::new(StdUdpSocket::bind("127.0.0.1:0").expect("client bind"));
-        client
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("client read timeout");
-        let client_port = client.local_addr().expect("client addr").port();
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("test runtime");
-
-        let (confirmed, out, err) = stream_capture::capture_streams(|| {
-            let held = std::sync::Arc::clone(&client);
-            rt.block_on(async move {
-                let repeater = tokio::spawn(run_repeater_with_debug(1));
-                // Re-send until the CONFIRM arrives: the first REGISTER can
-                // predate the daemon's bind, and a lost datagram must not
-                // turn into a flake.
-                let confirmed = tokio::task::spawn_blocking(move || {
-                    let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    let mut buf = [0u8; 64];
-                    while Instant::now() < deadline {
-                        let _ = client.send_to(&register, ("127.0.0.1", free_port));
-                        if let Ok((n, _)) = client.recv_from(&mut buf) {
-                            if n >= CaHeader::SIZE {
-                                if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
-                                    if h.cmmd == CA_PROTO_REPEATER_CONFIRM {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    false
-                })
-                .await
-                .unwrap_or(false);
-                // The sweep runs after the CONFIRM; give it the socket it
-                // bind-tests, and a moment to print its line.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                repeater.abort();
-                drop(held);
-                confirmed
-            })
-        });
+        let (confirmed, out, err, client_port) = registered_repeater(1);
 
         assert!(
             confirmed,

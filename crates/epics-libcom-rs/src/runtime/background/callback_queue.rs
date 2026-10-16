@@ -192,8 +192,9 @@ impl<T> Default for Node<T> {
 
 /// A never-shrinking arena with two tagged Treiber free lists.
 ///
-/// Chunks are published by index reservation (`fetch_add` on `reserved`), so
-/// two growers never contend for the same chunk and neither has to retry. A
+/// Chunks are published by index reservation (`fetch_add` on `reserved`), so a
+/// chunk is its grower's alone; past construction one grower at a time
+/// reserves one (see [`Pool::alloc_task`]). A
 /// published chunk pointer is never cleared and never freed before [`Drop`],
 /// which is what makes resolving a stale index defined rather than a
 /// use-after-free.
@@ -224,6 +225,11 @@ struct Pool<T> {
     /// Tagged head of the run-queue supply, grown on demand: a run-queue entry
     /// is never refused for capacity.
     free_task: AtomicU64,
+    /// Held by the one requester growing the run-queue supply. Chunk `c` is
+    /// `CHUNK0 << c`, so requesters that each grew on finding it empty reserved
+    /// chunks doubling per requester for one chunk's demand: seventeen threads
+    /// at once took chunks 6 through 22, 268 M nodes for 2 k entries.
+    grower: std::sync::Mutex<()>,
     /// First index that is not a ring slot.
     ring_slots: usize,
 }
@@ -244,6 +250,7 @@ impl<T> Pool<T> {
             free_ring: AtomicU64::new(pack(IDX_NONE, 0)),
             ring_used: AtomicUsize::new(0),
             free_task: AtomicU64::new(pack(IDX_NONE, 0)),
+            grower: std::sync::Mutex::new(()),
             ring_slots,
         };
         while chunk_base(pool.reserved.load(Ordering::Relaxed)) < ring_slots {
@@ -337,8 +344,21 @@ impl<T> Pool<T> {
 
     /// Take one run-queue node, growing the arena when the supply is empty.
     /// `None` only when the index space itself is exhausted.
+    ///
+    /// Only the [`Pool::grower`] holder grows, and only after finding the
+    /// supply still empty under it, so a requester that waited takes a node of
+    /// the chunk its predecessor linked. Each growth doubles the supply, so the
+    /// gate is met a logarithmic number of times per process and never by a
+    /// request that finds a node.
     fn alloc_task(&self) -> Option<u32> {
         loop {
+            if let Some(i) = self.pop(&self.free_task) {
+                return Some(i);
+            }
+            let _grower = self
+                .grower
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(i) = self.pop(&self.free_task) {
                 return Some(i);
             }
@@ -428,8 +448,8 @@ impl<T> Drop for Pool<T> {
     fn drop(&mut self) {
         // Sole owner here, so the chunks can be reclaimed; dropping a chunk
         // drops whatever values were still queued in its nodes.
-        for c in 0..MAX_CHUNKS {
-            let ptr = *self.chunks[c].get_mut();
+        for (c, chunk) in self.chunks.iter_mut().enumerate() {
+            let ptr = *chunk.get_mut();
             if ptr.is_null() {
                 continue;
             }
@@ -494,6 +514,30 @@ impl<T> BandQueue<T> {
                 Ok(depth)
             }
             None => Err(v),
+        }
+    }
+
+    /// [`Self::push_ring`] for an entry a claim decides on. The slot is taken
+    /// before `claim` runs, as the intrusive `callbackRequest` reserves its
+    /// place before it claims the object (epics-base `proto/callback-intrusive`
+    /// `callback.c:855-868`), so a full band refuses whether or not the object
+    /// is queued already. `claim` answering `None` gives the slot back and
+    /// publishes nothing: `Ok(None)`. `Err(())` is the band being full.
+    pub(super) fn push_ring_claimed(
+        &self,
+        claim: impl FnOnce() -> Option<T>,
+        recruit: impl FnOnce(),
+    ) -> Result<Option<usize>, ()> {
+        let (i, depth) = self.nodes.alloc_ring().ok_or(())?;
+        match claim() {
+            Some(v) => {
+                self.publish(i, v, recruit);
+                Ok(Some(depth))
+            }
+            None => {
+                self.nodes.dealloc(i);
+                Ok(None)
+            }
         }
     }
 
@@ -1132,6 +1176,32 @@ mod tests {
         assert!(q.is_empty());
         q.push_ring(8, || {}).unwrap();
         assert_eq!(pop1(&q), Some(8));
+    }
+
+    /// Requesters that find the run-queue supply empty together grow it once:
+    /// the next chunk alone holds every one of them.
+    #[test]
+    fn requesters_meeting_an_empty_task_supply_grow_one_chunk() {
+        const THREADS: usize = 8;
+        for _ in 0..if cfg!(miri) { 1 } else { 50 } {
+            let pool = Arc::new(Pool::<u32>::new(CHUNK0));
+            while pool.pop(&pool.free_task).is_some() {}
+            let before = pool.reserved.load(Ordering::Relaxed);
+            let start = Arc::new(std::sync::Barrier::new(THREADS));
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (pool, start) = (Arc::clone(&pool), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        pool.alloc_task().unwrap()
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(pool.reserved.load(Ordering::Relaxed), before + 1);
+        }
     }
 
     /// `CHUNK0` is the first chunk boundary and every later one doubles, so a

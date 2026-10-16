@@ -58,12 +58,12 @@
 //! established connections.
 //!
 //! The connection futures run at 18 as well, and that is what
-//! `pva_task_executor` is for. A bare `Reactor::spawn` on `exec_backend` lands
+//! `pva_executor` is for. A bare `Reactor::spawn` on `exec_backend` lands
 //! a future on the process-global callback pool's `Medium` band — 64, where
 //! C's `callbackRequest` work runs — so `serve` first rebinds the reactor it
 //! was handed to this server's own executor. Everything downstream inherits
-//! that through its clone of the reactor, the blocking driver's per-connection
-//! writer task included, since it spawns through the same seam.
+//! that through its clone of the reactor, except each connection's writer
+//! task, which `ConnInit` binds to the server's writer executor.
 //!
 //! # Shutdown: one owner for "may this connection still run"
 //!
@@ -78,15 +78,15 @@
 //! lock: `ConnTable::install` aborts the handle it was just given when the
 //! table is already stopped, rather than storing it.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): the six accept-loop tests drive a real client
+// RTEMS-EXEC-MODEL-ALLOW(8): the eight accept-loop tests drive a real client
 // against a running server, so they need the multi-thread tokio flavor they
 // ask for — that is the subject, not an accident. They run on the driver
 // `#[tokio::test]` builds and pass in the exec-backend suite (measured:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-pva-rs
-// -E 'test(/server_native::reactor::/)'`, 7/7).
+// -E 'test(/server_native::reactor::/)'`, 9/9).
 
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -96,13 +96,17 @@ use epics_base_rs::runtime::readiness::Poller;
 use epics_base_rs::runtime::task::{Reactor, TaskAbortHandle, enter_ioc_thread};
 use tracing::{debug, warn};
 
-use super::blocking::{PVA_SERVER_PRIORITY, handle_udp_search_blocking, tx_limit_bytes};
+use super::blocking::{
+    PVA_SERVER_PRIORITY, SearchSocket, handle_udp_search_blocking, tx_limit_bytes,
+};
 use super::config::PvaServerConfig;
 use super::peers::{PeerEntry, PeerRegistry};
 use super::search_engine::random_guid;
+use super::serv_iface::ServListeners;
 use super::source::{ChannelInvalidator, DynSource};
 use super::tcp::{ConnInit, handle_connection_io};
 use crate::error::PvaResult;
+use crate::liveness_clock::LivenessClock;
 
 /// The live connections — see the module doc's invariant.
 ///
@@ -274,7 +278,7 @@ impl Drop for ConnSlot {
 /// connection is registered with `tls = false` and authenticates through
 /// CONNECTION_VALIDATION.
 pub struct ReactorPvaServer {
-    listener: TcpListener,
+    listeners: ServListeners,
     source: DynSource,
     config: PvaServerConfig,
     peers: Arc<PeerRegistry>,
@@ -282,10 +286,11 @@ pub struct ReactorPvaServer {
     connections: Arc<ConnTable>,
     poller: Arc<Poller>,
     /// The executor connection futures spawn onto — see
-    /// [`pva_task_executor`](super::blocking::pva_task_executor). `None` on
+    /// [`pva_executor`](super::blocking::pva_executor). `None` on
     /// `tokio_backend`, where the runtime is the executor.
     task_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
-    tcp_port: u16,
+    /// The executor the connections' writer tasks run on.
+    writer_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
     shutdown: AtomicBool,
 }
 
@@ -296,30 +301,22 @@ impl ReactorPvaServer {
     /// binds its listener here: a constructed server is a listening server, so
     /// [`tcp_port`](Self::tcp_port) is answerable before any connection exists
     /// and the port is never probed, released and re-bound.
+    ///
+    /// The listener set is [`super::blocking::BlockingPvaServer::bind`]'s.
     pub fn bind<A: ToSocketAddrs>(
         addr: A,
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        // On RTEMS `bind` succeeds and `local_addr` fails (libc omits the BSD
-        // `sin_len` byte), so the two failures must stay distinguishable
-        // rather than both surfacing as "cannot bind".
-        let tcp_port = listener
-            .local_addr()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("bind() succeeded; local_addr() on the listener failed: {e}"),
-                )
-            })?
-            .port();
+        let listeners = ServListeners::bind(addr, &config)?;
         // One GUID per server, stamped at construction so the UDP responder
         // and the TCP-circuit SEARCH handler cannot advertise two identities;
         // `?` rather than a fallback because every consumer of a GUID
         // collision degrades silently.
         let mut config = config;
         config.guid = random_guid()?;
+        // The bound port, after any fallback: `config` is the one record of it.
+        config.tcp_port = listeners.port();
         let source = crate::server_native::server_info::compose_with_server_info(source)
             .map_err(io::Error::other)?;
         let channel_invalidator = ChannelInvalidator::new();
@@ -329,9 +326,10 @@ impl ReactorPvaServer {
         // Started here, not on first accept: a server that cannot run its
         // connections is a `bind` failure, like a poll thread that will not
         // start.
-        let task_exec = super::blocking::pva_task_executor()?;
+        let task_exec = super::blocking::pva_executor(super::blocking::PVA_TASK_EXECUTOR)?;
+        let writer_exec = super::blocking::pva_executor(super::blocking::PVA_WRITER_EXECUTOR)?;
         Ok(Self {
-            listener,
+            listeners,
             source,
             config,
             peers: PeerRegistry::new(),
@@ -339,7 +337,7 @@ impl ReactorPvaServer {
             connections: ConnTable::new(),
             poller,
             task_exec,
-            tcp_port,
+            writer_exec,
             shutdown: AtomicBool::new(false),
         })
     }
@@ -357,15 +355,23 @@ impl ReactorPvaServer {
         }
     }
 
+    /// `reactor` bound to this server's writer executor.
+    fn writer_reactor(&self, reactor: &Reactor) -> Reactor {
+        match &self.writer_exec {
+            Some(exec) => reactor.with_executor(exec),
+            None => reactor.clone(),
+        }
+    }
+
     /// The actual bound address — the value to use when the configured port
     /// was 0.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listeners.local_addr()
     }
 
     /// The bound TCP port, as SEARCH replies must advertise it.
     pub fn tcp_port(&self) -> u16 {
-        self.tcp_port
+        self.config.tcp_port
     }
 
     /// This server's GUID, as both SEARCH paths advertise it.
@@ -394,12 +400,12 @@ impl ReactorPvaServer {
     /// Blocks the calling thread and takes it to the UDP band, which is below
     /// the accept loop's — give it a *different* thread from
     /// [`serve`](Self::serve).
-    pub fn serve_udp_search(&self, socket: UdpSocket) -> PvaResult<()> {
+    pub fn serve_udp_search(&self, socket: SearchSocket) -> PvaResult<()> {
         handle_udp_search_blocking(
             socket,
             &self.source,
             &self.config,
-            self.tcp_port,
+            self.config.tcp_port,
             &self.shutdown,
         )
     }
@@ -412,14 +418,20 @@ impl ReactorPvaServer {
     /// woken by [`shutdown`](Self::shutdown)'s self-connect, which is one
     /// mechanism instead of two.
     pub fn serve(&self, reactor: &Reactor) {
-        let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         // From here down `reactor` is the server's own: every connection
         // future, and every task those futures go on to spawn through their
         // clone of it, runs on this server's band rather than the callback
         // pool's.
         let reactor = &self.conn_reactor(reactor);
+        self.listeners
+            .serve(|listener| self.accept_loop(listener, reactor));
+    }
+
+    /// One listener's accept loop, on its own thread.
+    fn accept_loop(&self, listener: &TcpListener, reactor: &Reactor) {
+        let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         let mut backoff = AcceptBackoff::new();
-        for stream in self.listener.incoming() {
+        for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     backoff.accepted();
@@ -471,6 +483,7 @@ impl ReactorPvaServer {
         stream: TcpStream,
         peer: SocketAddr,
     ) -> io::Result<()> {
+        let local_port = stream.local_addr()?.port();
         let slot = match self
             .connections
             .admit(&self.peers, peer, self.config.max_connections)
@@ -508,6 +521,9 @@ impl ReactorPvaServer {
             x509_identity: None,
             channel_invalidator: self.channel_invalidator.clone(),
             tx_limit_bytes: tx_limit,
+            writer_reactor: self.writer_reactor(reactor),
+            liveness_clock: LivenessClock::System,
+            local_port,
         };
         let conn_reactor = reactor.clone();
         let id = slot.id();
@@ -545,9 +561,7 @@ impl ReactorPvaServer {
     /// watches [`active_connections`](Self::active_connections).
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Ok(addr) = self.listener.local_addr() {
-            let _ = TcpStream::connect(addr);
-        }
+        self.listeners.wake();
         self.connections.stop();
         self.poller.shutdown();
     }
@@ -568,7 +582,7 @@ mod tests {
     // the client would let them drift apart without a test noticing.
     use super::super::blocking::tests::{
         TestClient, app_frame, create_channel_payload, eventually, harness_reactor,
-        isolated_config, test_source,
+        isolated_config, tcp_search_port, test_source, two_port_config,
     };
     use epics_base_rs::runtime::task::{StackSizeClass, spawn_dedicated_thread};
     use std::io::{Cursor, Read};
@@ -576,8 +590,15 @@ mod tests {
     use std::time::Duration;
 
     fn start_server(config: PvaServerConfig) -> (Arc<ReactorPvaServer>, thread::JoinHandle<()>) {
+        start_server_on(Ipv4Addr::LOCALHOST, config)
+    }
+
+    fn start_server_on(
+        ip: Ipv4Addr,
+        config: PvaServerConfig,
+    ) -> (Arc<ReactorPvaServer>, thread::JoinHandle<()>) {
         let server = Arc::new(
-            ReactorPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), config)
+            ReactorPvaServer::bind((ip, 0), test_source(), config)
                 .expect("bind the reactor PVA server"),
         );
         let serving = server.clone();
@@ -623,6 +644,69 @@ mod tests {
             "a connection accepted by the reactor driver must serve channels"
         );
 
+        stop_and_join(&server, accept);
+    }
+
+    /// pvxs `ServIface`: one listener per listed interface, and no wildcard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_listed_interface_gets_a_listener_and_nothing_else() {
+        let config = PvaServerConfig {
+            interfaces: ["127.0.0.1:0", "127.0.0.2:0"]
+                .map(|a| a.parse::<SocketAddr>().unwrap().into())
+                .to_vec(),
+            ..isolated_config()
+        };
+        let (server, accept) = start_server_on(Ipv4Addr::UNSPECIFIED, config);
+        let port = server.tcp_port();
+        // A connect, not a bind: Darwin and Windows bind a specific address
+        // beside a wildcard listener. 127.0.0.4: Darwin's lo0 carries only
+        // the addresses CI aliases.
+        std::net::TcpStream::connect((Ipv4Addr::new(127, 0, 0, 4), port))
+            .expect_err("the wildcard must not be bound beside the listed interfaces");
+        for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
+            let client = TestClient::connect(SocketAddr::from((ip, port)));
+            eventually("the connection is served", || {
+                server.active_connections() == 1
+            });
+            client.close();
+            eventually("the connection is gone", || {
+                server.active_connections() == 0
+            });
+        }
+        stop_and_join(&server, accept);
+    }
+
+    /// pvxs `serverchan.cpp:241`: a TCP SEARCH reply names the port of the
+    /// listener the connection came in on, not one server-wide number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tcp_search_reply_names_the_port_it_arrived_on() {
+        let (server, other) = named_port::on_a_named_port(|other| {
+            match ReactorPvaServer::bind(
+                (Ipv4Addr::UNSPECIFIED, 0),
+                test_source(),
+                two_port_config(other),
+            ) {
+                Ok(server) => Some((Arc::new(server), other)),
+                Err(e) if epics_base_rs::net::port_held(&e) => None,
+                Err(e) => panic!("bind the reactor PVA server: {e}"),
+            }
+        });
+        let first = server.tcp_port();
+        assert_ne!(first, other);
+        let serving = server.clone();
+        let accept = spawn_dedicated_thread(
+            "test-PVAR-accept".into(),
+            PVA_SERVER_PRIORITY,
+            StackSizeClass::Medium,
+            move || serving.serve(&harness_reactor()),
+        )
+        .expect("accept thread spawned");
+        for (ip, port) in [
+            (Ipv4Addr::LOCALHOST, first),
+            (Ipv4Addr::new(127, 0, 0, 2), other),
+        ] {
+            assert_eq!(tcp_search_port(SocketAddr::from((ip, port))), port);
+        }
         stop_and_join(&server, accept);
     }
 

@@ -1,6 +1,8 @@
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
+use crate::plugin::runtime::{PluginThreads, plugin_threads};
+
 /// Standard C-compatible arg descriptors for plugin configure commands.
 ///
 /// Matches: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, maxBuffers, maxMemory, priority, stackSize, maxThreads)`
@@ -129,7 +131,7 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`
 pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String), String> {
     let port_name = match &args[0] {
-        ArgValue::String(s) => s.clone(),
+        ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
     };
     let queue_size = match args.get(1) {
@@ -137,7 +139,7 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String),
         _ => 20,
     };
     let ndarray_port = match args.get(3) {
-        Some(ArgValue::String(s)) => s.clone(),
+        Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
     };
     Ok((port_name, queue_size, ndarray_port))
@@ -165,6 +167,18 @@ pub fn max_threads_arg(args: &[ArgValue], index: usize) -> i32 {
         Some(ArgValue::Int(n)) => *n as i32,
         _ => 0,
     }
+}
+
+/// The `priority` and `stackSize` a plugin `*Configure` command carries,
+/// through [`plugin_threads`]. `stack_index` is `stackSize`'s position; every
+/// ADCore `*Configure` signature puts `priority` just before it. An absent
+/// iocsh int argument is 0.
+pub fn threads_arg(args: &[ArgValue], stack_index: usize) -> PluginThreads {
+    let int = |index| match args.get(index) {
+        Some(ArgValue::Int(n)) => *n,
+        _ => 0,
+    };
+    plugin_threads(int(stack_index - 1), int(stack_index))
 }
 
 /// The count a plugin `*Configure` command carries — `maxOverlays` at 5

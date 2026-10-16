@@ -188,7 +188,7 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
             .name("test-poster".into())
             .spawn(move || {
                 let members: Vec<_> = (0..MEMBERS)
-                    .map(|i| db.get_record(&member_name(i)).expect("member exists"))
+                    .map(|i| db.get_record(member_name(i)).expect("member exists"))
                     .collect();
                 let scalar = db.get_record(SCALAR_PV).expect("scalar exists");
                 while run.load(Ordering::SeqCst) {

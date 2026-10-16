@@ -15,23 +15,29 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
@@ -188,13 +194,14 @@ pub static VARIABLES: &[(&str, &str)] = &[];
 // modelled separately (see the module docs).
 // ---------------------------------------------------------------------
 
-/// `recordtype(motor)` — 127 CA-visible own fields from `dbd/motorRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(motor)` — 128 CA-visible own fields from `dbd/motorRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static MOTOR_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -215,6 +222,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -235,6 +243,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -255,6 +264,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -275,6 +285,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -295,6 +306,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -315,6 +327,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -335,6 +348,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -355,6 +369,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -375,6 +390,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -395,6 +411,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -415,6 +432,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -435,6 +453,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -455,6 +474,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -475,6 +495,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -495,6 +516,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -515,6 +537,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -535,6 +558,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -555,6 +579,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -575,6 +600,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -595,6 +621,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -615,6 +642,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -635,6 +663,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -655,6 +684,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -675,6 +705,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -695,6 +726,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -715,6 +747,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -735,6 +768,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -755,6 +789,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -775,6 +810,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -795,6 +831,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -815,6 +852,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -835,6 +873,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -855,6 +894,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -875,6 +915,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -895,6 +936,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -915,6 +957,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -935,6 +978,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -955,6 +999,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -975,6 +1020,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -995,6 +1041,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1015,6 +1062,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1035,6 +1083,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1055,6 +1104,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1075,6 +1125,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1095,6 +1146,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1115,6 +1167,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1135,6 +1188,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1155,6 +1209,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1175,6 +1230,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1195,6 +1251,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1215,6 +1272,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1235,6 +1293,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1255,6 +1314,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1275,6 +1335,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1295,6 +1356,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1315,6 +1377,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1335,6 +1398,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1355,6 +1419,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1375,6 +1440,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1395,6 +1461,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1415,6 +1482,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1435,6 +1503,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1455,6 +1524,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1475,6 +1545,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1495,6 +1566,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1515,6 +1587,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1535,6 +1608,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1555,6 +1629,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1575,6 +1650,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1595,6 +1671,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1615,6 +1692,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1635,6 +1713,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1655,6 +1734,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1675,6 +1755,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1695,6 +1776,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1715,6 +1797,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1735,6 +1818,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1755,6 +1839,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1775,6 +1860,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1795,6 +1881,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1815,6 +1902,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1835,6 +1923,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1855,6 +1944,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1875,6 +1965,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1895,6 +1986,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1915,6 +2007,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1935,6 +2028,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1955,6 +2049,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1975,6 +2070,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1995,6 +2091,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         declared_dbf: DbfCode::Long,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2015,6 +2112,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2035,6 +2133,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2055,6 +2154,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2075,6 +2175,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2095,6 +2196,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2115,6 +2217,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2135,6 +2238,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2155,6 +2259,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::UShort,
         declared_dbf: DbfCode::UShort,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2175,6 +2280,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2195,6 +2301,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2215,6 +2322,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2231,10 +2339,32 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "CBAK",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void             *cbak"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Callback structure"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "PCOF",
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2255,6 +2385,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2275,6 +2406,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2295,6 +2427,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2315,6 +2448,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2335,6 +2469,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2355,6 +2490,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2375,6 +2511,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2395,6 +2532,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2415,6 +2553,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2435,6 +2574,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2455,6 +2595,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2475,6 +2616,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2495,6 +2637,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2515,6 +2658,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::UShort,
         declared_dbf: DbfCode::UShort,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2535,6 +2679,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2555,6 +2700,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2575,6 +2721,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2595,6 +2742,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2615,6 +2763,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2635,6 +2784,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2655,6 +2805,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -2675,6 +2826,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2695,6 +2847,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2715,6 +2868,7 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -2734,7 +2888,10 @@ pub static MOTOR_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(motor)` — the `DBF_NOACCESS` internal names dropped from
 /// [`MOTOR_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static MOTOR_NOACCESS: &[&str] = &["CBAK"];
+pub static MOTOR_NOACCESS: &[&str] = &[];
+
+/// `recordtype(motor)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static MOTOR_DBADDR: &[&str] = &[];
 
 /// `recordtype(motor)` — C's `papFldDes` order, all 176 declarations
 /// including the internals [`MOTOR_FIELDS`] drops. The index into this is
@@ -2777,6 +2934,15 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
     })
 }
 
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "motor" => MOTOR_DBADDR,
+        _ => return None,
+    })
+}
+
 /// Every field a record type declares, in C's `papFldDes` order — the order
 /// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`
 /// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`
@@ -2802,3 +2968,153 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["motor"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod motor {
+        use super::FieldSlot;
+        pub const VERS: FieldSlot = FieldSlot(0);
+        pub const OFF: FieldSlot = FieldSlot(1);
+        pub const FOFF: FieldSlot = FieldSlot(2);
+        pub const FOF: FieldSlot = FieldSlot(3);
+        pub const VOF: FieldSlot = FieldSlot(4);
+        pub const DIR: FieldSlot = FieldSlot(5);
+        pub const SET: FieldSlot = FieldSlot(6);
+        pub const SSET: FieldSlot = FieldSlot(7);
+        pub const SUSE: FieldSlot = FieldSlot(8);
+        pub const VELO: FieldSlot = FieldSlot(9);
+        pub const VBAS: FieldSlot = FieldSlot(10);
+        pub const VMAX: FieldSlot = FieldSlot(11);
+        pub const S: FieldSlot = FieldSlot(12);
+        pub const SBAS: FieldSlot = FieldSlot(13);
+        pub const SMAX: FieldSlot = FieldSlot(14);
+        pub const ACCL: FieldSlot = FieldSlot(15);
+        pub const ACCS: FieldSlot = FieldSlot(16);
+        pub const ACCU: FieldSlot = FieldSlot(17);
+        pub const BDST: FieldSlot = FieldSlot(18);
+        pub const BVEL: FieldSlot = FieldSlot(19);
+        pub const SBAK: FieldSlot = FieldSlot(20);
+        pub const BACC: FieldSlot = FieldSlot(21);
+        pub const FRAC: FieldSlot = FieldSlot(22);
+        pub const OUT: FieldSlot = FieldSlot(23);
+        pub const CARD: FieldSlot = FieldSlot(24);
+        pub const RDBL: FieldSlot = FieldSlot(25);
+        pub const DOL: FieldSlot = FieldSlot(26);
+        pub const OMSL: FieldSlot = FieldSlot(27);
+        pub const RLNK: FieldSlot = FieldSlot(28);
+        pub const SREV: FieldSlot = FieldSlot(29);
+        pub const UREV: FieldSlot = FieldSlot(30);
+        pub const MRES: FieldSlot = FieldSlot(31);
+        pub const ERES: FieldSlot = FieldSlot(32);
+        pub const RRES: FieldSlot = FieldSlot(33);
+        pub const UEIP: FieldSlot = FieldSlot(34);
+        pub const URIP: FieldSlot = FieldSlot(35);
+        pub const PREC: FieldSlot = FieldSlot(36);
+        pub const EGU: FieldSlot = FieldSlot(37);
+        pub const RHLM: FieldSlot = FieldSlot(38);
+        pub const RLLM: FieldSlot = FieldSlot(39);
+        pub const HLM: FieldSlot = FieldSlot(40);
+        pub const LLM: FieldSlot = FieldSlot(41);
+        pub const DHLM: FieldSlot = FieldSlot(42);
+        pub const DLLM: FieldSlot = FieldSlot(43);
+        pub const HOPR: FieldSlot = FieldSlot(44);
+        pub const LOPR: FieldSlot = FieldSlot(45);
+        pub const HLS: FieldSlot = FieldSlot(46);
+        pub const LLS: FieldSlot = FieldSlot(47);
+        pub const RHLS: FieldSlot = FieldSlot(48);
+        pub const RLLS: FieldSlot = FieldSlot(49);
+        pub const HIHI: FieldSlot = FieldSlot(50);
+        pub const LOLO: FieldSlot = FieldSlot(51);
+        pub const HIGH: FieldSlot = FieldSlot(52);
+        pub const LOW: FieldSlot = FieldSlot(53);
+        pub const HHSV: FieldSlot = FieldSlot(54);
+        pub const LLSV: FieldSlot = FieldSlot(55);
+        pub const HSV: FieldSlot = FieldSlot(56);
+        pub const LSV: FieldSlot = FieldSlot(57);
+        pub const HLSV: FieldSlot = FieldSlot(58);
+        pub const RDBD: FieldSlot = FieldSlot(59);
+        pub const SPDB: FieldSlot = FieldSlot(60);
+        pub const RCNT: FieldSlot = FieldSlot(61);
+        pub const RTRY: FieldSlot = FieldSlot(62);
+        pub const MISS: FieldSlot = FieldSlot(63);
+        pub const SPMG: FieldSlot = FieldSlot(64);
+        pub const LSPG: FieldSlot = FieldSlot(65);
+        pub const STOP: FieldSlot = FieldSlot(66);
+        pub const HOMF: FieldSlot = FieldSlot(67);
+        pub const HOMR: FieldSlot = FieldSlot(68);
+        pub const JOGF: FieldSlot = FieldSlot(69);
+        pub const JOGR: FieldSlot = FieldSlot(70);
+        pub const TWF: FieldSlot = FieldSlot(71);
+        pub const TWR: FieldSlot = FieldSlot(72);
+        pub const TWV: FieldSlot = FieldSlot(73);
+        pub const VAL: FieldSlot = FieldSlot(74);
+        pub const LVAL: FieldSlot = FieldSlot(75);
+        pub const DVAL: FieldSlot = FieldSlot(76);
+        pub const LDVL: FieldSlot = FieldSlot(77);
+        pub const RVAL: FieldSlot = FieldSlot(78);
+        pub const LRVL: FieldSlot = FieldSlot(79);
+        pub const RLV: FieldSlot = FieldSlot(80);
+        pub const LRLV: FieldSlot = FieldSlot(81);
+        pub const RBV: FieldSlot = FieldSlot(82);
+        pub const DRBV: FieldSlot = FieldSlot(83);
+        pub const DIFF: FieldSlot = FieldSlot(84);
+        pub const RDIF: FieldSlot = FieldSlot(85);
+        pub const CDIR: FieldSlot = FieldSlot(86);
+        pub const RRBV: FieldSlot = FieldSlot(87);
+        pub const RMP: FieldSlot = FieldSlot(88);
+        pub const REP: FieldSlot = FieldSlot(89);
+        pub const RVEL: FieldSlot = FieldSlot(90);
+        pub const DMOV: FieldSlot = FieldSlot(91);
+        pub const MOVN: FieldSlot = FieldSlot(92);
+        pub const MSTA: FieldSlot = FieldSlot(93);
+        pub const LVIO: FieldSlot = FieldSlot(94);
+        pub const TDIR: FieldSlot = FieldSlot(95);
+        pub const ATHM: FieldSlot = FieldSlot(96);
+        pub const PP: FieldSlot = FieldSlot(97);
+        pub const MIP: FieldSlot = FieldSlot(98);
+        pub const MMAP: FieldSlot = FieldSlot(99);
+        pub const NMAP: FieldSlot = FieldSlot(100);
+        pub const DLY: FieldSlot = FieldSlot(101);
+        pub const CBAK: FieldSlot = FieldSlot(102);
+        pub const PCOF: FieldSlot = FieldSlot(103);
+        pub const ICOF: FieldSlot = FieldSlot(104);
+        pub const DCOF: FieldSlot = FieldSlot(105);
+        pub const CNEN: FieldSlot = FieldSlot(106);
+        pub const INIT: FieldSlot = FieldSlot(107);
+        pub const PREM: FieldSlot = FieldSlot(108);
+        pub const POST: FieldSlot = FieldSlot(109);
+        pub const STOO: FieldSlot = FieldSlot(110);
+        pub const DINP: FieldSlot = FieldSlot(111);
+        pub const RINP: FieldSlot = FieldSlot(112);
+        pub const JVEL: FieldSlot = FieldSlot(113);
+        pub const JAR: FieldSlot = FieldSlot(114);
+        pub const LOCK: FieldSlot = FieldSlot(115);
+        pub const NTM: FieldSlot = FieldSlot(116);
+        pub const NTMF: FieldSlot = FieldSlot(117);
+        pub const HVEL: FieldSlot = FieldSlot(118);
+        pub const STUP: FieldSlot = FieldSlot(119);
+        pub const RMOD: FieldSlot = FieldSlot(120);
+        pub const ADEL: FieldSlot = FieldSlot(121);
+        pub const MDEL: FieldSlot = FieldSlot(122);
+        pub const ALST: FieldSlot = FieldSlot(123);
+        pub const MLST: FieldSlot = FieldSlot(124);
+        pub const SYNC: FieldSlot = FieldSlot(125);
+        pub const IGSET: FieldSlot = FieldSlot(126);
+        pub const RSTM: FieldSlot = FieldSlot(127);
+    }
+}
+
+/// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
+pub static DBD: epics_base_rs::server::record::ContributedDbd =
+    epics_base_rs::server::record::ContributedDbd {
+        record_types: RECORD_TYPES,
+        record_declaration_order,
+        record_fields,
+        record_no_prompt,
+        menus: MENUS,
+    };

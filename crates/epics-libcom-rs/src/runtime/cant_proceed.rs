@@ -16,7 +16,7 @@
 //! knob that is read in one place cannot drift that way.
 
 use crate::runtime::env_table::EPICS_ABORT_ON_ASSERT;
-use crate::runtime::log::{errlog_flush, errlog_printf};
+use crate::runtime::log::{errlog_flush, errlog_printf, errlog_vprintf};
 use crate::runtime::task;
 
 /// What a thread that cannot proceed does once it has logged.
@@ -59,8 +59,8 @@ pub fn fatal_action() -> FatalAction {
 /// it is what gets the bytes onto a slow serial console ahead of `abort()`.
 pub fn cant_proceed(msg: &str) -> ! {
     let action = fatal_action();
-    errlog_printf(&format!("{msg}\n"));
-    errlog_printf(&format!(
+    errlog_vprintf(format_args!("{msg}\n"));
+    errlog_vprintf(format_args!(
         "CRITICAL ERROR Thread {} can't proceed, {}.\n",
         std::thread::current().name().unwrap_or("noname"),
         match action {

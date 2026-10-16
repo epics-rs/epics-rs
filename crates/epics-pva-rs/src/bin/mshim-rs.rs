@@ -35,7 +35,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 
 use clap::Parser;
-use epics_base_rs::net::IfaceMap;
+use epics_base_rs::net::{IfaceMap, PortOrigin, PortUse};
 use epics_pva_rs::cli;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
@@ -142,11 +142,6 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
 
 fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        let _ = sock.set_reuse_port(true);
-    }
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
     // Multicast groups must bind 0.0.0.0; unicast/broadcast bind to
@@ -156,7 +151,7 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     } else {
         SocketAddr::new(ep.ip, ep.port)
     };
-    sock.bind(&bind_addr.into())?;
+    PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
     if let IpAddr::V4(v4) = ep.ip
         && v4.is_multicast()
     {
@@ -254,8 +249,7 @@ async fn main() {
     let default_port = args
         .port
         .or_else(|| {
-            std::env::var("EPICS_PVA_BROADCAST_PORT")
-                .ok()
+            epics_base_rs::runtime::env::get_lossy("EPICS_PVA_BROADCAST_PORT")
                 // pvxs-compatible port parse (uint64 + low-16 truncate,
                 // whitespace-tolerant) instead of a strict u16 parse.
                 .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s))
@@ -512,12 +506,11 @@ async fn futures_join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
 /// mshim.
 #[cfg(exec_backend)]
 fn main() -> std::process::ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mshim-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the UDP forwarder needs a \
-         tokio reactor. Unset that variable and rebuild."
-    );
-    std::process::ExitCode::FAILURE
+         tokio reactor. Unset that variable and rebuild.",
+    )
 }
 
 #[cfg(test)]

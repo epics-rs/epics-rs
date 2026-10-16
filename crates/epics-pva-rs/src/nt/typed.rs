@@ -310,7 +310,8 @@ pub mod __rt {
     fn enum_display_desc() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: String::new(),
-            fields: ::std::vec![("description".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: ::std::vec![("description".into(), FieldDesc::Scalar(ScalarType::String))]
+                .into(),
         }
     }
 
@@ -450,7 +451,8 @@ fn nt_scalar_root(value_field: FieldDesc) -> FieldDesc {
         fields: __rt::ensure_nt_meta_desc(
             "epics:nt/NTScalar:1.0",
             vec![("value".into(), value_field)],
-        ),
+        )
+        .into(),
     }
 }
 
@@ -557,7 +559,8 @@ fn nt_scalar_array_root(elem_type: crate::pvdata::ScalarType) -> FieldDesc {
         fields: __rt::ensure_nt_meta_desc(
             "epics:nt/NTScalarArray:1.0",
             vec![("value".into(), FieldDesc::ScalarArray(elem_type))],
-        ),
+        )
+        .into(),
     }
 }
 
@@ -665,14 +668,16 @@ impl TypedNT for EnumValue {
                     "choices".into(),
                     FieldDesc::ScalarArray(crate::pvdata::ScalarType::String),
                 ),
-            ],
+            ]
+            .into(),
         };
         FieldDesc::Structure {
             struct_id: "epics:nt/NTEnum:1.0".into(),
             fields: __rt::ensure_nt_meta_desc(
                 "epics:nt/NTEnum:1.0",
                 vec![("value".into(), value_field)],
-            ),
+            )
+            .into(),
         }
     }
 

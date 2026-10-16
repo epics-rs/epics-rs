@@ -309,9 +309,13 @@ async fn test_shutdown_cleanup() {
     mgr.shutdown();
 
     // Should complete within a reasonable time
-    epics_base_rs::runtime::task::timeout(Duration::from_secs(2), handle)
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
         .await
-        .expect("shutdown timed out")
+        .expect("shutdown never completed")
         .unwrap();
 }
 
@@ -371,4 +375,88 @@ async fn test_empty_pv_list_is_refused() {
         !sav_path.exists(),
         "nothing may be written for an empty set"
     );
+}
+
+/// A shutdown that lands before the set tasks have subscribed still ends
+/// them: under load the outer task `start` spawns can run after it.
+#[epics_macros_rs::epics_test]
+async fn a_shutdown_before_the_tasks_run_still_ends_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .status_prefix("T:")
+            .add_set(SaveSetConfig {
+                name: "early".into(),
+                save_path: dir.path().join("early.sav"),
+                strategy: SaveStrategy::Periodic {
+                    interval: Duration::from_millis(50),
+                },
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                search_paths: Vec::new(),
+            })
+            .build()
+            .await,
+    );
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
+    mgr.shutdown();
+    // The event is the outer join resolving: every set task has finished its
+    // in-flight save (a tmp write, `sync_all`, rename, directory sync) and
+    // seen the stop. That save is not cancelled, so its length is the disk's;
+    // the ceiling only catches a task that never stops.
+    epics_base_rs::runtime::task::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("shutdown never completed")
+        .unwrap();
+}
+
+/// A server's teardown aborts the task `start` returned and never calls
+/// `shutdown`: when that task held the last manager, the sender drops
+/// without sending `true`, and the set task must end on that too.
+#[epics_macros_rs::epics_test]
+async fn a_set_task_ends_when_the_manager_drops_without_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup_db().await;
+    let mgr = Arc::new(
+        AutosaveBuilder::new()
+            .add_set(SaveSetConfig {
+                name: "dropped".into(),
+                save_path: dir.path().join("dropped.sav"),
+                strategy: SaveStrategy::Periodic {
+                    interval: Duration::from_millis(50),
+                },
+                request_file: None,
+                request_pvs: vec!["TEMP".into()],
+                backup: quick_backup(),
+                macros: HashMap::new(),
+                search_paths: Vec::new(),
+            })
+            .build()
+            .await,
+    );
+    let set = Arc::downgrade(&mgr.sets()[0].0);
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    handle.abort();
+    drop(mgr);
+    // The set task owns the last reference to its set.
+    let start = std::time::Instant::now();
+    while set.strong_count() != 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the set task outlived its manager"
+        );
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+    }
 }

@@ -40,6 +40,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use epics_base_rs::runtime::task::Reactor;
+use epics_base_rs::types::RecordName;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
@@ -959,7 +960,8 @@ impl ChannelCache {
         let addr =
             epics_base_rs::runtime::task::timeout(connect_timeout, self.client.pvconnect(pv_name))
                 .await
-                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
+                .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))?
+                .map_err(GwError::Upstream)?;
         // Record / refresh the connection admission (poked recent).
         self.entries
             .lock()
@@ -1113,8 +1115,8 @@ impl ChannelCache {
                                 // upstream changedBitSet verbatim). `overrun`
                                 // is filled later by `subscribe_inner` on lag.
                                 let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
-                                    value: val,
-                                    marked: outcome.marked,
+                                    value: val.into(),
+                                    marked: outcome.marked.map(Into::into),
                                     type_changed: false,
                                     overrun: Vec::new(),
                                 });
@@ -1487,7 +1489,7 @@ impl ChannelCache {
         let Some(inv) = self.invalidator.get() else {
             return;
         };
-        let batch: Arc<[String]> = names.into_iter().collect();
+        let batch: Arc<[RecordName]> = names.into_iter().map(RecordName::from).collect();
         inv.publish(batch);
     }
 
@@ -1823,7 +1825,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1865,7 +1868,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");
@@ -1921,7 +1925,8 @@ mod tests {
             fields: vec![
                 ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
-            ],
+            ]
+            .into(),
         };
         let full = |a: i32, b: i32| {
             let mut s = epics_pva_rs::pvdata::PvStructure::new("");

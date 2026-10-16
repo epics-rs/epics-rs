@@ -66,16 +66,19 @@ async fn an_ai_with_no_dset_seeds_no_tracker() {
 
 /// The SAME record type with device support present runs the whole tail. This
 /// is the half a per-cell patch gets wrong: the seed is not deleted, it is
-/// conditional on reaching it.
+/// conditional on reaching it. The dset must lack `init_record`, which returns
+/// before the seed (`aiRecord.c:121-128`); softIoc reads 1.5 here and 0 for
+/// Soft Channel.
 #[epics_macros_rs::epics_test]
-async fn an_ai_with_a_soft_channel_seeds_its_trackers() {
-    let db = ioc("record(ai, \"T:S\") { field(DTYP,\"Soft Channel\") field(VAL,\"1.5\") }\n").await;
+async fn an_ai_with_a_dset_reaching_the_tail_seeds_its_trackers() {
+    let db =
+        ioc("record(ai, \"T:S\") { field(DTYP,\"Soft Timestamp\") field(VAL,\"1.5\") }\n").await;
 
     for field in ["MLST", "ALST", "LALM"] {
         assert_eq!(
             f64_of(&db, &format!("T:S.{field}")),
             1.5,
-            "a dset C always links reaches `aiRecord.c:127-129`"
+            "devTimestampAI has no init_record and reaches `aiRecord.c:129-131`"
         );
     }
 }

@@ -87,7 +87,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Resolve the global chaos config, parsing the env once.
 pub fn config() -> &'static ChaosConfig {
     CONFIG.get_or_init(
-        || match epics_base_rs::runtime::env::get("EPICS_CA_RS_CHAOS") {
+        || match epics_base_rs::runtime::env::get_lossy("EPICS_CA_RS_CHAOS") {
             Some(s) => ChaosConfig::from_env_str(&s),
             None => ChaosConfig::default(),
         },

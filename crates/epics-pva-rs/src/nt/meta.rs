@@ -13,7 +13,8 @@ pub fn alarm_desc() -> FieldDesc {
             ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("message".into(), FieldDesc::Scalar(ScalarType::String)),
-        ],
+        ]
+        .into(),
     }
 }
 
@@ -42,7 +43,8 @@ pub fn time_desc() -> FieldDesc {
             ),
             ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
-        ],
+        ]
+        .into(),
     }
 }
 

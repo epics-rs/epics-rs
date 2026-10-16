@@ -1,0 +1,16 @@
+[package]
+name = "raw-ca"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: a raw-socket CA client for epics-ca-rs's blocking front-end suites"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest.
+publish = false
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true }
+fact-budget = { path = "../fact-budget" }

@@ -31,7 +31,7 @@ fn golden_pvxs_struct_array_two_present() {
     // 2-element StructA where each element is `structure { int32 v }`.
     let desc = FieldDesc::StructureArray {
         struct_id: String::new(),
-        fields: vec![("v".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+        fields: vec![("v".to_string(), FieldDesc::Scalar(ScalarType::Int))].into(),
     };
     let arr = PvField::StructureArray(vec![
         Some(PvStructure {

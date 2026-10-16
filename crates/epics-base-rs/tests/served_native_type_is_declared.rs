@@ -20,8 +20,8 @@
 //! port and the fixture disagree, the port is wrong.
 
 use epics_base_rs::server::db_loader::create_record;
-use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::server::record::dbd_generated::record_fields;
+use epics_base_rs::server::record::{FieldDeclaration, RecordInstance};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const ORACLE: &str = include_str!("fixtures/c_native_types.tsv");
@@ -51,10 +51,14 @@ fn oracle_rows() -> impl Iterator<Item = (&'static str, &'static str, &'static s
         })
 }
 
-/// The CA native type the port would announce for `value` — the same
-/// `value.dbr_type().ca_wire_type()` the create-channel handler sends in the
-/// `CREATE_CHAN` reply.
-fn served_code(value: &EpicsValue) -> u16 {
+/// The CA native type the port would announce for `field` serving `value` —
+/// what the create-channel handler sends in the `CREATE_CHAN` reply: a
+/// long-string field's scalar `DBR_STRING` address, else
+/// `value.dbr_type().ca_wire_type()`.
+fn served_code(inst: &RecordInstance, field: &str, value: &EpicsValue) -> u16 {
+    if inst.record.field_is_long_string(field) {
+        return epics_base_rs::types::DbFieldType::String.ca_wire_type();
+    }
     value.dbr_type().ca_wire_type()
 }
 
@@ -110,7 +114,7 @@ fn create_channel_announces_the_declared_type() {
             continue;
         };
         let want = ca_code(c_native).unwrap_or_else(|| panic!("{record}.{field}: {c_native}?"));
-        let got = served_code(&value);
+        let got = served_code(&inst, field, &value);
         if got != want {
             wrong.push(format!(
                 "{record}.{field}: C serves {c_native} (code {want}), \
@@ -154,30 +158,23 @@ fn get_and_monitor_serve_what_create_channel_announced() {
         ) else {
             continue;
         };
-        let announced = served_code(&announced);
-        if served_code(&get.value) != announced {
+        let announced = served_code(&inst, field, &announced);
+        if served_code(&inst, field, &get.value) != announced {
             disagree.push(format!(
                 "{record}.{field}: create-channel says {announced}, GET serves {} ({:?})",
-                served_code(&get.value),
+                served_code(&inst, field, &get.value),
                 get.value
             ));
         }
-        // The monitor path, fed the raw stored variant the record would post.
+        // The monitor path: a post's log projects the raw stored variant.
         let Some(stored) = inst.resolve_field(field) else {
             continue;
         };
-        let posted = inst
-            .make_monitor_snapshot(
-                field,
-                stored,
-                epics_base_rs::server::database::LinkBacking::none(),
-            )
-            .expect("nothing was declined: the backing is unresolved, not declined");
-        if served_code(&posted.value) != announced {
+        let posted = inst.project_to_declared_type(field, stored);
+        if served_code(&inst, field, &posted) != announced {
             disagree.push(format!(
-                "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({:?})",
-                served_code(&posted.value),
-                posted.value
+                "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({posted:?})",
+                served_code(&inst, field, &posted),
             ));
         }
     }

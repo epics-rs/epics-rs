@@ -347,6 +347,11 @@ fn every_declared_field_is_served() {
         let inst = RecordInstance::new_boxed(format!("T:{record_type}"), rec);
 
         for f in fields {
+            // A pointer member C resolves as a name and refuses to read
+            // (`dbAccess.c:667-675`): there is no value to serve.
+            if f.unreadable() {
+                continue;
+            }
             checked += 1;
             let name = format!("{record_type}.{}", f.name);
             if inst.client_field_value(f.name).is_none() && !KNOWN_UNSERVED.contains(&name.as_str())

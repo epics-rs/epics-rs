@@ -78,6 +78,7 @@ struct Unlocked {
 }
 
 impl NDPluginProcess for Unlocked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let acc = burn(array);
         *self.sink.lock() = acc;
@@ -98,6 +99,7 @@ struct Locked {
 }
 
 impl NDPluginProcess for Locked {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut sink = self.sink.lock();
         *sink = burn(array);
@@ -217,6 +219,7 @@ fn measure_pool_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&unlocked, &frames, 1); // warm up: thread spawn, first-touch page faults
     let u1 = drive(&unlocked, &frames, 1);
@@ -231,6 +234,7 @@ fn measure_pool_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&locked, &frames, 1);
     let l1 = drive(&locked, &frames, 1);
@@ -270,6 +274,7 @@ fn measure_shipped_plugin_throughput() {
         "",
         wiring.clone(),
         &ts_registry,
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     let sp = stats.port_runtime().port_handle();
     sp.write_int32_blocking(stats_params.compute_statistics, 0, 1)
@@ -286,8 +291,14 @@ fn measure_shipped_plugin_throughput() {
     ));
 
     // C releases at NDPluginROI.cpp:140.
-    let (roi, roi_params, _j) =
-        create_roi_runtime("POOL_ROI", pool.clone(), QUEUE, "", wiring.clone());
+    let (roi, roi_params, _j) = create_roi_runtime(
+        "POOL_ROI",
+        pool.clone(),
+        QUEUE,
+        "",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     let rp = roi.port_runtime().port_handle();
     // An unconfigured ROI extracts nothing, which measures nothing.
     for (dim, extent) in [(0, WIDTH), (1, HEIGHT)] {
@@ -321,6 +332,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&roi_stat, &frames, 1);
     rows.push((
@@ -342,6 +354,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&codec, &frames, 1);
     rows.push((
@@ -368,6 +381,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&bad_pixel, &frames, 1);
     rows.push((
@@ -384,6 +398,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&transform, &frames, 1);
     rows.push((
@@ -400,6 +415,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&fft, &frames, 1);
     rows.push(("FFT", drive(&fft, &frames, 1), drive(&fft, &frames, 4)));
@@ -420,6 +436,7 @@ fn measure_shipped_plugin_throughput() {
         QUEUE,
         "",
         wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
     drive(&process, &frames, 1);
     rows.push((
@@ -445,8 +462,15 @@ fn measure_shipped_plugin_throughput() {
         c.file_base.auto_increment = true;
         c.file_base.set_mode(NDFileMode::Single);
     }
-    let (tiff, _j) =
-        create_plugin_runtime("POOL_TIFF", tiff, pool.clone(), QUEUE, "", wiring.clone());
+    let (tiff, _j) = create_plugin_runtime(
+        "POOL_TIFF",
+        tiff,
+        pool.clone(),
+        QUEUE,
+        "",
+        wiring.clone(),
+        ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+    );
     drive(&tiff, &frames, 1);
     let held = (
         "TIFF file (ctrl held)",

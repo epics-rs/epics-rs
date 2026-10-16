@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.32.0 — 2026-10-15
+
+Minor release, on the same 1.99.0 toolchain. The record cycle, its monitor
+post and the CA event path are rebuilt to C's shape, and every database
+serves its own local CA links. The breaking changes:
+`IocApplication::register_link_set_installer` becomes
+`register_link_type(key, installer)`, one link set per JSON link type per
+database; `DeviceSupport`'s `WriteCompletion` gives way to `WriteDone`;
+`CommonFields::time` and `general_time` are a `WallTime`; the process-wide
+`scan_pause`/`scan_run`/`scan_stop` are gone, each database owning its own
+interruptAccept gate; `CaChannel::on_connection_change`,
+`on_access_rights_change` and `EventWatcher` give way to
+`create_channel_with_events`, and CA names are bytes; asyn's `*_blocking`
+helpers are gone and `subscribe_async` returns a per-subscriber ring
+instead of a tokio broadcast; `PriorityInheritanceMutex` is the movable
+form, with `PinnedPriorityInheritanceMutex` beside it; and
+`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`;
+`DeviceInitOutcome::Live` splits into `Ok(DeviceUdf)` (C status 0) and
+`DoNotConvert(DeviceUdf)` (C 2), with `DeviceInitOutcome::ok()` as the
+default init's value.
+
+### A monitored IOC's realtime tail at C's
+
+A 2001-record IOC with monitors, under SCHED_FIFO on a PREEMPT_RT host,
+now wakes late as often as C softIoc: over 35 interleaved 60 s rounds the
+count of wakes past 300 us and the p99 do not differ from C's, and the
+mean is 5% above. The cycle takes a `CyclePlan` arm per record shape,
+reads a soft INP at its dset's DBR type off a cached link address, posts
+a fixed `PostLog` into the event queue's ring through a name-keyed
+subscriber list, and prefetches the next record's cycle lines. A CA
+client's updates go out as one send per queue drain, not one per event.
+The release profile is fat LTO with one codegen unit.
+
+### Local CA, CP and CPP links in base
+
+As C keeps dbCa and dbContext in base, `PvDatabase::new` registers a
+`CaLinks` set that resolves a link to a local record with no network;
+registering the `ca` link set adds only libca's network half, which is
+all `calink` now holds. `dbChannel_create`, put and `add_event` live in
+the database layer, shared by the in-process link and rsrv, and a link
+put of a `pva` link opens and drops the channel through its link set.
+
+### PVA interface list and beacons as pvxs
+
+The server expands its interface list once, as pvxs `Config::expand`,
+and binds each entry on its own port. Beacons go from an unbound socket
+to the expanded destinations; the collector joins the beacon groups and
+routes by listener. The v6 search socket binds the v4 number, a
+broadcast port of 0 gets its per-NIC receive sockets, and a datagram's
+arrival address is read through one owner on every platform, so a group
+SEARCH is no longer dropped off Linux. A panicking source no longer
+takes its client's connection down.
+
+### Records, links and asyn against C
+
+Link field text is held as given, so a Latin-1 target resolves. Calc
+programs compile to C's postfix bytes. Soft-input, deadband-tracker,
+simulation-stamp and post order follow C record by record (ai, bi,
+mbbi/mbbiDirect, mbboDirect, printf, lsi/lso, sseq, acalcout, scaler,
+epid, throttle, table, asyn, motor, mca), with tests that compare the
+records' posts with softIoc's and the std/calc oracle IOCs'. asyn's
+request queue keeps C's states: a disabled or disconnected port refuses
+at queueRequest and parks what is already queued, and `cancelRequest`
+unlinks and reports as C's does. Every port gets its owner gate at
+`register_port`. An asyn output whose dset reads the driver back at init
+converts RVAL and comes up defined, as C's status 0 does. modbus keeps
+its I/O statistics in the param library, set by each I/O and posted only
+through the generic write, and a data write sets no param, as
+drvModbusAsyn does. A port with maxAddr above 1 is multi-device, as
+asynPortDriver forces it; `PortDriverBase::new_exact_flags` keeps the
+attributes a driver's own `registerPort` gives. mqtt moves to
+rumqttc-v5-next 0.34 and keeps paho's connect timeout, reconnect backoff
+and per-request success and failure lines. motorSim reports C's status
+bits, and the motor poller runs on its own thread with no ambient tokio
+runtime.
+
+### SCHED_FIFO thread banding is on by default, under C's switch
+
+IOC threads now ask for SCHED_FIFO by default on every target, as C's do.
+`EPICS_ALLOW_POSIX_THREAD_PRIORITY_SCHEDULING` is the switch: unset means
+`YES` (`configure/CONFIG_ENV`), and only a case-insensitive `yes` turns it on,
+so `NO` or an empty value turns it off. `EPICS_RS_ALLOW_RT_PRIORITY`, the
+earlier opt-in, is still read, but only when C's variable is unset. Where the
+process may not use SCHED_FIFO (no `RLIMIT_RTPRIO`, no `CAP_SYS_NICE`), threads
+fall back to the default policy silently, as C's do; the once-per-process
+warning is gone.
+
 ## v0.31.0 — 2026-10-06
 
 Minor release. **The pinned toolchain moves 1.94.0 -> 1.99.0**, which
@@ -4125,11 +4212,13 @@ layer-by-layer code review across `pva-rs`, `ca-rs`, and `bridge-rs`.
   `configureChannelAccessAddressList`).
 - `casr` iocsh command (RSRV `casr` analog) on `epics_ca_rs::server::iocsh`,
   reading from `Arc<ServerStats>` (connects/disconnects/uptime).
-- `Channel::on_access_rights_change(cb)` callback wrapper.
+- `Channel::on_access_rights_change(cb)` callback wrapper (removed at
+  `ecf39866d`).
 
 **Round 2 (commit `007346e`)**
 - `Channel::on_connection_change(cb)` — libca `ca_change_connection_event`
   analog. Filters Connected / Disconnected events from the broadcast.
+  Removed at `ecf39866d`.
 - `Channel::host_name()` — libca `ca_host_name` analog returning the
   resolved server address.
 - `Channel::receive_watchdog_delay() -> Duration` — libca

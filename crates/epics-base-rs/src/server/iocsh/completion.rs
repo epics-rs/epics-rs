@@ -172,9 +172,11 @@ impl IocshCompleter {
     /// `dbNextRecord` iterate `precordType->recList`
     /// (`dbStaticLib.c:1584-1609`), which holds the alias nodes too.
     fn record_names(&self) -> Vec<String> {
+        // Completion matches the line's text, so a name that is not UTF-8
+        // offers its lossy form.
         let mut names = self.bridge.block_on(self.db.all_record_names());
         names.extend(self.db.all_alias_names());
-        names
+        names.iter().map(|n| n.to_string()).collect()
     }
 
     fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<String>) {

@@ -118,7 +118,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
     let resolver = CaLinkResolver::with_client(Arc::new(client));
     assert!(
         resolver
-            .wait_for_link_connected(PV, budget::FACT_BUDGET)
+            .wait_for_link_connected(PV, fact_budget::FACT_BUDGET)
             .await,
         "READ is granted to everyone, so the link must connect whatever \
          the write right is"
@@ -129,9 +129,9 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
 /// The rights frame follows the create-channel reply, so poll rather than
 /// racing it. Returns the admission actually observed at the deadline.
 async fn admission_settling_to(resolver: &CaLinkResolver, want: PutAdmission) -> PutAdmission {
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        let got = LinkSet::put_admission(resolver, PV);
+        let got = LinkSet::put_admission(resolver, PV.as_bytes());
         if got == want || Instant::now() >= deadline {
             return got;
         }
@@ -212,16 +212,66 @@ async fn a_connected_but_write_denied_link_is_refused() {
         "C refuses on `!pca->hasWriteAccess` alone (dbCa.c:529-532)"
     );
     assert!(
-        LinkSet::is_connected(&resolver, PV),
+        LinkSet::is_connected(&resolver, PV.as_bytes()),
         "and it is refused while CONNECTED — the read half is untouched, \
          which is why testing `is_connected` alone admitted it"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
         "a write-denied link still serves its value to dbCaGetLink"
+    );
+}
+
+/// The resolver's rights come from the events its watcher receives, so the
+/// receiver must exist before the channel can connect. Both arms read only
+/// after the connect is OVER: `wait_connected` wakes on the state change,
+/// and a second `WaitConnected` is answered by the coordinator after the
+/// handler that sent `AccessRightsChanged` + `Connected` has returned. The
+/// receiver made with the channel holds both; one taken then — what a
+/// preempted `open` used to do — holds neither, and its write right stayed
+/// at the default `true`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn a_receiver_taken_with_the_channel_keeps_a_connect_it_lost_the_race_to() {
+    use epics_base_rs::runtime::sync::broadcast::error::TryRecvError;
+    use epics_ca_rs::client::ConnectionEvent;
+    let port = serve_acf_pv().await;
+    pin_env(port);
+    let client = CaClient::new_with_config(CaClientConfig::default())
+        .await
+        .expect("CA client");
+    client.set_host_name(DENIED_HOST);
+    let (channel, mut with_channel) = client.create_channel_with_events(PV, 0);
+    for _ in 0..2 {
+        channel
+            .wait_connected(fact_budget::FACT_BUDGET)
+            .await
+            .expect("READ is granted to everyone");
+    }
+    let mut late = channel.connection_events();
+
+    let mut next = async || {
+        tokio::time::timeout(fact_budget::FACT_BUDGET, with_channel.recv())
+            .await
+            .expect("the receiver made with the channel holds the connect")
+            .ok()
+    };
+    assert_eq!(
+        next().await,
+        Some(ConnectionEvent::AccessRightsChanged {
+            read: true,
+            write: false
+        }),
+        "the ACF's WRITE rule names a HAG this client is not in"
+    );
+    assert_eq!(next().await, Some(ConnectionEvent::Connected));
+    assert_eq!(
+        late.try_recv(),
+        Err(TryRecvError::Empty),
+        "a receiver taken after the connect holds neither event"
     );
 }
 
@@ -244,13 +294,18 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
     );
 
     use epics_base_rs::server::database::LinkPutOp;
-    LinkSet::put_value(&resolver, PV, EpicsValue::Double(42.0), LinkPutOp::Plain)
-        .await
-        .expect("an admitted write must reach the wire");
+    LinkSet::put_value(
+        &resolver,
+        PV.as_bytes(),
+        EpicsValue::Double(42.0),
+        LinkPutOp::Plain,
+    )
+    .await
+    .expect("an admitted write must reach the wire");
 
-    let deadline = Instant::now() + budget::FACT_BUDGET;
+    let deadline = Instant::now() + fact_budget::FACT_BUDGET;
     loop {
-        if LinkSet::get_value(&resolver, PV)
+        if LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64())
             == Some(42.0)
@@ -288,7 +343,7 @@ async fn a_plain_out_write_to_a_write_denied_link_alarms_the_record() {
         "C refuses BEFORE addAction, so nothing is staged at all"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
@@ -323,13 +378,10 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
         "nothing staged, so no completion was ever owed"
     );
     assert_eq!(
-        LinkSet::get_value(&resolver, PV)
+        LinkSet::get_value(&resolver, PV.as_bytes())
             .await
             .and_then(|v| v.to_f64()),
         Some(REST),
         "and the upstream PV keeps its value"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

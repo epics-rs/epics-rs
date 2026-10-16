@@ -66,11 +66,8 @@ pub(crate) fn d2ui(x: f64) -> u32 {
 /// C's plain `(int)` / `(epicsInt32)` cast of a double.
 ///
 /// In range it truncates toward zero. Out of range (and for NaN/±Inf) the C
-/// standard calls it **undefined**, so a compiled C IOC is not single-valued:
-/// x86-64's `cvttsd2si` stores the "integer indefinite" `INT32_MIN`, while
-/// aarch64's `fcvtzs` saturates to `INT32_MAX` and sends NaN to 0. Since UB is
-/// not a contract, the port takes the clean value and **saturates** — see
-/// [`crate::types::c_cast`] for the decision (CBUG-E2) and the disassembly.
+/// standard calls it undefined; the port takes x86-64's `cvttsd2si` value, the
+/// "integer indefinite" `INT32_MIN` — see [`crate::types::c_cast`].
 ///
 /// Either way it differs from [`d2i`]'s wrap, which is the bug this module's
 /// split exists to prevent: `d2i` routes a non-negative double through
@@ -215,14 +212,13 @@ mod tests {
         // This is base's macro and is NOT the UB cast — it stays exactly as C.
         assert_eq!(d2i(3e9), -1_294_967_296);
         // The plain cast has no such route: 3e9 is out of `i32` range, and there
-        // it saturates (CBUG-E2) rather than taking x86's undefined `INT32_MIN`.
-        assert_eq!(c_int(3e9), i32::MAX);
+        // it is x86's `INT32_MIN`.
+        assert_eq!(c_int(3e9), i32::MIN);
         assert_eq!(c_long(3e9), 3_000_000_000);
     }
 
     /// The narrowing is inside C's macro — that placement is what this pins, and
-    /// it is unchanged. The out-of-range VALUE is the saturating one (CBUG-E2),
-    /// not x86's `INT32_MIN`; an aarch64 IOC agrees with us.
+    /// it is unchanged. The out-of-range VALUE is x86's `INT32_MIN`.
     #[test]
     fn my_nint_rounds_then_casts_at_c_width() {
         assert_eq!(my_nint(2.5), 3);
@@ -230,11 +226,11 @@ mod tests {
         assert_eq!(my_nint(2.4), 2);
         assert_eq!(my_nint(-2.4), -2);
         assert_eq!(my_nint(0.0), 0);
-        // Out of int32 range: saturate at the bound of the sign that overflowed.
-        assert_eq!(my_nint(3e9), i32::MAX);
+        // Out of int32 range: x86-64's integer indefinite, either sign.
+        assert_eq!(my_nint(3e9), i32::MIN);
         assert_eq!(my_nint(-3e9), i32::MIN);
-        assert_eq!(my_nint(1e18), i32::MAX);
-        assert_eq!(my_nint(f64::NAN), 0);
+        assert_eq!(my_nint(1e18), i32::MIN);
+        assert_eq!(my_nint(f64::NAN), i32::MIN);
         // The rounding happens BEFORE the cast, so INT32_MAX still fits.
         assert_eq!(my_nint(2147483647.0), i32::MAX);
         // Still not d2i: base's bitwise wrap would say -1294967296.
@@ -248,18 +244,17 @@ mod tests {
         assert_eq!(d2ui(-1.0), 0xFFFF_FFFF);
     }
 
-    /// The plain casts saturate, and NaN converts to 0 (CBUG-E2). x86-64's
-    /// `cvttsd2si` would answer `INT32_MIN`/`INT64_MIN` to every line below;
-    /// that value is UB and we do not store it.
+    /// The plain casts are x86-64's `cvttsd2si`: `INT32_MIN`/`INT64_MIN` for
+    /// NaN, infinities and everything out of range.
     #[test]
-    fn c_casts_saturate_and_send_nan_to_zero() {
-        assert_eq!(c_int(f64::NAN), 0);
-        assert_eq!(c_int(f64::INFINITY), i32::MAX);
+    fn c_casts_are_the_x86_64_integer_indefinite() {
+        assert_eq!(c_int(f64::NAN), i32::MIN);
+        assert_eq!(c_int(f64::INFINITY), i32::MIN);
         assert_eq!(c_int(f64::NEG_INFINITY), i32::MIN);
-        assert_eq!(c_long(f64::NAN), 0);
-        assert_eq!(c_long(1e300), i64::MAX);
+        assert_eq!(c_long(f64::NAN), i64::MIN);
+        assert_eq!(c_long(1e300), i64::MIN);
         // The 2^63 boundary: representable as f64 and NOT representable as i64.
-        assert_eq!(c_long(9223372036854775808.0), i64::MAX);
+        assert_eq!(c_long(9223372036854775808.0), i64::MIN);
         assert_eq!(c_long(-9223372036854775808.0), i64::MIN);
     }
 }

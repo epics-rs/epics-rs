@@ -28,9 +28,8 @@ pub enum SoftDtyp {
     /// DBR_DOUBLE, &oval, 1)` with a synchronous `dbPutLink` fallback when the
     /// link has no LSET (`devAoSoftCallback.c:41-54`), and `read_ai` returns 2
     /// on every terminal path (`devAiSoftCallback.c:167-216`) after
-    /// `dbProcessNotify` has put the link's value straight into VAL. This port
-    /// applies the link synchronously, so the observable difference is PACT
-    /// timing, not the value.
+    /// `dbProcessNotify` on INP has completed. The output side still applies
+    /// its link synchronously.
     Async,
 }
 
@@ -57,6 +56,121 @@ pub fn classify_soft(dtyp: &str) -> Option<SoftDtyp> {
     }
 }
 
+/// C `prec->dpvt` as the soft dsets use it, handed to the record's soft dset
+/// entry ([`Record::soft_input_read`]) as C hands `prec` to `read_xxx`.
+///
+/// A device-link put replaces it whole (`dbAccess.c:1192`), so per-link soft
+/// state lives here and not on the record.
+#[derive(Debug, Default)]
+pub enum Dpvt {
+    /// NULL.
+    #[default]
+    Null,
+    /// `devAiSoft.c:88`'s `prec->dpvt = &devAiSoft`: a read has completed.
+    Read,
+    /// The devPvt a `devXxxSoftCallback` `add_record` allocates
+    /// (`devAiSoftCallback.c:104-125`); a put that re-runs it gets a new one.
+    Callback(Box<CallbackPvt>),
+    /// `devEpidSoftCallback.c:143-145`'s `pepid->pact = TRUE`: the CA
+    /// readback trigger is in flight, and the callback pass runs the PID
+    /// instead of firing it again.
+    Triggered,
+}
+
+/// A `devXxxSoftCallback` `devPvt`; its notify is the record's async re-entry
+/// token, cancelled when a device-link put retires it.
+#[derive(Debug, Default)]
+pub struct CallbackPvt {
+    /// `devAiSoftCallback.c`'s `smooth`.
+    smooth: bool,
+    /// `devBiSoftCallback.c`/`devMbbiSoftCallback.c`'s `buffer.value`,
+    /// written only by a conversion that stores.
+    buffer: u16,
+    /// The notified target as the completion's `getCallback` read it.
+    notified: Option<Box<crate::server::database::NotifiedRead>>,
+}
+
+impl Dpvt {
+    /// The `SMOO` blend's "VAL holds a previous reading": `devAiSoft`'s
+    /// `prec->dpvt != NULL`, `devAiSoftCallback`'s `smooth`.
+    #[inline(always)]
+    pub fn smooth(&self) -> bool {
+        match self {
+            Self::Null | Self::Triggered => false,
+            Self::Read => true,
+            Self::Callback(pvt) => pvt.smooth,
+        }
+    }
+
+    /// The read succeeded (`devAiSoft.c:88`, `devAiSoftCallback.c:194`).
+    #[inline(always)]
+    pub fn read_done(&mut self) {
+        match self {
+            Self::Callback(pvt) => pvt.smooth = true,
+            other => *other = Self::Read,
+        }
+    }
+
+    /// The read failed (`devAiSoft.c:92`, `devAiSoftCallback.c:182`).
+    #[inline(always)]
+    pub fn read_failed(&mut self) {
+        match self {
+            Self::Callback(pvt) => pvt.smooth = false,
+            other => *other = Self::Null,
+        }
+    }
+
+    /// The devPvt's `buffer.value`; `None` with no devPvt.
+    #[inline(always)]
+    pub fn callback_buffer(&self) -> Option<u16> {
+        self.callback().map(|pvt| pvt.buffer)
+    }
+
+    /// Store a delivered `DBR_ENUM` reading in the devPvt's buffer.
+    #[inline(always)]
+    pub fn keep_buffer(&mut self, value: u16) {
+        if let Self::Callback(pvt) = self {
+            pvt.buffer = value;
+        }
+    }
+
+    /// Keep what the notify's callback read for the re-entry.
+    pub(crate) fn set_notified_read(
+        &mut self,
+        read: Option<Box<crate::server::database::NotifiedRead>>,
+    ) {
+        if let Self::Callback(pvt) = self {
+            pvt.notified = read;
+        }
+    }
+
+    /// The re-entry's read; `None` once taken, or for a non-callback dpvt.
+    pub(crate) fn take_notified_read(
+        &mut self,
+    ) -> Option<Box<crate::server::database::NotifiedRead>> {
+        match self {
+            Self::Callback(pvt) => pvt.notified.take(),
+            _ => None,
+        }
+    }
+
+    /// The address `dbpr` prints for a SoftCallback devPvt.
+    pub(crate) fn callback(&self) -> Option<&CallbackPvt> {
+        match self {
+            Self::Callback(pvt) => Some(pvt),
+            _ => None,
+        }
+    }
+}
+
+/// The soft dset `record_type`'s `dtyp` binds: [`classify_soft`]'s class,
+/// unless the row the DTYP selects was registered with a device object —
+/// mca's `devMCA_soft` is a `"Soft Channel"` the framework does not serve.
+/// Asked at init and on a device-link put, never by the cycle.
+pub fn served_soft(record_type: &str, dtyp: &str) -> Option<SoftDtyp> {
+    classify_soft(dtyp).filter(|_| !crate::server::record::has_device_object(record_type, dtyp))
+}
+
 /// Does this DTYP need no explicit device support registration?
 ///
 /// The attach phase's question, and the only one that is genuinely yes/no:
@@ -76,20 +190,150 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
 /// calls per cycle to re-derive an answer fixed when DTYP was written.
 ///
 /// The classification is stored WITH the name and the fields are private, so
-/// the two cannot disagree: [`Self::new`] is the only constructor and it is
-/// the only place [`classify_soft`] runs.
+/// the two cannot disagree before iocInit. `bind` then fixes it: C's
+/// `dset` is chosen once from DTYP at init, and a later DTYP put stores the
+/// menu index without touching the running record's dset.
 #[derive(Clone, Debug)]
 pub struct Dtyp {
-    name: String,
+    name: DtypName,
+    class: DsetClass,
+    /// [`Self::soft`], stored with the class: four classes make the match a
+    /// branch tree, and the process cycle asks it on every record. Written
+    /// only by [`Self::set_class`].
     soft: Option<SoftDtyp>,
+    /// `soft()` is `Plain` or `Async`: the classes whose input dset returns 2.
+    /// Stored with the class so the process cycle tests one byte; written only
+    /// by [`Self::set_class`].
+    skips_input_convert: bool,
+}
+
+/// The DTYP text. A device-menu choice is the menu's own `&'static str`, so a
+/// DTYP put under the record's hold stores a pointer and frees nothing; only a
+/// name no menu has is owned.
+#[derive(Clone, Debug)]
+pub(crate) enum DtypName {
+    Menu(&'static str),
+    Other(std::sync::Arc<str>),
+}
+
+impl std::ops::Deref for DtypName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Menu(name) => name,
+            Self::Other(name) => name,
+        }
+    }
+}
+
+/// Which soft dset a record runs, and whether DTYP may still change it.
+#[derive(Clone, Copy, Debug)]
+enum DsetClass {
+    /// Before init: the class the current name would bind.
+    Named(Option<SoftDtyp>),
+    /// After init: the class the record was bound to.
+    Bound(Option<SoftDtyp>),
+    /// Bound to `Async`, whose `add_record` refused INP: C's `dpvt` stays
+    /// NULL, so every `read_xxx` returns 2 without reading.
+    AsyncRefused,
+    /// C `prec->dset = NULL` after a device-link put whose new dset's
+    /// `add_record` refused (`dbAccess.c:1194-1197`); the next device-link
+    /// put binds again. Every arm that sets it also skips `dbAddLink`, so it
+    /// is the device link's removed state too.
+    Detached,
 }
 
 impl Dtyp {
     /// Classify `name` once and keep the answer beside it.
     pub fn new(name: impl Into<String>) -> Self {
-        let name = name.into();
-        let soft = classify_soft(&name);
-        Self { name, soft }
+        let name: String = name.into();
+        let mut dtyp = Self {
+            name: if name.is_empty() {
+                DtypName::Menu("")
+            } else {
+                DtypName::Other(name.into())
+            },
+            class: DsetClass::Named(None),
+            soft: None,
+            skips_input_convert: false,
+        };
+        dtyp.set_class(DsetClass::Named(classify_soft(&dtyp.name)));
+        dtyp
+    }
+
+    /// The one writer of `class`, and so of the byte derived from it.
+    fn set_class(&mut self, class: DsetClass) {
+        self.class = class;
+        self.soft = match class {
+            DsetClass::Named(soft) | DsetClass::Bound(soft) => soft,
+            DsetClass::AsyncRefused => Some(SoftDtyp::Async),
+            DsetClass::Detached => None,
+        };
+        self.skips_input_convert = matches!(self.soft, Some(SoftDtyp::Plain | SoftDtyp::Async));
+    }
+
+    /// A put to DTYP. Before `bind` the class follows the name; after
+    /// it, only the name changes.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        let name: String = name.into();
+        self.store_name(DtypName::Other(name.into()));
+    }
+
+    /// [`Self::set_name`] for a device-menu choice.
+    pub(crate) fn set_menu_name(&mut self, name: &'static str) {
+        self.store_name(DtypName::Menu(name));
+    }
+
+    fn store_name(&mut self, name: DtypName) {
+        self.name = name;
+        if let DsetClass::Named(_) = self.class {
+            self.set_class(DsetClass::Named(classify_soft(&self.name)));
+        }
+    }
+
+    /// Fix the class at init, as C's `dbInitRecord` fixes `prec->dset`.
+    pub(crate) fn bind(&mut self, record_type: &str) -> Option<SoftDtyp> {
+        let soft = match self.class {
+            DsetClass::Named(_) => served_soft(record_type, &self.name),
+            _ => self.soft(),
+        };
+        self.set_class(DsetClass::Bound(soft));
+        soft
+    }
+
+    /// C `dbPutFieldLink`'s device-link rebind (`dbAccess.c:1127-1199`): an
+    /// INP/OUT put sets `prec->dset` from the CURRENT DTYP and calls the new
+    /// dset's `add_record`, never its `init_record`. So the class follows the
+    /// name again and stays bound; the caller must not run
+    /// [`crate::server::record::Record::init_soft_dset`] for it.
+    pub fn rebind(&mut self, record_type: &str) -> Option<SoftDtyp> {
+        let soft = served_soft(record_type, &self.name);
+        self.set_class(DsetClass::Bound(soft));
+        soft
+    }
+
+    /// C `dev<T>SoftCallback::add_record` failing: only a record bound to
+    /// `Async` has that hook.
+    pub(crate) fn refuse_link(&mut self) {
+        if let DsetClass::Bound(Some(SoftDtyp::Async)) = self.class {
+            self.set_class(DsetClass::AsyncRefused);
+        }
+    }
+
+    /// C `dbPutFieldLink`'s failure arm: the record has no dset.
+    pub(crate) fn detach(&mut self) {
+        self.set_class(DsetClass::Detached);
+    }
+
+    /// C `prec->dset == NULL` after `Self::detach`.
+    pub fn is_detached(&self) -> bool {
+        matches!(self.class, DsetClass::Detached)
+    }
+
+    /// The bound dset never reads INP (C `read_xxx` with a NULL `dpvt`).
+    pub fn link_refused(&self) -> bool {
+        matches!(self.class, DsetClass::AsyncRefused)
     }
 
     /// The DTYP text, as a client put it or the `.db` declared it.
@@ -97,15 +341,28 @@ impl Dtyp {
         &self.name
     }
 
-    /// The soft-channel flavour this DTYP names — [`classify_soft`]'s answer,
-    /// taken when the name was set.
+    /// [`Self::as_str`] as a handle that outlives the record's hold.
+    pub(crate) fn shared_name(&self) -> DtypName {
+        self.name.clone()
+    }
+
+    /// The soft-channel flavour the record runs — [`classify_soft`]'s answer
+    /// for the name, frozen by `bind`.
+    #[inline(always)]
     pub fn soft(&self) -> Option<SoftDtyp> {
         self.soft
     }
 
+    /// `Plain` or `Async` soft channel — the input dset returns 2, never
+    /// "Raw Soft Channel".
+    #[inline(always)]
+    pub fn skips_input_convert(&self) -> bool {
+        self.skips_input_convert
+    }
+
     /// [`is_soft_dtyp`] for a DTYP that already carries its class.
     pub fn is_soft(&self) -> bool {
-        self.soft.is_some()
+        self.soft().is_some()
     }
 }
 
@@ -135,22 +392,14 @@ impl std::fmt::Display for Dtyp {
 
 impl PartialEq<str> for Dtyp {
     fn eq(&self, other: &str) -> bool {
-        self.name == other
+        &*self.name == other
     }
 }
 
 impl PartialEq<&str> for Dtyp {
     fn eq(&self, other: &&str) -> bool {
-        self.name == *other
+        &*self.name == *other
     }
-}
-
-/// Handle for waiting on asynchronous write completion.
-/// Returned by [`DeviceSupport::write_begin`] when the write is submitted
-/// to a worker queue rather than executed synchronously.
-pub trait WriteCompletion: Send + 'static {
-    /// Block until the write completes or timeout expires.
-    fn wait(&self, timeout: std::time::Duration) -> CaResult<()>;
 }
 
 /// What [`DeviceSupport::write_begin`] did with the record's output.
@@ -167,9 +416,10 @@ pub enum WriteStart {
     /// The write ran to completion inside `write_begin` (a port that cannot
     /// block, C `ASYN_CANBLOCK` clear); nothing remains to be done.
     Completed,
-    /// The write was submitted to a worker queue; the framework waits on
-    /// the handle outside the record lock and ends the cycle when it lands.
-    Pending(Box<dyn WriteCompletion>),
+    /// The write was submitted to a worker queue and the record stays PACT;
+    /// the device ends the cycle through the source's
+    /// [`WriteDone`](crate::server::database::WriteDone) when the write lands.
+    Pending,
 }
 
 /// What a device support `read()` produced.
@@ -358,6 +608,27 @@ impl DeviceReadOutcome {
     }
 }
 
+/// What the record's dset `init_record` did, as the record's own C
+/// `init_record` tests it before seeding MLST/ALST/LALM.
+///
+/// The record types do not agree on what a failure skips: `bi`, `longin`,
+/// `longout`, `int64in`, `int64out` and `ao` return before the seed, `bo`,
+/// `mbbi`, `mbbo`, `mbbiDirect`, `mbboDirect` and `calcout` seed regardless,
+/// and `ai` seeds only when there is no dset `init_record` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsetInit {
+    /// The dset has no `init_record` entry (devTimestampAI).
+    Absent,
+    /// C status 0. `bo`, `mbbo`, `mbboDirect` and `ao` convert the RVAL the
+    /// dset left and define the record; `mbbiDirect` derives B0-B1F.
+    Ok,
+    /// C status 2, "do not convert": the record keeps the VAL the dset left.
+    DoNotConvert,
+    /// Any other status: [`DeviceInitOutcome::Dead`] or an `Err` from
+    /// [`DeviceSupport::init`].
+    Failed,
+}
+
 /// Whether a device support's `init_record` left the record able to process.
 ///
 /// C's `init_record` failure has two shapes and they are not the same record
@@ -379,11 +650,17 @@ impl DeviceReadOutcome {
 /// severity: a dead waveform reads PACT=1 and BUSY=0 forever, `caput REC.RARM 1`
 /// sets RPRO and processes nothing (`dbAccess.c:1267-1271`), and a *scanned*
 /// dead record collects SCAN_ALARM/INVALID once `lcnt` passes MAX_LOCK.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceInitOutcome {
-    /// C `return INIT_OK` / `return 0` — the record processes normally.
-    #[default]
-    Live,
+    /// C `return INIT_OK` / `return 0` — the record processes normally, and
+    /// the record types that test the status convert the RVAL the dset left
+    /// ([`DsetInit::Ok`]). The [`DeviceUdf`] is what the dset itself wrote to
+    /// `prec->udf` (devAsynInt32.c `initLo`: `pr->udf = 0`).
+    Ok(DeviceUdf),
+    /// C `return INIT_DO_NOT_CONVERT` / `return 2` — the record keeps the VAL
+    /// the dset left ([`DsetInit::DoNotConvert`]); the [`DeviceUdf`] as above
+    /// (devAsynFloat64.c `initAo`: `pao->udf = 0`).
+    DoNotConvert(DeviceUdf),
     /// C's `bad:` arm — `pr->pact = 1`. The framework sets PACT and never
     /// releases it, so the record never processes again.
     ///
@@ -406,6 +683,12 @@ pub enum DeviceInitOutcome {
 }
 
 impl DeviceInitOutcome {
+    /// C `return 0` with `prec->udf` untouched — every dset that does not
+    /// test or write either.
+    pub fn ok() -> Self {
+        Self::Ok(DeviceUdf::Untouched)
+    }
+
     /// C's bare `bad:` arm — `pr->pact = 1` with no `recGblSetSevr`
     /// (`devAsynXXXTimeSeries.h:118-120`).
     pub fn dead() -> Self {
@@ -456,15 +739,55 @@ pub struct PropertyPost {
     pub post_field: String,
 }
 
+/// The alarm a device raises after a transfer: C's
+/// `recGblSetSevrMsg(prec, stat, sevr, msg)`, with an empty `msg` for a
+/// plain `recGblSetSevr`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceAlarm<'a> {
+    pub stat: u16,
+    pub sevr: u16,
+    pub msg: &'a str,
+}
+
 /// Trait for custom device support implementations.
 /// When DTYP is set to something other than "" or "Soft Channel",
 /// the registered DeviceSupport is used instead of link resolution.
 pub trait DeviceSupport: Send + Sync + 'static {
     /// C `init_record`. See [`DeviceInitOutcome`] for the two failure shapes:
     /// `Err` flags the record but leaves it processing, `Ok(Dead)` is C's
-    /// `pr->pact = 1` and stops it for good.
+    /// `pr->pact = 1` and stops it for good. The default is an `init_record`
+    /// that returns 0, so the record's status-0 arm runs; a dset with no
+    /// `init_record` says so through [`Self::has_init_record`].
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
+    }
+
+    /// Whether the C dset this ports has an `init_record` entry. `aiRecord.c`
+    /// seeds MLST/ALST/LALM from VAL only when it does not.
+    fn has_init_record(&self) -> bool {
+        true
+    }
+
+    /// C's `dsxt->add_record` for a device that extends its dset (`devExtend`):
+    /// bind the per-link state from the link this object was built with. A
+    /// device-link put runs it on the fresh object before the record's hold
+    /// and fails on `Err` (`dbAccess.c:1196-1199`); init discards the status
+    /// as `doResolveLinks` does.
+    fn add_record(&mut self, _record_type: &str) -> Result<(), crate::error::LinkRefusal> {
+        Ok(())
+    }
+
+    /// C's `dsxt->del_record` on the bound object, run under the record's
+    /// hold when a device-link put passes the `dsxt` gate. `Err` refuses the
+    /// put with the link, dset and SCAN as they were (`dbAccess.c:1160-1164`).
+    fn del_record(&mut self) -> Result<(), crate::error::LinkRefusal> {
+        Ok(())
+    }
+
+    /// Whether the C dset this ports leaves `prec->dpvt` set: this object
+    /// then stands for it, and `dbpr` prints its address.
+    fn holds_dpvt(&self) -> bool {
+        false
     }
 
     /// Read from hardware into the record.
@@ -482,15 +805,15 @@ pub trait DeviceSupport: Send + Sync + 'static {
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()>;
     fn dtyp(&self) -> &str;
 
-    /// Return the last alarm (status, severity) from the driver.
+    /// Return the alarm the driver's last transfer left.
     /// None means the driver does not override alarms.
-    fn last_alarm(&self) -> Option<(u16, u16)> {
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
         None
     }
 
     /// Return the last timestamp from the driver.
     /// None means the driver does not override timestamps.
-    fn last_timestamp(&self) -> Option<std::time::SystemTime> {
+    fn last_timestamp(&self) -> Option<crate::types::WallTime> {
         None
     }
 
@@ -532,6 +855,17 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// hints, etc.) override this. Called once after `set_record_info`
     /// during builder wiring; not called again at runtime.
     fn apply_record_info(&mut self, _info: &std::collections::HashMap<String, String>) {}
+
+    /// Tell the device which database it is loaded in, before
+    /// [`io_intr_receiver`](Self::io_intr_receiver) is asked: the gate is that
+    /// database's `interruptAccept`, for a device that must read it itself.
+    /// It does not choose the port's gate — a port reads its owner's alone.
+    /// Default: ignore.
+    fn bind_interrupt_gate(
+        &mut self,
+        _gate: &std::sync::Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    ) {
+    }
 
     /// Return a receiver for I/O Intr scan notifications.
     /// Called for records with `SCAN="I/O Intr"`, and for any device that
@@ -629,7 +963,11 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Begin the record's output write — see [`WriteStart`] for the three
     /// outcomes. The default has no submit-only path and asks for
     /// [`write()`](DeviceSupport::write).
-    fn write_begin(&mut self, _record: &mut dyn Record) -> CaResult<WriteStart> {
+    fn write_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        _done: &crate::server::database::WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
         Ok(WriteStart::Synchronous)
     }
 
@@ -702,6 +1040,8 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// of init outcome so the record is addressable; a failed init leaves
 /// the alarm set.
 pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceSupport>) {
+    let record_type = instance.record.record_type();
+    instance.common.dtyp.bind(record_type);
     attach_device_to_record(instance, dev);
     init_device_support(instance);
 }
@@ -717,9 +1057,11 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceS
 /// put the whole sequence after the record's init passes, so `init_record`
 /// could not see its own dset and ran the tail C's early return skips.
 pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn DeviceSupport>) {
-    let name = instance.name.clone();
+    // Device supports take a `&str` name; one that is not UTF-8 reaches
+    // them in its lossy form.
+    let name = instance.name.to_str_lossy().into_owned();
     dev.set_record_info(&name, instance.common.scan);
-    dev.apply_record_info(&instance.info);
+    dev.apply_record_info(instance.info());
     instance.device = Some(dev);
 }
 
@@ -730,12 +1072,34 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
 /// No-op for a record that has no device attached — C reaches this line only
 /// past `if (!pdset) return S_dev_noDSET`.
 pub fn init_device_support(instance: &mut RecordInstance) {
+    if let Some(soft) = instance.common.dtyp.soft() {
+        instance.record.init_soft_dset(soft);
+    }
     let Some(mut dev) = instance.device.take() else {
+        instance.dset_init = if instance.common.dtyp.is_soft() {
+            instance.record.soft_dset_init()
+        } else {
+            DsetInit::Ok
+        };
         return;
     };
     let name = instance.name.clone();
-    match dev.init(&mut *instance.record) {
-        Ok(DeviceInitOutcome::Live) => {}
+    let status = match dev.init(&mut *instance.record) {
+        Ok(DeviceInitOutcome::Ok(udf)) => {
+            apply_init_udf(instance, udf);
+            // The record's own `if (status == 0)` arm, after the dset's write;
+            // a dset with no `init_record` never reaches it.
+            if dev.has_init_record() {
+                if let Some(udf) = instance.record.dset_init_convert() {
+                    instance.common.udf = udf as u8;
+                }
+            }
+            DsetInit::Ok
+        }
+        Ok(DeviceInitOutcome::DoNotConvert(udf)) => {
+            apply_init_udf(instance, udf);
+            DsetInit::DoNotConvert
+        }
         Ok(DeviceInitOutcome::Dead { alarm }) => {
             // C's `bad:` arm. The driver has already printed why. The
             // `recGblSetSevr` comes first in every C arm that has one, so it
@@ -745,6 +1109,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
                 crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
             }
             instance.enter_pact();
+            DsetInit::Failed
         }
         Err(e) => {
             eprintln!(
@@ -755,9 +1120,24 @@ pub fn init_device_support(instance: &mut RecordInstance) {
             // than presenting a healthy-looking record.
             instance.common.sevr = AlarmSeverity::Invalid;
             instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
+            DsetInit::Failed
         }
-    }
+    };
+    instance.dset_init = if !dev.has_init_record() {
+        DsetInit::Absent
+    } else {
+        status
+    };
     instance.device = Some(dev);
+}
+
+/// The dset's own write of `prec->udf` from inside its `init_record`.
+fn apply_init_udf(instance: &mut RecordInstance, udf: DeviceUdf) {
+    match udf {
+        DeviceUdf::Untouched => {}
+        DeviceUdf::Defined => instance.common.udf = 0,
+        DeviceUdf::Undefined => instance.common.udf = 1,
+    }
 }
 
 #[cfg(test)]
@@ -819,7 +1199,7 @@ mod tests {
             o.record_info_before_init = self.record_info_set;
             o.info_at_init = self.info.keys().cloned().collect();
             match self.verdict {
-                InitVerdict::Live => Ok(DeviceInitOutcome::Live),
+                InitVerdict::Live => Ok(DeviceInitOutcome::ok()),
                 InitVerdict::Dead => Ok(DeviceInitOutcome::dead()),
                 InitVerdict::Fail => Err(CaError::InvalidValue("device init failed".into())),
             }
@@ -828,7 +1208,7 @@ mod tests {
 
     /// Wire a probe with `verdict` onto a fresh ai and hand back the instance.
     fn wire(verdict: InitVerdict) -> RecordInstance {
-        let mut instance = RecordInstance::new("TEST:DEAD".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:DEAD", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         wire_device_to_record(
             &mut instance,
@@ -898,7 +1278,7 @@ mod tests {
     /// IocBuilder path discarded the error with `let _ =`.)
     #[test]
     fn wire_device_init_failure_flags_record_invalid() {
-        let mut instance = RecordInstance::new("TEST:AI".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:AI", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         let obs = Arc::new(Mutex::new(WireObservation::default()));
         let dev = Box::new(ProbeDev {
@@ -931,7 +1311,7 @@ mod tests {
     /// `set_record_info` must have run first.
     #[test]
     fn wire_device_applies_info_and_record_info_before_init() {
-        let mut instance = RecordInstance::new("TEST:AI2".to_string(), AiRecord::new(0.0));
+        let mut instance = RecordInstance::new("TEST:AI2", AiRecord::new(0.0));
         instance.common.dtyp = "ProbeDev".into();
         instance.set_info("asyn:READBACK", "1");
         let obs = Arc::new(Mutex::new(WireObservation::default()));
@@ -960,6 +1340,44 @@ mod tests {
     /// `Dtyp` — the whole point of keeping the two together is that a reader
     /// may trust `soft()` without re-deriving it.
     #[test]
+    fn a_device_link_put_rebinds_to_the_current_dtyp_dbaccess_1128() {
+        let mut dtyp = Dtyp::new("Soft Channel");
+        assert_eq!(dtyp.bind("ai"), Some(SoftDtyp::Plain));
+        dtyp.set_name("Raw Soft Channel");
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Plain));
+        assert!(dtyp.skips_input_convert());
+        assert_eq!(dtyp.rebind("ai"), Some(SoftDtyp::Raw));
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
+        // The RVAL convert follows the rebound class, not the init one.
+        assert!(!dtyp.skips_input_convert());
+        // Still bound: the next DTYP put alone changes nothing again.
+        dtyp.set_name("Soft Channel");
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Raw));
+        dtyp.set_name("asynInt32");
+        assert_eq!(dtyp.rebind("ai"), None);
+    }
+
+    /// Only a bound `Async` dset has an `add_record` to fail, and an INP/OUT
+    /// put's rebind fetches the dset afresh.
+    #[test]
+    fn only_a_bound_async_dset_refuses_its_link_devaisoftcallback_c_171() {
+        let mut dtyp = Dtyp::new("Async Soft Channel");
+        dtyp.refuse_link();
+        assert!(!dtyp.link_refused());
+        dtyp.bind("ai");
+        dtyp.refuse_link();
+        assert!(dtyp.link_refused());
+        assert_eq!(dtyp.soft(), Some(SoftDtyp::Async));
+        assert!(dtyp.skips_input_convert());
+        assert_eq!(dtyp.rebind("ai"), Some(SoftDtyp::Async));
+        assert!(!dtyp.link_refused());
+        let mut plain = Dtyp::new("Soft Channel");
+        plain.bind("ai");
+        plain.refuse_link();
+        assert!(!plain.link_refused());
+    }
+
+    #[test]
     fn a_dtyp_carries_the_class_its_name_classifies_to() {
         let names = [
             "",
@@ -979,6 +1397,11 @@ mod tests {
                 assert_eq!(built.as_str(), name);
                 assert_eq!(built.soft(), classify_soft(name), "{name:?}");
                 assert_eq!(built.is_soft(), is_soft_dtyp(name), "{name:?}");
+                assert_eq!(
+                    built.skips_input_convert(),
+                    matches!(classify_soft(name), Some(SoftDtyp::Plain | SoftDtyp::Async)),
+                    "{name:?}"
+                );
                 assert_eq!(built.clone().soft(), classify_soft(name), "{name:?} clone");
             }
         }

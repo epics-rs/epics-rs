@@ -15,27 +15,35 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
+use super::dsets;
 use epics_base_rs::server::record::{Asl, Base, FieldDesc, Special};
+use epics_base_rs::server::record::{DbLinkType, DevSup};
 use epics_base_rs::types::{DbFieldType, DbfCode};
 
 // ---------------------------------------------------------------------
@@ -200,6 +208,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -220,6 +229,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -240,6 +250,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -260,6 +271,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -280,6 +292,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -300,6 +313,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -320,6 +334,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -340,6 +355,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -360,6 +376,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -380,6 +397,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -400,6 +418,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -420,6 +439,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -440,6 +460,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -460,6 +481,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -480,6 +502,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -500,6 +523,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -520,6 +544,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -540,6 +565,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -560,6 +586,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -580,6 +607,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -600,6 +628,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -620,6 +649,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -640,6 +670,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -660,6 +691,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -680,6 +712,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -700,6 +733,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -720,6 +754,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -740,6 +775,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -760,6 +796,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -780,6 +817,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -800,6 +838,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -820,6 +859,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -840,6 +880,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -860,6 +901,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -880,6 +922,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -900,6 +943,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -920,6 +964,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -940,6 +985,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -960,6 +1006,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -980,6 +1027,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1000,6 +1048,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1020,6 +1069,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1040,6 +1090,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::UChar,
         declared_dbf: DbfCode::NoAccess,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1060,6 +1111,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::UChar,
         declared_dbf: DbfCode::NoAccess,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1080,6 +1132,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1100,6 +1153,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1120,6 +1174,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1140,6 +1195,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1160,6 +1216,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1180,6 +1237,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1200,6 +1258,7 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1221,6 +1280,9 @@ pub static EPID_FIELDS: &[FieldDesc] = &[
 /// [`EPID_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static EPID_NOACCESS: &[&str] = &[];
 
+/// `recordtype(epid)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static EPID_DBADDR: &[&str] = &[];
+
 /// `recordtype(epid)` — C's `papFldDes` order, all 99 declarations
 /// including the internals [`EPID_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -1236,13 +1298,14 @@ pub static EPID_DECL: &[&str] = &[
     "MLST",
 ];
 
-/// `recordtype(throttle)` — 21 CA-visible own fields from `dbd/throttleRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(throttle)` — 22 CA-visible own fields from `dbd/throttleRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static THROTTLE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1263,6 +1326,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1283,6 +1347,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1303,6 +1368,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1323,6 +1389,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1343,6 +1410,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1363,6 +1431,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1383,6 +1452,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1403,6 +1473,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1423,6 +1494,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1443,6 +1515,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1463,6 +1536,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1479,10 +1553,32 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "STS",
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1503,6 +1599,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1523,6 +1620,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1543,6 +1641,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1563,6 +1662,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1583,6 +1683,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1603,6 +1704,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Inlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1623,6 +1725,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1643,6 +1746,7 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1662,7 +1766,10 @@ pub static THROTTLE_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(throttle)` — the `DBF_NOACCESS` internal names dropped from
 /// [`THROTTLE_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static THROTTLE_NOACCESS: &[&str] = &["RPVT"];
+pub static THROTTLE_NOACCESS: &[&str] = &[];
+
+/// `recordtype(throttle)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static THROTTLE_DBADDR: &[&str] = &[];
 
 /// `recordtype(throttle)` — C's `papFldDes` order, all 70 declarations
 /// including the internals [`THROTTLE_FIELDS`] drops. The index into this is
@@ -1683,6 +1790,7 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1703,6 +1811,7 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -1723,6 +1832,7 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1743,6 +1853,7 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1764,6 +1875,9 @@ pub static TIMESTAMP_FIELDS: &[FieldDesc] = &[
 /// [`TIMESTAMP_FIELDS`]: resolvable (a SEARCH is answered), never servable.
 pub static TIMESTAMP_NOACCESS: &[&str] = &[];
 
+/// `recordtype(timestamp)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static TIMESTAMP_DBADDR: &[&str] = &[];
+
 /// `recordtype(timestamp)` — C's `papFldDes` order, all 52 declarations
 /// including the internals [`TIMESTAMP_FIELDS`] drops. The index into this is
 /// C's `indRecordType`.
@@ -1774,6 +1888,101 @@ pub static TIMESTAMP_DECL: &[&str] = &[
     "RSET", "DSET", "DPVT", "RDES", "LSET", "PRIO", "TPRO", "BKPT", "UDF", "UDFS", "TIME", "UTAG",
     "FLNK", "VAL", "OVAL", "RVAL", "TST",
 ];
+
+// ---------------------------------------------------------------------
+// Per-record-type device menus (C `dbDeviceMenu`), in `.dbd` declaration
+// order. The index is wire-visible: it IS the value of the DTYP field.
+// ---------------------------------------------------------------------
+
+/// `device(ai, ...)` choices, in declaration order.
+pub static DEVICE_MENU_AI: &[&str] = &["Sec Past Epoch"];
+
+/// `device(epid, ...)` choices, in declaration order.
+pub static DEVICE_MENU_EPID: &[&str] = &["Soft Channel", "Async Soft Channel", "Fast Epid"];
+
+/// `device(stringin, ...)` choices, in declaration order.
+pub static DEVICE_MENU_STRINGIN: &[&str] = &["Time of Day"];
+
+/// The device menu for a record type — the choices its `DTYP` field selects
+/// among, in `.dbd` declaration order. `None` for a record type that declares
+/// no device support: C has no `dbDeviceMenu` for it, and its DTYP renders as
+/// the empty string.
+pub fn device_menu(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "ai" => DEVICE_MENU_AI,
+        "epid" => DEVICE_MENU_EPID,
+        "stringin" => DEVICE_MENU_STRINGIN,
+        _ => return None,
+    })
+}
+
+/// The record types [`device_menu`] returns `Some` for, in `.dbd` name order.
+pub static DEVICE_MENU_RECORD_TYPES: &[&str] = &["ai", "epid", "stringin"];
+
+// ---------------------------------------------------------------------
+// Per-record-type device rows (C `devSup`), in `.dbd` declaration order.
+// ---------------------------------------------------------------------
+
+/// The `device(ai, ...)` lines.
+pub static DEVICES_AI: &[DevSup] = &[DevSup {
+    name: "devAiTodSeconds",
+    choice: "Sec Past Epoch",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVAITODSECONDS,
+}];
+
+/// The `device(epid, ...)` lines.
+pub static DEVICES_EPID: &[DevSup] = &[
+    DevSup {
+        name: "devEpidSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVEPIDSOFT,
+    },
+    DevSup {
+        name: "devEpidSoftCB",
+        choice: "Async Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: dsets::DEVEPIDSOFTCB,
+    },
+    DevSup {
+        name: "devEpidFast",
+        choice: "Fast Epid",
+        link_type: DbLinkType::InstIo,
+        dset: dsets::DEVEPIDFAST,
+    },
+];
+
+/// The `device(stringin, ...)` lines.
+pub static DEVICES_STRINGIN: &[DevSup] = &[DevSup {
+    name: "devSiTodString",
+    choice: "Time of Day",
+    link_type: DbLinkType::Constant,
+    dset: dsets::DEVSITODSTRING,
+}];
+
+/// Every `device()` line for a record type, in declaration order:
+/// [`device_menu`]'s choices, each as its `devSup`.
+pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {
+    Some(match record_type {
+        "ai" => DEVICES_AI,
+        "epid" => DEVICES_EPID,
+        "stringin" => DEVICES_STRINGIN,
+        _ => return None,
+    })
+}
+
+/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.
+///
+/// `None` when no vendored `.dbd` declares that `device()` — a downstream
+/// crate registering its device support at runtime (asyn, motor) brings no
+/// `.dbd`, so there is no declaration to enforce and none is invented.
+pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
+    devices(record_type)?
+        .iter()
+        .find(|row| row.choice.eq_ignore_ascii_case(dtyp))
+        .map(|row| row.link_type)
+}
 
 /// The record-own field table for a record type name, or `None` for a type
 /// no vendored `.dbd` declares.
@@ -1795,6 +2004,17 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
         "epid" => EPID_NOACCESS,
         "throttle" => THROTTLE_NOACCESS,
         "timestamp" => TIMESTAMP_NOACCESS,
+        _ => return None,
+    })
+}
+
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "epid" => EPID_DBADDR,
+        "throttle" => THROTTLE_DBADDR,
+        "timestamp" => TIMESTAMP_DBADDR,
         _ => return None,
     })
 }
@@ -1828,3 +2048,110 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["epid", "throttle", "timestamp"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod epid {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const SMSL: FieldSlot = FieldSlot(1);
+        pub const STPL: FieldSlot = FieldSlot(2);
+        pub const INP: FieldSlot = FieldSlot(3);
+        pub const OUTL: FieldSlot = FieldSlot(4);
+        pub const TRIG: FieldSlot = FieldSlot(5);
+        pub const TVAL: FieldSlot = FieldSlot(6);
+        pub const CVAL: FieldSlot = FieldSlot(7);
+        pub const CVLP: FieldSlot = FieldSlot(8);
+        pub const OVAL: FieldSlot = FieldSlot(9);
+        pub const OVLP: FieldSlot = FieldSlot(10);
+        pub const PREC: FieldSlot = FieldSlot(11);
+        pub const MDT: FieldSlot = FieldSlot(12);
+        pub const FMOD: FieldSlot = FieldSlot(13);
+        pub const FBON: FieldSlot = FieldSlot(14);
+        pub const FBOP: FieldSlot = FieldSlot(15);
+        pub const KP: FieldSlot = FieldSlot(16);
+        pub const KI: FieldSlot = FieldSlot(17);
+        pub const KD: FieldSlot = FieldSlot(18);
+        pub const EGU: FieldSlot = FieldSlot(19);
+        pub const HOPR: FieldSlot = FieldSlot(20);
+        pub const LOPR: FieldSlot = FieldSlot(21);
+        pub const DRVH: FieldSlot = FieldSlot(22);
+        pub const DRVL: FieldSlot = FieldSlot(23);
+        pub const HIHI: FieldSlot = FieldSlot(24);
+        pub const LOLO: FieldSlot = FieldSlot(25);
+        pub const HIGH: FieldSlot = FieldSlot(26);
+        pub const LOW: FieldSlot = FieldSlot(27);
+        pub const HHSV: FieldSlot = FieldSlot(28);
+        pub const LLSV: FieldSlot = FieldSlot(29);
+        pub const HSV: FieldSlot = FieldSlot(30);
+        pub const LSV: FieldSlot = FieldSlot(31);
+        pub const HYST: FieldSlot = FieldSlot(32);
+        pub const ADEL: FieldSlot = FieldSlot(33);
+        pub const MDEL: FieldSlot = FieldSlot(34);
+        pub const ODEL: FieldSlot = FieldSlot(35);
+        pub const P: FieldSlot = FieldSlot(36);
+        pub const PP: FieldSlot = FieldSlot(37);
+        pub const I: FieldSlot = FieldSlot(38);
+        pub const IP: FieldSlot = FieldSlot(39);
+        pub const D: FieldSlot = FieldSlot(40);
+        pub const DP: FieldSlot = FieldSlot(41);
+        pub const CT: FieldSlot = FieldSlot(42);
+        pub const CTP: FieldSlot = FieldSlot(43);
+        pub const DT: FieldSlot = FieldSlot(44);
+        pub const DTP: FieldSlot = FieldSlot(45);
+        pub const ERR: FieldSlot = FieldSlot(46);
+        pub const ERRP: FieldSlot = FieldSlot(47);
+        pub const LALM: FieldSlot = FieldSlot(48);
+        pub const ALST: FieldSlot = FieldSlot(49);
+        pub const MLST: FieldSlot = FieldSlot(50);
+    }
+
+    pub mod throttle {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const OVAL: FieldSlot = FieldSlot(1);
+        pub const SENT: FieldSlot = FieldSlot(2);
+        pub const OSENT: FieldSlot = FieldSlot(3);
+        pub const WAIT: FieldSlot = FieldSlot(4);
+        pub const HOPR: FieldSlot = FieldSlot(5);
+        pub const LOPR: FieldSlot = FieldSlot(6);
+        pub const DRVLH: FieldSlot = FieldSlot(7);
+        pub const DRVLL: FieldSlot = FieldSlot(8);
+        pub const DRVLS: FieldSlot = FieldSlot(9);
+        pub const DRVLC: FieldSlot = FieldSlot(10);
+        pub const VER: FieldSlot = FieldSlot(11);
+        pub const RPVT: FieldSlot = FieldSlot(12);
+        pub const STS: FieldSlot = FieldSlot(13);
+        pub const PREC: FieldSlot = FieldSlot(14);
+        pub const DPREC: FieldSlot = FieldSlot(15);
+        pub const DLY: FieldSlot = FieldSlot(16);
+        pub const OUT: FieldSlot = FieldSlot(17);
+        pub const OV: FieldSlot = FieldSlot(18);
+        pub const SINP: FieldSlot = FieldSlot(19);
+        pub const SIV: FieldSlot = FieldSlot(20);
+        pub const SYNC: FieldSlot = FieldSlot(21);
+    }
+
+    pub mod timestamp {
+        use super::FieldSlot;
+        pub const VAL: FieldSlot = FieldSlot(0);
+        pub const OVAL: FieldSlot = FieldSlot(1);
+        pub const RVAL: FieldSlot = FieldSlot(2);
+        pub const TST: FieldSlot = FieldSlot(3);
+    }
+}
+
+/// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
+pub static DBD: epics_base_rs::server::record::ContributedDbd =
+    epics_base_rs::server::record::ContributedDbd {
+        record_types: RECORD_TYPES,
+        record_declaration_order,
+        record_fields,
+        record_no_prompt,
+        menus: MENUS,
+    };

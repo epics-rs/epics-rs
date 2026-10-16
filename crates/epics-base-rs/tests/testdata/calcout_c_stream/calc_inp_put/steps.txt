@@ -1,0 +1,3 @@
+monitor C1.B C1.VAL
+caput C1.INPB 7
+caput C1.PROC 1

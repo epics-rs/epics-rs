@@ -66,7 +66,12 @@ fn streams_of(line: &str, db: Arc<PvDatabase>) -> (String, String) {
 
     let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
     let owned = line.to_string();
-    let ran = std::thread::spawn(move || IocShell::new(db, bridge).execute_line(&owned)).join();
+    let ran = std::thread::spawn(move || {
+        // A script line runs inside `iocshBody`, which may block (`iocsh.cpp:1122`).
+        epics_base_rs::runtime::task::set_thread_ok_to_block(true);
+        IocShell::new(db, bridge).execute_line(&owned)
+    })
+    .join();
 
     // Restore BEFORE anything can panic, or the failure report has
     // nowhere to go.
@@ -170,25 +175,13 @@ ERROR: Failed to load 'bad5.db'
 /// type: 'nosuchtype'` — on STDOUT, where a `2>` startup log never saw
 /// it, in this port's own words, naming a position it did not have.
 ///
-/// Two things C prints here that this assertion does not, both deliberate:
-///
-/// 1. the position (` at or before ')' … line 1` and the source echo).
-///    C's lexer is still parked on the record head; this port checks the
-///    type in the install loop, after the text is gone, and
-///    `DbRecordDef` carries no line the way `DbFieldDef` does. Naming a
-///    line it does not hold would be a guess, so it names none —
-///    `db_loader`'s struct is where that line would have to start.
-/// 2. a SECOND `ERROR: syntax error` with the same source line echoed
-///    under it again. That is bison unwinding its stack after `yyAbort`,
-///    not a second thing wrong with the file, and this port has no bison
-///    stack to unwind. Same for C's `WARNING: dbReadCOM: Parser stack
-///    dirty w/o error. 1` (`dbLexRoutines.c:303-306`), which reports
-///    `ellCount(&tempList)` — a C parser-internal list with no
-///    counterpart here.
+/// C's `WARNING: dbReadCOM: Parser stack dirty w/o error. 1`
+/// (`dbLexRoutines.c:303-306`) reports `ellCount(&tempList)`, a C
+/// parser-internal list with no counterpart here, and is not reproduced.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn an_unknown_record_type_gets_cs_sentence_on_cs_stream() {
-    let (out, err, _dir) = load(
+    let (out, err, dir) = load(
         "bad4.db",
         "record(nosuchtype, \"A4\") {\n    field(VAL, \"1\")\n}\n",
     );
@@ -198,52 +191,51 @@ async fn an_unknown_record_type_gets_cs_sentence_on_cs_stream() {
     );
     assert_eq!(
         err,
-        "\
+        format!(
+            "\
 ERROR: Record type 'nosuchtype' for record 'A4' not found
+ERROR:  at or before ')' in path \"{dir}\"  file \"bad4.db\" line 1
+
+ 1 | record(nosuchtype, \"A4\") {{
+
+ERROR: syntax error
+
+ 1 | record(nosuchtype, \"A4\") {{
+
 ERROR: Failed to load 'bad4.db'
 "
+        )
     );
 }
 
-/// A record type the port DECLARES but cannot construct — C's rec_size == 0,
-/// not C's "not found".
-///
-/// Measured on `softIoc` with a `.dbd` that declares `recordtype(zzz)` and no
-/// `registerRecordDeviceDriver` to fill in its size:
-///
-/// ```text
-/// stdout: \t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***
-/// stderr: dbAllocRecord(Z1) with zzz rec_size = 0
-///         ERROR: Can't create zzz record 'Z1'
-/// ```
-///
-/// `swait` is this port's version of that state: `stdRecords.dbd` does not
-/// carry it, the crate vendors its `.dbd` anyway, and an application opts
-/// into the factory with `register_record_type`. Until it does, the type has
-/// a shape and no support — which is what C's `rec_size == 0` means, and why
-/// this is not the `Record type … not found` line the case below gets.
-///
-/// The hint goes to STDOUT and the size line to stderr because that is where
-/// C puts them: `printf` and `epicsPrintf` respectively
-/// (`dbStaticRun.c:92-94`). An operator redirecting only one of the two
-/// streams sees half of C's answer, and would have seen none of ours.
+/// A record type the crate vendors a `.dbd` for but no factory is registered
+/// for is still C's "not found": a registered factory is the `.dbd` load and
+/// `registerRecordDeviceDriver` together, so `rec_size = 0` has no state to
+/// come from. softIoc R7.0.10.1 (8f5015b66) `-d unreg.db` prints these lines,
+/// plus the bison unwind the case above leaves out.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
-async fn a_declared_but_unregistered_record_type_is_cs_rec_size_zero() {
-    let (out, err, _dir) = load(
+async fn an_unregistered_vendored_record_type_is_not_found() {
+    let (out, err, dir) = load(
         "unreg.db",
         "record(swait, \"Z1\") {\n    field(SCAN, \"Passive\")\n}\n",
     );
-    assert_eq!(
-        out, "\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***\n",
-        "C's printf half, on stdout"
-    );
+    assert_eq!(out, "", "C prints nothing on stdout");
     assert_eq!(
         err,
-        "\
-dbAllocRecord(Z1) with swait rec_size = 0
-ERROR: Can't create swait record 'Z1'
+        format!(
+            "\
+ERROR: Record type 'swait' for record 'Z1' not found
+ERROR:  at or before ')' in path \"{dir}\"  file \"unreg.db\" line 1
+
+ 1 | record(swait, \"Z1\") {{
+
+ERROR: syntax error
+
+ 1 | record(swait, \"Z1\") {{
+
 ERROR: Failed to load 'unreg.db'
 "
+        )
     );
 }

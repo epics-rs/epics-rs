@@ -167,7 +167,10 @@ impl Coverage {
 pub async fn probe_supported_record_types(dbd: &Dbd) -> Result<BTreeSet<String>, String> {
     use std::collections::HashMap;
 
-    let _devices = crate::register_port_ioc_devices()?;
+    // Each probe build gets its own database and is never run, so the port's
+    // owner is a database of the probe's own that never opens.
+    let owner = std::sync::Arc::new(epics_base_rs::server::database::PvDatabase::new());
+    let _devices = crate::register_port_ioc_devices(&owner)?;
     let mut supported = BTreeSet::new();
     let macros: HashMap<String, String> = HashMap::new();
 

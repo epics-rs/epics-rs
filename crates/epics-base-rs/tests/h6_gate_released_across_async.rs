@@ -18,9 +18,16 @@
 //!    the gate is free while the delay runs;
 //! 3. the completion re-entry RE-TAKES the gate, so it serialises against a
 //!    concurrent holder rather than racing it.
+//!
+//! The DLYn cases hold the seq's lock-set epoch across the process call. That
+//! is sound only because `process_record_with_links` never yields — a resumed
+//! future could release the blocking epoch from another worker — so those
+//! calls go through [`unyielding`], which fails the test if it ever does.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -123,6 +130,15 @@ async fn probe_gate_is_free(db: &PvDatabase, record: &'static str) -> Result<(),
     Ok(())
 }
 
+/// Run `fut` to completion in one poll, on whatever thread calls this — no
+/// executor needed. Panics if it is not ready at once.
+fn unyielding<T>(fut: impl Future<Output = T>) -> T {
+    match std::pin::pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("process_record_with_links yielded"),
+    }
+}
+
 /// Boundary 1b — the same property through a real put. A CA-route put to an
 /// async-pending record must reach its PACT/RPRO decision instead of blocking
 /// on a gate the async cycle never released.
@@ -187,30 +203,24 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
             .put_field("DLY0", EpicsValue::Double(0.30))
             .unwrap();
         inst.record
-            .put_field("DOL0", EpicsValue::String("7.0".into()))
-            .unwrap();
-        inst.record
             .put_field("DO0", EpicsValue::Double(7.0))
             .unwrap();
-        inst.record
-            .put_field("LNK0", EpicsValue::String("H6:SEQTGT".into()))
+    }
+    // Link text goes through the put funnel, which keeps the parsed link.
+    for (field, text) in [("DOL0", "7.0"), ("LNK0", "H6:SEQTGT")] {
+        db.put_record_field_from_ca("H6:SEQ", field, EpicsValue::String(text.into()))
+            .await
             .unwrap();
     }
 
-    let start = std::time::Instant::now();
+    // Held across the call as in the zero-delay case below: the group cannot
+    // fire before `epoch` is dropped, however long this thread is held up.
+    let epoch = db.lock_records(["H6:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("H6:SEQ", &mut visited)
-        .await
-        .unwrap();
-    let returned_after = start.elapsed();
+    unyielding(db.process_record_with_links("H6:SEQ", &mut visited)).unwrap();
 
-    // C `process` returns straight through `processNextLink`; it does not wait
-    // out `DLY0`.
-    assert!(
-        returned_after < Duration::from_millis(200),
-        "seq process must return before DLY0 elapses, took {returned_after:?}"
-    );
-    // The group has NOT run yet.
+    // C `process` returns straight through `processNextLink`; the group has
+    // NOT run yet.
     assert_eq!(
         db.get_record("H6:SEQTGT")
             .unwrap()
@@ -225,6 +235,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
         db.get_record("H6:SEQ").unwrap().read().is_processing(),
         "seq must be PACT while its DLYn chain runs"
     );
+    drop(epoch);
     // The gate is free while the delay runs — the whole point of the port.
     probe_gate_is_free(&db, "H6:SEQ")
         .await
@@ -266,39 +277,59 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     );
 }
 
-/// A `LNKn` target whose put parks the thread that is driving it. Which
-/// thread that is, is the whole question of UI-81 — so the test needs a put it
-/// can still be standing inside while it asks.
-struct ParkingTarget {
-    val: f64,
-}
+/// Boundary 2, clock-free — `process` does not wait on DLY0 at all.
+///
+/// The timed case above cannot tell "returns at once" from "sleeps DLY0
+/// inline, then defers the rest": both look the same once 0.3 s has passed.
+/// With DLY0 = 1e6 s only the first returns, so the call runs on its own
+/// thread under a 30 s backstop, and the record must be PACT when it does.
+#[epics_macros_rs::epics_test]
+async fn seq_process_returns_without_waiting_out_dly0() {
+    let db = PvDatabase::new();
+    db.add_record("H6:SEQCF", Box::new(SeqRecord::new()))
+        .await
+        .unwrap();
+    db.add_record("H6:SEQCFTGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.get_record("H6:SEQCF")
+        .unwrap()
+        .write()
+        .record
+        .put_field("DLY0", EpicsValue::Double(1e6))
+        .unwrap();
+    for (field, text) in [("DOL0", "7.0"), ("LNK0", "H6:SEQCFTGT")] {
+        db.put_record_field_from_ca("H6:SEQCF", field, EpicsValue::String(text.into()))
+            .await
+            .unwrap();
+    }
 
-impl Record for ParkingTarget {
-    fn record_type(&self) -> &'static str {
-        "ui81_parking_target"
-    }
-    fn process(&mut self) -> CaResult<ProcessOutcome> {
-        Ok(ProcessOutcome::complete())
-    }
-    fn get_field(&self, name: &str) -> Option<EpicsValue> {
-        match name {
-            "VAL" => Some(EpicsValue::Double(self.val)),
-            _ => None,
-        }
-    }
-    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        match name {
-            "VAL" => {
-                std::thread::sleep(Duration::from_millis(300));
-                self.val = value.to_f64().ok_or(CaError::InvalidValue("bad".into()))?;
-                Ok(())
-            }
-            _ => Err(CaError::FieldNotFound(name.into())),
-        }
-    }
-    fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
-    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        let _ = done_tx.send(unyielding(
+            db2.process_record_with_links("H6:SEQCF", &mut visited),
+        ));
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("process must return without waiting out DLY0")
+        .unwrap();
+
+    assert!(
+        db.get_record("H6:SEQCF").unwrap().read().is_processing(),
+        "seq must be PACT while DLY0 is pending (seqRecord.c:143)"
+    );
+    assert_eq!(
+        db.get_record("H6:SEQCFTGT")
+            .unwrap()
+            .read()
+            .record
+            .get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "LNK0 must not fire before DLY0 elapses"
+    );
 }
 
 /// Boundary 2b (UI-81) — a seq whose selected groups are ALL `DLYn == 0` is
@@ -313,8 +344,9 @@ impl Record for ParkingTarget {
 /// callback task. The port used to walk a zero-delay group inline, which held
 /// the caller for the whole chain and never made the record active.
 ///
-/// The parking target puts the boundary beyond a race: the walk is provably
-/// still inside the first group's put while this test asks its questions.
+/// The test holds the seq's lock set across the call, as C's caller holds
+/// `dbScanLock` across `dbProcess`, so the boundary is an ordering and not a
+/// race: the group cannot run on the callback task until the test lets go.
 // RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
 // real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -323,7 +355,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
     db.add_record("UI81:SEQ", Box::new(SeqRecord::new()))
         .await
         .unwrap();
-    db.add_record("UI81:TGT", Box::new(ParkingTarget { val: 0.0 }))
+    db.add_record("UI81:TGT", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
     {
@@ -331,28 +363,30 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         let mut inst = rec.write();
         // DLY0 stays 0.0 — the case under test.
         inst.record
-            .put_field("DOL0", EpicsValue::String("5.0".into()))
-            .unwrap();
-        inst.record
             .put_field("DO0", EpicsValue::Double(5.0))
             .unwrap();
-        inst.record
-            .put_field("LNK0", EpicsValue::String("UI81:TGT".into()))
+    }
+    // Link text goes through the put funnel, which keeps the parsed link.
+    for (field, text) in [("DOL0", "5.0"), ("LNK0", "UI81:TGT")] {
+        db.put_record_field_from_ca("UI81:SEQ", field, EpicsValue::String(text.into()))
+            .await
             .unwrap();
     }
 
-    let start = std::time::Instant::now();
+    let epoch = db.lock_records(["UI81:SEQ"]);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_with_links("UI81:SEQ", &mut visited)
-        .await
-        .unwrap();
-    let returned_after = start.elapsed();
+    unyielding(db.process_record_with_links("UI81:SEQ", &mut visited)).unwrap();
 
-    // C returns through `processNextLink` without running a single group.
-    assert!(
-        returned_after < Duration::from_millis(150),
-        "a zero-delay seq must return before its group's put completes, took \
-         {returned_after:?}"
+    // C returns through `processNextLink` without running a single group:
+    // whatever the chain did before `epoch` is dropped, it did inline.
+    assert_eq!(
+        db.get_record("UI81:TGT")
+            .unwrap()
+            .read()
+            .record
+            .get_field("VAL"),
+        Some(EpicsValue::Double(0.0)),
+        "a zero-delay seq must return before its group runs"
     );
     // `prec->pact = TRUE` (`seqRecord.c:143`) — the record is ACTIVE, which is
     // what makes it visible as busy and what `asyncFinish` later clears.
@@ -360,6 +394,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
         db.get_record("UI81:SEQ").unwrap().read().is_processing(),
         "a zero-delay seq must be PACT across its group chain"
     );
+    drop(epoch);
     // And the caller is not the walker: the gate the walk re-takes per group
     // (`processCallback`'s `dbScanLock`, `:252`) is not held by this thread.
     probe_gate_is_free(&db, "UI81:SEQ")

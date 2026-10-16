@@ -64,7 +64,7 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
         let r = db.get_record(name).unwrap();
         let mut inst = r.write();
         inst.common.scan = ScanType::Event;
-        inst.common.evnt = evnt.to_string();
+        inst.common.text.evnt = evnt.into();
     }
     db.update_scan_index(name, ScanType::Passive, ScanType::Event, 0, 0);
 }
@@ -74,6 +74,8 @@ async fn add_event_sibling(db: &PvDatabase, name: &str, evnt: &str, counter: Arc
 #[epics_macros_rs::epics_test]
 async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "W_SIB", "9", count.clone()).await;
 
@@ -154,6 +156,8 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
 #[epics_macros_rs::epics_test]
 async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "W3_SIB", "13", count.clone()).await;
 
@@ -358,6 +362,8 @@ async fn swait_odly_defers_forward_link_to_continuation() {
         inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
             .unwrap();
     }
+    // The forward links bind at iocInit, as C's do.
+    db.ioc_init().await;
 
     // Delaying cycle: FLNK must NOT fire (C defers recGblFwdLink to execOutput).
     let mut v1 = epics_base_rs::server::database::ProcStack::new();
@@ -390,6 +396,8 @@ async fn swait_odly_defers_forward_link_to_continuation() {
 #[epics_macros_rs::epics_test]
 async fn swait_no_odly_writes_out_and_posts_oevt_synchronously() {
     let db = PvDatabase::new();
+    // No `iocRun` over this database: the running transition is its own.
+    db.scan_control().run();
     let count = Arc::new(AtomicUsize::new(0));
     add_event_sibling(&db, "W2_SIB", "11", count.clone()).await;
 

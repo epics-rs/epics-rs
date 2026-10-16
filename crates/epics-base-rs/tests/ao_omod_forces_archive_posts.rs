@@ -79,7 +79,7 @@ fn read(db: &PvDatabase, field: &str) -> EpicsValue {
 fn drain(rx: &mut EventReader) -> Vec<EventMask> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        out.push(ev.mask);
+        out.push(ev.mask());
     }
     out
 }

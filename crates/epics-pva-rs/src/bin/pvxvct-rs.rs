@@ -537,12 +537,11 @@ fn refuse_without_a_reactor(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>)
         filters.peers.len(),
         filters.pvnames.len()
     );
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "pvxvct-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread); the UDP collector needs a tokio reactor, so \
-         there is nothing to sniff with. Rebuild without that feature."
-    );
-    std::process::exit(1);
+         there is nothing to sniff with. Rebuild without that feature.",
+    )
 }
 
 /// The `tokio_backend` arm: bind one collector per `-B` endpoint and print

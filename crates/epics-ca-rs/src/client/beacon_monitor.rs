@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
-use epics_base_rs::net::AsyncUdpV4;
+use epics_base_rs::net::{AsyncUdpV4, PortUse};
 use epics_base_rs::runtime::sync::mpsc;
 
 use crate::protocol::*;
@@ -282,8 +282,9 @@ async fn run_beacon_monitor_inner(
     // reachable and, because all NIC sockets share ONE ephemeral port, the
     // repeater keys the alternating datagrams to a single client by port
     // (C `identicalPort`, `repeater.cpp:418`) exactly as C's single
-    // INADDR_ANY socket does.
-    let socket = match AsyncUdpV4::bind_ephemeral_same_port(false) {
+    // INADDR_ANY socket does. `Exclusive`, as that socket sets no reuse
+    // option (`udpiiu.cpp:174-252`).
+    let socket = match AsyncUdpV4::bind_ephemeral_same_port(PortUse::Exclusive, false) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -330,7 +331,7 @@ async fn run_beacon_monitor_inner(
     let mut verified_tuples: HashMap<(u32, u16, u32), std::time::Instant> = HashMap::new();
     #[cfg(feature = "cap-tokens")]
     let require_signed = !matches!(
-        epics_base_rs::runtime::env::get("EPICS_CA_BEACON_REQUIRE_SIGNED").as_deref(),
+        epics_base_rs::runtime::env::get_lossy("EPICS_CA_BEACON_REQUIRE_SIGNED").as_deref(),
         Some("NO" | "no" | "0" | "false" | "FALSE")
     );
     let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
@@ -1084,7 +1085,7 @@ mod repeater_registration_tests {
         // only from the pacer's second registration on — a whole period of
         // slack, counted in ticks rather than in milliseconds.
         let pacer_ticks = std::cell::Cell::new(0usize);
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "registration must stop on CONFIRM (C `expire` returns noRestart \
              once `registered`)",
             |(src, _): &(SocketAddr, usize)| src.port() == client.port() && pacer_ticks.get() >= 2,

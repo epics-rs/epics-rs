@@ -273,7 +273,7 @@ impl DrvVxi11Port {
         // at :1016 and :1738, but does not define it).
         let max_addr = if multi_device { 32 } else { 1 };
 
-        let mut base = PortDriverBase::new(
+        let mut base = PortDriverBase::new_exact_flags(
             port_name,
             max_addr,
             PortFlags {
@@ -283,7 +283,7 @@ impl DrvVxi11Port {
             },
         );
         base.init_connected(false);
-        base.auto_connect = !no_auto_connect;
+        base.init_auto_connect(!no_auto_connect);
         Ok(Self {
             base,
             config,
@@ -603,9 +603,9 @@ mod tests {
     #[test]
     fn no_auto_connect_disables_framework_auto() {
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "inst0", 0, true).unwrap();
-        assert!(!drv.base().auto_connect);
+        assert!(!drv.base().is_auto_connect());
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "inst0", 0, false).unwrap();
-        assert!(drv.base().auto_connect);
+        assert!(drv.base().is_auto_connect());
     }
 
     #[test]

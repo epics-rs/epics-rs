@@ -36,35 +36,168 @@ impl AlarmSeverity {
 /// round-trips, matching sel/dfanout's already-raw `hhsv`/… fields; read the
 /// alarm meaning with `AlarmSeverity::from_u16(field as u16)` and the C nonzero
 /// enable with `field != 0`.
-/// `Copy` because the alarm ladder reads it once per cycle on every analog
-/// record and cannot borrow it — `evaluate_analog_alarm` needs `&mut` on the
-/// same `CommonFields`. Every field is already `Copy`, so a by-value read is a
-/// register move, where the `Clone` it replaces was four `AlarmLimit` matches
-/// and reconstructions per record per cycle.
+///
+/// The four limits are held as one array in the record's own domain, in the
+/// ladder's order, so the cycle compares them straight off the slot: C reads
+/// `prec->hihi` as a struct member, and a per-limit `AlarmLimit` cost a match
+/// and a conversion for each of the four on every cycle.
 #[derive(Clone, Copy, Debug)]
 pub struct AnalogAlarmConfig {
-    pub hihi: AlarmLimit,
-    pub high: AlarmLimit,
-    pub low: AlarmLimit,
-    pub lolo: AlarmLimit,
+    limits: AlarmLadder,
     pub hhsv: i16,
     pub hsv: i16,
     pub lsv: i16,
     pub llsv: i16,
 }
 
-impl Default for AnalogAlarmConfig {
-    fn default() -> Self {
+/// `[HIHI, LOLO, HIGH, LOW]` — the order [`analog_alarm_range`] tests them —
+/// in the one type the record's `.dbd` declares all four with.
+#[derive(Clone, Copy, Debug)]
+enum AlarmLadder {
+    Double([f64; 4]),
+    Long([i32; 4]),
+    Int64([i64; 4]),
+}
+
+/// One of the four analog-alarm limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmLimitField {
+    Hihi = 0,
+    Lolo = 1,
+    High = 2,
+    Low = 3,
+}
+
+impl AnalogAlarmConfig {
+    /// A slot for a record whose limits are `DBF_DOUBLE`, every limit and
+    /// severity zero as a fresh C record has them.
+    pub fn double() -> Self {
+        Self::of(AlarmLadder::Double([0.0; 4]))
+    }
+
+    /// A slot for a record whose limits are `DBF_LONG` (longin/longout).
+    pub fn long() -> Self {
+        Self::of(AlarmLadder::Long([0; 4]))
+    }
+
+    /// A slot for a record whose limits are `DBF_INT64` (int64in/int64out).
+    pub fn int64() -> Self {
+        Self::of(AlarmLadder::Int64([0; 4]))
+    }
+
+    fn of(limits: AlarmLadder) -> Self {
         Self {
-            hihi: AlarmLimit::default(),
-            high: AlarmLimit::default(),
-            low: AlarmLimit::default(),
-            lolo: AlarmLimit::default(),
+            limits,
             hhsv: 0,
             hsv: 0,
             lsv: 0,
             llsv: 0,
         }
+    }
+
+    /// The limit as stored, in the type its `.dbd` row declares.
+    pub fn limit(&self, field: AlarmLimitField) -> AlarmLimit {
+        let i = field as usize;
+        match self.limits {
+            AlarmLadder::Double(l) => AlarmLimit::Double(l[i]),
+            AlarmLadder::Long(l) => AlarmLimit::Long(l[i]),
+            AlarmLadder::Int64(l) => AlarmLimit::Int64(l[i]),
+        }
+    }
+
+    /// Store a limit. The put has already been coerced to the field's
+    /// declared type, so the casts are reached only by a value that arrives
+    /// in another domain, and take C's `dbPut` conversion.
+    pub fn set_limit(&mut self, field: AlarmLimitField, value: AlarmLimit) {
+        let i = field as usize;
+        match &mut self.limits {
+            AlarmLadder::Double(l) => l[i] = value.as_f64(),
+            AlarmLadder::Long(l) => {
+                l[i] = match value {
+                    AlarmLimit::Long(v) => v,
+                    AlarmLimit::Int64(v) => v as i32,
+                    AlarmLimit::Double(v) => v as i32,
+                }
+            }
+            AlarmLadder::Int64(l) => {
+                l[i] = match value {
+                    AlarmLimit::Int64(v) => v,
+                    AlarmLimit::Long(v) => v as i64,
+                    AlarmLimit::Double(v) => v as i64,
+                }
+            }
+        }
+    }
+
+    /// C `checkAlarms`' `alarmRange` for `val`, compared in VAL's own domain:
+    /// `f64` for a `DBF_DOUBLE` VAL, `i128` for `DBF_LONG`/`DBF_INT64` so
+    /// `alev - hyst` cannot overflow. `hyst` `None` is a type that keeps HYST
+    /// in `CommonFields`, passed as `common_hyst`.
+    #[inline(always)]
+    pub(crate) fn range(
+        &self,
+        val: AlarmLimit,
+        hyst: Option<AlarmLimit>,
+        lalm: AlarmLimit,
+        common_hyst: f64,
+    ) -> u16 {
+        let sevs = [self.hhsv, self.llsv, self.hsv, self.lsv];
+        // Every level is gated on its severity first, so with none enabled the
+        // operands need not be brought into a domain at all.
+        if sevs == [0; 4] {
+            return 3;
+        }
+        match val {
+            AlarmLimit::Double(v) => {
+                let limits = match self.limits {
+                    AlarmLadder::Double(l) => l,
+                    AlarmLadder::Long(l) => l.map(f64::from),
+                    AlarmLadder::Int64(l) => l.map(|x| x as f64),
+                };
+                analog_alarm_range(
+                    v,
+                    hyst.map_or(common_hyst, AlarmLimit::as_f64),
+                    lalm.as_f64(),
+                    limits,
+                    sevs,
+                )
+            }
+            AlarmLimit::Long(_) | AlarmLimit::Int64(_) => {
+                let v = val.as_i128();
+                let limits = match self.limits {
+                    AlarmLadder::Double(l) => l.map(|x| x as i128),
+                    AlarmLadder::Long(l) => l.map(i128::from),
+                    AlarmLadder::Int64(l) => l.map(i128::from),
+                };
+                analog_alarm_range(
+                    v,
+                    hyst.map_or(common_hyst as i128, AlarmLimit::as_i128),
+                    lalm.as_i128(),
+                    limits,
+                    sevs,
+                )
+            }
+        }
+    }
+
+    /// C `range_stat[]` plus the severity and `alev` each range selects. C
+    /// reaches this mapping twice — out of the ladder and out of the AFTC
+    /// filter's `switch (alarmRange)` — so it is one table.
+    #[inline]
+    pub(crate) fn resolve(&self, range: u16) -> (AlarmSeverity, u16, Option<AlarmLimit>) {
+        use crate::server::recgbl::alarm_status;
+        let (sev, stat, field) = match range {
+            5 => (self.hhsv, alarm_status::HIHI_ALARM, AlarmLimitField::Hihi),
+            4 => (self.hsv, alarm_status::HIGH_ALARM, AlarmLimitField::High),
+            2 => (self.lsv, alarm_status::LOW_ALARM, AlarmLimitField::Low),
+            1 => (self.llsv, alarm_status::LOLO_ALARM, AlarmLimitField::Lolo),
+            _ => return (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, None),
+        };
+        (
+            AlarmSeverity::from_u16(sev as u16),
+            stat,
+            Some(self.limit(field)),
+        )
     }
 }
 
@@ -193,5 +326,44 @@ where
         2
     } else {
         3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_is_normal_with_no_level_enabled_and_fires_with_any_one() {
+        for mut cfg in [
+            AnalogAlarmConfig::double(),
+            AnalogAlarmConfig::long(),
+            AnalogAlarmConfig::int64(),
+        ] {
+            cfg.set_limit(AlarmLimitField::Hihi, AlarmLimit::Long(10));
+            cfg.set_limit(AlarmLimitField::High, AlarmLimit::Long(5));
+            cfg.set_limit(AlarmLimitField::Low, AlarmLimit::Long(-5));
+            cfg.set_limit(AlarmLimitField::Lolo, AlarmLimit::Long(-10));
+            let at = |cfg: &AnalogAlarmConfig, v: i32| {
+                let val = match cfg.limit(AlarmLimitField::Hihi) {
+                    AlarmLimit::Double(_) => AlarmLimit::Double(v.into()),
+                    AlarmLimit::Long(_) => AlarmLimit::Long(v),
+                    AlarmLimit::Int64(_) => AlarmLimit::Int64(v.into()),
+                };
+                cfg.range(val, None, val, 0.0)
+            };
+            assert_eq!((at(&cfg, 20), at(&cfg, -20)), (3, 3), "{cfg:?}");
+            for sev in [1, 4, -1] {
+                let one = |f: fn(&mut AnalogAlarmConfig) -> &mut i16| {
+                    let mut c = cfg;
+                    *f(&mut c) = sev;
+                    c
+                };
+                assert_eq!(at(&one(|c| &mut c.hhsv), 20), 5, "{cfg:?} HHSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.hsv), 20), 4, "{cfg:?} HSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.lsv), -20), 2, "{cfg:?} LSV {sev}");
+                assert_eq!(at(&one(|c| &mut c.llsv), -20), 1, "{cfg:?} LLSV {sev}");
+            }
+        }
     }
 }

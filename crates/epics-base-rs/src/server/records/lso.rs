@@ -1,5 +1,6 @@
+use super::lsi::LongStringVal;
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldDeclaration, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -11,32 +12,19 @@ const MAX_STRING_SIZE: usize = 40;
 /// `menuPost_OnChange` (0).
 const MENU_POST_ALWAYS: i16 = 1;
 
-/// Truncate `s` to at most `max` bytes. C `lsoRecord.c` keeps the long
-/// string in a fixed `char[]` and copies it byte for byte
-/// (`memcpy`/`strncpy`) with no UTF-8 awareness, so the cut is on a raw
-/// byte boundary and a non-UTF-8 value keeps its bytes verbatim.
-fn truncate_bytes(s: PvString, max: usize) -> PvString {
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
-}
-
 // Long string output record (EPICS 7).
 // Native CA type is DBR_CHAR array; SIZV (default 256) sets the max byte count.
 pub struct LsoRecord {
-    pub val: PvString,
-    pub oval: PvString,
+    pub val: LongStringVal,
+    pub oval: LongStringVal,
     pub sizv: u16,
-    pub len: u32,
-    pub olen: u32,
     pub ivoa: i16,
     pub ivov: PvString,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menuPost` Post Value Monitors: `menuPost_OnChange` (0, default)
@@ -48,59 +36,70 @@ pub struct LsoRecord {
     /// DBE_LOG (archive) mask (C `lsoRecord.dbd.pod` APST, monitor:
     /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
     pub apst: i16,
+    /// LEN owed by `special()` on a VAL put, or by `monitor()`'s
+    /// `len != olen` on the cycle it ran; `take_cycle_posted_fields` takes it.
+    len_marked: bool,
 }
 
 impl Default for LsoRecord {
     fn default() -> Self {
         Self {
-            val: PvString::new(),
-            oval: PvString::new(),
+            val: LongStringVal::default(),
+            oval: LongStringVal::default(),
             // Intentional deviation from C `lsoRecord.dbd.pod`
             // `field(SIZV,DBF_USHORT){ initial("41") }`: the port defaults to a
             // larger 256-byte long-string buffer rather than C's 41. Kept by
             // design (a .db that needs C's size sets SIZV explicitly); not a
             // parity bug.
             sizv: 256,
-            // C `lsoRecord.c:62-64`: `prec->len = 0; prec->olen = 0;`.
-            len: 0,
-            olen: 0,
             ivoa: 0,
             ivov: PvString::new(),
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
             apst: 0,
+            len_marked: false,
         }
     }
 }
 
 impl LsoRecord {
     pub fn new(val: &str) -> Self {
-        let v = PvString::from(val);
-        let len = if v.is_empty() {
-            0
-        } else {
-            (v.len() + 1).min(256) as u32
-        };
-        Self {
-            val: v,
-            len,
-            ..Default::default()
+        let mut rec = Self::default();
+        if !val.is_empty() {
+            rec.val = LongStringVal::from_text(&val.as_bytes()[..val.len().min(rec.capacity())]);
         }
+        rec
     }
 
-    fn clamped(&self) -> PvString {
-        let max = (self.sizv as usize).saturating_sub(1);
-        truncate_bytes(self.val.clone(), max)
+    /// VAL's byte capacity: SIZV less the NUL. VAL never exceeds it — every
+    /// write, and a SIZV put, cuts to it.
+    fn capacity(&self) -> usize {
+        (self.sizv as usize).saturating_sub(1)
     }
 }
 
 impl Record for LsoRecord {
+    // LEN/OLEN are VAL's and OVAL's lengths, not members.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::lso;
+        IVOV => ivov,
+        SDLY => sdly;
+        read_only:
+        SIZV => sizv);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::WRITE_POSTED
+    }
+
     fn record_type(&self) -> &'static str {
         "lso"
     }
@@ -132,11 +131,18 @@ impl Record for LsoRecord {
         use crate::server::record::LinkReadAs;
         use crate::types::DbFieldType;
         Some(match source.field_type {
-            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::CharArrayAsString {
-                max_elements: self.sizv as usize,
-            },
+            Some(DbFieldType::Char | DbFieldType::UChar) => LinkReadAs::Native,
             _ => LinkReadAs::String,
         })
+    }
+
+    /// The closed-loop DOL read lands through `dbGetLinkLS`
+    /// (`lsoRecord.c:114`), not the 40-byte DBR_STRING put of a VAL write.
+    fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
+        match super::lsi::link_ls_read(value, self.sizv, &mut self.val) {
+            Ok(()) => Ok(()),
+            Err(other) => self.put_field_internal("VAL", other),
+        }
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsoRecord.dbd.pod`): `SIMM`
@@ -153,8 +159,15 @@ impl Record for LsoRecord {
         }
     }
 
-    fn long_string_fields(&self) -> &'static [&'static str] {
-        &["VAL", "OVAL"]
+    /// C `cvt_dbaddr` serves each as one `DBF_STRING` (`no_elements = 1`,
+    /// `lsoRecord.c:183`), whatever LEN holds.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        self.field_is_long_string(field).then_some(1)
+    }
+
+    /// `cvt_dbaddr` stores `field_size = prec->sizv`.
+    fn dbaddr_element_size(&self, field: &str) -> Option<u16> {
+        self.field_is_long_string(field).then_some(self.sizv)
     }
 
     /// C `lsoRecord.c::process:131-140` (`menuIvoaSet_output_to_IVOV`) writes
@@ -185,7 +198,13 @@ impl Record for LsoRecord {
     /// the PREVIOUS cycle. Naming VAL here is what lets the IVOA arm leave
     /// OVAL to its one meaning.
     fn output_link_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
+        self.val()
+    }
+
+    fn output_view(&self) -> Option<crate::server::record::OutView<'_>> {
+        Some(crate::server::record::OutView::Chars(
+            &self.val.elements()[..],
+        ))
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -203,12 +222,76 @@ impl Record for LsoRecord {
     /// `process()` returns, so a flag captured in `process()` would be the
     /// verdict on the PRE-arm value.
     fn monitor_value_changed(&mut self) -> Option<bool> {
-        let changed = self.len != self.olen || self.oval != self.val;
+        let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
-            self.olen = self.len;
+            // Unchanged bytes have an unchanged length, and the take that
+            // `marked` guarantees has already cleared the mark.
+            self.len_marked = self.oval.copy_from(&self.val);
         }
         Some(changed)
+    }
+
+    /// C `lsoRecord.c:254-256`: `if (len != olen) { olen = len; db_post_events(&len,
+    /// DBE_VALUE | DBE_LOG); }`, marked by `monitor_value_changed` as it
+    /// commits OVAL, whose length is OLEN.
+    fn monitor_value_classes(
+        &mut self,
+        _gate: crate::server::record::MonitorValueGate,
+        _last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let changed = self.monitor_value_changed() == Some(true);
+        let (val_always, archive_always) = self.monitor_always_post();
+        crate::server::record::MonitorValueClasses {
+            value: changed || val_always,
+            archive: changed || archive_always,
+            hash_changed: false,
+            marked: self.len_marked,
+        }
+    }
+
+    /// C `special()` sets `len` and posts it on every VAL put (lsoRecord.c:239),
+    /// changed or not; `monitor()` posts it again only when `len != olen`.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if after && field == "VAL" {
+            self.len_marked = true;
+        }
+        Ok(())
+    }
+
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        const LEN_POST_NAMED: [(&str, CyclePostMask); 1] = [("LEN", CyclePostMask::ValueLog)];
+        static LEN_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::LSO_FIELDS,
+            LEN_POST_NAMED,
+        );
+        CycleMarks::of(&LEN_POST, std::mem::take(&mut self.len_marked) as u128)
+    }
+
+    /// LEN posts from `special()` and from `monitor()`'s `olen` compare, never
+    /// against what a subscriber was last sent.
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["LEN"]
+    }
+
+    /// C `monitor()` posts VAL and LEN alone (lsoRecord.c:246-265); the
+    /// OVAL/OLEN copy it makes is never posted.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::LSO_FIELDS,
+                    ["VAL", "LEN"],
+                )
+            },
+        )
+    }
+
+    fn stamps_after_write(&self) -> bool {
+        true
     }
 
     /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a
@@ -250,20 +333,24 @@ impl Record for LsoRecord {
         Some("DOL")
     }
 
-    /// The `dbLoadLinkLS` sink plus C's init tail (`lsoRecord.c:92-95`).
+    /// The `dbLoadLinkLS` sink (`lsoRecord.c:82`). The OVAL copy is not part
+    /// of it: C makes that copy after the dset status return.
     fn apply_ls_load(&mut self, load: crate::server::record::LsLoad) -> u32 {
         match load {
             crate::server::record::LsLoad::Text(s) => {
-                let max = (self.sizv as usize).saturating_sub(1);
-                self.val = truncate_bytes(PvString::from(s), max);
-                self.len = (self.val.len() + 1) as u32;
+                self.val
+                    .set_text(&s.as_bytes()[..s.len().min(self.capacity())]);
             }
-            // C's number case: the buffer is untouched, LEN comes out 1.
-            crate::server::record::LsLoad::LenOnly => self.len = 1,
+            crate::server::record::LsLoad::LenOnly => self.val.set_len_one(),
         }
-        self.oval = self.val.clone();
-        self.olen = self.len;
-        self.len
+        self.val.len()
+    }
+
+    /// C `lsoRecord.c:91-94`, after `:84-88` returns a nonzero dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed && !self.val.is_empty() {
+            self.oval.copy_from(&self.val);
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -271,16 +358,38 @@ impl Record for LsoRecord {
     }
 
     fn val(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::CharArray(self.clamped().into_bytes().into()))
+        Some(EpicsValue::CharArray(self.val.elements().clone()))
+    }
+
+    /// [`Self::val`]'s elements, borrowed.
+    fn monitor_value_view(&self) -> Option<crate::server::record::ValueView<'_>> {
+        Some(crate::server::record::ValueView::Char(self.val.elements()))
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes().into())),
-            "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes().into())),
+            "VAL" => self.val(),
+            "OVAL" => Some(EpicsValue::CharArray(self.oval.elements().clone())),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
-            "LEN" => Some(EpicsValue::ULong(self.len)),
-            "OLEN" => Some(EpicsValue::ULong(self.olen)),
+            "LEN" => Some(EpicsValue::ULong(self.val.len())),
+            "OLEN" => Some(EpicsValue::ULong(self.oval.len())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             // `DBF_STRING size(40)` (`lsoRecord.dbd.pod:155-160`), the same
             // plain 40-byte field `stringout` has — not a long string. VAL and
@@ -305,22 +414,8 @@ impl Record for LsoRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
-                // DBR_STRING-typed put caps at MAX_STRING_SIZE (40);
-                // DBR_CHAR long-string put is bounded only by SIZV.
-                let mut s = match value {
-                    EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
-                    EpicsValue::CharArray(bytes) => {
-                        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        PvString::from_bytes(bytes[..end].to_vec())
-                    }
-                    _ => return Err(CaError::TypeMismatch("VAL".into())),
-                };
-                let max = (self.sizv as usize).saturating_sub(1);
-                if s.len() > max {
-                    s = truncate_bytes(s, max);
-                }
-                self.val = s;
-                self.len = (self.val.len() + 1) as u32;
+                let capacity = self.capacity();
+                self.val.put(value, capacity)?;
             }
             "SIZV" => {
                 // SIZV is DBF_USHORT (lsoRecord.dbd.pod:128): a client put
@@ -332,6 +427,10 @@ impl Record for LsoRecord {
                 };
                 // C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff].
                 self.sizv = raw.clamp(16, 0x7fff) as u16;
+                // C sizes the buffer once (SPC_NOMOD); the port takes SIZV
+                // after a .db VAL, so the cut lands here.
+                let capacity = self.capacity();
+                self.val.cut_text(capacity);
             }
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {
@@ -345,15 +444,16 @@ impl Record for LsoRecord {
             // one, so IVOV's 40-byte field holds 39 bytes of text however it is
             // written.
             "IVOV" => {
-                let s = match value {
-                    EpicsValue::String(s) => s,
+                let bytes = match &value {
+                    EpicsValue::String(s) => s.as_bytes(),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        PvString::from_bytes(bytes[..end].to_vec())
+                        &bytes[..end]
                     }
                     _ => return Err(CaError::TypeMismatch("IVOV".into())),
                 };
-                self.ivov = truncate_bytes(s, MAX_STRING_SIZE - 1);
+                self.ivov
+                    .set_bytes(&bytes[..bytes.len().min(MAX_STRING_SIZE - 1)]);
             }
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {
@@ -364,7 +464,7 @@ impl Record for LsoRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v.as_str_lossy().into_owned();
+                    self.dol = v;
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -378,14 +478,14 @@ impl Record for LsoRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v.as_str_lossy().into_owned();
+                    self.siml = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v.as_str_lossy().into_owned();
+                    self.siol = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

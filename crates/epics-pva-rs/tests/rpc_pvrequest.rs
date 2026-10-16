@@ -38,7 +38,7 @@ fn echo_server() -> (PvaServer, epics_pva_rs::client_native::context::PvaClient)
         };
         let desc = FieldDesc::Structure {
             struct_id: String::new(),
-            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
         };
         let mut s = PvStructure::new("");
         s.set("value", PvField::Scalar(ScalarValue::String(echoed)));
@@ -56,7 +56,7 @@ fn echo_server() -> (PvaServer, epics_pva_rs::client_native::context::PvaClient)
 fn echo_arg() -> (FieldDesc, PvField) {
     let desc = FieldDesc::Structure {
         struct_id: String::new(),
-        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+        fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
     };
     let mut s = PvStructure::new("");
     s.set("value", PvField::Scalar(ScalarValue::String("ping".into())));

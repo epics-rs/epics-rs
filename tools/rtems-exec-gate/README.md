@@ -30,7 +30,7 @@ for by exactly one of four things:
 
 1. a file-level `#![cfg(..)]` gate;
 2. an enclosing column-0 `mod` carrying a `#[cfg(..)]` gate;
-3. a per-test `#[cfg(..)]` gate directly above it, which is what keeps a file's
+3. a per-test `#[cfg(..)]` gate among the test's attributes, which is what keeps a file's
    pure wire-format tests running on the exec backend while its async ones are
    gated;
 4. a census marker declaring how many ungated sites follow it and why they may

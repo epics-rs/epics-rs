@@ -21,7 +21,8 @@
 //! the same rule for `seq`'s per-group restamp (`seqRecord.c:261`); this pins
 //! it for the ordinary one-stamp cycle.
 
-use std::time::{Duration, SystemTime};
+use epics_base_rs::types::WallTime;
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -59,12 +60,12 @@ async fn process(db: &PvDatabase, rec: &str) {
         .unwrap();
 }
 
-fn time_of(db: &PvDatabase, rec: &str) -> SystemTime {
+fn time_of(db: &PvDatabase, rec: &str) -> WallTime {
     db.get_record(rec).unwrap().read().common.time
 }
 
 fn tse_of(db: &PvDatabase, rec: &str) -> i16 {
-    db.get_record(rec).unwrap().read().common.tse
+    db.get_record(rec).unwrap().read().common.tse()
 }
 
 /// `TSEL="TSP:SRC.TIME"` with `INPA="TSP:SRC.VAL PP"`: `fetch_values` restamps

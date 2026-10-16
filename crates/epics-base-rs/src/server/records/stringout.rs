@@ -1,4 +1,5 @@
 use crate::error::{CaError, CaResult};
+use crate::server::record::{CycleCell, CycleRead, OutView};
 use crate::server::record::{MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -6,16 +7,12 @@ use crate::types::{EpicsValue, PvString};
 /// buffers in C `stringoutRecord.c`.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most 39 payload bytes (40 incl. the implicit
-/// NUL). Mirrors C `strncpy(dst, src, 40)`, which copies bytes with no
-/// UTF-8 awareness, so the cut is on a raw byte boundary and a non-UTF-8
-/// VAL keeps its bytes verbatim.
-fn truncate_string(s: PvString) -> PvString {
-    let max = MAX_STRING_SIZE - 1;
-    if s.len() <= max {
-        return s;
-    }
-    PvString::from_bytes(s.as_bytes()[..max].to_vec())
+/// `s` cut to at most 39 payload bytes (40 incl. the implicit NUL). Mirrors
+/// C `strncpy(dst, src, 40)`, which copies bytes with no UTF-8 awareness, so
+/// the cut is on a raw byte boundary and a non-UTF-8 VAL keeps its bytes
+/// verbatim.
+fn truncated(s: &[u8]) -> &[u8] {
+    &s[..s.len().min(MAX_STRING_SIZE - 1)]
 }
 
 /// Stringout record — a 40-byte (`MAX_STRING_SIZE`) string output.
@@ -33,10 +30,10 @@ pub struct StringoutRecord {
     pub ivoa: i16,
     pub ivov: PvString,
     pub omsl: i16,
-    pub dol: String,
+    pub dol: PvString,
     pub simm: i16,
-    pub siml: String,
-    pub siol: String,
+    pub siml: PvString,
+    pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
     /// `menu(stringoutPOST)` Post Value Monitors (0=On Change, 1=Always).
@@ -56,10 +53,10 @@ impl Default for StringoutRecord {
             ivoa: 0,
             ivov: PvString::new(),
             omsl: 0,
-            dol: String::new(),
+            dol: PvString::new(),
             simm: 0,
-            siml: String::new(),
-            siol: String::new(),
+            siml: PvString::new(),
+            siol: PvString::new(),
             sims: 0,
             sdly: -1.0,
             mpst: 0,
@@ -71,13 +68,28 @@ impl Default for StringoutRecord {
 impl StringoutRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(PvString::from(val)),
+            val: PvString::from(truncated(val.as_bytes())),
             ..Default::default()
         }
     }
 }
 
 impl Record for StringoutRecord {
+    crate::slot_map!(crate::server::record::dbd_generated::slots::stringout;
+        VAL => val,
+        SDLY => sdly,
+        IVOV => ivov;
+        read_only:
+        OVAL => oval);
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
     fn record_type(&self) -> &'static str {
         "stringout"
     }
@@ -145,7 +157,7 @@ impl Record for StringoutRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
     }
@@ -164,6 +176,10 @@ impl Record for StringoutRecord {
     /// cycle.
     fn output_link_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::String(self.val.clone()))
+    }
+
+    fn output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Str(self.val.as_bytes()))
     }
 
     /// C `stringoutRecord.c:138-144`: `process()` clears `udf` to FALSE only
@@ -194,8 +210,54 @@ impl Record for StringoutRecord {
         (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
+    /// `monitor()` posts VAL alone (`stringoutRecord.c:212-227`); OVAL is
+    /// its private copy.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::STRINGOUT_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
+    /// VAL, the deadband field, is the only post.
+    fn answers_own_posts(&self) -> bool {
+        true
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
+    }
+
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "DOL" => Some(self.dol.as_bytes()),
+            "SIML" => Some(self.siml.as_bytes()),
+            "SIOL" => Some(self.siol.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: self.sdly,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val | CycleCell::Oval => CycleRead::ByName,
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -217,19 +279,27 @@ impl Record for StringoutRecord {
         }
     }
 
+    // C `stringoutRecord.c:122` copies VAL after `:117-120` returns a nonzero
+    // dset status.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            self.oval.clone_from(&self.val);
+        }
+    }
+
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             // C truncates VAL/OVAL/IVOV copies at MAX_STRING_SIZE (40).
             "VAL" => match value {
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(s);
+                    self.val.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(s);
+                    self.oval.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -243,7 +313,7 @@ impl Record for StringoutRecord {
             },
             "IVOV" => match value {
                 EpicsValue::String(s) => {
-                    self.ivov = truncate_string(s);
+                    self.ivov.set_bytes(truncated(s.as_bytes()));
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("IVOV".into())),
@@ -257,7 +327,7 @@ impl Record for StringoutRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(s) => {
-                    self.dol = s.as_str_lossy().into_owned();
+                    self.dol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -271,14 +341,14 @@ impl Record for StringoutRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s.as_str_lossy().into_owned();
+                    self.siml = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s.as_str_lossy().into_owned();
+                    self.siol = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -337,7 +407,7 @@ mod tests {
         let mut rec = StringoutRecord::default();
         rec.put_field("APST", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(1)));
-        let inst = RecordInstance::new("SO:APST".into(), rec);
+        let inst = RecordInstance::new("SO:APST", rec);
         let snap = inst.snapshot_for_field("APST").unwrap();
         assert_eq!(snap.value, EpicsValue::Enum(1));
         assert_eq!(

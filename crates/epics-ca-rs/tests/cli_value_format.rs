@@ -49,6 +49,8 @@ async fn caget(port: u16, args: &[&str]) -> String {
     let shown = args.clone();
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_caget-rs"))
+            .arg("-w")
+            .arg(fact_budget::FACT_BUDGET.as_secs().to_string())
             .args(&args)
             .env("EPICS_CA_ADDR_LIST", format!("127.0.0.1:{port}"))
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")

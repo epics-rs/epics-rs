@@ -1,11 +1,11 @@
 //! The services every asyn port is born with — C's `pasynBase`.
 //!
 //! In C a port cannot exist without a trace configuration and an exception
-//! list: `registerPort` reaches `dpCommonInit` (asynManager.c:2066), which
-//! calls `tracePvtInit(&pdpCommon->trace)` (:528) and
-//! `ellInit(&pdpCommon->exceptionUserList)` (:524) on the
+//! list: `registerPort` reaches `dpCommonInit` (asynManager.c:2068), which
+//! calls `tracePvtInit(&pdpCommon->trace)` (:530) and
+//! `ellInit(&pdpCommon->exceptionUserList)` (:526) on the
 //! `dpCommon` it is allocating, so `announceExceptionOccurred`
-//! (asynManager.c:611-637) and `asynPrint` always have a list to walk. There
+//! (asynManager.c:613-639) and `asynPrint` always have a list to walk. There
 //! is no reachable state in which a registered port has neither.
 //!
 //! The port here binds the same guarantee to the one function every port
@@ -38,7 +38,7 @@ pub struct PortServices {
 impl PortServices {
     /// Build a fresh trace configuration and exception list, wired so the
     /// `asynSetTrace*` setters announce `asynExceptionTrace*` on that list
-    /// (asynManager.c:2790/2832/2874/2923/2956) — C `asynInit` building
+    /// (asynManager.c:2804/2846/2888/2937/2981) — C `asynInit` building
     /// `pasynBase` (asynManager.c:236-260).
     ///
     /// The trace is created here rather than taken from the caller because a

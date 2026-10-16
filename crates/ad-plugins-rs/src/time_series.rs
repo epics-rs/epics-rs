@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use asyn_rs::param::ParamType;
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::config::RuntimeConfig;
+use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
 use asyn_rs::user::AsynUser;
 
@@ -11,7 +10,7 @@ use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
 // Same types as `epics_libcom_rs::runtime::task` — `epics-base-rs` re-exports
 // the runtime layer, and this crate already depends on it unconditionally.
-use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass, ThreadPriority};
+use epics_base_rs::runtime::task::{MandatoryThread, StackSizeClass};
 use parking_lot::Mutex;
 
 // ===== Stats-specific channel definitions =====
@@ -312,14 +311,12 @@ impl TimeSeriesPortDriver {
         // template reads `TS_TIME_SERIES` at `addr == signal`
         // (`NDStats.template:396-567`, addresses 0..22). A single-address port
         // has no entry to publish a signal into.
+        // `NDPluginTimeSeries`' own flags (NDPluginTimeSeries.cpp:54), on
+        // whichever upstream this receiver is fed from.
         let mut base = PortDriverBase::new(
             port_name,
             num_channels + 1,
-            PortFlags {
-                multi_device: false,
-                can_block: false,
-                destructible: true,
-            },
+            ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE,
         );
 
         // NDPluginBase params (NDTimeSeries.template includes NDPluginBase.template)
@@ -690,6 +687,7 @@ pub fn create_ts_port_runtime(
     num_points: usize,
     data_rx: TimeSeriesReceiver,
     pool: Arc<NDArrayPool>,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PortRuntimeHandle,
     TSParams,
@@ -725,7 +723,7 @@ pub fn create_ts_port_runtime(
     // does not exist. C prints and throws here (asynPortDriver.cpp:4036-4040)
     // and iocsh catches it (iocsh.cpp:1269-1279), leaving the C IOC serving
     // without the port; we deviate on purpose — see `port_runtime_unavailable`.
-    let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, actor_jh) = create_port_runtime(driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
@@ -736,10 +734,10 @@ pub fn create_ts_port_runtime(
     // than returning a status the plugin carries on from.
     let data_jh = MandatoryThread::new(
         format!("ts-data-{port_name}"),
-        ThreadPriority::Medium,
+        threads.priority,
         StackSizeClass::Medium,
     )
-    .spawn(move || {
+    .spawn_sized(threads.stack, move || {
         ts_data_thread(shared, data_rx);
     });
 
@@ -870,9 +868,10 @@ mod tests {
     fn test_ts_port_driver_create() {
         let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
         let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared, test_pool());
-        assert_eq!(driver.base().port_name, "TEST_TS");
+        assert_eq!(&*driver.base().port_name, "TEST_TS");
         assert_eq!(driver.num_channels, 3);
-        assert!(!driver.base().flags.multi_device);
+        let flags = driver.base().flags;
+        assert!(flags.multi_device && !flags.can_block && !flags.destructible);
     }
 
     #[test]
@@ -1333,8 +1332,14 @@ mod tests {
     #[test]
     fn test_create_ts_port_runtime() {
         let (_tx, rx) = tokio::sync::mpsc::channel(16);
-        let (handle, params, _actor_jh, _data_jh) =
-            create_ts_port_runtime("TEST_TS_RT", &TEST_CHANNELS, 100, rx, test_pool());
+        let (handle, params, _actor_jh, _data_jh) = create_ts_port_runtime(
+            "TEST_TS_RT",
+            &TEST_CHANNELS,
+            100,
+            rx,
+            test_pool(),
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
         assert_eq!(handle.port_name(), "TEST_TS_RT");
         assert_eq!(params.channel_names.len(), 3);
         handle.shutdown();

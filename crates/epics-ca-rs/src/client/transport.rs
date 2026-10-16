@@ -1789,7 +1789,7 @@ fn process_command(
             server_addr,
             priority,
         } => {
-            let pv_payload = pad_string(&pv_name);
+            let pv_payload = pad_bytes(pv_name.as_bytes());
             let mut create_hdr = CaHeader::new(CA_PROTO_CREATE_CHAN);
             create_hdr.postsize = pv_payload.len() as u16;
             create_hdr.cid = cid;
@@ -1832,7 +1832,7 @@ fn process_command(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended(),
+                hdr.to_bytes_extended().to_vec(),
                 event_tx,
             );
         }
@@ -1946,8 +1946,7 @@ fn process_command(
             let mut mask_payload = [0u8; 16];
             mask_payload[12..14].copy_from_slice(&mask.to_be_bytes());
 
-            let mut frame = hdr.to_bytes_extended();
-            frame.extend_from_slice(&mask_payload);
+            let frame = [&hdr.to_bytes_extended()[..], &mask_payload[..]].concat();
             send_frame(
                 connections,
                 server_writers,
@@ -1992,7 +1991,7 @@ fn process_command(
                 connections,
                 server_writers,
                 (server_addr, priority),
-                hdr.to_bytes_extended(),
+                hdr.to_bytes_extended().to_vec(),
                 event_tx,
             );
         }
@@ -2102,9 +2101,9 @@ fn peer_minor_of(connections: &HashMap<CircuitKey, ServerConnection>, circuit: C
 /// that manages one anyway gets the payload clipped to the largest
 /// aligned size the 16-bit postsize can carry rather than a frame the
 /// peer cannot parse.
-pub(crate) fn build_identity_frame(cmd: u16, value: &str) -> Vec<u8> {
+pub(crate) fn build_identity_frame(cmd: u16, value: &[u8]) -> Vec<u8> {
     const MAX_IDENTITY_PAYLOAD: usize = 0xFFF8;
-    let mut payload = pad_string(value);
+    let mut payload = crate::protocol::pad_bytes(value);
     if payload.len() > MAX_IDENTITY_PAYLOAD {
         payload.truncate(MAX_IDENTITY_PAYLOAD);
         // keep the NUL terminator the receiver expects
@@ -3278,9 +3277,9 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             .iter()
                             .position(|&b| b == 0)
                             .unwrap_or(msg_bytes.len());
-                        String::from_utf8_lossy(&msg_bytes[..end]).to_string()
+                        msg_bytes[..end].to_vec()
                     } else {
-                        String::new()
+                        Vec::new()
                     };
                     // route to the in-flight operation registry
                     // matching the echoed request command. libca
@@ -3352,7 +3351,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         server = %server_addr,
                         eca = eca_status,
                         cmd = echo.cmmd,
-                        msg = %msg,
+                        msg = %String::from_utf8_lossy(&msg),
                         "CA server error",
                     );
                     // Identity of the failing request, from the record its
@@ -3836,7 +3835,7 @@ enum Seen {
 /// past its capacity completes only if the loop is still consuming, which is
 /// strictly after whatever decision could have closed the circuit. `biased`
 /// polls the event first, so an event emitted while draining is reported
-/// rather than lost. The shape `crate::test_budget::barrier` drives.
+/// rather than lost. The shape `fact_budget::barrier` drives.
 #[cfg(test)]
 async fn drain_or_event(
     remaining: std::time::Duration,
@@ -3923,7 +3922,7 @@ mod recv_body_limit_tests {
         // pre-fix client closed on. A window would have proved nothing but
         // that the close was slower than the number.
         let body = vec![0u8; 4096];
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "an oversize payload must never close a CA circuit — C logs and \
              ignores the message, and by default has no size limit at all",
             |s: &Seen| matches!(s, Seen::Event),
@@ -4149,7 +4148,7 @@ mod malformed_header_close_tests {
         // 19 bytes and chosen to read on. A closed loop stops reading, the
         // write stalls, and the close it emitted arrives first.
         let mut client = client_io;
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "partial extended header must NOT close — read_loop waits for the \
              rest of the header",
             |s: &Seen| matches!(s, Seen::Event),
@@ -4269,28 +4268,29 @@ mod error_echo_dispatch_tests {
 
         let mut ver = CaHeader::new(CA_PROTO_VERSION);
         ver.count = crate::protocol::CA_MINOR_VERSION;
-        client
-            .write_all(&ver.to_bytes())
-            .await
-            .expect("write the barrier VERSION frame");
-        client.flush().await.expect("flush");
+        match client.write_all(&ver.to_bytes()).await {
+            Ok(()) => client.flush().await.expect("flush"),
+            // The loop already closed on the frame under test and dropped its
+            // end; its verdict is on `event_rx` all the same.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("write the barrier VERSION frame: {e:?}"),
+        }
 
-        let verdict =
-            match tokio::time::timeout(crate::test_budget::FACT_BUDGET, event_rx.recv()).await {
-                // The barrier: the loop answered a frame that came after, so it
-                // was neither closed nor still chewing on the one under test.
-                Ok(Some(TransportEvent::ServerVersion { .. })) => Verdict::Quiet,
-                Ok(Some(TransportEvent::TcpClosed { .. })) => Verdict::Closed,
-                // The loop dropped its sender without saying anything, which is
-                // the same close seen from the channel's side.
-                Ok(None) => Verdict::Closed,
-                Ok(Some(_)) => Verdict::Other,
-                Err(_) => panic!(
-                    "neither the frame under test nor the VERSION barrier behind \
+        let verdict = match tokio::time::timeout(fact_budget::FACT_BUDGET, event_rx.recv()).await {
+            // The barrier: the loop answered a frame that came after, so it
+            // was neither closed nor still chewing on the one under test.
+            Ok(Some(TransportEvent::ServerVersion { .. })) => Verdict::Quiet,
+            Ok(Some(TransportEvent::TcpClosed { .. })) => Verdict::Closed,
+            // The loop dropped its sender without saying anything, which is
+            // the same close seen from the channel's side.
+            Ok(None) => Verdict::Closed,
+            Ok(Some(_)) => Verdict::Other,
+            Err(_) => panic!(
+                "neither the frame under test nor the VERSION barrier behind \
                  it drew anything within {:?}: the verdict would prove nothing",
-                    crate::test_budget::FACT_BUDGET
-                ),
-            };
+                fact_budget::FACT_BUDGET
+            ),
+        };
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
         verdict
@@ -4516,7 +4516,7 @@ mod error_echo_dispatch_tests {
             ServerVersion,
             Other,
         }
-        crate::test_budget::barrier::until_async(
+        fact_budget::barrier::until_async(
             "a READ_NOTIFY echo must not be routed to a subscription",
             |s: &Seen| matches!(s, Seen::MonitorStatusError),
             |s: &Seen| matches!(s, Seen::ServerVersion),
@@ -4584,7 +4584,7 @@ mod write_identity_tests {
         hdr.to_bytes().to_vec()
     }
 
-    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<String> {
+    async fn server_error_pv_name(frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
         let server_addr: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let (event_tx, _event_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -4594,17 +4594,17 @@ mod write_identity_tests {
         // its cid before any answer can come back.
         in_flight
             .write_identities
-            .insert(CID, Arc::from("TST:LO.RTYP"));
+            .insert(CID, Arc::from(b"TST:LO.\xff".as_slice()));
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client_io, server_io) = tokio::io::duplex(1024);
 
         // Observe the exception where a tool observes it: the installed
         // handler. `ca_add_exception_event`'s slot is the only surface the
         // block is printed from.
-        let (exc_tx, mut exc_rx) = mpsc::unbounded_channel::<Option<String>>();
+        let (exc_tx, mut exc_rx) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
         let exception_slot = crate::client::types::CaExceptionSlot::default();
         *exception_slot.write() = Some(Arc::new(move |e: &crate::client::types::CaException| {
-            let _ = exc_tx.send(e.pv_name.clone());
+            let _ = exc_tx.send(e.pv_name.as_ref().map(|n| n.as_bytes().to_vec()));
         }));
 
         let loop_handle = tokio::spawn(read_loop(
@@ -4651,7 +4651,7 @@ mod write_identity_tests {
             server_error_pv_name(vec![write_error_frame(CID)])
                 .await
                 .as_deref(),
-            Some("TST:LO.RTYP"),
+            Some(b"TST:LO.\xff".as_slice()),
         );
     }
 
@@ -4684,15 +4684,21 @@ mod flow_control_tests {
     use dashmap::DashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     /// Drive `read_loop` with a scriptable occupancy probe and collect the
     /// flow-control frames it emits.
+    ///
+    /// The probe is also the barrier. `read_loop` calls it once per receive
+    /// frame and sends that frame's EVENTS_OFF/ON right after it with no
+    /// await between, so while the probe is parked the write queue holds
+    /// exactly what the earlier frames sent.
     struct Harness {
         client: tokio::io::DuplexStream,
         writes: mpsc::UnboundedReceiver<Vec<u8>>,
         busy: Arc<AtomicBool>,
+        evaluated: mpsc::UnboundedReceiver<()>,
+        release: std::sync::mpsc::Sender<()>,
         _events: mpsc::UnboundedReceiver<TransportEvent>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -4702,9 +4708,18 @@ mod flow_control_tests {
         let (write_tx, writes) = mpsc::unbounded_channel::<Vec<u8>>();
         let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
         let busy = Arc::new(AtomicBool::new(false));
+        let (evaluated_tx, evaluated) = mpsc::unbounded_channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
         let probe: OsRecvQueueProbe = {
             let busy = Arc::clone(&busy);
-            Arc::new(move || busy.load(Ordering::SeqCst))
+            Arc::new(move || {
+                let pending = busy.load(Ordering::SeqCst);
+                let _ = evaluated_tx.send(());
+                // A dropped harness releases every later frame.
+                let _ = released.lock().unwrap().recv();
+                pending
+            })
         };
         let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
         let (client, server_io) = tokio::io::duplex(64 * 1024);
@@ -4727,30 +4742,42 @@ mod flow_control_tests {
             client,
             writes,
             busy,
+            evaluated,
+            release,
             _events,
             task,
         }
     }
 
-    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and wait
-    /// for `read_loop` to consume it, so each call drives exactly one receive
-    /// frame. Without the pause the duplex coalesces several frames into a
-    /// single `read()`, which is one frame for contiguous-count purposes.
-    async fn one_frame(h: &mut Harness) {
+    /// Push one CA_PROTO_ECHO frame — a complete, harmless message — and
+    /// return what the frames before it sent, read while `read_loop` is
+    /// parked in this frame's probe. The next frame is written only after
+    /// this one is evaluated, so every call is exactly one receive frame.
+    async fn frame(h: &mut Harness) -> Vec<u16> {
         let frame = CaHeader::new(CA_PROTO_ECHO).to_bytes().to_vec();
         h.client.write_all(&frame).await.expect("write");
         h.client.flush().await.expect("flush");
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::timeout(fact_budget::FACT_BUDGET, h.evaluated.recv())
+            .await
+            .expect("read_loop never evaluated the frame")
+            .expect("read_loop ended");
+        let mut sent = Vec::new();
+        while let Ok(frame) = h.writes.try_recv() {
+            sent.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
+        }
+        h.release
+            .send(())
+            .expect("read_loop is parked in the probe");
+        sent
     }
 
-    /// Drain whatever the loop queued for the wire, as command codes.
-    async fn drain(h: &mut Harness) -> Vec<u16> {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut out = Vec::new();
-        while let Ok(frame) = h.writes.try_recv() {
-            out.push(CaHeader::from_bytes(&frame).expect("header").cmmd);
-        }
-        out
+    /// The flow-control frame the last [`frame`] sent.
+    async fn sent_by_last_frame(h: &mut Harness) -> u16 {
+        let frame = tokio::time::timeout(fact_budget::FACT_BUDGET, h.writes.recv())
+            .await
+            .expect("the frame sent nothing")
+            .expect("read_loop ended");
+        CaHeader::from_bytes(&frame).expect("header").cmmd
     }
 
     /// The trigger is `max_contiguous_frames()` CONSECUTIVE busy frames —
@@ -4761,34 +4788,31 @@ mod flow_control_tests {
         let trigger = crate::protocol::max_contiguous_frames();
         let mut h = harness();
 
-        // Frames 1..trigger-1 with bytes still pending: under the bound, so no
-        // flow control yet.
+        // Frames 1..trigger-1 with bytes still pending: under the bound, so
+        // none of them asks for flow control — read at frame `trigger`.
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         assert_eq!(
-            drain(&mut h).await,
+            frame(&mut h).await,
             Vec::<u16>::new(),
             "{} contiguous busy frames is one short of the bound — no EVENTS_OFF",
             trigger - 1
         );
-
-        // Frame `trigger`: the bound is reached.
-        one_frame(&mut h).await;
         assert_eq!(
-            drain(&mut h).await,
-            vec![CA_PROTO_EVENTS_OFF],
+            sent_by_last_frame(&mut h).await,
+            CA_PROTO_EVENTS_OFF,
             "the {trigger}th contiguous busy frame must trip EVENTS_OFF"
         );
 
         // Socket drains. No consumer did anything — libca lifts flow control
         // on the socket alone, immediately, on the very next frame.
         h.busy.store(false, Ordering::SeqCst);
-        one_frame(&mut h).await;
+        assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         assert_eq!(
-            drain(&mut h).await,
-            vec![CA_PROTO_EVENTS_ON],
+            sent_by_last_frame(&mut h).await,
+            CA_PROTO_EVENTS_ON,
             "a drained socket must lift EVENTS_OFF immediately, with no \
              consumer-side drain"
         );
@@ -4806,20 +4830,20 @@ mod flow_control_tests {
 
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         // One clean read breaks the run.
         h.busy.store(false, Ordering::SeqCst);
-        one_frame(&mut h).await;
-        assert_eq!(drain(&mut h).await, Vec::<u16>::new());
+        assert_eq!(frame(&mut h).await, Vec::<u16>::new());
 
-        // Back to busy: a fresh run of trigger-1 must still be under the bound.
+        // Back to busy: a fresh run of trigger-1 must still be under the
+        // bound, read at the frame after it.
         h.busy.store(true, Ordering::SeqCst);
         for _ in 0..trigger - 1 {
-            one_frame(&mut h).await;
+            assert_eq!(frame(&mut h).await, Vec::<u16>::new());
         }
         assert_eq!(
-            drain(&mut h).await,
+            frame(&mut h).await,
             Vec::<u16>::new(),
             "the clean read must have reset the count — the run restarts at 1"
         );
@@ -5695,7 +5719,7 @@ mod connect_deadline_tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (circuit_dead_tx, _circuit_dead_rx) = mpsc::unbounded_channel();
         let identity = Arc::new(parking_lot::RwLock::new(
-            crate::client::types::ClientIdentity::from_env(),
+            crate::client::types::ClientIdentity::from_os(),
         ));
         let reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("the test driver enters an executor");
@@ -6027,7 +6051,7 @@ mod priority_circuit_tests {
     /// tests match what the manager emits.
     fn test_identity() -> crate::client::types::ClientIdentitySlot {
         Arc::new(parking_lot::RwLock::new(
-            crate::client::types::ClientIdentity::from_env(),
+            crate::client::types::ClientIdentity::from_os(),
         ))
     }
 
@@ -6068,7 +6092,7 @@ mod priority_circuit_tests {
     /// 65,535-byte body and de-syncs on.
     #[test]
     fn identity_frame_never_uses_the_extended_annex() {
-        let small = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, "operator");
+        let small = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, b"operator");
         let (hdr, consumed) = CaHeader::from_bytes_extended(&small).expect("parse small frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_CLIENT_NAME);
         assert_eq!(consumed, 16, "small payload stays in the 16-byte header");
@@ -6080,7 +6104,7 @@ mod priority_circuit_tests {
         // payload is clipped to the largest aligned size the plain header
         // can carry — never promoted to an annex.
         let big_value = "h".repeat(0x1_0000); // 65536 > 0xFFFF
-        let big = build_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, &big_value);
+        let big = build_identity_frame(crate::protocol::CA_PROTO_HOST_NAME, big_value.as_bytes());
         let (hdr, consumed) = CaHeader::from_bytes_extended(&big).expect("parse big frame");
         assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_HOST_NAME);
         assert_eq!(consumed, 16, "identity frames are never extended");
@@ -6099,7 +6123,7 @@ mod priority_circuit_tests {
     #[test]
     fn handshake_reflects_renamed_identity_slot() {
         let identity = test_identity();
-        identity.write().user = "renamed-operator".to_string();
+        identity.write().user = b"renamed-operator".to_vec();
         let hs = build_client_handshake(0, &identity);
 
         let (vhdr, vconsumed) = CaHeader::from_bytes_extended(&hs).expect("parse VERSION");
@@ -6112,6 +6136,49 @@ mod priority_circuit_tests {
         let payload = &hs[payload_start..payload_start + chdr.postsize as usize];
         let name = String::from_utf8_lossy(payload);
         assert_eq!(name.trim_end_matches('\0'), "renamed-operator");
+    }
+
+    /// libca sends the passwd name; `$USER` does not reach the wire.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn client_name_is_the_passwd_name_not_user() {
+        use std::os::unix::ffi::OsStrExt;
+        let saved = std::env::var_os("USER");
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var("USER", std::ffi::OsStr::from_bytes(b"op\xff")) };
+        let identity = crate::client::types::ClientIdentity::from_os();
+        // SAFETY: same serial group.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+        let pw_name = epics_base_rs::runtime::env::user_name().expect("passwd entry");
+        assert_eq!(identity.user, pw_name);
+        let frame = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, &identity.user);
+        assert_eq!(&frame[16..16 + pw_name.len()], pw_name.as_slice());
+        assert_ne!(identity.user, b"op\xff");
+    }
+
+    /// libca `tcpiiu::hostNameSetRequest` sends `localHostName`'s cache, the
+    /// `gethostname` bytes (localHostName.cpp:34): the HOST_NAME frame ends
+    /// the handshake and carries them unreplaced.
+    #[test]
+    fn a_non_utf8_host_reaches_host_name_byte_for_byte() {
+        let identity = test_identity();
+        identity.write().host = b"h\xff".to_vec();
+        let hs = build_client_handshake(0, &identity);
+        assert!(hs.ends_with(b"h\xff\0\0\0\0\0\0"), "{hs:?}");
+        let (hdr, _) = CaHeader::from_bytes_extended(&hs[hs.len() - 24..]).unwrap();
+        assert_eq!(hdr.cmmd, crate::protocol::CA_PROTO_HOST_NAME);
+    }
+
+    #[test]
+    fn a_non_utf8_user_reaches_client_name_byte_for_byte() {
+        let frame = build_identity_frame(crate::protocol::CA_PROTO_CLIENT_NAME, b"op\xff");
+        assert_eq!(&frame[16..], b"op\xff\0\0\0\0\0");
     }
 
     /// Spawn a transport manager wired to fresh channels; return its
@@ -6435,7 +6502,7 @@ mod circuit_retirement_tests {
         let last_rx_at: ServerLastRxAt = Arc::new(dashmap::DashMap::new());
         let observable = server_writers.clone();
         let identity = Arc::new(parking_lot::RwLock::new(
-            crate::client::types::ClientIdentity::from_env(),
+            crate::client::types::ClientIdentity::from_os(),
         ));
         #[cfg(not(feature = "experimental-rust-tls"))]
         tokio::spawn(run_transport_manager(

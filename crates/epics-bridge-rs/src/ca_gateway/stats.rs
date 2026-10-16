@@ -130,11 +130,11 @@ pub(crate) fn prefix_with_separator(bare: &str) -> String {
 /// Returned as the bare namespace; the `:` separator is added by
 /// `prefix_with_separator` at publish time.
 pub fn default_stats_prefix() -> String {
-    let host = epics_base_rs::runtime::env::hostname();
-    if host.is_empty() {
-        "gateway".to_string()
-    } else {
-        host
+    // C takes `uname().nodename` (gateResources.cc:125-128); the stats PV
+    // names here are text, so a non-UTF-8 name is replaced.
+    match epics_base_rs::runtime::env::hostname() {
+        Some(host) if !host.is_empty() => String::from_utf8_lossy(&host).into_owned(),
+        _ => "gateway".to_string(),
     }
 }
 
@@ -891,22 +891,19 @@ mod tests {
         assert_eq!(stats.loop_count.load(Ordering::Relaxed), 1);
     }
 
-    /// The fourth member of the skip family, keyed the same way as
-    /// [`open_fd_count_tracks_new_descriptors`]: the test process always has
-    /// at least stdin/stdout/stderr open, so once an fd directory reads the
-    /// count is owed and must be plausible.
+    /// The test process always has at least stdin/stdout/stderr open, so the
+    /// count is owed and must be plausible. Linux (`/proc/self/fd`) and macOS
+    /// (`/dev/fd`) are the platforms with an fd directory; there it must read.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn open_fd_count_is_plausible() {
-        if std::fs::read_dir("/proc/self/fd").is_err() && std::fs::read_dir("/dev/fd").is_err() {
-            eprintln!("skipping: no readable fd directory on this platform");
-            return;
-        }
         let n = open_fd_count().expect("an fd directory reads, so open_fd_count must answer");
         assert!(n >= 3, "expected at least 3 open fds, got {n}");
     }
 
     /// Env var marking "this process is the isolated child `run_isolated`
     /// spawned; run the real test body instead of spawning another one."
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const ISOLATION_CHILD_MARKER: &str = "EPICS_BRIDGE_RS_FD_COUNT_TEST_CHILD";
 
     /// [`open_fd_count`] samples the process-wide fd table, and this
@@ -922,6 +919,7 @@ mod tests {
     /// `fork()`: other tests run concurrently on other OS threads, and
     /// forking a multithreaded process risks the child inheriting a lock
     /// held by a thread that no longer exists to release it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_isolated(test_name: &str, body: impl FnOnce()) {
         if std::env::var_os(ISOLATION_CHILD_MARKER).is_some() {
             body();
@@ -941,25 +939,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn open_fd_count_tracks_new_descriptors() {
         run_isolated(
             "ca_gateway::stats::tests::open_fd_count_tracks_new_descriptors",
             || {
-                // Establish the platform fact WITHOUT asking the function
-                // under test. `open_fd_count` answers `None` both for "this
-                // platform has no fd directory" and for "reading it failed",
-                // so a `None`-driven early return let a regression in the
-                // reader report as a pass on Linux, where the directory is
-                // always there. Gate on READING the directory rather than on
-                // its existing, so one that is present but unreadable cannot
-                // pass the probe and then blow up in the `expect` below.
-                if std::fs::read_dir("/proc/self/fd").is_err()
-                    && std::fs::read_dir("/dev/fd").is_err()
-                {
-                    eprintln!("skipping: no readable fd directory on this platform");
-                    return;
-                }
                 let before =
                     open_fd_count().expect("an fd directory reads, so open_fd_count must answer");
                 // In the isolated child no other thread touches the fd
@@ -1163,23 +1148,12 @@ mod tests {
     /// total of process CPU jiffies on a procfs platform. Two reads
     /// bracketing a busy loop must not go backwards.
     ///
-    /// The skip is keyed on `/proc/self/stat` being unreadable, not on
-    /// `proc_self_cpu_jiffies()` returning `None`: that `None` covers the
-    /// absent-procfs case *and* all four of the parser's own failure modes
-    /// (`rsplit_once(')')`, the field-11 index, the two `parse()`s), so
-    /// skipping on it would turn a broken parser on a procfs machine into
-    /// a silent pass — the regression this test exists to catch. The same
-    /// reasoning keys [`open_fd_count_is_plausible`],
-    /// [`open_fd_count_tracks_new_descriptors`] and
-    /// [`load_average_1min_is_non_negative_on_procfs`]; and when a skip does
-    /// fire it announces itself on stderr, since a silent skip is the defect
-    /// this family exists to prevent.
+    /// Linux-only, and there `/proc/self/stat` must read: a `None` from
+    /// `proc_self_cpu_jiffies()` is a parser regression (`rsplit_once(')')`,
+    /// the field-11 index, the two `parse()`s), never a reason to return.
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_self_cpu_jiffies_is_monotonic_on_procfs() {
-        if std::fs::read_to_string("/proc/self/stat").is_err() {
-            eprintln!("skipping: /proc/self/stat is unreadable, so there is no procfs here");
-            return;
-        }
         let first = proc_self_cpu_jiffies()
             .expect("/proc/self/stat reads, so the field walk and parse must succeed");
         // Burn a little CPU so a second read can advance.
@@ -1198,16 +1172,10 @@ mod tests {
     /// `load_average_1min` returns a non-negative load on a procfs
     /// platform (the 1-minute field of `/proc/loadavg`).
     ///
-    /// Keyed on the file reading for the same reason as
-    /// [`proc_self_cpu_jiffies_is_monotonic_on_procfs`]: the old
-    /// `if let Some(load)` asserted nothing at all when the parse failed,
-    /// which is the one outcome worth failing on.
+    /// Linux-only; a parse failure is the one outcome worth failing on.
+    #[cfg(target_os = "linux")]
     #[test]
     fn load_average_1min_is_non_negative_on_procfs() {
-        if std::fs::read_to_string("/proc/loadavg").is_err() {
-            eprintln!("skipping: /proc/loadavg is unreadable, so there is no procfs here");
-            return;
-        }
         let load = load_average_1min().expect("/proc/loadavg reads, so the first field must parse");
         assert!(
             load >= 0.0,

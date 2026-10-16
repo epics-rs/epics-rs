@@ -331,7 +331,7 @@ fn main() -> ExitCode {
     // C reads the *current* EPICS_CAS_AUTO_BEACON_ADDR_LIST via getenv inside
     // the -cip branch (gateway.cc:367-372) and rewrites a present non-NO value
     // to YES; mirror that read here and pass it into the pure mapping.
-    let beacon_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
+    let beacon_auto = epics_base_rs::runtime::env::get_lossy("EPICS_CAS_AUTO_BEACON_ADDR_LIST");
     let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
         args.sip.as_deref(),
         args.signore.as_deref(),
@@ -481,11 +481,10 @@ async fn async_main(args: Args) -> ExitCode {
 /// exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "ca-gateway-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream CA client and the \
          downstream CA server need a tokio reactor. Rebuild without that \
-         feature."
-    );
-    ExitCode::FAILURE
+         feature.",
+    )
 }

@@ -28,17 +28,64 @@ use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use scaler_rs::records::scaler::ScalerRecord;
+use scaler_rs::device_support::scaler_asyn::ScalerDriver;
+use scaler_rs::records::scaler::{MAX_SCALER_CHANNELS, ScalerRecord};
 
-async fn scaler_db() -> PvDatabase {
+use std::sync::{Arc, Mutex};
+
+/// What the hardware holds: the counts `read()` returns and the `done()` flag.
+struct Hardware {
+    counts: [u32; MAX_SCALER_CHANNELS],
+    done: bool,
+}
+
+struct HardwareDriver(Arc<Mutex<Hardware>>);
+
+impl ScalerDriver for HardwareDriver {
+    fn reset(&mut self) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn read(
+        &mut self,
+        counts: &mut [u32; MAX_SCALER_CHANNELS],
+    ) -> epics_base_rs::error::CaResult<()> {
+        *counts = self.0.lock().unwrap().counts;
+        Ok(())
+    }
+    fn write_preset(
+        &mut self,
+        _channel: usize,
+        preset: u32,
+    ) -> epics_base_rs::error::CaResult<u32> {
+        Ok(preset)
+    }
+    fn arm(&mut self, _start: bool) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn done(&mut self) -> bool {
+        std::mem::take(&mut self.0.lock().unwrap().done)
+    }
+    fn num_channels(&self) -> usize {
+        4
+    }
+}
+
+async fn scaler_db() -> (PvDatabase, Arc<Mutex<Hardware>>) {
     let db = PvDatabase::new();
+    let hardware = Arc::new(Mutex::new(Hardware {
+        counts: [0; MAX_SCALER_CHANNELS],
+        done: false,
+    }));
     let mut rec = ScalerRecord::default();
     rec.freq = 1e7;
     rec.tp = 1.0;
     rec.nch = 4;
+    rec.bind_dset(Arc::new(Mutex::new(Box::new(HardwareDriver(
+        hardware.clone(),
+    )))));
     rec.init_record(1).unwrap();
     db.add_record("SCAL", Box::new(rec)).await.unwrap();
-    db
+    (db, hardware)
 }
 
 async fn watch(db: &PvDatabase, field: &str, sid: u32, mask: EventMask) -> EventReader {
@@ -63,24 +110,17 @@ fn drain(rx: &mut EventReader) -> usize {
     n
 }
 
-/// Hardware reported new counts and acquisition complete — the dset `read()`
-/// filling `s[]` plus the dset `done()` return (`scalerRecord.c:366`).
-async fn hardware_finishes_with(db: &PvDatabase, counts: [u32; 4]) {
-    let rec = db.get_record("SCAL").unwrap();
-    let mut inst = rec.write();
-    let scal = inst
-        .record
-        .as_any_mut()
-        .unwrap()
-        .downcast_mut::<ScalerRecord>()
-        .unwrap();
-    scal.s[..4].copy_from_slice(&counts);
-    scal.set_done();
+/// Hardware holds new counts and acquisition is complete: the next cycle's
+/// dset `done()` (`scalerRecord.c:366`) and `read()` (`:572`) see them.
+fn hardware_finishes_with(hardware: &Mutex<Hardware>, counts: [u32; 4]) {
+    let mut hw = hardware.lock().unwrap();
+    hw.counts[..4].copy_from_slice(&counts);
+    hw.done = true;
 }
 
 #[tokio::test]
 async fn r12_62_completion_cycle_posts_sn_with_both_value_and_log() {
-    let db = scaler_db().await;
+    let (db, hardware) = scaler_db().await;
     // Two separate subscribers on S1: one archiver (DBE_LOG only), one
     // value client (DBE_VALUE only). C's completion cycle serves both.
     let mut s1_log = watch(&db, "S1", 1, EventMask::LOG).await;
@@ -95,7 +135,7 @@ async fn r12_62_completion_cycle_posts_sn_with_both_value_and_log() {
     drain(&mut s1_value);
 
     // The completion cycle: counts moved AND ss lands on IDLE.
-    hardware_finishes_with(&db, [4242, 0, 0, 0]).await;
+    hardware_finishes_with(&hardware, [4242, 0, 0, 0]);
     process(&db).await;
 
     assert_eq!(
@@ -115,7 +155,7 @@ async fn r12_62_completion_cycle_posts_sn_with_both_value_and_log() {
 /// posts every `Sn` with `DBE_LOG` and nothing with `DBE_VALUE`.
 #[tokio::test]
 async fn r12_62_idle_cycle_still_posts_log_only() {
-    let db = scaler_db().await;
+    let (db, _hardware) = scaler_db().await;
     let mut s1_log = watch(&db, "S1", 1, EventMask::LOG).await;
     let mut s1_value = watch(&db, "S1", 2, EventMask::VALUE).await;
 

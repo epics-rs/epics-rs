@@ -25,7 +25,7 @@ use epics_base_rs::types::EpicsValue;
 use scaler_rs::records::scaler::ScalerRecord;
 
 fn scaler() -> RecordInstance {
-    RecordInstance::new("T:SCALER".to_string(), ScalerRecord::default())
+    RecordInstance::new("T:SCALER", ScalerRecord::default())
 }
 
 /// The reported defect: `#define get_alarm_double NULL` (`:158`), yet the port
@@ -112,7 +112,7 @@ fn scaler_precision_is_prec_everywhere_but_vers() {
     let mut rec = ScalerRecord::default();
     rec.put_field("PREC", EpicsValue::Short(3))
         .expect("scaler models PREC");
-    let inst = RecordInstance::new("T:SCALER".to_string(), rec);
+    let inst = RecordInstance::new("T:SCALER", rec);
 
     let prec_of = |field: &str| {
         inst.snapshot_for_field(field)

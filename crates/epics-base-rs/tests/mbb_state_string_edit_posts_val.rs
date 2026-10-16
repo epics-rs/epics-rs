@@ -79,7 +79,9 @@ async fn editing_the_selected_state_label_posts_val() {
             .try_recv()
             .unwrap_or_else(|e| panic!("{rtype}: C posts VAL here: {e:?}"));
         assert_eq!(
-            event.snapshot.value,
+            event
+                .delivered_value(&db.get_record("M").unwrap().read(), "VAL")
+                .unwrap(),
             EpicsValue::Enum(0),
             "{rtype}: VAL itself did not move — that is why C needs the post"
         );

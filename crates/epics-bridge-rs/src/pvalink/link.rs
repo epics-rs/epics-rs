@@ -3,6 +3,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the exec-backend
 // suite.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,8 +198,9 @@ pub struct PvaLink {
     _monitor_abort: Option<MonitorAbort>,
     config: PvaLinkConfig,
     client: PvaClient,
-    /// Latest received value (INP only — None until first event).
-    latest: Arc<Mutex<Option<PvField>>>,
+    /// Latest received value (INP only — None until first event), one
+    /// shared snapshot per update so a read borrows it.
+    latest: Arc<Mutex<Option<Arc<PvField>>>>,
     /// Live-connection flag for INP+monitor links (B-pvalink-restart).
     ///
     /// The INP monitor task is a re-subscribe loop: it sets this
@@ -293,7 +295,24 @@ pub struct PvaLink {
     /// `root[fieldName]` — each field root carries its own alarm, so each
     /// gets its own latch. An absent entry is the pvxs initial
     /// `INVALID_ALARM` / blank snapshot.
-    snap_alarm: Mutex<HashMap<String, (i32, String)>>,
+    snap_alarm: Mutex<HashMap<String, (i32, Arc<str>)>>,
+}
+
+/// The blank remote message, shared so a snapshot without one allocates
+/// nothing.
+fn no_text() -> Arc<str> {
+    static NONE: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
+    NONE.clone()
+}
+
+/// `text` as the `Arc<str>` a record's message store shares: `held` when it
+/// already says it, so only a changed remote message allocates.
+fn shared_text(held: Option<&Arc<str>>, text: &str) -> Arc<str> {
+    match held {
+        Some(held) if **held == *text => held.clone(),
+        _ if text.is_empty() => no_text(),
+        _ => Arc::from(text),
+    }
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -435,7 +454,7 @@ impl PvaLink {
                         }
                         MonitorEvent::Data { value, .. } => {
                             connected_inner.store(true, Ordering::Release);
-                            *latest_inner.lock() = Some(value.clone());
+                            *latest_inner.lock() = Some(Arc::new(value.clone()));
                             // The value is now cached in `latest`; enqueue a
                             // scan trigger, coalescing to the cache + overrun
                             // marker if the queue is full rather than dropping
@@ -670,14 +689,14 @@ impl PvaLink {
             if !self.is_connected() {
                 return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
             }
-            let cached = self.latest.lock().clone();
-            return match cached {
+            let cached = self.latest.lock();
+            return match cached.as_ref() {
                 Some(v) => {
                     // value-read latch: pvxs `pvaGetValue` copies the live
                     // `fld_severity` / `fld_message` into the snapshot on
                     // every connected read (`pvxs/ioc/pvalink_lset.cpp:412-422`).
-                    self.latch_alarm_snapshot(field, &v);
-                    Ok(select_link_value(&v, field))
+                    self.latch_alarm_snapshot(field, v);
+                    Ok(select_link_value(v, field).clone())
                 }
                 // Connected flag set but the first event has not yet
                 // written `latest` (the callback stores the flag before
@@ -686,7 +705,7 @@ impl PvaLink {
             };
         }
         let result = self.client.pvget_full(&self.config.pv_name).await?;
-        Ok(select_link_value(&result.value, field))
+        Ok(select_link_value(&result.value, field).clone())
     }
 
     /// Synchronous fast-path read: return the cached field if the
@@ -706,6 +725,13 @@ impl PvaLink {
     /// `self.config.field`. Mirrors the per-link field override path
     /// (`pvxs/ioc/pvalink_link.cpp:91`).
     pub fn try_read_cached_with_field(&self, field: &str) -> Option<PvField> {
+        self.with_cached_value(field, PvField::clone)
+    }
+
+    /// [`Self::try_read_cached_with_field`] handing `read` the selected
+    /// value in place, so a record-thread read copies nothing it does not
+    /// convert.
+    pub fn with_cached_value<R>(&self, field: &str, read: impl FnOnce(&PvField) -> R) -> Option<R> {
         if matches!(self.config.direction, LinkDirection::Out) || !self.config.monitor {
             return None;
         }
@@ -717,11 +743,12 @@ impl PvaLink {
         if !self.is_connected() {
             return None;
         }
-        let v = self.latest.lock().clone()?;
+        let cached = self.latest.lock();
+        let v = cached.as_ref()?;
         // value-read latch — same as `read_with_field` (pvxs
         // `pvaGetValue` snapshot, `pvxs/ioc/pvalink_lset.cpp:412-422`).
-        self.latch_alarm_snapshot(field, &v);
-        Some(select_link_value(&v, field))
+        self.latch_alarm_snapshot(field, v);
+        Some(read(select_link_value(v, field)))
     }
 
     /// Convenience: read the value as f64.
@@ -1108,10 +1135,11 @@ impl PvaLink {
     /// link skips the gate and issues the put anyway: pvxs reaches
     /// `lchan->put(true)`, whose `doit = force` is unconditionally true
     /// (`pvxs/ioc/pvalink_channel.cpp:226,266`), so the operation is started and the
-    /// client holds it until the channel connects. `retry` is the link's
-    /// own option here, not a per-call flag, matching `self->retry`.
-    pub async fn scan_forward(&self) -> PvaLinkResult<()> {
-        if !self.config.retry && !self.is_connected() {
+    /// client holds it until the channel connects. `retry` is the
+    /// forwarding link's own option, `self->retry`: this channel is shared by
+    /// every link to the PV and its `config` is only the first opener's.
+    pub async fn scan_forward(&self, retry: bool) -> PvaLinkResult<()> {
+        if !retry && !self.is_connected() {
             return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
         }
         // "FWD_LINK is never deferred, and always results in a Put"
@@ -1138,6 +1166,12 @@ impl PvaLink {
         }
     }
 
+    /// pvxs `pvaLink::valid`: connected, and a value has arrived
+    /// (`lchan->connected && lchan->root`, `pvalink_link.cpp:69-72`).
+    pub fn is_valid(&self) -> bool {
+        self.is_connected() && self.latest.lock().is_some()
+    }
+
     /// Raw remote NT `alarm.severity` of the latest cached value, read
     /// relative to the link's selected field root, in EPICS severity
     /// numbering (`0 = NO_ALARM` … `3 = INVALID`). `None` when no value
@@ -1150,8 +1184,8 @@ impl PvaLink {
     /// `pvxs/ioc/pvalink_lset.cpp:412-430`). `field=""` keeps the
     /// top-level root.
     fn remote_alarm_severity(&self, field: &str) -> Option<i32> {
-        let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let cached = self.latest.lock();
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let PvField::Structure(a) = s.get_field("alarm")? else {
@@ -1171,11 +1205,11 @@ impl PvaLink {
     /// is non-`NO_ALARM` (pvxs clears `snap_message` when
     /// `snap_severity == 0`). Pure so the value-read latch and any caller
     /// share one extraction rule.
-    fn alarm_from_value(value: &PvField, field: &str) -> (i32, String) {
+    fn alarm_from_value<'v>(value: &'v PvField, field: &str) -> (i32, Cow<'v, str>) {
         let PvField::Structure(s) = select_target(value, field) else {
             // A cached value that is not a structure carries no alarm
             // sub-field — `NO_ALARM`, no message (pvxs default snapshot).
-            return (0, String::new());
+            return (0, Cow::Borrowed(""));
         };
         let alarm = match s.get_field("alarm") {
             Some(PvField::Structure(a)) => Some(a),
@@ -1194,12 +1228,12 @@ impl PvaLink {
             alarm
                 .and_then(|a| a.get_field("message"))
                 .and_then(|m| match m {
-                    PvField::Scalar(ScalarValue::String(m)) if !m.is_empty() => Some(m.to_string()),
+                    PvField::Scalar(ScalarValue::String(m)) => Some(m.as_str_lossy()),
                     _ => None,
                 })
                 .unwrap_or_default()
         } else {
-            String::new()
+            Cow::Borrowed("")
         };
         (severity, message)
     }
@@ -1214,15 +1248,16 @@ impl PvaLink {
     /// exactly like pvxs `dbGetAlarm` before the first `dbGetLink`
     /// (`pvxs/test/testpvalink.cpp:373-375`). Called from the value-read
     /// path ([`Self::read_with_field`] / [`Self::try_read_cached_with_field`])
-    /// on a connected read. Reuses the existing key allocation in steady
-    /// state so a hot CP/CPP read does not allocate per process.
+    /// on a connected read. Reuses the existing key and the held message in
+    /// steady state, so a hot read allocates only when the remote message
+    /// text changes.
     fn latch_alarm_snapshot(&self, field: &str, value: &PvField) {
-        let snap = Self::alarm_from_value(value, field);
+        let (severity, message) = Self::alarm_from_value(value, field);
         let mut g = self.snap_alarm.lock();
         match g.get_mut(field) {
-            Some(slot) => *slot = snap,
+            Some(slot) => *slot = (severity, shared_text(Some(&slot.1), &message)),
             None => {
-                g.insert(field.to_string(), snap);
+                g.insert(field.to_string(), (severity, shared_text(None, &message)));
             }
         }
     }
@@ -1270,7 +1305,7 @@ impl PvaLink {
             .lock()
             .get(field)
             .cloned()
-            .unwrap_or((INVALID_ALARM, String::new()));
+            .unwrap_or_else(|| (INVALID_ALARM, no_text()));
         Some(RemoteAlarm::from_severity_message(severity, message))
     }
 
@@ -1359,7 +1394,7 @@ impl PvaLink {
     /// When the remote NT structure has no `alarm.message` string but
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
-    pub fn alarm_message(&self) -> Option<String> {
+    pub fn alarm_message(&self) -> Option<Arc<str>> {
         self.alarm_message_with(&self.config.field, self.config.sevr)
     }
 
@@ -1369,7 +1404,15 @@ impl PvaLink {
     /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
-    pub fn alarm_message_with(&self, field: &str, sevr: super::config::SevrMode) -> Option<String> {
+    ///
+    /// The text is the snapshot's own `Arc` when the value read this cycle
+    /// latched the same message, so an alarmed link's steady cycle shares
+    /// it rather than allocating.
+    pub fn alarm_message_with(
+        &self,
+        field: &str,
+        sevr: super::config::SevrMode,
+    ) -> Option<Arc<str>> {
         // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
@@ -1377,18 +1420,20 @@ impl PvaLink {
         // message rather than a misleading snapshot of the last remote
         // alarm string.
         if self.monitor_disconnected_stale() {
-            return Some("pvalink monitor disconnected".to_string());
+            static DISCONNECTED: std::sync::LazyLock<Arc<str>> =
+                std::sync::LazyLock::new(|| Arc::from("pvalink monitor disconnected"));
+            return Some(DISCONNECTED.clone());
         }
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity_with(field, sevr)?;
-        let v = self.latest.lock().clone()?;
+        self.link_alarm_severity_with(field, sevr)?;
+        let cached = self.latest.lock();
         // Resolve the alarm string relative to the link's selected
         // field root, matching `remote_alarm_severity` — pvxs reads
         // `fld_message` from the same selected `root[fieldName]`
         // (`pvxs/ioc/pvalink_link.cpp:90-110`,
         // `pvxs/ioc/pvalink_lset.cpp:412-430`).
-        let PvField::Structure(s) = select_target(&v, field) else {
+        let PvField::Structure(s) = select_target(cached.as_ref()?, field) else {
             return None;
         };
         let msg = s.get_field("alarm").and_then(|alarm| {
@@ -1397,12 +1442,16 @@ impl PvaLink {
             };
             match a.get_field("message") {
                 Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => {
-                    Some(m.to_string())
+                    Some(m.as_str_lossy())
                 }
                 _ => None,
             }
         });
-        Some(msg.unwrap_or_else(|| format!("remote severity {sev}")))
+        // No `alarm.message` leaves pvxs's `snap_message` empty
+        // (`pvalink_lset.cpp:423-427`).
+        let msg = msg?;
+        let held = self.snap_alarm.lock();
+        Some(shared_text(held.get(field).map(|(_, m)| m), &msg))
     }
 
     /// Latest cached NT value, if any. Returned as the raw [`PvField`]
@@ -1410,7 +1459,7 @@ impl PvaLink {
     /// timeStamp, value, etc.). pvxs `pvaGetTimeStampTag`
     /// (pvxs/ioc/pvalink_lset.cpp:577) lives on top of this.
     pub fn latest_value(&self) -> Option<PvField> {
-        self.latest.lock().clone()
+        self.latest.lock().as_deref().cloned()
     }
 
     /// Timestamp the owning record adopts on a `time=true` read,
@@ -1556,8 +1605,8 @@ impl PvaLink {
         // (`pvxs/ioc/pvalink_link.cpp:90-110`, `pvxs/ioc/pvalink_lset.cpp:199-240`).
         let value_field = select_link_value(&root, field);
 
-        let dbf_type = link_dbf_type(&value_field);
-        let element_count = link_element_count(&value_field);
+        let dbf_type = link_dbf_type(value_field);
+        let element_count = link_element_count(value_field);
 
         // display / control / valueAlarm are read from the selected
         // metadata root, NOT the top-level root. pvxs derives `fld_meta`
@@ -1573,15 +1622,15 @@ impl PvaLink {
         // metadata sub-structures, so its metadata root is empty.
         let meta_root = match select_target(&root, field) {
             s @ PvField::Structure(_) => s,
-            _ => PvField::Null,
+            _ => &NULL_FIELD,
         };
-        let graphic_limits = limit_pair(&meta_root, "display.limitLow", "display.limitHigh");
-        let control_limits = limit_pair(&meta_root, "control.limitLow", "control.limitHigh");
+        let graphic_limits = limit_pair(meta_root, "display.limitLow", "display.limitHigh");
+        let control_limits = limit_pair(meta_root, "control.limitLow", "control.limitHigh");
         let alarm_limits = {
-            let lolo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowAlarmLimit"));
-            let lo = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.lowWarningLimit"));
-            let hi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highWarningLimit"));
-            let hihi = scalar_as_f64(&extract_field(&meta_root, "valueAlarm.highAlarmLimit"));
+            let lolo = scalar_as_f64(extract_field(meta_root, "valueAlarm.lowAlarmLimit"));
+            let lo = scalar_as_f64(extract_field(meta_root, "valueAlarm.lowWarningLimit"));
+            let hi = scalar_as_f64(extract_field(meta_root, "valueAlarm.highWarningLimit"));
+            let hihi = scalar_as_f64(extract_field(meta_root, "valueAlarm.highAlarmLimit"));
             match (lolo, lo, hi, hihi) {
                 // pvxs writes each of the four buffers independently
                 // and leaves a missing one untouched; we only surface
@@ -1598,9 +1647,9 @@ impl PvaLink {
             }
         };
         let precision =
-            scalar_as_f64(&extract_field(&meta_root, "display.precision")).map(|p| p as i16);
-        let units = string_field(&meta_root, "display.units");
-        let description = string_field(&meta_root, "display.description");
+            scalar_as_f64(extract_field(meta_root, "display.precision")).map(|p| p as i16);
+        let units = string_field(meta_root, "display.units");
+        let description = string_field(meta_root, "display.description");
 
         Some(LinkMetadata {
             dbf_type,
@@ -1630,7 +1679,7 @@ impl PvaLink {
             _monitor_abort: None,
             config,
             client,
-            latest: Arc::new(Mutex::new(cached)),
+            latest: Arc::new(Mutex::new(cached.map(Arc::new))),
             monitor_connected: None,
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
@@ -1690,7 +1739,7 @@ impl PvaLink {
             _monitor_abort: None,
             config,
             client,
-            latest: Arc::new(Mutex::new(cached)),
+            latest: Arc::new(Mutex::new(cached.map(Arc::new))),
             monitor_connected: Some(flag.clone()),
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
@@ -1709,6 +1758,12 @@ impl PvaLink {
     #[cfg(test)]
     pub(crate) fn record_disconnect_time_for_test(&self, secs: i64, nsec: i32) {
         *self.disconnect_time.lock() = Some((secs, nsec));
+    }
+
+    /// Test-only: the monitor's delivery of `value`.
+    #[cfg(test)]
+    pub(crate) fn set_latest_for_test(&self, value: PvField) {
+        *self.latest.lock() = Some(Arc::new(value));
     }
 }
 
@@ -1896,13 +1951,16 @@ fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::P
 /// through nested structures). The target is the basis both for the
 /// value (see [`select_link_value`]) and for the display / control /
 /// valueAlarm metadata.
-fn select_target(root: &PvField, field: &str) -> PvField {
+fn select_target<'v>(root: &'v PvField, field: &str) -> &'v PvField {
     if field.is_empty() {
-        root.clone()
+        root
     } else {
         extract_field(root, field)
     }
 }
+
+/// What a path that names no field selects.
+static NULL_FIELD: PvField = PvField::Null;
 
 /// Select the link's *value* from the remote root, following pvxs's
 /// `pvaGetDBFtype` / `onTypeChange` rule
@@ -1918,7 +1976,7 @@ fn select_target(root: &PvField, field: &str) -> PvField {
 /// PV) is selected directly instead of being searched for a non-existent
 /// `value` child, and that an explicitly selected sub-structure drills
 /// into its own `.value`.
-fn select_link_value(root: &PvField, field: &str) -> PvField {
+fn select_link_value<'v>(root: &'v PvField, field: &str) -> &'v PvField {
     // A selected union / non-empty variant resolves to its concrete
     // member before the value is read — pvxs `value.lookup("->")`
     // (`pvxs/ioc/pvalink_lset.cpp:278-279`); the NTNDArray `value` member is a
@@ -1927,9 +1985,8 @@ fn select_link_value(root: &PvField, field: &str) -> PvField {
     match select_target(root, field).deref_selected() {
         PvField::Structure(s) => s
             .get_field("value")
-            .map(|v| v.deref_selected().clone())
-            .unwrap_or(PvField::Null),
-        other => other.clone(),
+            .map_or(&NULL_FIELD, PvField::deref_selected),
+        other => other,
     }
 }
 
@@ -1939,18 +1996,18 @@ fn select_link_value(root: &PvField, field: &str) -> PvField {
 /// member at every descent step and at the leaf (pvxs `lookup("->")`),
 /// so a path that crosses an NTNDArray-style union resolves to the
 /// active member instead of stopping at the union.
-fn extract_field(root: &PvField, path: &str) -> PvField {
+fn extract_field<'v>(root: &'v PvField, path: &str) -> &'v PvField {
     if path.is_empty() {
-        return root.deref_selected().clone();
+        return root.deref_selected();
     }
-    let mut cursor = root.clone();
+    let mut cursor = root;
     for segment in path.split('.') {
         cursor = match cursor.deref_selected() {
-            PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
-            other => return other.clone(),
+            PvField::Structure(s) => s.get_field(segment).unwrap_or(&NULL_FIELD),
+            other => return other,
         };
     }
-    cursor.deref_selected().clone()
+    cursor.deref_selected()
 }
 
 fn scalar_as_f64(field: &PvField) -> Option<f64> {
@@ -2119,8 +2176,8 @@ fn link_element_count(value_field: &PvField) -> Option<i64> {
 /// `*lo`/`*hi` buffer untouched against a record's zero-initialised
 /// limit field.
 fn limit_pair(root: &PvField, lo_path: &str, hi_path: &str) -> Option<(f64, f64)> {
-    let lo = scalar_as_f64(&extract_field(root, lo_path));
-    let hi = scalar_as_f64(&extract_field(root, hi_path));
+    let lo = scalar_as_f64(extract_field(root, lo_path));
+    let hi = scalar_as_f64(extract_field(root, hi_path));
     match (lo, hi) {
         (None, None) => None,
         (l, h) => Some((l.unwrap_or(0.0), h.unwrap_or(0.0))),
@@ -2204,7 +2261,7 @@ mod tests {
         let root = PvField::Structure(s);
         let v = extract_field(&root, "value");
         match v {
-            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(d, 1.5),
+            PvField::Scalar(ScalarValue::Double(d)) => assert_eq!(*d, 1.5),
             other => panic!("got {other:?}"),
         }
     }
@@ -2218,14 +2275,16 @@ mod tests {
         let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
         root.fields
             .push(("alarm".into(), PvField::Structure(alarm)));
-        let value = extract_field(&PvField::Structure(root), "alarm.severity");
+        let root = PvField::Structure(root);
+        let value = extract_field(&root, "alarm.severity");
         assert!(matches!(value, PvField::Scalar(ScalarValue::Int(2))));
     }
 
     #[test]
     fn missing_field_returns_null() {
         let s = PvStructure::new("epics:nt/NTScalar:1.0");
-        let v = extract_field(&PvField::Structure(s), "nope");
+        let s = PvField::Structure(s);
+        let v = extract_field(&s, "nope");
         assert!(matches!(v, PvField::Null));
     }
 
@@ -2245,12 +2304,12 @@ mod tests {
         let nt = PvField::Structure(nt);
         assert!(matches!(
             select_link_value(&nt, ""),
-            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+            PvField::Scalar(ScalarValue::Double(d)) if *d == 2.5
         ));
         // explicit field="value" yields the same scalar.
         assert!(matches!(
             select_link_value(&nt, "value"),
-            PvField::Scalar(ScalarValue::Double(d)) if d == 2.5
+            PvField::Scalar(ScalarValue::Double(d)) if *d == 2.5
         ));
 
         // Bare top-level scalar (PV whose root is not an NT structure):
@@ -2591,7 +2650,7 @@ mod tests {
                 Some(nt_with_alarm(sev, Some("oops"))),
             );
             assert_eq!(link.link_alarm_severity(), Some(sev), "sev={sev}");
-            assert_eq!(link.alarm_message(), Some("oops".to_string()), "sev={sev}");
+            assert_eq!(link.alarm_message().as_deref(), Some("oops"), "sev={sev}");
         }
     }
 
@@ -2604,16 +2663,16 @@ mod tests {
         let invalid =
             PvaLink::for_test(inp_cfg(SevrMode::Msi), Some(nt_with_alarm(3, Some("dead"))));
         assert_eq!(invalid.link_alarm_severity(), Some(3));
-        assert_eq!(invalid.alarm_message(), Some("dead".to_string()));
+        assert_eq!(invalid.alarm_message().as_deref(), Some("dead"));
     }
 
     #[test]
-    fn b2_synthetic_message_when_no_alarm_message_field() {
+    fn b2_no_message_when_no_alarm_message_field() {
         // MS link, severity propagates, but the NT struct has no
-        // alarm.message — a synthetic message is returned.
+        // alarm.message — pvxs stores an empty snap_message.
         let link = PvaLink::for_test(inp_cfg(SevrMode::Ms), Some(nt_with_alarm(2, None)));
         assert_eq!(link.link_alarm_severity(), Some(2));
-        assert_eq!(link.alarm_message(), Some("remote severity 2".to_string()));
+        assert_eq!(link.alarm_message(), None);
     }
 
     #[test]
@@ -2649,14 +2708,14 @@ mod tests {
         let pre = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(pre.severity, 3); // INVALID_ALARM
         assert_eq!(pre.status, 14); // LINK_ALARM
-        assert_eq!(pre.message, "");
+        assert_eq!(&*pre.message, "");
         // a value read latches the snapshot (pvxs pvaGetValue).
         assert!(link.try_read_cached_with_field("").is_some());
         // AFTER the read: remote MINOR(1) + LINK_ALARM(14) + message.
         let post = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(post.severity, 1);
         assert_eq!(post.status, 14); // LINK_ALARM
-        assert_eq!(post.message, "hi");
+        assert_eq!(&*post.message, "hi");
     }
 
     /// `MS` link with a remote MAJOR alarm: BOTH the gated owning-record
@@ -2675,7 +2734,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 2);
         assert_eq!(snap.status, 14); // LINK_ALARM
-        assert_eq!(snap.message, "oops");
+        assert_eq!(&*snap.message, "oops");
     }
 
     /// A NO_ALARM cached value yields a snapshot with severity 0, status
@@ -2694,7 +2753,7 @@ mod tests {
         let snap = link.remote_alarm_snapshot("").expect("connected snapshot");
         assert_eq!(snap.severity, 0);
         assert_eq!(snap.status, 0); // NO_ALARM
-        assert_eq!(snap.message, "", "NO_ALARM snapshot carries no message");
+        assert_eq!(&*snap.message, "", "NO_ALARM snapshot carries no message");
     }
 
     /// CHECK_VALID: a disconnected-stale monitor link serves no snapshot
@@ -2831,7 +2890,7 @@ mod tests {
     async fn scan_forward_on_disconnected_link_is_gated() {
         let (link, _flag) = PvaLink::for_test_with_monitor_flag(inp_cfg(SevrMode::Ms), None);
         assert!(!link.is_connected());
-        match link.scan_forward().await {
+        match link.scan_forward(link.config().retry).await {
             Err(PvaLinkError::Disconnected(_)) => {}
             other => {
                 panic!("disconnected forward must be gated to Disconnected, got {other:?}")
@@ -2846,16 +2905,14 @@ mod tests {
     /// unconditionally (`pvxs/ioc/pvalink_channel.cpp:226,266`) and lets the client
     /// hold it until the channel connects. The put here cannot succeed
     /// (no server), so what this pins is only that the failure is not the
-    /// gate's `Disconnected`.
+    /// gate's `Disconnected`. The channel is opened without `retry`: the
+    /// gate reads the forwarding link's, not the first opener's.
     #[tokio::test]
     async fn scan_forward_on_disconnected_retry_link_is_not_gated() {
-        let cfg = PvaLinkConfig {
-            retry: true,
-            ..inp_cfg(SevrMode::Ms)
-        };
-        let (link, _flag) = PvaLink::for_test_with_monitor_flag(cfg, None);
+        let (link, _flag) = PvaLink::for_test_with_monitor_flag(inp_cfg(SevrMode::Ms), None);
+        assert!(!link.config().retry);
         assert!(!link.is_connected());
-        if let Err(PvaLinkError::Disconnected(_)) = link.scan_forward().await {
+        if let Err(PvaLinkError::Disconnected(_)) = link.scan_forward(true).await {
             panic!("a retry link must skip the !valid() gate, not return Disconnected");
         }
     }
@@ -2998,7 +3055,8 @@ mod tests {
                         Status::ok().write_into(ORDER, &mut p);
                         let intro = FieldDesc::Structure {
                             struct_id: "epics:nt/NTScalar:1.0".into(),
-                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))]
+                                .into(),
                         };
                         epics_pva_rs::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
                     } else {
@@ -3051,7 +3109,7 @@ mod tests {
             client,
         );
 
-        link.scan_forward()
+        link.scan_forward(link.config().retry)
             .await
             .expect("the forward link must complete against a pvxs command switch");
 
@@ -3073,14 +3131,13 @@ mod tests {
         let req_val =
             epics_pva_rs::pvdata::encode::decode_pv_field(&req_desc, &mut cur, ByteOrder::Little)
                 .expect("pvRequest value");
-        let process = match &req_val {
-            PvField::Structure(s) => {
-                extract_field(&PvField::Structure(s.clone()), "record._options.process")
-            }
-            other => panic!("pvRequest is not a structure: {other:?}"),
-        };
+        assert!(
+            matches!(req_val, PvField::Structure(_)),
+            "pvRequest is not a structure: {req_val:?}"
+        );
+        let process = extract_field(&req_val, "record._options.process");
         assert_eq!(
-            process,
+            *process,
             PvField::Scalar(ScalarValue::String("true".into())),
             "a forced put pins record._options.process to \"true\" \
              (pvxs/ioc/pvalink_channel.cpp:258-260)"
@@ -3127,7 +3184,7 @@ mod tests {
             client,
         );
 
-        match link.scan_forward().await {
+        match link.scan_forward(link.config().retry).await {
             Err(PvaLinkError::Pva(_)) => {}
             other => panic!("a refused forward-link put must surface, got {other:?}"),
         }
@@ -3216,7 +3273,9 @@ mod tests {
             client,
         );
 
-        link.scan_forward().await.expect("forward link fires");
+        link.scan_forward(link.config().retry)
+            .await
+            .expect("forward link fires");
 
         assert_eq!(
             processed.load(Ordering::SeqCst),
@@ -4216,7 +4275,7 @@ mod tests {
         pv.open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -4299,7 +4358,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::ScalarArray(ScalarType::Long)),
                 ("aux".into(), FieldDesc::ScalarArray(ScalarType::Long)),
-            ],
+            ]
+            .into(),
         };
         let initial = PvField::Structure(PvStructure {
             struct_id: "structure".into(),
@@ -4404,7 +4464,8 @@ mod tests {
             fields: vec![
                 ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
                 ("setpoint".into(), FieldDesc::Scalar(ScalarType::Double)),
-            ],
+            ]
+            .into(),
         }
     }
 

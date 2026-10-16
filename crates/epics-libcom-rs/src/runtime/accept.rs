@@ -115,9 +115,9 @@ impl AcceptBackoff {
     pub fn failed(&mut self) -> Duration {
         self.consecutive = self.consecutive.saturating_add(1);
         if self.consecutive.is_power_of_two() {
-            crate::runtime::log::errlog_sev_printf(
+            crate::runtime::log::errlog_sev_vprintf(
                 crate::runtime::log::ErrlogSevEnum::Major,
-                &format!(
+                format_args!(
                     "accept failed {} time(s) in a row; the server is not taking \
                      connections and keeps retrying\n",
                     self.consecutive

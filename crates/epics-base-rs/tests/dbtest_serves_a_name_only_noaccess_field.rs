@@ -14,12 +14,12 @@
 //! printed nothing at all and `dbtgf T:AI.RSET` printed `PV '…' not found`
 //! for a name it had just resolved.
 //!
-//! Three cells of `dba`'s block have no counterpart here and print `(none)`:
+//! One cell of `dba`'s block has no counterpart here and prints `(none)`:
 //! the field address (this port reads a field through `Record::get_field`,
-//! not at a struct offset), and — for these rows only — the descriptor
-//! pointer and the width, because the generator carries a descriptor only for
-//! the `DBF_NOACCESS` rows whose `extra(...)` names a plain scalar. What is
-//! asserted below is everything else, which is C's bytes.
+//! not at a struct offset). The descriptor pointer and the width are carried
+//! for every `DBF_NOACCESS` row whose `extra(...)` names a scalar or a
+//! pointer, as `RSET` does. What is asserted below is everything else, which
+//! is C's bytes.
 //!
 //! Unix only: what is asserted is the process console.
 
@@ -119,7 +119,7 @@ async fn dba_prints_the_descriptor_block_for_rset() {
     let (head, rest) = out.split_once('\n').expect("dba printed nothing");
     assert!(
         head.starts_with("Record Address: 0x")
-            && head.ends_with(" Field Address: (none) Field Description: (none)"),
+            && head.contains(" Field Address: (none) Field Description: 0x"),
         "header was {head:?}"
     );
     assert_eq!(
@@ -127,7 +127,7 @@ async fn dba_prints_the_descriptor_block_for_rset() {
         "   No Elements: 1\n\
          \x20  Record Type: ai\n\
          \x20   Field Type: 17 = DBF_NOACCESS\n\
-         \x20   Field Size: (none)\n\
+         \x20   Field Size: 8\n\
          \x20      Special: 1\n\
          DBR Field Type: 17 = DBR_NOACCESS\n"
     );

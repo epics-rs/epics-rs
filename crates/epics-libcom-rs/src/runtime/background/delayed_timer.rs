@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use super::callback_executor::{Callback, CallbackHandle, CallbackPriority};
 use super::facility::{run_facility_loop, run_isolated};
-use crate::runtime::sync::{Event, PriorityInheritanceMutex};
+use crate::runtime::sync::{CMutex, Event, PriorityInheritanceMutex};
 use crate::runtime::task::{MandatoryThread, ThreadPriority};
 
 /// What this facility is called when it has to report something about itself.
@@ -90,7 +90,7 @@ struct TimerState {
 
 struct Inner {
     state: PriorityInheritanceMutex<TimerState>,
-    /// C's `epicsEvent` on the timer queue (`timerPrivate.h:188`) — separate
+    /// C's `epicsEvent` on the timer queue (`timerPrivate.h:161`) — separate
     /// from `state`, which is what leaves `state` free to be the PI one.
     wake: Event,
     sink: CallbackHandle,
@@ -271,11 +271,14 @@ impl DelayedTimer {
     /// (`callback.c:300`) whose `notify` routes to `callbackRequest`.
     pub fn new(sink: CallbackHandle) -> Self {
         let inner = Arc::new(Inner {
-            state: PriorityInheritanceMutex::new(TimerState {
-                queue: BTreeMap::new(),
-                next_seq: 0,
-                shutdown: false,
-            }),
+            state: PriorityInheritanceMutex::new(
+                TimerState {
+                    queue: BTreeMap::new(),
+                    next_seq: 0,
+                    shutdown: false,
+                },
+                CMutex::TimerQueue,
+            ),
             wake: Event::new(),
             sink,
         });
@@ -294,7 +297,7 @@ impl DelayedTimer {
             // but just below High (71), matching C: a due deadline preempts
             // ordinary callback work, and a High callback still preempts the
             // timer. Best effort, and only when the RT switch is on
-            // (`runtime::task::RT_PRIORITY_ENV`).
+            // (`runtime::task::C_RT_PRIORITY_ENV`).
             ThreadPriority::ScanHigh,
             // C allocates the timer queue's thread with
             // `epicsThreadGetStackSize(epicsThreadStackMedium)`

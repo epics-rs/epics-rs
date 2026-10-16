@@ -67,6 +67,8 @@ windows-sys = { version = "0.61", features = [
     # SECURITY_ATTRIBUTES — both must resolve even though we pass NULL.
     "Win32_System_IO",
     "Win32_Security",
+    # WSAEWOULDBLOCK: drivers::ip_port's test errno text.
+    "Win32_Networking_WinSock",
 ] }
 
 [dev-dependencies]
@@ -121,7 +123,47 @@ name = "device_support_brings_the_shell_commands"
 required-features = ["epics"]
 
 [[test]]
+name = "asyn_monitor_posts_its_read_fields"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_specials_under_the_hold"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_reentry_allocates_nothing"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_errs_posts_ahead_of_the_alarm"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_portless_errs_posts_once"
+required-features = ["epics"]
+
+[[test]]
+name = "interrupt_gate_follows_the_database"
+required-features = ["epics"]
+
+[[test]]
+name = "asyn_special_posts_in_c_order"
+required-features = ["epics"]
+
+[[test]]
+name = "special_puts_queue_behind_a_blocked_read"
+required-features = ["epics"]
+
+[[test]]
 name = "enum_property_post_mask"
+required-features = ["epics"]
+
+[[test]]
+name = "enum_notify_allocates_nothing"
+required-features = ["epics"]
+
+[[test]]
+name = "notify_allocates_nothing"
 required-features = ["epics"]
 
 [[test]]
@@ -134,6 +176,10 @@ required-features = ["epics"]
 
 [[test]]
 name = "non_blocking_write_reaches_the_driver_once"
+required-features = ["epics"]
+
+[[test]]
+name = "blocking_write_completes_on_the_callback_band"
 required-features = ["epics"]
 
 [[test]]

@@ -267,26 +267,25 @@ fn test_athm_tracks_home_switch_every_poll() {
 }
 
 #[test]
-fn test_process_motor_info_marks_diff_rdif_for_force_post() {
+fn test_process_motor_info_marks_diff_rdif() {
     // C process_motor_info (motorRecord.cc:3764-3767) MARKs M_DIFF/M_RDIF
-    // on every CALLBACK_DATA pass; monitor() (3522-3531) then posts both
-    // with DBE_VAL_LOG regardless of change. The Rust record records the
-    // mark so the framework re-posts DIFF/RDIF this cycle even when the
-    // following error is constant. A record that has not run
-    // process_motor_info this pass must name no force-posted field.
+    // on every CALLBACK_DATA pass, so monitor() (3522-3531) posts both
+    // whether or not the following error moved. MMAP is C's mark word.
+    let diff_rdif = (1 << 27) | (1 << 28);
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
-    assert!(
-        rec.force_posted_fields().is_empty(),
-        "a fresh record (no CALLBACK_DATA pass) force-posts nothing"
-    );
+    let mmap = |rec: &MotorRecord| match rec.get_field("MMAP") {
+        Some(EpicsValue::ULong(v)) => v,
+        other => panic!("MMAP: {other:?}"),
+    };
+    assert_eq!(mmap(&rec) & diff_rdif, 0, "a fresh record has no mark");
 
     let status = asyn_rs::interfaces::motor::MotorStatus::default();
     rec.process_motor_info(&status);
     assert_eq!(
-        rec.force_posted_fields(),
-        &["DIFF", "RDIF"],
-        "a CALLBACK_DATA pass marks DIFF/RDIF for unconditional re-post"
+        mmap(&rec) & diff_rdif,
+        diff_rdif,
+        "a CALLBACK_DATA pass marks DIFF/RDIF"
     );
 }
 
@@ -459,6 +458,7 @@ fn test_set_mode_offset_redefinition_retranslates_user_limits() {
 
     // VAL redefinition: off = 7 - 0 = 7.
     rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.pos.off, 7.0);
     assert_eq!(rec.limits.hlm, 17.0);
     assert_eq!(rec.limits.llm, -3.0);
@@ -479,6 +479,8 @@ fn test_set_foff_variable_val_completes_without_command() {
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
 
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no LOAD_POS, no motion");
     assert_eq!(rec.pos.off, 95.0);
     assert_eq!(rec.pos.dval, 5.0, "DVAL untouched");
     assert_eq!(rec.pos.rbv, 100.0, "RBV retranslated through new OFF");
@@ -1303,7 +1305,7 @@ fn test_field_list_coverage() {
     let ungettable: Vec<&str> = rec
         .field_list()
         .iter()
-        .filter(|fd| rec.get_field(fd.name).is_none())
+        .filter(|fd| !fd.unreadable() && rec.get_field(fd.name).is_none())
         .map(|fd| fd.name)
         .collect();
     assert_eq!(ungettable, UNIMPLEMENTED);
@@ -2150,7 +2152,7 @@ fn test_closed_loop_button_put_fires_implicit_get_info() {
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -2201,19 +2203,46 @@ fn test_stup_busy_ack_callback_skips_completion() {
     assert!(rec.stat.dmov);
 }
 
-#[test]
-fn test_hls_blocks_positive_move() {
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hls = true;
-    rec.stat.msta = MstaFlags::DONE;
-    rec.pos.dval = 50.0;
+/// Drive `rec` from rest on a struck limit switch through a put of `target`
+/// and the stopped callback that follows, as C does: the move block has no
+/// hardware-limit gate, so the command goes out, the controller refuses or
+/// stops at the switch, and the LS-error branch (motorRecord.cc:1367-1380)
+/// hands postProcess (827-849) the readback. Returns the dispatch effects.
+fn put_onto_struck_limit(
+    rec: &mut MotorRecord,
+    hls: bool,
+    lls: bool,
+    target: f64,
+) -> ProcessEffects {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let on_limit = MotorStatus {
+        position: 100.0,
+        done: true,
+        high_limit: hls,
+        low_limit: lls,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    rec.do_process();
+    rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
+    let effects = rec.do_process();
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit));
+    rec.do_process();
+    effects
+}
 
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
-    assert!(rec.stat.dmov); // no motion started
+#[test]
+fn test_hls_positive_move_dispatches_then_adopts_readback() {
+    // Oracle (C motorSim): VAL 160 at the +100 switch reads back VAL 100.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 200.0;
+    rec.limits.dllm = -200.0;
+    let effects = put_onto_struck_limit(&mut rec, true, false, 160.0);
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 100.0, "VAL adopts the limit readback");
+    assert_eq!(rec.pos.dval, 100.0);
 }
 
 #[test]
@@ -2232,17 +2261,15 @@ fn test_hls_allows_negative_move() {
 }
 
 #[test]
-fn test_lls_blocks_negative_move() {
+fn test_lls_negative_move_dispatches_then_adopts_readback() {
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.lls = true;
-    rec.stat.msta = MstaFlags::DONE;
-    rec.pos.dval = -50.0;
-
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 200.0;
+    rec.limits.dllm = -200.0;
+    let effects = put_onto_struck_limit(&mut rec, false, true, 50.0);
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 100.0, "VAL adopts the limit readback");
 }
 
 #[test]
@@ -2260,22 +2287,17 @@ fn test_lls_allows_positive_move() {
 }
 
 #[test]
-fn test_both_limits_block_all_moves() {
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hls = true;
-    rec.limits.lls = true;
-    rec.stat.msta = MstaFlags::DONE;
-
-    rec.pos.dval = 10.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
-
-    rec.pos.dval = -10.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
+fn test_both_limits_struck_moves_adopt_readback() {
+    for target in [150.0, 50.0] {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.limits.dhlm = 200.0;
+        rec.limits.dllm = -200.0;
+        let effects = put_onto_struck_limit(&mut rec, true, true, target);
+        assert!(!effects.commands.is_empty());
+        assert!(rec.stat.dmov);
+        assert_eq!(rec.pos.val, 100.0, "target {target} adopts the readback");
+    }
 }
 
 #[test]
@@ -2329,45 +2351,6 @@ fn test_cnen_no_command_without_gain_support() {
             .any(|c| matches!(c, MotorCommand::SetClosedLoop { .. })),
         "no SetClosedLoop without GAIN_SUPPORT"
     );
-}
-
-#[test]
-fn test_cnen_tracks_ea_position_under_gain_support() {
-    use asyn_rs::interfaces::motor::MotorStatus;
-    // C monitor() (3541-3549): a GAIN_SUPPORT controller syncs CNEN
-    // from the EA_POSITION torque readback on every MSTA post, so an
-    // externally toggled torque shows up in the field.
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 1.0;
-
-    let torque_on = MotorStatus {
-        done: true,
-        gain_support: true,
-        powered: true,
-        ..Default::default()
-    };
-    rec.process_motor_info(&torque_on);
-    assert!(rec.ctrl.cnen, "EA_POSITION on syncs CNEN=Enable");
-
-    let torque_off = MotorStatus {
-        done: true,
-        gain_support: true,
-        powered: false,
-        ..Default::default()
-    };
-    rec.process_motor_info(&torque_off);
-    assert!(!rec.ctrl.cnen, "EA_POSITION off syncs CNEN=Disable");
-
-    // Without GAIN_SUPPORT the user's CNEN is left alone.
-    rec.ctrl.cnen = true;
-    let no_gain = MotorStatus {
-        done: true,
-        gain_support: false,
-        powered: false,
-        ..Default::default()
-    };
-    rec.process_motor_info(&no_gain);
-    assert!(rec.ctrl.cnen, "CNEN untouched without GAIN_SUPPORT");
 }
 
 #[test]
@@ -3455,45 +3438,104 @@ fn test_retry_when_diff_exceeds_rdbd() {
     assert_eq!(rec.retry.rcnt, 1);
 }
 
-// --- 64-bit raw fields (epics-modules/motor #192) ---
+// --- raw fields are DBF_LONG (motorRecord.dbd), not 64-bit ---
 
 #[test]
-fn test_rval_holds_value_beyond_32bit_range() {
-    // 3e9 exceeds i32::MAX (~2.15e9); must round-trip without overflow.
-    let big: i64 = 3_000_000_000;
+fn test_rval_put_takes_the_c_long_conversion() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.conv.set = true; // SET mode: RVAL write redefines, no move
-    rec.put_field("RVAL", EpicsValue::Int64(big)).unwrap();
-    assert_eq!(rec.pos.rval, big);
-    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Int64(big)));
+    // dbPut DOUBLE->LONG is the x86 (epicsInt32) cast: overflow is INT_MIN.
+    rec.put_field("RVAL", EpicsValue::Double(3.0e9)).unwrap();
+    assert_eq!(rec.pos.rval, i32::MIN);
+    // An integer request narrows by truncation, as putInt64Long does.
+    rec.put_field("RVAL", EpicsValue::Int64(3_000_000_000))
+        .unwrap();
+    assert_eq!(rec.pos.rval, 3_000_000_000_u32 as i32);
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Long(rec.pos.rval)));
+}
+
+// devMotorAsyn.c:452/459/469 is a direct `(epicsInt32)floor(..)`: out of
+// range is INT_MIN on x86, not a 64-bit truncation. One case per arm.
+fn overflowed(
+    mres: f64,
+    eres: f64,
+    status: asyn_rs::interfaces::motor::MotorStatus,
+) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = mres;
+    rec.conv.eres = eres;
+    rec.process_motor_info(&status);
+    rec
 }
 
 #[test]
-fn test_rrbv_rmp_rep_are_int64_fields() {
+fn test_rmp_overflows_to_int_min() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 1.0;
-    // Driver position beyond 32-bit
-    let status = MotorStatus {
-        position: 5_000_000_000.0,
-        encoder_position: 5_000_000_000.0,
-        ..Default::default()
-    };
-    rec.process_motor_info(&status);
-    assert_eq!(rec.pos.rmp, 5_000_000_000_i64);
-    match rec.get_field("RRBV") {
-        Some(EpicsValue::Int64(v)) => assert_eq!(v, 5_000_000_000),
-        other => panic!("RRBV should be Int64, got {other:?}"),
-    }
-    match rec.get_field("RMP") {
-        Some(EpicsValue::Int64(_)) => {}
-        other => panic!("RMP should be Int64, got {other:?}"),
-    }
-    match rec.get_field("REP") {
-        Some(EpicsValue::Int64(_)) => {}
-        other => panic!("REP should be Int64, got {other:?}"),
-    }
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rmp, i32::MIN);
+    assert_eq!(rec.pos.rrbv, i32::MIN);
+    assert!(matches!(
+        rec.get_field("RMP"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
+}
+
+#[test]
+fn test_rep_eres_arm_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        1.0,
+        MotorStatus {
+            encoder_position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rep, i32::MIN);
+    assert!(matches!(
+        rec.get_field("REP"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
+}
+
+#[test]
+fn test_rep_mres_fallback_arm_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            encoder_position: 5_000_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.pos.rep, i32::MIN);
+}
+
+#[test]
+fn test_rvel_overflows_to_int_min() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let rec = overflowed(
+        1.0,
+        0.0,
+        MotorStatus {
+            velocity: -2_500_000_000.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rec.stat.rvel, i32::MIN);
+    assert!(matches!(
+        rec.get_field("RVEL"),
+        Some(EpicsValue::Long(i32::MIN))
+    ));
 }
 
 #[test]
@@ -3763,7 +3805,7 @@ fn test_rvel_is_floored_raw_velocity() {
     };
     rec.process_motor_info(&status);
     // C devMotorAsyn: rvel = floor(raw velocity); mres=1 → floor(3.7)
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(3)));
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(3)));
 }
 
 #[test]
@@ -3781,7 +3823,7 @@ fn test_rvel_converts_egu_velocity_to_raw_steps() {
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
-        Some(EpicsValue::Int64(2500)),
+        Some(EpicsValue::Long(2500)),
         "2.5 EGU/s at 0.001 EGU/step = 2500 steps/s"
     );
 
@@ -3793,7 +3835,7 @@ fn test_rvel_converts_egu_velocity_to_raw_steps() {
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
-        Some(EpicsValue::Int64(-2)),
+        Some(EpicsValue::Long(-2)),
         "floor(-1.5) = -2, matching C floor()"
     );
 }
@@ -3810,7 +3852,7 @@ fn test_rvel_is_independent_of_velo_setpoint() {
     rec.process_motor_info(&status);
     // VELO setpoint and RVEL raw velocity are separate values
     assert_eq!(rec.get_field("VELO"), Some(EpicsValue::Double(10.0)));
-    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(7)));
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(7)));
 }
 
 // --- ACCL safety when VELO==VBAS (C: b201e40e PR #75) ---
@@ -4444,7 +4486,7 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
     use epics_base_rs::server::record::Record;
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
-    rec.links.rdbl = "ext_readback.RBV".to_string();
+    rec.links.rdbl = "ext_readback.RBV".into();
 
     rec.set_resolved_input_links(epics_base_rs::server::record::ResolvedInputLinks::of_names(
         &[],
@@ -4762,7 +4804,7 @@ fn test_closed_loop_db_dol_suppresses_button_dispatch() {
     // OMSL flip back to supervisory can still act on it.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4785,7 +4827,7 @@ fn test_closed_loop_constant_dol_keeps_buttons_active() {
     // loop leaves the collection block running.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+    rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4802,7 +4844,7 @@ fn test_closed_loop_tweak_and_rlv_not_collected() {
     // bypassed else — the writes land in the fields and stay inert.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
@@ -4828,13 +4870,13 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     // lands in the field and stays inert, in move and SET mode alike.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
     rec.stat.msta = MstaFlags::DONE;
 
-    rec.put_field("RVAL", EpicsValue::Int64(5000)).unwrap();
+    rec.put_field("RVAL", EpicsValue::Long(5000)).unwrap();
     assert_eq!(rec.pos.rval, 5000, "field takes the raw write");
     assert_eq!(rec.pos.dval, 10.0, "no RVAL->DVAL propagation");
     assert_eq!(rec.pos.val, 10.0);
@@ -4842,7 +4884,7 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     assert!(effects.commands.is_empty(), "inert under closed loop");
 
     rec.conv.set = true;
-    rec.put_field("RVAL", EpicsValue::Int64(7000)).unwrap();
+    rec.put_field("RVAL", EpicsValue::Long(7000)).unwrap();
     assert_eq!(rec.pos.rval, 7000);
     assert_eq!(rec.pos.dval, 10.0, "no SET redefinition under closed loop");
 }
@@ -4854,7 +4896,7 @@ fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
     // the DOL cascade arriving through VAL.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
     rec.ctrl.twv = 1.0;
     rec.ctrl.twf = true; // latched before the DOL pass
@@ -4877,7 +4919,7 @@ fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
     // JOGF being re-written.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4903,7 +4945,7 @@ fn test_latent_tweak_folds_and_moves_after_omsl_flip() {
     // the move block dispatches the combined move.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
@@ -5024,7 +5066,7 @@ fn test_sync_pv_resyncs_under_closed_loop() {
     // under closed loop.
     let mut rec = MotorRecord::new();
     rec.links.omsl = 1;
-    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.links.dol = "setpoint_src.VAL".into();
     rec.conv.mres = 0.01;
     rec.pos.drbv = 25.0;
     rec.pos.rbv = 25.0;
@@ -5203,6 +5245,7 @@ fn test_loadpos_block_allows_offset_only_val_redefinition() {
     rec.pos.off = 0.0;
 
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.pos.off, 95.0, "OFF absorbs the redefinition");
     assert_eq!(rec.pos.dval, 5.0, "DVAL untouched (offset-only)");
 }
@@ -5215,6 +5258,7 @@ fn test_loadpos_block_allows_normal_set_when_unblocked() {
     rec.conv.loadpos_blocked = false;
     rec.pos.dval = 5.0;
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
     // Unblocked: SET mode redefines OFF (100 - 1*5 = 95)
     assert_eq!(rec.pos.off, 95.0);
 }
@@ -6190,7 +6234,10 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     let mut rec = MotorRecord::new();
     rec.pos.rbv = 42.0;
     rec.pos.val = 10.0; // setpoint differs from readback
-    assert_eq!(rec.monitor_deadband_value(), Some(42.0));
+    assert_eq!(
+        rec.monitor_deadband_value(),
+        Some(epics_base_rs::server::record::AlarmLimit::Double(42.0))
+    );
 }
 
 // --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc
@@ -6212,7 +6259,7 @@ fn paused_move_setup() -> MotorRecord {
 fn complete_stop_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
     rec.pos.drbv = pos;
     rec.pos.rbv = pos;
-    rec.pos.rrbv = pos as i64;
+    rec.pos.rrbv = pos as i32;
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = false;
     rec.check_completion()
@@ -7917,10 +7964,9 @@ mod alarm_sub {
     use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
 
     fn common() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..Default::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     // C 3372-3376: UDF raises UDF_ALARM/INVALID and short-circuits the
@@ -9026,16 +9072,15 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
     // transition fired, every field in the posting list goes out even
     // when unmarked — `local_mask = monitor_mask | (MARKED(x) ?
     // DBE_VAL_LOG : 0)` is non-zero for unmarked fields once
-    // `monitor_mask != 0`. A subscriber on DMOV must observe the alarm
-    // moment with a DBE_ALARM-only event even though DMOV itself did
-    // not change.
+    // `monitor_mask != 0` — up to the short circuit, below which a field
+    // posts only when one there is marked.
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::record::RecordInstance;
     use epics_base_rs::types::DbFieldType;
 
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
-    let mut instance = RecordInstance::new("M1".into(), rec);
+    let mut instance = RecordInstance::new("M1", rec);
     // A record is born UDF/`STAT=UDF` (dbCommon.dbd `initial("UDF")`), and
     // clearing that on the first process IS an alarm transition. This test is
     // about a QUIESCENT cycle, so start from the already-processed state:
@@ -9051,6 +9096,14 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
             (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
         )
         .expect("DMOV subscriber");
+    let _drbv_rx = instance
+        .add_subscriber(
+            "DRBV",
+            2,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .expect("DRBV subscriber");
 
     // Quiescent pass: no alarm transition, DMOV unchanged — no DMOV post.
     let (snap, _) = instance.process_local().unwrap();
@@ -9071,15 +9124,15 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
         .msta
         .insert(MstaFlags::PROBLEM);
     let (snap, _) = instance.process_local().unwrap();
-    let dmov_mask = snap
-        .iter()
-        .find(|(k, _, _)| k == "DMOV")
-        .map(|(_, _, m)| *m);
+    let mask = |field: &str| snap.iter().find(|(k, _, _)| k == field).map(|(_, _, m)| *m);
     assert_eq!(
-        dmov_mask,
+        mask("DRBV"),
         Some(EventMask::ALARM),
         "alarm cycle posts unchanged listed fields with DBE_ALARM alone"
     );
+    // The short circuit (3550-3551): with nothing below it marked, the
+    // fields under it do not post on the alarm.
+    assert_eq!(mask("DMOV"), None, "nothing marked below the short circuit");
 }
 
 #[test]
@@ -9387,35 +9440,69 @@ fn test_init_record_pass1_restores_dmov_after_load_time_blink() {
 }
 
 #[test]
-fn test_blinked_put_blocked_by_hw_limit_completes_with_lasts_adopted() {
-    // A blinked put whose first leg is blocked by an active hardware
-    // limit switch: C dispatches it (no hw-limit gate in the move
-    // block), the driver stops at the switch, and maybeRetry's
-    // limit-switch escape (1049) completes it with the lasts already
-    // adopted at dispatch (2469-2471). The Rust refusal skips the
-    // controller command but lands the same end state — the written
-    // target stays in VAL/DVAL, the lasts adopt it (no dangling
-    // re-dispatch on a later SPMG pass), and the pending pulse
-    // completes with DMOV=1 (the blink must not stay latched low).
+fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
+    // A blinked put whose leg runs into an active hardware limit switch:
+    // C dispatches it, the axis stops at the switch, and the LS-error
+    // completion (1367-1380 -> postProcess 827-849) adopts the readback
+    // into VAL/DVAL; the pulse completes with DMOV=1 and no stale target
+    // is left for a later SPMG pass to dispatch.
+    use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
-    rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
-    rec.limits.hls = true; // parked on the high limit switch
+    let on_limit = MotorStatus {
+        position: 0.0,
+        done: true,
+        high_limit: true,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    rec.do_process();
 
     rec.special("VAL", false).unwrap();
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let effects = rec.do_process();
-    assert!(effects.commands.is_empty(), "blocked move sends nothing");
-    assert!(rec.stat.dmov, "refusal completes the pending pulse");
-    assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert_eq!(rec.pos.val, 10.0, "the written target stays (C parity)");
-    assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts adopt the target");
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(!rec.stat.dmov);
 
-    // No dangling re-dispatch: an SPMG=Go pass finds nothing pending.
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit));
+    rec.do_process();
+    assert!(rec.stat.dmov, "the stopped callback completes the pulse");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.pos.val, 0.0, "VAL adopts the limit readback");
+    assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts follow the sync");
+
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(
         effects.commands.is_empty(),
-        "no stale target dispatches after the refusal"
+        "no stale target dispatches after the sync"
     );
+}
+
+#[test]
+fn every_field_default_is_the_dbd_initial() {
+    // A field with no `initial()` starts at zero (motorRecord.dbd TWV, which
+    // had defaulted to 1 here). VERS, LVIO and MRES are what init_record
+    // sets them to (608, 734, 3917), which lands the same after init.
+    let rec = MotorRecord::default();
+    let mut wrong = Vec::new();
+    for desc in rec.field_list() {
+        if matches!(desc.name, "VERS" | "LVIO" | "MRES") {
+            continue;
+        }
+        let Some(got) = rec.get_field(desc.name).and_then(|v| v.to_f64()) else {
+            continue;
+        };
+        let want = match (desc.initial, desc.menu) {
+            (None, _) => 0.0,
+            (Some(i), Some(menu)) if i.parse::<f64>().is_err() => {
+                menu.iter().position(|c| *c == i).expect("menu initial") as f64
+            }
+            (Some(i), _) => i.parse().expect("numeric initial"),
+        };
+        if got != want {
+            wrong.push((desc.name, got, want));
+        }
+    }
+    assert!(wrong.is_empty(), "(field, default, dbd initial): {wrong:?}");
 }

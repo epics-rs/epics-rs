@@ -96,20 +96,20 @@ struct MqttConfigHandler {
 impl CommandHandler for MqttConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let port_name = match &args[0] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("portName required".into()),
         };
         let broker_url = match &args[1] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("brokerUrl required".into()),
         };
         let client_id = match &args[2] {
-            ArgValue::String(s) => s.clone(),
+            ArgValue::String(s) => s.to_str()?.to_owned(),
             _ => return Err("clientId required".into()),
         };
         let qos = resolve_iocsh_qos(&args[3]);
         let conn_pv_name = match &args[4] {
-            ArgValue::String(s) if !s.is_empty() => Some(s.clone()),
+            ArgValue::String(s) if !s.is_empty() => Some(s.to_str()?.to_owned()),
             _ => None,
         };
 
@@ -125,10 +125,6 @@ impl CommandHandler for MqttConfigHandler {
         // Pre-bind config overlay (Z2M `normalize_on_off`); empty for generic
         // MQTT. Topic params themselves are created on demand when records bind.
         let overlay = take_pending_topics(&port_name);
-        println!(
-            "mqttDriverConfigure: port={port_name} broker={}:{}",
-            config.broker_host, config.broker_port,
-        );
 
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
         // Shared broker-connection flag: the event loop is the sole writer, the
@@ -159,12 +155,18 @@ impl CommandHandler for MqttConfigHandler {
         // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
         // The `?` is the same error channel the duplicate-name failure below
         // already uses.
-        let (runtime_handle, _actor_jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+        let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+            .map_err(|e| {
+                asyn_rs::manager::report_port_driver_register_failure(&port_name);
+                e.to_string()
+            })?;
         let port_handle = runtime_handle.port_handle().clone();
 
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone()) {
+        let owner = ctx.db().scan_control().interrupt_gate();
+        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
+        {
             // Nothing published this port, so ask the actor to stop.
+            asyn_rs::manager::report_port_driver_register_failure(&port_name);
             runtime_handle.shutdown();
             return Err(e.to_string());
         }

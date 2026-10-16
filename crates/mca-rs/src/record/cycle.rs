@@ -106,7 +106,10 @@ impl McaRecord {
     /// double-send, because the flags are already gone.
     pub fn take_device_requests(&mut self) -> Vec<McaCommand> {
         let mut cmds = Vec::new();
-        self.nack = 0;
+        if self.nack != 0 {
+            self.nack = 0;
+            self.mmap |= M_NACK;
+        }
 
         // C's NEWV block, in C's field order (`:525-634`). `special()` sets one
         // bit per setup field written; `process` then sends that field's CURRENT
@@ -130,6 +133,9 @@ impl McaRecord {
             if self.newv & bit != 0 {
                 cmds.push(cmd);
                 self.newv &= !bit;
+                // C marks each with its NEWV bit, which aliases a posted field
+                // for CHAS (IDTIM) and NUSE (NORD).
+                self.mmap |= bit;
             }
         }
 
@@ -139,10 +145,13 @@ impl McaRecord {
         if self.newv & (NEWV_ERAS | NEWV_ERST) != 0 {
             cmds.push(McaCommand::Erase);
             self.nord = 0;
+            self.mmap |= M_NORD;
             // NUSE channels, not NMAX (`:614`).
             self.zero_spectrum(self.nuse.max(0) as usize);
             if self.newv & NEWV_ERAS != 0 {
                 self.eras = 0;
+                // M_ERAS is M_DTIM's bit, so C posts DTIM on every erase.
+                self.mmap |= NEWV_ERAS | M_VAL;
                 self.newv &= !NEWV_ERAS;
                 self.newr = NEWR_ALL;
             }
@@ -151,6 +160,7 @@ impl McaRecord {
         if self.newv & NEWV_MODE != 0 {
             cmds.push(McaCommand::AcquireMode(self.mode as i32));
             self.newv &= !NEWV_MODE;
+            self.mmap |= NEWV_MODE;
         }
 
         // Start and stop go last, so the status read that follows sees them —
@@ -158,15 +168,21 @@ impl McaRecord {
         if self.strt != 0 || self.newv & NEWV_ERST != 0 {
             cmds.push(McaCommand::StartAcquire);
             self.acqg = 1;
-            self.strt = 0;
+            self.mmap |= M_ACQG;
+            if self.strt != 0 {
+                self.strt = 0;
+                self.mmap |= M_STRT;
+            }
             if self.newv & NEWV_ERST != 0 {
                 self.erst = 0;
                 self.newv &= !NEWV_ERST;
+                self.mmap |= NEWV_ERST;
             }
         }
         if self.stop != 0 {
             cmds.push(McaCommand::StopAcquire);
             self.stop = 0;
+            self.mmap |= M_STOP;
         }
 
         cmds
@@ -184,27 +200,42 @@ impl McaRecord {
     pub fn apply_status(&mut self, status: McaStatus) -> bool {
         self.rdns = 0;
 
-        let times_moved = self.ertm != status.elapsed_real || self.eltm != status.elapsed_live;
         let (prev_ertm, prev_eltm) = (self.ertm, self.eltm);
-        self.ertm = status.elapsed_real;
-        self.eltm = status.elapsed_live;
-        self.act = status.total_counts as i32;
+        if self.ertm != status.elapsed_real {
+            self.ertm = status.elapsed_real;
+            self.mmap |= M_ERTM;
+        }
+        if self.eltm != status.elapsed_live {
+            self.eltm = status.elapsed_live;
+            self.mmap |= M_ELTM;
+        }
+        let act = status.total_counts as i32;
+        if self.act != act {
+            self.act = act;
+            self.mmap |= M_ACT;
+        }
         // Device support is allowed to correct DWEL to the dwell the hardware
         // can actually deliver (`:706-709`).
-        self.dwel = status.dwell_time;
-        if times_moved {
+        if self.dwel != status.dwell_time {
+            self.dwel = status.dwell_time;
+            self.mmap |= M_DWEL;
+        }
+        if self.mmap & (M_ERTM | M_ELTM) != 0 {
             self.update_dead_time(prev_ertm, prev_eltm);
+            self.mmap |= M_DTIM | M_IDTIM;
         }
 
         self.status = status;
         if self.acqg != u16::from(status.acquiring) && !status.acquiring {
             self.read = 1;
+            self.mmap |= M_READ;
         }
 
         if self.read == 0 {
             return false;
         }
         self.read = 0;
+        self.mmap |= M_READ | M_RTIM;
         // C records the time the read BEGAN, for clients computing counts per
         // second across it (`:762-764`).
         self.rtim = epics_seconds(SystemTime::now());
@@ -214,8 +245,13 @@ impl McaRecord {
     /// C `readValue` (`:1097-1132`) once device support has produced the data:
     /// land it, and mark every region for recomputation.
     pub fn land_spectrum_read(&mut self, data: EpicsValue) -> CaResult<()> {
+        let nord = self.nord;
         self.read_completed();
-        self.land_spectrum(data)
+        self.land_spectrum(data)?;
+        if self.nord != nord {
+            self.mmap |= M_NORD;
+        }
+        Ok(())
     }
 
     /// The same read, for a device support that fills the record's buffer IN
@@ -228,7 +264,11 @@ impl McaRecord {
     /// driver claiming to have written more is claiming to have written past it.
     pub fn land_channel_count(&mut self, nord: i32) {
         self.read_completed();
-        self.nord = nord.clamp(0, self.nmax);
+        let nord = nord.clamp(0, self.nmax);
+        if self.nord != nord {
+            self.nord = nord;
+            self.mmap |= M_NORD;
+        }
     }
 
     /// C `readValue`'s first statement: EVERY read marks every region for
@@ -239,6 +279,7 @@ impl McaRecord {
     fn read_completed(&mut self) {
         self.newr = NEWR_ALL;
         self.rdng = 0;
+        self.mmap |= M_VAL;
     }
 
     /// C `mcaRecord.c:710-732`. `DTIM` is the average dead time over the whole acquisition;
@@ -353,6 +394,26 @@ pub(crate) fn format_stim(t: SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%b %d, %Y %H:%M:%S%.3f").to_string()
 }
+
+// C `mcaRecord.c:224-240` — the MMAP bits of the fields only `process()`
+// marks. The NEWV bits below share MMAP, and three of them alias these:
+// M_ERAS is M_DTIM, M_CHAS is M_IDTIM, M_NUSE is M_NORD.
+pub(crate) const M_VAL: u32 = 0x0000_0001;
+pub(crate) const M_NACK: u32 = 0x0000_0002;
+pub(crate) const M_BG: u32 = 0x0000_0004;
+pub(crate) const M_ACQG: u32 = 0x0000_0008;
+pub(crate) const M_READ: u32 = 0x0000_0010;
+pub(crate) const M_ERTM: u32 = 0x0000_0040;
+pub(crate) const M_ELTM: u32 = 0x0000_0080;
+pub(crate) const M_ACT: u32 = 0x0000_0100;
+pub(crate) const M_STRT: u32 = 0x0000_0200;
+pub(crate) const M_STOP: u32 = 0x0000_0400;
+pub(crate) const M_STIM: u32 = 0x0000_0800;
+pub(crate) const M_RTIM: u32 = 0x0000_1000;
+pub(crate) const M_DTIM: u32 = 0x0000_4000;
+pub(crate) const M_IDTIM: u32 = 0x0000_8000;
+pub(crate) const M_NORD: u32 = 0x0001_0000;
+pub(crate) const M_DWEL: u32 = 0x0002_0000;
 
 // C `mcaRecord.c:242-256` — the NEWV bits. `NEWV` is a `DBF_ULONG` field and so
 // is CA-visible: the bit VALUES are part of the field surface, not an

@@ -185,7 +185,10 @@ pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime")
-                .block_on(async move #body)
+                .block_on(async move {
+                    #base::runtime::task::adopt_current_runtime();
+                    #body
+                })
         }
     }
     .into()
@@ -295,6 +298,32 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   whose C `process()` keeps `prec->udf = FALSE` inside `if (status == 0)`
 ///   and folds `2` into `0` only afterwards (or not at all); omitted, the
 ///   trait default `true` applies
+/// - `#[record(type = "longin", soft_input_read_as = Long)]` — emit
+///   `Record::soft_input_request` answering `LinkReadAs::Long` under every
+///   soft DTYP, for a record whose soft dsets all hand INP's `dbGetLink` one
+///   `dbrType`; omitted, the trait default (the record's own INP request)
+///   applies. A name that is not a `LinkReadAs` variant does not compile:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs", soft_input_read_as = Lnog)]
+/// struct Bad {
+///     #[field(type = "Long")]
+///     val: i32,
+/// }
+/// ```
+/// - `#[record(type = "seq", take_cycle_posted_fields = seq_take_posts,
+///   fields_posted_only_when_marked = SEQ_CLAIMED)]` — the record's C
+///   `monitor()` posts: `Record::take_cycle_posted_fields` delegates to the
+///   named `fn(&mut Self) -> CycleMarks`, taken every cycle
+///   (`CycleHooks::CYCLE_POSTED`), and `Record::fields_posted_only_when_marked`
+///   answers the named `&'static [&'static str]`
+/// - `#[record(type = "longin", process_posted_fields = LONGIN_POSTED)]` —
+///   the closed set the record's C `process()` + `monitor()` post:
+///   `Record::process_posted_fields` answers `Some` of the named
+///   `[FieldIx; N]`, e.g. a `declared_set`
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -302,8 +331,42 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `&'static [&'static str]` choice table and is emitted through
 ///   `Record::menu_field_choices` (the framework promotes the stored menu
 ///   index to `EpicsValue::Enum` and attaches these labels).
+/// - `#[field(type = "PvStr", link)]` — a `DBF_INLINK`/`DBF_OUTLINK`/
+///   `DBF_FWDLINK` field, lent through `Record::link_text_ref`. The `type`
+///   cannot say this: link fields and `DBF_STRING` fields share `"PvStr"`
+///   storage, and the `.dbd` class is not visible to the derive.
 ///
 /// Field names are converted from snake_case to UPPER_CASE for EPICS field names.
+///
+/// A member named after a scan-cycle cell (`MDEL`, `ADEL`, `MLST`, `ALST`,
+/// `HYST`, `LALM`, `AFTC`, `AFVL`, and a numeric `VAL`/`OVAL`) is read by the
+/// cycle as a number, so any other storage type is refused:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs")]
+/// struct Bad {
+///     #[field(type = "String")]
+///     mdel: String,
+/// }
+/// ```
+///
+/// A numeric or `PvStr` member is the record's `Record::slot_mut` at
+/// `slots::<type>::<FIELD>`, so a member the type's `.dbd` does not declare
+/// does not compile:
+///
+/// ```compile_fail
+/// use epics_macros_rs::EpicsRecord;
+///
+/// #[derive(EpicsRecord)]
+/// #[record(type = "longin", crate_path = "epics_base_rs")]
+/// struct Bad {
+///     #[field(type = "Long")]
+///     no_such_field: i32,
+/// }
+/// ```
 #[proc_macro_derive(EpicsRecord, attributes(record, field))]
 pub fn derive_epics_record(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -356,6 +419,12 @@ struct RecordAttrs {
     /// with alarm events, never `DBE_VALUE`/`DBE_LOG`. Default `false` (the
     /// trait default `true` applies), so ordinary value records are unaffected.
     no_value_monitor: bool,
+    /// `#[record(take_cycle_posted_fields = some_fn)]`.
+    take_cycle_posted_fields: Option<syn::Path>,
+    /// `#[record(fields_posted_only_when_marked = SOME_SET)]`.
+    fields_posted_only_when_marked: Option<syn::Path>,
+    /// `#[record(process_posted_fields = SOME_SET)]`.
+    process_posted_fields: Option<syn::Path>,
     /// `#[record(dset_owns_udf_on_computed)]` — the record's C `process()` does
     /// NOT re-derive `udf` after a device read that wrote VAL directly (C
     /// `return 2`), because the `else if (status == 2) status = 0;` fold sits
@@ -365,6 +434,12 @@ struct RecordAttrs {
     /// trait default `true` applies), which is `aiRecord.c:158-161`'s shape and
     /// the majority.
     dset_owns_udf_on_computed: bool,
+    /// `#[record(soft_input_read_as = Long)]` — the `LinkReadAs` variant every
+    /// soft dset of the record type reads INP at (`devLiSoft` and
+    /// `devLiSoftCallback` both ask `DBR_LONG`). Emitted as
+    /// `Record::soft_input_request`; the variant path is resolved by rustc, so
+    /// a misspelt one is a compile error.
+    soft_input_read_as: Option<syn::Ident>,
 }
 
 struct FieldInfo {
@@ -377,6 +452,7 @@ struct FieldInfo {
     /// non-menu field. `SOME_CONST` must resolve to a
     /// `&'static [&'static str]` in the record's module.
     menu_choices: Option<syn::Expr>,
+    link: bool,
 }
 
 fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -412,7 +488,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let mut field_infos = Vec::new();
     for f in &fields.named {
         let ident = f.ident.as_ref().unwrap().clone();
-        let (dbf_type, read_only, menu_choices) = parse_field_attrs(f)?;
+        let (dbf_type, read_only, menu_choices, link) = parse_field_attrs(f)?;
         let epics_name = ident.to_string().to_uppercase();
         field_infos.push(FieldInfo {
             ident,
@@ -420,6 +496,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             dbf_type,
             read_only,
             menu_choices,
+            link,
         });
     }
 
@@ -468,6 +545,45 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         })
         .collect();
 
+    // `slot_ref`/`slot_mut` over `slots::<record_type>`, through C3's
+    // `slot_map!`. Only a member whose emitted `put_field` arm is a plain
+    // store of the declared kind is mapped (`slot_mut` must store exactly what
+    // `put_field` stores); a read-only one gets a `slot_ref` only. A `menu()`
+    // member is stored `Short` but declared `DBF_MENU`, so it is not mapped
+    // ([`slot_kind`]). A link is `PvStr` too, but its text is never a slot
+    // value.
+    // A mapped name the `.dbd` does not declare has no `slots::` constant and
+    // does not compile.
+    let slotted =
+        |fi: &&FieldInfo| fi.menu_choices.is_none() && !fi.link && slot_kind(&fi.dbf_type);
+    let slot_arm = |fi: &FieldInfo| {
+        let field = proc_macro2::Ident::new(&fi.epics_name, fi.ident.span());
+        let ident = &fi.ident;
+        quote! { #field => #ident }
+    };
+    let rw_slots: Vec<_> = field_infos
+        .iter()
+        .filter(slotted)
+        .filter(|fi| !fi.read_only)
+        .map(slot_arm)
+        .collect();
+    let ro_slots: Vec<_> = field_infos
+        .iter()
+        .filter(slotted)
+        .filter(|fi| fi.read_only)
+        .map(slot_arm)
+        .collect();
+    let slot_methods = if rw_slots.is_empty() && ro_slots.is_empty() {
+        quote! {}
+    } else {
+        let rtype = proc_macro2::Ident::new(record_type_str, proc_macro2::Span::call_site());
+        quote! {
+            #krate::slot_map!(#krate::server::record::dbd_generated::slots::#rtype;
+                #(#rw_slots),*;
+                read_only: #(#ro_slots),*);
+        }
+    };
+
     // Generate menu_field_choices for any `#[field(menu_choices = ...)]`
     // fields, so a DBF_MENU field served as DBR_ENUM carries its menu()
     // choice labels (see `Record::menu_field_choices`). Omitted entirely
@@ -492,6 +608,89 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 }
             }
         }
+    };
+
+    // `#[field(..., link)]` fields — emit `Record::link_text_ref`. Omitted
+    // when no field is a link, so the trait default (lend nothing) applies.
+    let link_arms: Vec<_> = field_infos
+        .iter()
+        .filter(|fi| fi.link)
+        .map(|fi| {
+            let epics_name = &fi.epics_name;
+            let ident = &fi.ident;
+            quote! { #epics_name => Some(self.#ident.as_bytes()), }
+        })
+        .collect();
+    let link_text_method = if link_arms.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+                match link_field {
+                    #(#link_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
+
+    // SIMM/SIMS/SDLY — emit `Record::simm_cells`. Keyed on the member names
+    // rather than a marker so a struct that carries the simulation cells
+    // cannot forget to opt in and fall back to the by-name path; a struct
+    // that carries only some of the three is rejected here, since the hook
+    // has no partial form.
+    let cell = |name: &str| field_infos.iter().find(|fi| fi.epics_name == name);
+    let simm_cells_method = match (cell("SIMM"), cell("SIMS"), cell("SDLY")) {
+        (None, None, None) => quote! {},
+        (Some(simm), Some(sims), Some(sdly)) => {
+            let (simm, sims, sdly) = (&simm.ident, &sims.ident, &sdly.ident);
+            quote! {
+                fn simm_cells(&self) -> Option<#krate::server::record::SimmCells> {
+                    Some(#krate::server::record::SimmCells {
+                        simm: self.#simm,
+                        sims: self.#sims,
+                        sdly: self.#sdly,
+                    })
+                }
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "EpicsRecord: a record carrying any of SIMM/SIMS/SDLY must carry all three \
+                 (they back `Record::simm_cells`)",
+            ));
+        }
+    };
+
+    // DLY0..DLYF and DO0..DOF — emit `Record::seq_group_cells`, keyed on the
+    // member names like `simm_cells`; all thirty-two or none.
+    const GROUPS: &str = "0123456789ABCDEF";
+    let group_cells: Vec<_> = GROUPS
+        .chars()
+        .map(|g| (cell(&format!("DLY{g}")), cell(&format!("DO{g}"))))
+        .collect();
+    let seq_group_cells_method = if group_cells.iter().all(|c| matches!(c, (None, None))) {
+        quote! {}
+    } else if group_cells.iter().all(|c| matches!(c, (Some(_), Some(_)))) {
+        let arms = group_cells.iter().enumerate().map(|(i, (dly, dov))| {
+            let (dly, dov) = (&dly.unwrap().ident, &dov.unwrap().ident);
+            quote! { #i => Some((self.#dly, self.#dov)), }
+        });
+        quote! {
+            fn seq_group_cells(&self, group: usize) -> Option<(f64, f64)> {
+                match group {
+                    #(#arms)*
+                    _ => None,
+                }
+            }
+        }
+    } else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "EpicsRecord: a record carrying any of DLY0..DLYF/DO0..DOF must carry all \
+             thirty-two (they back `Record::seq_group_cells`)",
+        ));
     };
 
     // `#[record(constant_init = "LINK:TARGET,...")]` — the record's C
@@ -557,6 +756,36 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         None => quote! {},
     };
 
+    // A type that posts from its own `monitor()` is taken every cycle; one
+    // that does not keeps `NONE`, so the walk never asks it.
+    let (take_cycle_posted_method, hooks) = match &attrs.take_cycle_posted_fields {
+        Some(path) => (
+            quote! {
+                fn take_cycle_posted_fields(&mut self) -> #krate::server::record::CycleMarks {
+                    #path(self)
+                }
+            },
+            quote! { CYCLE_POSTED },
+        ),
+        None => (quote! {}, quote! { NONE }),
+    };
+    let posted_only_when_marked_method = match &attrs.fields_posted_only_when_marked {
+        Some(path) => quote! {
+            fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+                &#path
+            }
+        },
+        None => quote! {},
+    };
+    let process_posted_method = match &attrs.process_posted_fields {
+        Some(path) => quote! {
+            fn process_posted_fields(&self) -> Option<#krate::server::record::DeclaredFields> {
+                Some(&#path)
+            }
+        },
+        None => quote! {},
+    };
+
     // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
     // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
     // absent, so the trait default (`true`) applies to every value record.
@@ -583,14 +812,179 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    // `#[record(soft_input_read_as = Variant)]` — emit
+    // `Record::soft_input_request` answering that variant under every soft DTYP.
+    let soft_input_request_method = match &attrs.soft_input_read_as {
+        Some(variant) => quote! {
+            fn soft_input_request(
+                &self,
+                _soft: #krate::server::device_support::SoftDtyp,
+            ) -> #krate::server::record::InputLinkRequest {
+                #krate::server::record::InputLinkRequest::As(
+                    #krate::server::record::LinkReadAs::#variant,
+                )
+            }
+        },
+        None => quote! {},
+    };
+
+    // The scan cycle's cells — emit `Record::cycle_cell`/`put_cycle_cell`,
+    // keyed on the member names so a struct that stores a cell cannot forget
+    // to opt in and leave the cycle reading it by name. A cell is read in the
+    // member's numeric carrier; a put in that carrier is the member's own
+    // `put_field` arm, and any other carrier goes to `put_field` itself.
+    let cycle_cells: Vec<_> = [
+        ("VAL", "Val"),
+        ("OVAL", "Oval"),
+        ("MDEL", "Mdel"),
+        ("ADEL", "Adel"),
+        ("MLST", "Mlst"),
+        ("ALST", "Alst"),
+        ("HYST", "Hyst"),
+        ("LALM", "Lalm"),
+        ("AFTC", "Aftc"),
+        ("AFVL", "Afvl"),
+    ]
+    .into_iter()
+    .map(|(epics_name, variant)| {
+        let variant = proc_macro2::Ident::new(variant, proc_macro2::Span::call_site());
+        let member = field_infos.iter().find(|fi| fi.epics_name == epics_name);
+        (epics_name, variant, member)
+    })
+    .collect();
+    let cycle_cell_methods = if cycle_cells.iter().all(|(_, _, m)| m.is_none()) {
+        quote! {}
+    } else {
+        let record = quote!(#krate::server::record);
+        let mut get_arms = Vec::new();
+        let mut put_arms = Vec::new();
+        for (epics_name, variant, member) in &cycle_cells {
+            let carrier = member.and_then(|fi| cycle_carrier(&fi.dbf_type));
+            get_arms.push(match (member, &carrier) {
+                (Some(fi), Some(carrier)) => {
+                    let ident = &fi.ident;
+                    quote! {
+                        #record::CycleCell::#variant =>
+                            #record::CycleRead::Value(#record::CycleValue::#carrier(self.#ident)),
+                    }
+                }
+                // A string or array VAL is not a number; the cycle reads it
+                // through `get_field`.
+                (Some(_), None) if matches!(*epics_name, "VAL" | "OVAL") => {
+                    quote! { #record::CycleCell::#variant => #record::CycleRead::ByName, }
+                }
+                (Some(fi), None) => {
+                    return Err(syn::Error::new_spanned(
+                        &fi.ident,
+                        format!(
+                            "{epics_name} is a scan-cycle cell and must be stored as \
+                             a number (Double, Float, Long, Int64, Short, UShort, Char or Enum), not {}",
+                            fi.dbf_type
+                        ),
+                    ));
+                }
+                (None, _) => quote! { #record::CycleCell::#variant => #record::CycleRead::Absent, },
+            });
+            put_arms.push(match (member, &carrier) {
+                (Some(fi), Some(carrier)) if !fi.read_only => {
+                    let ident = &fi.ident;
+                    quote! {
+                        #record::CycleCell::#variant => match value {
+                            #record::CycleValue::#carrier(v) => {
+                                self.validate_put(#epics_name, &#record::CycleValue::#carrier(v).lend())?;
+                                self.#ident = v;
+                                self.on_put(#epics_name);
+                                Ok(())
+                            }
+                            other => self.put_field(#epics_name, other.into()),
+                        },
+                    }
+                }
+                _ => quote! {
+                    #record::CycleCell::#variant => self.put_field(#epics_name, value.into()),
+                },
+            });
+        }
+        quote! {
+            #[inline]
+            fn cycle_cell(&self, cell: #record::CycleCell) -> #record::CycleRead {
+                match cell {
+                    #(#get_arms)*
+                }
+            }
+
+            fn put_cycle_cell(
+                &mut self,
+                cell: #record::CycleCell,
+                value: #record::CycleValue,
+            ) -> #krate::error::CaResult<()> {
+                match cell {
+                    #(#put_arms)*
+                }
+            }
+        }
+    };
+
+    // A soft reading at VAL's own carrier is the `put_field` arm the wrapped
+    // read reaches through `put_field_internal`, which converts nothing for a
+    // value already of the stored type.
+    let soft_input_entry_method = match cycle_cells
+        .iter()
+        .find(|(epics_name, _, _)| *epics_name == "VAL")
+        .and_then(|(_, _, member)| *member)
+        .filter(|fi| !fi.read_only)
+        .and_then(|fi| cycle_carrier(&fi.dbf_type))
+        .and_then(|carrier| {
+            SOFT_INPUT_ENTRIES
+                .iter()
+                .find(|(c, _, _)| carrier == c)
+                .map(|&(_, entry, ty)| (carrier, entry, ty))
+        }) {
+        Some((carrier, entry, ty)) => {
+            let record = quote!(#krate::server::record);
+            let entry = proc_macro2::Ident::new(entry, proc_macro2::Span::call_site());
+            let ty = proc_macro2::Ident::new(ty, proc_macro2::Span::call_site());
+            quote! {
+                fn #entry(
+                    &mut self,
+                    value: #ty,
+                    _dpvt: &mut #krate::server::device_support::Dpvt,
+                ) -> #krate::error::CaResult<()> {
+                    self.put_cycle_cell(#record::CycleCell::Val, #record::CycleValue::#carrier(value))
+                }
+            }
+        }
+        None => quote! {},
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
+            #soft_input_entry_method
             #constant_init_method
             #init_method
             #value_monitor_method
             #computed_udf_method
+            #soft_input_request_method
+            #cycle_cell_methods
             #metadata_override_method
             #link_metadata_field_method
+            #take_cycle_posted_method
+            #posted_only_when_marked_method
+            #process_posted_method
+
+            // The derive emits no `pre_process_actions`.
+            fn acts_before_process(&self) -> bool {
+                false
+            }
+
+            fn cycle_hooks(&self) -> #krate::server::record::CycleHooks {
+                #krate::server::record::CycleHooks::#hooks
+            }
+
+            // Nor an `array_monitor_post`.
+            fn has_array_monitor_post(&self) -> bool {
+                false
+            }
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -616,6 +1010,10 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
 
             #menu_method
+            #link_text_method
+            #simm_cells_method
+            #seq_group_cells_method
+            #slot_methods
         }
     };
 
@@ -630,7 +1028,11 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut metadata_override: Option<syn::Path> = None;
     let mut link_metadata_field: Option<syn::Path> = None;
     let mut no_value_monitor = false;
+    let mut take_cycle_posted_fields: Option<syn::Path> = None;
+    let mut fields_posted_only_when_marked: Option<syn::Path> = None;
+    let mut process_posted_fields: Option<syn::Path> = None;
     let mut dset_owns_udf_on_computed = false;
+    let mut soft_input_read_as: Option<syn::Ident> = None;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -675,15 +1077,29 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                     // Bare flag, like a field's `read_only`: no `= value`.
                     no_value_monitor = true;
                     Ok(())
+                } else if meta.path.is_ident("take_cycle_posted_fields") {
+                    take_cycle_posted_fields = Some(meta.value()?.parse()?);
+                    Ok(())
+                } else if meta.path.is_ident("fields_posted_only_when_marked") {
+                    fields_posted_only_when_marked = Some(meta.value()?.parse()?);
+                    Ok(())
+                } else if meta.path.is_ident("process_posted_fields") {
+                    process_posted_fields = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else if meta.path.is_ident("dset_owns_udf_on_computed") {
                     // Bare flag.
                     dset_owns_udf_on_computed = true;
+                    Ok(())
+                } else if meta.path.is_ident("soft_input_read_as") {
+                    soft_input_read_as = Some(meta.value()?.parse()?);
                     Ok(())
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
                          `metadata_override`, `link_metadata_field`, \
-                         `no_value_monitor` or `dset_owns_udf_on_computed`",
+                         `no_value_monitor`, `take_cycle_posted_fields`, \
+                         `fields_posted_only_when_marked`, `process_posted_fields`, \
+                         `dset_owns_udf_on_computed` or `soft_input_read_as`",
                     ))
                 }
             })?;
@@ -701,14 +1117,19 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         metadata_override,
         link_metadata_field,
         no_value_monitor,
+        take_cycle_posted_fields,
+        fields_posted_only_when_marked,
+        process_posted_fields,
         dset_owns_udf_on_computed,
+        soft_input_read_as,
     })
 }
 
-fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<syn::Expr>)> {
+fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<syn::Expr>, bool)> {
     let mut dbf_type = None;
     let mut read_only = false;
     let mut menu_choices = None;
+    let mut link = false;
 
     for attr in &field.attrs {
         if attr.path().is_ident("field") {
@@ -730,8 +1151,11 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
                     let value = meta.value()?;
                     menu_choices = Some(value.parse::<syn::Expr>()?);
                     Ok(())
+                } else if meta.path.is_ident("link") {
+                    link = true;
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type`, `read_only`, or `menu_choices`"))
+                    Err(meta.error("expected `type`, `read_only`, `menu_choices`, or `link`"))
                 }
             })?;
         }
@@ -739,8 +1163,45 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
 
     let dbf_type = dbf_type
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
+    if link && dbf_type != "PvStr" {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`link` lends the field's bytes, so it needs #[field(type = \"PvStr\")]",
+        ));
+    }
 
-    Ok((dbf_type, read_only, menu_choices))
+    Ok((dbf_type, read_only, menu_choices, link))
+}
+
+/// A `#[field(type)]` whose member is a `SlotMut` variant agreeing with the
+/// `DBF_*` it is declared as, and whose `put_field` arm stores the matching
+/// `EpicsValue` as is. `Char` is a `u8` member for a signed `DBF_CHAR` and
+/// `String` a Rust `String`, neither a variant; `Short` is also how a
+/// `menu()` field is stored when it carries no `menu_choices` (`int64in.SIMS`),
+/// which the derive cannot tell from a `DBF_SHORT`.
+fn slot_kind(dbf_type: &str) -> bool {
+    matches!(
+        dbf_type,
+        "Double" | "Float" | "Long" | "Int64" | "Enum" | "UShort" | "PvStr"
+    )
+}
+
+/// The `CycleValue` variant a scan-cycle cell of `dbf_type` is read in, or
+/// `None` for a type that is not a number.
+/// The scan-cycle carriers that have a typed soft dset entry
+/// (`Record::soft_input_read_*`), with that entry and its argument type.
+const SOFT_INPUT_ENTRIES: &[(&str, &str, &str)] = &[
+    ("Double", "soft_input_read_f64", "f64"),
+    ("Long", "soft_input_read_i32", "i32"),
+    ("Int64", "soft_input_read_i64", "i64"),
+];
+
+fn cycle_carrier(dbf_type: &str) -> Option<proc_macro2::Ident> {
+    matches!(
+        dbf_type,
+        "Double" | "Float" | "Long" | "Int64" | "Short" | "UShort" | "Char" | "Enum"
+    )
+    .then(|| proc_macro2::Ident::new(dbf_type, proc_macro2::Span::call_site()))
 }
 
 fn value_to_epics(
@@ -824,10 +1285,11 @@ fn value_from_epics(
     // `EpicsValue::String` variant wraps `PvString`, so convert on assign.
     // `PvStr` fields already store a `PvString`, so the wire bytes move in
     // verbatim — a non-UTF-8 value is preserved.
-    let assign = if dbf_type == "String" {
-        quote! { self.#field_ident = v.as_str_lossy().into_owned(); }
-    } else {
-        quote! { self.#field_ident = v; }
+    // A `PvStr` member keeps its buffer, so a reserve made at load holds.
+    let assign = match dbf_type {
+        "String" => quote! { self.#field_ident = v.as_str_lossy().into_owned(); },
+        "PvStr" => quote! { self.#field_ident.set_bytes(v.as_bytes()); },
+        _ => quote! { self.#field_ident = v; },
     };
 
     quote! {
@@ -1056,7 +1518,7 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
                 let __fields = __rt::ensure_nt_meta_desc(&__sid, __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: __sid,
-                    fields: __fields,
+                    fields: __fields.into(),
                 }
             }
 
@@ -1374,7 +1836,7 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                     ("labels".into(), __rt::FieldDesc::ScalarArray(__rt::ScalarType::String)),
                     ("value".into(), __rt::FieldDesc::Structure {
                         struct_id: "".into(),
-                        fields: __value_fields,
+                        fields: __value_fields.into(),
                     }),
                 ];
                 // pvxs `NTTable::build()` (nt.cpp:170-176) always carries
@@ -1384,7 +1846,7 @@ pub fn derive_nt_table(input: TokenStream) -> TokenStream {
                 let __fields = __rt::ensure_nt_meta_desc("epics:nt/NTTable:1.0", __fields);
                 __rt::FieldDesc::Structure {
                     struct_id: "epics:nt/NTTable:1.0".into(),
-                    fields: __fields,
+                    fields: __fields.into(),
                 }
             }
 

@@ -13,9 +13,9 @@ use epics_ca_rs::server::ioc_app::IocApplication;
 #[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
-    // Install a tracing subscriber so mqtt-rs log lines (e.g.,
-    // "MQTT connection error: ...", "MQTT connected, subscribing ...")
-    // actually reach stdout. Controlled via `RUST_LOG` (defaults to info).
+    // Install a tracing subscriber for the mqtt-rs lines that are not asyn
+    // trace (Connected PV recovery, shutdown). Controlled via `RUST_LOG`
+    // (defaults to info).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -53,25 +53,15 @@ async fn main() -> CaResult<()> {
     // The runner paired with the two protocol registrars, because `casr` and
     // `pvxsr` have to answer from the script's first line and `.run(runner)`
     // reaches only the interactive shell.
-    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        app.startup_script(&script)
-            // External links resolve with zero further setup: both link sets
-            // install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the iocInit
-            // external-link wait — the `ca` and `pva` link sets.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
-    )
-    .await
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
 
 /// The `exec_backend` arm: the dual-protocol runner this IOC hands its
 /// `IocApplication` to is compiled only on the tokio backend.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "mqtt_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

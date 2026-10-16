@@ -1,13 +1,16 @@
 use super::calc_compile;
 use super::link_status::{LinkStatusGen, SWAIT_NO_PV, SWAIT_PV_STATUS_CHOICES, classify_swait_pv};
 use crate::calc::NumericInputs;
-use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
+use crate::calc::{Rpcl, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
+use crate::server::record::{CycleCell, CycleRead, CycleValue, OutView};
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
+use crate::types::PvString;
 use crate::types::{EpicsValue, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
@@ -20,6 +23,9 @@ const SWAIT_PV_STATUS_FIELDS: [&str; 14] = [
     "DOLV", "OUTV",
 ];
 
+/// `swaitRecord.dbd:431` `char rpcl[184]`.
+const SWAIT_RPCL_SIZE: usize = 184;
+
 // swait (string wait) record from synApps calc module.
 // Functionally equivalent to scalcout, but uses INxN/INxP naming for input links
 // (INxN = link name, INxP = process passive flag) instead of INPx.
@@ -31,7 +37,7 @@ pub struct SwaitRecord {
     /// C `RPCL`. Always a program: an empty or uncompilable CALC carries C's
     /// empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run, so
     /// the record alarms on every process. See [`calc_compile`].
-    compiled_calc: CompiledExpr,
+    rpcl: Rpcl<SWAIT_RPCL_SIZE>,
     /// CLCV ("CALC Valid", `swaitRecord.dbd:433`, `DBF_LONG`) — `postfix()`'s
     /// return status, stored on every compile (`swaitRecord.c:304` at init,
     /// `:561` in `special(SPC_CALC)`) and posted `DBE_VALUE` (`:309`, `:566`).
@@ -72,7 +78,7 @@ pub struct SwaitRecord {
     // writes DOLD to OUT; see [`Record::output_time_input_links`]. With DOLN
     // unset (C `dolv == NO_PV`) the get is skipped and DOLD keeps whatever was
     // written to it (an operator/client put, or the init value).
-    pub doln: String,
+    pub doln: PvString,
     pub dold: f64,
     // OVAL ("Old Value", C `swaitRecord.dbd:440`): the VAL of the PREVIOUS
     // cycle. C sets it at `swaitRecord.c:471` (`pwait->oval = pwait->val`,
@@ -93,7 +99,7 @@ pub struct SwaitRecord {
     // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
     // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
     pub odly: f32,
-    pub out: crate::server::record::SparseText,
+    pub out: Box<[u8]>,
     pub prec: i16,
     // MDEL / ADEL (C `swaitRecord.dbd:477-486`, both DBF_DOUBLE): the monitor
     // and archive deadbands `monitor()` (swaitRecord.c:622-640) tests VAL
@@ -112,8 +118,8 @@ pub struct SwaitRecord {
     pub mlst: f64,
     pub alst: f64,
     // INxN: input link names; INxP: process passive flags (0/1)
-    pub inp_names: [String; 12], // INAN..INLN
-    pub inp_passive: [i16; 12],  // INAP..INLP
+    pub inp_names: [PvString; 12], // INAN..INLN
+    pub inp_passive: [i16; 12],    // INAP..INLP
     // numeric input values A-L
     pub num_vals: [f64; 12],
     // LA..LL ("Last Val of Input x", C `swaitRecord.dbd:298-331`, DBF_DOUBLE,
@@ -163,9 +169,9 @@ pub struct SwaitRecord {
     // The framework owns the branch (`Record::simulation_substitutes_input_stage`
     // + `check_simulation_mode`): it resolves SIMM from SIML, reads SIOL into
     // SVAL, writes VAL, raises SIMM_ALARM, and pushes `simulation_active` here.
-    pub siml: String,
+    pub siml: PvString,
     pub simm: i16,
-    pub siol: String,
+    pub siol: PvString,
     pub sval: f64,
     pub sims: i16,
     // This cycle's simulation state, pushed by the framework through
@@ -177,8 +183,11 @@ pub struct SwaitRecord {
     // shape calcout/sseq use (see `link_status::LinkStatusGen`): a refresh
     // classifies a snapshot of the link names off-thread, and only the latest
     // one issued may publish.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
+    // A refused CALC put's report, made by `special()` under the put's hold
+    // and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     cached_should_output: bool,
     // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
     // no DLYA database field, unlike scalcout). `output_wait` marks that the
@@ -187,6 +196,10 @@ pub struct SwaitRecord {
     // OUT + posts OEVT exactly once after the delay.
     output_wait: bool,
     pending_output: bool,
+    /// The CLCV/CALC/CLCV posts owed by a CALC `special()`.
+    calc_post: bool,
+    /// This cycle's `monitor()` posts of A..L and LA..LL, a bit per input.
+    input_changes: u16,
 }
 
 impl Default for SwaitRecord {
@@ -194,19 +207,19 @@ impl Default for SwaitRecord {
         Self {
             val: 0.0,
             calc: String::new(),
-            compiled_calc: CompiledExpr::empty(ExprKind::Numeric),
+            rpcl: Rpcl::empty(),
             clcv: 0,
             initialized: false,
             calc_alarm: false,
             calc_succeeded: false,
             oopt: 0,
             dopt: 0,
-            doln: String::new(),
+            doln: PvString::new(),
             dold: 0.0,
             oval: 0.0,
             oevt: 0,
             odly: 0.0,
-            out: crate::server::record::SparseText::default(),
+            out: Box::default(),
             prec: 0,
             mdel: 0.0,
             adel: 0.0,
@@ -220,17 +233,20 @@ impl Default for SwaitRecord {
             // and every name starts blank.
             pv_status: [SWAIT_NO_PV; 14],
             fetch_gate_failed: false,
-            siml: String::new(),
+            siml: PvString::new(),
             simm: 0,
-            siol: String::new(),
+            siol: PvString::new(),
             sval: 0.0,
             sims: 0,
             simulation_active: false,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
+            put_report: None,
             cached_should_output: true,
             output_wait: false,
             pending_output: false,
+            calc_post: false,
+            input_changes: 0,
         }
     }
 }
@@ -239,6 +255,12 @@ impl Default for SwaitRecord {
 const CHAN: [char; 12] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
 
 impl SwaitRecord {
+    /// `outValue = pwait->dopt ? pwait->dold : pwait->val`
+    /// (`swaitRecord.c:764-775`).
+    fn out_value(&self) -> f64 {
+        if self.dopt == 1 { self.dold } else { self.val }
+    }
+
     /// C `swaitRecord.c:304,561` — swait compiles its CALC with the **numeric**
     /// `postfix()`, not `sCalcPostfix()`. Its grammar is therefore epics-base
     /// calc's: no SVAL, no string literals, no sCalc string functions.
@@ -252,9 +274,20 @@ impl SwaitRecord {
         // returns 0 from `special()`, so the put SUCCEEDS and the client reads
         // the verdict back from CLCV (the calcout/scalcout/acalcout disposition,
         // not calcRecord's S_db_badField rejection).
-        let compiled = calc_compile::postfix("swait", "CALC", &self.calc);
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
         self.clcv = compiled.status;
-        self.compiled_calc = compiled.program;
+    }
+
+    /// C `recGblRecordError(S_db_badField, pwait, pmessage)` on a CALC
+    /// `postfix()` refused (swaitRecord.c:305-307, :562-564); swait writes no
+    /// `calcErrorStr` line. Returned, not printed: `special()` runs under the
+    /// put's hold.
+    fn bad_calc_report(&self, pmessage: &'static str) -> Option<PutReport> {
+        (self.clcv != 0).then_some(PutReport::RecordError {
+            status: "Illegal field value",
+            message: pmessage,
+            then: None,
+        })
     }
 
     /// Build the calc inputs. `prev_val` is the cell C passes as `presult`, which
@@ -337,11 +370,9 @@ impl SwaitRecord {
     }
 
     fn num_val_index(name: &str) -> Option<usize> {
-        // Single letter A-L
-        if name.len() == 1 {
-            CHAN.iter().position(|&c| c.to_string() == name)
-        } else {
-            None
+        match name.as_bytes() {
+            [c @ b'A'..=b'L'] => Some(usize::from(c - b'A')),
+            _ => None,
         }
     }
 
@@ -380,12 +411,11 @@ impl SwaitRecord {
         };
         let rec_name = name.clone();
         let handle = handle.clone();
-        let mut links: Vec<String> = self.inp_names.to_vec();
+        let mut links: Vec<PvString> = self.inp_names.to_vec();
         links.push(self.doln.clone());
-        links.push(self.out.as_str().to_owned());
-        let link_gen = self.link_gen.clone();
+        links.push(PvString::from(&*self.out));
         // Stamp this refresh; a later one supersedes it (see `LinkStatusGen`).
-        let token = link_gen.next();
+        let token = self.link_gen.next();
         let sched = handle.clone();
         // Through the database's `iocInit` owner — see `schedule_record_init`.
         // The parking key; `rec_name` itself moves into the future below.
@@ -401,13 +431,12 @@ impl SwaitRecord {
             }
             // `DBE_VALUE` alone, as C posts every `pPvStat`:
             // `swaitRecord.c:527`, `:550`, `:923`.
-            if link_gen.is_current(token) {
-                let _ = handle.post_fields_with_mask(
-                    &rec_name,
-                    fields,
-                    crate::server::recgbl::EventMask::VALUE,
-                );
-            }
+            token.post(
+                &handle,
+                &rec_name,
+                fields,
+                crate::server::recgbl::EventMask::VALUE,
+            );
         });
     }
 }
@@ -434,10 +463,58 @@ const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 /// *precision = 3;` — the one field swait answers with a literal instead of PREC.
 const SWAIT_ODLY_PRECISION: i16 = 3;
 
+/// VAL, then each input beside its LA..LL, in `monitor()`'s post order.
+const SWAIT_MONITORED: [&str; 25] = [
+    "VAL", "A", "LA", "B", "LB", "C", "LC", "D", "LD", "E", "LE", "F", "LF", "G", "LG", "H", "LH",
+    "I", "LI", "J", "LJ", "K", "LK", "L", "LL",
+];
+
+/// `special()`'s CALC posts, then the input pairs `monitor()` marks.
+const SWAIT_POSTS_NAMED: [(&str, crate::server::record::CyclePostMask); 27] = {
+    use crate::server::record::CyclePostMask::{MonitorValue, Value};
+    let mut t = [("", MonitorValue); 27];
+    t[0] = ("CLCV", Value);
+    t[1] = ("CALC", Value);
+    t[2] = ("CLCV", Value);
+    let mut i = 0;
+    while i < 24 {
+        t[3 + i] = (SWAIT_MONITORED[1 + i], MonitorValue);
+        i += 1;
+    }
+    t
+};
+
 impl Record for SwaitRecord {
+    /// What `put_field` stores for `A`..`L`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        match Self::num_val_index(field) {
+            Some(idx) => {
+                self.num_vals[idx] = value;
+                Ok(())
+            }
+            None => self.put_field_internal(field, EpicsValue::Double(value)),
+        }
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::WRITE_POSTED
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
+
     /// C `swaitRecord.c::init_record` (:266-) ends without touching
     /// MLST/ALST; both writes are in `monitor()` (:630,:639).
-    fn seed_deadband_tracking(&mut self) {}
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
 
     /// The same rset shape as `bo`'s `HIGH` and `busy`'s `HIGH`: one named
     /// field answered with a constant. `ODLY` is `DBF_FLOAT`, so it clears
@@ -449,6 +526,10 @@ impl Record for SwaitRecord {
                 precision: Some(SWAIT_ODLY_PRECISION),
                 ..Default::default()
             })
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
     }
 
     fn record_type(&self) -> &'static str {
@@ -479,13 +560,21 @@ impl Record for SwaitRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.recompile();
+            // Not under a put's hold, so it prints at once.
+            if let Some(report) = self.bad_calc_report("swait:init_record: Illegal CALC field") {
+                let name = self
+                    .async_ctx
+                    .as_ref()
+                    .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+                report.emit(&name, "");
+            }
             // C `swaitRecord.c:330`: `pwait->init = TRUE;` — and never cleared.
             self.initialized = true;
         }
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (swaitRecord.c:334-373) searches every PV name and
         // seeds INAV..INLV/DOLV/OUTV. The INxN/DOLN names are swait fields
@@ -496,7 +585,7 @@ impl Record for SwaitRecord {
     }
 
     fn init_links(&mut self, common: &crate::server::record::CommonFields) {
-        self.out.set(&common.out);
+        self.out = common.text.out.as_bytes().into();
         self.refresh_link_status();
     }
 
@@ -511,7 +600,71 @@ impl Record for SwaitRecord {
         if Self::is_pv_name_field(field) {
             self.refresh_link_status();
         }
+        self.calc_post = field == "CALC";
+        if self.calc_post {
+            self.put_report = self.bad_calc_report("swaitRecord:special: Illegal CALC field");
+        }
         Ok(())
+    }
+
+    /// C `special(SPC_CALC)` posts CLCV, CALC, CLCV, each a literal
+    /// `DBE_VALUE` (swaitRecord.c:566-568), and does not process; `monitor()`
+    /// posts each moved input then its LA..LL with `monitor_mask | DBE_VALUE`
+    /// (`:647-654`).
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::CycleMarks;
+        let calc = if std::mem::take(&mut self.calc_post) {
+            0b111
+        } else {
+            0
+        };
+        let mut inputs = 0u64;
+        for i in 0..12 {
+            if self.input_changes & (1 << i) != 0 {
+                inputs |= 0b11 << (2 * i);
+            }
+        }
+        self.input_changes = 0;
+        static SWAIT_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 27] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::SWAIT_FIELDS,
+            SWAIT_POSTS_NAMED,
+        );
+        CycleMarks::of(&SWAIT_POSTS, u128::from(calc | inputs << 3))
+    }
+
+    /// `monitor()` posts VAL and the A..L / LA..LL pairs alone.
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::SWAIT_FIELDS,
+                    SWAIT_MONITORED,
+                )
+            },
+        )
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &SWAIT_MONITORED[1..]
+    }
+
+    /// The deadband classes, with the walk told to take this cycle's input
+    /// marks only when there are any.
+    fn monitor_value_classes(
+        &mut self,
+        gate: crate::server::record::MonitorValueGate,
+        last_posted: &mut [f64; 2],
+    ) -> crate::server::record::MonitorValueClasses {
+        let mut classes = crate::server::record::monitor_deadband_classes(
+            self,
+            gate.array_monitor_post,
+            last_posted,
+        );
+        classes.marked = self.input_changes != 0;
+        classes
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -520,8 +673,8 @@ impl Record for SwaitRecord {
 
         // OUTN lives in the common fields, so a runtime re-point is invisible to
         // `special()`. Catch it here — the same split calcout uses for its OUT.
-        if self.out != common.out {
-            self.out.set(&common.out);
+        if *self.out != *common.text.out.as_bytes() {
+            self.out = common.text.out.as_bytes().into();
             self.refresh_link_status();
         }
 
@@ -675,7 +828,7 @@ impl Record for SwaitRecord {
             // alone. An empty or uncompilable CALC is the empty program and
             // fails here every cycle.
             let mut inputs = self.build_inputs(self.val);
-            let outcome = calc_eval(&self.compiled_calc, &mut inputs);
+            let outcome = calc_eval(&self.rpcl, &mut inputs);
             // C writes the stores through `&pwait->a` as the expression runs, so
             // they stand whether or not a later operator failed the perform.
             self.apply_stores(&inputs);
@@ -701,13 +854,16 @@ impl Record for SwaitRecord {
         // (see `output_link_value`).
         self.oval = self.val;
 
-        // C `swaitRecord.c::monitor` (647-654) advances each previous-input
-        // field to the input it just posted (`*pprev = *pnew`) — so LA..LL is
-        // "the value of input A..L as of the last cycle that posted it", which
-        // for these fields is every cycle the input changed. Assigning
-        // unconditionally is the same state: the C guard only skips the
-        // assignment when the two are already equal.
-        self.prev_vals = self.num_vals;
+        // C `swaitRecord.c::monitor` (647-654): each input that differs from
+        // its LA..LL posts, advances `*pprev = *pnew`, and posts LA..LL.
+        let mut changes = 0;
+        for (i, (new, prev)) in self.num_vals.iter().zip(&mut self.prev_vals).enumerate() {
+            if *new != *prev {
+                *prev = *new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
 
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
         // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
@@ -759,11 +915,13 @@ impl Record for SwaitRecord {
     /// the DOLD it reads is the one the framework just refreshed from the DOL
     /// link (see [`Record::output_time_input_links`]).
     fn output_link_value(&self) -> Option<EpicsValue> {
-        Some(EpicsValue::Double(if self.dopt == 1 {
-            self.dold
-        } else {
-            self.val
-        }))
+        Some(EpicsValue::Double(self.out_value()))
+    }
+
+    /// The same value; swait's OVAL is "Old Value", so the default view over
+    /// OVAL would be wrong.
+    fn output_view(&self) -> Option<OutView<'_>> {
+        Some(OutView::Num(CycleValue::Double(self.out_value())))
     }
 
     /// DOL is read at OUTPUT time, and only under DOPT="Use DOL" — C
@@ -786,14 +944,8 @@ impl Record for SwaitRecord {
         }
     }
 
-    /// C posts CLCV explicitly from `special()` (`db_post_events(pwait,
-    /// &pwait->clcv, DBE_VALUE)`, swaitRecord.c:566) — CLCV is not `pp(TRUE)`,
-    /// so nothing else would post it. Same shape as scalcout/acalcout.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            _ => &[],
-        }
+    fn declares_output_time_input_links(&self) -> bool {
+        true
     }
 
     /// C `execOutput` posts the refreshed DOLD with `DBE_VALUE` alone
@@ -803,32 +955,6 @@ impl Record for SwaitRecord {
         &["DOLD", "CLCV"]
     }
 
-    /// C `swaitRecord.c::monitor` (647-654) posts a changed input A..L with
-    /// `monitor_mask | DBE_VALUE` — no forced `DBE_LOG`:
-    ///
-    /// ```c
-    /// for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {
-    ///     if (*pnew != *pprev) {
-    ///         db_post_events(pwait, pnew, monitor_mask|DBE_VALUE);
-    ///         ...
-    /// ```
-    ///
-    /// so an archiver subscribed `DBE_LOG` to `swait.A` is sent a value only on
-    /// a cycle where VAL's own ADEL deadband crossed (which puts `DBE_LOG` into
-    /// `monitor_mask`), not on every change. `calcRecord.c:420` writes
-    /// `monitor_mask | DBE_VALUE | DBE_LOG` in the same loop and keeps the
-    /// framework default.
-    ///
-    /// LA..LL ride the same post: C advances `*pprev = *pnew` between the two
-    /// `db_post_events` calls, so the previous-value field is published with the
-    /// same mask as the input that moved it.
-    fn fields_posted_with_monitor_mask(&self) -> &'static [&'static str] {
-        &[
-            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "LA", "LB", "LC", "LD",
-            "LE", "LF", "LG", "LH", "LI", "LJ", "LK", "LL",
-        ]
-    }
-
     /// `OEVT` ("Output Event"): post the numeric output event when output
     /// fires. C `swaitRecord.c` `execOutput` runs `if (pwait->oevt > 0)
     /// post_event((int)pwait->oevt);` (swaitRecord.c:797) right after the OUT
@@ -836,9 +962,9 @@ impl Record for SwaitRecord {
     /// (`cached_should_output`). swait has no IVOA field, so — like its C —
     /// the post is never IVOA-suppressed. Stringified so the numeric event
     /// matches a `SCAN="Event"` record's `EVNT`.
-    fn output_event(&self) -> Option<String> {
+    fn output_event(&self) -> Option<crate::types::PvString> {
         if self.cached_should_output && self.oevt > 0 {
-            Some(self.oevt.to_string())
+            Some(self.oevt.to_string().into())
         } else {
             None
         }
@@ -851,12 +977,49 @@ impl Record for SwaitRecord {
     /// C reads `pwait->inan..inln` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 12 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
+        match link_field {
+            "SIML" => return Some(self.siml.as_bytes()),
+            "SIOL" => return Some(self.siol.as_bytes()),
+            _ => {}
+        }
         let [b'I', b'N', slot, b'N'] = *link_field.as_bytes() else {
             return None;
         };
         let slot = usize::from(slot.checked_sub(b'A')?);
-        self.inp_names.get(slot).map(String::as_str)
+        self.inp_names.get(slot).map(PvString::as_bytes)
+    }
+
+    // C `swaitRecord.dbd` declares SIML/SIMM/SIOL/SIMS and no SDLY, so the
+    // simulation is always synchronous: the -1.0 `check_simulation_mode`
+    // takes for an undeclared SDLY.
+    fn simm_cells(&self) -> Option<crate::server::record::SimmCells> {
+        Some(crate::server::record::SimmCells {
+            simm: self.simm,
+            sims: self.sims,
+            sdly: -1.0,
+        })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -877,7 +1040,7 @@ impl Record for SwaitRecord {
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "ODLY" => Some(EpicsValue::Float(self.odly)),
-            // OUTN is aliased to common.out via RecordInstance; not stored locally.
+            // OUTN is aliased to common.text.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
@@ -937,7 +1100,7 @@ impl Record for SwaitRecord {
             }
             "DOLN" => {
                 if let EpicsValue::String(s) = value {
-                    self.doln = s.as_str_lossy().into_owned();
+                    self.doln = s;
                 } else {
                     return Err(CaError::TypeMismatch("DOLN".into()));
                 }
@@ -960,13 +1123,13 @@ impl Record for SwaitRecord {
                         .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?,
                 );
             }
-            // OUTN falls through to put_common_field which mirrors to common.out.
+            // OUTN falls through to put_common_field which mirrors to common.text.out.
             "SIML" => match value {
-                EpicsValue::String(s) => self.siml = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siml = s,
                 _ => return Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
-                EpicsValue::String(s) => self.siol = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.siol = s,
                 _ => return Err(CaError::TypeMismatch("SIOL".into())),
             },
             "SIMM" => {
@@ -1030,7 +1193,7 @@ impl Record for SwaitRecord {
                         as i16;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_names[idx] = s.as_str_lossy().into_owned();
+                        self.inp_names[idx] = s;
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }

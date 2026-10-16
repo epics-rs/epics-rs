@@ -88,7 +88,7 @@ _epics-ca._tcp                  PTR    motor-ioc._epics-ca._tcp
                                 PTR    bpm-ioc._epics-ca._tcp
                                 PTR    vacuum-ioc._epics-ca._tcp
 
-; Per-instance SRV (host:port) + TXT (metadata)
+; Per-instance SRV (host:UDP search port) + TXT (metadata)
 motor-ioc._epics-ca._tcp        SRV    0 0 5064 motor-host
                                 TXT    "version=4.13" "asg=BEAM"
 bpm-ioc._epics-ca._tcp          SRV    0 0 5064 bpm-host

@@ -81,6 +81,7 @@ pub mod decode;
 pub mod error;
 pub mod format;
 pub(crate) mod leaf_convert;
+pub(crate) mod liveness_clock;
 pub mod log;
 pub mod nt;
 pub mod peer_buf;
@@ -90,6 +91,8 @@ pub mod pvdata;
 pub mod server;
 pub mod server_native;
 pub mod service;
+#[cfg(all(not(epics_embedded_target), any(unix, windows)))]
+pub(crate) mod udp_rx;
 pub mod util;
 
 pub use error::{PvaError, PvaResult};

@@ -52,10 +52,11 @@ impl NTURI {
                     "query".into(),
                     FieldDesc::Structure {
                         struct_id: String::new(),
-                        fields: query_fields,
+                        fields: query_fields.into(),
                     },
                 ),
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -188,11 +189,12 @@ mod tests {
             fields: vec![
                 ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
                 ("b".into(), FieldDesc::Scalar(ScalarType::String)),
-            ],
+            ]
+            .into(),
         };
         let sarr = FieldDesc::StructureArray {
             struct_id: String::new(),
-            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))],
+            fields: vec![("x".into(), FieldDesc::Scalar(ScalarType::Double))].into(),
         };
         let uri = NTURI::new()
             .arg("nested", nested)

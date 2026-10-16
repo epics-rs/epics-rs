@@ -126,7 +126,7 @@ On reconnection (`TransportEvent::ChannelCreated`):
 1. Update sid, native_type, element_count, server_addr,
    access_rights, last_connected_at
 2. Wake all `connect_waiters`
-3. Broadcast `Connected` + `AccessRightsChanged`
+3. Broadcast `AccessRightsChanged` + `Connected`
 4. `subscriptions.restore_for_channel(cid, sid, ...)` re-issues
    EVENT_ADD for every subscription whose receiver is still alive,
    purges the rest as stale

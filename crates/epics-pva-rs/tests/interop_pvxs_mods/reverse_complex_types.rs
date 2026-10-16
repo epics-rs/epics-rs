@@ -20,8 +20,6 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
-use super::interop_helpers::pvxs_lib_dir;
-
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 /// Normalise a PvField scalar-array to `Vec<ScalarValue>` regardless
@@ -35,7 +33,6 @@ fn array_to_vec(v: &PvField) -> Option<Vec<ScalarValue>> {
     }
 }
 
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Walk into a struct value and pull the `value` leaf (or return
@@ -58,54 +55,12 @@ fn extract_value(decoded: &PvField, path: &str) -> Option<PvField> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    // Bind a port for the pvxs server.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("reverse_ready");
 
-    let mut cmd = Command::new(&helper);
-    cmd.arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .env(
-            if cfg!(target_os = "macos") {
-                "DYLD_LIBRARY_PATH"
-            } else {
-                "LD_LIBRARY_PATH"
-            },
-            pvxs_lib_dir(),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-
-    // Wait for the readiness file (≤ 5s).
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server did not become ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &[]);
 
     // Drive a Rust client at the pvxs server via TCP-search-only
     // path so we don't depend on EPICS_PVA_BROADCAST_PORT (which
@@ -237,8 +192,7 @@ async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
     }
 
     // Tear down pvxs server.
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     assert!(
         failures.is_empty(),

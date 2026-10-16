@@ -19,19 +19,21 @@
 //! ...and the IOC *keeps running* and *serves values*. That is precisely the
 //! silent-wrong-answer this harness exists to not produce. Hence:
 //!
-//! - **Rust side:** true bind-`:0`-and-read-back.
-//!   `CaServer::from_parts(db, 0, ..)` — the four trailing arguments are the
+//! - **Rust side:** a claimed port ([`claim_port`]) passed to `oracle-ioc
+//!   --port`, bound and read back.
+//!   `CaServer::from_parts(db, port, ..)` — the four trailing arguments are the
 //!   ACF cell and the optional TLS and cap-token seams — binds the sockets and
-//!   reports the port it actually got, so no number is ever guessed and
-//!   nothing can take it in between. Named with its real arity because the
+//!   reports the port it actually got, which must be the claimed one, and the
+//!   claim is held for the IOC's life. Named with its real arity because the
 //!   `bin/oracle_ioc.rs` call is what a reader copies; and named in a code
 //!   span rather than linked because the constructor is `tokio_backend`-only,
 //!   so on the reactor-free backend this paragraph still renders while the
 //!   item it names is not there to link to.
 //! - **C side:** `softIoc` takes its port from the environment and cannot
 //!   inherit a pre-bound fd, so bind-read-back is *not available*. The honest
-//!   substitute is allocate-then-**verify**: [`alloc_free_port`] binds `:0` on
-//!   UDP *and* TCP to find a number free on both, then [`CIoc::boot`] scans the
+//!   substitute is claim-then-**verify**: [`claim_port`] reserves a number from
+//!   a range the kernel never hands to `bind(0)`, free on UDP *and* TCP, then
+//!   [`CIoc::boot`] scans the
 //!   IOC's own startup output and treats any bind complaint as a boot failure
 //!   to be retried on a fresh port. The residual TOCTOU window is closed by
 //!   verification after the fact, not by hoping.
@@ -188,39 +190,122 @@ fn err_retryable_neither<T>(msg: impl Into<String>) -> Result<T, BootError> {
     Err(BootError::retryable_neither(msg))
 }
 
-/// Find a port number that is free on **both** UDP and TCP, by binding it.
+/// The ports oracle processes are given. Below Linux's default
+/// `ip_local_port_range` (32768-60999) and the 49152+ ranges of macOS and
+/// Windows, so the kernel's ephemeral allocator -- which every other test,
+/// client and server on the host draws from -- can never hand one out.
+const ORACLE_PORTS: std::ops::RangeInclusive<u16> = 20000..=29999;
+
+/// A port number reserved for one oracle process (or one client's beacon),
+/// for as long as this value lives.
 ///
-/// A CA server needs the same number on both protocols, so checking only one
-/// would let the other collide. We bind UDP `:0` to have the kernel hand us a
-/// number it believes is free, then bind the same number on TCP to prove it.
-/// If TCP is taken we discard the number and ask the kernel for another —
-/// which is *not* a probe-then-rebind of a port we intend to use, it is
-/// rejecting a candidate before anyone commits to it.
+/// The reservation is an exclusive `flock` on a per-port file in a directory
+/// shared by every process of every user on the host, so two oracle runs --
+/// two nextest processes, two panels -- cannot be given the same number. The
+/// lock dies with the process, so a crash leaks nothing. Nothing is bound: the
+/// holder of the claim is the only party that is *told* the number, and the
+/// only one allowed to start something on it.
+#[derive(Debug)]
+pub struct PortClaim {
+    port: u16,
+    _lock: std::fs::File,
+}
+
+impl PortClaim {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// Where the claim files live: one directory for the whole host.
+fn claim_dir() -> PathBuf {
+    std::env::var_os("EPICS_ORACLE_PORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("epics-oracle-ports"))
+}
+
+/// Refuse a host whose ephemeral range overlaps `ORACLE_PORTS`: the premise
+/// of the allocator would be false there, and saying so beats a collision.
+#[cfg(target_os = "linux")]
+fn ephemeral_range_clear_of_oracle_ports() -> Result<(), BootError> {
+    let Ok(text) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") else {
+        return Ok(());
+    };
+    let mut nums = text
+        .split_whitespace()
+        .filter_map(|n| n.parse::<u16>().ok());
+    let (Some(lo), Some(hi)) = (nums.next(), nums.next()) else {
+        return Ok(());
+    };
+    if lo <= *ORACLE_PORTS.end() && hi >= *ORACLE_PORTS.start() {
+        return err_neither(format!(
+            "this host's ip_local_port_range {lo}-{hi} overlaps the oracle ports {}-{}; \
+             the kernel could hand a claimed port to any other socket",
+            ORACLE_PORTS.start(),
+            ORACLE_PORTS.end()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ephemeral_range_clear_of_oracle_ports() -> Result<(), BootError> {
+    Ok(())
+}
+
+/// Claim a port number from `ORACLE_PORTS` that is free on **both** UDP and
+/// TCP, and keep it claimed until the returned value is dropped.
 ///
-/// Both sockets are dropped on return, because `softIoc` cannot inherit them.
-/// The window this opens is what [`CIoc::boot`]'s output verification exists
-/// to close.
-pub fn alloc_free_port() -> Result<u16, BootError> {
-    for _ in 0..64 {
-        let Ok(udp) = UdpSocket::bind(("127.0.0.1", 0)) else {
+/// **The single owner of "who may start something on this port".** The number
+/// used to come from `bind(0)`, which draws on the kernel's ephemeral pool, and
+/// was released before the child bound it. Anything else on the host drawing
+/// from that pool could be handed the same number, and a `SO_REUSEPORT`
+/// squatter on it halves a pvxs client's unicast pings without any error. Now
+/// the number comes from a range the kernel never allocates, and other oracle
+/// processes are kept off it by the claim. A foreign process that binds it
+/// deliberately is still possible, and still caught by [`CIoc::boot`]'s output
+/// verification and `verify_sole_server`.
+///
+/// A candidate that is claimed elsewhere, or that something already holds on
+/// either protocol, is skipped.
+pub fn claim_port() -> Result<PortClaim, BootError> {
+    ephemeral_range_clear_of_oracle_ports()?;
+    let dir = claim_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| BootError::neither(format!("create {}: {e}", dir.display())))?;
+    let span = u32::from(*ORACLE_PORTS.end() - *ORACLE_PORTS.start()) + 1;
+    // Start somewhere process-specific so concurrent runs do not all scan from
+    // the bottom of the range and queue behind one another's claims.
+    let start = (std::process::id().wrapping_mul(2_654_435_761)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos()))
+        % span;
+    for i in 0..span {
+        let port = *ORACLE_PORTS.start() + ((start + i) % span) as u16;
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{port}.lock")))
+        else {
+            // A file another user owns is another user's claim.
             continue;
         };
-        let Ok(addr) = udp.local_addr() else {
+        if lock.try_lock().is_err() {
             continue;
-        };
-        let port = addr.port();
-        // Prove the same number is free on TCP too; if not, this candidate is
-        // unusable and we never tell anyone about it.
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(tcp) => {
-                drop(tcp);
-                drop(udp);
-                return Ok(port);
-            }
-            Err(_) => continue,
+        }
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && TcpListener::bind(("127.0.0.1", port)).is_ok()
+        {
+            return Ok(PortClaim { port, _lock: lock });
         }
     }
-    err_neither("could not find a port free on both UDP and TCP after 64 tries")
+    err_neither(format!(
+        "no port in {}-{} is both unclaimed and free on UDP and TCP",
+        ORACLE_PORTS.start(),
+        ORACLE_PORTS.end()
+    ))
 }
 
 /// Tell a `softIoc`-family binary to serve `db`, by whichever route that `db`
@@ -287,7 +372,12 @@ fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
 /// are four different faults behind one message, and keeping twelve lines
 /// tells them apart for free.
 #[derive(Clone, Default)]
-pub struct OutputTail(Arc<Mutex<VecDeque<String>>>);
+pub struct OutputTail {
+    kept: Arc<Mutex<VecDeque<String>>>,
+    /// Every line, for the one caller that must search more than the last
+    /// twelve; `None` keeps the tail bounded.
+    all: Option<Arc<Mutex<Vec<String>>>>,
+}
 
 impl OutputTail {
     /// Enough to hold an IOC's startup banner and the line that went wrong,
@@ -298,19 +388,49 @@ impl OutputTail {
         Self::default()
     }
 
+    /// A tail that also records every line, readable through
+    /// [`Self::all_lines`]. Unbounded: for a short-lived test IOC only.
+    pub fn keeping_everything() -> Self {
+        Self {
+            kept: Arc::default(),
+            all: Some(Arc::default()),
+        }
+    }
+
     fn push(&self, line: &str) {
-        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let line = line.trim_end().to_string();
+        if let Some(all) = &self.all {
+            all.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line.clone());
+        }
+        let mut q = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if q.len() == Self::KEEP {
             q.pop_front();
         }
-        q.push_back(line.trim_end().to_string());
+        q.push_back(line);
+    }
+
+    /// Every line since the process started, oldest first; the kept ones
+    /// only when this tail was not made with [`Self::keeping_everything`].
+    pub fn all_lines(&self) -> Vec<String> {
+        match &self.all {
+            Some(all) => all.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            None => self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
+        }
     }
 
     /// The kept lines, oldest first. Silence is a finding in its own right —
     /// an IOC that printed nothing at all did not merely boot slowly — so it
     /// is reported as such rather than as an empty string.
     pub fn text(&self) -> String {
-        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let q = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if q.is_empty() {
             "(the IOC printed nothing)".to_string()
         } else {
@@ -329,6 +449,9 @@ pub trait Ioc {
     /// What this IOC last said about itself. Quoted by whoever declares it
     /// unreachable, so the failure names a cause instead of a budget.
     fn recent_output(&self) -> String;
+    /// The process that owns this IOC's sockets, for the kernel-table proof
+    /// of who holds its port (`foreign_udp_holders`).
+    fn pid(&self) -> u32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -438,122 +561,396 @@ pub struct CIoc {
     port: u16,
     child: Child,
     tail: OutputTail,
+    _claim: PortClaim,
 }
 
 impl CIoc {
     pub fn boot(tools: &CTools, db: &Path) -> Result<Self, BootError> {
-        let mut why = Vec::new();
-        for n in 1..=BOOT_ATTEMPTS {
-            let port = alloc_free_port()?;
-            match Self::try_boot(tools, db, port) {
-                Ok(ioc) => return Ok(ioc),
-                Err(e) if e.retryable => {
-                    // Racy by nature: someone took the port between our probe
-                    // and softIoc's bind. Discard this port entirely and get a
-                    // new one — never re-use or re-probe the losing number.
-                    why.push(format!("attempt {n} on port {port}: {}", e.message));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        err(
-            Side::C,
-            format!(
-                "C softIoc could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
-                why.join("; ")
-            ),
-        )
+        let BootedProcess {
+            child,
+            port,
+            tail,
+            claim,
+        } = boot_on_free_port(&BootNames::C_SOFTIOC, LogPolicy::Tail, |port| {
+            let mut cmd = Command::new(&tools.ioc_bin);
+            cmd.arg("-S"); // no interactive shell
+            load_db_into(&mut cmd, db)?;
+            cmd.env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+                .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
+                .env("EPICS_CA_SERVER_PORT", port.to_string())
+                .env("EPICS_CAS_SERVER_PORT", port.to_string())
+                .stdin(Stdio::null());
+            Ok(cmd)
+        })?;
+        Ok(Self {
+            port,
+            child,
+            tail,
+            _claim: claim,
+        })
     }
+}
 
-    fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
-        let mut cmd = Command::new(&tools.ioc_bin);
-        cmd.arg("-S"); // no interactive shell
-        load_db_into(&mut cmd, db)?;
-        let mut child = cmd
-            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CA_SERVER_PORT", port.to_string())
-            .env("EPICS_CAS_SERVER_PORT", port.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| BootError::new(Side::C, format!("spawn softIoc: {e}")))?;
+/// How [`boot_on_free_port`] words its messages for one kind of process.
+/// The texts are part of what callers and the classifier match on, so each
+/// boot keeps its own wording byte for byte.
+#[derive(Clone, Copy)]
+pub struct BootNames<'a> {
+    /// The process as the timeout, death and exhaustion messages name it.
+    what: &'a str,
+    /// The name in `spawn {spawn}: {error}`.
+    spawn: &'a str,
+    /// The port kind in `on {label} {port}`.
+    label: &'a str,
+    /// What precedes the port number in `PORT_COLLISION on …`; empty for
+    /// the C softIoc, whose collision text has always been unlabelled.
+    collision_label: &'a str,
+    /// The child is told to listen on TCP `port`, so a ready child that does
+    /// not is a collision whatever its log said. Linux only (`/proc`).
+    tcp_on_port: bool,
+}
 
-        // softIoc announces readiness with "iocRun: All initialization
-        // complete". It announces a *port collision* with a `cas WARNING`
-        // about the TCP port being unavailable -- and then keeps running and
-        // serving, which is the silent-wrong-answer we must never accept. So
-        // we watch both streams and let the collision win over the ready line.
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let (tx, rx) = mpsc::channel::<BootSignal>();
-        let tail = OutputTail::new();
-        spawn_watcher(stdout, tx.clone(), tail.clone());
-        spawn_watcher(stderr, tx, tail.clone());
+impl BootNames<'static> {
+    /// `CIoc::boot`'s wording.
+    const C_SOFTIOC: Self = Self {
+        what: "C softIoc",
+        spawn: "softIoc",
+        label: "port",
+        collision_label: "",
+        tcp_on_port: false,
+    };
+    /// `PvxIoc::boot`'s wording.
+    const SOFTIOC_PVX: Self = Self {
+        what: "softIocPVX",
+        spawn: "softIocPVX",
+        label: "UDP",
+        collision_label: "UDP ",
+        tcp_on_port: true,
+    };
+}
 
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let mut ready = false;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                let _ = child.kill();
-                return err(
-                    Side::C,
-                    format!(
-                        "C softIoc did not report ready within {BOOT_TIMEOUT:?} on port {port}; \
-                         it said: {}",
-                        tail.text()
-                    ),
-                );
-            }
-            match rx.recv_timeout(left) {
-                Ok(BootSignal::PortCollision(line)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(Side::C, format!("PORT_COLLISION on {port}: {line}"));
-                }
-                // `rsrv` lost the CA port on the UDP bind, which base does not
-                // report (`caservertask.c:131-146` returns silently on
-                // EADDRINUSE) and then turns fatal at `cantProceed("CAS: No
-                // TCP server started")`. A different port is exactly the
-                // remedy, so it retries rather than waiting out the timeout.
-                Ok(BootSignal::Died(said)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(
-                        Side::C,
-                        format!(
-                            "C softIoc declared itself unable to proceed on port {port}; \
-                                 it said: {said}"
-                        ),
-                    );
-                }
-                Ok(BootSignal::Ready) => {
-                    ready = true;
-                    break;
-                }
-                Ok(BootSignal::Other) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                // Both streams closed without a ready line: the IOC died.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+impl<'a> BootNames<'a> {
+    /// A process named `what` on a `label` port, spelt the same everywhere.
+    pub fn new(what: &'a str, label: &'a str) -> Self {
+        Self {
+            what,
+            spawn: what,
+            label,
+            collision_label: label,
+            tcp_on_port: false,
         }
-        if !ready {
-            let status = child.try_wait().ok().flatten();
+    }
+}
+
+/// How much of the child's output [`boot_on_free_port`] keeps for the
+/// caller; what the boot does with the output does not depend on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogPolicy {
+    /// The last twelve lines: enough for a banner and the
+    /// line that went wrong, bounded for a chatty IOC.
+    Tail,
+    /// Every line, readable from [`OutputTail::all_lines`]. Unbounded: for a
+    /// short-lived test IOC only.
+    All,
+}
+
+/// A C IOC process that reported itself up on `port`: the child is the
+/// caller's to kill by its own pid, and `tail` goes on filling.
+pub struct BootedProcess {
+    pub child: Child,
+    pub port: u16,
+    pub tail: OutputTail,
+    /// Keeps `port` reserved for as long as the process lives; the owner must
+    /// outlive the child, which `Drop` on the IOC types guarantees by killing
+    /// the child before their fields drop.
+    pub claim: PortClaim,
+}
+
+/// The one owner of "start a C IOC on a port nothing else holds".
+///
+/// `softIoc` cannot inherit a bound fd, so the port number is allocated,
+/// released, and bound again by the child; anyone can take it in between.
+/// When that happens the IOC either prints a bind complaint or `rsrv_init`
+/// ends at `cantProceed("CAS: No TCP server started")` — both are
+/// `BootSignal::PortCollision`. This function kills that child by its own
+/// pid, takes a fresh port, and starts again, `BOOT_ATTEMPTS` times; a
+/// caller never sees a lost port. Any other failure is returned at once.
+///
+/// `command` builds the process for a port (environment, arguments, stdin);
+/// the two output streams are piped here, because the watch needs them.
+/// `names` only words the messages; `log` says how much output the returned
+/// [`OutputTail`] keeps.
+pub fn boot_on_free_port(
+    names: &BootNames,
+    log: LogPolicy,
+    command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    boot_on_free_port_claiming(names, log, |_| Ok(()), command)
+}
+
+/// [`boot_on_free_port`] for a caller that needs the same number for a
+/// resource of its own — a proxy listener, say. `claim` runs with each
+/// candidate port before the IOC is spawned. A [`BootError::retryable`] error
+/// is a lost port like any other and the attempt moves to the next one; any
+/// other error is returned at once, as `command`'s are. Whatever `claim`
+/// bound is therefore bound before the IOC could be started on the number,
+/// and the number the returned process got is the number `claim` last
+/// succeeded on.
+pub fn boot_on_free_port_claiming(
+    names: &BootNames,
+    log: LogPolicy,
+    claim: impl FnMut(u16) -> Result<(), BootError>,
+    command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    boot_within(names, log, BOOT_TIMEOUT, claim, command)
+}
+
+/// The boot loop, with the time each attempt has to report ready.
+fn boot_within(
+    names: &BootNames,
+    log: LogPolicy,
+    timeout: Duration,
+    mut claim: impl FnMut(u16) -> Result<(), BootError>,
+    mut command: impl FnMut(u16) -> Result<Command, BootError>,
+) -> Result<BootedProcess, BootError> {
+    let BootNames { what, label, .. } = *names;
+    let mut why = Vec::new();
+    for n in 1..=BOOT_ATTEMPTS {
+        let held = claim_port()?;
+        let port = held.port();
+        match claim(port) {
+            Ok(()) => {}
+            Err(e) if e.retryable => {
+                why.push(format!("attempt {n} on {label} {port}: {}", e.message));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        let mut cmd = command(port)?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        match watch_boot(names, log, timeout, held, &mut cmd) {
+            Ok(booted) => return Ok(booted),
+            Err(e) if e.retryable => {
+                // Someone took the port between our probe and the child's
+                // bind. Discard it entirely; never re-use the losing number.
+                why.push(format!("attempt {n} on {label} {port}: {}", e.message));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    err(
+        Side::C,
+        format!(
+            "{what} could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
+            why.join("; ")
+        ),
+    )
+}
+
+/// Spawn `cmd` and wait for its ready line, a collision, or its death.
+fn watch_boot(
+    names: &BootNames,
+    log: LogPolicy,
+    timeout: Duration,
+    claim: PortClaim,
+    cmd: &mut Command,
+) -> Result<BootedProcess, BootError> {
+    let port = claim.port();
+    let BootNames {
+        what,
+        spawn,
+        label,
+        collision_label,
+        tcp_on_port,
+    } = *names;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BootError::new(Side::C, format!("spawn {spawn}: {e}")))?;
+
+    // The IOC announces readiness with "iocRun: All initialization
+    // complete". It announces a *port collision* with a `cas WARNING` about
+    // the TCP port being unavailable -- and then keeps running and serving,
+    // which is the silent-wrong-answer we must never accept. So we watch both
+    // streams and let the collision win over the ready line.
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let (tx, rx) = mpsc::channel::<BootSignal>();
+    let tail = match log {
+        LogPolicy::All => OutputTail::keeping_everything(),
+        LogPolicy::Tail => OutputTail::new(),
+    };
+    spawn_watcher(stdout, tx.clone(), tail.clone());
+    spawn_watcher(stderr, tx, tail.clone());
+
+    let deadline = Instant::now() + timeout;
+    let mut ready = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             let _ = child.kill();
+            let _ = child.wait();
             return err(
                 Side::C,
                 format!(
-                    "C softIoc exited during boot (status {status:?}) — db rejected? \
+                    "{what} did not report ready within {timeout:?} on {label} {port}; \
                      it said: {}",
                     tail.text()
                 ),
             );
         }
-        Ok(Self { port, child, tail })
+        match rx.recv_timeout(left) {
+            Ok(BootSignal::PortCollision(line)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return err_retryable(
+                    Side::C,
+                    format!("PORT_COLLISION on {collision_label}{port}: {line}"),
+                );
+            }
+            Ok(BootSignal::Died(said)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return err(
+                    Side::C,
+                    format!(
+                        "{what} declared itself unable to proceed on {label} {port}; \
+                         it said: {said}"
+                    ),
+                );
+            }
+            Ok(BootSignal::Ready) => {
+                ready = true;
+                break;
+            }
+            Ok(BootSignal::Other) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // Both streams closed without a ready line: the IOC died.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
+    if !ready {
+        let status = child.try_wait().ok().flatten();
+        let _ = child.kill();
+        let _ = child.wait();
+        return err(
+            Side::C,
+            format!(
+                "{what} exited during boot (status {status:?}) — db rejected? \
+                 it said: {}",
+                tail.text()
+            ),
+        );
+    }
+    // pvxs's fallback warning is a log line, and `PVXS_LOG=*=ERR` in the
+    // inherited environment removes it while the IOC still reports ready. The
+    // kernel's table is the witness that does not depend on logging.
+    if tcp_on_port && listens_on_tcp(child.id(), port) == Some(false) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return err_retryable(
+            Side::C,
+            format!(
+                "PORT_COLLISION on {collision_label}{port}: {what} is ready but not listening \
+                 on TCP {port}; it said: {}",
+                tail.text()
+            ),
+        );
+    }
+    Ok(BootedProcess {
+        child,
+        port,
+        tail,
+        claim,
+    })
+}
+
+/// Is process `pid` listening on TCP `port`? `None` where `/proc` or
+/// sock_diag cannot say. The listeners come from one sock_diag dump of the
+/// port: a `/proc/net/tcp` read skips rows under churn, and a skipped LISTEN
+/// row reads a healthy IOC as a collision.
+#[cfg(target_os = "linux")]
+fn listens_on_tcp(pid: u32, port: u16) -> Option<bool> {
+    let inodes: std::collections::HashSet<String> = named_port::port_holders::tcp_listeners(port)
+        .ok()?
+        .iter()
+        .map(|h| h.fd_link())
+        .collect();
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(fds.filter_map(Result::ok).any(|fd| {
+        std::fs::read_link(fd.path())
+            .is_ok_and(|l| inodes.contains(&l.to_string_lossy().into_owned()))
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listens_on_tcp(_pid: u32, _port: u16) -> Option<bool> {
+    None
+}
+
+/// Sockets bound to UDP `port` that process `pid` does not own, each named by
+/// its owner. Empty: `pid` holds every socket on the port. `None` where `/proc`
+/// cannot say.
+///
+/// A `SO_REUSEPORT` squatter binds beside the IOC without error and takes a
+/// share of the unicast pings, so the IOC looks healthy while `pvxlist` finds
+/// nothing. The kernel's table separates that from an IOC that holds the port
+/// and does not answer, which no retry on a fresh port can cure.
+#[cfg(target_os = "linux")]
+fn foreign_udp_holders(pid: u32, port: u16) -> Option<Vec<String>> {
+    // One sock_diag snapshot of the port: `/proc/net/udp` repeats and skips
+    // rows while other processes open and close sockets.
+    let on_port: Vec<String> = named_port::port_holders::udp_holders(port)
+        .ok()?
+        .iter()
+        .map(|h| h.fd_link())
+        .collect();
+    let owned_by = |pid: &str| -> Option<Vec<String>> {
+        Some(
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .ok()?
+                .filter_map(Result::ok)
+                .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+                .map(|l| l.to_string_lossy().into_owned())
+                .collect(),
+        )
+    };
+    let mine = owned_by(&pid.to_string())?;
+    let foreign: Vec<String> = on_port.into_iter().filter(|i| !mine.contains(i)).collect();
+    if foreign.is_empty() {
+        return Some(Vec::new());
+    }
+    let procs: Vec<(String, Vec<String>)> = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let p = e.file_name().to_string_lossy().into_owned();
+            p.bytes().all(|b| b.is_ascii_digit()).then(|| {
+                let fds = owned_by(&p)?;
+                Some((p, fds))
+            })?
+        })
+        .collect();
+    let mut named: Vec<String> = foreign
+        .into_iter()
+        .map(
+            |inode| match procs.iter().find(|(_, fds)| fds.contains(&inode)) {
+                Some((p, _)) => {
+                    let comm =
+                        std::fs::read_to_string(format!("/proc/{p}/comm")).unwrap_or_default();
+                    format!("pid {p} ({})", comm.trim())
+                }
+                None => format!("an owner /proc would not show ({inode})"),
+            },
+        )
+        .collect();
+    named.sort();
+    named.dedup();
+    Some(named)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn foreign_udp_holders(_pid: u32, _port: u16) -> Option<Vec<String>> {
+    None
 }
 
 enum BootSignal {
@@ -582,10 +979,23 @@ fn spawn_watcher(
             // Order matters: a collision line must not be mistaken for noise,
             // and it can appear *before* the ready line.
             let sig = if line.contains("can't proceed, suspending") {
-                BootSignal::Died(tail.text())
+                // rsrv lost the CA port on its UDP bind, which it does not
+                // report (`caservertask.c:131-146`), and gave up at :752.
+                if tail.text().contains("CAS: No TCP server started") {
+                    BootSignal::PortCollision(tail.text())
+                } else {
+                    BootSignal::Died(tail.text())
+                }
             } else if line.contains("Configured TCP port was unavailable")
                 || line.contains("two or more servers share the same UDP port")
-                || line.contains("Unable to bind")
+                // pvalink's client context (`client.cpp:581/594`), and the
+                // server's search port (`udp_collector.cpp:151`) as the pvxs
+                // registrar reports it (`iochooks.cpp:509`).
+                || line.contains("Unable to bind random UDP")
+                // pvxs's TCP listener lost its named port and moved
+                // (`serverconn.cpp:463`).
+                || line.contains("Server unable to bind port")
+                || line.contains("Error in pvxsBaseRegistrar : Address already in use")
             {
                 BootSignal::PortCollision(line.trim().to_string())
             } else if line.contains("iocRun: All initialization complete")
@@ -609,6 +1019,9 @@ fn spawn_watcher(
 }
 
 impl Ioc for CIoc {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
     fn port(&self) -> u16 {
         self.port
     }
@@ -660,11 +1073,13 @@ impl RustMode {
 /// Runs as a subprocess rather than in-process so that both sides of the pair
 /// are driven through the *identical* external instrument (the C CA tools) and
 /// neither gets a privileged in-process path the other lacks. It binds CA on
-/// `:0` and prints the port it was actually given, so no number is guessed.
+/// the claimed port and prints the port it was actually given.
 pub struct RustIoc {
     port: u16,
     child: Child,
     tail: OutputTail,
+    /// The number `oracle-ioc` was told to serve on; dropped after the child.
+    _claim: PortClaim,
 }
 
 impl RustIoc {
@@ -703,16 +1118,40 @@ impl RustIoc {
 
     /// Boot the **PVA** side, reporting the bound UDP search port.
     ///
-    /// Same binary, same `.db`, same bind-and-read-back discipline — only the
+    /// Same binary, same `.db`, same claimed-port discipline — only the
     /// protocol and the port line differ (see `RustMode`).
     pub fn boot_pva(db: &Path) -> Result<Self, BootError> {
         Self::boot_mode(db, RustMode::Pva)
     }
 
+    /// Serve on a claimed port ([`claim_port`]), never on `bind(0)`: a number
+    /// taken from the kernel's ephemeral pool can be handed to any other socket
+    /// that asks for the same one with `SO_REUSEPORT`. A claim whose port turns
+    /// out to be taken is replaced, like the C side's.
     fn boot_mode(db: &Path, mode: RustMode) -> Result<Self, BootError> {
+        let mut why = Vec::new();
+        for n in 1..=BOOT_ATTEMPTS {
+            match Self::boot_on(db, mode, claim_port()?) {
+                Err(e) if e.retryable => why.push(format!("attempt {n}: {}", e.message)),
+                done => return done,
+            }
+        }
+        err(
+            Side::Rust,
+            format!(
+                "Rust IOC could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
+                why.join("; ")
+            ),
+        )
+    }
+
+    fn boot_on(db: &Path, mode: RustMode, claim: PortClaim) -> Result<Self, BootError> {
         let bin = Self::binary()?;
         let mut cmd = Command::new(&bin);
-        cmd.arg("--db").arg(db);
+        cmd.arg("--db")
+            .arg(db)
+            .arg("--port")
+            .arg(claim.port().to_string());
         if let Some(flag) = mode.flag() {
             cmd.arg(flag);
         }
@@ -772,7 +1211,25 @@ impl RustIoc {
         // failure carries it rather than a bare "boot failed".
         let outcome = rx.recv_timeout(BOOT_TIMEOUT);
         let reason = match outcome {
-            Ok(Ok(port)) => return Ok(Self { port, child, tail }),
+            Ok(Ok(port)) if port == claim.port() => {
+                return Ok(Self {
+                    port,
+                    child,
+                    tail,
+                    _claim: claim,
+                });
+            }
+            Ok(Ok(port)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return err(
+                    Side::Rust,
+                    format!(
+                        "oracle-ioc was told port {} and reported {port}",
+                        claim.port()
+                    ),
+                );
+            }
             Ok(Err(e)) => e,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 "oracle-ioc exited without reporting a port".to_string()
@@ -786,14 +1243,15 @@ impl RustIoc {
         let detail = erx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
         // `detail` needs the child's stderr to reach EOF; the tail does not, so
         // a boot that fails while the process is still alive still says why.
-        err(
-            Side::Rust,
-            format!(
-                "Rust IOC failed to boot: {reason}: {} (it said: {})",
-                first_useful_line(&detail),
-                tail.text()
-            ),
-        )
+        let message = format!(
+            "Rust IOC failed to boot: {reason}: {} (it said: {})",
+            first_useful_line(&detail),
+            tail.text()
+        );
+        if message.to_lowercase().contains("address already in use") {
+            return err_retryable(Side::Rust, message);
+        }
+        err(Side::Rust, message)
     }
 }
 
@@ -812,6 +1270,9 @@ fn first_useful_line(s: &str) -> String {
 }
 
 impl Ioc for RustIoc {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
     fn port(&self) -> u16 {
         self.port
     }
@@ -1000,7 +1461,7 @@ pub struct PvxTools {
     pub ioc_bin: PathBuf,
     // NO beacon port here, on purpose. The client tools need one, but a client
     // *binds* it, so the number must be one no live server holds — and
-    // `alloc_free_port` releases the port it names, so a number allocated once
+    // A claimed port is held only while its `PortClaim` lives, so a number allocated once
     // at start-up is owned by nobody. Any later allocation may legitimately
     // hand it to a `softIocPVX` or `oracle-ioc` search port, after which every
     // client aimed at it dies on `Address already in use` for the life of that
@@ -1089,154 +1550,78 @@ pub struct PvxIoc {
     port: u16,
     child: Child,
     tail: OutputTail,
+    _claim: PortClaim,
 }
 
 impl PvxIoc {
     /// Boot `softIocPVX` serving `db`, loopback-isolated, on a UDP search port
     /// nothing else holds.
     pub fn boot(tools: &PvxTools, db: &Path) -> Result<Self, BootError> {
-        let mut why = Vec::new();
-        for n in 1..=BOOT_ATTEMPTS {
-            let udp = alloc_free_port()?;
-            match Self::try_boot(tools, db, udp) {
-                Ok(ioc) => return Ok(ioc),
-                Err(e) if e.retryable => {
-                    why.push(format!("attempt {n} on UDP {udp}: {}", e.message));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        err(
-            Side::C,
-            format!(
-                "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
-                why.join("; ")
-            ),
-        )
-    }
-
-    fn try_boot(tools: &PvxTools, db: &Path, udp: u16) -> Result<Self, BootError> {
-        let mut cmd = Command::new(&tools.ioc_bin);
-        cmd.arg("-S"); // no interactive shell
-        // The same load route as the CA side, from the same owner: the fat
-        // `softIocPVX` is a `softMain` too, so an asyn db needs its port created
-        // before `iocInit` here exactly as it does there.
-        load_db_into(&mut cmd, db)?;
-        let mut child = cmd
-            // --- PVA server, loopback only. Names verified against pvxs
-            // `src/config.cpp:402-432`, not guessed. ---
-            .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
-            // Refuse auto-beaconing outright, so no frame reaches a real
-            // subnet (`config.cpp:430`).
-            .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
-            .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
-            // TCP is the one port that needs no allocation: pvxs binds `:0`
-            // and stamps the real port back (`server.cpp:484`), then
-            // advertises it in the search reply. A number nobody chose cannot
-            // be a number somebody else took.
-            // --- CA server: not started at all. softIocPVX links base's
-            // rsrv, which binds CA 5064 by default and would fight the host's
-            // real IOCs and the pair's other side. No CA is measured in this
-            // phase, so the CA server is removed rather than moved: base
-            // skips any `dbServer` named in `EPICS_IOC_IGNORE_SERVERS`
-            // (`db/dbServer.c:32-56`), and rsrv registers itself as `rsrv`
-            // (`rsrv/caservertask.c:1561-1569`).
-            //
-            // Moving it was the earlier fix and it could not be made sound.
-            // A port has to be *named* in the environment, so it has to be
-            // allocated and released before the child binds it, and whoever
-            // takes it in that window kills the IOC outright: rsrv's UDP bind
-            // fails silently (`caservertask.c:131-146` prints nothing on
-            // EADDRINUSE), the interface is dropped, and `rsrv_init` ends at
-            // `cantProceed("CAS: No TCP server started")`. Nor can the number
-            // be delegated to the kernel — `envGetInetPortConfigParam`
-            // (`libcom/src/env/envSubr.c:409-416`) clips a port of 0 back to
-            // the 5064 default. Not registering the server has no window at
-            // all. ---
-            .env("EPICS_IOC_IGNORE_SERVERS", "rsrv")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| BootError::new(Side::C, format!("spawn softIocPVX: {e}")))?;
-
-        // Same ready watch as `CIoc`: softIocPVX prints base's `iocRun: All
-        // initialization complete`. Note what this does NOT buy us — a *PVA*
-        // search-port collision prints nothing at all (see `PvaPair::boot`),
-        // and with rsrv unregistered there is no CA side left to warn either.
-        // What it still catches is a death: `cantProceed` suspends the thread
-        // instead of exiting, so nothing else would ever end the wait.
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
-        let (tx, rx) = mpsc::channel::<BootSignal>();
-        let tail = OutputTail::new();
-        spawn_watcher(stdout, tx.clone(), tail.clone());
-        spawn_watcher(stderr, tx, tail.clone());
-
-        let deadline = Instant::now() + BOOT_TIMEOUT;
-        let mut ready = false;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                let _ = child.kill();
-                return err(
-                    Side::C,
-                    format!(
-                        "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}; \
-                         it said: {}",
-                        tail.text()
-                    ),
-                );
-            }
-            match rx.recv_timeout(left) {
-                Ok(BootSignal::PortCollision(line)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(Side::C, format!("PORT_COLLISION on UDP {udp}: {line}"));
-                }
-                Ok(BootSignal::Died(said)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return err_retryable(
-                        Side::C,
-                        format!(
-                            "softIocPVX declared itself unable to proceed on UDP {udp}; \
-                                 it said: {said}"
-                        ),
-                    );
-                }
-                Ok(BootSignal::Ready) => {
-                    ready = true;
-                    break;
-                }
-                Ok(BootSignal::Other) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        if !ready {
-            let status = child.try_wait().ok().flatten();
-            let _ = child.kill();
-            return err(
-                Side::C,
-                format!(
-                    "softIocPVX exited during boot (status {status:?}) — db rejected? \
-                     it said: {}",
-                    tail.text()
-                ),
-            );
-        }
+        let BootedProcess {
+            child,
+            port: udp,
+            tail,
+            claim,
+        } = boot_on_free_port(&BootNames::SOFTIOC_PVX, LogPolicy::Tail, |udp| {
+            let mut cmd = Command::new(&tools.ioc_bin);
+            cmd.arg("-S"); // no interactive shell
+            // The same load route as the CA side, from the same owner: the fat
+            // `softIocPVX` is a `softMain` too, so an asyn db needs its port
+            // created before `iocInit` here exactly as it does there.
+            load_db_into(&mut cmd, db)?;
+            cmd
+                // --- PVA server, loopback only. Names verified against pvxs
+                // `src/config.cpp:402-432`, not guessed. ---
+                .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+                .env("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1")
+                // Refuse auto-beaconing outright, so no frame reaches a real
+                // subnet (`config.cpp:430`).
+                .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+                .env("EPICS_PVAS_BROADCAST_PORT", udp.to_string())
+                // TCP is named too, on the number the UDP side already proved free
+                // on both protocols. Left unset, pvxs binds 5075 and, when another
+                // process (another panel's IOC) holds it, falls back to an
+                // ephemeral port with only a `Server unable to bind port` warning
+                // (`serverconn.cpp:443-463`) -- an IOC that answers, on a port no
+                // reading was aimed at. The warning is a collision signal
+                // ([`spawn_watcher`]), so a lost number reruns the boot.
+                .env("EPICS_PVAS_SERVER_PORT", udp.to_string())
+                // --- CA server: not started at all. softIocPVX links base's
+                // rsrv, which binds CA 5064 by default and would fight the host's
+                // real IOCs and the pair's other side. No CA is measured in this
+                // phase, so the CA server is removed rather than moved: base
+                // skips any `dbServer` named in `EPICS_IOC_IGNORE_SERVERS`
+                // (`db/dbServer.c:32-56`), and rsrv registers itself as `rsrv`
+                // (`rsrv/caservertask.c:1561-1569`).
+                //
+                // Moving it was the earlier fix and it could not be made sound.
+                // A port has to be *named* in the environment, so it has to be
+                // allocated and released before the child binds it, and whoever
+                // takes it in that window kills the IOC outright: rsrv's UDP bind
+                // fails silently (`caservertask.c:131-146` prints nothing on
+                // EADDRINUSE), the interface is dropped, and `rsrv_init` ends at
+                // `cantProceed("CAS: No TCP server started")`. Nor can the number
+                // be delegated to the kernel — `envGetInetPortConfigParam`
+                // (`libcom/src/env/envSubr.c:409-416`) clips a port of 0 back to
+                // the 5064 default. Not registering the server has no window at
+                // all. ---
+                .env("EPICS_IOC_IGNORE_SERVERS", "rsrv")
+                .stdin(Stdio::null());
+            Ok(cmd)
+        })?;
         Ok(Self {
             port: udp,
             child,
             tail,
+            _claim: claim,
         })
     }
 }
 
 impl Ioc for PvxIoc {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
     fn port(&self) -> u16 {
         self.port
     }
@@ -1320,6 +1705,15 @@ pub trait PvaServer: Ioc {
     /// answered anything since, which is what makes a reading attributable.
     fn alive(&mut self) -> bool {
         self.exit_status().is_none()
+    }
+
+    /// Who else holds a socket on this server's UDP port right now (see
+    /// `foreign_udp_holders`); empty when it holds the port alone or `/proc`
+    /// cannot say. Asked again at every read, because a squatter that binds
+    /// after the boot proof takes the unicast pings just as one that bound
+    /// before it did.
+    fn foreign_holders(&self) -> Vec<String> {
+        foreign_udp_holders(self.pid(), self.port()).unwrap_or_default()
     }
 
     /// Boot a replacement onto this side, on the same proof a first boot needs.
@@ -1441,9 +1835,35 @@ fn wait_pva_reachable(tools: &PvxTools, ioc: &dyn Ioc, probe_pv: &str) -> Result
 /// quotes the addresses that answered, which is the only place they exist.
 fn verify_sole_server(tools: &PvxTools, ioc: &dyn Ioc) -> Result<(), BootError> {
     let (port, side) = (ioc.port(), ioc.side());
+    // The kernel's table first: a socket on this port that the IOC does not
+    // own is a proven collision, whatever `pvxlist` then prints.
+    let held = foreign_udp_holders(ioc.pid(), port);
+    if let Some(foreign) = held.as_ref().filter(|f| !f.is_empty()) {
+        return err_retryable(
+            side,
+            format!(
+                "PORT_COLLISION on UDP {port}: the {side} side's port is also bound by {} — a \
+                 PVA port collision binds silently (SO_REUSEPORT) and takes a share of the \
+                 unicast pings, so readings here would be misattributed or missing; it said: {}",
+                foreign.join(", "),
+                ioc.recent_output()
+            ),
+        );
+    }
     let t = crate::pvatool::PvaTools::new(tools, port, side);
     match t.servers() {
         Ok(s) if s.len() == 1 => Ok(()),
+        // The IOC holds every socket on its port and nothing answers: not a
+        // lost port, so a fresh pair would only hide it.
+        Ok(s) if s.is_empty() && held.is_some() => err(
+            side,
+            format!(
+                "the {side} side holds every socket on UDP port {port} and no PVA server \
+                 answers there — the IOC is up but not serving; it said: {}",
+                ioc.recent_output()
+            ),
+        ),
+        // Without a kernel table (non-Linux) an empty list is read as before.
         Ok(s) => err_retryable(
             side,
             format!(
@@ -1522,23 +1942,59 @@ mod tests {
     /// reported a *reachability* failure for a process that had already said
     /// it was dead.
     #[test]
-    fn a_cant_proceed_banner_is_a_death_not_noise() {
+    fn a_cant_proceed_on_a_lost_ca_port_is_a_collision() {
         let signals = classify(concat!(
             "CAS: No TCP server started\n",
             "CRITICAL ERROR Thread _main_ (0x7f0e4c0010a0) can't proceed, suspending.\n",
         ));
-        let died = signals
+        let lost = signals
             .iter()
             .filter_map(|s| match s {
-                BootSignal::Died(said) => Some(said.clone()),
+                BootSignal::PortCollision(said) => Some(said.clone()),
                 _ => None,
             })
             .next()
-            .expect("the fatal banner must be reported as a death");
+            .expect("the lost CA port must be reported as a collision");
         assert!(
-            died.contains("CAS: No TCP server started"),
-            "the death must quote what led to it, got {died:?}"
+            lost.contains("CAS: No TCP server started"),
+            "the collision must quote what led to it, got {lost:?}"
         );
+    }
+
+    /// Boundary — any other `cantProceed` is a death, which no fresh port
+    /// cures, so a boot loop must not take one.
+    #[test]
+    fn any_other_cant_proceed_is_a_death() {
+        let signals = classify(concat!(
+            "dbLoadRecords: failed\n",
+            "CRITICAL ERROR Thread _main_ (0x7f0e4c0010a0) can't proceed, suspending.\n",
+        ));
+        assert!(
+            signals.iter().any(|s| matches!(s, BootSignal::Died(_))),
+            "{:?}",
+            signals.len()
+        );
+        assert!(
+            !signals
+                .iter()
+                .any(|s| matches!(s, BootSignal::PortCollision(_)))
+        );
+    }
+
+    /// The two lost-port lines softIocPVX prints, verbatim, are collisions.
+    #[test]
+    fn a_softiocpvx_lost_port_is_a_collision() {
+        for line in [
+            "terminate called after throwing an instance of 'std::runtime_error'\n  what():  Unable to bind random UDP6 port\n",
+            "Error in pvxsBaseRegistrar : Address already in use\n",
+        ] {
+            assert!(
+                classify(line)
+                    .iter()
+                    .any(|s| matches!(s, BootSignal::PortCollision(_))),
+                "{line:?}"
+            );
+        }
     }
 
     /// Boundary — base's *recovered* collision. rsrv prints this when it
@@ -1556,6 +2012,20 @@ mod tests {
         assert!(
             !signals.iter().any(|s| matches!(s, BootSignal::Died(_))),
             "a server that kept running has not died"
+        );
+    }
+
+    /// Boundary — pvxs's TCP listener fell back from its named port.
+    #[test]
+    fn a_pvxs_tcp_fallback_is_a_collision() {
+        let signals = classify(
+            "WARN pvxs.tcp.setup Server unable to bind port 41941, falling back to 127.0.0.1:40000\n",
+        );
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, BootSignal::PortCollision(_))),
+            "a fallen-back TCP listener must rerun the boot"
         );
     }
 
@@ -1596,6 +2066,7 @@ mod tests {
             port: 5075,
             side: Side::Rust,
             said: "ORACLE_IOC_READY",
+            pid: std::process::id(),
         };
         let e = wait_probe("IOC", &ioc, "ORACLE:AI", || Err::<(), _>("not found"))
             .expect_err("must fail");
@@ -1729,25 +2200,452 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stand-in `softIoc`: it binds the CA port on UDP and TCP as rsrv
+    /// does, and says what rsrv says — the ready line when it got both,
+    /// `CAS: No TCP server started` and `cantProceed`'s banner when the port
+    /// was in use. Any other bind error is logged and suspends it, as `tryBind`
+    /// does (`caservertask.c:135-141`). It then idles, as `cantProceed` does,
+    /// so only the harness can end it.
+    fn fake_rsrv(port: u16) -> Command {
+        fake_rsrv_on("127.0.0.1", port)
+    }
+
+    /// [`fake_rsrv`] serving on `host`, as the softIoc behind a proxy does.
+    fn fake_rsrv_on(host: &str, port: u16) -> Command {
+        const BODY: &str = r#"
+import errno, os, socket, sys, time
+p = int(os.environ["EPICS_CA_SERVER_PORT"])
+h = os.environ.get("FAKE_RSRV_HOST", "127.0.0.1")
+try:
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((h, p))
+    t = socket.socket(); t.bind((h, p)); t.listen()
+    said = "bound"
+except OSError as x:
+    if x.errno != errno.EADDRINUSE:
+        print(f"CAS: bind ERROR: {x.strerror}", flush=True)
+        while True: time.sleep(60)
+    said = "collided"
+e = os.environ.get("FAKE_RSRV_EVIDENCE")
+if e:
+    with open(e, "a") as f: f.write(f"{p} {said}\n")
+if said == "bound":
+    print("iocRun: All initialization complete", flush=True)
+else:
+    print("CAS: No TCP server started", flush=True)
+    print("CRITICAL ERROR Thread _main_ (0x1) can't proceed, suspending.", flush=True)
+time.sleep(60)
+"#;
+        let mut cmd = Command::new("python3");
+        cmd.args(["-I", "-c", BODY])
+            .env("EPICS_CA_SERVER_PORT", port.to_string())
+            .env("FAKE_RSRV_HOST", host)
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    /// Take `port` on both protocols, as another process does between the
+    /// probe and the IOC's bind.
+    fn hold(port: u16) -> (UdpSocket, TcpListener) {
+        (
+            UdpSocket::bind(("127.0.0.1", port)).expect("hold udp"),
+            TcpListener::bind(("127.0.0.1", port)).expect("hold tcp"),
+        )
+    }
+
+    /// Boundary — a port taken between probe and spawn is never tried again,
+    /// and the IOC boots on a port that was free when tried. A busy box can
+    /// lose further ports to other processes, so the attempt count is not
+    /// the claim; each abandoned attempt must have collided.
     #[test]
-    fn allocated_port_is_free_on_both_protocols() {
-        let p = alloc_free_port().expect("alloc");
-        assert_ne!(p, 0);
+    fn a_port_taken_after_the_probe_is_replaced_on_the_next_attempt() {
+        let dir = crate::runner::workdir(None).expect("workdir");
+        let evidence = dir.join("binds");
+        let mut calls = Vec::new();
+        let mut held = Vec::new();
+        let mut booted = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                if calls.is_empty() {
+                    held.push(hold(port));
+                }
+                calls.push(port);
+                let mut cmd = fake_rsrv(port);
+                cmd.env("FAKE_RSRV_EVIDENCE", &evidence);
+                Ok(cmd)
+            },
+        )
+        .expect("a later attempt must boot");
+        let _ = booted.child.kill();
+        let _ = booted.child.wait();
+        let said = std::fs::read_to_string(&evidence).expect("evidence");
+        let _ = std::fs::remove_dir_all(&dir);
+        let want: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let outcome = if i + 1 == calls.len() {
+                    "bound"
+                } else {
+                    "collided"
+                };
+                format!("{p} {outcome}")
+            })
+            .collect();
+        assert_eq!(said.lines().collect::<Vec<_>>(), want, "attempts {calls:?}");
+        assert!(calls.len() >= 2, "the stolen port cannot boot: {calls:?}");
+        assert!(
+            !calls[1..].contains(&calls[0]),
+            "the stolen port must not be reused: {calls:?}"
+        );
+        assert_eq!(booted.port, *calls.last().unwrap());
+        assert!(booted.tail.text().contains("iocRun: All initialization"));
+    }
+
+    /// Boundary — every attempt losing its port ends in an error that names
+    /// the attempts and the last port.
+    #[test]
+    fn exhausted_attempts_name_the_last_port() {
+        let mut calls = Vec::new();
+        let mut held = Vec::new();
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                held.push(hold(port));
+                calls.push(port);
+                Ok(fake_rsrv(port))
+            },
+        );
+        let Err(e) = result else {
+            panic!("every attempt lost its port, yet a boot was reported");
+        };
+        assert_eq!(calls.len(), BOOT_ATTEMPTS);
+        let last = calls[BOOT_ATTEMPTS - 1];
+        assert!(
+            e.message.contains(&format!("{BOOT_ATTEMPTS} attempts"))
+                && e.message
+                    .contains(&format!("attempt {BOOT_ATTEMPTS} on port {last}")),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The wording a caller's classifier and a reader's grep match on stays
+    /// byte-exact per boot: the C softIoc's collision text carries no port
+    /// kind, softIocPVX's says `UDP`.
+    #[test]
+    fn each_boot_keeps_its_own_collision_wording() {
+        for (names, kind, expect_prefix) in [
+            (&BootNames::C_SOFTIOC, "port", ""),
+            (&BootNames::SOFTIOC_PVX, "UDP", "UDP "),
+        ] {
+            let mut calls = Vec::new();
+            let mut held = Vec::new();
+            let Err(e) = boot_on_free_port(names, LogPolicy::Tail, |port| {
+                held.push(hold(port));
+                calls.push(port);
+                Ok(fake_rsrv(port))
+            }) else {
+                panic!("every attempt lost its port, yet a boot was reported");
+            };
+            let first = calls[0];
+            let want =
+                format!("attempt 1 on {kind} {first}: PORT_COLLISION on {expect_prefix}{first}: ");
+            assert!(e.message.contains(&want), "{want:?} not in {}", e.message);
+        }
+    }
+
+    /// `listens_on_tcp` reads the kernel's table, not a log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listens_on_tcp_sees_this_process_s_listener_and_only_its_port() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = l.local_addr().unwrap().port();
+        let me = std::process::id();
+        assert_eq!(listens_on_tcp(me, port), Some(true));
+        let other = claim_port().expect("a port nothing holds");
+        assert_eq!(listens_on_tcp(me, other.port()), Some(false));
+    }
+
+    /// A child that reports ready while listening elsewhere (what a silenced
+    /// `Server unable to bind port` warning leaves) is a lost port; one
+    /// listening on the named port boots.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_ready_child_not_listening_on_its_named_port_is_a_collision() {
+        let names = BootNames {
+            tcp_on_port: true,
+            ..BootNames::new("fake pvxs", "UDP")
+        };
+        let ready_listening_on = |bind: Option<u16>| {
+            let mut cmd = Command::new("python3");
+            cmd.arg("-c").arg(format!(
+                "import socket,time\ns=socket.socket(); s.bind(('127.0.0.1', {})); s.listen(1)\n\
+                 print('iocRun: All initialization complete', flush=True); time.sleep(30)",
+                bind.unwrap_or(0)
+            ));
+            Ok(cmd)
+        };
+        let mut booted = boot_on_free_port(&names, LogPolicy::Tail, |port| {
+            ready_listening_on(Some(port))
+        })
+        .expect("a child listening on its port boots");
+        let _ = booted.child.kill();
+        let _ = booted.child.wait();
+
+        let Err(e) = boot_on_free_port(&names, LogPolicy::Tail, |_| ready_listening_on(None))
+        else {
+            panic!("a child listening elsewhere booted");
+        };
+        assert!(e.message.contains("not listening on TCP"), "{}", e.message);
+    }
+
+    /// The spawn failure names the binary the way each boot always did.
+    #[test]
+    fn each_boot_keeps_its_own_spawn_wording() {
+        for (names, want) in [
+            (&BootNames::C_SOFTIOC, "spawn softIoc: "),
+            (&BootNames::SOFTIOC_PVX, "spawn softIocPVX: "),
+        ] {
+            let Err(e) = boot_on_free_port(names, LogPolicy::Tail, |_| {
+                Ok(Command::new("/nonexistent/caucus-no-such-ioc"))
+            }) else {
+                panic!("a missing binary booted");
+            };
+            assert!(e.message.starts_with(want), "{}", e.message);
+        }
+    }
+
+    /// Boundary — a failure that is not a lost port returns at once: the
+    /// command is built once, nothing is retried, and the error is the
+    /// process's own, not an exhausted-attempts summary.
+    #[test]
+    fn a_non_collision_failure_is_not_retried() {
+        let mut calls = 0;
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args([
+                    "-I",
+                    "-c",
+                    "import sys; print('db rejected', flush=True); sys.exit(1)",
+                ])
+                .stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that died at boot was reported booted");
+        };
+        assert_eq!(calls, 1, "a non-collision failure must not be retried");
+        assert!(
+            e.message.contains("exited during boot") && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — a `cantProceed` that rsrv did not reach through a lost CA
+    /// port is the IOC's own death: one attempt, returned as it is.
+    #[test]
+    fn a_cant_proceed_without_a_lost_port_is_not_retried() {
+        const BODY: &str = r#"
+import time
+print("dbLoadRecords: record type not found", flush=True)
+print("CRITICAL ERROR Thread _main_ (0x1) can't proceed, suspending.", flush=True)
+time.sleep(60)
+"#;
+        let mut calls = 0;
+        let result = boot_on_free_port(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args(["-I", "-c", BODY]).stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that could not proceed was reported booted");
+        };
+        assert_eq!(calls, 1, "a death must not be retried");
+        assert!(!e.retryable, "a death is not a lost port: {}", e.message);
+        assert!(
+            e.message.contains("declared itself unable to proceed")
+                && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — an IOC that never reports ready is a hang, not a lost port:
+    /// one attempt, killed at the deadline, returned as it is.
+    #[test]
+    fn a_silent_boot_times_out_once() {
+        let mut calls = 0;
+        let result = boot_within(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            Duration::from_millis(300),
+            |_| Ok(()),
+            |_| {
+                calls += 1;
+                let mut cmd = Command::new("python3");
+                cmd.args(["-I", "-c", "import time; time.sleep(60)"])
+                    .stdin(Stdio::null());
+                Ok(cmd)
+            },
+        );
+        let Err(e) = result else {
+            panic!("a process that never reported ready was reported booted");
+        };
+        assert_eq!(calls, 1, "a hang must not be retried");
+        assert!(!e.retryable, "a hang is not a lost port: {}", e.message);
+        assert!(
+            e.message.contains("did not report ready within 300ms")
+                && !e.message.contains("attempts"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Boundary — the policy given to the boot decides whether a boot that
+    /// printed past the twelve-line window still has its first line.
+    #[test]
+    fn the_log_policy_decides_whether_the_first_line_survives_the_boot() {
+        fn chatty(_: u16) -> Result<Command, BootError> {
+            let mut cmd = Command::new("python3");
+            cmd.args([
+                "-I",
+                "-c",
+                "import time\nfor i in range(30): print('line', i, flush=True)\n\
+                 print('iocRun: All initialization complete', flush=True)\ntime.sleep(60)",
+            ])
+            .stdin(Stdio::null());
+            Ok(cmd)
+        }
+        let names = BootNames::new("chatty", "port");
+        let mut first = Vec::new();
+        for policy in [LogPolicy::Tail, LogPolicy::All] {
+            let mut booted = boot_on_free_port(&names, policy, chatty).expect("boots");
+            let _ = booted.child.kill();
+            let _ = booted.child.wait();
+            first.push(booted.tail.all_lines().iter().any(|l| l == "line 0"));
+        }
+        assert_eq!(first, [false, true]);
+    }
+
+    /// Boundary — past the twelve-line window the bounded tail forgets the
+    /// first line and the keeping tail still has it.
+    #[test]
+    fn a_keeping_tail_holds_what_the_bounded_one_drops() {
+        let bounded = OutputTail::new();
+        let keeping = OutputTail::keeping_everything();
+        for i in 0..OutputTail::KEEP + 5 {
+            bounded.push(&format!("line {i}"));
+            keeping.push(&format!("line {i}"));
+        }
+        assert!(!bounded.text().contains("line 0 |") && !bounded.text().starts_with("line 0"));
+        assert_eq!(keeping.all_lines().len(), OutputTail::KEEP + 5);
+        assert_eq!(keeping.all_lines()[0], "line 0");
+        assert_eq!(keeping.text(), bounded.text());
+    }
+
+    /// Boundary — a claim the owner's candidate cannot satisfy moves the
+    /// attempt to the next port, and the resource the claim bound ends up on
+    /// the number the IOC got: the proxy-in-front-of-an-IOC shape, the proxy
+    /// on 127.0.0.1 and the IOC on 127.0.0.2.
+    #[test]
+    fn a_refused_claim_takes_the_next_port_and_the_claim_ends_on_the_iocs() {
+        let mut claims = Vec::new();
+        let mut bound: Option<TcpListener> = None;
+        let mut booted = boot_on_free_port_claiming(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |port| {
+                claims.push(port);
+                if claims.len() == 1 {
+                    return err_retryable_neither("proxy listener refused");
+                }
+                bound = Some(
+                    TcpListener::bind(("127.0.0.1", port))
+                        .map_err(|e| BootError::new(Side::C, e.to_string()))?,
+                );
+                Ok(())
+            },
+            |port| Ok(fake_rsrv_on("127.0.0.2", port)),
+        )
+        .expect("the second claim must boot");
+        let _ = booted.child.kill();
+        let _ = booted.child.wait();
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        assert_ne!(claims[0], claims[1]);
+        assert_eq!(booted.port, claims[1]);
+        let listener = bound.expect("the claim bound its resource");
+        assert_eq!(listener.local_addr().unwrap().port(), booted.port);
+    }
+
+    /// Boundary — a claim that fails for a reason a fresh port cannot fix is
+    /// called once and its own error comes back, not "could not get an
+    /// exclusive port".
+    #[test]
+    fn a_fatal_claim_is_called_once_and_its_error_is_returned() {
+        let mut calls = 0;
+        let result = boot_on_free_port_claiming(
+            &BootNames::new("fake rsrv", "port"),
+            LogPolicy::Tail,
+            |_| {
+                calls += 1;
+                err_neither("permission denied binding the proxy")
+            },
+            |port| Ok(fake_rsrv(port)),
+        );
+        let e = result.err().expect("a fatal claim must fail the boot");
+        assert_eq!(calls, 1);
+        assert!(!e.retryable);
+        assert_eq!(e.message, "permission denied binding the proxy");
+    }
+
+    #[test]
+    fn a_claimed_port_is_in_the_oracle_range_and_free_on_both_protocols() {
+        let c = claim_port().expect("claim");
+        let p = c.port();
+        assert!(ORACLE_PORTS.contains(&p), "{p}");
         // Never the CA default: the harness must not be able to collide with a
         // real IOC on this host, and must never be tempted to hard-code it.
         assert_ne!(p, 5064);
-        // Both must be re-bindable now that the prober dropped them.
         UdpSocket::bind(("127.0.0.1", p)).expect("udp free");
         TcpListener::bind(("127.0.0.1", p)).expect("tcp free");
     }
 
+    /// The claim is the exclusion: while one is held, no claim -- in this
+    /// process or another -- returns the same number; dropping it frees it.
     #[test]
-    fn successive_allocations_do_not_repeat() {
-        let a = alloc_free_port().unwrap();
-        let b = alloc_free_port().unwrap();
-        // Not a hard guarantee from the kernel, but a repeat would mean the
-        // allocator is handing out a port it already gave away.
-        assert_ne!(a, b);
+    fn a_held_claim_is_never_handed_out_twice() {
+        let held: Vec<PortClaim> = (0..200).map(|_| claim_port().unwrap()).collect();
+        let mut ports: Vec<u16> = held.iter().map(PortClaim::port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 200, "a claimed port was handed out again");
+        let first = held[0].port();
+        drop(held);
+        // Released: the lock file is claimable again.
+        let lock = std::fs::File::open(claim_dir().join(format!("{first}.lock"))).unwrap();
+        lock.try_lock().expect("a dropped claim frees its port");
+    }
+
+    /// The range is outside what the kernel hands to `bind(0)` on this host,
+    /// which is the premise of claiming from it.
+    #[test]
+    fn the_oracle_range_is_outside_the_kernels_ephemeral_range() {
+        ephemeral_range_clear_of_oracle_ports().expect("host ephemeral range");
+        let s = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        assert!(!ORACLE_PORTS.contains(&s.local_addr().unwrap().port()));
     }
 
     /// A stand-in IOC: `wait_probe` reads a port, a side and the child's own
@@ -1757,6 +2655,7 @@ mod tests {
         port: u16,
         side: Side,
         said: &'static str,
+        pid: u32,
     }
 
     impl Ioc for FakeIoc {
@@ -1768,6 +2667,9 @@ mod tests {
         }
         fn recent_output(&self) -> String {
             self.said.to_string()
+        }
+        fn pid(&self) -> u32 {
+            self.pid
         }
     }
 
@@ -1783,6 +2685,7 @@ mod tests {
             port: 5064,
             side: Side::Rust,
             said: "iocRun: All initialization complete",
+            pid: std::process::id(),
         };
         let r = wait_probe("IOC", &ioc, "ORACLE:AI", || {
             n += 1;
@@ -1805,6 +2708,7 @@ mod tests {
             port: 34567,
             side: Side::C,
             said: "iocRun: All initialization complete",
+            pid: std::process::id(),
         };
         let e = wait_probe("PVA server", &ioc, "ORACLE:AI", || {
             n += 1;
@@ -1845,6 +2749,7 @@ mod tests {
             port: 5075,
             side: Side::Rust,
             said: "(the IOC printed nothing)",
+            pid: std::process::id(),
         };
         let e = wait_probe("IOC", &ioc, "ORACLE:AI", || Err::<(), _>("refused"))
             .expect_err("must fail");
@@ -1855,32 +2760,103 @@ mod tests {
         );
     }
 
-    /// The exclusivity proof quotes the IOC it is about.
+    /// An ephemeral UDP socket whose port number nothing else on the host
+    /// shares. The kernel hands out a port per address, so another process's
+    /// IPv6 socket can sit on the same number; the tests here assert on who
+    /// holds a port and must not inherit a neighbour test's socket.
+    fn quiet_udp_socket() -> std::net::UdpSocket {
+        for _ in 0..50 {
+            let s = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind a UDP socket");
+            let port = s.local_addr().unwrap().port();
+            if foreign_udp_holders(std::process::id(), port).is_some_and(|f| f.is_empty()) {
+                return s;
+            }
+        }
+        panic!("no ephemeral UDP port free of other processes' sockets");
+    }
+
+    /// The exclusivity proof quotes the IOC it is about, and tells a lost port
+    /// from an IOC that is up and silent.
     ///
-    /// This is the arm that used to report a bare count. It is the LAST step
-    /// of a PVA pair boot, so its message is the whole of what a reader gets
-    /// when a sweep comes back 56/56 errored — and it could not reach the one
-    /// witness that names a cause, because it took a port and a [`Side`] and
-    /// never saw the [`Ioc`] that owns the words. Driven here against a port
-    /// nothing serves, so `pvxlist` finds nothing and the `Err` arm runs.
+    /// Here this process is the IOC: it holds the only socket on the port and
+    /// never answers `pvxlist`. The kernel table proves no one else is there,
+    /// so the failure is the IOC's and a fresh pair would not cure it.
     #[test]
-    fn an_unprovable_port_names_what_the_ioc_said() {
+    fn an_ioc_that_holds_its_port_and_does_not_answer_is_a_hard_failure() {
         let tools = PvxTools::discover().expect(
             "the pvxs tree must be built for the PVA oracle to have ground truth; \
              set PVXS_BIN if it is not at the default path",
         );
-        let dead = alloc_free_port().expect("a port to aim at");
+        let held = quiet_udp_socket();
         let ioc = FakeIoc {
-            port: dead,
+            port: held.local_addr().unwrap().port(),
             side: Side::Rust,
             said: "ORACLE_IOC_PVA_PORT 1234",
+            pid: std::process::id(),
         };
-        let e = verify_sole_server(&tools, &ioc).expect_err("nothing serves that port");
+        let e = verify_sole_server(&tools, &ioc).expect_err("nothing answers on that port");
         assert_eq!(e.side, Some(Side::Rust));
+        assert!(!e.retryable, "{}", e.message);
+        assert!(e.message.contains("up but not serving"), "{}", e.message);
         assert!(
             e.message.ends_with("it said: ORACLE_IOC_PVA_PORT 1234"),
             "{}",
             e.message
+        );
+    }
+
+    /// A socket on the port that the IOC does not own is a proven collision,
+    /// retryable, and names the owner — decided from the kernel table before
+    /// `pvxlist` is asked.
+    #[test]
+    fn a_foreign_socket_on_the_port_is_a_retryable_collision_naming_its_owner() {
+        let tools = PvxTools::discover().expect("the pvxs tree must be built");
+        let squatter = quiet_udp_socket();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a process standing in for the IOC");
+        let ioc = FakeIoc {
+            port: squatter.local_addr().unwrap().port(),
+            side: Side::C,
+            said: "x",
+            pid: other.id(),
+        };
+        let e = verify_sole_server(&tools, &ioc).expect_err("a foreign holder");
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(e.retryable, "{}", e.message);
+        assert!(
+            e.message.starts_with("PORT_COLLISION on UDP "),
+            "{}",
+            e.message
+        );
+        assert!(
+            e.message.contains(&format!("pid {} (", std::process::id())),
+            "{}",
+            e.message
+        );
+    }
+
+    /// `foreign_udp_holders` reads the kernel's table: the owner sees nothing
+    /// foreign, anyone else sees the owner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_udp_holders_separates_owner_from_squatter() {
+        let sock = quiet_udp_socket();
+        let port = sock.local_addr().unwrap().port();
+        assert_eq!(foreign_udp_holders(std::process::id(), port), Some(vec![]));
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let seen = foreign_udp_holders(other.id(), port).expect("proc readable");
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].starts_with(&format!("pid {} (", std::process::id())),
+            "{seen:?}"
         );
     }
 

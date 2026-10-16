@@ -87,7 +87,7 @@ async fn build() -> (Arc<PvDatabase>, Arc<AtomicU32>, Arc<AtomicU32>) {
                 reads: Arc::clone(&d),
             }) as Box<dyn DeviceSupport>),
             "probeLive" => Some(Box::new(Probe {
-                outcome: DeviceInitOutcome::Live,
+                outcome: DeviceInitOutcome::ok(),
                 reads: Arc::clone(&l),
             }) as Box<dyn DeviceSupport>),
             _ => None,

@@ -60,7 +60,11 @@ async fn dbpf(db: &PvDatabase, record: &str, field: &str, text: &str) {
 fn partition(db: &PvDatabase) -> (Vec<Vec<String>>, usize) {
     let report = db.lock_set_report();
     (
-        report.active.iter().map(|s| s.members.clone()).collect(),
+        report
+            .active
+            .iter()
+            .map(|s| s.members.iter().map(|m| m.to_string()).collect())
+            .collect(),
         report.free,
     )
 }
@@ -87,14 +91,19 @@ async fn linked_records_share_one_lock_set_and_free_the_spare() {
     let db = ioc(ORACLE_DB).await;
     let report = db.lock_set_report();
 
-    let members: Vec<Vec<String>> = report.active.iter().map(|s| s.members.clone()).collect();
+    let members: Vec<Vec<String>> = report
+        .active
+        .iter()
+        .map(|s| s.members.iter().map(|m| m.to_string()).collect())
+        .collect();
     assert_eq!(
         members,
         vec![
-            vec!["R:A".to_string(), "R:B".to_string()],
-            vec!["R:C".to_string()]
+            vec!["R:C".to_string()],
+            vec!["R:A".to_string(), "R:B".to_string()]
         ],
-        "C merges R:A and R:B through INPA/FLNK and leaves R:C alone"
+        "C merges R:A and R:B through INPA/FLNK and leaves R:C alone, and \
+         numbers the ai R:C's set first because it walks record types in order"
     );
     assert_eq!(report.active.len(), 2, "C: Active lockSets: 2");
     assert_eq!(
@@ -394,9 +403,10 @@ async fn a_link_written_on_the_target_side_merges_the_same_way() {
     assert_eq!(
         members,
         vec![
-            vec!["L:A".to_string(), "L:B".to_string()],
+            vec!["L:B".to_string(), "L:A".to_string()],
             vec!["L:C".to_string()]
-        ]
+        ],
+        "L:B's set survives and L:A's list is appended to it"
     );
     assert_eq!(free, 1);
     assert_eq!(
@@ -481,11 +491,11 @@ record(calc, "D:Z") { field(INPA, "D:MID") field(CALC, "A") }
     assert_eq!(
         partition(&db).0,
         vec![vec![
+            "D:Z".to_string(),
             "D:A".to_string(),
-            "D:MID".to_string(),
-            "D:Z".to_string()
+            "D:MID".to_string()
         ]],
-        "D:MID joins all three"
+        "D:MID joins all three; D:Z's INPA merges D:A's set into D:Z's"
     );
 
     assert!(db.remove_record("D:MID").await);
@@ -525,7 +535,7 @@ async fn a_record_added_after_ioc_init_joins_the_set_its_links_reach() {
     dbpf(&db, "L:NEW", "INPA", "L:A").await;
     assert_eq!(
         db.lock_set_of("L:NEW").unwrap().members,
-        vec!["L:A".to_string(), "L:NEW".to_string()]
+        vec!["L:NEW".to_string(), "L:A".to_string()]
     );
 }
 
@@ -541,7 +551,7 @@ record(calc, "A:REAL") { field(CALC, "1") }
     .await;
     assert_eq!(
         partition(&db).0,
-        vec![vec!["A:REAL".to_string()], vec!["A:SRC".to_string()]],
+        vec![vec!["A:SRC".to_string()], vec!["A:REAL".to_string()]],
         "A:NICK names no record yet, so the link is not a DB link"
     );
 
@@ -550,7 +560,8 @@ record(calc, "A:REAL") { field(CALC, "1") }
     assert_eq!(
         partition(&db).0,
         vec![vec!["A:REAL".to_string(), "A:SRC".to_string()]],
-        "the alias made the link resolve, and C merges on a resolved DB link"
+        "the alias made the link resolve, and C merges on a resolved DB link; \
+         the relink is seeded from the aliased record, whose list leads"
     );
 }
 
@@ -626,4 +637,82 @@ async fn a_name_gate_and_an_instance_gate_name_one_set_in_either_order() {
     drop(db.lock_record("L:C"));
     drop(db.lock_instance(&c));
     assert_eq!(db.lock_set_of("L:C").unwrap().id, by_name);
+}
+
+/// Member ORDER, which is C's `lockRecordList` order and what `dblsr` prints:
+/// sets minted in `forEachRecord` order (record types, then load order), and
+/// every merge appending the moved set's list to the survivor's
+/// (`dbLock.c:619-623`).
+///
+/// GROUND TRUTH — the C `softIoc` on `MERGE_ORDER_DB`, `dblsr` at level 1
+/// after `iocInit` and after each `dbpf`, headers and mutex rows elided:
+///
+/// ```text
+/// epics> dblsr("*",1)
+/// M:Q M:Z M:B M:Y M:A / M:SOLO / L:A / L:B / L:C / L:D L:E / S:D S:C S:A S:B
+/// epics> dbpf("L:B.INPA","L:A")
+/// epics> dblsr("L:A",1)          L:B L:A
+/// epics> dbpf("L:C.INPA","L:D")
+/// epics> dblsr("L:C",1)          L:C L:D L:E
+/// epics> dbpf("L:A.INPB","L:C")
+/// epics> dblsr("L:A",1)          L:B L:A L:C L:D L:E
+/// epics> dbpf("S:A.INPA","0")
+/// epics> dblsr("S:A",1)          S:A
+/// epics> dblsr("S:B",1)          S:B S:C S:D
+/// ```
+const MERGE_ORDER_DB: &str = r#"
+record(calc, "M:Z") { field(INPA, "M:B") field(INPB, "M:Y") field(CALC, "1") }
+record(calc, "M:B") { field(CALC, "1") }
+record(ao,   "M:Y") { field(DOL, "M:A") }
+record(ai,   "M:A") { }
+record(ai,   "M:Q") { field(FLNK, "M:Z") }
+record(calc, "M:SOLO") { field(CALC, "1") }
+record(calc, "L:A") { field(CALC, "A+1") }
+record(calc, "L:B") { field(CALC, "1") }
+record(calc, "L:C") { field(CALC, "1") }
+record(calc, "L:D") { field(INPA, "L:E") field(CALC, "1") }
+record(calc, "L:E") { field(CALC, "1") }
+record(calc, "S:A") { field(INPA, "S:B") field(CALC, "1") }
+record(calc, "S:B") { field(CALC, "1") }
+record(calc, "S:C") { field(INPA, "S:B") field(CALC, "1") }
+record(calc, "S:D") { field(INPA, "S:C") field(CALC, "1") }
+"#;
+
+#[epics_macros_rs::epics_test]
+async fn lock_set_members_are_listed_in_c_merge_order() {
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+    let db = ioc(MERGE_ORDER_DB).await;
+    let members = |r: &str| db.lock_set_of(r).expect("a set").members;
+
+    assert_eq!(
+        partition(&db).0,
+        vec![
+            names(&["M:Q", "M:Z", "M:B", "M:Y", "M:A"]),
+            names(&["M:SOLO"]),
+            names(&["L:A"]),
+            names(&["L:B"]),
+            names(&["L:C"]),
+            names(&["L:D", "L:E"]),
+            names(&["S:D", "S:C", "S:A", "S:B"]),
+        ]
+    );
+
+    dbpf(&db, "L:B", "INPA", "L:A").await;
+    assert_eq!(members("L:A"), names(&["L:B", "L:A"]));
+    dbpf(&db, "L:C", "INPA", "L:D").await;
+    assert_eq!(members("L:C"), names(&["L:C", "L:D", "L:E"]));
+    dbpf(&db, "L:A", "INPB", "L:C").await;
+    assert_eq!(members("L:A"), names(&["L:B", "L:A", "L:C", "L:D", "L:E"]));
+
+    // The side that keeps the set keeps C's order. The split-off side is C's
+    // breadth-first walk from the old target over links and `bklnk`
+    // (`dbLock.c:717-773`), which this port has no ordered `bklnk` to
+    // reproduce, so only its grouping is pinned.
+    dbpf(&db, "S:A", "INPA", "0").await;
+    assert_eq!(members("S:A"), names(&["S:A"]));
+    let mut split_off = members("S:B");
+    split_off.sort();
+    assert_eq!(split_off, names(&["S:B", "S:C", "S:D"]));
 }

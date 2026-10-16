@@ -67,7 +67,10 @@ static SRC_FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::Long, false),
     FieldDesc::new("FLAG", DbFieldType::Short, false),
     FieldDesc::new("REJECT", DbFieldType::Short, false),
-    FieldDesc::new("LNK", DbFieldType::String, false),
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Outlink,
+        ..FieldDesc::new("LNK", DbFieldType::String, false)
+    },
 ];
 
 const CLEAR: (&str, EpicsValue) = ("FLAG", EpicsValue::Short(0));
@@ -82,17 +85,16 @@ impl Record for FlagSource {
             link_field: "LNK",
             value: EpicsValue::Long(42),
         };
-        let clear = vec![(CLEAR.0.to_string(), CLEAR.1)];
+        let clear = vec![(PostStage::Output, CLEAR.0.to_string(), CLEAR.1)];
         Ok(match self.arm {
             Arm::SyncComplete => ProcessOutcome {
                 post_write_fields: clear,
                 ..ProcessOutcome::complete_with(vec![write])
             },
             Arm::AsyncNotify => ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "VAL".to_string(),
-                    EpicsValue::Long(7),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(vec![
+                    const { epics_base_rs::server::record::declared_field_ix(SRC_FIELDS, "VAL") },
+                ]),
                 actions: vec![write],
                 device_did_compute: false,
                 post_write_fields: clear,
@@ -103,8 +105,12 @@ impl Record for FlagSource {
             },
             Arm::DeferredAfterAFailingField => ProcessOutcome {
                 post_write_fields: vec![
-                    ("REJECT".to_string(), EpicsValue::Short(1)),
-                    (CLEAR.0.to_string(), CLEAR.1),
+                    (
+                        PostStage::Output,
+                        "REJECT".to_string(),
+                        EpicsValue::Short(1),
+                    ),
+                    (PostStage::Output, CLEAR.0.to_string(), CLEAR.1),
                 ],
                 ..ProcessOutcome::complete_with(vec![write])
             },

@@ -46,9 +46,8 @@ async fn main() -> CaResult<()> {
 /// backend, so there is no IOC to build here.
 #[cfg(exec_backend)]
 fn main() -> CaResult<()> {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "ophyd_test_ioc needs the tokio backend; this build selects the \
-         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
-    );
-    Ok(())
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread).",
+    )
 }

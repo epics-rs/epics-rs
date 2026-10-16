@@ -15,6 +15,9 @@ bytes = "1"
 hostname = "0.4"
 chrono = "0.4"
 parking_lot = "0.12"
+# The record's inline subscriber list (C `mlis`): two monitors without a heap
+# buffer.
+smallvec = "1.15"
 # Lock-free snapshot cells for the read-mostly database indices and the ACF
 # config cell. Readers take an `Arc` snapshot with no lock, so a low-priority
 # reader can never hold a high-priority scan thread off an index.
@@ -109,6 +112,7 @@ source-guard = { path = "../source-guard" }
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
+fact-budget = { path = "../fact-budget" }
 tempfile = "3"
 serial_test = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

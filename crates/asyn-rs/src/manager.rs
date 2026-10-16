@@ -3,9 +3,12 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
+use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
 use crate::error::{AsynError, AsynResult};
 use crate::exception::ExceptionManager;
-use crate::port::PortDriver;
+use crate::fixed_text::FixedText;
+use crate::port::{DpCells, PortDriver};
 use crate::port_handle::PortHandle;
 use crate::registry::PortEntry;
 use crate::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
@@ -33,7 +36,7 @@ impl PortManager {
 
     /// The process's one port table — C's `pasynBase->asynPortList`, which
     /// every `registerPort` adds to and every shell command reads
-    /// (asynManager.c:2018-2070). It is bound to [`PortServices::global`],
+    /// (asynManager.c:2096). It is bound to [`PortServices::global`],
     /// the services a port built with `RuntimeConfig::default()` gets, so a
     /// port created from a driver's own configure command and one created by
     /// `drvAsynIPPortConfigure` share the trace file, the masks and the
@@ -79,8 +82,16 @@ impl PortManager {
     /// now-unreachable handle, leaking resources and silently shadowing
     /// legitimate I/O). To replace a port, call
     /// [`Self::unregister_port`] first.
-    pub fn register_port<D: PortDriver>(&self, driver: D) -> AsynResult<PortRuntimeHandle> {
-        self.register_port_with_config(driver, RuntimeConfig::default())
+    ///
+    /// `owner` is the gate of the database the port serves (see
+    /// [`PortRegistry::register`](crate::registry::PortRegistry::register)); a
+    /// manager has no database of its own, so the caller names it.
+    pub fn register_port<D: PortDriver>(
+        &self,
+        driver: D,
+        owner: &Arc<InterruptGate>,
+    ) -> AsynResult<PortRuntimeHandle> {
+        self.register_port_with_config(driver, RuntimeConfig::default(), owner)
     }
 
     /// Register a port driver with custom runtime config.
@@ -89,9 +100,24 @@ impl PortManager {
     pub fn register_port_with_config<D: PortDriver>(
         &self,
         driver: D,
-        mut config: RuntimeConfig,
+        config: RuntimeConfig,
+        owner: &Arc<InterruptGate>,
     ) -> AsynResult<PortRuntimeHandle> {
-        let name = driver.base().port_name.clone();
+        let name = driver.base().port_name.to_string();
+        // The `asynPortDriver` constructor's `registerPort` failure: the line
+        // on stdout, then the error is the constructor's throw
+        // (asynPortDriver.cpp:4036-4040).
+        self.register_port_inner(driver, config, owner, &name)
+            .inspect_err(|_| report_port_driver_register_failure(&name))
+    }
+
+    fn register_port_inner<D: PortDriver>(
+        &self,
+        driver: D,
+        mut config: RuntimeConfig,
+        owner: &Arc<InterruptGate>,
+        name: &str,
+    ) -> AsynResult<PortRuntimeHandle> {
         // Pre-flight: refuse before we spawn the runtime thread, so a
         // rejected duplicate doesn't burn a thread + create a
         // half-initialized PortRuntimeHandle. The manager map catches a
@@ -100,12 +126,14 @@ impl PortManager {
         // other creator (drvAsyn*PortConfigure, plugins, hand-registered).
         {
             let ph = self.port_handles.lock();
-            if ph.contains_key(&name) {
-                return Err(AsynError::PortAlreadyRegistered(name));
+            if ph.contains_key(name) {
+                crate::registry::report_already_registered(name);
+                return Err(AsynError::PortAlreadyRegistered(name.to_string()));
             }
         }
-        if crate::registry::get_port(&name).is_some() {
-            return Err(AsynError::PortAlreadyRegistered(name));
+        if crate::registry::get_port(name).is_some() {
+            crate::registry::report_already_registered(name);
+            return Err(AsynError::PortAlreadyRegistered(name.to_string()));
         }
         // The manager's services, not the config's default global ones — a
         // caller-supplied `RuntimeConfig` cannot detach a port from the trace
@@ -115,7 +143,7 @@ impl PortManager {
         // `?` is the whole registration contract on this path: a port whose
         // actor thread the OS refused is not a port, so the name below is never
         // claimed for it (C `registerDriver` returns `asynError` ahead of
-        // `ellAdd(&pasynBase->asynPortList,...)`, asynManager.c:2082-2095).
+        // `ellAdd(&pasynBase->asynPortList,...)`, asynManager.c:2084-2097).
         let (handle, _jh) = create_port_runtime(driver, config)?;
 
         // The process-registry insert is the atomic claim on the name —
@@ -125,14 +153,14 @@ impl PortManager {
         // claim means a concurrent registrant won between the pre-flight
         // and here: drop the runtime we just built and report the
         // duplicate.
-        if let Err(e) = crate::registry::register_port(&name, handle.port_handle().clone()) {
+        if let Err(e) = crate::registry::register_port(name, handle.port_handle().clone(), owner) {
             handle.shutdown();
             return Err(e);
         }
         let mut ph = self.port_handles.lock();
         let mut rh = self.runtime_handles.lock();
-        ph.insert(name.clone(), handle.port_handle().clone());
-        rh.insert(name.clone(), handle.clone());
+        ph.insert(name.to_string(), handle.port_handle().clone());
+        rh.insert(name.to_string(), handle.clone());
         drop(rh);
         drop(ph);
 
@@ -166,7 +194,7 @@ impl PortManager {
     }
 
     /// Permanently shut down a `ASYN_DESTRUCTIBLE` port — mirror of
-    /// C `asynManager::shutdownPort` at asynManager.c:2251-2308.
+    /// C `asynManager::shutdownPort` at asynManager.c:2253-2310.
     ///
     /// Sends a `RequestOp::ShutdownPort` through the port's actor
     /// queue (so the lifecycle runs in the same thread that owns the
@@ -242,6 +270,19 @@ impl PortManager {
     }
 }
 
+/// The line an `asynPortDriver` constructor prints, on stdout, when its
+/// `registerPort` fails, before it throws (asynPortDriver.cpp:4036-4040).
+///
+/// Called by [`PortManager::register_port_with_config`], by
+/// `port_runtime_unavailable` (the constructor-shaped plugin runtimes that
+/// abort), and by the `*Configure` commands of `asynPortDriver`-derived
+/// drivers that hold the error themselves (modbus-rs, mqtt-rs, ad-core's
+/// `PluginManager`). A driver C builds without `asynPortDriver`
+/// (`drvAsynIPPort`, …) does not call it.
+pub fn report_port_driver_register_failure(port_name: &str) {
+    println!("asynPortDriver:asynPortDriver ERROR: Can't register port: {port_name}");
+}
+
 impl Default for PortManager {
     fn default() -> Self {
         Self::new()
@@ -252,7 +293,7 @@ impl Default for PortManager {
 ///
 /// Deliberately carries no message. C's manager writes its diagnostic into
 /// `pasynUser->errorMessage` and returns only the status
-/// (asynManager.c:1331-1346, :2331-2373), so the last call to touch a user owns
+/// (asynManager.c:1331-1348, :2331-2373), so the last call to touch a user owns
 /// what the caller reads: `asynRecord`'s `special()` splices the buffer *after*
 /// `connectDevice`'s tail has run `monitorStatus` over it, and therefore
 /// reports the `isEnabled` text for a failed connect (asynRecord.c:515). A
@@ -261,6 +302,10 @@ impl Default for PortManager {
 /// paths the shared buffer exists to model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceError;
+
+/// C `ERROR_MESSAGE_SIZE` (asynManager.c:44), the `errorMessageSize` every
+/// `createAsynUser` hands out (:1194).
+const ERROR_MESSAGE_SIZE: usize = 160;
 
 /// C's `pasynUser` as the manager's device calls see it: the port the user is
 /// connected to (`userPvt->pport`, asynManager.c:1345-1352) beside the
@@ -282,17 +327,19 @@ pub struct DeviceError;
 /// each call builds.
 ///
 /// The address is part of the binding, not a per-call argument: C stores it as
-/// `userPvt->pdevice` when the user attaches (asynManager.c:1349-1352) and every
+/// `userPvt->pdevice` when the user attaches (asynManager.c:1351-1353) and every
 /// later `findDpCommon` reads it back, so a caller cannot ask about one device
 /// on a user bound to another.
 pub struct DeviceUser {
-    device: Option<PortEntry>,
+    /// C `userPvt->pport`, with the cells of the `dpCommon` C's `findDpCommon`
+    /// resolves this user to — `pdevice`'s, or the port's own.
+    device: Option<(PortEntry, DpCells)>,
     /// C `userPvt->pdevice`, as the address that selects it. `-1` is C's null
     /// `pdevice`: `connectDevice` creates a device node only for `addr >= 0`
     /// (asynManager.c:1349-1352), and `findDpCommon` then answers from the
     /// port's own `dpc` (:541-544).
     addr: i32,
-    error_message: String,
+    error_message: FixedText<{ ERROR_MESSAGE_SIZE - 1 }>,
 }
 
 impl Default for DeviceUser {
@@ -302,7 +349,7 @@ impl Default for DeviceUser {
             // C `pasynManager->createAsynUser` leaves `pdevice` null until
             // `connectDevice` sets it; `-1` is that null in port addressing.
             addr: -1,
-            error_message: String::new(),
+            error_message: FixedText::EMPTY,
         }
     }
 }
@@ -310,7 +357,7 @@ impl Default for DeviceUser {
 impl DeviceUser {
     /// The port this user is connected to — C `userPvt->pport`.
     pub fn device(&self) -> Option<&PortEntry> {
-        self.device.as_ref()
+        self.device.as_ref().map(|(entry, _)| entry)
     }
 
     /// The last diagnostic any call below left on this user — C
@@ -320,37 +367,32 @@ impl DeviceUser {
     /// write one, which is what makes the *order* of the manager calls
     /// observable in the text a caller splices.
     pub fn error_message(&self) -> &str {
-        &self.error_message
+        self.error_message.as_str()
     }
 
-    /// C `connectDevice` (asynManager.c:1324-1355), in C's order: no port name,
+    /// C `connectDevice` (asynManager.c:1324-1357), in C's order: no port name,
     /// then the registry lookup (`locatePort`), then a user that is already
     /// connected to a device.
     pub fn connect_device(&mut self, port_name: &str, addr: i32) -> Result<PortEntry, DeviceError> {
         if port_name.is_empty() {
-            return Err(self.fail("asynManager:connectDevice no port name provided".to_string()));
+            return Err(self.fail(format_args!(
+                "asynManager:connectDevice no port name provided"
+            )));
         }
         let Some(entry) = crate::registry::get_port(port_name) else {
-            return Err(self.fail(format!(
+            return Err(self.fail(format_args!(
                 "asynManager:connectDevice port {port_name} not found"
             )));
         };
         if self.device.is_some() {
-            return Err(
-                self.fail("asynManager:connectDevice already connected to device".to_string())
-            );
-        }
-        // C :1349-1352 under `asynManagerLock`: `locateDevice(pport, addr,
-        // TRUE)` creates the device on a multi-device port. The port owns
-        // its device list, so the creation is the port actor's; C's call
-        // cannot fail, and the one way this one can - the actor is gone -
-        // is a port that is no longer the one the registry answered with.
-        if let Err(e) = entry.handle.connect_device_blocking(addr) {
-            return Err(self.fail(format!(
-                "asynManager:connectDevice port {port_name} not found: {e}"
+            return Err(self.fail(format_args!(
+                "asynManager:connectDevice already connected to device"
             )));
         }
-        self.device = Some(entry.clone());
+        // C :1349-1352 under `asynManagerLock`: `locateDevice(pport, addr,
+        // TRUE)` creates the device on a multi-device port, and cannot fail.
+        let dp = entry.handle.connect_device(addr);
+        self.device = Some((entry.clone(), dp));
         self.addr = addr;
         Ok(entry)
     }
@@ -364,67 +406,66 @@ impl DeviceUser {
     /// takes is the only one modelled.
     pub fn disconnect(&mut self) {
         // C clears both halves of the binding: `puserPvt->pport = 0;
-        // puserPvt->pdevice = 0` (asynManager.c:1386-1387).
+        // puserPvt->pdevice = 0` (asynManager.c:1387-1388).
         self.device = None;
         self.addr = -1;
     }
 
-    /// C `isConnected` (asynManager.c:2331-2343).
-    ///
-    /// C reads `pdpCommon->connected`, a field read that cannot fail once the
-    /// user is bound. The actor query behind [`PortHandle`] can — a shut-down
-    /// port, or a call made from the actor's own thread, where waiting would be
-    /// the actor waiting on itself — and those answer `false` rather than
-    /// writing the buffer: they are not C's "not connected to device", and a
-    /// diagnostic C never writes must not displace one it did. Same for the two
-    /// below.
+    /// C `isConnected` (asynManager.c:2331-2343): a read of the bound
+    /// `dpCommon`, which never queues — so a record may ask it under its lock
+    /// while the port sits in a driver call.
     pub fn is_connected(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isConnected")?
-            .is_connected_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isConnected")?.connected())
     }
 
     /// C `isEnabled` (asynManager.c:2345-2359).
     pub fn is_enabled(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isEnabled")?
-            .is_enabled_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isEnabled")?.enabled())
     }
 
     /// C `isAutoConnect` (asynManager.c:2361-2373).
     pub fn is_auto_connect(&mut self) -> Result<bool, DeviceError> {
-        let addr = self.addr;
-        Ok(self
-            .handle_for("isAutoConnect")?
-            .is_auto_connect_blocking(addr)
-            .unwrap_or(false))
+        Ok(self.dp("isAutoConnect")?.auto_connect())
+    }
+
+    /// C `findInterface(pasynUser, asynCommonType, ...)` (asynManager.c:1470-1513)
+    /// as `connectDevice` asks it. A `PortDriver` cannot lack asynCommon, so only
+    /// C's two refusals can answer differently: no binding, or a port shut down.
+    pub fn find_common(&mut self) -> Result<(), DeviceError> {
+        let defunct = match &self.device {
+            None => {
+                return Err(self.fail(format_args!("asynManager:findInterface: not connected")));
+            }
+            Some((entry, _)) => entry.handle.is_defunct(),
+        };
+        if defunct {
+            return Err(self.fail(format_args!("asynManager:findInterface: port shut down")));
+        }
+        Ok(())
     }
 
     /// Bind to an already-resolved port, for tests that build a [`PortEntry`]
     /// by hand rather than publishing it to the process registry.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "epics"))]
     pub(crate) fn attach_for_test(&mut self, entry: PortEntry, addr: i32) {
-        self.device = Some(entry);
+        let dp = entry.handle.connect_device(addr);
+        self.device = Some((entry, dp));
         self.addr = addr;
     }
 
     /// The bound port, or C's `findDpCommon` failure: the `is*` calls share one
     /// message shape and one buffer, so they share this.
-    fn handle_for(&mut self, which: &str) -> Result<PortHandle, DeviceError> {
-        if let Some(entry) = self.device.as_ref() {
-            return Ok(entry.handle.clone());
+    fn dp(&mut self, which: &str) -> Result<&DpCells, DeviceError> {
+        if self.device.is_none() {
+            return Err(self.fail(format_args!(
+                "asynManager:{which} asynUser not connected to device"
+            )));
         }
-        Err(self.fail(format!(
-            "asynManager:{which} asynUser not connected to device"
-        )))
+        Ok(&self.device.as_ref().unwrap().1)
     }
 
-    fn fail(&mut self, message: String) -> DeviceError {
-        self.error_message = message;
+    fn fail(&mut self, message: std::fmt::Arguments<'_>) -> DeviceError {
+        self.error_message = FixedText::format(message);
         DeviceError
     }
 }
@@ -484,17 +525,23 @@ mod tests {
             user.error_message(),
             "asynManager:isEnabled asynUser not connected to device"
         );
+        assert_eq!(user.find_common(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:findInterface: not connected"
+        );
     }
 
     /// `connectDevice`'s three rejections in C's order — no port name, an
     /// unknown name, a user already connected — and the binding each leaves
-    /// behind (asynManager.c:1324-1355).
+    /// behind (asynManager.c:1324-1357).
     #[test]
     fn connect_device_binds_once_and_refuses_the_second_attempt() {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("devuser_port_1");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let mut user = DeviceUser::default();
         assert!(user.connect_device("", 0).is_err());
@@ -531,7 +578,7 @@ mod tests {
     /// being (`locateDevice(pport, addr, TRUE)`, asynManager.c:1349-1352):
     /// `asynReport` counts it in `nDevices` and prints its block from that
     /// moment. The boundaries: a multi-device port with `addr >= 0` allocates;
-    /// `addr < 0` on the same port binds the port's own dpCommon (:1349
+    /// `addr < 0` on the same port binds the port's own dpCommon (:1351
     /// `if(addr>=0)`); a single-device port allocates nothing whatever the
     /// addr (:576 `!(attributes&ASYN_MULTIDEVICE)`).
     #[test]
@@ -540,19 +587,23 @@ mod tests {
         let mut multi = DummyDriver::new("devuser_multi");
         multi.base.flags.multi_device = true;
         multi.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(multi).unwrap();
+        mgr.register_port(multi, &crate::registry::open_owner())
+            .unwrap();
         let mut single = DummyDriver::new("devuser_single");
         single.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(single).unwrap();
+        mgr.register_port(single, &crate::registry::open_owner())
+            .unwrap();
 
         let devices = |port: &str| {
             crate::registry::get_port(port)
                 .unwrap()
                 .handle
                 .with_driver_blocking(|d: &mut DummyDriver| {
-                    let mut addrs: Vec<i32> = d.base.device_states.keys().copied().collect();
-                    addrs.sort_unstable();
-                    addrs
+                    d.base
+                        .devices()
+                        .into_iter()
+                        .map(|(addr, _)| addr)
+                        .collect::<Vec<_>>()
                 })
                 .unwrap()
         };
@@ -595,7 +646,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("devuser_port_2");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let mut user = DeviceUser::default();
         user.connect_device("devuser_port_2", 0).unwrap();
@@ -623,7 +675,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("port1");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         assert!(mgr.find_port_handle("port1").is_ok());
         assert!(mgr.find_port_handle("nope").is_err());
@@ -634,7 +687,9 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("testport");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -645,7 +700,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("findme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let handle = mgr.find_port_handle("findme").unwrap();
         handle.write_int32_blocking(0, 0, 99).unwrap();
@@ -659,7 +715,8 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("rt_find");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         let handle = mgr.find_runtime_handle("rt_find").unwrap();
         handle.port_handle().write_int32_blocking(0, 0, 77).unwrap();
@@ -680,7 +737,8 @@ mod tests {
 
         let mut drv = DummyDriver::new("exctest");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        mgr.register_port(drv).unwrap();
+        mgr.register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         // The runtime sends a Started event but not via the exception manager.
         // Exception manager is injected for driver-level exceptions.
@@ -690,7 +748,8 @@ mod tests {
     #[test]
     fn test_unregister_port() {
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("removeme")).unwrap();
+        mgr.register_port(DummyDriver::new("removeme"), &crate::registry::open_owner())
+            .unwrap();
         assert!(mgr.find_port_handle("removeme").is_ok());
         mgr.unregister_port("removeme");
         assert!(mgr.find_port_handle("removeme").is_err());
@@ -702,8 +761,9 @@ mod tests {
         // with the same name must return PortAlreadyRegistered, not
         // silently overwrite the prior PortRuntimeHandle.
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("dup")).unwrap();
-        match mgr.register_port(DummyDriver::new("dup")) {
+        mgr.register_port(DummyDriver::new("dup"), &crate::registry::open_owner())
+            .unwrap();
+        match mgr.register_port(DummyDriver::new("dup"), &crate::registry::open_owner()) {
             Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
                 assert_eq!(name, "dup")
             }
@@ -721,20 +781,20 @@ mod tests {
         // must block manager registration too — the registry is the
         // process-wide authority on port names, matching C
         // asynManager::registerPort.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // Stands in for a port published by another creator; no actor loop
         // runs behind it, so its `ActorId` is never current on any thread.
         let ext = crate::port_handle::PortHandle::new(
             tx,
             "extowned".to_string(),
-            Arc::new(crate::interrupt::InterruptManager::new(4)),
-            crate::port_actor::ActorId::new(),
+            Arc::new(crate::interrupt::InterruptManager::new()),
+            crate::port_actor::ActorLink::unowned(),
             Arc::new(crate::trace::TraceManager::new()),
         );
-        crate::registry::register_port("extowned", ext).unwrap();
+        crate::registry::register_port("extowned", ext, &crate::registry::open_owner()).unwrap();
 
         let mgr = PortManager::new();
-        match mgr.register_port(DummyDriver::new("extowned")) {
+        match mgr.register_port(DummyDriver::new("extowned"), &crate::registry::open_owner()) {
             Err(crate::error::AsynError::PortAlreadyRegistered(name)) => {
                 assert_eq!(name, "extowned")
             }
@@ -750,10 +810,12 @@ mod tests {
     fn duplicate_after_unregister_succeeds() {
         // Replace-via-unregister must work cleanly.
         let mgr = PortManager::new();
-        mgr.register_port(DummyDriver::new("recycle")).unwrap();
+        mgr.register_port(DummyDriver::new("recycle"), &crate::registry::open_owner())
+            .unwrap();
         mgr.unregister_port("recycle");
         assert!(
-            mgr.register_port(DummyDriver::new("recycle")).is_ok(),
+            mgr.register_port(DummyDriver::new("recycle"), &crate::registry::open_owner())
+                .is_ok(),
             "re-register after unregister must succeed"
         );
     }
@@ -763,7 +825,9 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("f64_port");
         drv.base.create_param("TEMP", ParamType::Float64).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle
             .port_handle()
@@ -794,7 +858,9 @@ mod tests {
         // methods and no such layer answers "not implemented" (R18-71).
         drv.base
             .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         // Drive through the public handle helper — same path as
         // asynRecord's IEOS / OEOS writes after the
@@ -819,12 +885,100 @@ mod tests {
         let mgr = PortManager::new();
         let mut drv = DummyDriver::new("shutme");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
-        let handle = mgr.register_port(drv).unwrap();
+        let handle = mgr
+            .register_port(drv, &crate::registry::open_owner())
+            .unwrap();
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         handle.shutdown_and_wait();
 
         // After shutdown, operations should fail
         assert!(handle.port_handle().write_int32_blocking(0, 0, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod register_port_line_tests {
+    use super::*;
+    use crate::param::ParamType;
+    use crate::port::{PortDriver, PortDriverBase, PortFlags};
+
+    struct P(PortDriverBase);
+    impl PortDriver for P {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    fn port(name: &str) -> P {
+        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        P(base)
+    }
+
+    /// A refused registerPort prints C's two stdout lines, the manager's
+    /// (asynManager.c:2056) then the constructor's, and the error is the
+    /// constructor's throw (asynPortDriver.cpp:4036-4040). The
+    /// refusal here is a duplicate name, which `registerPort` also fails on.
+    #[test]
+    fn a_refused_register_port_prints_the_constructor_line() {
+        const CHILD: &str = "ASYN_RS_REGISTER_LINE_CHILD";
+        const TEST: &str = "manager::register_port_line_tests::a_refused_register_port_prints_the_constructor_line";
+        if std::env::var_os(CHILD).is_some() {
+            let mgr = PortManager::new();
+            let owner = crate::registry::open_owner();
+            let _first = mgr.register_port(port("dupLine"), &owner).unwrap();
+            match mgr.register_port(port("dupLine"), &owner) {
+                Err(AsynError::PortAlreadyRegistered(n)) => println!("ERR={n}"),
+                Err(e) => println!("OTHER={e}"),
+                Ok(_) => println!("REGISTERED"),
+            }
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "asynCommon:registerDriver dupLine already registered")
+            .unwrap_or_else(|| panic!("no already-registered line:\n{stdout}"));
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some("asynPortDriver:asynPortDriver ERROR: Can't register port: dupLine"),
+            "{stdout}"
+        );
+        assert!(stdout.lines().any(|l| l == "ERR=dupLine"), "{stdout}");
+        assert!(!stderr.contains("Can't register port"), "{stderr}");
+    }
+
+    /// A port that registers prints nothing.
+    #[test]
+    fn a_registered_port_prints_no_constructor_line() {
+        const CHILD: &str = "ASYN_RS_REGISTER_OK_CHILD";
+        const TEST: &str =
+            "manager::register_port_line_tests::a_registered_port_prints_no_constructor_line";
+        if std::env::var_os(CHILD).is_some() {
+            let mgr = PortManager::new();
+            let _h = mgr
+                .register_port(port("okLine"), &crate::registry::open_owner())
+                .unwrap();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec the test binary");
+        assert!(out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("Can't register port"));
     }
 }

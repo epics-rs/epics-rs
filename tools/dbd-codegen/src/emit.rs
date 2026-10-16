@@ -21,8 +21,8 @@ use crate::parse::{Device, Field, Menu, RecordType, Variable};
 /// * `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` are served as `DBR_STRING`
 ///   (the link's `dbGetLinkStr` rendering).
 /// * `DBF_NOACCESS` is a C-internal pointer (`RSET`, `DPVT`, `MLOK`, `BPTR`,
-///   ...). It is not CA-visible and has no port representation; the caller
-///   drops it.
+///   ...). It is not CA-visible and has no served type; the caller carries it
+///   as raw bytes ([`internal_width`]) or drops it to a name.
 pub fn dbf_to_rust(dbf: &str) -> Option<&'static str> {
     Some(match dbf {
         "DBF_STRING" => "String",
@@ -88,6 +88,25 @@ pub fn is_internal(f: &Field) -> bool {
     f.dbf == "DBF_NOACCESS" && f.special.as_deref() != Some("SPC_DBADDR")
 }
 
+/// The width of the C struct member an `extra("...")` declaration names.
+#[derive(Clone, Copy)]
+pub enum Width {
+    Bytes(u16),
+    /// `sizeof(void *)` of the target, which no `.dbd` states and which a
+    /// 32-bit RTEMS build does not share with a 64-bit host.
+    Pointer,
+}
+
+impl Width {
+    /// The `FieldDesc::size` initializer.
+    fn tokens(self) -> String {
+        match self {
+            Width::Bytes(n) => n.to_string(),
+            Width::Pointer => "core::mem::size_of::<*const ()>() as u16".to_string(),
+        }
+    }
+}
+
 /// The byte width of the C struct member an `extra("...")` declaration names.
 ///
 /// No `.dbd` spells this. A C IOC's generated `<rec>RecordSizeOffset` writes
@@ -97,24 +116,29 @@ pub fn is_internal(f: &Field) -> bool {
 ///
 /// `None` for a member this port cannot state a width for, and the test is on
 /// the DECLARATOR, not just the type name: only a plain scalar member has a
-/// width the type alone gives. A pointer (`*`) is refused because C prints its
-/// ADDRESS (`PTR %p`), which no two IOCs agree on. An array (`[`) is refused
-/// because its width is the bound, not the element — `calc.RPCL` is
+/// width the type alone gives. A `*` declarator without a `[` is a pointer —
+/// including a function pointer, `long (*cadr)(...)` — and its width is
+/// `sizeof(void *)`, which is what `dbpr`'s `PTR %p` arm tests
+/// (`dbTest.c:1239`). An array (`[`) is refused because its width is the
+/// bound, not the element — `calc.RPCL` is
 /// `extra("char rpcl[INFIX_TO_POSTFIX_SIZE(160)]")`, whose size is that C
 /// macro expanded, and reading the leading `char` would carry the row at one
 /// byte and print a one-byte `dbpr` line where C prints the whole buffer.
-fn extra_width(extra: &str) -> Option<u16> {
-    if extra.contains('*') || extra.contains('[') {
+fn extra_width(extra: &str) -> Option<Width> {
+    if extra.contains('[') {
         return None;
     }
+    if extra.contains('*') {
+        return Some(Width::Pointer);
+    }
     match extra.split_whitespace().next()? {
-        "epicsInt8" | "epicsUInt8" | "char" => Some(1),
-        "epicsInt16" | "epicsUInt16" | "short" => Some(2),
-        "epicsInt32" | "epicsUInt32" | "epicsFloat32" => Some(4),
-        "epicsInt64" | "epicsUInt64" | "epicsFloat64" => Some(8),
+        "epicsInt8" | "epicsUInt8" | "char" => Some(Width::Bytes(1)),
+        "epicsInt16" | "epicsUInt16" | "short" => Some(Width::Bytes(2)),
+        "epicsInt32" | "epicsUInt32" | "epicsFloat32" => Some(Width::Bytes(4)),
+        "epicsInt64" | "epicsUInt64" | "epicsFloat64" => Some(Width::Bytes(8)),
         // `epicsTimeStamp` is two `epicsUInt32` (`epicsTime.h`), which is
         // what `dbCommon.TIME` stands for.
-        "epicsTimeStamp" => Some(8),
+        "epicsTimeStamp" => Some(Width::Bytes(8)),
         _ => None,
     }
 }
@@ -127,8 +151,21 @@ fn extra_width(extra: &str) -> Option<u16> {
 /// both need the declaration, not just proof that the name exists. So the row
 /// is kept exactly when the port can say how wide it is; everything else stays
 /// a name.
-pub fn internal_width(f: &Field) -> Option<u16> {
+pub fn internal_width(f: &Field) -> Option<Width> {
     if !is_internal(f) {
+        return None;
+    }
+    extra_width(f.extra.as_deref()?)
+}
+
+/// The width of any `DBF_NOACCESS` declaration, `SPC_DBADDR` rows included.
+///
+/// `FieldDesc::size` is `sizeof(prec->member)` whatever the row's `special`:
+/// `dbpr` tests it (`dbTest.c:1239`) for the rows `cvt_dbaddr` re-types, such
+/// as `waveform.VAL` — `void *val` — whose descriptor must keep the pointer
+/// width or the row prints as nothing.
+fn declared_width(f: &Field) -> Option<Width> {
+    if f.dbf != "DBF_NOACCESS" {
         return None;
     }
     extra_width(f.extra.as_deref()?)
@@ -150,10 +187,12 @@ pub struct CvtDbAddr {
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
     pub selector: Option<String>,
+    /// The field that sets C's `field_size` (`SIZV`): a long string.
+    pub size: Option<String>,
 }
 
 /// Parse `dbd/cvt_dbaddr.types`:
-/// `record.FIELD  DBF_TYPE  SPC_xxx  selector|-  cite`.
+/// `record.FIELD  DBF_TYPE  SPC_xxx  selector|-  size|-  cite`.
 pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAddr>, String> {
     let mut out = BTreeMap::new();
     for (n, line) in src.lines().enumerate() {
@@ -162,12 +201,12 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(key), Some(dbf), Some(spc), Some(sel)) =
-            (it.next(), it.next(), it.next(), it.next())
+        let (Some(key), Some(dbf), Some(spc), Some(sel), Some(size)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next())
         else {
             return Err(format!(
                 "cvt_dbaddr.types:{}: expected \
-                 `record.FIELD DBF_TYPE SPC_xxx selector`, got `{line}`",
+                 `record.FIELD DBF_TYPE SPC_xxx selector size`, got `{line}`",
                 n + 1
             ));
         };
@@ -178,12 +217,16 @@ pub fn parse_cvt_dbaddr(src: &str) -> Result<BTreeMap<(String, String), CvtDbAdd
             return Err(format!("cvt_dbaddr.types:{}: unknown type `{dbf}`", n + 1));
         }
         special_variant(spc).map_err(|e| format!("cvt_dbaddr.types:{}: {e}", n + 1))?;
+        if size != "-" && dbf != "DBF_STRING" {
+            return Err(format!("cvt_dbaddr.types:{}: a size on a {dbf} row", n + 1));
+        }
         let prev = out.insert(
             (rec.to_string(), field.to_string()),
             CvtDbAddr {
                 dbf: dbf.to_string(),
                 special: spc.to_string(),
                 selector: (sel != "-").then(|| sel.to_string()),
+                size: (size != "-").then(|| size.to_string()),
             },
         );
         if prev.is_some() {
@@ -297,8 +340,8 @@ pub struct Input<'a> {
     /// mapped to base's generated const path. Empty for the base target, which
     /// declares every menu it references.
     pub external_menus: &'a BTreeMap<String, String>,
-    /// Record type names in DBD load order. Emitted only by the base target;
-    /// empty everywhere else.
+    /// Record type names in `recordTypeList` order. Emitted only by the base
+    /// target; empty everywhere else.
     pub order: &'a [String],
     /// Every `variable()` this target's `.dbd`s declare.
     pub variables: &'a [Variable],
@@ -359,29 +402,36 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
          //!   into every record table would double-declare them. Base's table emits\n\
          //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled\n\
          //!   (and so a `dbCommon` addition is a diff, not a silent gap).\n\
-         //! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an\n\
-         //!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps\n\
-         //!   `sizeof` the struct member in `pdbFldDes->size`, and neither a\n\
-         //!   pointer (whose C value is an address no two IOCs agree on) nor an\n\
-         //!   array (whose width is its bound, not its element) has one this port\n\
-         //!   can state, so the *descriptor* is dropped rather than invented —\n\
-         //!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`\n\
-         //!   resolves them, so a SEARCH for `REC.BPTR` is answered and the\n\
-         //!   refusal lands at channel creation, and the search gate needs the\n\
-         //!   names to do the same.\n\
+         //! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type\n\
+         //!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,\n\
+         //!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and\n\
+         //!   an array's width is its bound, not its element, so the *descriptor*\n\
+         //!   is dropped rather than invented — but the NAME is kept\n\
+         //!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a\n\
+         //!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel\n\
+         //!   creation, and the search gate needs the names to do the same.\n\
          //!\n\
          //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`\n\
-         //!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`\n\
-         //!   prints its bytes and `dba` reports its `Field Size` and both read\n\
-         //!   the declaration. Carried is not servable: `FieldDesc::unreadable`\n\
-         //!   is what refuses the read, so the SEARCH is answered off the\n\
-         //!   descriptor instead of off the name list.\n",
+         //!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is\n\
+         //!   CARRIED, descriptor and width both, because `dbpr` prints it and\n\
+         //!   `dba` reports its `Field Size` and both read the declaration. A\n\
+         //!   pointer's width is `sizeof(void *)` of the build, as C's is.\n\
+         //!   Carried is not servable: `FieldDesc::unreadable` is what refuses\n\
+         //!   the read, so the SEARCH is answered off the descriptor instead of\n\
+         //!   off the name list.\n\
+         //!\n\
+         //! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field\n\
+         //! table here, the one numbering a `FieldSlot` uses. Names are as\n\
+         //! declared; a name that is not a Rust identifier has each other\n\
+         //! character replaced by `_`, a leading digit prefixed by `_`, and a\n\
+         //! keyword suffixed by `_`.\n",
         input.dbd_dir
     )
     .unwrap();
     out.push_str("#![allow(clippy::all)]\n\n");
     if !input.devices.is_empty() {
-        writeln!(out, "use {base}::server::record::DbLinkType;").unwrap();
+        writeln!(out, "use super::dsets;").unwrap();
+        writeln!(out, "use {base}::server::record::{{DbLinkType, DevSup}};").unwrap();
     }
     // `Asl`, `Special`, `DbFieldType` and `DbfCode` appear ONLY in an emitted `FieldDesc`
     // literal, so a target with no record fields (asyn declares only `device()`
@@ -532,7 +582,9 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     let mut record_consts: Vec<(String, String)> = Vec::new();
     let mut noaccess_consts: Vec<(String, String)> = Vec::new();
     let mut decl_consts: Vec<(String, String)> = Vec::new();
+    let mut dbaddr_consts: Vec<(String, String)> = Vec::new();
     let mut no_prompt: Vec<(String, usize)> = Vec::new();
+    let mut slot_mods: Vec<(String, Vec<String>)> = Vec::new();
     for rec in input.records {
         let konst = fields_const(&rec.name);
         let own: Vec<&Field> = rec
@@ -569,6 +621,10 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         }
         out.push_str("];\n\n");
         record_consts.push((rec.name.clone(), konst.clone()));
+        slot_mods.push((
+            rec.name.clone(),
+            own.iter().map(|f| f.name.clone()).collect(),
+        ));
 
         // The dropped internals keep their NAMES: C's `dbNameToAddr`
         // resolves a `DBF_NOACCESS` field, so a SEARCH for it is answered
@@ -592,6 +648,26 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         }
         out.push_str("];\n\n");
         noaccess_consts.push((rec.name.clone(), na_konst));
+
+        // The `.dbd`'s own `special(SPC_DBADDR)` rows — `pdbFldDes->special`,
+        // which `cvt_dbaddr` cannot overwrite — so a put asks a list of a few
+        // names rather than every row of `{konst}`.
+        let da_konst = format!("{}_DBADDR", konst.trim_end_matches("_FIELDS"));
+        writeln!(
+            out,
+            "/// `recordtype({})` — the fields its `.dbd` declares `special(SPC_DBADDR)`.",
+            rec.name
+        )
+        .unwrap();
+        writeln!(out, "pub static {da_konst}: &[&str] = &[").unwrap();
+        for f in own
+            .iter()
+            .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
+        {
+            writeln!(out, "    {},", rust_str(&f.name)).unwrap();
+        }
+        out.push_str("];\n\n");
+        dbaddr_consts.push((rec.name.clone(), da_konst));
 
         // C's `papFldDes` — EVERY declaration in `.dbd` order with dbCommon
         // spliced at the `include`, internals included. It is a different list
@@ -712,17 +788,14 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
 
     if !input.order.is_empty() {
         out.push_str(
-            "/// Every record type this port declares, in DBD **load** order — the order\n\
-             /// C's `pdbbase->recordTypeList` holds.\n\
+            "/// Every record type this port declares, in the order C's\n\
+             /// `pdbbase->recordTypeList` holds: name order, because an IOC loads its\n\
+             /// expanded `.dbd` and `dbdExpand.pl` writes record types sorted.\n\
              ///\n\
              /// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` record-type-major:\n\
              /// the outer loop walks `recordTypeList`, the inner one walks that type's\n\
              /// instances in `.db` order. So this table, not `.db` declaration order alone,\n\
              /// is what decides which of two same-`PHAS` records scans first.\n\
-             ///\n\
-             /// Base's own types come from `stdRecords.dbd`, vendored beside the `.dbd`\n\
-             /// files it names; every other type this port vendors sorts after all of them,\n\
-             /// where a C IOC also puts a module `.dbd` included after `base.dbd`.\n\
              pub static RECORD_TYPE_ORDER: &[&str] = &[\n",
         );
         for name in input.order {
@@ -757,6 +830,18 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         noaccess_consts
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
+
+    out.push_str(
+        "/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or\n\
+         /// `None` for a type no vendored `.dbd` declares.\n\
+         pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {\n",
+    );
+    emit_str_lookup(
+        &mut out,
+        "record_type",
+        dbaddr_consts.iter().map(|(k, v)| (k.as_str(), v.as_str())),
     );
     out.push_str("}\n\n");
 
@@ -804,7 +889,97 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     }
     out.push_str("];\n");
 
+    emit_slots(&mut out, base, &slot_mods)?;
+
+    // Base's tables are base's own lookups; a downstream crate hands its set
+    // to base through `register_contributed_dbd`, its `dbLoadDatabase`.
+    if base != "crate" {
+        writeln!(
+            out,
+            "\n/// This crate's tables, for `{base}::server::record::register_contributed_dbd`.\n\
+             pub static DBD: {base}::server::record::ContributedDbd =\n\
+             \x20   {base}::server::record::ContributedDbd {{\n\
+             \x20       record_types: RECORD_TYPES,\n\
+             \x20       record_declaration_order,\n\
+             \x20       record_fields,\n\
+             \x20       record_no_prompt,\n\
+             \x20       menus: MENUS,\n\
+             \x20   }};"
+        )
+        .unwrap();
+    }
+
     Ok(out)
+}
+
+/// `pub mod slots { pub mod <rtype> { pub const <FIELD>: FieldSlot = ...; } }`,
+/// each value the field's index in its type's field table. Nothing is emitted
+/// for a target with no record types.
+fn emit_slots(out: &mut String, base: &str, types: &[(String, Vec<String>)]) -> Result<(), String> {
+    if types.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\n/// Each field's index in its record type's field table: the slot\n\
+         /// `RecordCell::new` caches it at and `FieldSlot` names.\n\
+         // Module names are the record type names as declared (`aSub`).\n\
+         #[allow(non_snake_case)]\n\
+         pub mod slots {{\n\
+         \x20   use {base}::server::record::FieldSlot;"
+    )
+    .unwrap();
+    let mut mods = BTreeSet::new();
+    for (rtype, fields) in types {
+        let module = rust_ident(rtype);
+        if !mods.insert(module.clone()) {
+            return Err(format!("slots module collision: {rtype} -> {module}"));
+        }
+        writeln!(
+            out,
+            "\n    pub mod {module} {{\n        use super::FieldSlot;"
+        )
+        .unwrap();
+        let mut consts = BTreeSet::new();
+        for (i, name) in fields.iter().enumerate() {
+            let konst = rust_ident(name);
+            if !consts.insert(konst.clone()) {
+                return Err(format!("slots::{module} collision: {name} -> {konst}"));
+            }
+            let i = u16::try_from(i)
+                .map_err(|_| format!("{rtype}.{name}: index {i} exceeds FieldSlot"))?;
+            writeln!(
+                out,
+                "        pub const {konst}: FieldSlot = FieldSlot({i});"
+            )
+            .unwrap();
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
+    Ok(())
+}
+
+/// `name` as a Rust identifier, by the escape the module header documents.
+fn rust_ident(name: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod",
+        "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+        "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box",
+        "do", "final", "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+    ];
+    let mut out: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    if out == "_" || KEYWORDS.contains(&out.as_str()) {
+        out.push('_');
+    }
+    out
 }
 
 /// Emit the body of a `fn(&str) -> Option<&'static [T]>` string-keyed lookup:
@@ -914,42 +1089,54 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
     }
     out.push_str("];\n\n");
 
-    // --- device link types ----------------------------------------------
+    // --- device rows ------------------------------------------------------
     //
-    // The `link_type` argument of each `device()` line — C `devSup::link_type`.
-    // `dbCanSetLink` (`dbStaticLib.c:2400-2419`) refuses to install a link whose
-    // parsed type is incompatible with the device's, which is how C rejects a
-    // `.db` that hands an `INST_IO` device a constant `INP`. The port dropped
-    // this argument at the parser and so accepted that `.db`.
+    // Each `device()` line as C's `devSup`. Its `link_type` is what
+    // `dbCanSetLink` (`dbStaticLib.c:2400-2419`) holds a link to, which is how
+    // C rejects a `.db` that hands an `INST_IO` device a constant `INP`. The
+    // dset shape comes from the target's hand-written `dsets` module, one
+    // const per dset symbol, so a `device()` line without one does not build.
     out.push_str(
         "// ---------------------------------------------------------------------\n\
-         // Per-(record type, DTYP) device LINK TYPE (C `devSup::link_type`), the\n\
-         // half of the `device()` declaration `dbCanSetLink` enforces.\n\
+         // Per-record-type device rows (C `devSup`), in `.dbd` declaration order.\n\
          // ---------------------------------------------------------------------\n\n",
     );
-    let mut link_consts: Vec<(&str, String)> = Vec::new();
+    let mut row_consts: Vec<(&str, String)> = Vec::new();
     let mut by_record: BTreeMap<&str, Vec<&Device>> = BTreeMap::new();
     for d in input.devices {
         by_record.entry(d.record.as_str()).or_default().push(d);
     }
     for (record, devs) in &by_record {
-        let konst = format!(
-            "DEVICE_LINK_TYPES_{}",
-            record.to_uppercase().replace('-', "_")
-        );
-        writeln!(
-            out,
-            "/// `device({record}, LINK_TYPE, ...)` — the link type each DTYP choice demands."
-        )
-        .unwrap();
-        writeln!(out, "pub static {konst}: &[(&str, DbLinkType)] = &[").unwrap();
+        let konst = format!("DEVICES_{}", record.to_uppercase().replace('-', "_"));
+        writeln!(out, "/// The `device({record}, ...)` lines.").unwrap();
+        writeln!(out, "pub static {konst}: &[DevSup] = &[").unwrap();
         for d in devs {
             let variant = link_type_variant(&d.link_type)?;
-            writeln!(out, "    ({}, DbLinkType::{variant}),", rust_str(&d.name)).unwrap();
+            writeln!(
+                out,
+                "    DevSup {{\n        name: {},\n        choice: {},\n        link_type: DbLinkType::{variant},\n        dset: dsets::{},\n    }},",
+                rust_str(&d.dset),
+                rust_str(&d.name),
+                d.dset.to_uppercase()
+            )
+            .unwrap();
         }
         out.push_str("];\n\n");
-        link_consts.push((record, konst));
+        row_consts.push((record, konst));
     }
+    out.push_str(
+        "/// Every `device()` line for a record type, in declaration order:\n\
+         /// [`device_menu`]'s choices, each as its `devSup`.\n\
+         pub fn devices(record_type: &str) -> Option<&'static [DevSup]> {\n",
+    );
+    emit_str_lookup(
+        out,
+        "record_type",
+        row_consts
+            .iter()
+            .map(|(record, konst)| (*record, konst.as_str())),
+    );
+    out.push_str("}\n\n");
     out.push_str(
         "/// The link type the named `DTYP` of `record_type` demands of its `INP`/`OUT`.\n\
          ///\n\
@@ -957,18 +1144,10 @@ fn emit_devices(out: &mut String, input: &Input<'_>) -> Result<(), String> {
          /// crate registering its device support at runtime (asyn, motor) brings no\n\
          /// `.dbd`, so there is no declaration to enforce and none is invented.\n\
          pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {\n\
-         \x20   let table = match record_type {\n",
-    );
-    for (record, konst) in &link_consts {
-        writeln!(out, "        {} => {konst},", rust_str(record)).unwrap();
-    }
-    out.push_str(
-        "        _ => return None,\n\
-         \x20   };\n\
-         \x20   table\n\
+         \x20   devices(record_type)?\n\
          \x20       .iter()\n\
-         \x20       .find(|(name, _)| name.eq_ignore_ascii_case(dtyp))\n\
-         \x20       .map(|(_, lt)| *lt)\n\
+         \x20       .find(|row| row.choice.eq_ignore_ascii_case(dtyp))\n\
+         \x20       .map(|row| row.link_type)\n\
          }\n\n",
     );
 
@@ -1052,6 +1231,7 @@ fn emit_field(
         }
     }
     let runtime_typed = entry.is_some_and(|c| c.selector.is_some());
+    let long_string = entry.is_some_and(|c| c.size.is_some());
     // The RAW declaration, before `field_dbf` swapped in the cvt_dbaddr type —
     // C's `pdbFldDes->field_type`, which `dbDumpField` prints and which
     // `dbPutString` refuses a `.db` assignment on (`dbStaticLib.c:2646-2650`).
@@ -1067,6 +1247,7 @@ fn emit_field(
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
     writeln!(s, "        declared_dbf: DbfCode::{declared_dbf},").unwrap();
     writeln!(s, "        runtime_typed: {runtime_typed},").unwrap();
+    writeln!(s, "        long_string: {long_string},").unwrap();
     writeln!(s, "        read_only: {read_only},").unwrap();
     writeln!(s, "        special: {special},").unwrap();
     writeln!(s, "        declared_special: {declared_special},").unwrap();
@@ -1075,7 +1256,7 @@ fn emit_field(
     writeln!(
         s,
         "        size: {},",
-        kept_internal.unwrap_or_else(|| f.size.unwrap_or(0) as u16)
+        declared_width(f).map_or_else(|| f.size.unwrap_or(0).to_string(), Width::tokens)
     )
     .unwrap();
     // C's loader requires `extra` on every DBF_NOACCESS row and `size` on
@@ -1125,6 +1306,16 @@ mod tests {
         assert_eq!(fields_const("mbbiDirect"), "MBBI_DIRECT_FIELDS");
         assert_eq!(fields_const("aSub"), "A_SUB_FIELDS");
         assert_eq!(fields_const("int64in"), "INT64IN_FIELDS");
+    }
+
+    #[test]
+    fn slot_identifiers_escape_deterministically() {
+        assert_eq!(rust_ident("VAL"), "VAL");
+        assert_eq!(rust_ident("aSub"), "aSub");
+        assert_eq!(rust_ident("A.B"), "A_B");
+        assert_eq!(rust_ident("1X"), "_1X");
+        assert_eq!(rust_ident("type"), "type_");
+        assert_eq!(rust_ident(""), "__");
     }
 
     /// The generator emits the *declared* DBF type and leaves the CA promotion

@@ -1804,6 +1804,7 @@ impl Default for StatsProcessor {
 }
 
 impl NDPluginProcess for StatsProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let p = &self.params;
         let info = array.info();
@@ -2136,6 +2137,7 @@ pub fn create_stats_runtime(
     ndarray_port: &str,
     wiring: Arc<WiringRegistry>,
     ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     Arc<Mutex<StatsResult>>,
@@ -2156,6 +2158,7 @@ pub fn create_stats_runtime(
         queue_size,
         ndarray_port,
         wiring,
+        threads,
     );
 
     let stats_params = *params_handle.lock();
@@ -2348,15 +2351,8 @@ mod tests {
     #[cfg(feature = "simd")]
     #[test]
     fn wide_and_float_kernels_match_the_lane_passes_on_every_level() {
-        use fearless_simd::{Level, dispatch};
-        let top = ad_core_rs::simd::level();
-        let mut levels = vec![top, Level::baseline()];
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            levels.extend(top.as_avx2().map(Level::Avx2));
-            levels.extend(top.as_sse4_2().map(Level::Sse4_2));
-            levels.extend(top.as_sse2().map(Level::Sse2));
-        }
+        use fearless_simd::dispatch;
+        let levels = ad_core_rs::simd::levels();
         fn same<T: StatsElem + std::fmt::Debug>(what: &str, got: Range<T>, want: Range<T>) {
             let bits = |x: T| format!("{x:?}");
             assert_eq!(bits(got.min), bits(want.min), "{what} min");
@@ -3206,8 +3202,15 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let ts_registry = crate::time_series::TsReceiverRegistry::new();
-        let (handle, stats, _params, _jh) =
-            create_stats_runtime("STATS_RT", pool, 10, "", wiring, &ts_registry);
+        let (handle, stats, _params, _jh) = create_stats_runtime(
+            "STATS_RT",
+            pool,
+            10,
+            "",
+            wiring,
+            &ts_registry,
+            ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
+        );
 
         // Plugins default to disabled — enable for test, and fence until the
         // data thread has applied the flip (the write only queues it).

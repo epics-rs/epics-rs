@@ -1,5 +1,19 @@
 use thiserror::Error;
 
+/// One `yyerrorAbort` from the `.db` lexer's `JSON` start condition
+/// (`dbLex.l:136-155`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonLexFault {
+    /// `Invalid character '%c'`; carries the character.
+    Invalid(u8),
+    /// `Bad character in JSON string`; carries the whole string, quotes included.
+    BadString(String),
+    /// `Newline in string, closing quote missing` (`dbLex.l:131-133`), the
+    /// `INITIAL`-state rule the lookahead token after a value can draw; carries
+    /// the text through the newline it consumed.
+    NewlineInString(String),
+}
+
 #[derive(Error, Debug)]
 pub enum CaError {
     #[error("I/O error: {0}")]
@@ -42,13 +56,19 @@ pub enum CaError {
     BadField(String),
 
     /// C `S_db_badChoice` ("Illegal choice") — a `DBR_STRING` write to a
-    /// `DBF_MENU` field named neither an exact choice label nor an in-range
-    /// index (`dbConvert.c::putStringMenu:1216-1229`). C's converter returns
+    /// `DBF_MENU` or `DBF_ENUM` field named neither an exact choice label nor
+    /// an in-range index (`dbConvert.c::putStringMenu:1216-1229`). C's converter returns
     /// this from inside `dbPut`, *before* the value is stored
     /// (`dbAccess.c:1362`), so the field keeps its old value, no monitor is
     /// posted and the record is not processed.
     #[error("illegal menu choice: {0}")]
-    BadChoice(String),
+    BadChoice(ChoiceRefusal),
+
+    /// C `S_dbLib_badField` from `dbParseLink` — brace-delimited link text
+    /// `dbJLinkParse` refused (`dbStaticLib.c:2281-2283`). The field keeps
+    /// its old link.
+    #[error("invalid value: {0}")]
+    BadLink(LinkRefusal),
 
     /// C `S_db_badDbrtype` ("Illegal Database Request Type") — `dbPut`
     /// refusing a put to a DBF link field (`field_type > DBF_DEVICE`,
@@ -68,6 +88,11 @@ pub enum CaError {
 
     #[error("link error: {0}")]
     LinkError(String),
+
+    /// C `S_db_noSupport` ("RSET or DSXT routine not defined") — a runtime
+    /// device-link put whose device support has no extension table.
+    #[error("RSET or DSXT routine not defined")]
+    NoSupport,
 
     /// A `.db`/`.dbd` parse abort, carried as C `yyerror` prints it
     /// (`dbYacc.y:370-383`): the line, the sentence, and `yytext` — the token
@@ -138,6 +163,356 @@ pub enum CaError {
     /// rsrv answers `ECA_PUTFAIL`.
     #[error("get conversion failed: {0}")]
     GetConvertFailed(String),
+}
+
+/// The payload of [`CaError::BadChoice`], as data: the refusal is made under
+/// the put's hold and its text is formatted only when it is printed or shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceRefusal(Choice);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Choice {
+    /// `from` names none of `field`'s `count` choices and is no index below
+    /// it, with the report C prints for it while that is still owed.
+    String {
+        field: ReportString,
+        from: ReportString,
+        count: u16,
+        owed: Owed,
+    },
+    /// `index` is past `field`'s `count` choices.
+    Index {
+        field: ReportString,
+        index: i64,
+        count: u16,
+    },
+    Said(&'static str),
+    /// A `.db` load's refusal, made with no hold.
+    Text(String),
+}
+
+/// The report a [`Choice::String`] refusal still owes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owed {
+    Nothing,
+    /// `cvt_st_e` / `putStringEnum`'s
+    /// `recGblRecordError(S_db_badChoice, precord, from)`.
+    RecordError,
+    /// `cvt_st_menu`'s `recGblDbaddrError` (`dbFastLinkConv.c:314`).
+    CvtStMenu,
+    /// `cvt_st_device`'s `recGblDbaddrError` (`dbFastLinkConv.c:347`).
+    CvtStDevice,
+}
+
+use crate::server::recgbl::ReportString;
+
+impl ChoiceRefusal {
+    /// A refusal from `cvt_st_e` / `putStringEnum`, which report it with
+    /// `recGblRecordError(status, precord, from)` (`dbFastLinkConv.c:279`,
+    /// `dbConvert.c:1189`).
+    pub(crate) fn enum_state(field: &str, from: &str, count: usize) -> Self {
+        Self(Choice::String {
+            field: ReportString::new(field),
+            from: ReportString::new(from),
+            count: count as u16,
+            owed: Owed::RecordError,
+        })
+    }
+
+    /// `from` names no menu choice of `field` and is no index below `count`.
+    /// `owed` is its converter's line; the loader's `dbPutStringNum` prints
+    /// none.
+    pub(crate) fn menu(field: &str, from: &str, count: usize, owed: Owed) -> Self {
+        Self(Choice::String {
+            field: ReportString::new(field),
+            from: ReportString::new(from),
+            count: count as u16,
+            owed,
+        })
+    }
+
+    /// `index` is past `field`'s `count` menu choices.
+    pub(crate) fn index(field: &str, index: i64, count: usize) -> Self {
+        Self(Choice::Index {
+            field: ReportString::new(field),
+            index,
+            count: count as u16,
+        })
+    }
+
+    /// Move out the report C prints with this refusal, for the put's owner.
+    pub(crate) fn take_report(&mut self) -> Option<crate::server::recgbl::PutReport> {
+        use crate::server::recgbl::PutReport;
+        match &mut self.0 {
+            Choice::String { from, owed, .. } => {
+                let report = match *owed {
+                    Owed::Nothing => None,
+                    Owed::RecordError => Some(PutReport::IllegalChoice { from: *from }),
+                    Owed::CvtStMenu => Some(PutReport::DbaddrError {
+                        status: "Illegal choice",
+                        message: "dbFastLinkConv(cvt_st_menu)",
+                    }),
+                    Owed::CvtStDevice => Some(PutReport::DbaddrError {
+                        status: "Illegal choice",
+                        message: "dbFastLinkConv(cvt_st_device)",
+                    }),
+                };
+                *owed = Owed::Nothing;
+                report
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The payload of [`CaError::BadLink`]: why `dbParseLink` refused the text,
+/// and whether the line `dbJLinkInit` prints while it parses
+/// (`dbJLink.c:262-268`) is still owed. Carried out of the hold as data, like
+/// [`ChoiceRefusal`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkRefusal {
+    why: LinkWhy,
+    owed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkWhy {
+    /// A link type C registers and this port does not serve. C prints
+    /// nothing of its own here.
+    Unported(ReportString),
+    /// `dbJLinkInit: Link type '%s' not found`.
+    NotFound(ReportString),
+    /// `dbJLinkInit: Support for Link type '%s' not loaded`: declared by a
+    /// loaded `link()` line, bound to no support.
+    NotLoaded(ReportString),
+    /// `dbJLinkInit: Illegal second link key '%s'`.
+    SecondKey(ReportString),
+    /// A `/*` with no `*/`, at this byte.
+    UnterminatedComment(usize),
+    NoTypeKey,
+    /// A served type's reader refused its value.
+    ValueRejected(ReportString),
+    /// `lnkConst` stopped the parse, printing what it said if anything.
+    ConstStop(Option<&'static str>),
+    /// `alloc_jlink` refused the field's link type: what the link type said,
+    /// then `dbJLinkInit: Link type '%s' allocation failed. `.
+    AllocFailed {
+        key: &'static str,
+        said: &'static str,
+    },
+    /// `lnkCalc`'s callbacks stopped the parse, saying why.
+    CalcStop(CalcSaid),
+    /// yajl's verbose error block.
+    Yajl(crate::server::db_convert_json::YajlError),
+    /// A `#` link whose letters name no bus.
+    NoBus,
+    /// This dset's `add_record` refused the new link; its line goes out
+    /// through the put's own report.
+    AddRecord(&'static str),
+    /// This dset's `del_record` refused to let the old link go.
+    DelRecord(&'static str),
+    /// `dbPutFieldLink`'s `S_db_badHWaddr` (`dbAccess.c:1171-1174`): this
+    /// field's link was removed by an earlier refused put, and C says
+    /// nothing.
+    NotDefined(&'static str),
+}
+
+/// What `lnkCalc`'s parse callbacks print before they stop
+/// (`lnkCalc.c:122-370`), each after `lnkCalc: `.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CalcSaid {
+    TooManyArgs,
+    UnexpectedInteger(i64),
+    /// `%g` of the value.
+    UnexpectedDouble(ReportString),
+    BadTime(ReportString),
+    /// `sCalcErrorStr`'s text.
+    BadExpr(&'static str),
+    UnexpectedString(ReportString),
+    UnexpectedMap,
+    UnknownKey(ReportString),
+    NoExpr,
+    NoOut,
+    UnexpectedArray,
+    UnexpectedChild(i32),
+}
+
+impl std::fmt::Display for CalcSaid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyArgs => write!(
+                f,
+                "Too many input args, limit is {}",
+                crate::calc::CALC_NARGS
+            ),
+            Self::UnexpectedInteger(value) => write!(f, "Unexpected integer {value}"),
+            Self::UnexpectedDouble(g) => write!(f, "Unexpected double {}", g.as_str()),
+            Self::BadTime(text) => write!(f, "Bad 'time' parameter \"{}\"", text.as_str()),
+            Self::BadExpr(why) => write!(f, "Error in calc expression, {why}"),
+            Self::UnexpectedString(text) => write!(f, "Unexpected string \"{}\"", text.as_str()),
+            Self::UnexpectedMap => f.write_str("Unexpected map"),
+            Self::UnknownKey(key) => write!(f, "Unknown key \"{}\"", key.as_str()),
+            Self::NoExpr => f.write_str("No expression ('expr' key)"),
+            Self::NoOut => f.write_str("No output link ('out' key)"),
+            Self::UnexpectedArray => f.write_str("Unexpected array"),
+            Self::UnexpectedChild(state) => {
+                write!(f, "Unexpected child link, parser state = {state}")
+            }
+        }
+    }
+}
+
+impl LinkRefusal {
+    pub(crate) fn new(why: LinkWhy) -> Self {
+        let owed = matches!(
+            why,
+            LinkWhy::NotFound(_)
+                | LinkWhy::NotLoaded(_)
+                | LinkWhy::SecondKey(_)
+                | LinkWhy::ConstStop(Some(_))
+                | LinkWhy::AllocFailed { .. }
+                | LinkWhy::CalcStop(_)
+                | LinkWhy::Yajl(_)
+        );
+        Self { why, owed }
+    }
+
+    /// A dset's `add_record` refused the link, printing nothing of its own
+    /// or having printed it already.
+    pub fn add_record(dset: &'static str) -> Self {
+        Self::new(LinkWhy::AddRecord(dset))
+    }
+
+    /// A dset's `del_record` refused to release the old link, printing
+    /// nothing of its own or having printed it already.
+    pub fn del_record(dset: &'static str) -> Self {
+        Self::new(LinkWhy::DelRecord(dset))
+    }
+
+    /// The errlog line still owed for this refusal, if C prints one.
+    pub fn report(&self) -> Option<String> {
+        if !self.owed {
+            return None;
+        }
+        Some(match self.why {
+            LinkWhy::ConstStop(Some(said)) => said.to_string(),
+            LinkWhy::AllocFailed { key, said } => {
+                format!("{said}\ndbJLinkInit: Link type '{key}' allocation failed. \n")
+            }
+            LinkWhy::Yajl(e) => format!("dbJLinkInit: {e}\n"),
+            _ => format!("{self}\n"),
+        })
+    }
+
+    /// Print [`Self::report`], with the hold down.
+    pub(crate) fn emit(&self) {
+        if let Some(line) = self.report() {
+            crate::runtime::log::errlog_printf(&line);
+        }
+    }
+}
+
+impl std::fmt::Display for LinkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.why {
+            LinkWhy::Unported(key) => write!(
+                f,
+                "dbJLinkInit: Link type '{}' is registered by epics-base but not \
+                 implemented by this port",
+                key.as_str()
+            ),
+            LinkWhy::NotFound(key) => {
+                write!(f, "dbJLinkInit: Link type '{}' not found", key.as_str())
+            }
+            LinkWhy::NotLoaded(key) => write!(
+                f,
+                "dbJLinkInit: Support for Link type '{}' not loaded",
+                key.as_str()
+            ),
+            LinkWhy::SecondKey(key) => {
+                write!(f, "dbJLinkInit: Illegal second link key '{}'", key.as_str())
+            }
+            LinkWhy::UnterminatedComment(offset) => write!(
+                f,
+                "dbJLinkInit: not a JSON link — unterminated block comment '/*' at byte {offset}"
+            ),
+            LinkWhy::NoTypeKey => f.write_str("dbJLinkInit: not a JSON link — no link type key"),
+            LinkWhy::ValueRejected(key) => write!(
+                f,
+                "dbJLinkInit: Link type '{}' rejected its value",
+                key.as_str()
+            ),
+            LinkWhy::ConstStop(_) => f.write_str("dbJLinkInit: lnkConst refused its value"),
+            LinkWhy::AllocFailed { key, .. } => {
+                write!(f, "dbJLinkInit: Link type '{key}' allocation failed.")
+            }
+            LinkWhy::CalcStop(said) => write!(f, "lnkCalc: {said}"),
+            LinkWhy::Yajl(_) => f.write_str("dbJLinkInit: not a JSON link"),
+            LinkWhy::NoBus => f.write_str("dbParseLink: the text names no hardware bus"),
+            LinkWhy::AddRecord(dset) => write!(f, "{dset} (add_record) refused the link"),
+            LinkWhy::DelRecord(dset) => write!(f, "{dset} (del_record) kept the link"),
+            LinkWhy::NotDefined(field) => write!(f, "{field} has no link to remove"),
+        }
+    }
+}
+
+impl CaError {
+    /// Emit the errlog line a refused put still owes ([`LinkRefusal`]). Called
+    /// by a put entry once its gate is down.
+    pub(crate) fn emit_put_report(&self) {
+        if let CaError::BadLink(refusal) = self {
+            refusal.emit();
+        }
+    }
+
+    /// Move out what [`Self::emit_put_report`] would print, for a put whose
+    /// error is handed back before its gate drops.
+    pub(crate) fn take_put_report(&mut self) -> Option<LinkRefusal> {
+        match self {
+            CaError::BadLink(refusal) if refusal.owed => {
+                refusal.owed = false;
+                Some(LinkRefusal {
+                    owed: true,
+                    ..*refusal
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for ChoiceRefusal {
+    fn from(detail: String) -> Self {
+        Self(Choice::Text(detail))
+    }
+}
+
+impl From<&'static str> for ChoiceRefusal {
+    fn from(said: &'static str) -> Self {
+        Self(Choice::Said(said))
+    }
+}
+
+impl std::fmt::Display for ChoiceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Choice::String {
+                field, from, count, ..
+            } => write!(
+                f,
+                "{}: '{}' is no choice and no index below {count}",
+                field.as_str(),
+                from.as_str()
+            ),
+            Choice::Index {
+                field,
+                index,
+                count,
+            } => write!(f, "{}: {index} is no index below {count}", field.as_str()),
+            Choice::Said(said) => f.write_str(said),
+            Choice::Text(text) => f.write_str(text),
+        }
+    }
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)

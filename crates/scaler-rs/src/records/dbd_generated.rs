@@ -15,23 +15,29 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
-//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
-//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
-//!   pointer (whose C value is an address no two IOCs agree on) nor an
-//!   array (whose width is its bound, not its element) has one this port
-//!   can state, so the *descriptor* is dropped rather than invented —
-//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
-//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
-//!   refusal lands at channel creation, and the search gate needs the
-//!   names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names an array or a type
+//!   this generator has no width for** (`MLOK`, `MLIS`, `BKLNK`, `RPCL`,
+//!   ...). C keeps `sizeof` the struct member in `pdbFldDes->size`, and
+//!   an array's width is its bound, not its element, so the *descriptor*
+//!   is dropped rather than invented — but the NAME is kept
+//!   (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so a
+//!   SEARCH for `REC.MLOK` is answered and the refusal lands at channel
+//!   creation, and the search gate needs the names to do the same.
 //!
 //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
-//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
-//!   prints its bytes and `dba` reports its `Field Size` and both read
-//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
-//!   is what refuses the read, so the SEARCH is answered off the
-//!   descriptor instead of off the name list.
+//!   and `TIME` — or a pointer — `RSET`, `DPVT`, `BPTR`, `PPN`, ... — is
+//!   CARRIED, descriptor and width both, because `dbpr` prints it and
+//!   `dba` reports its `Field Size` and both read the declaration. A
+//!   pointer's width is `sizeof(void *)` of the build, as C's is.
+//!   Carried is not servable: `FieldDesc::unreadable` is what refuses
+//!   the read, so the SEARCH is answered off the descriptor instead of
+//!   off the name list.
+//!
+//! `slots::<rtype>::<FIELD>` is `FIELD`'s index in `<rtype>`'s field
+//! table here, the one numbering a `FieldSlot` uses. Names are as
+//! declared; a name that is not a Rust identifier has each other
+//! character replaced by `_`, a leading digit prefixed by `_`, and a
+//! keyword suffixed by `_`.
 
 #![allow(clippy::all)]
 
@@ -107,13 +113,14 @@ pub static VARIABLES: &[(&str, &str)] = &[];
 // modelled separately (see the module docs).
 // ---------------------------------------------------------------------
 
-/// `recordtype(scaler)` — 341 CA-visible own fields from `dbd/scalerRecord.dbd` (1 `DBF_NOACCESS` internals dropped).
+/// `recordtype(scaler)` — 342 CA-visible own fields from `dbd/scalerRecord.dbd` (0 `DBF_NOACCESS` internals dropped).
 pub static SCALER_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "VERS",
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -130,10 +137,32 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         base: Base::Decimal,
     },
     FieldDesc {
+        name: "RPVT",
+        dbf_type: DbFieldType::UChar,
+        declared_dbf: DbfCode::NoAccess,
+        runtime_typed: false,
+        long_string: false,
+        read_only: true,
+        special: Special::NoMod,
+        declared_special: Special::NoMod,
+        pp: false,
+        asl: Asl::Asl1,
+        size: core::mem::size_of::<*const ()>() as u16,
+        extra: Some("void *rpvt"),
+        menu: None,
+        initial: None,
+        interest: 4,
+        prop: false,
+        prompt: Some("Record Private"),
+        promptgroup: None,
+        base: Base::Decimal,
+    },
+    FieldDesc {
         name: "VAL",
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -154,6 +183,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -174,6 +204,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -194,6 +225,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -214,6 +246,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -234,6 +267,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -254,6 +288,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -274,6 +309,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -294,6 +330,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -314,6 +351,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -334,6 +372,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -354,6 +393,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Float,
         declared_dbf: DbfCode::Float,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -374,6 +414,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -394,6 +435,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -414,6 +456,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -434,6 +477,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -454,6 +498,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -474,6 +519,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -494,6 +540,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -514,6 +561,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -534,6 +582,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -554,6 +603,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -574,6 +624,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -594,6 +645,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -614,6 +666,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -634,6 +687,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -654,6 +708,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -674,6 +729,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -694,6 +750,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -714,6 +771,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -734,6 +792,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -754,6 +813,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -774,6 +834,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -794,6 +855,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -814,6 +876,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -834,6 +897,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -854,6 +918,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -874,6 +939,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -894,6 +960,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -914,6 +981,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -934,6 +1002,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -954,6 +1023,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -974,6 +1044,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -994,6 +1065,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1014,6 +1086,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1034,6 +1107,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1054,6 +1128,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1074,6 +1149,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1094,6 +1170,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1114,6 +1191,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1134,6 +1212,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1154,6 +1233,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1174,6 +1254,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1194,6 +1275,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1214,6 +1296,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1234,6 +1317,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1254,6 +1338,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1274,6 +1359,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1294,6 +1380,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1314,6 +1401,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1334,6 +1422,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1354,6 +1443,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1374,6 +1464,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1394,6 +1485,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1414,6 +1506,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1434,6 +1527,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1454,6 +1548,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1474,6 +1569,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1494,6 +1590,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1514,6 +1611,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1534,6 +1632,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1554,6 +1653,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1574,6 +1674,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1594,6 +1695,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1614,6 +1716,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1634,6 +1737,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1654,6 +1758,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -1674,6 +1779,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1694,6 +1800,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1714,6 +1821,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1734,6 +1842,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1754,6 +1863,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1774,6 +1884,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1794,6 +1905,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1814,6 +1926,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1834,6 +1947,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1854,6 +1968,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1874,6 +1989,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1894,6 +2010,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1914,6 +2031,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1934,6 +2052,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1954,6 +2073,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1974,6 +2094,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -1994,6 +2115,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2014,6 +2136,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2034,6 +2157,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2054,6 +2178,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2074,6 +2199,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2094,6 +2220,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2114,6 +2241,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2134,6 +2262,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2154,6 +2283,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2174,6 +2304,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2194,6 +2325,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2214,6 +2346,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2234,6 +2367,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2254,6 +2388,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2274,6 +2409,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2294,6 +2430,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2314,6 +2451,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2334,6 +2472,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2354,6 +2493,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2374,6 +2514,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2394,6 +2535,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2414,6 +2556,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2434,6 +2577,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2454,6 +2598,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2474,6 +2619,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2494,6 +2640,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2514,6 +2661,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2534,6 +2682,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2554,6 +2703,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2574,6 +2724,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2594,6 +2745,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2614,6 +2766,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2634,6 +2787,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2654,6 +2808,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2674,6 +2829,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2694,6 +2850,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2714,6 +2871,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2734,6 +2892,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2754,6 +2913,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2774,6 +2934,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2794,6 +2955,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2814,6 +2976,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2834,6 +2997,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2854,6 +3018,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2874,6 +3039,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2894,6 +3060,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2914,6 +3081,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2934,6 +3102,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Enum,
         declared_dbf: DbfCode::Menu,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2954,6 +3123,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2974,6 +3144,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -2994,6 +3165,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3014,6 +3186,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3034,6 +3207,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3054,6 +3228,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3074,6 +3249,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3094,6 +3270,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3114,6 +3291,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3134,6 +3312,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3154,6 +3333,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3174,6 +3354,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3194,6 +3375,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3214,6 +3396,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3234,6 +3417,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3254,6 +3438,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3274,6 +3459,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3294,6 +3480,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3314,6 +3501,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3334,6 +3522,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3354,6 +3543,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3374,6 +3564,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3394,6 +3585,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3414,6 +3606,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3434,6 +3627,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3454,6 +3648,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3474,6 +3669,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3494,6 +3690,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3514,6 +3711,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3534,6 +3732,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3554,6 +3753,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3574,6 +3774,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3594,6 +3795,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3614,6 +3816,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3634,6 +3837,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3654,6 +3858,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3674,6 +3879,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3694,6 +3900,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3714,6 +3921,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3734,6 +3942,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3754,6 +3963,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3774,6 +3984,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3794,6 +4005,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3814,6 +4026,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3834,6 +4047,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3854,6 +4068,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3874,6 +4089,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3894,6 +4110,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3914,6 +4131,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3934,6 +4152,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3954,6 +4173,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3974,6 +4194,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -3994,6 +4215,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4014,6 +4236,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4034,6 +4257,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4054,6 +4278,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4074,6 +4299,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4094,6 +4320,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4114,6 +4341,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4134,6 +4362,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4154,6 +4383,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4174,6 +4404,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4194,6 +4425,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4214,6 +4446,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4234,6 +4467,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4254,6 +4488,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -4274,6 +4509,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         declared_dbf: DbfCode::Double,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4294,6 +4530,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4314,6 +4551,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4334,6 +4572,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4354,6 +4593,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4374,6 +4614,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4394,6 +4635,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4414,6 +4656,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4434,6 +4677,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4454,6 +4698,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4474,6 +4719,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4494,6 +4740,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4514,6 +4761,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4534,6 +4782,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4554,6 +4803,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4574,6 +4824,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4594,6 +4845,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4614,6 +4866,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4634,6 +4887,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4654,6 +4908,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4674,6 +4929,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4694,6 +4950,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4714,6 +4971,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4734,6 +4992,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4754,6 +5013,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4774,6 +5034,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4794,6 +5055,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4814,6 +5076,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4834,6 +5097,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4854,6 +5118,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4874,6 +5139,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4894,6 +5160,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4914,6 +5181,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4934,6 +5202,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4954,6 +5223,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4974,6 +5244,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -4994,6 +5265,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5014,6 +5286,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5034,6 +5307,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5054,6 +5328,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5074,6 +5349,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5094,6 +5370,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5114,6 +5391,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5134,6 +5412,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5154,6 +5433,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5174,6 +5454,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5194,6 +5475,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5214,6 +5496,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5234,6 +5517,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5254,6 +5538,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5274,6 +5559,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5294,6 +5580,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5314,6 +5601,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5334,6 +5622,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5354,6 +5643,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5374,6 +5664,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5394,6 +5685,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5414,6 +5706,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5434,6 +5727,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5454,6 +5748,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5474,6 +5769,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5494,6 +5790,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5514,6 +5811,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5534,6 +5832,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5554,6 +5853,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::ULong,
         declared_dbf: DbfCode::ULong,
         runtime_typed: false,
+        long_string: false,
         read_only: true,
         special: Special::NoMod,
         declared_special: Special::NoMod,
@@ -5574,6 +5874,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5594,6 +5895,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5614,6 +5916,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5634,6 +5937,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5654,6 +5958,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5674,6 +5979,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5694,6 +6000,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5714,6 +6021,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5734,6 +6042,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5754,6 +6063,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5774,6 +6084,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5794,6 +6105,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5814,6 +6126,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5834,6 +6147,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5854,6 +6168,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5874,6 +6189,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5894,6 +6210,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5914,6 +6231,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5934,6 +6252,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5954,6 +6273,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5974,6 +6294,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -5994,6 +6315,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6014,6 +6336,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6034,6 +6357,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6054,6 +6378,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6074,6 +6399,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6094,6 +6420,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6114,6 +6441,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6134,6 +6462,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6154,6 +6483,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6174,6 +6504,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6194,6 +6525,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6214,6 +6546,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6234,6 +6567,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6254,6 +6588,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6274,6 +6609,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6294,6 +6630,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6314,6 +6651,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6334,6 +6672,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6354,6 +6693,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6374,6 +6714,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6394,6 +6735,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6414,6 +6756,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6434,6 +6777,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6454,6 +6798,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6474,6 +6819,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6494,6 +6840,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6514,6 +6861,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6534,6 +6882,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6554,6 +6903,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6574,6 +6924,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6594,6 +6945,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6614,6 +6966,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6634,6 +6987,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6654,6 +7008,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6674,6 +7029,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6694,6 +7050,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6714,6 +7071,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6734,6 +7092,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6754,6 +7113,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6774,6 +7134,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6794,6 +7155,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6814,6 +7176,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6834,6 +7197,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6854,6 +7218,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::String,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6874,6 +7239,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         declared_dbf: DbfCode::Short,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::None,
         declared_special: Special::None,
@@ -6894,6 +7260,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -6914,6 +7281,7 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         declared_dbf: DbfCode::Outlink,
         runtime_typed: false,
+        long_string: false,
         read_only: false,
         special: Special::Mod,
         declared_special: Special::Mod,
@@ -6933,7 +7301,10 @@ pub static SCALER_FIELDS: &[FieldDesc] = &[
 
 /// `recordtype(scaler)` — the `DBF_NOACCESS` internal names dropped from
 /// [`SCALER_FIELDS`]: resolvable (a SEARCH is answered), never servable.
-pub static SCALER_NOACCESS: &[&str] = &["RPVT"];
+pub static SCALER_NOACCESS: &[&str] = &[];
+
+/// `recordtype(scaler)` — the fields its `.dbd` declares `special(SPC_DBADDR)`.
+pub static SCALER_DBADDR: &[&str] = &[];
 
 /// `recordtype(scaler)` — C's `papFldDes` order, all 390 declarations
 /// including the internals [`SCALER_FIELDS`] drops. The index into this is
@@ -6992,6 +7363,15 @@ pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static st
     })
 }
 
+/// The fields a record type's `.dbd` declares `special(SPC_DBADDR)`, or
+/// `None` for a type no vendored `.dbd` declares.
+pub fn record_dbaddr_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    Some(match record_type {
+        "scaler" => SCALER_DBADDR,
+        _ => return None,
+    })
+}
+
 /// Every field a record type declares, in C's `papFldDes` order — the order
 /// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`
 /// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`
@@ -7017,3 +7397,367 @@ pub fn record_no_prompt(record_type: &str) -> Option<u16> {
 
 /// Every record type a vendored `.dbd` declares, in `.dbd` name order.
 pub static RECORD_TYPES: &[&str] = &["scaler"];
+
+/// Each field's index in its record type's field table: the slot
+/// `RecordCell::new` caches it at and `FieldSlot` names.
+// Module names are the record type names as declared (`aSub`).
+#[allow(non_snake_case)]
+pub mod slots {
+    use epics_base_rs::server::record::FieldSlot;
+
+    pub mod scaler {
+        use super::FieldSlot;
+        pub const VERS: FieldSlot = FieldSlot(0);
+        pub const RPVT: FieldSlot = FieldSlot(1);
+        pub const VAL: FieldSlot = FieldSlot(2);
+        pub const FREQ: FieldSlot = FieldSlot(3);
+        pub const CNT: FieldSlot = FieldSlot(4);
+        pub const PCNT: FieldSlot = FieldSlot(5);
+        pub const SS: FieldSlot = FieldSlot(6);
+        pub const US: FieldSlot = FieldSlot(7);
+        pub const CONT: FieldSlot = FieldSlot(8);
+        pub const OUT: FieldSlot = FieldSlot(9);
+        pub const RATE: FieldSlot = FieldSlot(10);
+        pub const RAT1: FieldSlot = FieldSlot(11);
+        pub const DLY: FieldSlot = FieldSlot(12);
+        pub const DLY1: FieldSlot = FieldSlot(13);
+        pub const NCH: FieldSlot = FieldSlot(14);
+        pub const D1: FieldSlot = FieldSlot(15);
+        pub const D2: FieldSlot = FieldSlot(16);
+        pub const D3: FieldSlot = FieldSlot(17);
+        pub const D4: FieldSlot = FieldSlot(18);
+        pub const D5: FieldSlot = FieldSlot(19);
+        pub const D6: FieldSlot = FieldSlot(20);
+        pub const D7: FieldSlot = FieldSlot(21);
+        pub const D8: FieldSlot = FieldSlot(22);
+        pub const D9: FieldSlot = FieldSlot(23);
+        pub const D10: FieldSlot = FieldSlot(24);
+        pub const D11: FieldSlot = FieldSlot(25);
+        pub const D12: FieldSlot = FieldSlot(26);
+        pub const D13: FieldSlot = FieldSlot(27);
+        pub const D14: FieldSlot = FieldSlot(28);
+        pub const D15: FieldSlot = FieldSlot(29);
+        pub const D16: FieldSlot = FieldSlot(30);
+        pub const D17: FieldSlot = FieldSlot(31);
+        pub const D18: FieldSlot = FieldSlot(32);
+        pub const D19: FieldSlot = FieldSlot(33);
+        pub const D20: FieldSlot = FieldSlot(34);
+        pub const D21: FieldSlot = FieldSlot(35);
+        pub const D22: FieldSlot = FieldSlot(36);
+        pub const D23: FieldSlot = FieldSlot(37);
+        pub const D24: FieldSlot = FieldSlot(38);
+        pub const D25: FieldSlot = FieldSlot(39);
+        pub const D26: FieldSlot = FieldSlot(40);
+        pub const D27: FieldSlot = FieldSlot(41);
+        pub const D28: FieldSlot = FieldSlot(42);
+        pub const D29: FieldSlot = FieldSlot(43);
+        pub const D30: FieldSlot = FieldSlot(44);
+        pub const D31: FieldSlot = FieldSlot(45);
+        pub const D32: FieldSlot = FieldSlot(46);
+        pub const D33: FieldSlot = FieldSlot(47);
+        pub const D34: FieldSlot = FieldSlot(48);
+        pub const D35: FieldSlot = FieldSlot(49);
+        pub const D36: FieldSlot = FieldSlot(50);
+        pub const D37: FieldSlot = FieldSlot(51);
+        pub const D38: FieldSlot = FieldSlot(52);
+        pub const D39: FieldSlot = FieldSlot(53);
+        pub const D40: FieldSlot = FieldSlot(54);
+        pub const D41: FieldSlot = FieldSlot(55);
+        pub const D42: FieldSlot = FieldSlot(56);
+        pub const D43: FieldSlot = FieldSlot(57);
+        pub const D44: FieldSlot = FieldSlot(58);
+        pub const D45: FieldSlot = FieldSlot(59);
+        pub const D46: FieldSlot = FieldSlot(60);
+        pub const D47: FieldSlot = FieldSlot(61);
+        pub const D48: FieldSlot = FieldSlot(62);
+        pub const D49: FieldSlot = FieldSlot(63);
+        pub const D50: FieldSlot = FieldSlot(64);
+        pub const D51: FieldSlot = FieldSlot(65);
+        pub const D52: FieldSlot = FieldSlot(66);
+        pub const D53: FieldSlot = FieldSlot(67);
+        pub const D54: FieldSlot = FieldSlot(68);
+        pub const D55: FieldSlot = FieldSlot(69);
+        pub const D56: FieldSlot = FieldSlot(70);
+        pub const D57: FieldSlot = FieldSlot(71);
+        pub const D58: FieldSlot = FieldSlot(72);
+        pub const D59: FieldSlot = FieldSlot(73);
+        pub const D60: FieldSlot = FieldSlot(74);
+        pub const D61: FieldSlot = FieldSlot(75);
+        pub const D62: FieldSlot = FieldSlot(76);
+        pub const D63: FieldSlot = FieldSlot(77);
+        pub const D64: FieldSlot = FieldSlot(78);
+        pub const G1: FieldSlot = FieldSlot(79);
+        pub const G2: FieldSlot = FieldSlot(80);
+        pub const G3: FieldSlot = FieldSlot(81);
+        pub const G4: FieldSlot = FieldSlot(82);
+        pub const G5: FieldSlot = FieldSlot(83);
+        pub const G6: FieldSlot = FieldSlot(84);
+        pub const G7: FieldSlot = FieldSlot(85);
+        pub const G8: FieldSlot = FieldSlot(86);
+        pub const G9: FieldSlot = FieldSlot(87);
+        pub const G10: FieldSlot = FieldSlot(88);
+        pub const G11: FieldSlot = FieldSlot(89);
+        pub const G12: FieldSlot = FieldSlot(90);
+        pub const G13: FieldSlot = FieldSlot(91);
+        pub const G14: FieldSlot = FieldSlot(92);
+        pub const G15: FieldSlot = FieldSlot(93);
+        pub const G16: FieldSlot = FieldSlot(94);
+        pub const G17: FieldSlot = FieldSlot(95);
+        pub const G18: FieldSlot = FieldSlot(96);
+        pub const G19: FieldSlot = FieldSlot(97);
+        pub const G20: FieldSlot = FieldSlot(98);
+        pub const G21: FieldSlot = FieldSlot(99);
+        pub const G22: FieldSlot = FieldSlot(100);
+        pub const G23: FieldSlot = FieldSlot(101);
+        pub const G24: FieldSlot = FieldSlot(102);
+        pub const G25: FieldSlot = FieldSlot(103);
+        pub const G26: FieldSlot = FieldSlot(104);
+        pub const G27: FieldSlot = FieldSlot(105);
+        pub const G28: FieldSlot = FieldSlot(106);
+        pub const G29: FieldSlot = FieldSlot(107);
+        pub const G30: FieldSlot = FieldSlot(108);
+        pub const G31: FieldSlot = FieldSlot(109);
+        pub const G32: FieldSlot = FieldSlot(110);
+        pub const G33: FieldSlot = FieldSlot(111);
+        pub const G34: FieldSlot = FieldSlot(112);
+        pub const G35: FieldSlot = FieldSlot(113);
+        pub const G36: FieldSlot = FieldSlot(114);
+        pub const G37: FieldSlot = FieldSlot(115);
+        pub const G38: FieldSlot = FieldSlot(116);
+        pub const G39: FieldSlot = FieldSlot(117);
+        pub const G40: FieldSlot = FieldSlot(118);
+        pub const G41: FieldSlot = FieldSlot(119);
+        pub const G42: FieldSlot = FieldSlot(120);
+        pub const G43: FieldSlot = FieldSlot(121);
+        pub const G44: FieldSlot = FieldSlot(122);
+        pub const G45: FieldSlot = FieldSlot(123);
+        pub const G46: FieldSlot = FieldSlot(124);
+        pub const G47: FieldSlot = FieldSlot(125);
+        pub const G48: FieldSlot = FieldSlot(126);
+        pub const G49: FieldSlot = FieldSlot(127);
+        pub const G50: FieldSlot = FieldSlot(128);
+        pub const G51: FieldSlot = FieldSlot(129);
+        pub const G52: FieldSlot = FieldSlot(130);
+        pub const G53: FieldSlot = FieldSlot(131);
+        pub const G54: FieldSlot = FieldSlot(132);
+        pub const G55: FieldSlot = FieldSlot(133);
+        pub const G56: FieldSlot = FieldSlot(134);
+        pub const G57: FieldSlot = FieldSlot(135);
+        pub const G58: FieldSlot = FieldSlot(136);
+        pub const G59: FieldSlot = FieldSlot(137);
+        pub const G60: FieldSlot = FieldSlot(138);
+        pub const G61: FieldSlot = FieldSlot(139);
+        pub const G62: FieldSlot = FieldSlot(140);
+        pub const G63: FieldSlot = FieldSlot(141);
+        pub const G64: FieldSlot = FieldSlot(142);
+        pub const TP: FieldSlot = FieldSlot(143);
+        pub const TP1: FieldSlot = FieldSlot(144);
+        pub const PR1: FieldSlot = FieldSlot(145);
+        pub const PR2: FieldSlot = FieldSlot(146);
+        pub const PR3: FieldSlot = FieldSlot(147);
+        pub const PR4: FieldSlot = FieldSlot(148);
+        pub const PR5: FieldSlot = FieldSlot(149);
+        pub const PR6: FieldSlot = FieldSlot(150);
+        pub const PR7: FieldSlot = FieldSlot(151);
+        pub const PR8: FieldSlot = FieldSlot(152);
+        pub const PR9: FieldSlot = FieldSlot(153);
+        pub const PR10: FieldSlot = FieldSlot(154);
+        pub const PR11: FieldSlot = FieldSlot(155);
+        pub const PR12: FieldSlot = FieldSlot(156);
+        pub const PR13: FieldSlot = FieldSlot(157);
+        pub const PR14: FieldSlot = FieldSlot(158);
+        pub const PR15: FieldSlot = FieldSlot(159);
+        pub const PR16: FieldSlot = FieldSlot(160);
+        pub const PR17: FieldSlot = FieldSlot(161);
+        pub const PR18: FieldSlot = FieldSlot(162);
+        pub const PR19: FieldSlot = FieldSlot(163);
+        pub const PR20: FieldSlot = FieldSlot(164);
+        pub const PR21: FieldSlot = FieldSlot(165);
+        pub const PR22: FieldSlot = FieldSlot(166);
+        pub const PR23: FieldSlot = FieldSlot(167);
+        pub const PR24: FieldSlot = FieldSlot(168);
+        pub const PR25: FieldSlot = FieldSlot(169);
+        pub const PR26: FieldSlot = FieldSlot(170);
+        pub const PR27: FieldSlot = FieldSlot(171);
+        pub const PR28: FieldSlot = FieldSlot(172);
+        pub const PR29: FieldSlot = FieldSlot(173);
+        pub const PR30: FieldSlot = FieldSlot(174);
+        pub const PR31: FieldSlot = FieldSlot(175);
+        pub const PR32: FieldSlot = FieldSlot(176);
+        pub const PR33: FieldSlot = FieldSlot(177);
+        pub const PR34: FieldSlot = FieldSlot(178);
+        pub const PR35: FieldSlot = FieldSlot(179);
+        pub const PR36: FieldSlot = FieldSlot(180);
+        pub const PR37: FieldSlot = FieldSlot(181);
+        pub const PR38: FieldSlot = FieldSlot(182);
+        pub const PR39: FieldSlot = FieldSlot(183);
+        pub const PR40: FieldSlot = FieldSlot(184);
+        pub const PR41: FieldSlot = FieldSlot(185);
+        pub const PR42: FieldSlot = FieldSlot(186);
+        pub const PR43: FieldSlot = FieldSlot(187);
+        pub const PR44: FieldSlot = FieldSlot(188);
+        pub const PR45: FieldSlot = FieldSlot(189);
+        pub const PR46: FieldSlot = FieldSlot(190);
+        pub const PR47: FieldSlot = FieldSlot(191);
+        pub const PR48: FieldSlot = FieldSlot(192);
+        pub const PR49: FieldSlot = FieldSlot(193);
+        pub const PR50: FieldSlot = FieldSlot(194);
+        pub const PR51: FieldSlot = FieldSlot(195);
+        pub const PR52: FieldSlot = FieldSlot(196);
+        pub const PR53: FieldSlot = FieldSlot(197);
+        pub const PR54: FieldSlot = FieldSlot(198);
+        pub const PR55: FieldSlot = FieldSlot(199);
+        pub const PR56: FieldSlot = FieldSlot(200);
+        pub const PR57: FieldSlot = FieldSlot(201);
+        pub const PR58: FieldSlot = FieldSlot(202);
+        pub const PR59: FieldSlot = FieldSlot(203);
+        pub const PR60: FieldSlot = FieldSlot(204);
+        pub const PR61: FieldSlot = FieldSlot(205);
+        pub const PR62: FieldSlot = FieldSlot(206);
+        pub const PR63: FieldSlot = FieldSlot(207);
+        pub const PR64: FieldSlot = FieldSlot(208);
+        pub const T: FieldSlot = FieldSlot(209);
+        pub const S1: FieldSlot = FieldSlot(210);
+        pub const S2: FieldSlot = FieldSlot(211);
+        pub const S3: FieldSlot = FieldSlot(212);
+        pub const S4: FieldSlot = FieldSlot(213);
+        pub const S5: FieldSlot = FieldSlot(214);
+        pub const S6: FieldSlot = FieldSlot(215);
+        pub const S7: FieldSlot = FieldSlot(216);
+        pub const S8: FieldSlot = FieldSlot(217);
+        pub const S9: FieldSlot = FieldSlot(218);
+        pub const S10: FieldSlot = FieldSlot(219);
+        pub const S11: FieldSlot = FieldSlot(220);
+        pub const S12: FieldSlot = FieldSlot(221);
+        pub const S13: FieldSlot = FieldSlot(222);
+        pub const S14: FieldSlot = FieldSlot(223);
+        pub const S15: FieldSlot = FieldSlot(224);
+        pub const S16: FieldSlot = FieldSlot(225);
+        pub const S17: FieldSlot = FieldSlot(226);
+        pub const S18: FieldSlot = FieldSlot(227);
+        pub const S19: FieldSlot = FieldSlot(228);
+        pub const S20: FieldSlot = FieldSlot(229);
+        pub const S21: FieldSlot = FieldSlot(230);
+        pub const S22: FieldSlot = FieldSlot(231);
+        pub const S23: FieldSlot = FieldSlot(232);
+        pub const S24: FieldSlot = FieldSlot(233);
+        pub const S25: FieldSlot = FieldSlot(234);
+        pub const S26: FieldSlot = FieldSlot(235);
+        pub const S27: FieldSlot = FieldSlot(236);
+        pub const S28: FieldSlot = FieldSlot(237);
+        pub const S29: FieldSlot = FieldSlot(238);
+        pub const S30: FieldSlot = FieldSlot(239);
+        pub const S31: FieldSlot = FieldSlot(240);
+        pub const S32: FieldSlot = FieldSlot(241);
+        pub const S33: FieldSlot = FieldSlot(242);
+        pub const S34: FieldSlot = FieldSlot(243);
+        pub const S35: FieldSlot = FieldSlot(244);
+        pub const S36: FieldSlot = FieldSlot(245);
+        pub const S37: FieldSlot = FieldSlot(246);
+        pub const S38: FieldSlot = FieldSlot(247);
+        pub const S39: FieldSlot = FieldSlot(248);
+        pub const S40: FieldSlot = FieldSlot(249);
+        pub const S41: FieldSlot = FieldSlot(250);
+        pub const S42: FieldSlot = FieldSlot(251);
+        pub const S43: FieldSlot = FieldSlot(252);
+        pub const S44: FieldSlot = FieldSlot(253);
+        pub const S45: FieldSlot = FieldSlot(254);
+        pub const S46: FieldSlot = FieldSlot(255);
+        pub const S47: FieldSlot = FieldSlot(256);
+        pub const S48: FieldSlot = FieldSlot(257);
+        pub const S49: FieldSlot = FieldSlot(258);
+        pub const S50: FieldSlot = FieldSlot(259);
+        pub const S51: FieldSlot = FieldSlot(260);
+        pub const S52: FieldSlot = FieldSlot(261);
+        pub const S53: FieldSlot = FieldSlot(262);
+        pub const S54: FieldSlot = FieldSlot(263);
+        pub const S55: FieldSlot = FieldSlot(264);
+        pub const S56: FieldSlot = FieldSlot(265);
+        pub const S57: FieldSlot = FieldSlot(266);
+        pub const S58: FieldSlot = FieldSlot(267);
+        pub const S59: FieldSlot = FieldSlot(268);
+        pub const S60: FieldSlot = FieldSlot(269);
+        pub const S61: FieldSlot = FieldSlot(270);
+        pub const S62: FieldSlot = FieldSlot(271);
+        pub const S63: FieldSlot = FieldSlot(272);
+        pub const S64: FieldSlot = FieldSlot(273);
+        pub const NM1: FieldSlot = FieldSlot(274);
+        pub const NM2: FieldSlot = FieldSlot(275);
+        pub const NM3: FieldSlot = FieldSlot(276);
+        pub const NM4: FieldSlot = FieldSlot(277);
+        pub const NM5: FieldSlot = FieldSlot(278);
+        pub const NM6: FieldSlot = FieldSlot(279);
+        pub const NM7: FieldSlot = FieldSlot(280);
+        pub const NM8: FieldSlot = FieldSlot(281);
+        pub const NM9: FieldSlot = FieldSlot(282);
+        pub const NM10: FieldSlot = FieldSlot(283);
+        pub const NM11: FieldSlot = FieldSlot(284);
+        pub const NM12: FieldSlot = FieldSlot(285);
+        pub const NM13: FieldSlot = FieldSlot(286);
+        pub const NM14: FieldSlot = FieldSlot(287);
+        pub const NM15: FieldSlot = FieldSlot(288);
+        pub const NM16: FieldSlot = FieldSlot(289);
+        pub const NM17: FieldSlot = FieldSlot(290);
+        pub const NM18: FieldSlot = FieldSlot(291);
+        pub const NM19: FieldSlot = FieldSlot(292);
+        pub const NM20: FieldSlot = FieldSlot(293);
+        pub const NM21: FieldSlot = FieldSlot(294);
+        pub const NM22: FieldSlot = FieldSlot(295);
+        pub const NM23: FieldSlot = FieldSlot(296);
+        pub const NM24: FieldSlot = FieldSlot(297);
+        pub const NM25: FieldSlot = FieldSlot(298);
+        pub const NM26: FieldSlot = FieldSlot(299);
+        pub const NM27: FieldSlot = FieldSlot(300);
+        pub const NM28: FieldSlot = FieldSlot(301);
+        pub const NM29: FieldSlot = FieldSlot(302);
+        pub const NM30: FieldSlot = FieldSlot(303);
+        pub const NM31: FieldSlot = FieldSlot(304);
+        pub const NM32: FieldSlot = FieldSlot(305);
+        pub const NM33: FieldSlot = FieldSlot(306);
+        pub const NM34: FieldSlot = FieldSlot(307);
+        pub const NM35: FieldSlot = FieldSlot(308);
+        pub const NM36: FieldSlot = FieldSlot(309);
+        pub const NM37: FieldSlot = FieldSlot(310);
+        pub const NM38: FieldSlot = FieldSlot(311);
+        pub const NM39: FieldSlot = FieldSlot(312);
+        pub const NM40: FieldSlot = FieldSlot(313);
+        pub const NM41: FieldSlot = FieldSlot(314);
+        pub const NM42: FieldSlot = FieldSlot(315);
+        pub const NM43: FieldSlot = FieldSlot(316);
+        pub const NM44: FieldSlot = FieldSlot(317);
+        pub const NM45: FieldSlot = FieldSlot(318);
+        pub const NM46: FieldSlot = FieldSlot(319);
+        pub const NM47: FieldSlot = FieldSlot(320);
+        pub const NM48: FieldSlot = FieldSlot(321);
+        pub const NM49: FieldSlot = FieldSlot(322);
+        pub const NM50: FieldSlot = FieldSlot(323);
+        pub const NM51: FieldSlot = FieldSlot(324);
+        pub const NM52: FieldSlot = FieldSlot(325);
+        pub const NM53: FieldSlot = FieldSlot(326);
+        pub const NM54: FieldSlot = FieldSlot(327);
+        pub const NM55: FieldSlot = FieldSlot(328);
+        pub const NM56: FieldSlot = FieldSlot(329);
+        pub const NM57: FieldSlot = FieldSlot(330);
+        pub const NM58: FieldSlot = FieldSlot(331);
+        pub const NM59: FieldSlot = FieldSlot(332);
+        pub const NM60: FieldSlot = FieldSlot(333);
+        pub const NM61: FieldSlot = FieldSlot(334);
+        pub const NM62: FieldSlot = FieldSlot(335);
+        pub const NM63: FieldSlot = FieldSlot(336);
+        pub const NM64: FieldSlot = FieldSlot(337);
+        pub const EGU: FieldSlot = FieldSlot(338);
+        pub const PREC: FieldSlot = FieldSlot(339);
+        pub const COUT: FieldSlot = FieldSlot(340);
+        pub const COUTP: FieldSlot = FieldSlot(341);
+    }
+}
+
+/// This crate's tables, for `epics_base_rs::server::record::register_contributed_dbd`.
+pub static DBD: epics_base_rs::server::record::ContributedDbd =
+    epics_base_rs::server::record::ContributedDbd {
+        record_types: RECORD_TYPES,
+        record_declaration_order,
+        record_fields,
+        record_no_prompt,
+        menus: MENUS,
+    };

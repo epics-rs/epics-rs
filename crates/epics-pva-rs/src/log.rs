@@ -66,7 +66,7 @@ static GLOBAL_HANDLE: OnceLock<FilterReloadHandle> = OnceLock::new();
 /// variable wins.
 pub(crate) fn log_env_base() -> Option<String> {
     for key in ["PVXS_LOG", "EPICS_PVA_LOG", "RUST_LOG"] {
-        if let Ok(spec) = std::env::var(key) {
+        if let Some(spec) = epics_base_rs::runtime::env::get_lossy(key) {
             if !spec.is_empty() {
                 return Some(spec);
             }

@@ -42,7 +42,7 @@ fn loaded() -> RecordInstance {
         rec.put_field(name, value)
             .unwrap_or_else(|e| panic!("field({name}) failed to load: {e:?}"));
     }
-    RecordInstance::new("T:MOTOR".to_string(), rec)
+    RecordInstance::new("T:MOTOR", rec)
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn dial_and_raw_loaded(mres: f64) -> RecordInstance {
         rec.put_field(name, value)
             .unwrap_or_else(|e| panic!("field({name}) failed to load: {e:?}"));
     }
-    RecordInstance::new("T:MOTOR".to_string(), rec)
+    RecordInstance::new("T:MOTOR", rec)
 }
 
 fn windows(inst: &RecordInstance, field: &str) -> ((f64, f64), (f64, f64)) {

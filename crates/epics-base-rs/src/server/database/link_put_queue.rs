@@ -77,17 +77,89 @@ use crate::types::EpicsValue;
 /// what the pre-queue `write_external_pv` did.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum LinkTarget {
-    Scheme(String),
+    Scheme(&'static str),
     Any,
 }
 
-/// Identity of one external link: the lset it belongs to plus the name that
-/// lset is addressed with. The unit of latest-wins coalescing, exactly as
-/// `caLink` is in C.
+/// The channel an external link addresses: the lset it belongs to plus the
+/// name that lset is addressed with. The unit of an OPEN, because the lset
+/// keeps one connection per name.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Channel {
+    pub(crate) target: LinkTarget,
+    pub(crate) name: crate::types::RecordName,
+}
+
+/// The link a put comes from: C's `DBLINK` and the `caLink` it holds.
+/// `rec` is `None` only for a cell built outside a database.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct LinkId {
+    pub(crate) rec: Option<super::RecordIdx>,
+    pub(crate) field: &'static str,
+    pub(crate) install: LinkInstall,
+}
+
+/// The parse the source record has installed on the link field when the put
+/// is made: C's `caLink` (`plink->value.pv_link.pvt`), which every relink
+/// replaces, same name or not (`dbCaRemoveLink` then
+/// `dbCaAddLinkCallbackOpt`, `dbCa.c:431-446`, `:389-414`). Held weakly, so
+/// the relink that drops the parse is what retires the values staged
+/// through it. Read from the record, never from the caller's parse, which
+/// may be a copy made for the one put.
+#[derive(Clone, Debug)]
+pub(crate) enum LinkInstall {
+    Installed(Weak<crate::server::record::ParsedLink>),
+    /// A put from no record, or through a link the record does not store:
+    /// nothing can relink it.
+    Detached,
+}
+
+impl LinkInstall {
+    pub(crate) fn of_field(instance: &crate::server::record::RecordInstance, field: &str) -> Self {
+        instance
+            .stored_link_shared(field)
+            .map_or(Self::Detached, |link| Self::Installed(Arc::downgrade(link)))
+    }
+
+    /// C `dbCaRemoveLink`'s `CA_CLEAR_CHANNEL`: the task drops whatever the
+    /// link still had to write (`dbCa.c:1200-1203`).
+    fn removed(&self) -> bool {
+        match self {
+            Self::Installed(link) => link.strong_count() == 0,
+            Self::Detached => false,
+        }
+    }
+}
+
+impl PartialEq for LinkInstall {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Installed(a), Self::Installed(b)) => Weak::ptr_eq(a, b),
+            (Self::Detached, Self::Detached) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LinkInstall {}
+
+impl std::hash::Hash for LinkInstall {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Installed(link) => link.as_ptr().hash(state),
+            Self::Detached => std::ptr::null::<()>().hash(state),
+        }
+    }
+}
+
+/// Identity of one external link: the link plus the channel it names. The
+/// unit of latest-wins coalescing, exactly as `caLink` is in C — each link
+/// gets its own (`dbCa.c:398-414`), so two links naming one PV have two
+/// `pputNative` buffers and neither put supersedes the other (`:611`).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct LinkKey {
-    pub(crate) target: LinkTarget,
-    pub(crate) name: String,
+    pub(crate) link: LinkId,
+    pub(crate) channel: Channel,
 }
 
 /// The completion half of a staged put — the `pca->putCallback` slot
@@ -130,6 +202,17 @@ struct StagedPut {
     completion: Option<PutCompletion>,
 }
 
+impl StagedPut {
+    /// Drop a value whose link was removed before it was sent.
+    fn removed(self) {
+        if let Some(c) = self.completion {
+            c.resolve(Err(
+                "external link put dropped: the link was removed before it was sent".to_string(),
+            ));
+        }
+    }
+}
+
 /// Per-link state. Membership of the ready deque is exactly `Queued`, so the
 /// deque cannot disagree with the map: the illegal combinations
 /// ("in the deque but in flight", "staged but nobody will pick it up") are
@@ -163,8 +246,8 @@ enum OpenState {
 struct QueueInner {
     links: HashMap<LinkKey, LinkState>,
     ready: VecDeque<LinkKey>,
-    opens: HashMap<LinkKey, OpenState>,
-    ready_opens: VecDeque<LinkKey>,
+    opens: HashMap<Channel, OpenState>,
+    ready_opens: VecDeque<(Channel, Option<super::CaLinkInit>)>,
     /// Per-link count of staged values a later put on the same link
     /// overwrote — C's `pca->nNoWrite` (`dbCa.c:548`, `:582`), which lives on
     /// the `caLink` and is therefore per link, not per IOC. Keyed rather than
@@ -172,10 +255,10 @@ struct QueueInner {
     /// (`dbCaTest.c:111-116`) and a whole-queue total cannot be attributed
     /// back to one of them.
     ///
-    /// Never pruned: C's counter lives as long as the `caLink`, whereas an
-    /// entry in `links` exists only while a write is outstanding, so pruning
-    /// with the state would reset the count every time the link went idle.
-    coalesced: HashMap<LinkKey, u64>,
+    /// One entry per link field and channel, holding the install it counts
+    /// for: C's counter lives as long as the `caLink`, so it outlives the
+    /// link going idle and starts over at a relink (`dbCa.c:398`).
+    coalesced: HashMap<(Option<super::RecordIdx>, &'static str, Channel), (LinkInstall, u64)>,
     /// Number of writes the owner has completed. Diagnostic.
     completed: u64,
     /// Number of link opens the owner has completed. Diagnostic.
@@ -322,7 +405,15 @@ impl LinkPutQueue {
     /// Resolve a displaced value's completion — the only place a staged put
     /// is superseded, so the `nNoWrite` accounting has one owner.
     fn supersede(inner: &mut QueueInner, key: &LinkKey, prev: StagedPut) {
-        *inner.coalesced.entry(key.clone()).or_default() += 1;
+        let site = (key.link.rec, key.link.field, key.channel.clone());
+        let count = inner
+            .coalesced
+            .entry(site)
+            .or_insert_with(|| (key.link.install.clone(), 0));
+        if count.0 != key.link.install {
+            *count = (key.link.install.clone(), 0);
+        }
+        count.1 += 1;
         if let Some(c) = prev.completion {
             c.resolve(Err(
                 "external link put superseded by a newer put on the same link".to_string(),
@@ -332,12 +423,25 @@ impl LinkPutQueue {
 
     /// Owner-only: take the next ready link, moving it `Queued` → `InFlight`.
     /// Mirrors `dbCaTask` popping `workList` and clearing `link_action`
-    /// before doing the work (`dbCa.c:1115-1132`).
+    /// before doing the work (`dbCa.c:1115-1132`). A removed link's value is
+    /// dropped instead (`dbCa.c:1200-1203`).
     fn take_ready(&self) -> Option<(LinkKey, StagedPut)> {
         let mut inner = self.inner.lock();
+        let mut dropped = false;
         loop {
-            let key = inner.ready.pop_front()?;
+            let Some(key) = inner.ready.pop_front() else {
+                let idle = dropped && inner.is_idle();
+                drop(inner);
+                if idle {
+                    self.idle.notify_waiters();
+                }
+                return None;
+            };
             match inner.links.remove(&key) {
+                Some(LinkState::Queued(staged)) if key.link.install.removed() => {
+                    staged.removed();
+                    dropped = true;
+                }
                 Some(LinkState::Queued(staged)) => {
                     inner.links.insert(key.clone(), LinkState::InFlight);
                     return Some((key, staged));
@@ -362,6 +466,10 @@ impl LinkPutQueue {
             inner.completed += 1;
             let wake_work = match inner.links.remove(&key) {
                 Some(LinkState::InFlight) | None => false,
+                Some(LinkState::InFlightRestaged(staged)) if key.link.install.removed() => {
+                    staged.removed();
+                    false
+                }
                 Some(LinkState::InFlightRestaged(staged)) => {
                     inner.links.insert(key.clone(), LinkState::Queued(staged));
                     inner.ready.push_back(key);
@@ -397,15 +505,21 @@ impl LinkPutQueue {
     /// attempt, not ten per second. Reconnection is the lset's job, as it is
     /// libca's in C.
     ///
-    /// Returns true when this call is the one that staged it.
-    pub(crate) fn stage_open(&self, key: LinkKey) -> bool {
+    /// Returns true when this call is the one that staged it. `init` runs
+    /// only then, before the owner can see the open, and what it returns
+    /// rides with the open to the lsets.
+    pub(crate) fn stage_open(
+        &self,
+        key: Channel,
+        init: impl FnOnce() -> Option<super::CaLinkInit>,
+    ) -> bool {
         let staged = {
             let mut inner = self.inner.lock();
             if inner.opens.contains_key(&key) {
                 false
             } else {
                 inner.opens.insert(key.clone(), OpenState::Queued);
-                inner.ready_opens.push_back(key);
+                inner.ready_opens.push_back((key, init()));
                 true
             }
         };
@@ -416,14 +530,14 @@ impl LinkPutQueue {
     }
 
     /// Owner-only: take the next link to open, `Queued` → `InFlight`.
-    fn take_ready_open(&self) -> Option<LinkKey> {
+    fn take_ready_open(&self) -> Option<(Channel, Option<super::CaLinkInit>)> {
         let mut inner = self.inner.lock();
         loop {
-            let key = inner.ready_opens.pop_front()?;
+            let (key, init) = inner.ready_opens.pop_front()?;
             match inner.opens.get_mut(&key) {
                 Some(state @ OpenState::Queued) => {
                     *state = OpenState::InFlight;
-                    return Some(key);
+                    return Some((key, init));
                 }
                 // Only `Queued` is ever in the deque.
                 _ => continue,
@@ -432,7 +546,7 @@ impl LinkPutQueue {
     }
 
     /// Owner-only: the open for `key` returned. `InFlight` → `Done`.
-    fn finish_open(&self, key: LinkKey) {
+    fn finish_open(&self, key: Channel) {
         let wake_idle = {
             let mut inner = self.inner.lock();
             inner.opened += 1;
@@ -459,13 +573,30 @@ impl LinkPutQueue {
     /// aggregated the way `dbcar`'s trailing `(%lu disconnects, %lu writes
     /// prohibited)` total does (`dbCaTest.c:153-154`).
     pub(crate) fn coalesced_count(&self) -> u64 {
-        self.inner.lock().coalesced.values().sum()
+        self.inner
+            .lock()
+            .coalesced
+            .values()
+            .filter(|(install, _)| !install.removed())
+            .map(|(_, n)| n)
+            .sum()
     }
 
     /// The same count for one link — the per-`caLink` `pca->nNoWrite`
     /// `dbcar` prints beside the link's name.
-    pub(crate) fn coalesced_for(&self, key: &LinkKey) -> u64 {
-        self.inner.lock().coalesced.get(key).copied().unwrap_or(0)
+    pub(crate) fn coalesced_for(
+        &self,
+        rec: Option<super::RecordIdx>,
+        field: &str,
+        channel: &Channel,
+    ) -> u64 {
+        self.inner
+            .lock()
+            .coalesced
+            .iter()
+            .find(|((r, f, c), _)| *r == rec && *f == field && c == channel)
+            .filter(|(_, (install, _))| !install.removed())
+            .map_or(0, |(_, (_, n))| *n)
     }
 
     /// Number of writes the owner has completed.
@@ -494,21 +625,33 @@ impl LinkPutQueue {
     /// whatever thread processed the record, so the loop itself goes to the
     /// background executor. The network work it dispatches goes to
     /// [`Self::reactor`] instead — see that field.
-    pub(crate) fn ensure_owner(self: &Arc<Self>, db: Weak<super::PvDatabaseInner>) {
+    ///
+    /// The call that starts it gets a latch that opens once the loop has
+    /// registered with the watchdog — C `dbCaLinkInit` waits for exactly
+    /// that (`dbCa.c:355-357`). Only `ca_link_init` waits. The lazy callers
+    /// (`stage_external_link_open`, `write_external_pv`) must not: they run in
+    /// record processing under the record hold, and they can run on the
+    /// Medium band, where the loop itself would have to start.
+    pub(crate) fn ensure_owner(
+        self: &Arc<Self>,
+        db: Weak<super::PvDatabaseInner>,
+    ) -> Option<crate::runtime::sync::StartWait> {
         if self
             .owner_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            return;
+            return None;
         }
         let queue = Arc::downgrade(self);
         let work = self.work.clone();
+        let (started, wait) = crate::runtime::sync::start_latch();
         // Middle band: one owner loop drains the queued link puts of every
         // record, so there is no single record whose PRIO it could take.
         crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
-            owner_loop(queue, work, db),
+            owner_loop(queue, work, db, started),
         );
+        Some(wait)
     }
 }
 
@@ -524,6 +667,7 @@ async fn owner_loop(
     queue: Weak<LinkPutQueue>,
     work: Arc<tokio::sync::Notify>,
     db: Weak<super::PvDatabaseInner>,
+    started: crate::runtime::sync::StartSignal,
 ) {
     // C `dbCaTask` registers with the watchdog before its loop
     // (`dbCa.c:1096`) and removes when told to exit (`:1262`). Unbounded: the
@@ -534,6 +678,7 @@ async fn owner_loop(
         crate::runtime::taskwd::CheckIn::Unbounded,
         None,
     );
+    drop(started);
     loop {
         // Register on the wake signal BEFORE draining, so a put staged
         // during the drain cannot be missed.
@@ -548,21 +693,22 @@ async fn owner_loop(
                     // is waiting on, and C services `CA_CONNECT` on the same
                     // task ahead of that link's other actions
                     // (`dbCa.c:1133-1160`).
-                    while let Some(key) = q.take_ready_open() {
+                    while let Some((key, init)) = q.take_ready_open() {
                         let Some(inner) = db.upgrade() else { return };
                         let lsets = resolve_lsets(&inner, &key.target);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
                             for lset in &lsets {
-                                lset.connect_link(&key.name).await;
+                                lset.connect_link(&key.name, init.clone()).await;
                             }
+                            drop(init);
                             q2.finish_open(key);
                         });
                     }
                     while let Some((key, staged)) = q.take_ready() {
                         let Some(inner) = db.upgrade() else { return };
-                        let lsets = resolve_lsets(&inner, &key.target);
+                        let lsets = resolve_lsets(&inner, &key.channel.target);
                         drop(inner);
                         let q2 = q.clone();
                         reactor.spawn(async move {
@@ -579,7 +725,7 @@ async fn owner_loop(
                 // bypassed the gate still gets its completion resolved rather
                 // than left pending until teardown.
                 None => {
-                    while let Some(key) = q.take_ready_open() {
+                    while let Some((key, _init)) = q.take_ready_open() {
                         q.finish_open(key);
                     }
                     while let Some((key, staged)) = q.take_ready() {
@@ -595,22 +741,33 @@ async fn owner_loop(
     }
 }
 
-/// The lsets a write (or an open) may be offered to, in order. Single owner
-/// of the target → lset mapping, shared with `PvDatabase::resolve_external_pv`
-/// so a link's cached read and its staged open address the same lsets.
+/// Offer `f` the lsets a read, write or open may go to, in order, until it
+/// answers. Single owner of the target → lset mapping, shared with
+/// `PvDatabase::resolve_external_pv` so a link's cached read and its staged
+/// open address the same lsets. Allocates nothing: a cycle asks it.
+pub(super) fn find_lset<T>(
+    inner: &super::PvDatabaseInner,
+    target: &LinkTarget,
+    f: impl FnMut(&DynLinkSet) -> Option<T>,
+) -> Option<T> {
+    let registry = inner.link_sets.load();
+    match target {
+        LinkTarget::Scheme(s) => registry.get_ref(s).and_then(f),
+        LinkTarget::Any => registry.link_sets().find_map(f),
+    }
+}
+
+/// [`find_lset`]'s lsets, held past the registry snapshot for an await.
 pub(super) fn resolve_lsets(
     inner: &super::PvDatabaseInner,
     target: &LinkTarget,
 ) -> Vec<DynLinkSet> {
-    let registry = inner.link_sets.load();
-    match target {
-        LinkTarget::Scheme(s) => registry.get(s).into_iter().collect(),
-        LinkTarget::Any => registry
-            .schemes()
-            .iter()
-            .filter_map(|s| registry.get(s))
-            .collect(),
-    }
+    let mut lsets = Vec::new();
+    find_lset(inner, target, |lset| {
+        lsets.push(lset.clone());
+        None::<()>
+    });
+    lsets
 }
 
 /// Resolve a staged write that no owner can perform, because the database
@@ -625,9 +782,9 @@ fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
     let msg = format!(
         "external link put to '{}' refused: this database was built with no \
          tokio runtime, so no link set can reach the network",
-        key.name
+        key.channel.name
     );
-    eprintln!("dbCa: {msg}");
+    crate::runtime::log::errlog_vprintf(format_args!("dbCa: {msg}\n"));
     if let Some(c) = staged.completion {
         c.resolve(Err(msg));
     }
@@ -643,10 +800,10 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     } = staged;
     let mut result = Err(format!(
         "no link set accepted the write to external link '{}'",
-        key.name
+        key.channel.name
     ));
     for lset in lsets {
-        match lset.put_value(&key.name, value.clone(), op).await {
+        match lset.put_value(&key.channel.name, value.clone(), op).await {
             Ok(()) => {
                 // Production drain of any retry-queued OUT writes
                 // on this lset now that a write has reached it (the
@@ -664,9 +821,18 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
     // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
     // (`dbCa.c:1161-1183`). The record has already returned; its alarm came
-    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does.
-    if let Err(e) = &result {
-        eprintln!("dbCa: external link put to '{}' failed: {e}", key.name);
+    // from the staging gate, exactly as `dbCaPutLink`'s `-1` does. A link
+    // that went down after staging says nothing: the task skips it with
+    // `if (ca_state(pca->chid) != cs_conn) continue;` (`dbCa.c:1224`).
+    if let Err(e) = &result
+        && lsets
+            .iter()
+            .any(|lset| lset.is_connected(&key.channel.name))
+    {
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "dbCa: external link put to '{}' failed: {e}\n",
+            key.channel.name
+        ));
     }
     if let Some(c) = completion {
         c.resolve(result);
@@ -680,11 +846,36 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
-    fn key(name: &str) -> LinkKey {
-        LinkKey {
-            target: LinkTarget::Scheme("ca".to_string()),
-            name: name.to_string(),
+    fn coalesced(q: &LinkPutQueue, k: &LinkKey) -> u64 {
+        q.coalesced_for(k.link.rec, k.link.field, &k.channel)
+    }
+
+    /// One parse per test thread stands for every link field the tests name,
+    /// alive for the thread, so a key keeps one identity across calls.
+    fn installed() -> Arc<crate::server::record::ParsedLink> {
+        thread_local! {
+            static LINK: Arc<crate::server::record::ParsedLink> =
+                Arc::new(crate::server::record::ParsedLink::None);
         }
+        LINK.with(Arc::clone)
+    }
+
+    fn key_on(name: &str, link: &Arc<crate::server::record::ParsedLink>) -> LinkKey {
+        LinkKey {
+            link: LinkId {
+                rec: None,
+                field: "OUT",
+                install: LinkInstall::Installed(Arc::downgrade(link)),
+            },
+            channel: Channel {
+                target: LinkTarget::Scheme("ca"),
+                name: name.into(),
+            },
+        }
+    }
+
+    fn key(name: &str) -> LinkKey {
+        key_on(name, &installed())
     }
 
     /// Read a completion out of its receiver with no runtime at all.
@@ -745,11 +936,34 @@ mod tests {
         }
         q.stage_put(key("B"), EpicsValue::Long(9), LinkPutOp::Plain);
 
-        assert_eq!(q.coalesced_for(&key("A")), 2);
-        assert_eq!(q.coalesced_for(&key("B")), 0);
+        assert_eq!(coalesced(&q, &key("A")), 2);
+        assert_eq!(coalesced(&q, &key("B")), 0);
         // Never staged at all — C's `pca == NULL`, zero rather than absent.
-        assert_eq!(q.coalesced_for(&key("C")), 0);
+        assert_eq!(coalesced(&q, &key("C")), 0);
         assert_eq!(q.coalesced_count(), 2, "the total is still the sum");
+    }
+
+    /// Boundary: two link fields naming ONE channel. C gives each `DBLINK` its
+    /// own `caLink` and so its own `pputNative` (`dbCa.c:398-414`): neither
+    /// put supersedes the other, and both are written.
+    #[test]
+    fn two_links_to_one_channel_do_not_coalesce() {
+        let q = LinkPutQueue::default();
+        let other = LinkKey {
+            link: LinkId {
+                field: "OUTB",
+                ..key("A").link
+            },
+            ..key("A")
+        };
+        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
+        q.stage_put(other.clone(), EpicsValue::Long(2), LinkPutOp::Plain);
+
+        assert_eq!(q.coalesced_count(), 0);
+        let (k1, s1) = q.take_ready().expect("first link ready");
+        let (k2, s2) = q.take_ready().expect("second link ready");
+        assert_eq!((k1, s1.value), (key("A"), EpicsValue::Long(1)));
+        assert_eq!((k2, s2.value), (other, EpicsValue::Long(2)));
     }
 
     /// Boundary: the per-link count SURVIVES the link going idle. C's counter
@@ -760,11 +974,11 @@ mod tests {
         let q = LinkPutQueue::default();
         q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
         q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Plain);
-        assert_eq!(q.coalesced_for(&key("A")), 1);
+        assert_eq!(coalesced(&q, &key("A")), 1);
         let (k, _staged) = q.take_ready().expect("ready");
         q.finish(k);
         assert!(q.is_idle(), "nothing pending on any link");
-        assert_eq!(q.coalesced_for(&key("A")), 1);
+        assert_eq!(coalesced(&q, &key("A")), 1);
     }
 
     /// Boundary: distinct links do NOT coalesce — one ready entry each, in
@@ -863,5 +1077,55 @@ mod tests {
         q.finish(k);
         assert!(q.is_idle());
         assert_eq!(q.completed_count(), 1);
+    }
+
+    /// Boundary: a value staged on a link that is then relinked to the SAME
+    /// name, while the owner has not taken it. C's relink is
+    /// `dbCaRemoveLink` + `dbCaAddLink`: the old `caLink` gets
+    /// `CA_CLEAR_CHANNEL`, which the task services first and alone
+    /// (`dbCa.c:1200-1203`), so the pending value is never written, and the
+    /// new `caLink` starts with no pending value and `nNoWrite` 0.
+    #[test]
+    fn a_relink_drops_the_value_staged_through_the_old_link() {
+        let q = LinkPutQueue::default();
+        let old = Arc::new(crate::server::record::ParsedLink::None);
+        let rx = q
+            .stage_put(key_on("A", &old), EpicsValue::Long(1), LinkPutOp::Async)
+            .expect("Async put yields a completion");
+        q.stage_put(key_on("A", &old), EpicsValue::Long(2), LinkPutOp::Plain);
+        assert_eq!(coalesced(&q, &key_on("A", &old)), 1);
+        let new = Arc::new(crate::server::record::ParsedLink::None);
+        drop(old);
+
+        assert!(q.take_ready().is_none(), "the old link's value is dropped");
+        assert!(q.is_idle());
+        assert!(resolved(rx).unwrap_err().contains("superseded"));
+        assert_eq!(coalesced(&q, &key_on("A", &new)), 0, "a new caLink");
+        assert_eq!(q.coalesced_count(), 0);
+
+        q.stage_put(key_on("A", &new), EpicsValue::Long(3), LinkPutOp::Plain);
+        let (_, staged) = q.take_ready().expect("the new link's value is sent");
+        assert_eq!(staged.value, EpicsValue::Long(3));
+    }
+
+    /// Boundary: the same relink while the old link has a write IN FLIGHT and
+    /// a newer value staged behind it. The in-flight write is C's
+    /// `ca_array_put` already issued; the value behind it is dropped.
+    #[test]
+    fn a_relink_drops_the_value_restaged_behind_a_write_in_flight() {
+        let q = LinkPutQueue::default();
+        let old = Arc::new(crate::server::record::ParsedLink::None);
+        q.stage_put(key_on("A", &old), EpicsValue::Long(1), LinkPutOp::Plain);
+        let (k, first) = q.take_ready().expect("ready");
+        assert_eq!(first.value, EpicsValue::Long(1));
+        let rx = q
+            .stage_put(key_on("A", &old), EpicsValue::Long(2), LinkPutOp::Async)
+            .expect("Async put yields a completion");
+        drop(old);
+
+        q.finish(k);
+        assert!(q.take_ready().is_none(), "the restaged value is dropped");
+        assert!(q.is_idle());
+        assert!(resolved(rx).unwrap_err().contains("removed"));
     }
 }

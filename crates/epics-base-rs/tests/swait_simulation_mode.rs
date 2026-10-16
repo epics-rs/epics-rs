@@ -106,7 +106,7 @@ async fn alarm(db: &PvDatabase) -> (AlarmSeverity, u16, bool) {
 async fn amsg(db: &PvDatabase) -> String {
     let inst = db.get_record("W").unwrap();
     let g = inst.read();
-    g.common.amsg.as_str().to_owned()
+    String::from(&g.common.amsg)
 }
 
 /// SIMM = YES: VAL comes from SIOL through SVAL, the calc does not run, and the

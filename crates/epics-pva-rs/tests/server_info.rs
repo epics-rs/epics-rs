@@ -51,10 +51,11 @@ fn nturi_op(op: &str) -> (FieldDesc, PvField) {
                 "query".into(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("op".into(), FieldDesc::Scalar(ScalarType::String))].into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     };
     (desc, PvField::Structure(root))
 }
@@ -232,10 +233,12 @@ async fn rpc_op_errors_carry_pvxs_contract_text() {
                 "query".into(),
                 FieldDesc::Structure {
                     struct_id: String::new(),
-                    fields: vec![("unrelated".into(), FieldDesc::Scalar(ScalarType::String))],
+                    fields: vec![("unrelated".into(), FieldDesc::Scalar(ScalarType::String))]
+                        .into(),
                 },
             ),
-        ],
+        ]
+        .into(),
     };
     let err = tokio::time::timeout(
         Duration::from_secs(5),

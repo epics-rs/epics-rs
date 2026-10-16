@@ -122,10 +122,12 @@ async fn shft_zero_is_an_identity_in_both_directions() {
 }
 
 /// End to end through the real process path, with the dset that DOES own MASK.
-/// `DTYP="Raw Soft Channel"` is C `devMbbiDirectSoftRaw`: it positions the mask
-/// (`mask <<= shft` -> 0xF0) and applies it to RVAL, then the record convert
-/// shifts. RVAL keeps the positioned raw; VAL is the nibble. Pre-fix the record
-/// re-masked with the unshifted 0x0F and published VAL=0.
+/// `DTYP="Raw Soft Channel"` is C `devMbbiDirectSoftRaw`: its `init_record`
+/// positions the mask in the field (`mask <<= shft` -> 0xF0,
+/// `devMbbiDirectSoftRaw.c:45-48`; softIoc reads MASK 14 for NOBT 3 SHFT 1) and
+/// applies it to RVAL, then the record convert shifts. RVAL keeps the
+/// positioned raw; VAL is the nibble. Pre-fix the record re-masked with the
+/// unshifted 0x0F and published VAL=0.
 #[epics_macros_rs::epics_test]
 async fn raw_soft_channel_masks_positioned_and_the_record_only_shifts() {
     const DB: &str = r#"
@@ -155,9 +157,9 @@ record(mbbiDirect, "M") {
     let g = inst.read();
     assert_eq!(
         g.record.get_field("MASK").unwrap(),
-        EpicsValue::ULong(0x0F),
-        "the record seeds MASK from NOBT UNSHIFTED and leaves it there \
-         (mbbiDirectRecord.c:112-113)"
+        EpicsValue::ULong(0xF0),
+        "the record seeds MASK 0x0F from NOBT (mbbiDirectRecord.c:112-113) and \
+         the dset's init positions it in the field"
     );
     assert_eq!(
         g.record.get_field("RVAL").unwrap(),

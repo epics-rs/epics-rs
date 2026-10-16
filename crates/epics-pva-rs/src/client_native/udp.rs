@@ -40,16 +40,17 @@
 // redundant, and kept only so the census marker's count stays the reviewable
 // number it was; §4.2 UDP search, stage 3.)
 
-// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend at
+// RTEMS-EXEC-MODEL-ALLOW(5): this file does not build on the exec backend at
 // all — `client_native/mod.rs` declares it `#[cfg(tokio_backend)]` because its
 // `UdpSocket::readable` waits need a reactor the exec backend has not got. The
-// four are counted, not run.
+// five are counted, not run.
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use epics_base_rs::net::{PortOrigin, PortUse};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -282,13 +283,9 @@ impl CollectorState {
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
         // `epicsSocketEnableAddressUseForDatagramFanout` (pvxs
-        // `udp_collector.cpp:136`): SO_REUSEADDR (+ SO_REUSEPORT on unix) so
-        // this wildcard listener can coexist with a co-located server's UDP
+        // `udp_collector.cpp:136`), applied at the bind below, so this
+        // wildcard listener can coexist with a co-located server's UDP
         // responder and with sibling collectors on the same port.
-        sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-
         if is_v6 {
             // Keep the v6 collector v6-only; the v4 collector owns v4.
             sock.set_only_v6(true)?;
@@ -301,14 +298,15 @@ impl CollectorState {
         // Ask the kernel to attach each datagram's original destination as
         // ancillary data (pvxs `sock.enable_IP_PKTINFO()`,
         // `udp_collector.cpp:138`).
-        enable_recv_orig_dest(&sock, is_v6)?;
+        #[cfg(any(unix, windows))]
+        crate::udp_rx::enable(&sock, is_v6)?;
 
         let bind_addr: SocketAddr = if is_v6 {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
         } else {
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
         };
-        sock.bind(&bind_addr.into())?;
+        PortUse::Shared.bind(&sock, bind_addr, PortOrigin::Configured)?;
 
         let std_sock: std::net::UdpSocket = sock.into();
         let tokio_sock = UdpSocket::from_std(std_sock)?;
@@ -328,7 +326,7 @@ impl CollectorState {
         // the state, so it neither keeps the collector alive nor leaks the
         // socket: when the last handle drops, the next idle re-check (or the
         // post-datagram upgrade) fails and the task exits.
-        reactor.spawn(recv_loop(sock, is_v6, Arc::downgrade(&state)));
+        reactor.spawn(recv_loop(sock, Arc::downgrade(&state)));
 
         Ok(state)
     }
@@ -379,7 +377,7 @@ fn dest_matches(dest_ip: IpAddr, orig_dest: Option<IpAddr>) -> bool {
 
 /// Background loop: receive datagrams on the wildcard socket and fan them
 /// out. Exits when the owning [`CollectorState`] has been dropped.
-async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>) {
+async fn recv_loop(sock: Arc<UdpSocket>, weak: Weak<CollectorState>) {
     // PVA UDP messages fit well under 64 KiB; one reusable buffer.
     let mut buf = vec![0u8; 0x1_0000];
     loop {
@@ -396,7 +394,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>
             }
         }
 
-        match recv_with_orig_dest(&sock, is_v6, &mut buf) {
+        match recv_with_orig_dest(&sock, &mut buf) {
             Ok(Some((n, src, orig_dest))) => {
                 let Some(state) = weak.upgrade() else { break };
                 fanout(&state, src, orig_dest, &buf[..n]);
@@ -411,517 +409,35 @@ async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>
     }
 }
 
-/// Enable the socket option that makes the kernel attach each datagram's
-/// original destination address as ancillary data.
-///
-/// * v4 Linux family (`linux`, `android`): `IP_PKTINFO` (yields
-///   `in_pktinfo.ipi_addr`). These share the Linux IP stack but carry
-///   distinct `target_os` values, and `libc` defines `IP_RECVDSTADDR`
-///   for neither — gating on `target_os = "linux"` alone would fail to
-///   compile on `android`.
-/// * v4 BSD/Apple family — `macos`, `netbsd`, and the *BSDs that do NOT
-///   provide `IP_PKTINFO` (`freebsd`, `openbsd`, `dragonfly`):
-///   `IP_RECVDSTADDR` (yields a bare `in_addr`). It is the only v4
-///   option `libc` defines across the whole BSD family, so it is
-///   preferred over pvxs's `IP_ORIGDSTADDR` (freebsd-only in `libc`;
-///   absent on `openbsd`/`netbsd`).
-/// * v6: `IPV6_RECVPKTINFO` (yields `in6_pktinfo.ipi6_addr`).
-///
-/// The `optname` selected here MUST equal the `cmsg_type` matched in
-/// [`decode_orig_dest_cmsg`]; keep the two cfg groups identical.
-#[cfg(unix)]
-fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let (level, optname) = if is_v6 {
-        (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
-    } else {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            (libc::IPPROTO_IP, libc::IP_PKTINFO)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR)
-        }
-    };
-
-    let on: libc::c_int = 1;
-    // SAFETY: `fd` is owned by `sock` for the duration of this call; the
-    // option value outlives the syscall.
-    let r = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            level,
-            optname,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&on) as libc::socklen_t,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Windows: enable `IP_PKTINFO` / `IPV6_PKTINFO` so each datagram's
-/// destination arrives as ancillary data, and resolve the `WSARecvMsg`
-/// extension-fn pointer up front so the hot recv path can't fail on first
-/// use (mirrors pvxs `enable_IP_PKTINFO` + `oseDoOnce`,
-/// `os/WIN32/osdSockExt.cpp`). Unlike Unix, Windows recovers the v4
-/// destination from `IP_PKTINFO` too — there is no `IP_RECVDSTADDR`.
-#[cfg(windows)]
-fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{
-        IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, SOCKET, setsockopt,
-    };
-
-    let raw = sock.as_raw_socket() as SOCKET;
-    let on: i32 = 1;
-    let (level, optname) = if is_v6 {
-        (IPPROTO_IPV6 as i32, IPV6_PKTINFO as i32)
-    } else {
-        (IPPROTO_IP as i32, IP_PKTINFO as i32)
-    };
-    // SAFETY: `raw` is owned by `sock` for this call; `on` outlives it.
-    let r = unsafe {
-        setsockopt(
-            raw,
-            level,
-            optname,
-            &on as *const i32 as *const u8,
-            std::mem::size_of_val(&on) as i32,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::from_raw_os_error(win_orig_dest::last_wsa_error()));
-    }
-    // Resolve+cache the WSARecvMsg extension pointer while we hold a socket.
-    win_orig_dest::resolve_wsarecvmsg(raw)?;
-    Ok(())
-}
-
-/// Other non-Unix, non-Windows targets: no ancillary-data mechanism, so
-/// the collector receives without original-destination recovery
-/// (`orig_dest == None`). See [`recv_with_orig_dest`].
-#[cfg(all(not(unix), not(windows)))]
-fn enable_recv_orig_dest(_sock: &Socket, _is_v6: bool) -> io::Result<()> {
-    Ok(())
-}
-
-/// Drive one non-blocking `recvmsg`, returning the byte count, source
-/// address, and recovered original destination. `Ok(None)` means the read
-/// would block (re-arm and wait).
-#[cfg(unix)]
+/// Drive one non-blocking receive, returning the byte count, source address,
+/// and recovered original destination ([`crate::udp_rx`]). `Ok(None)` means
+/// the read would block (re-arm and wait).
+#[cfg(any(unix, windows))]
 fn recv_with_orig_dest(
     sock: &UdpSocket,
-    is_v6: bool,
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
-    let res = sock.try_io(tokio::io::Interest::READABLE, || {
-        // SAFETY: every pointer below refers to a local that outlives the
-        // single `recvmsg` call; the destination buffers are borrowed for
-        // the duration of the call.
-        unsafe {
-            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-            let mut iov = libc::iovec {
-                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buf.len(),
-            };
-            let mut cbuf = [0u8; 128];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
-            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cbuf.len() as _;
-
-            let n = libc::recvmsg(std::os::fd::AsRawFd::as_raw_fd(sock), &mut msg, 0);
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let src = sockaddr_storage_to_socketaddr(&storage, msg.msg_namelen)?;
-            let orig_dest = orig_dest_from_cmsgs(&msg, is_v6);
-            Ok((n as usize, src, orig_dest))
-        }
-    });
-
-    match res {
-        Ok(v) => Ok(Some(v)),
+    match sock.try_io(tokio::io::Interest::READABLE, || {
+        crate::udp_rx::recv(sock, buf)
+    }) {
+        Ok(d) => Ok(Some((d.len, d.src, d.dest))),
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Windows: one non-blocking `WSARecvMsg`, recovering the original
-/// destination from the `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
-/// `Ok(None)` on `WSAEWOULDBLOCK` mirrors the Unix re-arm contract; the
-/// `try_io` wrapper clears tokio's readiness on that.
-#[cfg(windows)]
-fn recv_with_orig_dest(
-    sock: &UdpSocket,
-    is_v6: bool,
-    buf: &mut [u8],
-) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::SOCKET;
-
-    let raw = sock.as_raw_socket() as SOCKET;
-    let res = sock.try_io(tokio::io::Interest::READABLE, || {
-        // SAFETY: every pointer built inside refers to a local that
-        // outlives the single WSARecvMsg call; `buf` is borrowed for it.
-        unsafe { win_orig_dest::recvmsg_once(raw, is_v6, buf) }
-    });
-
-    match res {
-        Ok(v) => Ok(Some(v)),
-        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// Other non-Unix, non-Windows targets: receive without ancillary data.
+/// Other targets: receive without ancillary data.
 /// Yields the source address and `None` for the original destination.
-/// `try_recv_from` mirrors the Unix `WouldBlock` -> `Ok(None)` contract.
-#[cfg(all(not(unix), not(windows)))]
+/// `try_recv_from` mirrors the `WouldBlock` -> `Ok(None)` contract.
+#[cfg(not(any(unix, windows)))]
 fn recv_with_orig_dest(
     sock: &UdpSocket,
-    _is_v6: bool,
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
     match sock.try_recv_from(buf) {
         Ok((n, src)) => Ok(Some((n, src, None))),
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
-    }
-}
-
-/// Walk the ancillary-data list for the original-destination cmsg and
-/// decode it. Returns `None` when no matching cmsg is present.
-///
-/// # Safety
-/// `msg.msg_control` must point at `msg.msg_controllen` valid bytes
-/// populated by a preceding `recvmsg`.
-#[cfg(unix)]
-unsafe fn orig_dest_from_cmsgs(msg: &libc::msghdr, is_v6: bool) -> Option<IpAddr> {
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
-    while !cmsg.is_null() {
-        let hdr = unsafe { &*cmsg };
-        if let Some(ip) = unsafe { decode_orig_dest_cmsg(hdr, cmsg, is_v6) } {
-            return Some(ip);
-        }
-        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
-    }
-    None
-}
-
-/// Decode a single cmsg into an original-destination IP if it carries one.
-///
-/// # Safety
-/// `cmsg_ptr` must equal `&*hdr` and reference a cmsg whose payload was
-/// populated by `recvmsg`.
-#[cfg(unix)]
-unsafe fn decode_orig_dest_cmsg(
-    hdr: &libc::cmsghdr,
-    cmsg_ptr: *const libc::cmsghdr,
-    is_v6: bool,
-) -> Option<IpAddr> {
-    let fits =
-        |size: usize| hdr.cmsg_len as usize >= unsafe { libc::CMSG_LEN(size as u32) } as usize;
-
-    if is_v6 {
-        if hdr.cmsg_level == libc::IPPROTO_IPV6
-            && hdr.cmsg_type == libc::IPV6_PKTINFO
-            && fits(std::mem::size_of::<libc::in6_pktinfo>())
-        {
-            let info = unsafe {
-                std::ptr::read_unaligned(libc::CMSG_DATA(cmsg_ptr) as *const libc::in6_pktinfo)
-            };
-            return Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
-        }
-        return None;
-    }
-
-    // v4 Linux family (linux, android): IP_PKTINFO carries in_pktinfo with
-    // the destination in ipi_addr. Mirrors `enable_recv_orig_dest`'s cfg.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if hdr.cmsg_level == libc::IPPROTO_IP
-        && hdr.cmsg_type == libc::IP_PKTINFO
-        && fits(std::mem::size_of::<libc::in_pktinfo>())
-    {
-        let info = unsafe {
-            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg_ptr) as *const libc::in_pktinfo)
-        };
-        return Some(IpAddr::V4(Ipv4Addr::from(
-            info.ipi_addr.s_addr.to_ne_bytes(),
-        )));
-    }
-
-    // v4 BSD/Apple family (macos, netbsd, and the IP_PKTINFO-less freebsd/
-    // openbsd/dragonfly): IP_RECVDSTADDR carries a bare in_addr (the
-    // destination). Mirrors `enable_recv_orig_dest`'s cfg.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    if hdr.cmsg_level == libc::IPPROTO_IP
-        && hdr.cmsg_type == libc::IP_RECVDSTADDR
-        && fits(std::mem::size_of::<libc::in_addr>())
-    {
-        let addr =
-            unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg_ptr) as *const libc::in_addr) };
-        return Some(IpAddr::V4(Ipv4Addr::from(addr.s_addr.to_ne_bytes())));
-    }
-
-    None
-}
-
-/// Convert a kernel-filled `sockaddr_storage` into a [`SocketAddr`].
-///
-/// # Safety
-/// `storage` must be initialised by `recvmsg` and `len` is its
-/// `msg_namelen`.
-#[cfg(unix)]
-unsafe fn sockaddr_storage_to_socketaddr(
-    storage: &libc::sockaddr_storage,
-    _len: libc::socklen_t,
-) -> io::Result<SocketAddr> {
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-            let port = u16::from_be(sin.sin_port);
-            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-        }
-        libc::AF_INET6 => {
-            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            let port = u16::from_be(sin6.sin6_port);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
-                ip,
-                port,
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("recvmsg returned unsupported address family {other}"),
-        )),
-    }
-}
-
-/// Windows original-destination recovery via `WSARecvMsg` + `IP_PKTINFO`,
-/// the Winsock analog of the Unix `recvmsg`/cmsg path. Mirrors pvxs
-/// `os/WIN32/osdSockExt.cpp` (`recvfromx::call`). Scoped to 64-bit Windows
-/// targets (the matrix builds x86_64 + aarch64), where the cmsg header and
-/// data alignments both equal `align_of::<CMSGHDR>()`.
-#[cfg(windows)]
-mod win_orig_dest {
-    use super::*;
-    use core::ffi::c_void;
-    use std::mem::size_of;
-    use std::ptr::{null, null_mut, read_unaligned};
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, CMSGHDR, IN_PKTINFO, IN6_PKTINFO, IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6,
-        IPV6_PKTINFO, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR_IN, SOCKADDR_IN6,
-        SOCKADDR_STORAGE, SOCKET, WSABUF, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl, WSAMSG,
-    };
-    use windows_sys::core::GUID;
-
-    /// `WSARecvMsg` extension fn. Its trailing `OVERLAPPED*` and completion
-    /// routine are always null here, so they are typed as opaque pointers to
-    /// avoid naming extra types.
-    type WsaRecvMsgFn =
-        unsafe extern "system" fn(SOCKET, *mut WSAMSG, *mut u32, *mut c_void, *mut c_void) -> i32;
-
-    static WSARECVMSG: OnceLock<WsaRecvMsgFn> = OnceLock::new();
-
-    pub(super) fn last_wsa_error() -> i32 {
-        // SAFETY: `WSAGetLastError` has no preconditions.
-        unsafe { WSAGetLastError() }
-    }
-
-    /// Resolve and cache the `WSARecvMsg` extension-fn pointer via
-    /// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` (pvxs `oseDoOnce`).
-    pub(super) fn resolve_wsarecvmsg(sock: SOCKET) -> io::Result<WsaRecvMsgFn> {
-        if let Some(f) = WSARECVMSG.get() {
-            return Ok(*f);
-        }
-        let guid: GUID = WSAID_WSARECVMSG;
-        let mut func: Option<WsaRecvMsgFn> = None;
-        let mut nout: u32 = 0;
-        // SAFETY: `guid`/`func`/`nout` outlive the call; the sizes match.
-        let rc = unsafe {
-            WSAIoctl(
-                sock,
-                SIO_GET_EXTENSION_FUNCTION_POINTER,
-                &guid as *const GUID as *const c_void,
-                size_of::<GUID>() as u32,
-                &mut func as *mut Option<WsaRecvMsgFn> as *mut c_void,
-                size_of::<Option<WsaRecvMsgFn>>() as u32,
-                &mut nout,
-                null_mut(),
-                None,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(last_wsa_error()));
-        }
-        let func = func.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "WSARecvMsg pointer unavailable")
-        })?;
-        let _ = WSARECVMSG.set(func);
-        Ok(func)
-    }
-
-    /// One non-blocking `WSARecvMsg`.
-    ///
-    /// # Safety
-    /// `buf` must be writable for its full length; the call borrows it.
-    pub(super) unsafe fn recvmsg_once(
-        sock: SOCKET,
-        is_v6: bool,
-        buf: &mut [u8],
-    ) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
-        let recv = resolve_wsarecvmsg(sock)?;
-
-        // SAFETY: zeroed sockaddr/WSAMSG are valid initial states; every
-        // pointer below refers to a stack local that outlives the call.
-        let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
-        let mut iov = WSABUF {
-            len: buf.len() as u32,
-            buf: buf.as_mut_ptr(),
-        };
-        // Room for one in6_pktinfo cmsg (header + 20 bytes, aligned).
-        let mut cbuf = [0u8; 128];
-        let mut msg: WSAMSG = unsafe { std::mem::zeroed() };
-        msg.name = &mut storage as *mut SOCKADDR_STORAGE as *mut _;
-        msg.namelen = size_of::<SOCKADDR_STORAGE>() as i32;
-        msg.lpBuffers = &mut iov;
-        msg.dwBufferCount = 1;
-        msg.Control = WSABUF {
-            len: cbuf.len() as u32,
-            buf: cbuf.as_mut_ptr(),
-        };
-        msg.dwFlags = 0;
-
-        let mut nrx: u32 = 0;
-        // SAFETY: `recv` is the resolved WSARecvMsg; pointers outlive it.
-        let rc = unsafe { recv(sock, &mut msg, &mut nrx, null_mut(), null_mut()) };
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(last_wsa_error()));
-        }
-
-        let src = sockaddr_to_socketaddr(&storage)?;
-        // SAFETY: `msg.Control` was populated by the WSARecvMsg above.
-        let orig_dest = unsafe { orig_dest_from_wsacmsgs(&msg, is_v6) };
-        Ok((nrx as usize, src, orig_dest))
-    }
-
-    #[inline]
-    fn cmsg_align(len: usize) -> usize {
-        let a = std::mem::align_of::<CMSGHDR>();
-        (len + a - 1) & !(a - 1)
-    }
-
-    /// `WSA_CMSG_DATA`: payload pointer for a cmsg header.
-    ///
-    /// # Safety
-    /// `cmsg` must point at a valid `CMSGHDR` inside the control buffer.
-    unsafe fn wsa_cmsg_data(cmsg: *const CMSGHDR) -> *const u8 {
-        (cmsg as *const u8).wrapping_add(cmsg_align(size_of::<CMSGHDR>()))
-    }
-
-    /// `WSA_CMSG_FIRSTHDR`.
-    fn wsa_cmsg_firsthdr(msg: &WSAMSG) -> *const CMSGHDR {
-        if (msg.Control.len as usize) >= size_of::<CMSGHDR>() {
-            msg.Control.buf as *const CMSGHDR
-        } else {
-            null()
-        }
-    }
-
-    /// `WSA_CMSG_NXTHDR`. Bounds the walk by `Control.len` using integer
-    /// arithmetic so no out-of-range pointer is ever formed.
-    ///
-    /// # Safety
-    /// `cmsg`, when non-null, must point at a valid `CMSGHDR`.
-    unsafe fn wsa_cmsg_nxthdr(msg: &WSAMSG, cmsg: *const CMSGHDR) -> *const CMSGHDR {
-        if cmsg.is_null() {
-            return wsa_cmsg_firsthdr(msg);
-        }
-        // SAFETY: caller guarantees `cmsg` is a valid header.
-        let cmsg_len = unsafe { (*cmsg).cmsg_len } as usize;
-        let base = msg.Control.buf as usize;
-        let end = base + msg.Control.len as usize;
-        let next = (cmsg as usize) + cmsg_align(cmsg_len);
-        if next + size_of::<CMSGHDR>() > end {
-            null()
-        } else {
-            next as *const CMSGHDR
-        }
-    }
-
-    /// Walk the ancillary data for the `IP_PKTINFO` / `IPV6_PKTINFO` cmsg
-    /// and return the recovered destination IP, or `None`.
-    ///
-    /// # Safety
-    /// `msg.Control` must point at `Control.len` valid bytes from `WSARecvMsg`.
-    unsafe fn orig_dest_from_wsacmsgs(msg: &WSAMSG, is_v6: bool) -> Option<IpAddr> {
-        let mut cmsg = wsa_cmsg_firsthdr(msg);
-        while !cmsg.is_null() {
-            // SAFETY: `cmsg` is non-null and within the control buffer.
-            let hdr = unsafe { &*cmsg };
-            if is_v6 {
-                if hdr.cmsg_level == IPPROTO_IPV6 as i32 && hdr.cmsg_type == IPV6_PKTINFO as i32 {
-                    // SAFETY: an IPV6_PKTINFO cmsg payload is an in6_pktinfo.
-                    let info = unsafe { read_unaligned(wsa_cmsg_data(cmsg) as *const IN6_PKTINFO) };
-                    return Some(IpAddr::V6(Ipv6Addr::from(unsafe { info.ipi6_addr.u.Byte })));
-                }
-            } else if hdr.cmsg_level == IPPROTO_IP as i32 && hdr.cmsg_type == IP_PKTINFO as i32 {
-                // SAFETY: an IP_PKTINFO cmsg payload is an in_pktinfo.
-                let info = unsafe { read_unaligned(wsa_cmsg_data(cmsg) as *const IN_PKTINFO) };
-                return Some(IpAddr::V4(Ipv4Addr::from(unsafe {
-                    info.ipi_addr.S_un.S_addr.to_ne_bytes()
-                })));
-            }
-            // SAFETY: `cmsg` is a valid header from this same control buffer.
-            cmsg = unsafe { wsa_cmsg_nxthdr(msg, cmsg) };
-        }
-        None
-    }
-
-    /// Convert a `WSARecvMsg`-filled `SOCKADDR_STORAGE` into a [`SocketAddr`].
-    fn sockaddr_to_socketaddr(storage: &SOCKADDR_STORAGE) -> io::Result<SocketAddr> {
-        match storage.ss_family {
-            AF_INET => {
-                // SAFETY: ss_family == AF_INET ⟹ storage is a SOCKADDR_IN.
-                let sin = unsafe { &*(storage as *const SOCKADDR_STORAGE as *const SOCKADDR_IN) };
-                let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
-                Ok(SocketAddr::V4(SocketAddrV4::new(
-                    ip,
-                    u16::from_be(sin.sin_port),
-                )))
-            }
-            AF_INET6 => {
-                // SAFETY: ss_family == AF_INET6 ⟹ storage is a SOCKADDR_IN6.
-                let sin6 = unsafe { &*(storage as *const SOCKADDR_STORAGE as *const SOCKADDR_IN6) };
-                let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
-                let scope = unsafe { sin6.Anonymous.sin6_scope_id };
-                Ok(SocketAddr::V6(SocketAddrV6::new(
-                    ip,
-                    u16::from_be(sin6.sin6_port),
-                    sin6.sin6_flowinfo,
-                    scope,
-                )))
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("WSARecvMsg returned unsupported address family {other}"),
-            )),
-        }
     }
 }
 
@@ -1028,17 +544,74 @@ mod tests {
         assert_eq!(c.listener_count(), 3);
     }
 
-    // Asserts a recovered original destination. Unix uses `recvmsg`/cmsg,
-    // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
-    // `orig_dest == None` by construction (see `enable_recv_orig_dest`), so
-    // the assertion is gated to the two that actually recover it. Binds a real
-    // `tokio::net` UDP socket and drives `recv_loop`, whose spawn now lands on
-    // the reactor-less callback pool under `exec_backend` (§4.2 UDP search is
-    // deferred). Reactor-dependent — gated out on the exec backend (stage 3).
-    #[cfg(any(unix, windows))]
-    #[cfg(tokio_backend)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wildcard_listener_receives_with_orig_dest() {
+    /// IPv4 sockets on UDP `port`, the collector's own included, from one
+    /// sock_diag snapshot (`/proc/net/udp` repeats and skips rows under
+    /// churn). Only Linux can say; elsewhere a timeout is never put down to a
+    /// co-holder.
+    fn udp_sockets_on(port: u16) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            named_port::port_holders::udp_holders(port)
+                .map(|h| h.iter().filter(|h| h.local.is_ipv4()).count())
+                .unwrap_or(1)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = port;
+            1
+        }
+    }
+
+    /// What a stand-in does to the one datagram of an attempt.
+    #[derive(Clone, Copy)]
+    enum Fate {
+        Deliver,
+        /// A same-user, options-first socket co-binds the collector's number
+        /// (a pvxs or softIoc process whose `bind(0)` was handed it) and takes
+        /// the datagram, as the kernel's reuse hash does about half the time.
+        #[cfg(target_os = "linux")]
+        TakenByStranger,
+        /// Sent to a number nobody listens on.
+        #[cfg(target_os = "linux")]
+        Misdirected,
+    }
+
+    impl Fate {
+        /// The stranger co-bound on the collector's `port`, if any, and the
+        /// number the datagram is sent to.
+        fn stage(self, port: u16) -> (Option<std::net::UdpSocket>, u16) {
+            match self {
+                Fate::Deliver => (None, port),
+                #[cfg(target_os = "linux")]
+                Fate::TakenByStranger => {
+                    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+                    s.set_reuse_address(true).unwrap();
+                    s.set_reuse_port(true).unwrap();
+                    s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+                        .expect("co-bind the collector's number");
+                    let s: std::net::UdpSocket = s.into();
+                    s.set_nonblocking(true).unwrap();
+                    (Some(s), port)
+                }
+                #[cfg(target_os = "linux")]
+                Fate::Misdirected => {
+                    // A number that is free now: bind, read, release.
+                    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                    (None, probe.local_addr().unwrap().port())
+                }
+            }
+        }
+    }
+
+    enum Attempt {
+        Got(CollectedDatagram),
+        /// Nothing arrived; `co_holders` other sockets sit on the number.
+        TimedOut {
+            co_holders: usize,
+        },
+    }
+
+    async fn attempt(fate: Fate, wait: Duration) -> Attempt {
         let mgr = UdpManager::new();
         let collector = mgr
             .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
@@ -1047,19 +620,59 @@ mod tests {
         let mut rx = collector
             .add_listener(&ep("0.0.0.0:0"))
             .expect("wildcard listener");
+        let (stranger, target) = fate.stage(port);
+        // Send from fresh source ports until the stranger's share of the
+        // reuse hash takes one, so the loss is not left to chance.
+        let mut sent = 0;
+        loop {
+            let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
+            sender
+                .send_to(b"hello-pva", &format!("127.0.0.1:{target}"))
+                .await
+                .expect("send");
+            sent += 1;
+            let Some(stranger) = &stranger else { break };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if stranger.recv(&mut [0u8; 64]).is_ok() {
+                break;
+            }
+            // The collector got this one: drop it and draw another source.
+            while rx.try_recv().is_ok() {}
+            assert!(sent < 200, "the stranger never drew a datagram");
+        }
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(got) => Attempt::Got(got.expect("channel open")),
+            Err(_) => Attempt::TimedOut {
+                co_holders: udp_sockets_on(port).saturating_sub(1),
+            },
+        }
+    }
 
-        // Send a unicast datagram to loopback; the collector must recover
-        // 127.0.0.1 as the original destination via the pktinfo cmsg.
-        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender bind");
-        sender
-            .send_to(b"hello-pva", &format!("127.0.0.1:{port}"))
-            .await
-            .expect("send");
+    /// The first datagram a wildcard collector delivers. A collector binds its
+    /// ephemeral number before it sets the reuse options, so a stranger whose
+    /// own `bind(0)` was handed that number co-binds it and takes some of the
+    /// datagrams: a timeout with another socket on the number is the stranger,
+    /// and a fresh collector is drawn. A timeout with nobody else there is the
+    /// collector failing, and fails the test.
+    async fn first_delivery(fates: &[Fate], wait: Duration) -> CollectedDatagram {
+        const ATTEMPTS: usize = 4;
+        let mut co_held = Vec::new();
+        for n in 0..ATTEMPTS {
+            let fate = fates.get(n).copied().unwrap_or(Fate::Deliver);
+            match attempt(fate, wait).await {
+                Attempt::Got(got) => return got,
+                Attempt::TimedOut { co_holders: 0 } => {
+                    panic!("datagram never arrived and no other socket holds the number")
+                }
+                Attempt::TimedOut { co_holders } => co_held.push(co_holders),
+            }
+        }
+        panic!(
+            "{ATTEMPTS} collectors in a row shared their number; co-holders per attempt: {co_held:?}"
+        );
+    }
 
-        let got = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("datagram must arrive")
-            .expect("channel open");
+    fn assert_recovered_orig_dest(got: &CollectedDatagram) {
         assert_eq!(&got.data, b"hello-pva");
         assert_eq!(
             got.orig_dest,
@@ -1067,6 +680,66 @@ mod tests {
             "original destination must be recovered from ancillary data"
         );
         assert_eq!(got.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    // Asserts a recovered original destination. Unix uses `recvmsg`/cmsg,
+    // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
+    // `orig_dest == None` by construction (see `crate::udp_rx`), so
+    // the assertion is gated to the two that actually recover it. Binds a real
+    // `tokio::net` UDP socket and drives `recv_loop`, whose spawn now lands on
+    // the reactor-less callback pool under `exec_backend` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out on the exec backend (stage 3).
+    #[cfg(any(unix, windows))]
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wildcard_listener_receives_with_orig_dest() {
+        // Send a unicast datagram to loopback; the collector must recover
+        // 127.0.0.1 as the original destination via the pktinfo cmsg.
+        let got = first_delivery(&[], Duration::from_secs(3)).await;
+        assert_recovered_orig_dest(&got);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stranger_on_the_collectors_number_costs_a_fresh_collector_not_the_test() {
+        let got = first_delivery(&[Fate::TakenByStranger], Duration::from_secs(1)).await;
+        assert_recovered_orig_dest(&got);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "no other socket holds the number")]
+    async fn a_collector_that_never_delivers_still_fails_the_test() {
+        first_delivery(&[Fate::Misdirected], Duration::from_millis(500)).await;
+    }
+
+    /// A port-0 collector binds before its fanout options, so it never lands
+    /// on a number a same-user fanout socket holds and loses its datagrams to
+    /// that socket's reuse group (`epics_base_rs::net::bind_fanout`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_port_0_collector_never_takes_a_strangers_number() {
+        let mut theirs = HashSet::new();
+        let mut held = Vec::new();
+        for _ in 0..2000 {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(true).unwrap();
+            s.set_reuse_port(true).unwrap();
+            s.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+                .unwrap();
+            theirs.insert(s.local_addr().unwrap().as_socket().unwrap().port());
+            held.push(s);
+        }
+        let mgr = UdpManager::new();
+        for _ in 0..200 {
+            let c = mgr
+                .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
+                .expect("bind collector");
+            let port = c.local_addr().unwrap().port();
+            assert!(!theirs.contains(&port), "collector on {port}, a stranger's");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

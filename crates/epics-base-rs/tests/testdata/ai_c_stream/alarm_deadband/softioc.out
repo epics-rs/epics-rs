@@ -1,0 +1,42 @@
+X                               0  
+X                               1.2  
+X                               4  
+X                               6 HIGH MINOR
+X                               12 HIHI MAJOR
+X                               10.5 HIHI MAJOR
+X                               8.9 HIGH MINOR
+X                               4.5 HIGH MINOR
+X                               3  
+X                               -6 LOW MINOR
+X                               -11 LOLO MAJOR
+X                               -9.5 LOLO MAJOR
+X                               -8.9 LOW MINOR
+X                               -4.5 LOW MINOR
+X                               0  
+X                               0  
+X                               4  
+X                               12 HIHI MAJOR
+X                               8.9 HIGH MINOR
+X                               4.5 HIGH MINOR
+X                               -6 LOW MINOR
+X                               -11 LOLO MAJOR
+X                               -4.5 LOW MINOR
+X                               0  
+X.SEVR                          NO_ALARM  
+X.SEVR                          MINOR HIGH MINOR
+X.SEVR                          MAJOR HIHI MAJOR
+X.SEVR                          MINOR HIGH MINOR
+X.SEVR                          NO_ALARM  
+X.SEVR                          MINOR LOW MINOR
+X.SEVR                          MAJOR LOLO MAJOR
+X.SEVR                          MINOR LOW MINOR
+X.SEVR                          NO_ALARM  
+X.STAT                          NO_ALARM  
+X.STAT                          HIGH HIGH MINOR
+X.STAT                          HIHI HIHI MAJOR
+X.STAT                          HIGH HIGH MINOR
+X.STAT                          NO_ALARM  
+X.STAT                          LOW LOW MINOR
+X.STAT                          LOLO LOLO MAJOR
+X.STAT                          LOW LOW MINOR
+X.STAT                          NO_ALARM  

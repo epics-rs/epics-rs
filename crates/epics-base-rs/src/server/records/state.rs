@@ -1,5 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::record::{CycleCell, CycleRead};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
@@ -37,7 +38,7 @@ pub struct StateRecord {
     /// Record name, delivered by the framework at `add_record`
     /// ([`Record::set_async_context`]); used to name the deprecation
     /// warning exactly as C does.
-    name: Option<String>,
+    name: Option<crate::types::RecordName>,
 }
 
 impl Default for StateRecord {
@@ -60,26 +61,49 @@ impl StateRecord {
 }
 
 impl Record for StateRecord {
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::NONE
+    }
+
+    /// `monitor()` posts VAL alone (`stateRecord.c:120-129`).
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::STATE_FIELDS,
+                    ["VAL"],
+                )
+            },
+        )
+    }
+
     fn record_type(&self) -> &'static str {
         "state"
     }
 
-    /// C `stateRecord.c::init_record` pass 0 warns that the record type is
-    /// deprecated (`stateRecord.c:96-104`). Mirror the message, naming the
-    /// record as C does (`prec->name`).
+    /// C `stateRecord.c::init_record` pass 0 warns through `errlogPrintf`
+    /// that the record type is deprecated (`stateRecord.c:84-90`), so `eltc 0`
+    /// silences it and a log listener receives it.
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            let name = self.name.as_deref().unwrap_or("<unknown>");
-            eprintln!(
+            let name = self
+                .name
+                .as_ref()
+                .map_or("<unknown>".into(), |n| n.to_str_lossy());
+            crate::runtime::log::errlog_vprintf(format_args!(
                 "WARNING: Using deprecated record type \"state\" for record \"{name}\".\n\
                  This record type will be removed beginning with EPICS 7.1. Please replace it\n\
-                 by a stringin record."
-            );
+                 by a stringin record.\n"
+            ));
         }
         Ok(())
     }
 
-    fn set_async_context(&mut self, name: String, _db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, _db: AsyncDbHandle) {
         self.name = Some(name);
     }
 
@@ -103,9 +127,14 @@ impl Record for StateRecord {
     fn monitor_value_changed(&mut self) -> Option<bool> {
         let changed = self.oval != self.val;
         if changed {
-            self.oval = self.val.clone();
+            self.oval.clone_from(&self.val);
         }
         Some(changed)
+    }
+
+    /// The `recGblResetAlarms` mask rides the `strncmp` branch's post only.
+    fn alarm_alone_posts_value(&self) -> bool {
+        false
     }
 
     /// C `stateRecord.c::monitor` (lines 120-129) posts only `VAL`. `OVAL`
@@ -117,6 +146,23 @@ impl Record for StateRecord {
     /// never a change update — matching C. It stays readable on the GET path.
     fn event_posted_fields(&self) -> &'static [&'static str] {
         &["OVAL"]
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val | CycleCell::Oval => CycleRead::ByName,
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn val(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
+    }
+
+    /// C `process` sets `udf = FALSE` unconditionally (`stateRecord.c:99`);
+    /// the default would copy VAL through [`Self::val`] to say the same.
+    fn value_is_undefined(&self) -> bool {
+        false
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

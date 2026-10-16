@@ -87,9 +87,9 @@ fn link_text(db: &PvDatabase, field: &str) -> String {
         .unwrap_or_else(|| panic!("{REC} must survive a refused link, as it does in C"));
     let inst = rec.read();
     match field {
-        "INP" => inst.common.inp.clone(),
-        "SDIS" => inst.common.sdis.clone(),
-        "FLNK" => inst.common.flnk.clone(),
+        "INP" => inst.common.text.inp.to_string(),
+        "SDIS" => inst.common.text.sdis.to_string(),
+        "FLNK" => inst.common.text.flnk.to_string(),
         other => panic!("no accessor for {other}"),
     }
 }
@@ -263,7 +263,7 @@ async fn a_runtime_put_of_a_link_the_device_cannot_take_is_refused_too() {
         "{err}"
     );
     assert_eq!(
-        inst.common.inp, "@instio parm",
+        inst.common.text.inp, "@instio parm",
         "a refused put must leave the link exactly as it was — C's does"
     );
 }
@@ -341,7 +341,7 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         inst.record.get_field("INPA"),
         Some(epics_base_rs::types::EpicsValue::String("".into()))
     );
-    assert_eq!(inst.common.out, "");
+    assert_eq!(inst.common.text.out, "");
     // calcout's `INAV`/`OUTV` menu is `{Ext PV NC, Ext PV OK, Local PV,
     // Constant}` (`calcoutRecord.dbd`), so `Constant` is index 3.
     assert_eq!(
@@ -354,4 +354,31 @@ async fn a_refused_link_leaves_no_stale_classification_behind() {
         Some(epics_base_rs::types::EpicsValue::Enum(3)),
         "OUTV must be Constant — calcout captures the common OUT in init_links"
     );
+}
+
+/// A record type with no `device()` line has no `devSup`, so its INP/OUT
+/// expects CONSTANT as every other link field does (`dbStaticLib.c:2187-2193`).
+/// The C `softIoc` on `record(compress,"T:C1"){ field(INP,"@instio parm") }`:
+///
+/// ```text
+/// ERROR: T:C1.INP: can't initialize link type CONSTANT with "@instio parm" (type INST_IO)
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_device_link_of_a_type_without_device_support_is_held_to_constant() {
+    let line = link_type_refusal("T:C1", "compress", None, "INP", "@instio parm")
+        .expect("compress has no device support: C refuses a hardware INP");
+    assert_eq!(
+        line,
+        "T:C1.INP: can't initialize link type CONSTANT with \"@instio parm\" (type INST_IO)"
+    );
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            "record(compress, \"T:C1\") {\n    field(INP, \"@instio parm\")\n}\n",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(db.get_record("T:C1").unwrap().read().common.text.inp, "");
 }

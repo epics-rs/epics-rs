@@ -222,11 +222,17 @@ pub struct PvaServerConfig {
     /// Auto-discover per-NIC broadcast addresses for beacons. From
     /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` (default true).
     pub auto_beacon: bool,
-    /// Interfaces to bind UDP responder on. When empty, bind 0.0.0.0.
-    /// From `EPICS_PVAS_INTF_ADDR_LIST`.
-    pub interfaces: Vec<std::net::IpAddr>,
+    /// Interfaces to bind the TCP listeners and UDP responder on. When empty,
+    /// bind `bind_ip`. Each TCP listener binds its own entry's port; a port
+    /// of 0 takes `tcp_port`, then the first listener's bound port
+    /// (`server.cpp:476-486`). A multicast entry is a search group, joined on
+    /// its `@iface` (else the default route), and adds that interface's
+    /// address (else the wildcard) as pvxs `Config::expand` does
+    /// (`config.cpp:497-509`). From `EPICS_PVAS_INTF_ADDR_LIST`; a plain
+    /// `SocketAddr` converts via `.into()`.
+    pub interfaces: Vec<crate::config::Endpoint>,
     /// PVX-82: deferred config error set by [`Self::with_env`] when
-    /// `EPICS_PVA[S]_INTF_ADDR_LIST` named interface(s) that all failed to
+    /// `EPICS_PVAS_INTF_ADDR_LIST` named interface(s) that all failed to
     /// resolve. `PvaServer::start` refuses to bind in that case rather than
     /// silently promoting the (now-empty) `interfaces` to the wildcard
     /// `0.0.0.0`. `None` on any programmatically-built config — an empty
@@ -329,15 +335,7 @@ pub struct PvaServerConfig {
     /// address family carried the SEARCH. Beacon emission stays on
     /// the v4 path for now; v6 multicast beacons are deferred.
     pub enable_ipv6_udp: bool,
-    /// Per-monitor "high" watermark — emit a `tracing::warn!` when an
-    /// outbound monitor queue grows past this many items. Default:
-    /// `monitor_queue_depth * 3 / 4` (3, for the pvxs per-op default
-    /// depth of 4). Mirrors pvxs
-    /// `MonitorControlOp::setWatermarks` `high` argument; high-mark
-    /// callbacks (`onHighMark`) aren't surfaced yet — the watermark
-    /// drives diagnostics only.
-    pub monitor_high_watermark: usize,
-    /// Per-monitor "low" watermark — companion to `high`, currently
+    /// Per-monitor "low" watermark, currently
     /// unused (pvxs notes the `onLowMark` callback isn't fully
     /// implemented either). Reserved for future flow-control logic.
     pub monitor_low_watermark: usize,
@@ -418,7 +416,6 @@ impl Default for PvaServerConfig {
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
             enable_ipv6_udp: false,
-            monitor_high_watermark: (super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize) * 3 / 4,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),
@@ -576,7 +573,7 @@ pub struct ClientCredentials {
     /// Account name (e.g., the `ca` auth's `user` field, or the x509
     /// leaf cert subject CommonName). Empty when the auth method does
     /// not carry one.
-    pub account: String,
+    pub account: epics_base_rs::types::PvString,
     /// Host identity of the peer, as the ACF `HAG(...)` gate matches it:
     /// the connection's peer address in numeric form, port stripped and
     /// IPv4-mapped IPv6 collapsed to IPv4 (QSRV `ioc/credentials.cpp:27-29`).
@@ -610,5 +607,5 @@ pub struct ClientCredentials {
     /// trusting it would let `account="nobody", roles=["admin"]` satisfy
     /// any group-gated rule — an ACL bypass. Every constructor funnels
     /// through `with_server_derived`, so a wire value can never reach here.
-    pub roles: Vec<String>,
+    pub roles: Vec<epics_base_rs::types::PvString>,
 }

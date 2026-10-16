@@ -40,6 +40,7 @@ impl GatherProcessor {
 }
 
 impl NDPluginProcess for GatherProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
         ProcessResult::forward(array, vec![])

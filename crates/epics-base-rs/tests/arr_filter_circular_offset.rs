@@ -77,18 +77,17 @@ fn through_arr(values: Vec<f64>, start: i64, end: i64) -> Vec<f64> {
         incr: 1,
         end,
     };
-    let event = FilteredMonitorEvent::new(MonitorEvent {
-        snapshot: std::sync::Arc::new(Snapshot::new(
+    let event = FilteredMonitorEvent::new(MonitorEvent::read_log(
+        &mut Snapshot::new(
             EpicsValue::DoubleArray(values.into()),
             0,
             0,
             std::time::SystemTime::UNIX_EPOCH,
-        )),
-        origin: 0,
-        mask: EventMask::VALUE,
-    });
+        ),
+        EventMask::VALUE,
+    ));
     let out = ArrayFilter::new(cfg).apply(event).unwrap();
-    match std::sync::Arc::unwrap_or_clone(out.event.snapshot).value {
+    match out.event.value().as_value().cloned().unwrap() {
         EpicsValue::DoubleArray(v) => v.to_vec(),
         other => panic!("expected DoubleArray, got {other:?}"),
     }

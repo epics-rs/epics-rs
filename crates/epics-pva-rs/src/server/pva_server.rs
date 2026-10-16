@@ -2,8 +2,8 @@
 //!
 //! Built on top of the native runtime in [`crate::server_native`].
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
-// suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend -
+// server/mod.rs declares it under #[cfg(tokio_backend)] mod pva_server;.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,6 +33,18 @@ pub struct PvaServerBuilder {
     acf: Option<access_security::AccessSecurityConfig>,
 }
 
+/// A server that cannot start leaves the IOC and its shell running, with
+/// the reason on stderr: pvxs `pvxsBaseRegistrar` catches the
+/// `Server(conf)` exception thrown by a failed `sock.bind()`
+/// (`udp_collector.cpp:151`) and prints `Error in <func> : <what>`
+/// (`ioc/iochooks.cpp:508-509`, pvxs 1.5.3).
+fn announce_server_failure(result: CaResult<()>) -> CaResult<()> {
+    if let Err(e) = &result {
+        eprintln!("Error in pvxsBaseRegistrar : {e}");
+    }
+    result
+}
+
 impl PvaServerBuilder {
     pub fn new() -> Self {
         Self {
@@ -42,7 +54,9 @@ impl PvaServerBuilder {
         }
     }
 
-    /// Set the TCP port (UDP = port + 1), overriding the environment.
+    /// Set the TCP port, overriding the environment. The search (UDP) port
+    /// stays `EPICS_PVAS_BROADCAST_PORT`'s, as pvxs reads the two
+    /// independently (`config.cpp:402-415`); `0` binds both ephemerally.
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
         self
@@ -71,7 +85,7 @@ impl PvaServerBuilder {
     }
 
     pub async fn build(self) -> CaResult<PvaServer> {
-        let (db, autosave_config) = self.ioc.build().await?;
+        let (db, autosave_config) = self.ioc.build_served().await?;
         let acf = epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
         Ok(PvaServer {
             db,
@@ -123,16 +137,20 @@ impl PvaServer {
     /// server, the sibling CA/QSRV servers, and the iocsh `asInit`
     /// command all gate on one cell. A standalone caller creates its
     /// own with [`epics_base_rs::server::access_security::new_acf_cell`].
+    ///
+    /// `port` is [`PvaServerBuilder::port`]'s: `None` leaves both ports to
+    /// the environment, so a caller never resolves `EPICS_PVAS_SERVER_PORT`
+    /// itself and hands it back as an explicit port.
     pub fn from_parts(
         db: Arc<PvDatabase>,
-        port: u16,
+        port: Option<u16>,
         acf: epics_base_rs::server::access_security::AcfCell,
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> Self {
         Self {
             db,
-            port: Some(port),
+            port,
             acf,
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
@@ -148,9 +166,8 @@ impl PvaServer {
     /// subsequent checks see the new one. Unlike the `RwLock` this replaced,
     /// the reload does not wait for in-flight checks to finish.
     pub async fn reload_acf_from(&self, path: &std::path::Path) -> CaResult<()> {
-        let content = std::fs::read_to_string(path).map_err(epics_base_rs::error::CaError::Io)?;
-        let cfg = access_security::parse_acf(&content)?;
-        self.acf.store(Some(std::sync::Arc::new(cfg)));
+        let cfg = access_security::read_acf(path).await?;
+        self.acf.install_async(cfg).await;
         // Bump the shared ACL generation so monitor tasks
         // spawned on the default `PvDatabaseSource` (which captured
         // this counter at spawn time) detect the change on their
@@ -247,17 +264,20 @@ impl PvaServer {
         report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
     ) -> CaResult<()> {
         // The environment is the base (pvxs `Config::applyEnv`); an
-        // explicit `.port(p)` overrides it, keeping the port/port+1
-        // derivation this builder has always used.
+        // explicit port overrides the TCP port alone. The search port is
+        // `EPICS_PVAS_BROADCAST_PORT`, then `EPICS_PVA_BROADCAST_PORT`, then
+        // 5076 (pvxs `config.cpp:410-415`), whatever the TCP port is.
         let mut config = PvaServerConfig::default().with_env();
         if let Some(port) = self.port {
             config.tcp_port = port;
-            // `0` is the ephemeral sentinel (`PvaServerBuilder::port` documents
-            // `Some(0)` as "an ephemeral bind"), not a base to offset from:
-            // `0 + 1` asked for the *privileged* UDP port 1, so the one
-            // configuration that means "kernel, pick both" was the one that
-            // could not work. Ephemeral TCP implies ephemeral UDP.
-            config.udp_port = if port == 0 { 0 } else { port + 1 };
+            // An explicit `0` asks for a server on no fixed port, so the
+            // search port goes ephemeral with it and two such servers on one
+            // host never share one. `EPICS_PVAS_SERVER_PORT=0` is not this: it
+            // reaches here as `None` and leaves the search port alone, as
+            // softIocPVX 1.5.3 keeps 5076.
+            if port == 0 {
+                config.udp_port = 0;
+            }
         }
 
         // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
@@ -344,7 +364,7 @@ impl PvaServer {
         let server_clone = server.clone();
         let server_handle = bridge
             .reactor()
-            .spawn(async move { server_clone.run_reporting(None).await });
+            .spawn(async move { announce_server_failure(server_clone.run_reporting(None).await) });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -404,9 +424,9 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let server_handle = bridge
-            .reactor()
-            .spawn(async move { server_clone.run_with_source_inner(source, None).await });
+        let server_handle = bridge.reactor().spawn(async move {
+            announce_server_failure(server_clone.run_with_source_inner(source, None).await)
+        });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -450,7 +470,7 @@ impl PvaServer {
 mod tests {
     use super::*;
 
-    /// `from_parts(db, 0, ..)` must bind BOTH ports ephemerally and report
+    /// `from_parts(db, Some(0), ..)` must bind BOTH ports ephemerally and report
     /// what it got.
     ///
     /// `PvaServerBuilder::port` documents `Some(0)` as "an ephemeral bind",
@@ -468,7 +488,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let server = PvaServer::from_parts(
             db,
-            0,
+            Some(0),
             epics_base_rs::server::access_security::new_acf_cell(None),
             None,
             None,
@@ -511,5 +531,212 @@ mod tests {
         }
         assert_eq!(handle.bound_tcp_port(), report.tcp_port);
         run.abort();
+    }
+
+    /// The search port is `EPICS_PVAS_BROADCAST_PORT`'s whatever TCP port the
+    /// caller passes (pvxs `config.cpp:402-415` reads the two apart);
+    /// softIocPVX 1.5.3 with 5281/5287 binds TCP 5281 and UDP 5287. The
+    /// pvxget half is `interop_pvxs::server_ports_env`.
+    #[tokio::test]
+    #[serial_test::serial(epics_env)]
+    async fn search_port_is_the_broadcast_port_not_tcp_plus_one() {
+        // Both numbers are named and bound on every NIC, so a lost one is a
+        // retry: TCP falls back to another port (`bind_serv_iface` does that
+        // only on a refused bind), UDP fails the start while still held.
+        for _ in 0..named_port::ATTEMPTS {
+            let tcp = named_port::free_for_tcp_and_udp();
+            let udp = named_port::free_for_tcp_and_udp();
+            // SAFETY: `serial(epics_env)` holds every env-touching test off.
+            unsafe { std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string()) };
+            let server = PvaServer::from_parts(
+                Arc::new(PvDatabase::new()),
+                Some(tcp),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+                None,
+                None,
+            );
+            let (tx, mut rx) = watch::channel(None);
+            let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+            let report = loop {
+                if let Some(h) = rx.borrow_and_update().clone() {
+                    break Some(h.report());
+                }
+                if rx.changed().await.is_err() {
+                    break None;
+                }
+            };
+            run.abort();
+            let ended = run.await;
+            unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
+            match report {
+                Some(report) if report.tcp_port != tcp => continue,
+                Some(report) => {
+                    assert_eq!((report.tcp_port, report.udp_port), (tcp, udp));
+                    return;
+                }
+                None if named_port::udp_port_is_held(udp) => continue,
+                None => panic!("the server never reported: {ended:?}"),
+            }
+        }
+        panic!(
+            "every one of {} candidate ports was taken",
+            named_port::ATTEMPTS
+        );
+    }
+
+    /// `EPICS_PVAS_SERVER_PORT=0` makes the TCP port ephemeral and nothing
+    /// else: softIocPVX 1.5.3 under it listens on an ephemeral TCP port and
+    /// still searches on 5076 (here, `EPICS_PVAS_BROADCAST_PORT`'s).
+    #[tokio::test]
+    #[serial_test::serial(epics_env)]
+    async fn env_server_port_zero_leaves_the_search_port() {
+        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: `serial(epics_env)` holds every env-touching test off.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_SERVER_PORT", "0");
+            std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string());
+        }
+        let server = PvaServer::from_parts(
+            Arc::new(PvDatabase::new()),
+            None,
+            epics_base_rs::server::access_security::new_acf_cell(None),
+            None,
+            None,
+        );
+        let (tx, mut rx) = watch::channel(None);
+        let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+        let report = loop {
+            if let Some(h) = rx.borrow_and_update().clone() {
+                break h.report();
+            }
+            rx.changed().await.expect("server reports its ports");
+        };
+        run.abort();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::remove_var("EPICS_PVAS_BROADCAST_PORT");
+        }
+        assert_ne!(report.tcp_port, 0);
+        assert_eq!(report.udp_port, udp);
+    }
+
+    /// An explicit port still wins with `EPICS_PVAS_INTF_ADDR_LIST` set: a
+    /// bare interface entry keeps port 0 and takes the resolved `tcp_port`
+    /// at bind. qsrv-rs `--port`, dual-ioc-rs `--pva-port` and oracle_ioc's
+    /// `Some(0)` reach `from_parts`; the builder sets the same field.
+    #[tokio::test]
+    #[serial_test::serial(epics_env)]
+    async fn explicit_port_survives_the_interface_list() {
+        async fn bound_tcp(server: PvaServer) -> u16 {
+            let (tx, mut rx) = watch::channel(None);
+            let run = tokio::spawn(async move { server.run_reporting(Some(tx)).await });
+            let port = loop {
+                if let Some(h) = rx.borrow_and_update().clone() {
+                    break h.report().tcp_port;
+                }
+                rx.changed().await.expect("server reports its ports");
+            };
+            run.abort();
+            let _ = run.await;
+            port
+        }
+        let from_parts = |port| {
+            PvaServer::from_parts(
+                Arc::new(PvDatabase::new()),
+                Some(port),
+                epics_base_rs::server::access_security::new_acf_cell(None),
+                None,
+                None,
+            )
+        };
+        let free = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // SAFETY: `serial(epics_env)` holds every env-touching test off.
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1");
+            std::env::set_var("EPICS_PVAS_BROADCAST_PORT", udp.to_string());
+        }
+        let explicit = free();
+        let got_explicit = bound_tcp(from_parts(explicit)).await;
+        let got_zero = bound_tcp(from_parts(0)).await;
+        let built = free();
+        let got_built = bound_tcp(PvaServer::builder().port(built).build().await.unwrap()).await;
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_BROADCAST_PORT");
+        }
+        assert_eq!(got_explicit, explicit);
+        assert!(
+            got_zero != 0 && got_zero != 5075,
+            "Some(0) bound {got_zero}"
+        );
+        assert_eq!(got_built, built);
+    }
+
+    /// C `asInit` returns only once `asCaStart` has the inputs' first readings
+    /// (`asCaTaskWait`), so a check right after a reload sees them, and the
+    /// wait parks no thread, so it completes on the watcher's own band.
+    #[epics_macros_rs::epics_test]
+    async fn reload_acf_from_returns_with_the_first_readings_in_place() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "rv",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(5.0)),
+        )
+        .await
+        .unwrap();
+        db.put_record_field_from_ca("rv", "VAL", epics_base_rs::types::EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.acf");
+        std::fs::write(
+            &path,
+            r#"ASG(DEFAULT) { INPA(rv) RULE(1,READ) { CALC("A>1") } }"#,
+        )
+        .unwrap();
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(None, &db);
+        let server = PvaServer::from_parts(db.clone(), Some(0), acf.clone(), None, None);
+        // Hold `rv`'s lock across the reload: the first reading is in place at
+        // the assert only if the reload waited for the watcher to take it.
+        let (locked, held) = std::sync::mpsc::channel();
+        let rec = db.get_record("rv").unwrap();
+        let holder = std::thread::spawn(move || {
+            let _guard = rec.write();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        held.recv().unwrap();
+        // From cbMedium, the INP watcher's band: an install that parks its
+        // thread there waits on a watcher that cannot run.
+        let reload = epics_base_rs::runtime::task::spawn_background(
+            epics_base_rs::runtime::task::CallbackPriority::Medium,
+            async move { server.reload_acf_from(&path).await },
+        );
+        epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload parked cbMedium")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acf.load_full().unwrap().asg[b"DEFAULT".as_slice()].inp_bad(),
+            0
+        );
+        holder.join().unwrap();
     }
 }

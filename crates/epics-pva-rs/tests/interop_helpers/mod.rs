@@ -20,9 +20,8 @@ use std::process::{Child, Command, Stdio};
 /// hard-coded `/Users/<name>/codes/pvxs`; on a machine where the checkout
 /// lives anywhere else every interop test silently reported SKIP — which
 /// nextest prints as a pass. Resolution failure is now fatal, matching the
-/// parity guards; a resolved tree whose binaries are simply not built still
-/// skips, because that is an absent build artifact rather than a
-/// misconfigured path (see `require_pvxs`).
+/// parity guards, and so is a resolved tree whose binaries are not built
+/// (see `require_pvxs`).
 fn pvxs_home() -> PathBuf {
     epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
 }
@@ -133,77 +132,200 @@ pub fn locate_pvxs(name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Skip the test with a SKIP-prefixed stderr line if the named
-/// binary cannot be found.
-pub fn require_pvxs(name: &str) -> Option<PathBuf> {
-    match locate_pvxs(name) {
-        Some(p) => Some(p),
-        None => {
-            eprintln!(
-                "SKIP: pvxs binary `{name}` not found under {:?} or on PATH; \
-                 build pvxs in `{:?}` to enable this interop test.",
-                pvxs_bin_dir(),
-                pvxs_home(),
-            );
-            None
+/// Resolve the named pvxs binary, failing the test when it cannot be found:
+/// an early return would score as a pass.
+pub fn require_pvxs(name: &str) -> PathBuf {
+    locate_pvxs(name).unwrap_or_else(|| {
+        panic!(
+            "pvxs binary `{name}` not found under {:?} or on PATH; \
+             build pvxs in `{:?}` to run this interop test.",
+            pvxs_bin_dir(),
+            pvxs_home(),
+        )
+    })
+}
+
+/// How many times a pvxs process is started before its failure stands.
+const RANDOM_UDP_ATTEMPTS: usize = 8;
+
+/// Whether a pvxs process's output shows it lost a port to another socket,
+/// the only failure a fresh attempt is allowed to absorb. The rerun is
+/// justified only because the test needs the port it picked: the number was
+/// free when picked and released, and pvxs itself refuses a taken one.
+///
+/// - `Unable to bind random UDP`: a client context binds a random UDP4 port,
+///   then the same port on UDP6 (`client.cpp:576-594`), and no variable skips
+///   the second bind. It throws before sending anything. Every process that
+///   builds a client prints it: the tools, softIocPVX's pvalink, a client
+///   helper.
+/// - `Error in pvxsBaseRegistrar : Address already in use`: softIocPVX's
+///   server binds the search port a test picked and released
+///   (`server.cpp:423`, `udp_collector.cpp:151`) at registration, and the
+///   registrar prints the throw (`iochooks.cpp:509`) and serves nothing.
+/// - `Server unable to bind port`: a server's picked TCP port was taken, and
+///   it serves on another one (`serverconn.cpp:443-463`).
+/// - RSRV's report that softIocPVX's CA server lost its probed
+///   `EPICS_CAS_SERVER_PORT`, read as softIoc's is
+///   ([`named_port::verdict::softioc_verdict`]).
+pub fn port_collision(text: &str) -> bool {
+    text.contains("Unable to bind random UDP")
+        || text.contains("Error in pvxsBaseRegistrar : Address already in use")
+        || text.contains("Server unable to bind port")
+        || named_port::verdict::softioc_verdict(text)
+            == named_port::verdict::SoftIocVerdict::PortTaken
+}
+
+/// Run `attempt` until the output `text` reads from its result does not show
+/// [`port_collision`], at most [`RANDOM_UDP_ATTEMPTS`] times.
+pub fn rerun_pvxs<T>(mut attempt: impl FnMut() -> T, text: impl Fn(&T) -> String) -> T {
+    for _ in 1..RANDOM_UDP_ATTEMPTS {
+        let out = attempt();
+        if !port_collision(&text(&out)) {
+            return out;
         }
+    }
+    attempt()
+}
+
+/// `Command::output` for a pvxs process that runs to completion, through
+/// [`rerun_pvxs`].
+pub trait PvxsOutput {
+    fn pvxs_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl PvxsOutput for Command {
+    fn pvxs_output(&mut self) -> std::io::Result<std::process::Output> {
+        rerun_pvxs(
+            || self.output(),
+            |out| match out {
+                Ok(out) => String::from_utf8_lossy(&out.stderr).into_owned(),
+                Err(_) => String::new(),
+            },
+        )
     }
 }
 
-/// Skip the test with a SKIP-prefixed stderr line when the pvxs build
-/// this suite resolves has no TLS support.
-///
-/// pvxs master still links without OpenSSL, so a host can have every
-/// binary an interop test needs and still be unable to speak TLS. Until
-/// this was asked up front the absence only surfaced later — as a TLS
-/// port that never opened, or a handshake that timed out — and those
-/// look exactly like our own client or config being wrong, so the tests
-/// returned early and reported green over both. Answering it here is
-/// what lets every path after the gate fail instead of skip.
-///
-/// `pvxinfo -D` on a TLS-enabled build lists `EPICS_PVA_TLS_KEYCHAIN`
-/// (the variable is dumped even when it is unset); a build without
-/// OpenSSL has no TLS entry at all. The probe deliberately runs the same
-/// tree [`locate_pvxs`] resolves, not [`pvxs_tls_home`], so it describes
-/// the binaries the caller will actually spawn.
-pub fn require_pvxs_tls() -> bool {
-    let Some(pvxinfo) = locate_pvxs("pvxinfo") else {
-        eprintln!(
-            "SKIP: pvxs binary `pvxinfo` not found under {:?} or on PATH, so \
-             this host cannot be probed for TLS support.",
-            pvxs_bin_dir(),
-        );
-        return false;
-    };
-    let out = match pvxs_command(&pvxinfo)
-        .arg("-D")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => panic!("`pvxinfo` at {} would not run: {e}", pvxinfo.display()),
-    };
-    let dump =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    if dump.contains("EPICS_PVA_TLS_KEYCHAIN") {
-        return true;
+/// Where a [`start_pvxs`] process writes its stdout and stderr.
+pub struct PvxsLogs {
+    pub out: PathBuf,
+    pub err: PathBuf,
+}
+
+impl PvxsLogs {
+    /// `<tag>.out` / `<tag>.err` in `dir`.
+    pub fn in_dir(dir: &Path, tag: &str) -> Self {
+        Self {
+            out: dir.join(format!("{tag}.out")),
+            err: dir.join(format!("{tag}.err")),
+        }
     }
-    eprintln!(
-        "SKIP: the pvxs build at {:?} has no TLS support (`pvxinfo -D` does \
-         not mention EPICS_PVA_TLS_KEYCHAIN); rebuild pvxs against OpenSSL, \
-         or point PVXS_HOME at a build that has it, to run this test.",
-        pvxs_home(),
-    );
-    false
+
+    /// Both logs, stdout first.
+    pub fn text(&self) -> String {
+        [&self.out, &self.err]
+            .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+            .join("\n")
+    }
+
+    /// Where attempt `n`'s logs are kept once a later attempt replaces it.
+    pub fn kept(&self, n: usize) -> Self {
+        let tag = |p: &Path| PathBuf::from(format!("{}.{n}", p.display()));
+        Self {
+            out: tag(&self.out),
+            err: tag(&self.err),
+        }
+    }
+
+    /// The logs and every attempt's kept copy.
+    pub fn remove_all(&self) {
+        for logs in (1..=RANDOM_UDP_ATTEMPTS).map(|n| self.kept(n)) {
+            let _ = std::fs::remove_file(&logs.out);
+            let _ = std::fs::remove_file(&logs.err);
+        }
+        let _ = std::fs::remove_file(&self.out);
+        let _ = std::fs::remove_file(&self.err);
+    }
+}
+
+/// Start a long-running pvxs process: `build` makes one attempt's command and
+/// the value `ready` is judged against, and the process is returned once
+/// `ready` holds on its logs. Only a [`port_collision`] is built afresh, at
+/// most [`RANDOM_UDP_ATTEMPTS`] times, its logs kept at [`PvxsLogs::kept`]; an
+/// exit or 5 s without `ready` is the error, with its whole output.
+pub fn start_pvxs<T>(
+    logs: &PvxsLogs,
+    mut build: impl FnMut() -> (Command, T),
+    mut ready: impl FnMut(&T, &str) -> bool,
+) -> Result<(DropChild, T), String> {
+    let mut kept = Vec::new();
+    let mut last = String::new();
+    let fail = |why: String, text: String, kept: &[PathBuf]| {
+        Err(format!(
+            "{why}; earlier attempts' logs: {kept:?}\n--- output ---\n{text}"
+        ))
+    };
+    for n in 1..=RANDOM_UDP_ATTEMPTS {
+        let (mut cmd, value) = build();
+        let child = cmd
+            .stdout(std::fs::File::create(&logs.out).expect("create stdout log"))
+            .stderr(std::fs::File::create(&logs.err).expect("create stderr log"))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {:?}: {e}", cmd.get_program()));
+        let mut proc = DropChild { child };
+        let mut polls = 0;
+        loop {
+            // Exit first, so the text read after it is the whole output.
+            let exit = proc.child.try_wait().ok().flatten();
+            let text = logs.text();
+            if port_collision(&text) {
+                last = text;
+                break;
+            }
+            if exit.is_none() && ready(&value, &text) {
+                return Ok((proc, value));
+            }
+            if let Some(status) = exit {
+                return fail(format!("attempt {n} exited: {status}"), text, &kept);
+            }
+            polls += 1;
+            if polls == 50 {
+                return fail(format!("attempt {n} not ready within 5 s"), text, &kept);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        drop(proc);
+        let to = logs.kept(n);
+        std::fs::rename(&logs.out, &to.out).expect("keep stdout log");
+        std::fs::rename(&logs.err, &to.err).expect("keep stderr log");
+        kept.extend([to.out, to.err]);
+    }
+    fail(
+        format!("all {RANDOM_UDP_ATTEMPTS} attempts lost a port"),
+        last,
+        &kept,
+    )
+}
+
+/// An IOC is ready once iocInit has ended and `addr` accepts. The listen
+/// socket accepts before iocInit runs, and the pvalink client context built
+/// inside iocInit can still abort, so the connect alone proves nothing.
+pub fn ioc_ready(addr: &std::net::SocketAddr, text: &str) -> bool {
+    text.contains("All initialization complete")
+        && std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_millis(100)).is_ok()
 }
 
 /// Build a `Command` for a pvxs binary, with `DYLD_LIBRARY_PATH`
-/// (macOS) / `LD_LIBRARY_PATH` (linux) extended with the bundled
-/// libpvxs directory so the binary loads cleanly.
+/// (macOS) / `LD_LIBRARY_PATH` (linux) extended with the libpvxs directory
+/// of the tree it came from — `<root>/lib/<arch>` beside `<root>/bin/<arch>`,
+/// so a [`pvxs_tls_home`] binary loads its own — else [`pvxs_lib_dir`].
 pub fn pvxs_command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
-    let lib = pvxs_lib_dir();
+    let lib = bin
+        .ancestors()
+        .nth(3)
+        .map(|root| root.join("lib").join(pvxs_arch()))
+        .filter(|lib| lib.is_dir())
+        .unwrap_or_else(pvxs_lib_dir);
     if lib.is_dir() {
         let var = if cfg!(target_os = "macos") {
             "DYLD_LIBRARY_PATH"
@@ -226,6 +348,80 @@ pub fn pvxs_command(bin: &Path) -> Command {
 pub fn pick_localhost_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
     l.local_addr().unwrap().port()
+}
+
+/// softIocPVX on `db` with `-S`, serving PVA on `tcp` and CA on `ca`.
+///
+/// The CA port is named, because `0` is out of range and falls back to 5064
+/// (`envSubr.c:410`), where another IOC's steal suspends this one's iocInit.
+pub fn soft_ioc_pvx_command(ioc_bin: &Path, db: &Path, tcp: u16, ca: u16) -> Command {
+    let mut cmd = pvxs_command(ioc_bin);
+    cmd.arg("-D")
+        .arg(pvxs_dbd_dir().join("softIocPVX.dbd"))
+        .arg("-d")
+        .arg(db)
+        .arg("-S")
+        .env("EPICS_PVAS_SERVER_PORT", tcp.to_string())
+        .env(
+            "EPICS_PVAS_BROADCAST_PORT",
+            pick_localhost_port().to_string(),
+        )
+        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+        .env("EPICS_CA_SERVER_PORT", ca.to_string());
+    cmd
+}
+
+/// softIocPVX on `db` with `-S`, its output in `dir`'s `ioc.out`/`ioc.err`,
+/// and the PVA TCP port it serves. A released port can be taken before the
+/// IOC binds it, so each attempt takes fresh ones and [`port_collision`]
+/// reruns a lost one.
+pub fn spawn_soft_ioc_pvx(ioc_bin: &Path, db: &Path, dir: &Path) -> (DropChild, u16) {
+    let logs = PvxsLogs::in_dir(dir, "ioc");
+    let build = || {
+        let tcp = pick_localhost_port();
+        let ca = named_port::free_for_tcp_and_udp();
+        (
+            soft_ioc_pvx_command(ioc_bin, db, tcp, ca),
+            std::net::SocketAddr::from(([127, 0, 0, 1], tcp)),
+        )
+    };
+    match start_pvxs(&logs, build, ioc_ready) {
+        Ok((ioc, addr)) => (ioc, addr.port()),
+        Err(text) => panic!("softIocPVX did not come up:\n{text}"),
+    }
+}
+
+/// [`start_pvxs`] for a `cpp_helpers` server, ready once it writes `ready`,
+/// and the port it serves. Its logs go next to the ready file and are gone
+/// once it is up; a failed start leaves them for the error to name.
+pub fn start_cpp_server(helper: &Path, ready: &ReadyFile, extra: &[&str]) -> (DropChild, u16) {
+    let logs = PvxsLogs {
+        out: ready.path().with_extension("out"),
+        err: ready.path().with_extension("err"),
+    };
+    let build = || {
+        // A failed attempt's file would read as this one's.
+        let _ = std::fs::remove_file(ready.path());
+        let port = pick_localhost_port();
+        let mut cmd = pvxs_command(helper);
+        cmd.arg("--port")
+            .arg(port.to_string())
+            .arg("--ready")
+            .arg(ready.path())
+            .args(extra);
+        (cmd, port)
+    };
+    let started = start_pvxs(&logs, build, |_, _| ready.is_up());
+    if started.is_ok() {
+        logs.remove_all();
+    }
+    match started {
+        Ok(started) => started,
+        Err(text) => panic!("{} did not become ready:\n{text}", helper.display()),
+    }
 }
 
 /// A helper's "I am listening" handshake file, on a path no other process can
@@ -471,28 +667,20 @@ fn cpp_compiler() -> String {
 
 /// The one gate for "this host has no C++ compiler".
 ///
-/// An absent `c++` is a third-party PREREQUISITE, not an artefact of ours, so
-/// it is the single case in this file that stays a visible skip; everything
-/// past this gate — a helper source that is missing, a compile that fails, a
-/// library that is not built — is our own tree being broken and panics. That
-/// split is why [`cpp_helper`] returns a `PathBuf` and not an `Option`: a
-/// return type that could mean "no compiler" would also be readable as "the
-/// build failed", and a skip reports as a pass.
-///
-/// Shaped like [`require_pvxs`]: `None` prints its own reason, so a caller's
-/// bare `return` is still a visible skip.
-pub fn require_cxx() -> Option<String> {
+/// An absent `c++` fails the test like everything past this gate — a helper
+/// source that is missing, a compile that fails, a library that is not
+/// built — because a skip reports as a pass. It returns the driver so a
+/// caller cannot read "no compiler" and "the build failed" as the same
+/// `None`.
+pub fn require_cxx() -> String {
     let driver = cpp_compiler();
-    match Command::new(&driver).arg("--version").output() {
-        Ok(_) => Some(driver),
-        Err(e) => {
-            eprintln!(
-                "SKIP: no C++ compiler: `{driver}` would not run ({e}); set $CXX \
-                 or install one to enable the pvxs interop helpers."
-            );
-            None
-        }
+    if let Err(e) = Command::new(&driver).arg("--version").output() {
+        panic!(
+            "no C++ compiler: `{driver}` would not run ({e}); set $CXX \
+             or install one to run the pvxs interop helpers."
+        );
     }
+    driver
 }
 
 /// base ships `include/compiler/clang` and `include/compiler/gcc`, and the

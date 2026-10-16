@@ -111,17 +111,15 @@ fn test_printf_hex_upper() {
 /// `types::c_cast`, and every call site sees the same int — which is what the
 /// PRINTF/WRITE agreement below actually pins.
 ///
-/// WHICH int is out of range is CBUG-E2's call, not this test's: the `(int)`
-/// cast is UB on an out-of-range double, so compiled C answers `INT32_MIN` on
-/// x86-64 (`cvttsd2si`) and `INT32_MAX` on aarch64 (`fcvtzs`). The port
-/// saturates, so `3e9` is `INT32_MAX` and `-3e9` is `INT32_MIN` — the two
-/// out-of-range signs no longer collapse onto one indefinite value.
+/// The out-of-range int is x86-64's `cvttsd2si` answer: `INT32_MIN` for both
+/// signs of overflow (oracleStdIoc scalcout: `PRINTF("%d",3e9)` and `-3e9` both
+/// print -2147483648).
 #[test]
 fn test_my_nint_narrows_at_c_width_at_every_call_site() {
-    // PRINTF: out of int32 range saturates toward the operand's own sign.
+    // PRINTF: out of int32 range is INT32_MIN for either sign.
     assert_eq!(
         eval_str(r#"PRINTF("%d", 3e9)"#),
-        StackValue::Str("2147483647".into())
+        StackValue::Str("-2147483648".into())
     );
     assert_eq!(
         eval_str(r#"PRINTF("%d", -3e9)"#),
@@ -129,7 +127,7 @@ fn test_my_nint_narrows_at_c_width_at_every_call_site() {
     );
     assert_eq!(
         eval_str(r#"PRINTF("%x", 3e9)"#),
-        StackValue::Str("7fffffff".into())
+        StackValue::Str("80000000".into())
     );
     // In range, `myNINT` still rounds half away from zero.
     assert_eq!(
@@ -145,8 +143,8 @@ fn test_my_nint_narrows_at_c_width_at_every_call_site() {
     // PRINTF bit for bit, which is what having one narrowing buys.
     assert_eq!(
         eval_str(r#"WRITE("%i", 3e9)"#),
-        StackValue::Str(r"\xff\xff\xff\x7f".into()),
-        "the four little-endian bytes of INT32_MAX"
+        StackValue::Str(r"\0\0\0\x80".into()),
+        "the four little-endian bytes of INT32_MIN, NUL escaped as \\0"
     );
     assert_eq!(
         eval_str(r#"WRITE("%i", -3e9)"#),
@@ -155,8 +153,8 @@ fn test_my_nint_narrows_at_c_width_at_every_call_site() {
     );
     assert_eq!(
         eval_str(r#"WRITE("%c", 3e9)"#),
-        StackValue::Str(r"\xff".into()),
-        "the low byte of INT32_MAX"
+        StackValue::Str(r"\0".into()),
+        "the low byte of INT32_MIN"
     );
 }
 

@@ -24,7 +24,7 @@ use std::time::Duration;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+use epics_bridge_rs::qsrv::{BridgeProvider, QsrvMount, QsrvPvStore};
 use epics_pva_rs::client_native::decode::Frame;
 use epics_pva_rs::codec::{CMD_CREATE_CHANNEL, CMD_PUT, PvaCodec};
 use epics_pva_rs::proto::{
@@ -46,35 +46,26 @@ const ORDER: ByteOrder = ByteOrder::Little;
 // ---------------------------------------------------------------------------
 
 /// Start a `PvaServer` on a random loopback port serving `provider`'s
-/// records and groups through the QSRV source.
+/// records and groups as an IOC mounts them: `qsrvSingle` ahead of
+/// `qsrvGroup`.
 fn spawn_qsrv(provider: Arc<BridgeProvider>) -> (PvaServer, SocketAddr) {
-    let pick_tcp = || {
-        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let pick_udp = || {
-        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let cfg = PvaServerConfig {
-        tcp_port: pick_tcp(),
-        udp_port: pick_udp(),
-        ..PvaServerConfig::isolated()
-    };
-    let bound = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        cfg.tcp_port,
-    );
-    let source = QsrvPvStore::new(
+    let db = provider.database().clone();
+    let store = QsrvPvStore::new(
         epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
         provider,
     );
-    let server = PvaServer::start(Arc::new(source), cfg).expect("qsrv test server must start");
-    (server, bound)
+    let composite = epics_pva_rs::server_native::CompositeSource::new();
+    QsrvMount {
+        store: Arc::new(store),
+        enabled: true,
+        acf: epics_base_rs::server::access_security::new_acf_cell(None),
+    }
+    .install_channel_sources(&db, &composite)
+    .expect("qsrv sources mount");
+    let server = PvaServer::start(composite, PvaServerConfig::isolated())
+        .expect("qsrv test server must start");
+    let addr = server.tcp_addr();
+    (server, addr)
 }
 
 // ---------------------------------------------------------------------------

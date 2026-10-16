@@ -59,7 +59,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       # One platform failing must not cancel the others — each cell
       # reports portability independently.
@@ -74,6 +74,9 @@ jobs:
             os: macos-latest
           - name: macos-x86_64
             os: macos-15-intel
+            # Build 18-26 min + nextest 11-15 min on 4 vCPU: 41 min measured
+            # against the 45 min default.
+            timeout: 75
           - name: windows-x86_64
             os: windows-latest
           - name: windows-arm64
@@ -94,6 +97,42 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      # The search_udp v6 tests use `::1` and `ensure_iface_socket` needs an up
+      # non-loopback IPv4 interface; each fails, not skips, without them.
+      # Every hosted image has both, so this only turns an image change into
+      # one clear error. Per-OS commands, same two facts.
+      - name: Test prerequisites (::1, external NIC) - Linux
+        if: runner.os == 'Linux'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ip -4 -o addr show scope global up | grep -q .
+
+      - name: Test prerequisites (::1, external NIC) - macOS
+        if: runner.os == 'macOS'
+        run: |
+          python3 -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          ifconfig | grep 'inet ' | grep -qv '127\.0\.0\.1'
+
+      # The multi-interface bind tests hold 127.0.0.2 and 127.0.0.4 as a second
+      # NIC; Linux and Windows route all of 127/8 to loopback, Darwin's lo0
+      # carries only 127.0.0.1.
+      - name: Second loopback addresses - macOS
+        if: runner.os == 'macOS'
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.4 up
+          # A second broadcast-capable address for the multi-NIC broadcast
+          # bundle tests; the hosted image has one.
+          sudo ifconfig en0 alias 198.18.0.2 netmask 255.255.255.0 broadcast 198.18.0.255
+
+      - name: Test prerequisites (::1, external NIC) - Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -c 'import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.bind(("::1", 0)); s.sendto(b"x", s.getsockname())'
+          if ($LASTEXITCODE -ne 0) { throw "::1 is not usable" }
+          if (-not (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' })) { throw "no non-loopback IPv4 interface" }
+
       # Compiles libs, bins, AND test targets — the surest catch for
       # platform-specific source that isn't `#[cfg]`-gated.
       - name: Build (workspace + tests)
@@ -108,5 +147,9 @@ jobs:
       # The reference_trees suite is excluded the same way and for the same
       # reason, via profile.ci's default-filter in .config/nextest.toml — it
       # reads epics-base sources directly and this job provisions none.
+      # Below the job timeout, so a hang fails this step and the job log is
+      # kept; `--status-level slow` is what prints the SLOW line naming a
+      # stuck test (profile.ci stops at `retry`). The slowest cell takes ~15 min.
       - name: Test (nextest)
-        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci
+        timeout-minutes: 30
+        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci --status-level slow

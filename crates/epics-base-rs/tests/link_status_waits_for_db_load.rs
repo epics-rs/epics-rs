@@ -52,7 +52,7 @@ async fn inav(db: &PvDatabase, rec: &str) -> u16 {
 async fn add_calcout(db: &PvDatabase, name: &str, inpa: &str) {
     let mut co = CalcoutRecord::default();
     co.calc = "A".to_string();
-    co.inpa = inpa.to_string();
+    co.inpa = inpa.into();
     db.add_record(name, Box::new(co)).await.unwrap();
 }
 

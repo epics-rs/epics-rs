@@ -3,12 +3,14 @@ pub mod c_parse;
 pub(crate) mod codec;
 mod dbr;
 mod pv_string;
+mod record_name;
 mod value;
 
 pub use codec::*;
 pub use dbr::*;
 pub use epics_libcom_rs::SharedArray;
 pub use pv_string::*;
+pub use record_name::RecordName;
 pub use value::*;
 // `WallTime` moved down into `epics-libcom-rs` with the rest of the libCom
 // layer (issue #55): `runtime::time` returns it, so leaving it here would have

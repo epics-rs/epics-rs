@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use crate::runtime::sync::PriorityInheritanceMutex;
+use crate::runtime::sync::{CMutex, PriorityInheritanceMutex};
+use crate::walltime::WallTime;
 use std::time::SystemTime;
 
 /// Priority the built-in OS clock is registered at. C parity:
@@ -10,22 +11,22 @@ use std::time::SystemTime;
 const OS_CLOCK_PRIORITY: i32 = 999;
 
 /// Closure that returns the current time, or `None` if unavailable.
-type CurrentTimeFn = Box<dyn Fn() -> Option<SystemTime> + Send + Sync>;
+type CurrentTimeFn = Box<dyn Fn() -> Option<WallTime> + Send + Sync>;
 
 /// Closure that returns the time for a given event number, or `None`.
-type EventTimeFn = Box<dyn Fn(i32) -> Option<SystemTime> + Send + Sync>;
+type EventTimeFn = Box<dyn Fn(i32) -> Option<WallTime> + Send + Sync>;
 
 /// Seconds between the Unix epoch (1970-01-01) and the EPICS epoch
 /// (1990-01-01 00:00:00 UTC).
 pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
 
 /// The EPICS epoch (1990-01-01 00:00:00 UTC) expressed as a Unix
-/// `SystemTime`.
+/// `WallTime`.
 ///
 /// This is the value of an all-zero `epicsTimeStamp`, and therefore the
 /// single owner of "a time nobody has set yet" everywhere in the port —
 /// a record's `TIME` before its first `process()`, the general-time
-/// ratchet's seed. Seeding such a field with `SystemTime::UNIX_EPOCH`
+/// ratchet's seed. Seeding such a field with `WallTime::UNIX_EPOCH`
 /// instead is a 20-year error that survives every conversion: C's
 /// `epicsTimeToTimespec` adds `POSIX_TIME_AT_EPICS_EPOCH`, so the wire
 /// value C derives from `{0,0}` is 631152000, not 0.
@@ -34,8 +35,8 @@ pub const EPICS_EPOCH_UNIX_SECS: u64 = 631_152_000;
 /// to `epicsTimeStamp {0,0}`; `dbCommon.time` is likewise zeroed by
 /// `calloc` in `dbStaticLib` and never touched until the record first
 /// processes.
-pub fn epics_epoch() -> SystemTime {
-    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(EPICS_EPOCH_UNIX_SECS)
+pub const fn epics_epoch() -> WallTime {
+    WallTime::from_unix(EPICS_EPOCH_UNIX_SECS, 0)
 }
 
 struct CurrentTimeProvider {
@@ -60,11 +61,11 @@ struct GeneralTimeInner {
     current_providers: Vec<CurrentTimeProvider>,
     event_providers: Vec<EventTimeProvider>,
     /// Monotonic ratchet for current time.
-    last_provided_time: SystemTime,
+    last_provided_time: WallTime,
     /// Per-event ratchet for events 1..=255.
-    event_times: [SystemTime; 256],
+    event_times: [WallTime; 256],
     /// Ratchet for event -1 (BestTime).
-    last_best_time: SystemTime,
+    last_best_time: WallTime,
     /// Name of the provider that last supplied current time. C keeps
     /// `const char *lastProvider` (`epicsGeneralTime.c:80`) — the provider's
     /// own storage, pointed at, never duplicated. An owned `String` here made
@@ -76,7 +77,7 @@ struct GeneralTimeInner {
     last_event_name: Option<Arc<str>>,
     /// Rust-only notification channel — see [`register_clock_sync_hook`].
     /// This is **not** a C-base API; it is an additive extension.
-    sync_hooks: Vec<Box<dyn Fn(SystemTime) + Send + Sync>>,
+    sync_hooks: Vec<Box<dyn Fn(WallTime) + Send + Sync>>,
 }
 
 impl GeneralTimeInner {
@@ -110,8 +111,9 @@ impl GeneralTimeInner {
 /// `get()` (C does the same, `:119-136`) — so the holder can be a provider
 /// doing real work while a High-band record waits behind it. That is the
 /// convergence point priority inheritance exists for.
-static GENERAL_TIME: LazyLock<PriorityInheritanceMutex<GeneralTimeInner>> =
-    LazyLock::new(|| PriorityInheritanceMutex::new(GeneralTimeInner::new()));
+static GENERAL_TIME: LazyLock<PriorityInheritanceMutex<GeneralTimeInner>> = LazyLock::new(|| {
+    PriorityInheritanceMutex::new(GeneralTimeInner::new(), CMutex::GeneralTimeList)
+});
 
 static ERROR_COUNTS: AtomicU64 = AtomicU64::new(0);
 
@@ -138,15 +140,15 @@ static USE_OSD_GET_CURRENT: AtomicBool = AtomicBool::new(true);
 /// is what lets the `useOsdGetCurrent` path skip both the list and its
 /// lock; the list also holds it at the last-resort priority so that
 /// `generalTimeReport` and the ratcheted walk still see it.
-fn osd_time_get_current() -> SystemTime {
-    SystemTime::now()
+fn osd_time_get_current() -> WallTime {
+    WallTime::now()
 }
 
 /// Register a current-time provider at the given priority (lower = higher priority).
 pub fn register_current_provider(
     name: impl Into<String>,
     priority: i32,
-    get_time: impl Fn() -> Option<SystemTime> + Send + Sync + 'static,
+    get_time: impl Fn() -> Option<WallTime> + Send + Sync + 'static,
 ) {
     register_current_provider_impl(name.into().into(), priority, Box::new(get_time), false);
 }
@@ -160,7 +162,7 @@ pub fn register_current_provider(
 pub fn register_int_current_provider(
     name: impl Into<String>,
     priority: i32,
-    get_time: impl Fn() -> Option<SystemTime> + Send + Sync + 'static,
+    get_time: impl Fn() -> Option<WallTime> + Send + Sync + 'static,
 ) {
     register_current_provider_impl(name.into().into(), priority, Box::new(get_time), true);
 }
@@ -197,7 +199,7 @@ fn register_current_provider_impl(
 pub fn register_event_provider(
     name: impl Into<String>,
     priority: i32,
-    get_event: impl Fn(i32) -> Option<SystemTime> + Send + Sync + 'static,
+    get_event: impl Fn(i32) -> Option<WallTime> + Send + Sync + 'static,
 ) {
     register_event_provider_impl(name.into().into(), priority, Box::new(get_event), false);
 }
@@ -210,7 +212,7 @@ pub fn register_event_provider(
 pub fn register_int_event_provider(
     name: impl Into<String>,
     priority: i32,
-    get_event: impl Fn(i32) -> Option<SystemTime> + Send + Sync + 'static,
+    get_event: impl Fn(i32) -> Option<WallTime> + Send + Sync + 'static,
 ) {
     register_event_provider_impl(name.into().into(), priority, Box::new(get_event), true);
 }
@@ -253,7 +255,7 @@ fn register_event_provider_impl(
 /// lifetime.
 pub fn register_clock_sync_hook<F>(hook: F)
 where
-    F: Fn(SystemTime) + Send + Sync + 'static,
+    F: Fn(WallTime) + Send + Sync + 'static,
 {
     let mut inner = GENERAL_TIME.lock();
     inner.sync_hooks.push(Box::new(hook));
@@ -270,7 +272,7 @@ where
 /// (a backward step is rejected). The hook is purely a notification
 /// channel for downstream consumers (records that want to log a
 /// step, archivers that want to insert a discontinuity marker).
-pub fn notify_clock_sync(t_synced: SystemTime) {
+pub fn notify_clock_sync(t_synced: WallTime) {
     let inner = GENERAL_TIME.lock();
     for hook in &inner.sync_hooks {
         hook(t_synced);
@@ -292,11 +294,16 @@ pub fn notify_clock_sync(t_synced: SystemTime) {
 /// monotonically enforced: if a provider returns a time earlier than
 /// the last provided time, the last provided time is returned and the
 /// error counter is incremented.
-pub fn get_current() -> SystemTime {
+#[inline(always)]
+pub fn get_current() -> WallTime {
     if USE_OSD_GET_CURRENT.load(Ordering::Relaxed) {
         return osd_time_get_current();
     }
+    get_current_providers()
+}
 
+#[inline(never)]
+fn get_current_providers() -> WallTime {
     let mut inner = GENERAL_TIME.lock();
     for i in 0..inner.current_providers.len() {
         if let Some(t) = (inner.current_providers[i].get_time)() {
@@ -334,7 +341,7 @@ pub fn get_current() -> SystemTime {
 /// `ignore_priority` follows the C convention: a positive value skips
 /// the provider *at* that priority; a negative value `-n` skips every
 /// provider *except* the one at priority `n`.
-pub fn get_current_except_priority(ignore_priority: i32) -> Option<(SystemTime, i32)> {
+pub fn get_current_except_priority(ignore_priority: i32) -> Option<(WallTime, i32)> {
     // C `generalTimeGetExceptPriority` (`epicsGeneralTime.c:111-112`)
     // tests `useOsdGetCurrent` before the lock and before `ignore` is
     // looked at, so while only the OS clock can answer it is returned
@@ -367,7 +374,7 @@ pub fn get_current_except_priority(ignore_priority: i32) -> Option<(SystemTime, 
 /// returns `S_time_noProvider` in that case. **No ratchet** — the C
 /// `*Int` path does not touch the shared ratchet state (it must be
 /// interrupt-safe).
-pub fn get_current_int() -> Option<SystemTime> {
+pub fn get_current_int() -> Option<WallTime> {
     let inner = GENERAL_TIME.lock();
     for p in &inner.current_providers {
         if !p.interrupt_safe {
@@ -386,7 +393,7 @@ pub fn get_current_int() -> Option<SystemTime> {
 /// Consults only event providers registered via
 /// [`register_int_event_provider`]. Returns `None` when no
 /// interrupt-safe event provider answers. **No ratchet.**
-pub fn get_event_int(event: i32) -> Option<SystemTime> {
+pub fn get_event_int(event: i32) -> Option<WallTime> {
     let inner = GENERAL_TIME.lock();
     for p in &inner.event_providers {
         if !p.interrupt_safe {
@@ -431,12 +438,18 @@ pub fn highest_current_name() -> Option<String> {
 ///   provider by default — `installLastResortEventProvider`
 ///   (`epicsGeneralTime.c:521-525`) is an iocsh command —
 ///   so an IOC with none holds the old stamp instead of stamping now.
-pub fn get_event(event: i32) -> Option<SystemTime> {
-    if event < -1 {
-        return None;
-    }
+#[inline(always)]
+pub fn get_event(event: i32) -> Option<WallTime> {
     if event == 0 {
         return Some(get_current());
+    }
+    get_event_providers(event)
+}
+
+#[inline(never)]
+fn get_event_providers(event: i32) -> Option<WallTime> {
+    if event < -1 {
+        return None;
     }
 
     let mut inner = GENERAL_TIME.lock();
@@ -500,7 +513,7 @@ pub fn get_event(event: i32) -> Option<SystemTime> {
 /// `generalTimeReport` prints; `"OS Clock"` is the name of the *current
 /// time* provider (`osiClockTime.c:116`), a different table.
 pub fn install_last_resort_event_provider() {
-    register_event_provider("Last Resort Event", 999, |_| Some(SystemTime::now()));
+    register_event_provider("Last Resort Event", 999, |_| Some(WallTime::now()));
 }
 
 /// Return the cumulative count of monotonic-enforcement errors.
@@ -525,14 +538,14 @@ pub fn event_provider_name() -> Option<String> {
     name.as_deref().map(str::to_string)
 }
 
-/// Format a `SystemTime` the way C `generalTimeReport` does
+/// Format a `WallTime` the way C `generalTimeReport` does
 /// (`epicsTimeToStrftime` with `"%Y-%m-%d %H:%M:%S.%06f"`).
 ///
 /// `epicsTimeToStrftime` converts via `epicsTime_localtime` -> `localtime_r`
 /// (epicsTime.cpp:202 -> :318, osdTime.cpp:82), i.e. LOCAL wall-clock, not
 /// UTC — so this uses `chrono::Local` to match the C report output.
-fn format_time_sample(t: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Local> = t.into();
+fn format_time_sample(t: WallTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = SystemTime::from(t).into();
     dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
 }
 
@@ -543,7 +556,7 @@ fn format_time_sample(t: SystemTime) -> String {
 /// initialisation rather than at `main()`, so "program start" already means
 /// "when the clock provider came up" there. This `LazyLock` is forced by the
 /// first use of the registry, which is the same moment.
-static PROGRAM_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+static PROGRAM_START: LazyLock<WallTime> = LazyLock::new(WallTime::now);
 
 /// C's `ClockTime_Report` (`osiClockTime.c:266-312` @R7.0.10).
 ///
@@ -644,7 +657,6 @@ fn _reset_for_testing() {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::time::Duration;
 
     /// Serialize all tests that touch the global GENERAL_TIME state.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -684,7 +696,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
         let t = get_current();
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let secs = t.unix_secs();
         // Should be after 2020-01-01
         assert!(secs > 1_577_836_800, "time should be after 2020");
     }
@@ -693,7 +705,7 @@ mod tests {
     fn custom_provider_overrides_os_clock() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let fixed = WallTime::from_unix(2_000_000_000, 0);
         register_current_provider("Test Clock", 10, move || Some(fixed));
 
         let t = get_current();
@@ -705,7 +717,7 @@ mod tests {
     fn provider_returning_none_falls_through() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let fixed = WallTime::from_unix(2_000_000_000, 0);
         // High-priority provider that always fails.
         register_current_provider("Broken", 1, || None);
         // Lower-priority provider that succeeds.
@@ -720,8 +732,8 @@ mod tests {
     fn monotonic_enforcement() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000); // backwards
+        let t1 = WallTime::from_unix(2_000_000_000, 0);
+        let t2 = WallTime::from_unix(1_999_999_000, 0); // backwards
 
         let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_c = call.clone();
@@ -749,7 +761,7 @@ mod tests {
     fn event_zero_delegates_to_get_current() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let fixed = WallTime::from_unix(2_000_000_000, 0);
         register_current_provider("Fixed", 10, move || Some(fixed));
 
         let t = get_event(0);
@@ -765,7 +777,7 @@ mod tests {
     fn an_event_below_best_time_is_a_bad_event() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let fixed = WallTime::from_unix(2_000_000_000, 0);
         register_current_provider("Fixed", 10, move || Some(fixed));
         register_event_provider("EventSrc", 10, move |_ev| Some(fixed));
 
@@ -786,7 +798,7 @@ mod tests {
     fn an_event_no_provider_serves_is_not_the_current_time() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let fixed = WallTime::from_unix(2_000_000_000, 0);
         register_current_provider("Fixed", 10, move || Some(fixed));
 
         assert_eq!(get_event(42), None);
@@ -797,9 +809,9 @@ mod tests {
     fn event_per_slot_ratcheting() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000); // backwards
-        let t3 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_001_000); // forward
+        let t1 = WallTime::from_unix(2_000_000_000, 0);
+        let t2 = WallTime::from_unix(1_999_999_000, 0); // backwards
+        let t3 = WallTime::from_unix(2_000_001_000, 0); // forward
 
         let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_c = call.clone();
@@ -830,8 +842,8 @@ mod tests {
     fn event_best_time_ratcheting() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000);
+        let t1 = WallTime::from_unix(2_000_000_000, 0);
+        let t2 = WallTime::from_unix(1_999_999_000, 0);
 
         let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_c = call.clone();
@@ -857,7 +869,7 @@ mod tests {
     fn error_counts_reset() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t_back = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let t_back = WallTime::from_unix(1, 0);
         register_current_provider("AlwaysBack", 10, move || Some(t_back));
 
         // First call sets last_provided_time, second triggers backward detection
@@ -871,7 +883,7 @@ mod tests {
         assert_eq!(error_counts(), 0);
 
         // Force an error via best-time ratchet.
-        let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000_000);
+        let t_high = WallTime::from_unix(3_000_000_000, 0);
         {
             let mut inner = GENERAL_TIME.lock();
             inner.last_best_time = t_high;
@@ -893,7 +905,7 @@ mod tests {
     #[test]
     fn sync_hooks_fire_in_registration_order() {
         use std::sync::{Arc, Mutex};
-        let captured: Arc<Mutex<Vec<(usize, SystemTime)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(usize, WallTime)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let cap1 = captured.clone();
         register_clock_sync_hook(move |t| {
@@ -904,7 +916,7 @@ mod tests {
             cap2.lock().unwrap().push((2, t));
         });
 
-        let synced = SystemTime::UNIX_EPOCH + Duration::from_secs(5_000_000_000);
+        let synced = WallTime::from_unix(5_000_000_000, 0);
         notify_clock_sync(synced);
 
         let log = captured.lock().unwrap();
@@ -945,7 +957,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
 
-        let ahead = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let ahead = WallTime::from_unix(2_000_000_000, 0);
         GENERAL_TIME.lock().last_provided_time = ahead;
 
         reset_error_counts();
@@ -977,7 +989,7 @@ mod tests {
 
         let (t, prio) = get_current_except_priority(OS_CLOCK_PRIORITY).expect("OS clock answers");
         assert_eq!(prio, OS_CLOCK_PRIORITY);
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let secs = t.unix_secs();
         assert!(secs > 1_577_836_800, "time should be after 2020");
     }
 
@@ -987,8 +999,8 @@ mod tests {
     fn registering_provider_enables_ratchet() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let t_low = SystemTime::UNIX_EPOCH + Duration::from_secs(1_999_999_000);
+        let t_high = WallTime::from_unix(2_000_000_000, 0);
+        let t_low = WallTime::from_unix(1_999_999_000, 0);
         let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let call_c = call.clone();
         register_current_provider("Stepper", 10, move || {
@@ -1010,8 +1022,8 @@ mod tests {
     fn except_priority_skips_named_provider() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t10 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let t20 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        let t10 = WallTime::from_unix(2_000_000_000, 0);
+        let t20 = WallTime::from_unix(1_900_000_000, 0);
         register_current_provider("P10", 10, move || Some(t10));
         register_current_provider("P20", 20, move || Some(t20));
 
@@ -1032,11 +1044,11 @@ mod tests {
     fn int_providers_only_seen_by_int_queries() {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
-        let t_int = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let t_int = WallTime::from_unix(2_000_000_000, 0);
         register_int_current_provider("IntClock", 5, move || Some(t_int));
         assert_eq!(get_current_int(), Some(t_int));
 
-        let t_evt = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_500);
+        let t_evt = WallTime::from_unix(2_000_000_500, 0);
         register_int_event_provider("IntEvent", 5, move |_| Some(t_evt));
         assert_eq!(get_event_int(7), Some(t_evt));
     }
@@ -1048,9 +1060,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         _reset_for_testing();
         // A non-int event provider must not satisfy the int query.
-        register_event_provider("Plain", 10, |_| {
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
-        });
+        register_event_provider("Plain", 10, |_| Some(WallTime::from_unix(1, 0)));
         assert_eq!(get_event_int(3), None);
     }
 
@@ -1111,10 +1121,7 @@ mod tests {
     #[test]
     fn ratchet_seeds_at_epics_epoch() {
         // 631_152_000 s past the Unix epoch == 1990-01-01 00:00:00 UTC.
-        let secs = epics_epoch()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let secs = epics_epoch().unix_secs();
         assert_eq!(secs, EPICS_EPOCH_UNIX_SECS);
         assert_eq!(secs, 631_152_000);
 

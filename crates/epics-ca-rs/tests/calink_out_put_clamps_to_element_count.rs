@@ -70,7 +70,7 @@ async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
     let resolver = CaLinkResolver::with_client(client.clone());
     assert!(
         resolver
-            .wait_for_link_connected(pv, budget::FACT_BUDGET)
+            .wait_for_link_connected(pv, fact_budget::FACT_BUDGET)
             .await,
         "CA link must connect to the upstream CA server"
     );
@@ -81,13 +81,13 @@ async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
 /// fire-and-forget put is not raced.
 async fn readback_becomes(client: &CaClient, pv: &str, want: EpicsValue) {
     let ch = client.create_channel(pv);
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("readback channel");
-    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
+    let deadline = std::time::Instant::now() + fact_budget::FACT_BUDGET;
     loop {
         let got = ch
-            .get_with_timeout_count(budget::FACT_BUDGET, 0)
+            .get_with_timeout_count(fact_budget::FACT_BUDGET, 0)
             .await
             .expect("readback get")
             .1;
@@ -112,7 +112,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:WF",
+        b"CALINK:CLAMP:WF",
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0].into()),
         LinkPutOp::Async,
     )
@@ -138,7 +138,7 @@ async fn a_plain_put_takes_the_same_clamp() {
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:WFP",
+        b"CALINK:CLAMP:WFP",
         EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0].into()),
         LinkPutOp::Plain,
     )
@@ -176,13 +176,13 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
     let resolver = CaLinkResolver::with_client(client.clone());
     assert!(
         resolver
-            .wait_for_link_connected("CALINK:CLAMP:AI", budget::FACT_BUDGET)
+            .wait_for_link_connected("CALINK:CLAMP:AI", fact_budget::FACT_BUDGET)
             .await
     );
 
     LinkSet::put_value(
         &resolver,
-        "CALINK:CLAMP:AI",
+        b"CALINK:CLAMP:AI",
         EpicsValue::DoubleArray(vec![7.5, 8.5, 9.5].into()),
         LinkPutOp::Async,
     )
@@ -203,7 +203,7 @@ async fn a_direct_client_put_is_still_refused() {
     let (client, _resolver) = wf3("CALINK:CLAMP:DIRECT").await;
 
     let ch = client.create_channel("CALINK:CLAMP:DIRECT");
-    ch.wait_connected(budget::FACT_BUDGET)
+    ch.wait_connected(fact_budget::FACT_BUDGET)
         .await
         .expect("direct channel");
     let err = ch
@@ -217,6 +217,3 @@ async fn a_direct_client_put_is_still_refused() {
         "the direct-write refusal must stay ECA_BADCOUNT-shaped, got: {err}"
     );
 }
-
-#[path = "common/budget.rs"]
-mod budget;

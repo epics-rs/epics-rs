@@ -623,7 +623,7 @@ impl GatewayServer {
         let beacon_anomaly = self.beacon_anomaly.clone();
 
         let resolver: epics_base_rs::server::database::SearchResolver = std::sync::Arc::new(
-            move |name: String,
+            move |name: epics_base_rs::types::RecordName,
                   peer: Option<std::net::SocketAddr>|
                   -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
                 let pvlist = pvlist.clone();
@@ -733,7 +733,7 @@ impl GatewayServer {
         let cache = self.cache.clone();
 
         let gate: epics_base_rs::server::database::ExistenceGate = std::sync::Arc::new(
-            move |name: String,
+            move |name: epics_base_rs::types::RecordName,
                   peer: Option<std::net::SocketAddr>|
                   -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
                 let pvlist = pvlist.clone();
@@ -798,12 +798,12 @@ impl GatewayServer {
             Some(p) => p,
             None => return Ok(0),
         };
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read(path)?;
         let mut count = 0;
 
-        for line in content.lines() {
-            let name = line.trim();
-            if name.is_empty() || name.starts_with('#') {
+        for line in content.split(|b| *b == b'\n') {
+            let name = line.trim_ascii();
+            if name.is_empty() || name.starts_with(b"#") {
                 continue;
             }
 
@@ -1021,7 +1021,7 @@ impl GatewayServer {
                 use std::collections::HashMap;
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
-                fn synthetic_sid(peer: std::net::SocketAddr, pv: &str, cid: u32) -> u32 {
+                fn synthetic_sid(peer: std::net::SocketAddr, pv: &[u8], cid: u32) -> u32 {
                     let mut h = DefaultHasher::new();
                     peer.hash(&mut h);
                     pv.hash(&mut h);
@@ -1035,8 +1035,10 @@ impl GatewayServer {
                 // refcounts inflated and entries stuck in the Active
                 // state. We mirror every Created here and drain the
                 // peer's entries on Disconnected as a safety net.
-                let mut peer_channels: HashMap<std::net::SocketAddr, Vec<(String, u32)>> =
-                    HashMap::new();
+                let mut peer_channels: HashMap<
+                    std::net::SocketAddr,
+                    Vec<(std::sync::Arc<[u8]>, u32)>,
+                > = HashMap::new();
                 // No-cache: per-peer OPEN-MONITOR registry, parallel to
                 // `peer_channels` but keyed on `EVENT_ADD`/`EVENT_CANCEL`
                 // (sub_id) rather than CREATE/CLEAR (cid) — a plain caget
@@ -1044,8 +1046,10 @@ impl GatewayServer {
                 // monitor and is drained on a hard `Disconnected` so a
                 // peer that vanishes without `EVENT_CANCEL` still releases
                 // its monitor interest. Stays empty in cached mode.
-                let mut peer_monitors: HashMap<std::net::SocketAddr, Vec<(String, u32)>> =
-                    HashMap::new();
+                let mut peer_monitors: HashMap<
+                    std::net::SocketAddr,
+                    Vec<(std::sync::Arc<[u8]>, u32)>,
+                > = HashMap::new();
                 loop {
                     let event = match rx.recv().await {
                         ConnEventRecv::Event(ev) => ev,
@@ -1123,7 +1127,7 @@ impl GatewayServer {
                                 entry.write().await.remove_subscriber(sid);
                             }
                             if let Some(channels) = peer_channels.get_mut(&peer) {
-                                channels.retain(|(p, s)| !(p == &pv_name && *s == sid));
+                                channels.retain(|(p, s)| !(*p == pv_name && *s == sid));
                                 if channels.is_empty() {
                                     peer_channels.remove(&peer);
                                 }
@@ -1206,7 +1210,7 @@ impl GatewayServer {
                                 upstream_for_conn.release_prop_monitor(&pv_name);
                             }
                             if let Some(monitors) = peer_monitors.get_mut(&peer) {
-                                monitors.retain(|(p, s)| !(p == &pv_name && *s == msid));
+                                monitors.retain(|(p, s)| !(*p == pv_name && *s == msid));
                                 if monitors.is_empty() {
                                     peer_monitors.remove(&peer);
                                 }

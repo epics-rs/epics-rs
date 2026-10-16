@@ -1,11 +1,13 @@
+use crate::server::record::{CycleCell, CycleRead, CycleValue};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
+use crate::server::recgbl::PutReport;
 use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
@@ -22,6 +24,17 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
     "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV", "INLV",
     "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV",
 ];
+
+/// The value field a link's `special()` posts, by link index (INPA..INPU, OUT):
+/// C `pvalue = &prec->a + lnkIndex` (calcoutRecord.c:370), whose slot past `U`
+/// is `OVAL`.
+const CALCOUT_LINK_VALUE_FIELDS: [&str; 22] = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "OVAL",
+];
+
+/// Where CLCV's post sits in calcout's put-post table, after every link's.
+const CLCV_POST: usize = 2 * CALCOUT_LINK_VALUE_FIELDS.len();
 
 /// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
 /// `get_precision` serves for `ODLY`, the output-delay field.
@@ -66,30 +79,32 @@ pub struct CalcoutRecord {
     pub dopt: i16, // Data Option: 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     pub oval: f64,
+    /// C `prec->povl`: the OVAL `monitor()` last compared and posted.
+    povl: f64,
     pub ivoa: i16, // Invalid Output Action: 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
     // Input links (INPA..INPU)
-    pub inpa: String,
-    pub inpb: String,
-    pub inpc: String,
-    pub inpd: String,
-    pub inpe: String,
-    pub inpf: String,
-    pub inpg: String,
-    pub inph: String,
-    pub inpi: String,
-    pub inpj: String,
-    pub inpk: String,
-    pub inpl: String,
-    pub inpm: String,
-    pub inpn: String,
-    pub inpo: String,
-    pub inpp: String,
-    pub inpq: String,
-    pub inpr: String,
-    pub inps: String,
-    pub inpt: String,
-    pub inpu: String,
+    pub inpa: PvString,
+    pub inpb: PvString,
+    pub inpc: PvString,
+    pub inpd: PvString,
+    pub inpe: PvString,
+    pub inpf: PvString,
+    pub inpg: PvString,
+    pub inph: PvString,
+    pub inpi: PvString,
+    pub inpj: PvString,
+    pub inpk: PvString,
+    pub inpl: PvString,
+    pub inpm: PvString,
+    pub inpn: PvString,
+    pub inpo: PvString,
+    pub inpp: PvString,
+    pub inpq: PvString,
+    pub inpr: PvString,
+    pub inps: PvString,
+    pub inpt: PvString,
+    pub inpu: PvString,
     // Input values (A..U)
     pub a: f64,
     pub b: f64,
@@ -112,6 +127,10 @@ pub struct CalcoutRecord {
     pub s: f64,
     pub t: f64,
     pub u: f64,
+    // The inputs this cycle's `advance_prev_all` found apart from LA..LU,
+    // bit i for input i; zero on a cycle that ran no advance (the ODLY
+    // delaying cycle, which C leaves before `monitor()`).
+    input_changes: u32,
     // Previous values LA..LU
     pub la: f64,
     pub lb: f64,
@@ -154,17 +173,24 @@ pub struct CalcoutRecord {
     // Delay-active flag (DLYA) — C `prec->dlya`. Set to 1 while an ODLY
     // delay is pending, cleared on the delayed re-process. Externally
     // readable (DBF_SHORT) so clients can observe the pending state.
-    pub dlya: i16,
+    pub dlya: u16,
+    /// This cycle set or cleared DLYA, which C posts from `process()` with a
+    /// literal `DBE_VALUE` (`calcoutRecord.c:279`, `:296`).
+    dlya_moved: bool,
     // OEVT ("Event To Issue") — C `calcoutRecord.c` `prec->oevt` (DBF_STRING).
     // When output fires and OEVT names a non-empty event, `execOutput` posts
     // it (`postEvent(eventNameToHandle(oevt))`) right after `writeValue`; see
     // [`Record::output_event`].
-    pub oevt: String,
+    pub oevt: PvString,
     // Internal: captured output decision while an ODLY delay is pending.
     // The delayed re-process must write the output that the *original*
     // cycle decided on, not re-evaluate should_output() against the
     // (by then stale) pval/val.
     pending_output: bool,
+    /// `prec->pact` at `process()` entry: C takes the delayed-output arm only
+    /// with PACT held, so a re-entry after a device-link put cleared it
+    /// (`dbAccess.c:1194`) is a fresh cycle.
+    pact: bool,
     // This cycle's `calcPerform` outcome (C `calcoutRecord.c:238-241` for CALC,
     // `:622` for OCAL). A per-cycle fact, not record state: `check_alarms` — the
     // owner of this record's alarm transitions — consumes it, so it cannot
@@ -191,8 +217,8 @@ pub struct CalcoutRecord {
     // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
     // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
     // run, so the record alarms on every process. See [`calc_compile`].
-    rpcl: crate::calc::CompiledExpr,
-    orpc: crate::calc::CompiledExpr,
+    rpcl: crate::calc::Rpcl<CALCOUT_RPCL_SIZE>,
+    orpc: crate::calc::Rpcl<CALCOUT_RPCL_SIZE>,
     // CLCV/OCLV — `DBF_LONG` expression-validity fields
     // (calcoutRecord.dbd.pod:729,1049). C stores `postfix()`'s RETURN VALUE
     // here (`prec->clcv = postfix(...)`, calcoutRecord.c:327,338), i.e. 0 when
@@ -206,14 +232,19 @@ pub struct CalcoutRecord {
     // the OUT link into these. Index 0..21 maps to inputs A..U.
     in_status: [i16; 21],
     out_status: i16,
-    // Mirror of the common OUT-link string, synced from `CommonFields::out`
-    // in `check_alarms`. The OUT link is a common field, not a calcout-owned
-    // field, so this is the only in-record path to observe it for OUTV
-    // classification (see `check_alarms`).
-    out: crate::server::record::SparseText,
+    // The common OUT-link text as `init_links` saw it at load, for the init
+    // classification; a runtime OUT put classifies nothing.
+    out: Box<[u8]>,
+    // The posts the last `special()` owes, a bit per put-post table entry:
+    // one put's worth, so a mark no put path drains is overwritten, never
+    // queued.
+    put_posts: u64,
     // Async surface for posting the live INAV..INUV/OUTV diagnostics
     // (C `checkLinks`), wired by `set_async_context`.
-    async_ctx: Option<(String, AsyncDbHandle)>,
+    async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
+    // A refused CALC/OCAL put's report, made by `special()` under the put's
+    // hold and printed by the put's owner after it.
+    put_report: Option<PutReport>,
     // Monotonic generation guarding the link-status refresh. Each refresh
     // classifies a *snapshot* of the link strings off-thread; a later
     // refresh (an INP/OUT re-point) must win over an earlier one regardless
@@ -234,29 +265,30 @@ impl Default for CalcoutRecord {
             dopt: 0,
             ocal: String::new(),
             oval: 0.0,
+            povl: 0.0,
             ivoa: 0,
             ivov: 0.0,
-            inpa: String::new(),
-            inpb: String::new(),
-            inpc: String::new(),
-            inpd: String::new(),
-            inpe: String::new(),
-            inpf: String::new(),
-            inpg: String::new(),
-            inph: String::new(),
-            inpi: String::new(),
-            inpj: String::new(),
-            inpk: String::new(),
-            inpl: String::new(),
-            inpm: String::new(),
-            inpn: String::new(),
-            inpo: String::new(),
-            inpp: String::new(),
-            inpq: String::new(),
-            inpr: String::new(),
-            inps: String::new(),
-            inpt: String::new(),
-            inpu: String::new(),
+            inpa: PvString::new(),
+            inpb: PvString::new(),
+            inpc: PvString::new(),
+            inpd: PvString::new(),
+            inpe: PvString::new(),
+            inpf: PvString::new(),
+            inpg: PvString::new(),
+            inph: PvString::new(),
+            inpi: PvString::new(),
+            inpj: PvString::new(),
+            inpk: PvString::new(),
+            inpl: PvString::new(),
+            inpm: PvString::new(),
+            inpn: PvString::new(),
+            inpo: PvString::new(),
+            inpp: PvString::new(),
+            inpq: PvString::new(),
+            inpr: PvString::new(),
+            inps: PvString::new(),
+            inpt: PvString::new(),
+            inpu: PvString::new(),
             a: 0.0,
             b: 0.0,
             c: 0.0,
@@ -278,6 +310,7 @@ impl Default for CalcoutRecord {
             s: 0.0,
             t: 0.0,
             u: 0.0,
+            input_changes: 0,
             la: 0.0,
             lb: 0.0,
             lc: 0.0,
@@ -311,13 +344,15 @@ impl Default for CalcoutRecord {
             pval: 0.0,
             odly: 0.0,
             dlya: 0,
-            oevt: String::new(),
+            dlya_moved: false,
+            oevt: PvString::new(),
             pending_output: false,
+            pact: false,
             calc_alarm: None,
             fetch_gate_failed: false,
             value_computed: false,
-            rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
-            orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            rpcl: crate::calc::Rpcl::empty(),
+            orpc: crate::calc::Rpcl::empty(),
             clcv: 0,
             oclv: 0,
             // C `init_record` leaves an empty/unconfigured link CON
@@ -325,20 +360,50 @@ impl Default for CalcoutRecord {
             // async context exists.
             in_status: [LINK_CON; 21],
             out_status: LINK_CON,
-            out: crate::server::record::SparseText::default(),
+            out: Box::default(),
+            put_posts: 0,
             async_ctx: None,
+            put_report: None,
             link_gen: LinkStatusGen::default(),
         }
     }
 }
 
+/// `calcoutRecord.dbd` `rpcl`/`orpc[INFIX_TO_POSTFIX_SIZE(160)]`.
+const CALCOUT_RPCL_SIZE: usize = crate::calc::infix_to_postfix_size(160);
+
 impl CalcoutRecord {
-    /// C `calcoutRecord.c::monitor`: advance the `LX` previous-value
-    /// field only when the input `X` actually changed since the last
-    /// monitor post.
-    fn advance_prev(new: f64, prev: &mut f64) {
-        if new != *prev {
-            *prev = new;
+    /// C's CALC compile, the same in `init_record` (calcoutRecord.c:191-197)
+    /// and `special()` (`:325-333`): a refused `postfix()` writes
+    /// `recGblRecordError(S_db_badField, prec, pmessage)` then the
+    /// `calcErrorStr` line, both naming the record. Returned, not printed:
+    /// `special()` runs under the put's hold.
+    fn recompile_calc(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::postfix_into(&self.calc, &mut self.rpcl);
+        let report = compiled.put_report_in_expression(pmessage, "CALC", &self.calc);
+        self.clcv = compiled.status;
+        report
+    }
+
+    /// The OCAL half (`:199-205`, `:336-342`): reported only under DOPT
+    /// "Use OCAL"; OCLV is -1 either way.
+    fn recompile_ocal(&mut self, pmessage: &'static str) -> Option<PutReport> {
+        let compiled = calc_compile::postfix_into(&self.ocal, &mut self.orpc);
+        let report = compiled
+            .put_report_in_expression(pmessage, "OCAL", &self.ocal)
+            .filter(|_| self.dopt == 1);
+        self.oclv = compiled.status;
+        report
+    }
+
+    /// `init_record` is not under a put's hold, so it prints at once.
+    fn init_report(&self, report: Option<PutReport>) {
+        if let Some(report) = report {
+            let name = self
+                .async_ctx
+                .as_ref()
+                .map_or("Unknown".into(), |(n, _)| n.to_str_lossy());
+            report.emit(&name, "");
         }
     }
 
@@ -347,27 +412,41 @@ impl CalcoutRecord {
     /// the ODLY early return at `:282`, so both the immediate cycle and the
     /// delayed continuation run them and the delaying cycle does not.
     fn advance_prev_all(&mut self) {
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
+        let prev = [
+            &mut self.la,
+            &mut self.lb,
+            &mut self.lc,
+            &mut self.ld,
+            &mut self.le,
+            &mut self.lf,
+            &mut self.lg,
+            &mut self.lh,
+            &mut self.li,
+            &mut self.lj,
+            &mut self.lk,
+            &mut self.ll,
+            &mut self.lm,
+            &mut self.ln,
+            &mut self.lo,
+            &mut self.lp,
+            &mut self.lq,
+            &mut self.lr,
+            &mut self.ls,
+            &mut self.lt,
+            &mut self.lu,
+        ];
+        let new = [
+            self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
+            self.l, self.m, self.n, self.o, self.p, self.q, self.r, self.s, self.t, self.u,
+        ];
+        let mut changes = 0;
+        for (i, (new, prev)) in new.into_iter().zip(prev).enumerate() {
+            if new != *prev {
+                *prev = new;
+                changes |= 1 << i;
+            }
+        }
+        self.input_changes = changes;
     }
 
     /// C `calcoutRecord.c::execOutput` (613-627), the "Determine output data"
@@ -477,7 +556,7 @@ impl CalcoutRecord {
     }
 
     /// The 21 input link strings (INPA..INPU) in input order A..U.
-    fn input_links(&self) -> [String; 21] {
+    fn input_links(&self) -> [PvString; 21] {
         [
             self.inpa.clone(),
             self.inpb.clone(),
@@ -516,14 +595,16 @@ impl CalcoutRecord {
         }
     }
 
-    /// True for the INP link-config fields whose put must re-classify the
-    /// link diagnostics (C `calcoutRecord.c::special` SPC_MOD → `checkLinks`).
-    /// `OUT` is excluded: it is a common field, so its post-put string is not
-    /// visible here — OUTV re-classifies from `check_alarms` instead.
-    fn is_link_config_field(name: &str) -> bool {
-        match name.strip_prefix("INP") {
-            Some(rest) => matches!(rest.as_bytes(), [b'A'..=b'U']),
-            None => false,
+    /// C's `lnkIndex = fieldIndex - calcoutRecordINPA` (calcoutRecord.c:368)
+    /// for the 22 link fields `special()` handles: INPA..INPU are 0..=20 and
+    /// OUT, which follows INPU in the record, is 21.
+    fn link_index(name: &str) -> Option<usize> {
+        if name == "OUT" {
+            return Some(21);
+        }
+        match name.strip_prefix("INP")?.as_bytes() {
+            [c @ b'A'..=b'U'] => Some((c - b'A') as usize),
+            _ => None,
         }
     }
 
@@ -531,25 +612,24 @@ impl CalcoutRecord {
     /// `menu(calcoutINAV)` connection status and post the live
     /// `INAV`..`INUV`/`OUTV` diagnostics, mirroring C
     /// `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) and the
-    /// `checkLinksCallback` re-poll. epics-base-rs surfaces no link
-    /// connection-change signal, so (like sseq) the refresh runs at record
-    /// init (`set_async_context`), on `special()` of an INP field, and when
-    /// `check_alarms` observes the OUT link change. No-op without an async
-    /// context.
+    /// `checkLinksCallback` re-poll. Runs at record init only
+    /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
+    /// which C answers without classifying. No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, String, LinkRole)> = self
+        let mut links: Vec<(&'static str, PvString)> = self
             .input_links()
             .into_iter()
             .enumerate()
-            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
+            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link))
             .collect();
-        links.push(("OUTV", self.out.as_str().to_owned(), LinkRole::Output));
+        links.push(("OUTV", PvString::from(&*self.out)));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
             crate::server::recgbl::EventMask::VALUE,
+            LinkStatusPosts::All,
         );
     }
 }
@@ -569,7 +649,222 @@ const CALCOUT_OOPT_CHOICES: &[&str] = &[
 /// C `menu(calcoutDOPT)` (`calcoutRecord.dbd.pod:41-43`).
 const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 
+/// VAL, A..U and OVAL: what `calcoutRecord.c::monitor` posts.
+const CALCOUT_PROCESS_POSTED: [&str; 23] = [
+    "VAL", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+    "R", "S", "T", "U", "OVAL",
+];
+
 impl Record for CalcoutRecord {
+    // The menus are `i16` served as ENUM, so they map no slot.
+    crate::slot_map!(crate::server::record::dbd_generated::slots::calcout;
+        VAL => val,
+        PVAL => pval,
+        CLCV => clcv,
+        ODLY => odly,
+        OCLV => oclv,
+        IVOV => ivov,
+        EGU => egu,
+        PREC => prec,
+        HOPR => hopr,
+        LOPR => lopr,
+        ADEL => adel,
+        MDEL => mdel,
+        A => a,
+        B => b,
+        C => c,
+        D => d,
+        E => e,
+        F => f,
+        G => g,
+        H => h,
+        I => i,
+        J => j,
+        K => k,
+        L => l,
+        M => m,
+        N => n,
+        O => o,
+        P => p,
+        Q => q,
+        R => r,
+        S => s,
+        T => t,
+        U => u,
+        OVAL => oval;
+        read_only:
+        LA => la,
+        LB => lb,
+        LC => lc,
+        LD => ld,
+        LE => le,
+        LF => lf,
+        LG => lg,
+        LH => lh,
+        LI => li,
+        LJ => lj,
+        LK => lk,
+        LL => ll,
+        LM => lm,
+        LN => ln,
+        LO => lo,
+        LP => lp,
+        LQ => lq,
+        LR => lr,
+        LS => ls,
+        LT => lt,
+        LU => lu,
+        LALM => lalm,
+        ALST => alst,
+        MLST => mlst,
+        DLYA => dlya);
+
+    fn alarms_before_stamp(&self) -> bool {
+        true
+    }
+
+    /// C posts these only from `checkLinks` (`calcoutRecord.c:404`, `:752`,
+    /// `:757`), which the port's link-status refresh owns.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        &[
+            "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV",
+            "INLV", "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV", "OUTV",
+        ]
+    }
+
+    /// What `put_field` stores for `A`..`U`, without the by-name lookups
+    /// that precede it on the default path.
+    fn put_multi_input_f64(&mut self, field: &'static str, value: f64) -> CaResult<()> {
+        let var = match field.as_bytes() {
+            b"A" => &mut self.a,
+            b"B" => &mut self.b,
+            b"C" => &mut self.c,
+            b"D" => &mut self.d,
+            b"E" => &mut self.e,
+            b"F" => &mut self.f,
+            b"G" => &mut self.g,
+            b"H" => &mut self.h,
+            b"I" => &mut self.i,
+            b"J" => &mut self.j,
+            b"K" => &mut self.k,
+            b"L" => &mut self.l,
+            b"M" => &mut self.m,
+            b"N" => &mut self.n,
+            b"O" => &mut self.o,
+            b"P" => &mut self.p,
+            b"Q" => &mut self.q,
+            b"R" => &mut self.r,
+            b"S" => &mut self.s,
+            b"T" => &mut self.t,
+            b"U" => &mut self.u,
+            _ => return self.put_field_internal(field, EpicsValue::Double(value)),
+        };
+        *var = value;
+        Ok(())
+    }
+
+    /// C `monitor()` posts every input A..U when the alarm moved, changed or
+    /// not: `if (*pnew != *pprev || monitor_mask & DBE_ALARM)` with
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` (calcoutRecord.c:681-682).
+    fn alarm_cycle_monitored_fields(&self) -> crate::server::record::DeclaredFields {
+        &const {
+            crate::server::record::declared_set(
+                crate::server::record::dbd_generated::CALCOUT_FIELDS,
+                crate::server::records::calc::CALC_INPUT_FIELDS,
+            )
+        }
+    }
+
+    fn prev_compared_inputs(&self) -> (&'static [&'static str], u32) {
+        (
+            &crate::server::records::calc::CALC_INPUT_FIELDS,
+            self.input_changes,
+        )
+    }
+
+    fn alarm_cycle_posts_value_log(&self) -> bool {
+        true
+    }
+
+    fn acts_before_process(&self) -> bool {
+        false
+    }
+
+    fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
+        crate::server::record::CycleHooks::WRITE_POSTED
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::PROCESS_POSTED)
+            .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::CONTINUATION)
+            .union(crate::server::record::CycleHooks::MONITOR_SETS)
+            .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+    }
+
+    fn take_put_report(&mut self) -> Option<PutReport> {
+        self.put_report.take()
+    }
+
+    fn has_array_monitor_post(&self) -> bool {
+        false
+    }
+
+    /// `calcoutRecord.c:124-126` discards the dset status and seeds.
+    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
+        crate::server::record::seed_trackers_from_val(self);
+        self.povl = self.oval;
+    }
+
+    /// `monitor()` posts VAL, A..U and OVAL alone (`calcoutRecord.c:660-691`);
+    /// DLYA posts from `process()` through [`Self::take_process_posted_fields`].
+    fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
+        Some(
+            &const {
+                crate::server::record::declared_set(
+                    crate::server::record::dbd_generated::CALCOUT_FIELDS,
+                    CALCOUT_PROCESS_POSTED,
+                )
+            },
+        )
+    }
+
+    /// C `calcoutRecord.c:687-690` posts OVAL with `monitor_mask | DBE_VALUE |
+    /// DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("OVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// C `if (prec->povl != prec->oval) { ...; prec->povl = prec->oval; }`
+    /// (`calcoutRecord.c:687-690`), minus the post. Outside init, `monitor()`
+    /// is the only writer of `povl`, so an OVAL put posts again from its cycle
+    /// unless the cycle sets back the value `povl` holds.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.povl, self.oval),
+        ))
+    }
+
+    fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
+        &["OVAL"]
+    }
+
+    fn take_process_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        const DLYA_POST_NAMED: [(&str, CyclePostMask); 1] = [("DLYA", CyclePostMask::Value)];
+        static DLYA_POST: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); 1] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::CALCOUT_FIELDS,
+            DLYA_POST_NAMED,
+        );
+        CycleMarks::of(&DLYA_POST, u128::from(std::mem::take(&mut self.dlya_moved)))
+    }
+
     fn record_type(&self) -> &'static str {
         "calcout"
     }
@@ -671,13 +966,10 @@ impl Record for CalcoutRecord {
             // depended on whether the value arrived from the db file or from a
             // later put, which is not a distinction C makes. The compile is the
             // single owner of CLCV/RPCL on both paths.
-            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-            self.clcv = compiled.status;
-            self.rpcl = compiled.program;
-
-            let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
-            self.oclv = compiled.status;
-            self.orpc = compiled.program;
+            let report = self.recompile_calc("calcout: init_record: Illegal CALC field");
+            self.init_report(report);
+            let report = self.recompile_ocal("calcout: init_record: Illegal OCAL field");
+            self.init_report(report);
             self.pval = self.val;
             self.mlst = self.val;
             self.alst = self.val;
@@ -686,15 +978,25 @@ impl Record for CalcoutRecord {
         Ok(())
     }
 
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.input_changes = 0;
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` + `dlya`
         // branch, `:294-301`). No input fetch and no CALC pass — C's `pact`
         // arm re-enters below them — but `execOutput` DOES run here, and the
         // DOPT switch is its first half, so OVAL is computed now, from the
         // A..U present at expiry.
-        if self.dlya == 1 {
+        if self.pact && self.dlya == 1 {
             self.dlya = 0;
+            self.dlya_moved = true;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
@@ -764,6 +1066,7 @@ impl Record for CalcoutRecord {
         // branch at the top of process() then emits the captured output.
         if do_output && self.odly > 0.0 {
             self.dlya = 1;
+            self.dlya_moved = true;
             self.pending_output = true;
             self.cached_should_output = false;
             let delay = crate::runtime::time::duration_from_secs(self.odly);
@@ -780,10 +1083,7 @@ impl Record for CalcoutRecord {
             // snapshot + FLNK tail on the delaying cycle, so VAL/OVAL posted
             // ODLY-seconds early and the forward link fired twice.
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![(
-                    "DLYA".to_string(),
-                    EpicsValue::Short(1),
-                )]),
+                result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
                 post_write_fields: Vec::new(),
@@ -802,34 +1102,57 @@ impl Record for CalcoutRecord {
     /// C reads `prec->inpa..inpu` off the record and copies nothing; the generic
     /// `get_field` path hands back an owned `EpicsValue` per link, which is
     /// 21 clones on every cycle of a record that wires none of them.
-    fn link_text_ref(&self, link_field: &str) -> Option<&str> {
+    fn link_text_ref(&self, link_field: &str) -> Option<&[u8]> {
         let [b'I', b'N', b'P', slot] = *link_field.as_bytes() else {
             return None;
         };
         Some(match slot {
-            b'A' => &self.inpa,
-            b'B' => &self.inpb,
-            b'C' => &self.inpc,
-            b'D' => &self.inpd,
-            b'E' => &self.inpe,
-            b'F' => &self.inpf,
-            b'G' => &self.inpg,
-            b'H' => &self.inph,
-            b'I' => &self.inpi,
-            b'J' => &self.inpj,
-            b'K' => &self.inpk,
-            b'L' => &self.inpl,
-            b'M' => &self.inpm,
-            b'N' => &self.inpn,
-            b'O' => &self.inpo,
-            b'P' => &self.inpp,
-            b'Q' => &self.inpq,
-            b'R' => &self.inpr,
-            b'S' => &self.inps,
-            b'T' => &self.inpt,
-            b'U' => &self.inpu,
+            b'A' => self.inpa.as_bytes(),
+            b'B' => self.inpb.as_bytes(),
+            b'C' => self.inpc.as_bytes(),
+            b'D' => self.inpd.as_bytes(),
+            b'E' => self.inpe.as_bytes(),
+            b'F' => self.inpf.as_bytes(),
+            b'G' => self.inpg.as_bytes(),
+            b'H' => self.inph.as_bytes(),
+            b'I' => self.inpi.as_bytes(),
+            b'J' => self.inpj.as_bytes(),
+            b'K' => self.inpk.as_bytes(),
+            b'L' => self.inpl.as_bytes(),
+            b'M' => self.inpm.as_bytes(),
+            b'N' => self.inpn.as_bytes(),
+            b'O' => self.inpo.as_bytes(),
+            b'P' => self.inpp.as_bytes(),
+            b'Q' => self.inpq.as_bytes(),
+            b'R' => self.inpr.as_bytes(),
+            b'S' => self.inps.as_bytes(),
+            b'T' => self.inpt.as_bytes(),
+            b'U' => self.inpu.as_bytes(),
             _ => return None,
         })
+    }
+
+    fn cycle_cell(&self, cell: CycleCell) -> CycleRead {
+        match cell {
+            CycleCell::Val => CycleRead::Value(CycleValue::Double(self.val)),
+            CycleCell::Oval => CycleRead::Value(CycleValue::Double(self.oval)),
+            CycleCell::Mdel => CycleRead::Value(CycleValue::Double(self.mdel)),
+            CycleCell::Adel => CycleRead::Value(CycleValue::Double(self.adel)),
+            CycleCell::Mlst => CycleRead::Value(CycleValue::Double(self.mlst)),
+            CycleCell::Alst => CycleRead::Value(CycleValue::Double(self.alst)),
+            CycleCell::Lalm => CycleRead::Value(CycleValue::Double(self.lalm)),
+            _ => CycleRead::Absent,
+        }
+    }
+
+    fn put_cycle_cell(&mut self, cell: CycleCell, value: CycleValue) -> CaResult<()> {
+        match (cell, value) {
+            (CycleCell::Lalm, CycleValue::Double(v)) => self.lalm = v,
+            (CycleCell::Alst, CycleValue::Double(v)) => self.alst = v,
+            (CycleCell::Mlst, CycleValue::Double(v)) => self.mlst = v,
+            (cell, value) => return self.put_field(cell.name(), value.into()),
+        }
+        Ok(())
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -850,8 +1173,8 @@ impl Record for CalcoutRecord {
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
-            "DLYA" => Some(EpicsValue::Short(self.dlya)),
-            "OEVT" => Some(EpicsValue::String(self.oevt.clone().into())),
+            "DLYA" => Some(EpicsValue::UShort(self.dlya)),
+            "OEVT" => Some(EpicsValue::String(self.oevt.clone())),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
@@ -986,7 +1309,7 @@ impl Record for CalcoutRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s;
+                    self.egu.set_bytes(s.as_bytes());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1064,7 +1387,7 @@ impl Record for CalcoutRecord {
             "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
             "OEVT" => match value {
                 EpicsValue::String(s) => {
-                    self.oevt = s.as_str_lossy().into_owned();
+                    self.oevt = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OEVT".into())),
@@ -1106,147 +1429,147 @@ impl Record for CalcoutRecord {
             },
             "INPA" => match value {
                 EpicsValue::String(s) => {
-                    self.inpa = s.as_str_lossy().into_owned();
+                    self.inpa = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPA".into())),
             },
             "INPB" => match value {
                 EpicsValue::String(s) => {
-                    self.inpb = s.as_str_lossy().into_owned();
+                    self.inpb = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPB".into())),
             },
             "INPC" => match value {
                 EpicsValue::String(s) => {
-                    self.inpc = s.as_str_lossy().into_owned();
+                    self.inpc = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPC".into())),
             },
             "INPD" => match value {
                 EpicsValue::String(s) => {
-                    self.inpd = s.as_str_lossy().into_owned();
+                    self.inpd = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPD".into())),
             },
             "INPE" => match value {
                 EpicsValue::String(s) => {
-                    self.inpe = s.as_str_lossy().into_owned();
+                    self.inpe = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPE".into())),
             },
             "INPF" => match value {
                 EpicsValue::String(s) => {
-                    self.inpf = s.as_str_lossy().into_owned();
+                    self.inpf = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPF".into())),
             },
             "INPG" => match value {
                 EpicsValue::String(s) => {
-                    self.inpg = s.as_str_lossy().into_owned();
+                    self.inpg = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPG".into())),
             },
             "INPH" => match value {
                 EpicsValue::String(s) => {
-                    self.inph = s.as_str_lossy().into_owned();
+                    self.inph = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPH".into())),
             },
             "INPI" => match value {
                 EpicsValue::String(s) => {
-                    self.inpi = s.as_str_lossy().into_owned();
+                    self.inpi = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPI".into())),
             },
             "INPJ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpj = s.as_str_lossy().into_owned();
+                    self.inpj = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPJ".into())),
             },
             "INPK" => match value {
                 EpicsValue::String(s) => {
-                    self.inpk = s.as_str_lossy().into_owned();
+                    self.inpk = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPK".into())),
             },
             "INPL" => match value {
                 EpicsValue::String(s) => {
-                    self.inpl = s.as_str_lossy().into_owned();
+                    self.inpl = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPL".into())),
             },
             "INPM" => match value {
                 EpicsValue::String(s) => {
-                    self.inpm = s.as_str_lossy().into_owned();
+                    self.inpm = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPM".into())),
             },
             "INPN" => match value {
                 EpicsValue::String(s) => {
-                    self.inpn = s.as_str_lossy().into_owned();
+                    self.inpn = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPN".into())),
             },
             "INPO" => match value {
                 EpicsValue::String(s) => {
-                    self.inpo = s.as_str_lossy().into_owned();
+                    self.inpo = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPO".into())),
             },
             "INPP" => match value {
                 EpicsValue::String(s) => {
-                    self.inpp = s.as_str_lossy().into_owned();
+                    self.inpp = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPP".into())),
             },
             "INPQ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpq = s.as_str_lossy().into_owned();
+                    self.inpq = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPQ".into())),
             },
             "INPR" => match value {
                 EpicsValue::String(s) => {
-                    self.inpr = s.as_str_lossy().into_owned();
+                    self.inpr = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPR".into())),
             },
             "INPS" => match value {
                 EpicsValue::String(s) => {
-                    self.inps = s.as_str_lossy().into_owned();
+                    self.inps = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPS".into())),
             },
             "INPT" => match value {
                 EpicsValue::String(s) => {
-                    self.inpt = s.as_str_lossy().into_owned();
+                    self.inpt = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPT".into())),
             },
             "INPU" => match value {
                 EpicsValue::String(s) => {
-                    self.inpu = s.as_str_lossy().into_owned();
+                    self.inpu = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPU".into())),
@@ -1325,42 +1648,32 @@ impl Record for CalcoutRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
-    /// C `calcoutRecord.c::special` (367-378) — a runtime put to INPA..INPU that
-    /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
-    /// DBF_DOUBLE, pvalue)`, posts the value field with `DBE_VALUE` and sets
-    /// `INAV = CON`. Declared here, run by the put path's one
-    /// `special(field, true)` owner — see `Record::special_reseed_input_links`.
-    /// Every calcout input is a DBF_DOUBLE scalar, so the whole table re-seeds.
-    fn special_reseed_input_links(&self) -> &[(&'static str, &'static str)] {
-        self.multi_input_links()
-    }
-
     /// The 21 `INPA..INPU` texts read straight off the record's own fields, not
     /// through the default body's 21 name matches on `link_text_ref`.
     /// See [`Record::set_input_link_slots`].
     fn set_input_link_slots(&self) -> Option<(u64, u64)> {
         crate::server::record::input_link_slots_of(&[
-            self.inpa.as_str(),
-            self.inpb.as_str(),
-            self.inpc.as_str(),
-            self.inpd.as_str(),
-            self.inpe.as_str(),
-            self.inpf.as_str(),
-            self.inpg.as_str(),
-            self.inph.as_str(),
-            self.inpi.as_str(),
-            self.inpj.as_str(),
-            self.inpk.as_str(),
-            self.inpl.as_str(),
-            self.inpm.as_str(),
-            self.inpn.as_str(),
-            self.inpo.as_str(),
-            self.inpp.as_str(),
-            self.inpq.as_str(),
-            self.inpr.as_str(),
-            self.inps.as_str(),
-            self.inpt.as_str(),
-            self.inpu.as_str(),
+            self.inpa.as_bytes(),
+            self.inpb.as_bytes(),
+            self.inpc.as_bytes(),
+            self.inpd.as_bytes(),
+            self.inpe.as_bytes(),
+            self.inpf.as_bytes(),
+            self.inpg.as_bytes(),
+            self.inph.as_bytes(),
+            self.inpi.as_bytes(),
+            self.inpj.as_bytes(),
+            self.inpk.as_bytes(),
+            self.inpl.as_bytes(),
+            self.inpm.as_bytes(),
+            self.inpn.as_bytes(),
+            self.inpo.as_bytes(),
+            self.inpp.as_bytes(),
+            self.inpq.as_bytes(),
+            self.inpr.as_bytes(),
+            self.inps.as_bytes(),
+            self.inpt.as_bytes(),
+            self.inpu.as_bytes(),
         ])
     }
 
@@ -1421,8 +1734,8 @@ impl Record for CalcoutRecord {
     /// `Don't_drive` veto. The event name is posted verbatim (a numeric name
     /// is canonicalised by the event router to match a `SCAN="Event"` record's
     /// `EVNT`). An empty `OEVT` is C's `epvt == NULL` (no event).
-    fn output_event(&self) -> Option<String> {
-        if self.cached_should_output && !self.oevt.trim().is_empty() {
+    fn output_event(&self) -> Option<PvString> {
+        if self.cached_should_output && !self.oevt.as_bytes().trim_ascii().is_empty() {
             Some(self.oevt.clone())
         } else {
             None
@@ -1434,15 +1747,14 @@ impl Record for CalcoutRecord {
         false
     }
 
-    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+    fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (calcoutRecord.c:160-189) classifies every INP and
         // the OUT link into INAV..INUV/OUTV. The INP links are calcout fields
         // already applied (record fields load before `add_record`), so
         // classify them now. The OUT link is a common field not yet applied
-        // at `add_record`; it is captured later in `init_links` (load) or
-        // `check_alarms` (a runtime OUT re-point). The generation gate lets
-        // that later, fuller refresh supersede this one.
+        // at `add_record`; it is captured later in `init_links`. The
+        // generation gate lets that later, fuller refresh supersede this one.
         self.refresh_link_status();
     }
 
@@ -1453,7 +1765,11 @@ impl Record for CalcoutRecord {
         // `set_async_context` (which ran before the common fields were
         // applied), so capture it here, once the framework has resolved it,
         // and classify so a passive never-processed record already shows OUTV.
-        self.out.set(&common.out);
+        self.out = common.text.out.as_bytes().into();
+        // A load-time `special()` marked posts nobody could watch; this full
+        // classification supersedes them, so the first runtime put must not
+        // drain them.
+        self.put_posts = 0;
         self.refresh_link_status();
     }
 
@@ -1471,39 +1787,65 @@ impl Record for CalcoutRecord {
         // calc carries it in the put status.
         match field {
             "CALC" => {
-                let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-                self.clcv = compiled.status;
-                self.rpcl = compiled.program;
+                self.put_report = self.recompile_calc("calcout: special(): Illegal CALC field");
+                self.put_posts = 1 << CLCV_POST;
                 return Ok(());
             }
             "OCAL" => {
-                let compiled = calc_compile::postfix(self.record_type(), "OCAL", &self.ocal);
-                self.oclv = compiled.status;
-                self.orpc = compiled.program;
+                self.put_report = self.recompile_ocal("calcout: special(): Illegal OCAL field");
+                self.put_posts = 1 << (CLCV_POST + 1);
                 return Ok(());
             }
             _ => {}
         }
-        // A put to an INP link re-classifies the link diagnostics: C
-        // `calcoutRecord.c::special` (SPC_MOD) re-runs `checkLinks`. The INP
-        // string the put just stored is re-read by `refresh_link_status`.
-        // OUT is excluded here (see `is_link_config_field`); it re-classifies
-        // from `check_alarms`.
-        if Self::is_link_config_field(field) {
-            self.refresh_link_status();
+        // C `calcoutRecord.c:366-405`. `dbPutFieldLink` runs this pass before
+        // `dbAddLink` (dbAccess.c:1181-1208), so the link has no `lset` yet and
+        // `dbLinkIsConstant` holds for EVERY put: the status reads Constant
+        // whatever the target, and `recGblInitConstantLink` loads nothing.
+        // Bumping the generation drops any classification still in flight.
+        if let Some(idx) = Self::link_index(field) {
+            match self.in_status.get_mut(idx) {
+                Some(status) => *status = LINK_CON,
+                None => self.out_status = LINK_CON,
+            }
+            self.link_gen.next();
+            self.put_posts = 0b11 << (2 * idx);
         }
         Ok(())
     }
 
-    /// C posts the validity field explicitly from `special()`
-    /// (`db_post_events(prec, &prec->clcv, DBE_VALUE)`, calcoutRecord.c:335,344)
-    /// — CLCV/OCLV are not `pp(TRUE)`, so nothing else would post them.
-    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
-        match put_field {
-            "CALC" => &["CLCV"],
-            "OCAL" => &["OCLV"],
-            _ => &[],
-        }
+    /// The posts `special()` makes, each a literal `DBE_VALUE`: a link put's
+    /// value and status (calcoutRecord.c:377,404), and CLCV/OCLV after a
+    /// CALC/OCAL put (`:335`, `:344`). calcout declares no `CYCLE_POSTED`
+    /// hook, so only the put path drains this.
+    fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
+        use crate::server::record::{CycleMarks, CyclePostMask};
+        /// Link `i`'s value then status at `2i`, `2i + 1`; OUT's status is
+        /// OUTV. CLCV and OCLV follow at [`CLCV_POST`].
+        const PUT_POSTS_NAMED: [(&str, CyclePostMask); CLCV_POST + 2] = {
+            let mut table = [("", CyclePostMask::Value); CLCV_POST + 2];
+            let mut i = 0;
+            while i < CALCOUT_LINK_VALUE_FIELDS.len() {
+                table[2 * i].0 = CALCOUT_LINK_VALUE_FIELDS[i];
+                table[2 * i + 1].0 = if i < CALCOUT_INAV_FIELDS.len() {
+                    CALCOUT_INAV_FIELDS[i]
+                } else {
+                    "OUTV"
+                };
+                i += 1;
+            }
+            table[CLCV_POST].0 = "CLCV";
+            table[CLCV_POST + 1].0 = "OCLV";
+            table
+        };
+        static PUT_POSTS: [(
+            crate::server::record::FieldIx,
+            crate::server::record::CyclePostMask,
+        ); CLCV_POST + 2] = crate::server::record::declared_post_table(
+            crate::server::record::dbd_generated::CALCOUT_FIELDS,
+            PUT_POSTS_NAMED,
+        );
+        CycleMarks::of(&PUT_POSTS, u128::from(std::mem::take(&mut self.put_posts)))
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
@@ -1520,17 +1862,6 @@ impl Record for CalcoutRecord {
         // as defined.
         if std::mem::take(&mut self.value_computed) {
             common.udf = self.value_is_undefined() as u8;
-        }
-
-        // The OUT link lives in the common fields, not a calcout-owned field.
-        // `init_links` captures it at load; this hook catches a *runtime* OUT
-        // re-point (a put to OUT does not process, so `special("OUT")` cannot
-        // re-classify it — see `is_link_config_field`). C re-runs the same
-        // `init_record`/`checkLinks` OUT classification on any link change
-        // (calcoutRecord.c:160-189). Only re-classify when OUT actually moved.
-        if self.out != common.out {
-            self.out.set(&common.out);
-            self.refresh_link_status();
         }
 
         // C `calcoutRecord.c:238-241` (CALC) and `:622` (OCAL, inside
@@ -1584,15 +1915,15 @@ mod link_status_tests {
         assert_eq!(CalcoutRecord::input_status_index("INABV"), None);
     }
 
-    // Boundary: `special()` re-classifies only on an INP link put; OUT is a
-    // common field whose post-put string is invisible here.
+    // Boundary: C's `lnkIndex` covers INPA..INPU and OUT, nothing else.
     #[test]
-    fn is_link_config_field_only_inp_links() {
-        assert!(CalcoutRecord::is_link_config_field("INPA"));
-        assert!(CalcoutRecord::is_link_config_field("INPU"));
-        assert!(!CalcoutRecord::is_link_config_field("OUT"));
-        assert!(!CalcoutRecord::is_link_config_field("INAV")); // status, not link
-        assert!(!CalcoutRecord::is_link_config_field("CALC"));
+    fn link_index_boundaries() {
+        assert_eq!(CalcoutRecord::link_index("INPA"), Some(0));
+        assert_eq!(CalcoutRecord::link_index("INPU"), Some(20));
+        assert_eq!(CalcoutRecord::link_index("OUT"), Some(21));
+        assert_eq!(CalcoutRecord::link_index("INPV"), None); // past U
+        assert_eq!(CalcoutRecord::link_index("INAV"), None); // status, not link
+        assert_eq!(CalcoutRecord::link_index("CALC"), None);
     }
 
     // Every INAV..INUV and OUTV serves the menu(calcoutINAV) labels; the

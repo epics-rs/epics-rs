@@ -483,6 +483,7 @@ fn set_mode_redefines_coordinates() {
 
     // Write VAL=100 → should update OFF, not move
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Val);
 
     assert_eq!(rec.pos.val, 100.0);
     assert_eq!(rec.pos.dval, 10.0); // unchanged
@@ -990,9 +991,22 @@ fn move_start_notify_posts_diff_and_rdif() {
         RecordProcessResult::AsyncPendingNotify(fields) => fields,
         other => panic!("expected move-start AsyncPendingNotify, got {other:?}"),
     };
+    // The notify names its fields; the record holds what they post.
+    let fields: Vec<(&str, EpicsValue)> = fields
+        .into_iter()
+        .map(|ix| {
+            let name = epics_base_rs::server::record::field_at(
+                motor_rs::record::dbd_generated::MOTOR_FIELDS,
+                ix,
+            )
+            .expect("declared")
+            .name;
+            (name, rec.get_field(name).expect("readable"))
+        })
+        .collect();
     // diff = dval - drbv = 10 - 0 = 10; rdif = NINT(diff/mres) = 10/0.001 = 10000.
-    let diff = fields.iter().find(|(n, _)| n == "DIFF").map(|(_, v)| v);
-    let rdif = fields.iter().find(|(n, _)| n == "RDIF").map(|(_, v)| v);
+    let diff = fields.iter().find(|(n, _)| *n == "DIFF").map(|(_, v)| v);
+    let rdif = fields.iter().find(|(n, _)| *n == "RDIF").map(|(_, v)| v);
     assert_eq!(
         diff,
         Some(&EpicsValue::Double(10.0)),
@@ -1000,7 +1014,7 @@ fn move_start_notify_posts_diff_and_rdif() {
     );
     assert_eq!(
         rdif,
-        Some(&EpicsValue::Int64(10000)),
+        Some(&EpicsValue::Long(10000)),
         "move-start notify posts RDIF = NINT(diff/mres)"
     );
 }
@@ -1339,7 +1353,7 @@ fn calibration_set_current_position_updates_offset() {
 
     // Write new position: "I am now at 10.0"
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Set);
+    let effects = rec.plan_motion(CommandSource::Val);
 
     // C 2206-2227: a FOFF=Variable redefinition is offset-only — no
     // controller command (LOAD_POS belongs to the Frozen leg and the

@@ -5,7 +5,7 @@
 //! `sscanf(val, "%d")` / `sscanf(val, "%u")` for the numeric keys, and
 //! `epicsStrCaseCmp(val, "Y"/"N")` for the boolean ones — and it reports the
 //! failure with a fixed string per key (`drvAsynSerialPort.c:261-616`,
-//! `drvAsynSerialPortWin32.c:192-345`, `drvAsynIPPort.c:924-935`). Those strings
+//! `drvAsynSerialPortWin32.c:192-345`, `drvAsynIPPort.c:978-989`). Those strings
 //! are the operator's diagnostic: they reach ERRS through
 //! `pasynUser->errorMessage` (asynRecord.c `reportError`), and an OPI or a
 //! script that keys off them sees the driver's own words.
@@ -34,6 +34,12 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 /// whatever `setOption` accepts, `getOption` has to be able to answer.
 pub fn option_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
+}
+
+/// `option_key(key) == normalized`, without building the key — for a caller
+/// under a record's hold.
+pub fn is_option_key(key: &str, normalized: &str) -> bool {
+    key.trim().eq_ignore_ascii_case(normalized)
 }
 
 /// C's `epicsStrCaseCmp(val, ...)` — the value half of the same rule
@@ -111,7 +117,7 @@ pub fn sscanf_uint(value: &str) -> Option<u32> {
 }
 
 /// C's diagnostic for a value that carries no number at all —
-/// `"Bad number"` (drvAsynSerialPort.c:264, :512, :576, :585;
+/// `"Bad number"` (drvAsynSerialPort.c:264, :515, :576, :586;
 /// drvAsynSerialPortWin32.c:196, :205, :314).
 pub fn bad_number() -> AsynError {
     AsynError::Status {
@@ -122,7 +128,7 @@ pub fn bad_number() -> AsynError {
 
 /// C's diagnostic for a boolean/enumerated key whose value it does not
 /// recognise — `"Invalid <key> value."` (drvAsynSerialPort.c:419, :440, :464,
-/// :481, :502, :539, :558; drvAsynIPPort.c:933).
+/// :481, :501, :539, :553; drvAsynIPPort.c:987).
 ///
 /// The three keys whose C text is *not* of this shape have their own literal at
 /// the call site: `"Invalid parity."`, `"Invalid number of bits."`,
@@ -253,6 +259,8 @@ mod tests {
         assert_eq!(option_key(" rs485_Enable "), "rs485_enable");
         assert_eq!(option_key("Break"), "break");
         assert_eq!(option_key(""), "");
+        assert!(is_option_key(" HostInfo ", "hostinfo"));
+        assert!(!is_option_key("hostinfo2", "hostinfo"));
     }
 
     /// R11-49: C parses every numeric option value with `sscanf("%d")`, a prefix

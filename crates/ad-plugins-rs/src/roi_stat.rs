@@ -359,6 +359,7 @@ fn roi_stats_of<T: StatsElem>(
 }
 
 impl NDPluginProcess for ROIStatProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // NDPluginROIStat operates on the raw array dimensions like the C
         // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
@@ -749,6 +750,7 @@ pub fn create_roi_stat_runtime(
     wiring: Arc<WiringRegistry>,
     num_rois: usize,
     ts_registry: &crate::time_series::TsReceiverRegistry,
+    threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     ROIStatParams,
@@ -769,6 +771,7 @@ pub fn create_roi_stat_runtime(
         ndarray_port,
         wiring,
         num_rois,
+        threads,
     );
 
     let roi_stat_params = *params_handle.lock();

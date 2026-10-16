@@ -2,7 +2,7 @@
 //!
 //! Loads EPICS records from a `.db` file and optional group PV definitions
 //! from a JSON config, then exposes them over pvAccess using the native
-//! PVA server via [`QsrvPvStore`].
+//! PVA server via [`QsrvPvStore`](epics_bridge_rs::qsrv::pva_adapter::QsrvPvStore).
 //!
 //! Usage:
 //!
@@ -16,17 +16,21 @@
 // lints this file in full.
 #![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::Parser;
 
-use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+use epics_base_rs::error::CaError;
+use epics_base_rs::server::ioc_app::{GroupLoadRequest, IocApplication};
 #[cfg(tokio_backend)]
-use epics_pva_rs::server::{PvaServer, PvaServerBuilder};
-use epics_pva_rs::server_native::ChannelSource;
+use epics_base_rs::server::iocsh::registry::escape_arg;
+#[cfg(tokio_backend)]
+use epics_bridge_rs::qsrv::run_qsrv_ioc_app;
+#[cfg(tokio_backend)]
+use epics_pva_rs::server::PvaServer;
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::CompositeSource;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,7 +51,8 @@ struct Args {
     #[arg(long = "macro", value_parser = parse_macro)]
     macros: Vec<(String, String)>,
 
-    /// TCP port for pvAccess (UDP is port + 1). Omit to take
+    /// TCP port for pvAccess; the search (UDP) port is
+    /// `EPICS_PVAS_BROADCAST_PORT`'s whatever this is. Omit to take
     /// `EPICS_PVAS_SERVER_PORT`, then `EPICS_PVA_SERVER_PORT`, then 5075.
     /// `--port 0` binds an ephemeral port.
     #[arg(long)]
@@ -69,12 +74,9 @@ fn parse_macro(raw: &str) -> Result<(String, String), String> {
 #[cfg(tokio_backend)]
 #[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // softIocPVX's console is errlog's stderr; an application subscriber
+    // would keep errlog lines as its own records on stdout instead.
+    epics_base_rs::runtime::log::install_console_subscriber();
 
     let args = Args::parse();
 
@@ -89,47 +91,46 @@ async fn main() -> ExitCode {
 
 #[cfg(tokio_backend)]
 async fn run(args: Args) -> Result<(), String> {
-    let mut builder: PvaServerBuilder = PvaServer::builder();
-    if let Some(port) = args.port {
-        builder = builder.port(port);
-    }
+    let mut app = IocApplication::new();
     if let Some(path) = args.db_file.as_ref() {
-        let macros: HashMap<String, String> = args.macros.iter().cloned().collect();
-        builder = builder
-            .db_file(path.to_string_lossy().as_ref(), &macros)
-            .map_err(|e| format!("loading db file {}: {e}", path.display()))?;
+        let macros: Vec<String> = args
+            .macros
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        app = app.startup_line(&format!(
+            "dbLoadRecords({}, {})",
+            escape_arg(&path.to_string_lossy()),
+            escape_arg(&macros.join(","))
+        ));
     }
-    let server = builder.build().await.map_err(|e| e.to_string())?;
-    let db = server.database().clone();
-
-    // C iocInit owns scan start (scanInit/initialProcess) — the PVA
-    // front-end does not scan. Start the core-owned scan owner here,
-    // where this binary's iocInit sequence ends; held to process end so
-    // periodic SCAN fields stay live as long as the server serves.
-    let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
-
-    let provider = BridgeProvider::new(db);
-    if let Some(path) = args.group_file.as_ref() {
-        provider
-            .load_group_file(path.to_string_lossy().as_ref())
-            .map_err(|e| format!("loading group file {}: {e}", path.display()))?;
-    }
-    let store = Arc::new(QsrvPvStore::new(
-        epics_base_rs::runtime::task::Reactor::current()
-            .expect("qsrv-rs main is awaited on the tool's runtime"),
-        Arc::new(provider),
-    ));
-
-    let pv_count = store.list_pvs().await.len();
-    let group_count = store.provider().groups().len();
-    tracing::info!(
-        "qsrv-rs: serving {pv_count} PV(s) ({group_count} group) — starting PVA listener"
-    );
-
-    server
-        .run_with_source(store)
+    let group_files: Vec<GroupLoadRequest> = args
+        .group_file
+        .iter()
+        .map(|path| GroupLoadRequest {
+            filename: path.to_string_lossy().into_owned(),
+            macros: String::new(),
+        })
+        .collect();
+    let port = args.port;
+    run_qsrv_ioc_app(app, group_files, move |config, mount| async move {
+        let composite = CompositeSource::new();
+        mount
+            .install_channel_sources(&config.db, &composite)
+            .map_err(CaError::InvalidValue)?;
+        PvaServer::from_parts(
+            config.db,
+            port,
+            config.acf,
+            config.autosave_config,
+            config.autosave_manager,
+        )
+        .run_with_source(composite)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| CaError::InvalidValue(e.to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The `exec_backend` arm. QSRV serves its groups over the async PVA front-end
@@ -137,10 +138,9 @@ async fn run(args: Args) -> Result<(), String> {
 /// is the entry point for this execution model.
 #[cfg(exec_backend)]
 fn main() -> ExitCode {
-    eprintln!(
+    epics_base_rs::runtime::task::refuse_backend(
         "qsrv-rs: this build selects the reactor-free execution backend \
          (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the PVA server front-end needs \
-         a tokio reactor. Unset that variable and rebuild."
-    );
-    ExitCode::FAILURE
+         a tokio reactor. Unset that variable and rebuild.",
+    )
 }

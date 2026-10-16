@@ -44,7 +44,7 @@ fn enum_strs(inst: &RecordInstance, field: &str) -> Vec<String> {
 /// The type a CA client sees on create-channel, and the label it reads back.
 #[test]
 fn ai_menu_fields_serve_dbr_enum_with_the_choices_c_serves() {
-    let inst = RecordInstance::new("T:AI".to_string(), AiRecord::new(0.0));
+    let inst = RecordInstance::new("T:AI", AiRecord::new(0.0));
 
     for (field, index, label) in [
         ("LINR", 0u16, "NO CONVERSION"),
@@ -75,7 +75,7 @@ fn ai_menu_fields_serve_dbr_enum_with_the_choices_c_serves() {
 /// cannot tell them apart.
 #[test]
 fn ai_simm_serves_its_own_three_choice_menu() {
-    let inst = RecordInstance::new("T:AI".to_string(), AiRecord::new(0.0));
+    let inst = RecordInstance::new("T:AI", AiRecord::new(0.0));
     assert_eq!(
         enum_strs(&inst, "SIMM"),
         ["NO", "YES", "RAW"],
@@ -88,7 +88,7 @@ fn ai_simm_serves_its_own_three_choice_menu() {
 /// arm unreachable.
 #[test]
 fn a_put_to_a_menu_field_still_lands_as_the_stored_index() {
-    let mut inst = RecordInstance::new("T:AI".to_string(), AiRecord::new(0.0));
+    let mut inst = RecordInstance::new("T:AI", AiRecord::new(0.0));
     inst.record.put_field("SIMM", EpicsValue::Short(1)).unwrap();
     assert_eq!(served(&inst, "SIMM"), EpicsValue::Enum(1));
     assert_eq!(enum_strs(&inst, "SIMM")[1], "YES");

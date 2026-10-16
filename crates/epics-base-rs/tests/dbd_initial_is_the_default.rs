@@ -71,8 +71,8 @@ async fn string_of(db: &PvDatabase, pv: &str) -> String {
 
 /// STAT/SEVR as a client sees them — the numeric codes a `caget` reads back.
 async fn alarm_of(db: &PvDatabase, rec: &str) -> (i64, i64) {
-    let stat = db.get_pv(&format!("{rec}.STAT")).unwrap();
-    let sevr = db.get_pv(&format!("{rec}.SEVR")).unwrap();
+    let stat = db.get_pv(format!("{rec}.STAT")).unwrap();
+    let sevr = db.get_pv(format!("{rec}.SEVR")).unwrap();
     (stat.to_f64().unwrap() as i64, sevr.to_f64().unwrap() as i64)
 }
 

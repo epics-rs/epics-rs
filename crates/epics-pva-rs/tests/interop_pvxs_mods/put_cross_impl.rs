@@ -18,6 +18,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
+use super::interop_helpers::PvxsOutput;
 use super::interop_helpers::{LogCapture, PVXGET, PVXPUT, pvxs_command, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
@@ -37,9 +38,7 @@ fn pvxs_lib_dir_str() -> std::ffi::OsString {
 /// Direction A: pvxput → Rust SharedPV → readback via Rust SharedPV::current().
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_put_a_pvxput_writes_into_rust_server() {
-    let Some(pvxput) = require_pvxs(PVXPUT) else {
-        return;
-    };
+    let pvxput = require_pvxs(PVXPUT);
 
     // Captures the Rust server's debug output for the failure message
     // below. This test only decorates a panic with it, so losing the
@@ -57,7 +56,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
         .open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -73,7 +72,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
         .open(
             FieldDesc::Structure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
-                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))],
+                fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Int))].into(),
             },
             PvField::Structure(PvStructure {
                 struct_id: "epics:nt/NTScalar:1.0".into(),
@@ -113,7 +112,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
                 .env(env_key, lib)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .output()
+                .pvxs_output()
                 .expect("pvxput exec")
         })
         .await
@@ -163,21 +162,11 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
 /// --writable) → readback via pvxget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_put_b_rust_client_writes_into_pvxs_server() {
-    let Some(pvxget) = require_pvxs(PVXGET) else {
-        return;
-    };
+    let pvxget = require_pvxs(PVXGET);
     // Build reverse_server (re-uses batch-1 helper compile pipeline).
-    // The only absent-prerequisite skip on this path; everything past it
-    // is our own helper, so it panics rather than skipping.
-    if super::interop_helpers::require_cxx().is_none() {
-        return;
-    }
+    super::interop_helpers::require_cxx();
     let helper = super::interop_helpers::cpp_helper("reverse_server");
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
     let ready = super::interop_helpers::ReadyFile::new("rev_ready_w");
 
     let env_key = if cfg!(target_os = "macos") {
@@ -186,34 +175,7 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
         "LD_LIBRARY_PATH"
     };
 
-    let mut child = match std::process::Command::new(&helper)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ready")
-        .arg(ready.path())
-        .arg("--writable")
-        .env(env_key, pvxs_lib_dir_str())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => panic!("failed to spawn reverse_server: {e}"),
-    };
-
-    let mut up = false;
-    for _ in 0..50 {
-        if ready.is_up() {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !up {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("reverse_server did not become ready");
-    }
+    let (srv, port) = super::interop_helpers::start_cpp_server(&helper, &ready, &["--writable"]);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()
@@ -246,14 +208,13 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
             .env(env_key_c, pvxs_lib_dir_str())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .pvxs_output()
             .expect("pvxget exec")
     })
     .await
     .expect("join");
 
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(srv);
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();

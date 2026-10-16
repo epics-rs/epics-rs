@@ -62,6 +62,7 @@ impl MotorRecord {
             // apply the C 1345 gate (the ack is not a motion completion).
             if self.stat.stup == 2 {
                 self.stat.stup = 0;
+                self.mark(m::STUP);
                 self.internal.stup_ack = true;
             }
             if !self.initialized {
@@ -174,7 +175,11 @@ impl MotorRecord {
         // C posts the change without MARKing M_UEIP, so no re-anchor.
         if self.conv.ueip && !status.has_encoder {
             self.conv.ueip = false;
+            self.mark(m::UEIP_POSTED);
         }
+        let (old_rrbv, old_drbv, old_rbv) = (self.pos.rrbv, self.pos.drbv, self.pos.rbv);
+        let (old_tdir, old_movn) = (self.stat.tdir, self.stat.movn);
+        let (old_hls, old_lls, old_athm) = (self.limits.hls, self.limits.lls, self.stat.athm);
 
         // Layer 1: update raw positions. C devMotorAsyn.c:452/459 rounds the
         // raw motor and encoder counts with floor(x + 0.5) (half toward +inf),
@@ -182,7 +187,11 @@ impl MotorRecord {
         // negative count (raw -2.5 -> C -2, Rust .round() -> -3). The other raw
         // conversions in this file (rdif, rval, URIP rrbv) use C NINT
         // (motorRecord.cc) == Rust .round(), so they must stay .round().
-        self.pos.rmp = (status.position / self.conv.mres + 0.5).floor() as i64;
+        // RMP/REP/RVEL are a direct `(epicsInt32)floor(..)` there, so an
+        // out-of-range count is INT_MIN (x86), not a 64-bit truncation.
+        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32(
+            (status.position / self.conv.mres + 0.5).floor(),
+        );
 
         // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
         // independent of UEIP (C rounds the count the asyn layer already
@@ -191,7 +200,9 @@ impl MotorRecord {
         // it). MRES is only a fallback for an invalid runtime ERES.
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
         if eres_valid {
-            self.pos.rep = (status.encoder_position / self.conv.eres + 0.5).floor() as i64;
+            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
+                (status.encoder_position / self.conv.eres + 0.5).floor(),
+            );
         } else {
             if self.conv.ueip {
                 tracing::warn!(
@@ -199,7 +210,9 @@ impl MotorRecord {
                     self.conv.eres
                 );
             }
-            self.pos.rep = (status.encoder_position / self.conv.mres + 0.5).floor() as i64;
+            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
+                (status.encoder_position / self.conv.mres + 0.5).floor(),
+            );
         }
 
         // RRBV depends on UEIP
@@ -218,7 +231,7 @@ impl MotorRecord {
                 } else {
                     1.0
                 };
-                self.pos.rrbv = ((rdbl_value * rres) / self.conv.mres).round() as i64;
+                self.pos.rrbv = coordinate::to_long(((rdbl_value * rres) / self.conv.mres).round());
             }
         }
 
@@ -232,29 +245,36 @@ impl MotorRecord {
 
         // RBV from DRBV
         self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+        // C 3711-3720.
+        if self.pos.rrbv != old_rrbv {
+            self.mark(m::RRBV);
+        }
+        if self.pos.drbv != old_drbv {
+            self.mark(m::DRBV);
+        }
+        if self.pos.rbv != old_rbv {
+            self.mark(m::RBV);
+        }
 
         // DIFF and RDIF
         self.pos.diff = self.pos.dval - self.pos.drbv;
         // C: rdif = NINT(diff / mres) -- raw step difference
         self.pos.rdif = if self.conv.mres != 0.0 {
-            (self.pos.diff / self.conv.mres).round() as i64
+            coordinate::to_long((self.pos.diff / self.conv.mres).round())
         } else {
             0
         };
-        // C `process_motor_info` MARKs M_DIFF / M_RDIF unconditionally on
-        // every CALLBACK_DATA pass (motorRecord.cc:3765,3767); `monitor()`
-        // (3522-3531) posts both with `monitor_mask | DBE_VAL_LOG` whether
-        // or not the value moved. Record the mark so `force_posted_fields`
-        // re-posts DIFF/RDIF this cycle even when unchanged — a settled
-        // axis at constant non-zero following error still emits them each
-        // poll. The mark is one-pass: reset at the top of `process()`.
-        self.internal.diff_rdif_marked = true;
+        // C 3764-3767: marked whether or not they moved.
+        self.mark(m::DIFF | m::RDIF);
 
         // MOVN: C uses RAW limit switches (rhls/rlls) with RAW cdir
         // Must compute ls_active BEFORE mapping limits to user coordinates
         let ls_active =
             (status.high_limit && self.stat.cdir) || (status.low_limit && !self.stat.cdir);
         self.stat.movn = !(ls_active || status.done || status.problem);
+        if self.stat.movn != old_movn {
+            self.mark(m::MOVN);
+        }
         // C 3744-3747: a struck limit in the commanded direction or a
         // driver problem releases every latched motion button, so the
         // stopped axis is not re-commanded on the next pass.
@@ -274,6 +294,8 @@ impl MotorRecord {
         {
             self.stat.dmov = false;
             self.stat.mip |= MipFlags::EXTERNAL;
+            // C process 1315-1318.
+            self.mark(m::DMOV | m::MIP);
         }
 
         // Raw limit switch readbacks (C 3727-3728), then the user-mapped
@@ -288,6 +310,12 @@ impl MotorRecord {
         } else {
             self.limits.hls = self.limits.rlls;
             self.limits.lls = self.limits.rhls;
+        }
+        if self.limits.hls != old_hls {
+            self.mark(m::HLS);
+        }
+        if self.limits.lls != old_lls {
+            self.mark(m::LLS);
         }
 
         // Build MSTA from driver status
@@ -348,20 +376,16 @@ impl MotorRecord {
         }
         let msta_changed = msta != self.stat.msta;
         self.stat.msta = msta;
-
-        // C monitor() (3541-3549): when the controller supports closed-loop
-        // gain (GAIN_SUPPORT), CNEN is a readback of the EA_POSITION
-        // (position-maintenance/torque) bit — but the readback lives inside
-        // monitor()'s MARKED(M_MSTA) branch, so it refreshes only on a poll
-        // where MSTA actually changed, not every poll. Gating on msta_changed
-        // keeps a user-written CNEN that the driver has not yet reflected in
-        // EA_POSITION from being reverted a poll early.
-        if msta_changed && msta.contains(MstaFlags::GAIN_SUPPORT) {
-            self.ctrl.cnen = msta.contains(MstaFlags::POSITION);
+        // C process() 1277-1278, right after update_values.
+        if msta_changed {
+            self.mark(m::MSTA);
         }
 
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
+        if self.stat.tdir != old_tdir {
+            self.mark(m::TDIR);
+        }
 
         // C 3755-3762: ATHM tracks the motor's home switch — or the
         // encoder's home signal when UEIP=Yes — on every poll. It is
@@ -372,6 +396,9 @@ impl MotorRecord {
         } else {
             msta.contains(MstaFlags::HOME_LS)
         };
+        if self.stat.athm != old_athm {
+            self.mark(m::ATHM);
+        }
 
         // C devMotorAsyn.c:469-474 — RVEL is the RAW velocity in steps/s
         // (motorRecord.dbd DBF_LONG "Raw Velocity"), floor()ed as in C.
@@ -379,7 +406,7 @@ impl MotorRecord {
         // driver convention is EGU (AsynMotor docs), so convert through
         // MRES at the record boundary exactly like RMP above.
         self.stat.rvel = if self.conv.mres != 0.0 {
-            (status.velocity / self.conv.mres).floor() as i64
+            epics_base_rs::types::c_cast::f64_to_i32((status.velocity / self.conv.mres).floor())
         } else {
             0
         };
@@ -400,12 +427,13 @@ impl MotorRecord {
         // equivalent of the dial value — NINT(dval/mres) — never RRBV,
         // which is encoder counts under UEIP=Yes (or the RDBL scaling
         // under URIP) and differs whenever ERES != MRES.
-        self.pos.rval = (self.pos.dval / self.conv.mres).round() as i64;
+        self.pos.rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
         self.pos.diff = 0.0;
         self.pos.rdif = 0;
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
         self.internal.lrvl = self.pos.rval;
+        self.mark(m::VAL | m::DVAL | m::RVAL);
     }
 
     /// Motion-completion drive resync (C postProcess 827-849).
@@ -420,6 +448,7 @@ impl MotorRecord {
     pub(crate) fn postprocess_sync(&mut self) {
         if self.links.omsl != 1 {
             self.sync_positions();
+            self.mark(m::DIFF | m::RDIF);
         }
     }
 

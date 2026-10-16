@@ -52,9 +52,9 @@ impl OctetInterpose for EchoInterpose {
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
         // C `asynInterposeEcho.c::writeIt` (:40-85) counts a byte as transferred
-        // only once its echo has come back and matched — `transfered++` sits at
+        // only once its echo has come back and matched — `transferred++` sits at
         // the bottom of the loop, after the echo check — and publishes that
-        // count on *every* break (`*nbytesTransfered = transfered`, :83). So a
+        // count on *every* break (`*nbytesTransferred = transferred`, :83). So a
         // half-echoed command reports the bytes the device confirmed, and each
         // failure exit here carries `total` out with it.
         let mut total = 0;
@@ -86,7 +86,7 @@ impl OctetInterpose for EchoInterpose {
                 // `asynError`. The status is the contract: `asynRecord` maps it
                 // to a different alarm than a generic error, and a device
                 // support layer that retries on timeout must still see one.
-                // The count in the message is C's `transfered` — the 0-based
+                // The count in the message is C's `transferred` — the 0-based
                 // index of the char whose echo never came back.
                 //
                 // Classify by the carried status, not the variant: the layer
@@ -119,7 +119,7 @@ impl OctetInterpose for EchoInterpose {
                 }
                 .with_partial_write(total));
             }
-            // C `transfered++` (:80) — after the echo matched, not after the
+            // C `transferred++` (:80) — after the echo matched, not after the
             // write.
             total += n;
         }
@@ -227,7 +227,7 @@ mod tests {
         // back against what went out, both escaped.
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(err.message(), "got back 'X' instead of 'A'");
-        // C `asynInterposeEcho.c:83` publishes `*nbytesTransfered = transfered`
+        // C `asynInterposeEcho.c:83` publishes `*nbytesTransferred = transferred`
         // on the mismatch break — the byte was sent but never confirmed, so it
         // does not count as transferred.
         assert_eq!(err.partial_write(), Some(0));
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(err.partial_write(), Some(0));
     }
 
-    /// R8-49: the timeout message counts C's `transfered` — the 0-based index
+    /// R8-49: the timeout message counts C's `transferred` — the 0-based index
     /// of the char whose echo never came back, not the char position in the
     /// buffer minus one, and not the byte count written.
     #[test]
@@ -316,7 +316,7 @@ mod tests {
     }
 
     /// R8-49: a non-timeout failure from the layer below breaks with its own
-    /// status and message intact (C :73 — `break` without rewriting either).
+    /// status and message intact (C :69 — `break` without rewriting either).
     /// Only the timeout arm rewrites the message.
     #[test]
     fn non_timeout_read_error_propagates_untouched() {
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(err.message(), "got back '' instead of '\\n'");
     }
 
-    /// R8-49: a short write from the layer below is C's `nbytesTransfered != 1`
+    /// R8-49: a short write from the layer below is C's `nbytesTransferred != 1`
     /// break (:55-60), reported as its own diagnostic rather than folded into
     /// the echo mismatch.
     #[test]

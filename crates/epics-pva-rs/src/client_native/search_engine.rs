@@ -24,7 +24,7 @@
 // host. The three that stay gated are the IPv6 ones, whose subject is
 // uninhabited there.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the exec-backend
 // suite.
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -83,9 +83,8 @@ use crate::proto::{
 use super::beacon_throttle::{BeaconAction, BeaconTracker};
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
-    DEFAULT_BUFFER_SIZE, DEFAULT_REGISTRY_SIZE, build_client_connection_validation,
-    heartbeat_interval, heartbeat_timeout, read_handshake_init, select_client_auth,
-    wait_for_validated,
+    build_client_connection_validation, heartbeat_interval, heartbeat_timeout, read_handshake_init,
+    select_client_auth, wait_for_validated,
 };
 
 /// Search retry intervals in seconds.
@@ -344,8 +343,7 @@ impl ClientSearchConfig {
     /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
     pub fn from_env() -> Self {
         let broadcast_port = crate::config::env::broadcast_port();
-        let addr_list = std::env::var("EPICS_PVA_ADDR_LIST")
-            .ok()
+        let addr_list = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST")
             .map(|s| crate::config::env::parse_endpoints_with_port(&s, broadcast_port))
             .unwrap_or_default();
         Self {
@@ -723,8 +721,8 @@ impl SearchEngine {
             reactor,
             Self::env_transport(extra_targets)?,
             name_servers,
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -749,8 +747,8 @@ impl SearchEngine {
         config: ClientSearchConfig,
         extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -784,8 +782,8 @@ impl SearchEngine {
         reactor: &epics_base_rs::runtime::task::Reactor,
         extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -815,8 +813,8 @@ impl SearchEngine {
     pub async fn spawn_name_servers_only(
         reactor: &epics_base_rs::runtime::task::Reactor,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
@@ -834,8 +832,8 @@ impl SearchEngine {
         reactor: &epics_base_rs::runtime::task::Reactor,
         transport: SearchTransport,
         name_servers: Vec<SocketAddr>,
-        ns_user: String,
-        ns_host: String,
+        ns_user: epics_base_rs::types::PvString,
+        ns_host: epics_base_rs::types::PvString,
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
@@ -1379,8 +1377,8 @@ async fn run_engine(
     transport: SearchTransport,
     beacons: Arc<BeaconTracker>,
     name_servers: Vec<SocketAddr>,
-    ns_user: String,
-    ns_host: String,
+    ns_user: epics_base_rs::types::PvString,
+    ns_host: epics_base_rs::types::PvString,
     ns_handshake_timeout: Duration,
 ) {
     // pvxs has no separate search counter: it reuses each channel's CID as
@@ -1442,6 +1440,9 @@ async fn run_engine(
     // `dedup_name_servers`.
     let name_servers = dedup_name_servers(name_servers);
     let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+    // pvxs `Connection` pokes the search ring when a name server validates
+    // (clientconn.cpp:315-317); one slot, since pokes coalesce anyway.
+    let (ns_ready_tx, mut ns_ready_rx) = mpsc::channel::<()>(1);
     let mut ns_senders: Vec<NsHandle> = Vec::with_capacity(name_servers.len());
     for ns_addr in name_servers {
         let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -1464,6 +1465,7 @@ async fn run_engine(
             ns_addr,
             search_rx,
             resp_tx,
+            ns_ready_tx.clone(),
             ready,
             queued_bytes,
             NsConnParams {
@@ -1649,7 +1651,7 @@ async fn run_engine(
                         // one revolution while keeping its accumulated backoff.
                         // `maybe_poke` enforces the 30 s holdoff + one-active
                         // -revolution guard.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
@@ -1667,7 +1669,7 @@ async fn run_engine(
                     // the increment and requeues into the same bucket). The prior
                     // `attempt = 0` reset was more aggressive than pvxs's poked
                     // semantic.
-                    maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                    maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                 }
                 Some(SearchCommand::CacheClear { pv_name }) => {
                     // Same drop-the-name path as Cancel, but the name
@@ -1733,7 +1735,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1759,7 +1761,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1784,7 +1786,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1811,7 +1813,7 @@ async fn run_engine(
                     if poke {
                         // pvxs `poke()` (src/client.cpp:736-759): rate-limited.
                         // Never extends a revolution already in flight.
-                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke).await;
+                        maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
                     }
                 }
             }
@@ -1821,6 +1823,12 @@ async fn run_engine(
                     let evt = Discovered::Timeout { server, guid, proto, peer_version };
                     publish_discovery(&mut subscribers, evt);
                 }
+            }
+
+            Some(()) = ns_ready_rx.recv() => {
+                // A search skipped while the name server was not ready is
+                // sent now, not at its next bucket.
+                maybe_poke(&mut tick, &mut fast_ticks_remaining, &mut last_poke);
             }
 
             ns_rsp = ns_response_rx.recv() => {
@@ -2044,7 +2052,7 @@ async fn run_engine(
 /// forward. Returns `false` (no side effects) when either guard declines —
 /// this is what stops a site-wide IOC reboot from amplifying into a sustained
 /// UDP search-broadcast storm.
-async fn maybe_poke(
+fn maybe_poke(
     tick: &mut Interval,
     fast_ticks_remaining: &mut u32,
     last_poke: &mut Option<Instant>,
@@ -2061,8 +2069,9 @@ async fn maybe_poke(
         }
     }
     *last_poke = Some(now);
+    // The interval's first tick is immediate: pvxs schedules the poked
+    // search timer with `immediate{0,0}` (src/client.cpp:757-758).
     *tick = interval(Duration::from_millis(200));
-    tick.tick().await; // skip the immediate fire so cadence doesn't double-tick
     *fast_ticks_remaining = N_SEARCH_BUCKETS as u32;
     true
 }
@@ -2928,8 +2937,8 @@ fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
 /// Client identity and handshake deadline for one name-server connection,
 /// grouped so the long-lived connect/handshake task signatures stay readable.
 struct NsConnParams {
-    user: String,
-    host: String,
+    user: epics_base_rs::types::PvString,
+    host: epics_base_rs::types::PvString,
     handshake_timeout: Duration,
 }
 
@@ -2952,6 +2961,7 @@ async fn ns_task(
     ns_addr: SocketAddr,
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready_tx: mpsc::Sender<()>,
     ready: Arc<AtomicBool>,
     queued_bytes: Arc<AtomicUsize>,
     params: NsConnParams,
@@ -2963,6 +2973,7 @@ async fn ns_task(
             ns_addr,
             &mut search_rx,
             &response_tx,
+            &ready_tx,
             &ready,
             &queued_bytes,
             &params,
@@ -3033,6 +3044,7 @@ async fn ns_run_once(
     ns_addr: SocketAddr,
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ready_tx: &mpsc::Sender<()>,
     ready: &AtomicBool,
     queued_bytes: &AtomicUsize,
     params: &NsConnParams,
@@ -3078,12 +3090,10 @@ async fn ns_run_once(
     let negotiated_auth = select_client_auth(&auth_methods);
     let reply = build_client_connection_validation(
         byte_order,
-        DEFAULT_BUFFER_SIZE,
-        DEFAULT_REGISTRY_SIZE,
-        0,
         negotiated_auth,
-        user,
-        host,
+        user.as_bytes(),
+        host.as_bytes(),
+        &super::server_conn::auth_groups(negotiated_auth),
     );
     ns_write_all(&mut writer, &reply, handshake_timeout).await?;
     wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
@@ -3092,17 +3102,19 @@ async fn ns_run_once(
 
     // Discard any SEARCH frames that the engine enqueued while this connection
     // was down or handshaking. pvxs keeps no disconnected-side queue to replay
-    // (src/client.cpp:1227-1235); the still-pending searches are re-sent on the next
-    // ready tick by the normal bucket cadence, so replaying a stale backlog would
-    // only generate load for CIDs whose callers may already be gone. Only after
-    // draining do we publish readiness, so the engine never races a frame into
-    // the about-to-be-drained window.
+    // (src/client.cpp:1227-1235); the still-pending searches are re-sent by the
+    // poke below, so replaying a stale backlog would only generate load for
+    // CIDs whose callers may already be gone. Only after draining do we
+    // publish readiness, so the engine never races a frame into the
+    // about-to-be-drained window.
     while search_rx.try_recv().is_ok() {}
     // The drained frames were counted in `queued_bytes`; zero the accounting
     // so the new connection starts with an empty output backlog (the byte
     // gate must not stay tripped by frames that were discarded, not written).
     queued_bytes.store(0, Ordering::SeqCst);
     ready.store(true, Ordering::SeqCst);
+    // Full means a poke is already pending.
+    let _ = ready_tx.try_send(());
 
     // A name-server circuit is an ORDINARY PVA connection and must keep the
     // same heartbeat as one. pvxs builds it through `Connection::build()` and
@@ -3309,9 +3321,24 @@ mod tests {
         let mut tick = interval(Duration::from_secs(1));
         let mut ftr = 0u32;
         let mut last = None;
-        assert!(maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
         assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
         assert!(last.is_some(), "granted poke must record a poke time");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_granted_poke_ticks_at_once() {
+        let mut tick = interval(Duration::from_secs(1));
+        tick.tick().await;
+        let (mut ftr, mut last) = (0u32, None);
+        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
+        // The fast period is 200 ms; a skipped first tick waits all of it.
+        assert!(
+            timeout(Duration::from_millis(100), tick.tick())
+                .await
+                .is_ok(),
+            "the first poked tick waited a period"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3320,7 +3347,7 @@ mod tests {
         let mut tick = interval(Duration::from_secs(1));
         let mut ftr = 5u32;
         let mut last = None;
-        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last));
         assert_eq!(ftr, 5, "active revolution must not be re-armed or extended");
         assert!(last.is_none(), "declined poke must not record a poke time");
     }
@@ -3331,7 +3358,7 @@ mod tests {
         let mut tick = interval(Duration::from_secs(1));
         let mut ftr = 0u32;
         let mut last = Some(Instant::now());
-        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert!(!maybe_poke(&mut tick, &mut ftr, &mut last));
         assert_eq!(
             ftr, 0,
             "poke inside the holdoff window must not arm a revolution"
@@ -3345,7 +3372,7 @@ mod tests {
         let mut ftr = 0u32;
         let prev = Instant::now() - (POKE_HOLDOFF + Duration::from_secs(1));
         let mut last = Some(prev);
-        assert!(maybe_poke(&mut tick, &mut ftr, &mut last).await);
+        assert!(maybe_poke(&mut tick, &mut ftr, &mut last));
         assert_eq!(ftr, N_SEARCH_BUCKETS as u32);
         assert!(last.unwrap() > prev, "granted poke must advance last_poke");
     }
@@ -4895,7 +4922,13 @@ mod tests {
 
         // Sniffer on loopback ephemeral. The engine will be told
         // about it via `extra_targets`.
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -5074,7 +5107,13 @@ mod tests {
             // this test's poke before `hurry_up()` asks for it.
             ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
         ]);
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -5177,7 +5216,13 @@ mod tests {
             // engine on the 200 ms cadence and collapse the gaps measured here.
             ("EPICS_PVA_BROADCAST_PORT", &beacon_port),
         ]);
-        let sniffer = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("bind sniffer");
+        let sniffer = AsyncUdpV4::bind_single(
+            Ipv4Addr::LOCALHOST,
+            0,
+            epics_base_rs::net::PortUse::Exclusive,
+            false,
+        )
+        .expect("bind sniffer");
         let sniffer_addr = sniffer
             .local_addrs()
             .first()
@@ -5392,21 +5437,32 @@ mod tests {
     /// with the default v6 multicast group joined. Confirms the
     /// plumbing — without it the recv arm in `run_engine` never
     /// fires for v6 beacons.
+    /// A v6 number this test owns on `[::]`, where the beacon socket binds:
+    /// picked by the kernel, then opened to the beacon socket's fanout
+    /// co-bind, so nobody else can take it while the test hands it over.
+    #[cfg(tokio_backend)]
+    fn hold_v6_beacon_port() -> (socket2::Socket, u16) {
+        use epics_base_rs::net::{PortOrigin, PortUse};
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("v6 socket");
+        s.set_only_v6(true).expect("v6 only");
+        let any = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+        PortUse::Shared
+            .bind(&s, any, PortOrigin::Chosen)
+            .expect("v6 holder bind");
+        let port = s.local_addr().unwrap().as_socket().unwrap().port();
+        (s, port)
+    }
+
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
     async fn v6_beacon_socket_binds_and_joins_default_group() {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
-        // 5076 socket. Picks via OS-coordinated probe, drops, then
-        // passes the port directly to `bind_beacon_udp_v6`.
-        let pick_port = || {
-            let s = std::net::UdpSocket::bind("[::1]:0").expect("v6 probe bind");
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        };
-        let port = pick_port();
+        // 5076 socket.
+        let (_holder, port) = hold_v6_beacon_port();
 
         let sock = bind_beacon_udp_v6(port)
             .expect("v6 beacon socket must bind on a host with IPv6 enabled");
@@ -5434,15 +5490,9 @@ mod tests {
     async fn v6_beacon_arriving_at_engine_is_observed_by_tracker() {
         use crate::proto::{ByteOrder, Command, PvaHeader, WriteExt};
 
-        // Pick a free v6 UDP port. The engine's v6 beacon socket and
-        // our sender both target this port.
-        let pick_port = || {
-            let s = std::net::UdpSocket::bind("[::1]:0").expect("probe");
-            let p = s.local_addr().unwrap().port();
-            drop(s);
-            p
-        };
-        let port = pick_port();
+        // The engine's v6 beacon socket and our sender both target this
+        // port.
+        let (holder, port) = hold_v6_beacon_port();
         let port_str = port.to_string();
         // Suppress v4 search destinations so the engine's broadcast
         // loop has nothing useful to fire.
@@ -5455,6 +5505,9 @@ mod tests {
         let engine = SearchEngine::spawn(&crate::test_reactor(), Vec::new(), Vec::new())
             .await
             .expect("spawn engine");
+        // The engine holds the number now; the holder would take a share of
+        // the beacons.
+        drop(holder);
         // Give the engine a moment to bind sockets and enter its
         // select loop.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5543,7 +5596,7 @@ mod tests {
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_mock_name_server_watch(ns_listener, ns_addr, None)
+        spawn_mock_name_server_watch(ns_listener, ns_addr, None, Duration::ZERO)
     }
 
     /// [`spawn_mock_name_server`] plus a one-shot that fires on the first
@@ -5558,11 +5611,13 @@ mod tests {
         ns_listener: tokio::net::TcpListener,
         ns_addr: SocketAddr,
         mut echo_tx: Option<oneshot::Sender<()>>,
+        validate_after: Duration,
     ) -> tokio::task::JoinHandle<()> {
         use std::io::Cursor as IoCursor;
 
         tokio::spawn(async move {
             let (mut stream, _peer) = ns_listener.accept().await.expect("mock NS: accept");
+            tokio::time::sleep(validate_after).await;
             let order = ByteOrder::Little;
 
             // ── Step 1: SET_BYTE_ORDER ─────────────────────────────────────────
@@ -5742,13 +5797,14 @@ mod tests {
         ]);
 
         let (echo_tx, echo_rx) = oneshot::channel();
-        let ns_handle = spawn_mock_name_server_watch(ns_listener, ns_addr, Some(echo_tx));
+        let ns_handle =
+            spawn_mock_name_server_watch(ns_listener, ns_addr, Some(echo_tx), Duration::ZERO);
 
         let engine = SearchEngine::spawn_name_servers_only(
             &crate::test_reactor(),
             vec![ns_addr],
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -5797,16 +5853,18 @@ mod tests {
 
         let (search_tx, search_rx) = mpsc::channel::<Vec<u8>>(64);
         let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let (ready_tx, _ready_rx) = mpsc::channel::<()>(1);
         let ready = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(ns_task(
             ns_addr,
             search_rx,
             response_tx,
+            ready_tx,
             Arc::clone(&ready),
             Arc::new(AtomicUsize::new(0)),
             NsConnParams {
-                user: String::new(),
-                host: String::new(),
+                user: Default::default(),
+                host: Default::default(),
                 handshake_timeout: Duration::from_secs(5),
             },
         ));
@@ -5837,6 +5895,53 @@ mod tests {
             .await
             .expect("ns_task future must complete")
             .expect("ns_task must not panic");
+    }
+
+    /// pvxs pokes the search ring when a name server validates
+    /// (clientconn.cpp:315-317), so a search skipped while the circuit was
+    /// still handshaking goes out then, not at its next bucket a second or
+    /// more later.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(epics_env)]
+    async fn a_search_skipped_before_the_name_server_validates_is_sent_when_it_does() {
+        use tokio::net::TcpListener;
+        const HOLD: Duration = Duration::from_millis(1100);
+
+        let ns_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock NS listener bind");
+        let ns_addr = ns_listener.local_addr().unwrap();
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
+        let ns_handle = spawn_mock_name_server_watch(ns_listener, ns_addr, None, HOLD);
+        let engine = SearchEngine::spawn_name_servers_only(
+            &crate::test_reactor(),
+            vec![ns_addr],
+            Default::default(),
+            Default::default(),
+            NS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .expect("spawn name-servers-only engine");
+
+        let t0 = std::time::Instant::now();
+        let found = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.find("TEST:NS:LATE", SearchReason::Initial),
+        )
+        .await;
+        let took = t0.elapsed();
+        ns_handle.abort();
+        found
+            .expect("find() must complete within 10 s")
+            .expect("find() must resolve through the name server");
+        assert!(
+            took < HOLD + Duration::from_millis(450),
+            "resolved {took:?} after the find, the name server validating at {HOLD:?}"
+        );
     }
 
     /// Regression: TCP name servers must resolve PVs via persistent
@@ -5962,8 +6067,8 @@ mod tests {
         let engine = SearchEngine::spawn_name_servers_only(
             &crate::test_reactor(),
             vec![ns_addr],
-            String::new(),
-            String::new(),
+            Default::default(),
+            Default::default(),
             NS_HANDSHAKE_TIMEOUT,
         )
         .await
@@ -6085,8 +6190,8 @@ mod tests {
             &crate::test_reactor(),
             Vec::new(),
             vec![ns_addr],
-            "operator".to_string(),
-            "myhost".to_string(),
+            "operator".into(),
+            "myhost".into(),
             Duration::from_secs(5),
         )
         .await

@@ -114,12 +114,12 @@ async fn busy_init_seeds_neither_mlst_nor_lalm() {
     assert_eq!(field(&db, "B", "VAL"), Some(EpicsValue::Enum(1)));
     assert_eq!(
         field(&db, "B", "MLST"),
-        Some(EpicsValue::Enum(0)),
+        Some(EpicsValue::UShort(0)),
         "busyRecord.c:127-181 never assigns mlst, unlike boRecord.c:172"
     );
     assert_eq!(
         field(&db, "B", "LALM"),
-        Some(EpicsValue::Enum(0)),
+        Some(EpicsValue::UShort(0)),
         "nor lalm, unlike boRecord.c:173"
     );
 }

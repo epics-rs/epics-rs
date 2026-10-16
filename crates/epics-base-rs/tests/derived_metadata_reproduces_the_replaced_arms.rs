@@ -39,7 +39,7 @@ fn load<R: Record + 'static>(mut rec: R, fields: &[(&str, EpicsValue)]) -> Recor
             unmodeled.push((*name, value.clone()));
         }
     }
-    let mut inst = RecordInstance::new("T:REC".to_string(), rec);
+    let mut inst = RecordInstance::new("T:REC", rec);
     for (name, value) in unmodeled {
         inst.put_common_field_db_load(name, value)
             .unwrap_or_else(|e| panic!("field({name}) failed to load: {e:?}"));

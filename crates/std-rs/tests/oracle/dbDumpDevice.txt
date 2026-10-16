@@ -1,0 +1,939 @@
+recordtype(aSub)
+recordtype(aai)
+    device name:   devAaiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ea20
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d62ea0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d62f50
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(aao)
+    device name:   devAaoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ea60
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d630b0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63060
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(acalcout)
+    device name:   devaCalcoutSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308e74880
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308e62d80
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(ai)
+    device name:   devAiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eaa0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d630e0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63160
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devAiSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eae0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63350 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63380
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devAiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f2e0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d64f60 - init()
+	    func 2: 0x79c308d64f30 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64d70
+	    func 5: (nil)
+	pdsxt:     0x79c308d7f320
+	    add_record: 0x79c308d65030
+	    del_record: 0x79c308d64f90
+    device name:   devTimestampAI
+	choice:    Soft Timestamp
+	link_type: 12
+	pdset:     0x79c308d7f9c0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67640 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d675f0
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devAiGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x79c308d7f920
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d67210 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d671b0
+	    func 5: (nil)
+	pdsxt:     (nil)
+    device name:   devAiTodSeconds
+	choice:    Sec Past Epoch
+	link_type: 0
+	pdset:     0x5682b51817c0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5682b517d620 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5682b517d630
+	    func 5: 0x5682b517d710
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(ao)
+    device name:   devAoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eb20
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63420 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63430
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devAoSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eb60
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63460
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devAoSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f580
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66c30
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(bi)
+    device name:   devBiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eba0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63510 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63540
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devBiSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ebe0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63670 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d636a0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devBiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f340
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d653a0 - init()
+	    func 2: 0x79c308d65370 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d65240
+	pdsxt:     0x79c308d7f370
+	    add_record: 0x79c308d65470
+	    del_record: 0x79c308d653d0
+    device name:   devBiDbState
+	choice:    Db State
+	link_type: 12
+	pdset:     0x79c308d7ec20
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d637a0 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63770
+	pdsxt:     0x79c308d7ec50
+	    add_record: 0x79c308d637d0
+	    del_record: 0x79c308d63750
+recordtype(bo)
+    device name:   devBoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ec80
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63860 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63870
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devBoSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ecc0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d638a0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d638b0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devBoSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f5c0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66cb0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devBoGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x79c308d7f8e0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d672a0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67150
+	pdsxt:     (nil)
+    device name:   devBoDbState
+	choice:    Db State
+	link_type: 12
+	pdset:     0x79c308d7ed00
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d63940 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63900
+	pdsxt:     0x79c308d7ed30
+	    add_record: 0x79c308d63970
+	    del_record: 0x79c308d638e0
+recordtype(calc)
+recordtype(calcout)
+    device name:   devCalcoutSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ed60
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63a00
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devCalcoutSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f600
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66d30
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(compress)
+recordtype(dfanout)
+recordtype(epid)
+    device name:   devEpidSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x5682b5181520
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5682b517a4a0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5682b517a4b0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devEpidSoftCB
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x5682b5181580
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5682b517abe0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5682b517abf0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devEpidFast
+	choice:    Fast Epid
+	link_type: 12
+	pdset:     0x5682b51815e0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5682b517b930 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5682b517b630
+	    func 5: (nil)
+	pdsxt:     (nil)
+recordtype(event)
+    device name:   devEventSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eda0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63a30 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63aa0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(fanout)
+recordtype(histogram)
+    device name:   devHistogramSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ede0
+	    number: 6
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63c00 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63bd0
+	    func 5: (nil)
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(int64in)
+    device name:   devI64inSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ee20
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63ca0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63cd0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devI64inSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f3a0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d657f0 - init()
+	    func 2: 0x79c308d657c0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d65680
+	pdsxt:     0x79c308d7f3d0
+	    add_record: 0x79c308d658c0
+	    del_record: 0x79c308d65820
+recordtype(int64out)
+    device name:   devI64outSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ee60
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63d70 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63d80
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devI64outSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f640
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66da0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(longin)
+    device name:   devLiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eea0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63e20 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63e50
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devLiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f400
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d65c40 - init()
+	    func 2: 0x79c308d65c10 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d65ad0
+	pdsxt:     0x79c308d7f430
+	    add_record: 0x79c308d65d10
+	    del_record: 0x79c308d65c70
+    device name:   devLiGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x79c308d7f8a0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d67340 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67180
+	pdsxt:     (nil)
+recordtype(longout)
+    device name:   devLoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7eee0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63ef0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63f00
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devLoSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f680
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66e20
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(lsi)
+    device name:   devLsiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ef20
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d63fa0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d63fd0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devLsiEnviron
+	choice:    getenv
+	link_type: 12
+	pdset:     0x79c308d7fb80
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67c10 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67c70
+	pdsxt:     0x79c308d7fbb0
+	    add_record: 0x79c308d67bc0
+	    del_record: 0x79c308d67be0
+recordtype(lso)
+    device name:   devLsoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7ef60
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64070
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devLsoSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f6c0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66ea0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devLsoStdio
+	choice:    stdio
+	link_type: 12
+	pdset:     0x79c308d7fae0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d677f0 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d676f0
+	pdsxt:     0x79c308d7fb10
+	    add_record: 0x79c308d67a10
+	    del_record: 0x79c308d676d0
+recordtype(mbbi)
+    device name:   devMbbiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f020
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64330 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64360
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbbiSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f060
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64470 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d644c0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbbiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f4c0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d664c0 - init()
+	    func 2: 0x79c308d66490 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66360
+	pdsxt:     0x79c308d7f4f0
+	    add_record: 0x79c308d66590
+	    del_record: 0x79c308d664f0
+recordtype(mbbiDirect)
+    device name:   devMbbiDirectSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7efa0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64110 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64140
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbbiDirectSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7efe0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64260 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d641e0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbbiDirectSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f460
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d66080 - init()
+	    func 2: 0x79c308d66050 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d65f20
+	pdsxt:     0x79c308d7f490
+	    add_record: 0x79c308d66150
+	    del_record: 0x79c308d660b0
+recordtype(mbbo)
+    device name:   devMbboSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f120
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64620 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64630
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbboSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f160
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64660 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64690
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbboSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f700
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66f40
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(mbboDirect)
+    device name:   devMbboDirectSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f0a0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64560
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbboDirectSoftRaw
+	choice:    Raw Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f0e0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64590 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d645c0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devMbboDirectSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f740
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d66fc0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(permissive)
+recordtype(printf)
+    device name:   devPrintfSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f1a0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d646f0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devPrintfSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f780
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67040
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devPrintfStdio
+	choice:    stdio
+	link_type: 12
+	pdset:     0x79c308d7faa0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67820 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67750
+	pdsxt:     0x79c308d7fad0
+	    add_record: 0x79c308d67aa0
+	    del_record: 0x79c308d67730
+recordtype(scalcout)
+    device name:   devsCalcoutSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308e74760
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308e5e6f0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(sel)
+recordtype(seq)
+recordtype(sseq)
+recordtype(state)
+recordtype(stringin)
+    device name:   devSiSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f220
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64aa0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64ad0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devSiSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f520
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d66930 - init()
+	    func 2: 0x79c308d66900 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d667a0
+	pdsxt:     0x79c308d7f550
+	    add_record: 0x79c308d66a00
+	    del_record: 0x79c308d66960
+    device name:   devTimestampSI
+	choice:    Soft Timestamp
+	link_type: 12
+	pdset:     0x79c308d7f980
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67640 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67670
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devSiGeneralTime
+	choice:    General Time
+	link_type: 12
+	pdset:     0x79c308d7f820
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d673d0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67560
+	pdsxt:     (nil)
+    device name:   devSiEnviron
+	choice:    getenv
+	link_type: 12
+	pdset:     0x79c308d7fb40
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67c40 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d67d10
+	pdsxt:     0x79c308d7fb70
+	    add_record: 0x79c308d67bf0
+	    del_record: 0x79c308d67d80
+    device name:   devSiTodString
+	choice:    Time of Day
+	link_type: 0
+	pdset:     0x5682b5181800
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x5682b517d620 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x5682b517d690
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(stringout)
+    device name:   devSoSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f260
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64b80
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devSoSoftCallback
+	choice:    Async Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f7c0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d670e0
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+    device name:   devSoStdio
+	choice:    stdio
+	link_type: 12
+	pdset:     0x79c308d7fa60
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: 0x79c308d67850 - init()
+	    func 2: (nil) - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d677b0
+	pdsxt:     0x79c308d7fa90
+	    add_record: 0x79c308d67b30
+	    del_record: 0x79c308d67790
+recordtype(sub)
+recordtype(subArray)
+    device name:   devSASoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f1e0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64710 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64870
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350
+recordtype(throttle)
+recordtype(timestamp)
+recordtype(transform)
+recordtype(waveform)
+    device name:   devWfSoft
+	choice:    Soft Channel
+	link_type: 0
+	pdset:     0x79c308d7f2a0
+	    number: 5
+	    func 0: (nil) - report()
+	    func 1: (nil) - init()
+	    func 2: 0x79c308d64ba0 - init_record()
+	    func 3: (nil) - get_ioint_info()
+	    func 4: 0x79c308d64c60
+	pdsxt:     0x79c308d32a90
+	    add_record: 0x79c308cf8350
+	    del_record: 0x79c308cf8350

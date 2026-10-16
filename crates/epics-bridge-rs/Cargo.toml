@@ -53,14 +53,18 @@ qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # accessor has to be compiled by the same flag that compiles the reporter
 # thread which prints it.
 bringup-probes = ["epics-pva-rs?/bringup-probes"]
+# `realtime-pva-ioc` registers the do-nothing aSub subroutine `benchNoop` that
+# the record benches' x-asub-link.db names, as softIoc loads it from a .so.
+bench-subroutines = []
 # Record ↔ pvAccess channels (C++ QSRV equivalent). Pulls in `pvalink`
 # so a PVA-serving IOC resolves `pva://` record links out of the box —
 # symmetric with `calink`, which is always-on whenever `epics-ca-rs` is
 # present (`epics_ca_rs::calink`, no feature). pvxs likewise ties pvalink
 # to QSRV2 (`iochooks.cpp:461-496`).
 #
-# `epics-ca-rs` is needed by exactly one item — `run_ca_pva_qsrv_ioc`, the host
-# dual-protocol runner — which is why it is here and not in `qsrv-core`.
+# `epics-ca-rs` is needed by the host runners only — `run_ca_pva_qsrv_ioc_app`
+# and the `ca` link set `run_qsrv_ioc_app` installs — which is why it is here
+# and not in `qsrv-core`.
 # The `epics-pva-rs/*` entries restore what `default-features = false` on the
 # dependency drops; see the note over the dependency itself.
 qsrv = [
@@ -72,7 +76,7 @@ qsrv = [
     "epics-pva-rs/pkcs12",
 ]
 # QSRV daemon binary (qsrv-rs)
-qsrv-bin = ["qsrv", "dep:clap", "dep:tracing-subscriber"]
+qsrv-bin = ["qsrv", "dep:clap"]
 # CA fan-out gateway (C++ ca-gateway equivalent)
 ca-gateway = ["dep:epics-ca-rs", "dep:regex"]
 # CA gateway daemon binary (ca-gateway-rs)
@@ -171,7 +175,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # host-facing feature that pulls this dependency — `qsrv`, `pvalink`,
 # `pva-gateway`, `dual-ioc` — so host builds resolve exactly as before. Only
 # `qsrv-core`, the RTEMS selection, gets the reduced set.
-epics-pva-rs = { path = "../epics-pva-rs", version = "0.31.0", optional = true, default-features = false }
+epics-pva-rs = { path = "../epics-pva-rs", version = "0.32.0", optional = true, default-features = false }
 # `epics-ca-rs` stays inherited, but NOT because its defaults are empty — they
 # stopped being empty at `274a734b`, which introduced the `client-core`/`client`
 # split and made `default = ["client"]`. The reason is narrower and is a fact
@@ -312,5 +316,13 @@ source-guard = { path = "../source-guard" }
 # crate that derives the backend has the same hole, and a 300-line audit
 # copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+libc = "0.2"
+# Dev-only and path-only: `boot_on_free_port`, the one owner of starting a C
+# IOC on a port nothing else took, which `gw_upstream_unresponsive_window`
+# used to re-implement.
+epics-oracle-rs = { path = "../epics-oracle-rs" }
+# Dev-only and path-only: the retry rule for a test that must name a port.
+named-port = { path = "../named-port" }
 serial_test = "3"
 tempfile = "3"
+tracing-subscriber = "0.3"

@@ -10,7 +10,7 @@
 //! The owner is `epics_libcom_rs::runtime::exit` (C `epicsExit.c`), which
 //! `IocApplication::run` calls on every way out. Ports enrol themselves in it at
 //! creation, where C's `registerPort` enrols an `ASYN_DESTRUCTIBLE` one
-//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2096-2098) — here every
+//! (`epicsAtExit(destroyPortDriver, …)`, asynManager.c:2098-2100) — here every
 //! port enrols, whatever it declared, so a driver still knows nothing about
 //! shutdown.
 //!
@@ -70,7 +70,11 @@ impl Drop for TeardownDriver {
 /// its own and prove nothing about who stopped it.
 fn publish(registry: &PortRegistry, name: &str, port: &PortRuntimeHandle) {
     registry
-        .register(name, port.port_handle().clone())
+        .register(
+            name,
+            port.port_handle().clone(),
+            &asyn_rs::registry::open_owner(),
+        )
         .expect("port name is free");
 }
 
@@ -123,13 +127,11 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         "a running IOC must not have torn its ports down"
     );
     #[cfg(unix)]
-    if let Some(pty) = &serial {
-        assert!(
-            pty.driver_still_holds_the_tty(),
-            "the serial port must be connected before shutdown, or this test \
-             proves nothing about its teardown"
-        );
-    }
+    assert!(
+        serial.driver_still_holds_the_tty(),
+        "the serial port must be connected before shutdown, or this test \
+         proves nothing about its teardown"
+    );
 
     // ---- the IOC shuts down --------------------------------------------
     //
@@ -154,13 +156,11 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         ),
     }
     #[cfg(unix)]
-    if let Some(pty) = &serial {
-        assert!(
-            !pty.driver_still_holds_the_tty(),
-            "DrvAsynSerialPort's Drop runs `disconnect`; IOC shutdown must \
-             reach it, releasing the tty"
-        );
-    }
+    assert!(
+        !serial.driver_still_holds_the_tty(),
+        "DrvAsynSerialPort's Drop runs `disconnect`; IOC shutdown must \
+         reach it, releasing the tty"
+    );
 }
 
 #[cfg(unix)]
@@ -201,9 +201,9 @@ mod serial {
         }
     }
 
-    /// A serial port on a fresh pty, or `None` where the host has no pty to
-    /// give — the same skip the driver's own pty tests take.
-    pub fn open_port_on_a_pty(registry: &PortRegistry) -> Option<Pty> {
+    /// A serial port on a fresh pty. A host with no pty fails the test: an
+    /// early return would score as a pass.
+    pub fn open_port_on_a_pty(registry: &PortRegistry) -> Pty {
         let mut master: RawFd = 0;
         let mut slave: RawFd = 0;
         let mut name = [0u8; 256];
@@ -216,10 +216,11 @@ mod serial {
                 std::ptr::null_mut(),
             )
         };
-        if opened < 0 {
-            eprintln!("openpty unavailable; skipping the serial half of this test");
-            return None;
-        }
+        assert!(
+            opened >= 0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
         let device = unsafe {
             std::ffi::CStr::from_ptr(name.as_ptr() as *const libc::c_char)
                 .to_string_lossy()
@@ -236,6 +237,6 @@ mod serial {
         )
         .expect("the port runtime thread must start");
         super::publish(registry, "MQ4:SERIAL", &port);
-        Some(Pty { master })
+        Pty { master }
     }
 }

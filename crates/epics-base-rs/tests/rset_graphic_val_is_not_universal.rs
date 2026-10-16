@@ -43,7 +43,7 @@ fn disp(inst: &RecordInstance, field: &str) -> (f64, f64) {
 }
 
 fn inst<R: Record + 'static>(rec: R) -> RecordInstance {
-    RecordInstance::new("T:REC".to_string(), rec)
+    RecordInstance::new("T:REC", rec)
 }
 
 /// The measured regression: seq's VAL is DBF_LONG and unlisted, so it takes

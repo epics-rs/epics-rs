@@ -4,11 +4,12 @@ use std::sync::Arc;
 use crate::server::record::{
     AlarmSeverity, NotifyWaitSet, OutTarget, RecordCell, RecordInstance, ScanType,
 };
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
 use super::filters::ChannelName;
 use super::link_set::LinkDbfType;
 use super::processing::ProcStack;
+use super::record_lock::InFrame;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
 /// The `record[.FIELD]` name a link target is addressed by in the local
@@ -20,17 +21,27 @@ use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select
 /// that splits it, and this is the one place that puts the halves back
 /// together for a local lookup. The external name stays `pvname`, which keeps
 /// the filter because C hands it to `dbCaAddLink` unchanged.
-fn local_pv_name(target: &ChannelName) -> String {
-    local_name(&target.record, &target.field)
+fn local_pv_name(target: &ChannelName) -> Vec<u8> {
+    let mut name = local_name(&target.record, &target.field);
+    // A `$` address the record refused keeps its `$`, so the put is refused
+    // too rather than storing through the field's own type.
+    if target.string_view {
+        if target.field == "VAL" {
+            name.extend_from_slice(b".VAL");
+        }
+        name.push(b'$');
+    }
+    name
 }
 
 /// [`local_pv_name`] from the halves, for a caller that holds them apart.
-pub(super) fn local_name(record: &str, field: &str) -> String {
-    if field == "VAL" {
-        record.to_string()
-    } else {
-        format!("{record}.{field}")
+pub(super) fn local_name(record: &[u8], field: &str) -> Vec<u8> {
+    let mut name = record.to_vec();
+    if field != "VAL" {
+        name.push(b'.');
+        name.extend_from_slice(field.as_bytes());
     }
+    name
 }
 
 /// **The one classifier of a process-time read that delivered no value.**
@@ -40,7 +51,7 @@ pub(super) fn local_name(record: &str, field: &str) -> String {
 /// (`dbConstLink.c:219-225`) — status 0, `*pnRequest = 0`, buffer untouched —
 /// while any other link that produced nothing FAILED and owes the reader a LINK
 /// alarm. Every process-time reader ends here ([`PvDatabase::read_link_with_alarm`]
-/// for the input-fetch/control-link paths, [`PvDatabase::read_link_value_as`] for
+/// for the input-fetch/control-link paths, [`PvDatabase::read_link_value_as_with_alarm`] for
 /// the `ReadDbLink` executor), so a constant cannot be no-data on one path and a
 /// live value on another.
 /// C `dbDbGetValue`'s filter arm, and its NULL-log fallback to the raw
@@ -64,11 +75,36 @@ fn filter_read(suffix: &str, v: EpicsValue) -> EpicsValue {
         .unwrap_or(v)
 }
 
+/// C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes its
+/// element 0 (C asks for one element, so `dbGet` converts offset 0), the same
+/// rule the multi-input fetch applies.
+#[inline]
+fn link_value_as_f64(value: EpicsValue) -> Option<f64> {
+    let scalar = if value.is_array() {
+        value.first_element()
+    } else {
+        Some(value)
+    };
+    scalar.and_then(|s| s.get_convert_f64())
+}
+
+/// [`link_value_as_f64`] for the integer requests: element 0 through C's GET
+/// table, so a string source parses (`cvt_st_l` and siblings) and an integer
+/// source narrows by cast.
+fn link_value_get_as(value: EpicsValue, target: DbFieldType) -> Option<EpicsValue> {
+    let scalar = if value.is_array() {
+        value.first_element()?
+    } else {
+        value
+    };
+    scalar.get_convert(target).ok()
+}
+
 fn empty_read_fetch(
     link: &crate::server::record::ParsedLink,
 ) -> crate::server::recgbl::simm::LinkFetch {
     use crate::server::recgbl::simm::LinkFetch;
-    if crate::server::recgbl::simm::is_constant(link) {
+    if crate::server::recgbl::simm::has_const_lset(link) {
         LinkFetch::NoData
     } else {
         LinkFetch::Failed
@@ -85,14 +121,23 @@ fn empty_read_fetch(
 /// against its `char s[40]`). The bytes stop at the first NUL, which is where the
 /// C string ends; a scalar `CHAR` source contributes its single byte, exactly as
 /// C's `n_elements == 1` read does.
+///
+/// Any other source is `dbGet`'s `DBR_CHAR` conversion of it (`cvt_l_c`,
+/// `cvt_st_c`, ...: one element of a scalar, a string parsed), and a refused
+/// conversion is a failed read.
 fn char_bytes_as_string(value: &EpicsValue, max_elements: usize) -> Option<PvString> {
+    let converted;
     let bytes: &[u8] = match value {
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => b,
         EpicsValue::Char(b) | EpicsValue::UChar(b) => std::slice::from_ref(b),
-        // Not a char-class source after all (the metadata said it was): C would
-        // have copied raw bytes of whatever it found. There is no faithful
-        // rendering, so deliver nothing — the caller treats it as a failed read.
-        _ => return None,
+        other => {
+            converted = other.get_convert(DbFieldType::Char).ok()?;
+            match &converted {
+                EpicsValue::Char(b) => std::slice::from_ref(b),
+                EpicsValue::CharArray(b) => b,
+                _ => return None,
+            }
+        }
     };
     let n = bytes.len().min(max_elements);
     let text = &bytes[..n];
@@ -155,12 +200,55 @@ pub(crate) const LNK_LINK_FIELDS: [&str; 16] = [
     "LNKC", "LNKD", "LNKE", "LNKF",
 ];
 
+const SELL: &[&str] = &["SELL"];
+
+/// Every link a cycle reads through [`RecordInstance::record_link`], by
+/// record type. A field with no slot would read as no link, so the load
+/// refuses it ([`check_record_links`]) and the cycle keeps no check.
+const RECORD_LINK_USES: &[(&str, &[&[&str]])] = &[
+    ("fanout", &[&LNK_LINK_FIELDS, SELL]),
+    ("dfanout", &[&DFANOUT_LINK_FIELDS, SELL]),
+    ("seq", &[&DOL_LINK_FIELDS, &LNK_LINK_FIELDS, SELL]),
+];
+
+/// Refuse a record whose type reads a field through `record_link` that is
+/// not one of its slotted links, naming the field.
+pub(super) fn check_record_links(instance: &RecordInstance) -> crate::error::CaResult<()> {
+    check_record_links_in(instance, RECORD_LINK_USES)
+}
+
+fn check_record_links_in(
+    instance: &RecordInstance,
+    uses: &[(&str, &[&[&str]])],
+) -> crate::error::CaResult<()> {
+    let rtype = instance.record.record_type();
+    let fields = uses
+        .iter()
+        .filter(|(t, _)| *t == rtype)
+        .flat_map(|(_, f)| f.iter().copied().flatten());
+    for field in fields {
+        if !instance.has_link_slot(field) {
+            return Err(crate::error::CaError::DbLoadFailed(format!(
+                "{}: {rtype}.{field} is read as a link but is not a link the type declares",
+                instance.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// seq desired-output link fields, index-aligned with `MultiOut::Seq`
 /// (`seqRecord.c:86` — DOL0..DOLF). The names C's `dbLinkFieldName` yields
 /// for the `setLinkAlarm` AMSG of a failed group read.
 pub(crate) const DOL_LINK_FIELDS: [&str; 16] = [
     "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9", "DOLA", "DOLB",
     "DOLC", "DOLD", "DOLE", "DOLF",
+];
+
+/// seq DOn value-storage fields (`linkGrp.dov`), index-aligned with DOLn.
+const SEQ_DO_FIELDS: [&str; 16] = [
+    "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB", "DOC",
+    "DOD", "DOE", "DOF",
 ];
 
 /// Alarm state from a link source, used for MS/NMS propagation.
@@ -210,6 +298,11 @@ impl SourceId {
     pub(crate) fn of(rec: &RecordCell) -> Self {
         SourceId(std::ptr::from_ref(rec) as usize)
     }
+
+    /// The frame's own record. Identity only: nothing is read through it.
+    pub(crate) fn of_frame(frame: InFrame<'_>) -> Self {
+        Self::of(frame.unframed())
+    }
 }
 
 impl std::fmt::Debug for SourceAlarm {
@@ -227,7 +320,7 @@ impl SourceAlarm {
     /// The committed alarm of a LOCAL source record, read off the cell the
     /// value was just read from.
     /// `alarm` is the source's committed alarm as read under the SAME lock
-    /// hold that produced the value ([`PvDatabase::read_target`]), so the
+    /// hold that produced the value ([`PvDatabase::read_db_target`]), so the
     /// pair is one snapshot of the source and costs the target one lock.
     pub(crate) fn local(record: SourceId, alarm: LinkAlarm) -> Self {
         Self {
@@ -255,11 +348,8 @@ impl LinkAlarm {
     /// the committed `stat`/`sevr` here would carry the PREVIOUS cycle's
     /// severity to every MS-class target.
     ///
-    /// EVERY OUT-link put site uses this: the record's own OUT, the generic
-    /// multi-output pairs, the fanout/dfanout/seq dispatch, the `WriteDbLink`
-    /// / `WriteDbLinkNotify` process actions, and sseq's `put_link_notify`
-    /// (sseqRecord.c: `dbPutLink` in `processCallback`, `recGblResetAlarms` in
-    /// `asyncFinish` — the puts still precede the commit).
+    /// Read at each put, after the put itself, as C does: an earlier link's
+    /// failure in the same cycle has already raised the source's LINK_ALARM.
     pub(crate) fn pending(common: &crate::server::record::CommonFields) -> Self {
         LinkAlarm {
             stat: common.nsta,
@@ -295,7 +385,7 @@ impl LinkAlarm {
 ///
 /// Shared by the INPUT-link read path (`processing.rs`, where `dest` is
 /// the record reading its inputs) and the DB OUT-link write path
-/// (`write_db_link_value`, C `dbDbPutValue` →
+/// (`write_db_link_value_in`, C `dbDbPutValue` →
 /// `recGblInheritSevrMsg`, dbDbLink.c:382-383, where `dest` is the
 /// OUT-link target). One implementation keeps the two sides from
 /// diverging — an earlier INPUT-side variant wrongly treated MS like
@@ -329,9 +419,6 @@ pub(crate) fn inherit_sevr_msg(
 ///
 /// * `putf` / `notify` — the PUTF bit and put-notify wait-set that C
 ///   `processTarget` carries to each target (dbDbLink.c:460-474).
-/// * `alarm` — the PENDING alarm that C `recGblInheritSevrMsg` folds
-///   into the dest per the link's MS-class switch (dbDbLink.c:382-383
-///   reads `psrce->nsta`/`nsev`/`namsg`, before the source commits them).
 /// * `field` — the source's link FIELD name (`OUT`, `SIOL`, `OUTA`, …),
 ///   which C `setLinkAlarm` puts in the source's alarm message on a failed
 ///   put (`dbLink.c:319-323`: `"field %s", dbLinkFieldName(plink)`).
@@ -344,8 +431,162 @@ pub(crate) fn inherit_sevr_msg(
 pub(crate) struct OutLinkSrc<'a> {
     pub putf: bool,
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
-    pub alarm: &'a LinkAlarm,
-    pub field: &'a str,
+    pub field: &'static str,
+}
+
+impl OutLinkSrc<'_> {
+    /// The link this put leaves through, which keys its external staging.
+    /// Built only on the external arm, so a DB write pays nothing for it.
+    fn link_id(&self, src_rec: Option<InFrame<'_>>) -> super::LinkId {
+        match src_rec {
+            Some(f) => super::LinkId {
+                rec: f.unframed().index(),
+                field: self.field,
+                install: super::LinkInstall::of_field(&f.read(), self.field),
+            },
+            None => super::LinkId {
+                rec: None,
+                field: self.field,
+                install: super::LinkInstall::Detached,
+            },
+        }
+    }
+}
+
+/// A frame's OUT-link write, captured from the link's cache before the frame
+/// releases its guard: the lent target when the cache holds one at the
+/// current name revision, else the link. [`Self::capture`] is the only way
+/// to a lent target, so the frame never dereferences a stale one.
+pub(crate) struct OutLinkWrite(OutWrite);
+
+enum OutWrite {
+    Lent(LentOut),
+    Link(Arc<crate::server::record::ParsedLink>),
+}
+
+/// C `dbDbPutValue`'s `dbAddr`, with what the parse settled about it.
+struct LentOut {
+    target: crate::server::record::record_instance::OutTarget,
+    field: &'static crate::server::record::FieldDesc,
+    acts: TargetActs,
+}
+
+/// What a DB link's parse settled about acting on its local target after
+/// the put: C `dbDbPutValue`'s `processTarget` gate and the MS inherit.
+#[derive(Clone, Copy)]
+struct TargetActs {
+    gate: Option<ProcessTargetGate>,
+    switch: crate::server::record::MonitorSwitch,
+}
+
+impl OutLinkWrite {
+    /// The write of the cycle's OUT `value`, if it has one. In the frame
+    /// holding `held`, the set of the record whose OUT `cache` is, under
+    /// that record's write guard: the only place the target is set, since
+    /// after `guard.release()` the cache could be reached only by taking
+    /// the guard again.
+    #[inline(always)]
+    pub(crate) fn capture<V>(
+        value: Option<V>,
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
+        db: &PvDatabase,
+        held: &super::SetGuard,
+    ) -> Option<(Self, V)> {
+        let value = value?;
+        Some((Self::of(cache, db, held), value))
+    }
+
+    #[inline(always)]
+    fn of(
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
+        db: &PvDatabase,
+        held: &super::SetGuard,
+    ) -> Self {
+        use crate::server::record::record_instance::LinkTargetResolver;
+        let target = match cache.out_target() {
+            Some(target) if target.revision() == db.name_revision() => target,
+            _ => match Self::refresh(cache, db, held) {
+                Some(target) => target,
+                None => return Self(OutWrite::Link(Arc::clone(cache.shared()))),
+            },
+        };
+        match target.put().field().desc {
+            Some(field) => Self(OutWrite::Lent(LentOut {
+                target,
+                field,
+                acts: TargetActs {
+                    gate: cache.process_gate(),
+                    switch: cache.monitor_switch(),
+                },
+            })),
+            None => Self(OutWrite::Link(Arc::clone(cache.shared()))),
+        }
+    }
+
+    /// The cache's target at the current name revision, lent as the put
+    /// would lend it (`DbLink::lend_out_addr`), or none for a link with no
+    /// settled local answer; a stale target never survives it.
+    #[cold]
+    #[inline(never)]
+    fn refresh(
+        cache: &mut crate::server::record::record_instance::OutLinkCache,
+        db: &PvDatabase,
+        held: &super::SetGuard,
+    ) -> Option<crate::server::record::record_instance::OutTarget> {
+        use crate::server::record::record_instance::{LinkTargetResolver, OutTarget};
+        let revision = db.name_revision();
+        let target = match &**cache.shared() {
+            crate::server::record::ParsedLink::Db(link) => link
+                .lend_out_addr(held, revision, || db.resolve_db_link(link))
+                .map(|at| OutTarget::new(&at.rec, at.put, revision)),
+            _ => None,
+        };
+        cache.set_out_target(target);
+        target
+    }
+}
+
+/// What [`PvDatabase::write_db_link_value_in`] leaves once the link's
+/// address is gone: everything owned, so nothing borrowed from the link or
+/// the lend outlives the put.
+pub(crate) struct DbLinkWrite {
+    /// The local target, kept only when the special's link writes, an
+    /// inherit or `processTarget` still act on it.
+    target: Option<Arc<crate::server::record::RecordCell>>,
+    switch: crate::server::record::MonitorSwitch,
+    gate: Option<ProcessTargetGate>,
+    failed: bool,
+}
+
+impl DbLinkWrite {
+    /// A write that reached no local record: the external route's.
+    fn untargeted(failed: bool) -> Self {
+        Self {
+            target: None,
+            switch: crate::server::record::MonitorSwitch::NoMaximize,
+            gate: None,
+            failed,
+        }
+    }
+}
+
+/// The special's link writes and the rest of its `dbPut`, with the put's
+/// report owed after them. A caller-owned slot that only a special with
+/// link writes fills: returned by value, its ~440 bytes were copied on
+/// every write.
+pub(crate) struct LinkStage {
+    stage: (
+        super::field_io::LinkActions,
+        super::field_io::LinkTail<'static>,
+    ),
+    report: Option<(super::field_io::PutTail, std::borrow::Cow<'static, str>)>,
+}
+
+/// What a DB link's `dbPut` leaves its caller to finish: the special's
+/// stage, and the chain that put and its link writes run on.
+pub(crate) struct LinkWriteOut<'a> {
+    staged: &'a mut Option<LinkStage>,
+    visited: &'a mut ProcStack,
 }
 
 /// Which of C's two gates a `processTarget` call is coming through — the two
@@ -369,6 +610,20 @@ pub(crate) enum ProcessTargetGate {
 }
 
 impl ProcessTargetGate {
+    /// C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when the
+    /// destination field is `.PROC` **or** the link carries `pvlOptPP` and
+    /// the target is Passive: two gates, not one — the `.PROC` arm is
+    /// independent of both the PP flag and the target's SCAN (R18-94).
+    pub(crate) fn of_put(link: &crate::server::record::DbLink) -> Option<Self> {
+        if link.target().field == "PROC" {
+            Some(Self::ProcField)
+        } else if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
+            Some(Self::ScanPassive)
+        } else {
+            None
+        }
+    }
+
     /// Does a target with this SCAN reach `processTarget` through this gate?
     fn admits(self, target_scan: ScanType) -> bool {
         match self {
@@ -378,13 +633,15 @@ impl ProcessTargetGate {
     }
 }
 
-/// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
+/// One selected `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
 #[derive(Clone, Debug)]
 pub(crate) struct SeqGroup {
-    /// DOLn input link string (empty when unset).
-    pub dol: String,
-    /// LNKn output link string (empty when unset).
-    pub lnk: String,
+    /// The group's index, 0..F.
+    pub idx: usize,
+    /// DOLn's parse, from the record's link cache.
+    pub dol: Arc<crate::server::record::ParsedLink>,
+    /// LNKn's parse, from the record's link cache.
+    pub lnk: Arc<crate::server::record::ParsedLink>,
     /// DLYn per-group delay in seconds.
     pub dly: f64,
     /// DOn value-storage field (`linkGrp.dov`) — used when DOLn is
@@ -401,22 +658,80 @@ pub(crate) struct SeqGroup {
 /// PACT machine (C `sseqRecord.c::processCallback`) — not via this
 /// all-at-once dispatch.
 pub(crate) enum MultiOut {
-    /// fanout — 16 forward-link strings (LNK0..LNKF).
-    Fanout(Vec<String>),
-    /// dfanout — 16 output-link strings (OUTA..OUTP).
-    Dfanout(Vec<String>),
-    /// seq — 16 link groups (0..F).
+    /// fanout — each selected forward link (LNK0..LNKF) is read where it is
+    /// dispatched, as `fanoutRecord.c` hands `&prec->lnk0 + i` to
+    /// `dbScanFwdLink`.
+    Fanout,
+    /// dfanout — the parse of each selected output link (OUTA..OUTP).
+    Dfanout(SelectedLinks),
+    /// seq — the selected link groups, in selection order.
     Seq(Vec<SeqGroup>),
 }
+
+/// The cached parse of each link a SELM selection picked, by link index; the
+/// rest stay `None`, so the cycle reads no link it does not drive.
+pub(crate) type SelectedLinks = [Option<Arc<crate::server::record::ParsedLink>>; 16];
 
 impl MultiOut {
     /// Number of link slots — the `count` passed to the SELM selector.
     fn len(&self) -> usize {
         match self {
-            MultiOut::Fanout(v) => v.len(),
+            MultiOut::Fanout => LNK_LINK_FIELDS.len(),
             MultiOut::Dfanout(v) => v.len(),
-            MultiOut::Seq(v) => v.len(),
+            MultiOut::Seq(_) => LNK_LINK_FIELDS.len(),
         }
+    }
+}
+
+/// The parse of each output-row link that `indices` selects
+/// ([`RecordInstance::out_row_link`]).
+fn selected_links(instance: &RecordInstance, sel: SelmResult) -> SelectedLinks {
+    let mut links: SelectedLinks = Default::default();
+    for i in sel.indices() {
+        links[i] = Some(instance.out_row_link(i).clone());
+    }
+    links
+}
+
+/// `rec`'s forward links, by field.
+fn forward_links(
+    rec: &crate::server::record::RecordCell,
+) -> Vec<(&'static str, Arc<crate::server::record::ParsedLink>)> {
+    let inst = rec.read();
+    crate::server::record::declared_fields(inst.record.record_type())
+        .filter(|desc| {
+            crate::types::link_class_of(desc) == Some(crate::types::DbfLinkClass::FwdLink)
+        })
+        .filter_map(|desc| Some((desc.name, inst.stored_link_shared(desc.name)?.clone())))
+        .collect()
+}
+
+/// `dbInitLink`'s warning for a CA forward link that will never forward
+/// (`dbLink.c:137-142`); the runtime `dbAddLink` sets the flag silently.
+fn warn_ca_forward_without_proc(name: &[u8], field: &str, ca: &crate::server::record::CaLink) {
+    if !ca.fwd {
+        let name = String::from_utf8_lossy(name);
+        crate::runtime::log::errlog_vprintf(format_args!(
+            "{}: Forward-link uses Channel Access without pointing to PROC field\n    {name}.{field} => {}\n",
+            crate::runtime::log::erl_warning(),
+            ca.pv
+        ));
+    }
+}
+
+/// The sixteen-link rows [`PvDatabase::dispatch_multi_output`] reads by
+/// index, by record type: the output row, and seq's `DOLn` row.
+pub(crate) fn multi_out_rows(
+    record_type: &str,
+) -> (
+    Option<&'static [&'static str; 16]>,
+    Option<&'static [&'static str; 16]>,
+) {
+    match record_type {
+        "fanout" => (Some(&LNK_LINK_FIELDS), None),
+        "dfanout" => (Some(&DFANOUT_LINK_FIELDS), None),
+        "seq" => (Some(&LNK_LINK_FIELDS), Some(&DOL_LINK_FIELDS)),
+        _ => (None, None),
     }
 }
 
@@ -472,44 +787,6 @@ pub(crate) fn resolves_subroutine_from_link(record_type: &str) -> bool {
     record_type == "aSub"
 }
 
-/// Which phase of a process cycle a multi-output record's links belong to.
-///
-/// The phase follows from what the links ARE, not from the record's name:
-///
-/// * A record whose links carry a VALUE (`dbPutLink`) — dfanout `OUTn`
-///   (`dfanoutRecord.c:323`), seq `LNKn` (`seqRecord.c:264`) — dispatches
-///   PRE-commit, because C issues those puts from inside `process()` /
-///   `processCallback`, before `recGblResetAlarms` commits the cycle
-///   (dfanout: `monitor()`, seq: `asyncFinish`, seqRecord.c:227). A failed
-///   put's `LINK_ALARM`/`INVALID` and a `SELN`-out-of-range
-///   `SOFT_ALARM`/`INVALID` must therefore land in the alarm THIS cycle
-///   commits and posts.
-/// * A record whose links only SCAN a target — fanout `LNK0..LNKF` are
-///   `DBF_FWDLINK` (`fanoutRecord.dbd`), dispatched via `dbScanFwdLink`
-///   (`fanoutRecord.c:110/121/138`) — dispatches in the post-commit
-///   forward-link tail: no value, no put status, no alarm to fold.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultiOutPhaseKind {
-    Output,
-    ForwardLink,
-}
-
-/// The phase argument of [`PvDatabase::dispatch_multi_output`]. The `Output`
-/// variant carries `skip_out` — the IVOA=Don't_drive veto as decided by the
-/// cycle's single IVOA owner (`process_record_with_links_inner`), on the
-/// severity `checkAlarms` produced. That is the one decision C makes
-/// (`dfanoutRecord.c:128`: `if (prec->nsev < INVALID_ALARM) push_values();
-/// else switch (ivoa)`), taken before ANY output runs; the IVOA=IVOV arm has
-/// already stored IVOV in the record's own value field
-/// ([`Record::apply_invalid_output_value`](crate::server::record::Record::apply_invalid_output_value) — C `prec->val = prec->ivov`,
-/// dfanoutRecord.c:137), so the push here just reads VAL, as C's `push_values`
-/// does.
-#[derive(Clone, Copy)]
-pub(crate) enum MultiOutPhase {
-    Output { skip_out: bool },
-    ForwardLink,
-}
-
 /// Where in the cycle a caller of [`PvDatabase::read_sell_into_seln`] sits.
 /// Each SELL-owning record answers to exactly one of these — see that
 /// function for the per-record C line.
@@ -548,18 +825,6 @@ impl MultiOutDispatch {
     }
 }
 
-/// The phase a record type's multi-output links belong to — see
-/// [`MultiOutPhaseKind`]. Both call sites (the pre-commit output stage and
-/// the forward-link tail) run `dispatch_multi_output` unconditionally and
-/// this single classifier decides which types act, so a record cannot be
-/// dispatched in both phases or in neither.
-pub(crate) fn multi_out_phase_of(record_type: &str) -> MultiOutPhaseKind {
-    match record_type {
-        "dfanout" | "seq" => MultiOutPhaseKind::Output,
-        _ => MultiOutPhaseKind::ForwardLink,
-    }
-}
-
 /// **The one answer to "is this link target a record in this IOC?"** — the
 /// locality question C's `dbInitLink` asks once (`dbLink.c:118-130`), together
 /// with the handle that answer implies, taken in the SAME lookup.
@@ -569,27 +834,18 @@ pub(crate) fn multi_out_phase_of(record_type: &str) -> MultiOutPhaseKind {
 /// calls, so a record removed in the gap reads local on the first and `None`
 /// on the second. The three-way result below is what that pair was spelling
 /// out, with the record already in hand.
-/// What [`PvDatabase::read_target`] found behind a link target.
+/// What [`PvDatabase::read_db_target`] found behind a link target.
 enum TargetValue {
     /// A local record, its field as a reader sees it, the cell it came from,
-    /// and the alarm the record held under the same lock hold — so a caller
-    /// that wants the source's committed alarm neither looks the record up
-    /// nor locks it a second time.
-    Record(Option<EpicsValue>, SourceId, LinkAlarm),
+    /// and — for a link that inherits it — the alarm the record held under
+    /// the same lock hold, so a caller that wants the source's committed
+    /// alarm neither looks the record up nor locks it a second time.
+    Record(Option<EpicsValue>, SourceId, Option<LinkAlarm>),
     /// Local, but no record answers: a simple PV under the target's full
     /// `record[.FIELD]` name, or nothing readable at all.
     NoRecord(Option<EpicsValue>),
     /// Not served here. C `dbInitLink` makes it a CA link; the caller names it.
     External,
-}
-
-/// What [`PvDatabase::read_field_of`] found at a resolved address.
-enum FieldRead {
-    /// A simple PV registered under the field's own spelling shadows it.
-    Shadow(EpicsValue),
-    /// The record's field — `None` when it resolves but does not read — and
-    /// the record's committed alarm.
-    Field(Option<EpicsValue>, LinkAlarm),
 }
 
 pub(super) enum LinkTarget {
@@ -603,18 +859,127 @@ pub(super) enum LinkTarget {
     External,
 }
 
+/// The render a string read of `field` takes. Cold: only a `DBR_STRING`
+/// read of a non-string field asks for it, and inlined into the read path
+/// it cost every numeric link read.
+#[cold]
+#[inline(never)]
+fn link_source_render(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+    v: &EpicsValue,
+) -> crate::server::record::record_instance::SourceRender {
+    instance.source_render_of(field, v)
+}
+
 impl PvDatabase {
     /// See [`LinkTarget`]. The records map is asked FIRST — a link target is
     /// overwhelmingly a record, and only the miss then pays the `simple_pvs`
     /// mutex `has_name_no_resolve` takes on every call.
-    pub(super) fn link_target(&self, record: &str) -> LinkTarget {
+    pub(super) fn link_target(&self, record: &[u8]) -> LinkTarget {
         if let Some(rec) = self.get_record(record) {
             return LinkTarget::Local(rec);
         }
+        // A record was answered above.
         if self.has_name_no_resolve(record) {
             return LinkTarget::LocalNotRecord;
         }
         LinkTarget::External
+    }
+
+    /// C's `dbAddr` for `db`: resolved by name once per name-map revision
+    /// and held in the link's `addr` cell ([`DbLink`](crate::server::record::DbLink)), so the cycle's read
+    /// hashes no name. `None` for a target that is not a local record.
+    pub(crate) fn db_link_addr(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::record::record_instance::ResolvedTarget> {
+        match self.db_link_answer(db) {
+            crate::server::record::DbLinkAnswer::Local(at) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// [`Self::db_link_addr`] with the non-local answers kept: a shadowing
+    /// simple PV is settled once per revision like an address, so its read
+    /// takes no `simple_pvs` lock and builds no name.
+    pub(crate) fn db_link_answer(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> crate::server::record::DbLinkAnswer {
+        use crate::server::record::record_instance::LinkTargetResolver;
+        db.answer(self.name_revision(), || self.resolve_db_link(db))
+    }
+
+    /// [`Self::db_link_addr`] for the reader's own `INP`, lent with the link
+    /// for as long as the reader is held: no lock and no refcount on a hit.
+    /// The hit is two loads, so it is taken in the caller's frame.
+    ///
+    /// The reader is taken `&mut`: a miss publishes outside the cell's `lent`
+    /// lock, which is sound only while no other borrow of the reader can
+    /// reach the same cell.
+    #[inline(always)]
+    pub(crate) fn inp_addr<'g>(
+        &self,
+        instance: &'g mut crate::server::record::RecordInstance,
+    ) -> Option<(
+        &'g crate::server::record::ParsedLink,
+        &'g crate::server::record::record_instance::ResolvedTarget,
+    )> {
+        use crate::server::record::record_instance::LinkTargetResolver;
+        instance.lend_inp_addr(self.name_revision(), |db| self.resolve_db_link(db))
+    }
+
+    fn resolve_db_link(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> crate::server::record::DbLinkAnswer {
+        use crate::server::record::DbLinkAnswer;
+        // A simple PV spelling the target shadows it, as in `put_pv` and
+        // `get_pv`.
+        if let Some(pv) = self.shadowing_pv(db) {
+            return DbLinkAnswer::Shadowed(pv);
+        }
+        let Some((name, rec)) = self.lookup_record(&db.target().record) else {
+            return if self.has_name_no_resolve(&db.target().record) {
+                DbLinkAnswer::Absent
+            } else {
+                DbLinkAnswer::External
+            };
+        };
+        if !self.names_field(&rec, db.field_as_written()) {
+            return DbLinkAnswer::Absent;
+        }
+        use crate::server::record::record_instance::PutAddr;
+        let field = &db.target().field;
+        let put = if db.target().string_view {
+            match PutAddr::resolve_chars_in(&rec, field) {
+                Some(put) => put,
+                None => return DbLinkAnswer::Absent,
+            }
+        } else {
+            PutAddr::resolve_in(&rec, field)
+        };
+        DbLinkAnswer::Local(crate::server::record::record_instance::ResolvedTarget {
+            f64_slot: (db.target_is_val() && db.target().json_suffix.is_none())
+                .then(|| super::field_io::double_slot(put.field()))
+                .flatten(),
+            rec,
+            name,
+            put,
+        })
+    }
+
+    /// [`Self::link_target`] for a DB link, through its cached answer.
+    fn db_link_target(&self, db: &crate::server::record::DbLink) -> LinkTarget {
+        use crate::server::record::DbLinkAnswer;
+        match self.db_link_answer(db) {
+            DbLinkAnswer::Local(at) => LinkTarget::Local(at.rec),
+            DbLinkAnswer::External => LinkTarget::External,
+            DbLinkAnswer::Shadowed(_) | DbLinkAnswer::Absent => {
+                self.link_target(&db.target().record)
+            }
+        }
     }
 
     /// **One resolution per link-target read**, and the record handle it
@@ -637,66 +1002,147 @@ impl PvDatabase {
     /// The external arm is left to the CALLER, which alone knows the name to
     /// use: an external read keeps the channel filter (C hands `dbCaAddLink`
     /// the verbatim `pv_link.pvname`) and the local name never has it.
-    fn read_target(&self, record: &str, field: &str) -> TargetValue {
-        let rec = match self.link_target(record) {
-            LinkTarget::Local(rec) => rec,
+    fn read_db_target(&self, db: &crate::server::record::DbLink) -> TargetValue {
+        use crate::server::record::DbLinkAnswer;
+        match self.db_link_answer(db) {
+            DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
+            DbLinkAnswer::Shadowed(pv) => TargetValue::NoRecord(Some(pv.get())),
+            DbLinkAnswer::Absent => self.read_db_target_by_name(db),
+            DbLinkAnswer::External => TargetValue::External,
+        }
+    }
+
+    /// [`Self::read_db_target`] for a target the cache does not hold.
+    fn read_db_target_by_name(&self, db: &crate::server::record::DbLink) -> TargetValue {
+        use crate::server::record::DbLinkAnswer;
+        let target = db.target();
+        match self.link_target(target.record.as_bytes()) {
+            // The record was added after the answer settled `Absent`, so the
+            // revision moved: read through the re-resolved answer, once. A
+            // target gone again by then has nothing readable this cycle.
+            LinkTarget::Local(_) => match self.db_link_answer(db) {
+                DbLinkAnswer::Local(at) => self.target_value_of(&at.rec, db, at.put.field()),
+                DbLinkAnswer::Shadowed(pv) => TargetValue::NoRecord(Some(pv.get())),
+                DbLinkAnswer::Absent | DbLinkAnswer::External => TargetValue::NoRecord(None),
+            },
             // A simple PV under the target's own name — the value `get_pv`
             // answers with before it ever reaches a record.
             LinkTarget::LocalNotRecord => {
-                return TargetValue::NoRecord(self.get_pv(&local_name(record, field)).ok());
+                TargetValue::NoRecord(self.get_pv(local_name(&target.record, &target.field)).ok())
             }
-            LinkTarget::External => return TargetValue::External,
-        };
-        let addr = crate::server::record::record_instance::FieldAddr::resolve(rec.rdes(), field);
-        self.read_target_at(&rec, record, field, addr)
-    }
-
-    /// [`Self::read_target`] once the name HAS resolved to `rec` — the read a
-    /// cached handle ([`ParsedInputLink::target`](crate::server::record::record_instance::ParsedInputLink::target)) skips straight
-    /// to, C's `dbDbGetValue` through a `dbAddr`.
-    fn read_target_at(
-        &self,
-        rec: &RecordCell,
-        record: &str,
-        field: &str,
-        addr: crate::server::record::record_instance::FieldAddr,
-    ) -> TargetValue {
-        match self.read_field_of(rec, record, field, addr) {
-            FieldRead::Shadow(value) => TargetValue::NoRecord(Some(value)),
-            FieldRead::Field(value, alarm) => TargetValue::Record(value, SourceId::of(rec), alarm),
+            LinkTarget::External => TargetValue::External,
         }
     }
 
-    /// The read itself: `rec`'s field at `addr`, with the alarm the record
-    /// held under the same lock hold — or the simple PV that shadows the
-    /// spelling. The one frame both [`Self::read_target_at`] and the cached
-    /// link read go through, each packing the answer for its own caller.
-    #[inline]
+    #[inline(always)]
+    fn target_value_of(
+        &self,
+        rec: &RecordCell,
+        db: &crate::server::record::DbLink,
+        addr: crate::server::record::record_instance::FieldAddr,
+    ) -> TargetValue {
+        let (value, alarm) = self.read_field_of(rec, db, addr);
+        TargetValue::Record(value, SourceId::of(rec), alarm)
+    }
+
+    /// The read through a cached target, packed as the caller consumes it:
+    /// the filtered value and, for an inheriting link, the source's alarm.
+    /// Both [`Self::read_link_value_and_alarm`]'s hit and
+    /// [`Self::read_db_link_at`] are this, so the two cannot disagree.
+    /// `held` is the reader's set, which a target merged into it rides.
+    /// `render` asks for the [`SourceRender`] a `DBR_STRING` conversion of the
+    /// value needs, taken under this same hold.
+    ///
+    /// [`SourceRender`]: crate::server::record::record_instance::SourceRender
+    #[inline(always)]
+    fn read_db_at(
+        &self,
+        held: Option<&crate::server::database::SetGuard>,
+        db: &crate::server::record::DbLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        render_requested: bool,
+    ) -> RenderedRead {
+        // A shadowed target has no address (`resolve_db_link`).
+        let target = db.target();
+        // Built in the shape it is returned in, and filtered in place: each
+        // repack of the value on the way up is a copy the optimiser keeps —
+        // which is also why a `$` address does not return early, and hands
+        // its hold to the cold build instead.
+        let instance = match held {
+            Some(set) => at.rec.read_in(set),
+            None => at.rec.read(),
+        };
+        let mut value;
+        let alarm;
+        let render;
+        if at.put.field().char_view() {
+            alarm = db_link_alarm(db, at, &instance);
+            value = char_image_after_hold(instance, &target.field);
+            render = None;
+        } else {
+            value = self.read_field_at(&instance, &target.field, at.put.field());
+            alarm = db_link_alarm(db, at, &instance);
+            // A `$` source is a `DBF_CHAR` array, which renders with nothing
+            // of the record's; a string renders as itself.
+            render = match &value {
+                Some(v)
+                    if render_requested
+                        && !target.string_view
+                        && !matches!(v, EpicsValue::String(_) | EpicsValue::StringArray(_)) =>
+                {
+                    Some(link_source_render(&instance, &target.field, v))
+                }
+                _ => None,
+            };
+            drop(instance);
+        }
+        if let Some(suffix) = target.json_suffix.as_deref() {
+            value = value.map(|v| filter_read(suffix, v));
+        }
+        (value, alarm, render)
+    }
+
+    /// The read itself: `rec`'s field at `addr` — `None` when it resolves but
+    /// does not read — with the alarm the record held under the same lock
+    /// hold.
+    ///
+    /// The alarm is taken only for an `MS`/`MSS`/`MSI` link: C's
+    /// `recGblInheritSevrMsg(pvlOptNMS)` is a `break`, so an NMS read has no
+    /// use for it.
+    #[inline(always)]
     fn read_field_of(
         &self,
         rec: &RecordCell,
-        record: &str,
-        field: &str,
+        db: &crate::server::record::DbLink,
         addr: crate::server::record::record_instance::FieldAddr,
-    ) -> FieldRead {
-        // `get_pv`'s own first question, and NOT redundant with the records
-        // map: `check_name_free` keeps the three namespaces disjoint, so a
-        // name the map just answered cannot also be a simple PV — but a
-        // simple PV may be registered under a name that SPELLS this record's
-        // field (`REC.FLD`), and that one shadows the field read. Which is
-        // why the `VAL` spelling, where the two names are the same string,
-        // needs no `simple_pvs` lock at all.
-        if field != "VAL" {
-            let pv_name = local_name(record, field);
-            if let Some(pv) = self.inner.simple_pvs.lock().get(&pv_name).cloned() {
-                return FieldRead::Shadow(pv.get());
-            }
-        }
+    ) -> (Option<EpicsValue>, Option<LinkAlarm>) {
         let instance = rec.read();
-        FieldRead::Field(
-            self.read_field_at(&instance, field, addr),
-            LinkAlarm::committed(&instance.common),
-        )
+        let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
+            .then(|| LinkAlarm::committed(&instance.common));
+        let value = if addr.char_view() {
+            char_image_after_hold(instance, &db.target().field)
+        } else {
+            self.read_field_at(&instance, &db.target().field, addr)
+        };
+        (value, alarm)
+    }
+
+    /// `get_pv`'s own first question, and NOT redundant with the records
+    /// map: `check_name_free` keeps the three namespaces disjoint, so a name
+    /// the map answers cannot also be a simple PV — but a simple PV may be
+    /// registered under a name that SPELLS a record's field (`REC.FLD`), and
+    /// that one shadows the field. The `VAL` spelling, where the two names
+    /// are the same string, cannot. Asked once per name revision, by
+    /// [`Self::resolve_db_link`].
+    fn shadowing_pv(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> Option<Arc<crate::server::pv::ProcessVariable>> {
+        if db.target_is_val() {
+            return None;
+        }
+        let target = db.target();
+        self.simple_pv_bytes(&local_name(&target.record, &target.field))
     }
 
     /// Read a `Db`-variant link's value honoring C `dbInitLink`'s
@@ -720,18 +1166,62 @@ impl PvDatabase {
     /// read routes through the lset's lazy-open path: the first read
     /// opens the CA link and returns `None` until the monitor connects,
     /// then serves the cached value — exactly C `dbCaGetLink`.
+    /// C `dbGetLink(link, read_as, ...)` from inside `init_record`. A CA link
+    /// is not connected yet at init, nor is a DB link to a name no record
+    /// here serves (`dbInitLink` made it CA); every other link reads as it
+    /// would in a cycle.
+    pub(super) fn read_link_at_init(
+        &self,
+        reader: SourceId,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> crate::server::record::InitRead {
+        use crate::server::recgbl::simm::LinkFetch;
+        use crate::server::record::{InitGetFailure, InitRead, ParsedLink};
+        let failed = |failure| InitRead {
+            fetch: LinkFetch::Failed,
+            inherit: None,
+            failure,
+        };
+        match link {
+            _ if crate::server::recgbl::simm::has_no_lset(link) => failed(InitGetFailure::NoLset),
+            ParsedLink::Ca(_) | ParsedLink::Pva(_) | ParsedLink::PvaJson(_) => {
+                failed(if self.get_failure_disconn(link) {
+                    InitGetFailure::Disconn
+                } else {
+                    InitGetFailure::LinkAlarm
+                })
+            }
+            ParsedLink::Db(db)
+                if matches!(self.link_target(&db.target().record), LinkTarget::External) =>
+            {
+                failed(InitGetFailure::LinkAlarm)
+            }
+            _ => {
+                let (fetch, alarm) =
+                    self.read_link_value_as_with_alarm(None, link, read_as, &mut ProcStack::new());
+                InitRead {
+                    fetch,
+                    inherit: alarm.and_then(|alarm| self.inherit_source_alarm(reader, link, alarm)),
+                    failure: InitGetFailure::LinkAlarm,
+                }
+            }
+        }
+    }
+
     fn read_db_link_value(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
         let target = db.target();
-        let Some(suffix) = target.json_suffix.as_deref() else {
-            return self.read_target_value(&target.record, &target.field);
-        };
         // A filtered target that is NOT local stays whole: C hands
         // `pv_link.pvname` to `dbCaAddLink` filter and all
         // (`dbLink.c:128`), and the far end's `dbChannelCreate` builds the
         // chain. Applying it here as well would filter twice.
-        if !self.has_name_no_resolve(&target.record) {
-            return self.resolve_external_pv(&db.pvname());
-        }
+        let value = match self.read_db_target(db) {
+            TargetValue::Record(value, ..) | TargetValue::NoRecord(value) => value,
+            TargetValue::External => return self.resolve_external_pv(db.external()),
+        };
+        let Some(suffix) = target.json_suffix.as_deref() else {
+            return value;
+        };
         // Local: C `dbDbGetValue` takes the "filter, array, or special"
         // arm (`dbDbLink.c:206-219`) — `db_create_read_log`, then
         // `dbChannelRunPreChain` and `dbChannelRunPostChain`, then
@@ -742,86 +1232,65 @@ impl PvDatabase {
         // reads the raw field, so a drop falls back to the unfiltered
         // value here too — the same rule the CA read path applies
         // (`epics-ca-rs/src/server/tcp.rs:3466-3471`).
-        let value = self.read_target_value(&target.record, &target.field)?;
+        let value = value?;
         let chain = crate::server::database::filters::parse_filter_chain(suffix);
         Some(chain.apply_to_read_value(value.clone()).unwrap_or(value))
     }
 
-    /// Read a `(record, field)` link target's value, dispatching by C
-    /// `dbInitLink` locality (`dbLink.c:118-130`): a target present in
-    /// this IOC reads from the local database (`get_pv`); a non-local
-    /// target is a CA link, resolved through the external path
-    /// (`dbCaGetLink`). The single owner of that locality decision for
-    /// the value-read path — shared by [`Self::read_db_link_value`] (the
-    /// record's own `Db` link) and the lnkCalc input loop
-    /// ([`Self::evaluate_calc_link`]), whose `A..L` inputs are each their
-    /// own `dbInitLink` link and so become CA links when non-local.
-    fn read_target_value(&self, record: &str, field: &str) -> Option<EpicsValue> {
-        match self.read_target(record, field) {
-            TargetValue::Record(value, ..) | TargetValue::NoRecord(value) => value,
-            // This reader's external name is the UNFILTERED one: it is reached
-            // only from the no-suffix arm of `read_db_link_value`, where the
-            // two spellings are the same string.
-            TargetValue::External => self.resolve_external_pv(&local_name(record, field)),
-        }
-    }
-
-    /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
+    /// **The single owner of the name an external link reads through** — C
+    /// `dbCaAddLink`'s verbatim `pv_link.pvname`, which this port qualifies
+    /// with the link's own scheme ([`ParsedLink::external_pv_name`](crate::server::record::ParsedLink::external_pv_name)).
     ///
-    /// `visited` is the caller's processing-chain state so a PP source is
-    /// processed within the same chain — see
-    /// [`Self::process_passive_db_source`] for why a fresh set would
-    /// defeat the cycle guard.
-    pub(crate) fn read_link_value(
+    /// [`PvDatabase::resolve_external_pv`](super::PvDatabase::resolve_external_pv) accepts the bare body too, and
+    /// resolves it as `LinkTarget::Any`: every registered lset in turn, the
+    /// first holding a cached value wins. A reader that spelled the name
+    /// itself therefore read a `pva` link off the `ca` link set whenever both
+    /// were installed — measured, and the reason `external_pv_name` qualifies
+    /// the two variants that know their scheme. Deriving the name here and
+    /// nowhere else is what keeps the bare spelling from coming back.
+    fn read_external_link_value(
         &self,
         link: &crate::server::record::ParsedLink,
-        visited: &mut ProcStack,
     ) -> Option<EpicsValue> {
-        match link {
-            crate::server::record::ParsedLink::None => None,
-            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv),
-            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name),
-            // Resolve through the per-link identity key (not bare `j.pv`)
-            // so two same-PV structured links keep distinct configs —
-            // matches the boundary key the write/scan/alarm paths use via
-            // `external_pv_name` (pvxs per-link `pvaLinkConfig`,
-            // ioc/pvalink.h:65).
-            crate::server::record::ParsedLink::PvaJson(j) => {
-                self.resolve_external_pv(&j.link_identity_key())
-            }
-            // A CONSTANT (or unset) link delivers NOTHING at process time —
-            // `dbConstGetValue` (`dbConstLink.c:219-225`) sets `*pnRequest = 0`
-            // and returns 0, so the reader's buffer keeps whatever it held. The
-            // constant reaches the record exactly once, at init, through
-            // [`super::PvDatabase::rec_gbl_init_constant_links`]. Handing the
-            // parsed text back here is what let the `ReadDbLink` executor
-            // re-apply a constant every cycle (sseq `SELL="3"` stomping a
-            // client's `caput SELN 5`, a compress with `INP="5"` filling its
-            // buffer with 5s). `None` here is classified as
-            // [`LinkFetch::NoData`](crate::server::recgbl::simm::LinkFetch::NoData) — success, nothing delivered — by
-            // [`empty_read_fetch`], never as a failed read.
-            crate::server::record::ParsedLink::Constant(_) => None,
-            crate::server::record::ParsedLink::Db(db) => {
-                // PP: process source record if Passive before reading.
-                // Threads the caller's `visited` so an A↔B PP
-                // cycle terminates at the existing cycle guard instead
-                // of recursing with a fresh set.
-                self.process_passive_db_source(db, visited);
-                self.read_db_link_value(db)
-            }
-            // Hardware links are dispatched by device support directly
-            // — there's no canonical "value" available from a generic
-            // read; return None so the framework treats the link as
-            // unresolvable for value-read purposes.
-            crate::server::record::ParsedLink::Hw(_) => None,
-            // lnkCalc: fetch each input PV, evaluate the expr,
-            // return the result. The timestamp half is not here — C keeps
-            // it on the link (`clink->time`) and serves it from the lset
-            // (`lnkCalc_getTimestampTag`), so this port answers it from
-            // `db_get_time_stamp_tag`, the one owner of link→timestamp.
-            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc),
-            crate::server::record::ParsedLink::State(st) => Some(self.read_state_link(st)),
+        self.resolve_external_pv(link.external()?)
+    }
+
+    /// A link's value and the source's alarm off the SAME read —
+    /// C `dbGetLink`, whose `dbDbGetValue` tail folds the source's severity in
+    /// from the cell the value was just read from (`dbDbLink.c:220-232`).
+    ///
+    /// Asking the two separately — a value read, then
+    /// [`Self::read_link_with_alarm`] with its value thrown away — read the
+    /// target TWICE per cycle per link: two name resolutions and two value
+    /// reads where C resolves nothing and reads once through its `dbAddr`. It
+    /// also tore, since the severity then came off a later read than the value
+    /// it was reported with.
+    ///
+    /// `render` asks for the source's
+    /// [`SourceRender`](crate::server::record::record_instance::SourceRender),
+    /// taken under the read's own hold.
+    pub(crate) fn read_link_value_and_alarm_at_source(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        render: bool,
+        visited: &mut ProcStack,
+    ) -> RenderedRead {
+        // PP: process a Passive DB source before reading, threading the
+        // caller's chain state so an A<->B cycle terminates at the existing
+        // guard — `read_link_value`'s rule, unchanged.
+        if let crate::server::record::ParsedLink::Db(db) = link {
+            self.process_passive_db_source(db, visited);
         }
+        let (value, alarm, render) = self.read_link_value_and_alarm(link, render);
+        // A failed read inherits NOTHING: the gate
+        // [`Self::read_link_with_alarm_at`] applies, kept at the primitive
+        // here too so the illegal "no value, but here is the source's
+        // severity" pair cannot leave it.
+        let alarm = match value {
+            None if !crate::server::recgbl::simm::has_const_lset(link) => None,
+            _ => alarm,
+        };
+        (value, alarm, render)
     }
 
     /// C `dbGetLink(plink, dbrType, ...)` — an input-link read for the DBR class
@@ -845,19 +1314,28 @@ impl PvDatabase {
     /// be one `Option` here, which is how the `ReadDbLink` executor came to
     /// re-deliver a constant on every cycle while the multi-input fetch (same
     /// links, same records) correctly ignored it.
-    pub(crate) fn read_link_value_as(
+    /// The value at `read_as` and the source's alarm off the SAME read —
+    /// see [`Self::read_link_value_and_alarm_at_source`].
+    ///
+    /// A conversion failure carries no alarm, which is where the separate-read
+    /// caller already stood: it asked for the severity only inside its
+    /// `LinkFetch::Value` arm.
+    pub(crate) fn read_link_value_as_with_alarm(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut ProcStack,
-    ) -> crate::server::recgbl::simm::LinkFetch {
+    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
         use crate::server::recgbl::simm::LinkFetch;
-        let Some(value) = self.read_link_value(link, visited) else {
-            return empty_read_fetch(link);
+        let (value, alarm, render) =
+            self.read_link_value_and_alarm_at_source(link, read_as.renders_at_source(), visited);
+        let Some(value) = value else {
+            return (empty_read_fetch(link), None);
         };
-        match self.apply_link_read_as(link, read_as, value) {
-            Some(v) => LinkFetch::Value(v),
-            None => LinkFetch::Failed,
+        match self.apply_link_read_as(held, link, read_as, value, render) {
+            Some(v) => (LinkFetch::Value(v), alarm),
+            None => (LinkFetch::Failed, None),
         }
     }
 
@@ -868,11 +1346,34 @@ impl PvDatabase {
     ///
     /// `None` is C's non-zero `dbGetLink` status (`dbConvert.c`'s NULL
     /// conversion slot), i.e. a FAILED read — never a silent no-op.
+    #[inline(always)]
+    ///
+    /// `render` is what the read that produced `value` took of a local source
+    /// under its own hold ([`RenderedRead`]): a `DBR_STRING` conversion never
+    /// goes back to the source for it.
     pub(crate) fn apply_link_read_as(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<EpicsValue> {
+        match read_as {
+            crate::server::record::LinkReadAs::Native => Some(value),
+            _ => self.convert_link_read(held, link, read_as, value, render),
+        }
+    }
+
+    /// [`Self::apply_link_read_as`]'s converting arms, out of the native
+    /// read's frame.
+    fn convert_link_read(
+        &self,
+        held: Option<&crate::server::database::SetGuard>,
+        link: &crate::server::record::ParsedLink,
+        read_as: crate::server::record::LinkReadAs,
+        value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<EpicsValue> {
         use crate::server::record::LinkReadAs;
         match read_as {
@@ -880,20 +1381,136 @@ impl PvDatabase {
             // C `dbGetLink(..., DBR_DOUBLE, ...)`: an array source contributes
             // its element 0 (C asks for one element, so `dbGet` converts offset
             // 0), the same rule the multi-input fetch applies.
-            LinkReadAs::Double => {
-                let scalar = if value.is_array() {
-                    value.first_element()
-                } else {
-                    Some(value)
-                };
-                scalar
-                    .and_then(|s| s.get_convert_f64())
-                    .map(EpicsValue::Double)
-            }
-            LinkReadAs::String => self.dbr_string_of(link, &value).map(EpicsValue::String),
+            LinkReadAs::Double => link_value_as_f64(value).map(EpicsValue::Double),
+            LinkReadAs::Char
+            | LinkReadAs::UChar
+            | LinkReadAs::Short
+            | LinkReadAs::Float
+            | LinkReadAs::Long
+            | LinkReadAs::ULong
+            | LinkReadAs::UShort
+            | LinkReadAs::Int64
+            | LinkReadAs::UInt64 => link_value_get_as(value, read_as.dbr_type()?),
+            LinkReadAs::Enum => self.enum_read_of(held, link, value),
+            LinkReadAs::String => self
+                .dbr_string_of(link, value, render)
+                .map(EpicsValue::String),
             LinkReadAs::CharArrayAsString { max_elements } => {
                 char_bytes_as_string(&value, max_elements).map(EpicsValue::String)
             }
+            LinkReadAs::Array { dbr, n_request } => {
+                self.array_read_of(held, link, dbr, n_request, value, render)
+            }
+        }
+    }
+
+    /// [`LinkReadAs::Array`](crate::server::record::LinkReadAs::Array): an array source keeps its first `n_request`
+    /// elements, each converted to `dbr`; a scalar source converts as the
+    /// matching scalar request does.
+    fn array_read_of(
+        &self,
+        held: Option<&crate::server::database::SetGuard>,
+        link: &crate::server::record::ParsedLink,
+        dbr: DbFieldType,
+        n_request: usize,
+        mut value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<EpicsValue> {
+        if value.is_array() {
+            if dbr == DbFieldType::String {
+                return self.dbr_strings_of(value, n_request, render);
+            }
+            value.truncate(n_request);
+            return value.get_convert(dbr).ok();
+        }
+        match dbr {
+            DbFieldType::String => self
+                .dbr_string_of(link, value, render)
+                .map(EpicsValue::String),
+            DbFieldType::Enum => self.enum_read_of(held, link, value),
+            _ => value.get_convert(dbr).ok(),
+        }
+    }
+
+    /// The `DBR_ENUM` form of a value just read from `link`, or an empty
+    /// `EnumArray` where C writes nothing into the reader's buffer. A
+    /// one-element string is C's `cvt_st_e`, which hands it to the source's
+    /// `put_enum_str` with the SOURCE's `dbAddr`: a state name stores the
+    /// source's VAL (no post) and the buffer is not written. More elements
+    /// take `dbGet`'s table, `getStringUshort` on element 0; none (NORD=0) is
+    /// `dbGet`'s `n <= 0` arm, which converts nothing and succeeds.
+    fn enum_read_of(
+        &self,
+        held: Option<&crate::server::database::SetGuard>,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+    ) -> Option<EpicsValue> {
+        use crate::server::record::EnumChoice;
+        let unwritten = || Some(EpicsValue::EnumArray(Vec::new().into()));
+        if value.is_array() && value.count() == 0 {
+            return unwritten();
+        }
+        let one = value.count() == 1;
+        let scalar = if value.is_array() {
+            value.first_element()?
+        } else {
+            value
+        };
+        let EpicsValue::String(s) = scalar else {
+            return scalar.get_convert(DbFieldType::Enum).ok();
+        };
+        if !one {
+            let EpicsValue::UShort(v) = EpicsValue::String(s)
+                .get_convert(DbFieldType::UShort)
+                .ok()?
+            else {
+                return None;
+            };
+            return Some(EpicsValue::Enum(v));
+        }
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return None;
+        };
+        let at = self.db_link_addr(db)?;
+        let mut source = at.rec.write_under(held);
+        // Named only by a refusal, so a delivered read never looks it up.
+        let field = || at.put.field().desc.map_or("VAL", |d| d.name);
+        // C's `cvt_st_e` reports both refusals under the reader's lock set
+        // (`dbFastLinkConv.c:255-256`, `:277-280`); printed here once the
+        // source's data lock is down.
+        let Some(states) = source.record.enum_state_strings() else {
+            let record_type = source.record.record_type();
+            drop(source);
+            let report = crate::server::recgbl::PutReport::RecSupError {
+                message: "dbPutField",
+                record_type,
+                support: "put_enum_str",
+            };
+            self.emit_put_report(&at.name, field(), report);
+            return None;
+        };
+        let Some(choice) = crate::server::record::enum_state_choice(&*source.record, &states, &s)
+        else {
+            drop(source);
+            let mut refusal =
+                crate::error::ChoiceRefusal::enum_state(field(), &s.as_str_lossy(), states.len());
+            if let Some(report) = refusal.take_report() {
+                self.emit_put_report(&at.name, field(), report);
+            }
+            return None;
+        };
+        match choice {
+            EnumChoice::Named(i) => {
+                source
+                    .record
+                    .put_field_internal("VAL", EpicsValue::Enum(i))
+                    .ok()?;
+                if source.record.enum_str_clears_udf() {
+                    source.common.udf = 0;
+                }
+                unwritten()
+            }
+            EnumChoice::Index(i) => Some(EpicsValue::Enum(i)),
         }
     }
 
@@ -902,17 +1519,60 @@ impl PvDatabase {
     /// `ENUM`/`MENU` index into a state label — C `getEnumString`), by the value
     /// itself otherwise (an external link / constant / lnkCalc result carries no
     /// reachable field metadata).
+    ///
+    /// `value` is the read itself: only an index goes back to the source, for
+    /// its choice table at the cached address, so a cycle resolves no name.
+    ///
+    /// The result is C's `MAX_STRING_SIZE` buffer: at most 39 bytes, as
+    /// `getStringString` copies (`dbConvert.c`), whatever the source holds.
     fn dbr_string_of(
         &self,
         link: &crate::server::record::ParsedLink,
-        value: &EpicsValue,
+        value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
     ) -> Option<PvString> {
+        self.dbr_string_rendered(link, value, render)
+            .map(crate::types::codec::cap_dbr_string)
+    }
+
+    /// [`Self::dbr_string_of`] for every element of an array source: `dbGet`
+    /// converts `nRequest` elements at the source, so a float field renders
+    /// at ITS precision (`getFloatString`), not the reader's.
+    fn dbr_strings_of(
+        &self,
+        mut value: EpicsValue,
+        n_request: usize,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<EpicsValue> {
+        let rendered = match render {
+            Some(render) => render.dbr_strings(value, n_request)?,
+            None => {
+                value.truncate(n_request);
+                value.get_convert(DbFieldType::String).ok()?
+            }
+        };
+        Some(crate::types::codec::cap_dbr_strings(rendered))
+    }
+
+    fn dbr_string_rendered(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+        render: Option<crate::server::record::record_instance::SourceRender>,
+    ) -> Option<PvString> {
+        let value = match value {
+            EpicsValue::String(s) => return Some(s),
+            value => value,
+        };
+        // A `$` source is a `DBF_CHAR` array whatever the field holds:
+        // `getCharString` of element 0, with no field metadata to apply.
         if let crate::server::record::ParsedLink::Db(db) = link
-            && let target = db.target()
-            && let LinkTarget::Local(rec) = self.link_target(&target.record)
+            && db.target().string_view
         {
-            let guard = rec.read();
-            return guard.field_as_dbr_string(&target.field);
+            return crate::server::record::value_as_dbr_string(&value.first_element()?);
+        }
+        if let Some(render) = render {
+            return render.dbr_string(value);
         }
         // An external ENUM value crosses the wire as a bare index; the label
         // table lives in the lset's cached metadata (CA: the one-shot
@@ -920,15 +1580,15 @@ impl PvDatabase {
         // `DBR_STRING` monitor for exactly this read, `dbCa.c` `pgetString`).
         // An index past the cached table falls through to the digits, the
         // same rule as [`value_as_dbr_string`]'s `EnumWithChoices` arm.
-        if let EpicsValue::Enum(idx) = value
+        if let EpicsValue::Enum(idx) = &value
             && let Some(name) = link.external_pv_name()
-            && let Some(m) = self.external_link_metadata(&name)
+            && let Some(m) = self.external_link_metadata(name)
             && let Some(choices) = m.enum_choices
             && let Some(label) = choices.get(*idx as usize)
         {
             return Some(PvString::from(label.as_str()));
         }
-        crate::server::record::value_as_dbr_string(value)
+        crate::server::record::value_as_dbr_string(&value)
     }
 
     /// Read a link's current value WITHOUT processing a Passive source —
@@ -937,7 +1597,7 @@ impl PvDatabase {
     /// (DB / CA / PVA / constant / lnkCalc) and never processes the
     /// target record.
     ///
-    /// Distinct from [`Self::read_link_value`], which threads
+    /// Distinct from [`Self::read_link_value_and_alarm_at_source`], which threads
     /// `visited` to PP-process a Passive DB source before reading
     /// (the INPUT-link path). `dbGetLink` does no such processing, so the
     /// DB arm here reads with a plain `get_pv` exactly as the pre-fix
@@ -953,13 +1613,11 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
     ) -> Option<EpicsValue> {
         match link {
-            crate::server::record::ParsedLink::None => None,
-            crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv),
-            crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name),
-            // Per-link identity key, as in `read_link_value` above.
-            crate::server::record::ParsedLink::PvaJson(j) => {
-                self.resolve_external_pv(&j.link_identity_key())
-            }
+            crate::server::record::ParsedLink::None
+            | crate::server::record::ParsedLink::Removed(_) => None,
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => self.read_external_link_value(link),
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => self.read_db_link_value(db),
             // Hardware links carry no generic readable value.
@@ -971,7 +1629,9 @@ impl PvDatabase {
 
     /// The record name a `time` argument's timestamp comes from, or `None`
     /// when that slot holds a numeric literal (nothing to read a time from).
-    pub(super) fn calc_time_source_record(arg: &crate::server::record::CalcArg) -> Option<String> {
+    pub(super) fn calc_time_source_record(
+        arg: &crate::server::record::CalcArg,
+    ) -> Option<RecordName> {
         use crate::server::record::{CalcArg, ParsedLink};
         let CalcArg::Link(link) = arg else {
             return None;
@@ -979,23 +1639,22 @@ impl PvDatabase {
         let name = match link.as_ref() {
             // Strip the `.FIELD` suffix — and any channel filter — to land
             // on the record name.
-            ParsedLink::Db(db) => db.target().record.clone(),
-            ParsedLink::Ca(ca) => ca.pv.clone(),
-            ParsedLink::Pva(pv) => pv.clone(),
-            ParsedLink::PvaJson(j) => j.pv.clone(),
+            ParsedLink::Db(db) => return Some(db.target().record.clone()),
+            ParsedLink::Ca(ca) => ca.pv.as_bytes(),
+            ParsedLink::Pva(pv) => pv.name().as_bytes(),
+            ParsedLink::PvaJson(j) => j.pv.as_bytes(),
             // A state link names no record, so it has no timestamp to adopt
             // — its lset implements no `getTimestampTag`.
             ParsedLink::None
             | ParsedLink::Constant(_)
             | ParsedLink::Hw(_)
             | ParsedLink::Calc(_)
-            | ParsedLink::State(_) => return None,
+            | ParsedLink::State(_)
+            | ParsedLink::Removed(_) => return None,
         };
-        Some(
-            name.rsplit_once('.')
-                .map(|(r, _)| r.to_string())
-                .unwrap_or(name),
-        )
+        Some(RecordName::from(
+            name.rsplitn(2, |&b| b == b'.').last().unwrap_or(name),
+        ))
     }
 
     /// lnkCalc evaluation: resolve each input, bind the calc engine's
@@ -1004,7 +1663,68 @@ impl PvDatabase {
     /// compile fails, or eval fails — the caller treats the link as
     /// unresolvable.
     pub fn evaluate_calc_link(&self, calc: &crate::server::record::CalcLink) -> Option<EpicsValue> {
-        use crate::calc::engine::{CALC_NARGS, NumericInputs};
+        self.read_calc_link(calc).0
+    }
+
+    /// C `lnkCalc_getValue` (`lnkCalc.c:586-622`): the value, and the
+    /// `LINK_ALARM` that `major`, else `minor`, raises on the reader with
+    /// `recGblSetSevrMsg`, which [`Self::inherit_source_alarm`] applies.
+    pub(crate) fn read_calc_link(
+        &self,
+        calc: &crate::server::record::CalcLink,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        use crate::server::record::AlarmSeverity;
+        let Some(vars) = self.calc_link_args(calc) else {
+            return (None, None);
+        };
+        // C `calcPerform(clink->arg, &val, expr)`: `VAL` reads `val`.
+        let perform = |expr: &str, val: f64| {
+            let compiled = crate::calc::compile(expr).ok()?;
+            let mut inputs = crate::calc::engine::NumericInputs::with_vars(vars);
+            inputs.prev_val = val;
+            crate::calc::eval(&compiled, &mut inputs).ok()
+        };
+        // `clink->val` is the last result.
+        let Some(val) = calc
+            .expr
+            .as_deref()
+            .and_then(|e| perform(e, calc.val.get()))
+        else {
+            return (None, None);
+        };
+        calc.val.set(val);
+        for (expr, sevr, msg) in [
+            (&calc.major, AlarmSeverity::Major, "post_major error"),
+            (&calc.minor, AlarmSeverity::Minor, "post_minor error"),
+        ] {
+            let Some(expr) = expr else { continue };
+            match perform(expr, val) {
+                None => return (None, None),
+                Some(alval) if alval != 0.0 => {
+                    let alarm = LinkAlarm {
+                        stat: crate::server::recgbl::alarm_status::LINK_ALARM,
+                        sevr,
+                        amsg: msg.into(),
+                    };
+                    let alarm = SourceAlarm {
+                        alarm,
+                        record: None,
+                    };
+                    return (Some(EpicsValue::Double(val)), Some(alarm));
+                }
+                Some(_) => {}
+            }
+        }
+        (Some(EpicsValue::Double(val)), None)
+    }
+
+    /// The `dbGetLink` of each lnkCalc input into `clink->arg`, `None` when
+    /// one fails.
+    fn calc_link_args(
+        &self,
+        calc: &crate::server::record::CalcLink,
+    ) -> Option<[f64; crate::calc::engine::CALC_NARGS]> {
+        use crate::calc::engine::CALC_NARGS;
         use crate::server::record::CalcArg;
         // The parser already refuses an over-long `args`; a link built
         // in-process could still carry one, and C's limit is a refusal
@@ -1028,10 +1748,7 @@ impl PvDatabase {
                 CalcArg::Link(link) => self.read_link_value_no_process(link)?.get_convert_f64()?,
             };
         }
-        let compiled = crate::calc::compile(&calc.expr).ok()?;
-        let mut inputs = NumericInputs::with_vars(vars);
-        let result = crate::calc::eval(&compiled, &mut inputs).ok()?;
-        Some(EpicsValue::Double(result))
+        Some(vars)
     }
 
     /// **The single owner of a process-time link read that carries both a
@@ -1048,22 +1765,35 @@ impl PvDatabase {
     /// failed read that gates `fetch_values`. The constant reaches the record
     /// exactly once, at init, through
     /// [`super::PvDatabase::rec_gbl_init_constant_links`].
+    ///
+    /// `render` asks for the source's part of a `DBR_STRING` conversion, as
+    /// [`Self::read_link_with_alarm_at`] takes it.
     pub(crate) fn read_link_with_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
-        self.read_link_with_alarm_at(link, None)
+        render: bool,
+    ) -> RenderedFetch {
+        self.read_link_with_alarm_at(link, None, render)
     }
 
     /// [`Self::read_link_with_alarm`] with the link's local target already
     /// in hand — `at` is the record's cached handle for the link, validated
     /// by [`ParsedInputLink::target`](crate::server::record::record_instance::ParsedInputLink::target), and `None` resolves the
-    /// name as before.
+    /// name as before. `render` asks for the [`SourceRender`] a `DBR_STRING`
+    /// conversion of the value takes from a local source, under the read's
+    /// own hold.
+    ///
+    /// [`SourceRender`]: crate::server::record::record_instance::SourceRender
+    ///
+    /// `always`: each input read's cycle runs it, and the heuristic dropped
+    /// it out of line once its body grew, at +29 instr/cycle on seq.
+    #[inline(always)]
     pub(crate) fn read_link_with_alarm_at(
         &self,
         link: &crate::server::record::ParsedLink,
         at: Option<&crate::server::record::record_instance::ResolvedTarget>,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+        render: bool,
+    ) -> RenderedFetch {
         use crate::server::recgbl::simm::LinkFetch;
         // C `dbDbGetValue` through the link's `dbAddr`: the target in hand
         // is read in one lock hold and classified here, straight into the
@@ -1075,9 +1805,9 @@ impl PvDatabase {
         // is a `break` — so its alarm is not carried to the fold that
         // would drop it.
         if let (crate::server::record::ParsedLink::Db(db), Some(at)) = (link, at) {
-            return self.read_db_link_at(db, at);
+            return self.read_db_link_at(None, db, at, render);
         }
-        let (value, alarm) = self.read_link_value_and_alarm(link);
+        let (value, alarm, render) = self.read_link_value_and_alarm(link, render);
         let fetch = match value {
             Some(v) => LinkFetch::Value(v),
             None => empty_read_fetch(link),
@@ -1110,7 +1840,7 @@ impl PvDatabase {
             LinkFetch::Failed => None,
             _ => alarm,
         };
-        (fetch, alarm)
+        (fetch, alarm, render)
     }
 
     /// The cached-target arm of [`Self::read_link_with_alarm_at`], in its
@@ -1122,19 +1852,81 @@ impl PvDatabase {
     #[inline(always)]
     pub(crate) fn read_db_link_at(
         &self,
+        held: Option<&crate::server::database::SetGuard>,
         db: &crate::server::record::DbLink,
         at: &crate::server::record::record_instance::ResolvedTarget,
-    ) -> (crate::server::recgbl::simm::LinkFetch, Option<SourceAlarm>) {
+        render: bool,
+    ) -> RenderedFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        let target = db.target();
-        let inherits = db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize;
-        match self.read_field_of(&at.rec, &target.record, &target.field, at.field) {
-            FieldRead::Field(Some(v), alarm) => (
-                LinkFetch::Value(filtered_read(target, v)),
-                inherits.then(|| SourceAlarm::local(SourceId::of(&at.rec), alarm)),
-            ),
-            FieldRead::Shadow(v) => (LinkFetch::Value(filtered_read(target, v)), None),
-            FieldRead::Field(None, _) => (LinkFetch::Failed, None),
+        match self.read_db_at(held, db, at, render) {
+            (Some(v), alarm, render) => (LinkFetch::Value(v), alarm, render),
+            (None, ..) => (LinkFetch::Failed, None, None),
+        }
+    }
+
+    /// The read of `link`'s cached target at the reader's request, for a
+    /// caller that has the target in hand: the value as `read_as` asks, and
+    /// the source's alarm only for a read and conversion that both
+    /// succeeded (`dbDbLink.c:228`), as [`Self::read_link_value_as_with_alarm`]
+    /// gates the general path. `None` with no alarm for a non-DB `link`.
+    #[inline(always)]
+    pub(crate) fn read_db_link_as_at(
+        &self,
+        held: &crate::server::database::SetGuard,
+        link: &crate::server::record::ParsedLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+        read_as: crate::server::record::LinkReadAs,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return (None, None);
+        };
+        if read_as == crate::server::record::LinkReadAs::Double {
+            let (value, alarm) = self.read_db_link_f64_at(held, db, at);
+            return (value.map(EpicsValue::Double), alarm);
+        }
+        let (Some(value), alarm, render) =
+            self.read_db_at(Some(held), db, at, read_as.renders_at_source())
+        else {
+            return (None, None);
+        };
+        match self.apply_link_read_as(Some(held), link, read_as, value, render) {
+            Some(value) => (Some(value), alarm),
+            None => (None, None),
+        }
+    }
+
+    /// [`Self::read_db_link_at`] read as `DBR_DOUBLE`: `None`, with no alarm,
+    /// for a read or a conversion that failed — C inherits only on
+    /// `dbGetLink`'s success (`dbDbLink.c:228`), and a failed conversion is a
+    /// failed status. An unfiltered `VAL` the record serves as `DBF_DOUBLE`
+    /// is read straight off its slot, the `dbGetLink` of C's `dbAddr`.
+    #[inline(always)]
+    pub(crate) fn read_db_link_f64_at(
+        &self,
+        held: &crate::server::database::SetGuard,
+        db: &crate::server::record::DbLink,
+        at: &crate::server::record::record_instance::ResolvedTarget,
+    ) -> (Option<f64>, Option<SourceAlarm>) {
+        if let Some(slot) = at.f64_slot {
+            let instance = at.rec.read_in(held);
+            let Some(value) = instance.record.get_slot_f64(slot) else {
+                return (None, None);
+            };
+            let alarm = (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize)
+                .then(|| {
+                    SourceAlarm::local(
+                        SourceId::of(&at.rec),
+                        LinkAlarm::committed(&instance.common),
+                    )
+                });
+            return (Some(value), alarm);
+        }
+        match self.read_db_at(Some(held), db, at, false) {
+            (Some(v), alarm, _) => match link_value_as_f64(v) {
+                Some(f) => (Some(f), alarm),
+                None => (None, None),
+            },
+            (None, ..) => (None, None),
         }
     }
 
@@ -1165,29 +1957,49 @@ impl PvDatabase {
     /// * **MS class per scheme** — DB and CA links carry their own parsed
     ///   `MonitorSwitch`; a PVA link's lset has already applied the MS/NMS/MSI
     ///   gate, so its (already final) severity folds as `MaximizeStatus` to keep
-    ///   the remote stat + message. Constant/Hw/Calc links inherit nothing.
-    #[inline]
+    ///   the remote stat + message. A calc link's alarm is the one its
+    ///   `getValue` raised with `recGblSetSevrMsg`, which `MaximizeStatus` is.
+    ///   Constant/Hw links inherit nothing.
+    ///
+    /// No alarm — an NMS read, which never takes one — is answered in the
+    /// caller's frame.
+    #[inline(always)]
     pub(crate) fn input_link_inheritance(
         &self,
-        reader: &Arc<RecordCell>,
+        reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         alarm: Option<SourceAlarm>,
     ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
-        let SourceAlarm { alarm, record } = alarm?;
+        self.inherit_source_alarm(SourceId::of_frame(reader), link, alarm?)
+    }
+
+    /// [`Self::input_link_inheritance`] for a read that carried an alarm.
+    fn inherit_source_alarm(
+        &self,
+        reader: SourceId,
+        link: &crate::server::record::ParsedLink,
+        alarm: SourceAlarm,
+    ) -> Option<(crate::server::record::MonitorSwitch, LinkAlarm)> {
+        // NMS: `recGblInheritSevrMsg(pvlOptNMS)` is a `break`.
+        let inherits = |ms| ms != crate::server::record::MonitorSwitch::NoMaximize;
+        let SourceAlarm { alarm, record } = alarm;
         match link {
             crate::server::record::ParsedLink::Db(db) => {
                 // C's `precord != dbChannelRecord(chan)`, asked as the pointer
                 // test it is. The handle came off the same read that produced
                 // the alarm, so there is no second lookup and no name to
                 // canonicalise: an alias and the record it names ARE one cell.
-                if record == Some(SourceId::of(reader)) {
+                if record == Some(reader) {
                     return None;
                 }
-                Some((db.monitor_switch, alarm))
+                inherits(db.monitor_switch).then_some((db.monitor_switch, alarm))
             }
-            crate::server::record::ParsedLink::Ca(ca) => Some((ca.monitor_switch, alarm)),
+            crate::server::record::ParsedLink::Ca(ca) => {
+                inherits(ca.monitor_switch).then_some((ca.monitor_switch, alarm))
+            }
             crate::server::record::ParsedLink::Pva(_)
-            | crate::server::record::ParsedLink::PvaJson(_) => {
+            | crate::server::record::ParsedLink::PvaJson(_)
+            | crate::server::record::ParsedLink::Calc(_) => {
                 Some((crate::server::record::MonitorSwitch::MaximizeStatus, alarm))
             }
             _ => None,
@@ -1201,7 +2013,7 @@ impl PvDatabase {
     pub(crate) fn fold_input_link_alarm(
         &self,
         common: &mut crate::server::record::CommonFields,
-        reader: &Arc<RecordCell>,
+        reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
         alarm: SourceAlarm,
     ) {
@@ -1213,7 +2025,278 @@ impl PvDatabase {
     /// The raw value+alarm read behind [`Self::read_link_with_alarm`]. Never
     /// call this directly from a process path — it cannot tell "constant" from
     /// "failed"; that is the classifier's job.
+    #[inline]
     fn read_link_value_and_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        render: bool,
+    ) -> RenderedRead {
+        if let crate::server::record::ParsedLink::Db(db) = link {
+            match self.db_link_answer(db) {
+                crate::server::record::DbLinkAnswer::Local(at) => {
+                    return self.read_db_at(None, db, &at, render);
+                }
+                crate::server::record::DbLinkAnswer::Shadowed(pv) => {
+                    return (Some(filtered_read(db.target(), pv.get())), None, None);
+                }
+                crate::server::record::DbLinkAnswer::External => {
+                    let (value, alarm) = self.read_db_external(db);
+                    return (value, alarm, None);
+                }
+                crate::server::record::DbLinkAnswer::Absent => {}
+            }
+        }
+        let (value, alarm) = self.read_unresolved_link_value_and_alarm(link);
+        (value, alarm, None)
+    }
+
+    /// What a link's lset `getValue` raised on the reader itself before
+    /// failing — pvalink's `"%s Disconn"` (`pvalink_lset.cpp:263-268`).
+    /// Both `dbGetLink` and `dbTryGetLink` reach the lset, so a reader of
+    /// either kind runs this first.
+    #[cold]
+    pub(crate) fn lset_get_failed(
+        &self,
+        common: &mut crate::server::record::CommonFields,
+        link: &crate::server::record::ParsedLink,
+        field: &'static str,
+    ) {
+        if self.get_failure_disconn(link) {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::LINK_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                crate::server::record::SparseText::link_disconn(field),
+            );
+        }
+    }
+
+    /// [`LinkSet::get_failure_disconn`](super::LinkSet::get_failure_disconn)
+    /// of the lset `link` names by scheme. A bare name (a CA link) is
+    /// `dbCa`'s, which raises nothing.
+    pub(crate) fn get_failure_disconn(&self, link: &crate::server::record::ParsedLink) -> bool {
+        let Some(external) = link.external() else {
+            return false;
+        };
+        let (target, body) = Self::split_external_link_name(external.name);
+        matches!(target, super::link_put_queue::LinkTarget::Scheme(_))
+            && super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+                lset.get_failure_disconn(body).then_some(())
+            })
+            .is_some()
+    }
+
+    /// C `doResolveLinks`' `openLink` (`iocInit.c:535-559`) for each
+    /// external link of `rec_arc`, once per record
+    /// ([`RecordCell::claim_link_opens`]); a link its lset opens without one
+    /// is bound by [`RecordInstance::bind_no_lset`], a forward link it opens
+    /// gets its handle ([`Self::bind_external_forward`]). Runs ahead of the
+    /// record's init reads.
+    ///
+    /// [`RecordCell::claim_link_opens`]: crate::server::record::RecordCell::claim_link_opens
+    /// [`RecordInstance::bind_no_lset`]: crate::server::record::RecordInstance::bind_no_lset
+    pub(crate) fn open_record_links(&self, rec_arc: &Arc<crate::server::record::RecordCell>) {
+        if !rec_arc.claim_link_opens() {
+            return;
+        }
+        let texts = Self::link_field_texts(&rec_arc.read());
+        let opened: Vec<(String, super::LinkOpen)> = texts
+            .into_iter()
+            .filter_map(|(field, raw, ftype)| {
+                let holder = super::LinkHolder::new(
+                    rec_arc.rdes().record_type,
+                    rec_arc.name().as_bytes(),
+                    &field,
+                );
+                let open = self.open_external_link(
+                    holder,
+                    &crate::server::record::parse_link_field(&raw, ftype),
+                )?;
+                Some((field, open))
+            })
+            .collect();
+        if opened.is_empty() {
+            return;
+        }
+        let mut instance = rec_arc.write();
+        for (field, open) in &opened {
+            self.bind_opened(&mut instance, field, *open);
+        }
+    }
+
+    /// `dbPutFieldLink`'s `dbAddLink` → `openLink` (`dbAccess.c:1208`,
+    /// `dbLink.c:194-199`) for the link a put just stored in `field`, under
+    /// the put's hold, after its `special()` pass 1 and before its posts.
+    pub(crate) fn open_put_link(
+        &self,
+        instance: &mut crate::server::record::RecordInstance,
+        field: &str,
+    ) {
+        let holder = super::LinkHolder::new(
+            instance.record.record_type(),
+            instance.name.as_bytes(),
+            field,
+        );
+        let open = instance
+            .stored_link_shared(field)
+            .and_then(|link| self.open_external_link(holder, link));
+        if let Some(open) = open {
+            self.bind_opened(instance, field, open);
+        }
+    }
+
+    /// `field`'s stored link ahead of a put that may replace it, when an lset
+    /// opened it: what [`Self::remove_put_link`] compares the put's result to.
+    pub(crate) fn link_before_put(
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+    ) -> Option<Arc<crate::server::record::ParsedLink>> {
+        instance
+            .stored_link_shared(field)
+            .filter(|link| Self::scheme_link_name(link).is_some())
+            .cloned()
+    }
+
+    /// `dbPutFieldLink`'s `dbRemoveLink` (`dbAccess.c:1167`) → the lset's
+    /// `removeLink` for `before`, the link [`Self::link_before_put`] saw, once
+    /// the put replaced it or left the field unadded. Under the put's hold,
+    /// ahead of [`Self::open_put_link`], so an lset never holds two links for
+    /// one holder.
+    pub(crate) fn remove_put_link(
+        &self,
+        instance: &crate::server::record::RecordInstance,
+        field: &str,
+        before: Option<Arc<crate::server::record::ParsedLink>>,
+    ) {
+        let Some(before) = before else {
+            return;
+        };
+        let replaced = instance
+            .stored_link_shared(field)
+            .is_none_or(|now| !Arc::ptr_eq(now, &before));
+        if !replaced && !instance.link_unadded(field) {
+            return;
+        }
+        let Some((target, body)) = Self::scheme_link_name(&before) else {
+            return;
+        };
+        let holder = super::LinkHolder::new(
+            instance.record.record_type(),
+            instance.name.as_bytes(),
+            field,
+        );
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            lset.remove_link(holder, body);
+            Some(())
+        });
+    }
+
+    /// A record's own post of `field` under its hold: the put, then the open
+    /// of the link it installed. C's `dbPut` refuses a link field
+    /// (`dbAccess.c:1340`); only `dbPutFieldLink` changes one, and it opens it
+    /// (`dbAccess.c:1208`), so a link this post installs is opened as a put's.
+    pub(crate) fn put_internal_field_opening(
+        &self,
+        instance: &mut crate::server::record::RecordInstance,
+        field: &str,
+        value: EpicsValue,
+        links: &mut crate::server::record::PreparedLinks,
+    ) -> crate::error::CaResult<()> {
+        let before = Self::link_before_put(instance, field);
+        if let Some(link_field) = instance.put_internal_field_of(field, value, links)? {
+            self.remove_put_link(instance, link_field, before);
+            self.open_put_link(instance, link_field);
+        }
+        Ok(())
+    }
+
+    /// The lset's [`LinkSet::open_link`](super::LinkSet::open_link) of an
+    /// external `link`; `None` when there is no lset to ask. Only a link
+    /// naming its scheme has one: a bare CA name is C's `PV_LINK`, which
+    /// `dbCaAddLink` takes with no `openLink` (`dbLink.c:128`). The one caller
+    /// of `open_link`, so every link is opened once per init and once per put.
+    fn open_external_link(
+        &self,
+        holder: super::LinkHolder<'_>,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<super::LinkOpen> {
+        let (target, body) = Self::scheme_link_name(link)?;
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            Some(lset.open_link(holder, body))
+        })
+    }
+
+    /// The lset target and name of a link naming its scheme — the links an
+    /// lset opens and removes.
+    fn scheme_link_name(
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<(super::link_put_queue::LinkTarget, &[u8])> {
+        let external = link.external()?;
+        let (target, body) = Self::split_external_link_name(external.name);
+        matches!(target, super::link_put_queue::LinkTarget::Scheme(_)).then_some((target, body))
+    }
+
+    /// What an open of `field`'s stored link answered, bound into the record:
+    /// no lset is [`RecordInstance::bind_no_lset`](crate::server::record::RecordInstance::bind_no_lset),
+    /// an lset gives a forward link its handle.
+    fn bind_opened(
+        &self,
+        instance: &mut crate::server::record::RecordInstance,
+        field: &str,
+        open: super::LinkOpen,
+    ) {
+        match open {
+            super::LinkOpen::NoLset => instance.bind_no_lset(field),
+            super::LinkOpen::Lset => {
+                let forward =
+                    crate::server::record::declared_field(instance.record.record_type(), field)
+                        .and_then(crate::types::link_class_of)
+                        == Some(crate::types::DbfLinkClass::FwdLink);
+                if let Some(link) = instance.stored_link_shared(field).filter(|_| forward) {
+                    self.bind_external_forward(link);
+                }
+            }
+        }
+    }
+
+    /// C `dbGetLink`'s failure tail (`dbLink.c:335-339`): nothing for a link
+    /// with no lset; otherwise the lset's own message, then `setLinkAlarm`,
+    /// whose equal severity leaves that message in place (`recGbl.c:242`).
+    #[cold]
+    pub(crate) fn get_link_failed(
+        &self,
+        common: &mut crate::server::record::CommonFields,
+        link: &crate::server::record::ParsedLink,
+        field: &'static str,
+    ) {
+        if crate::server::recgbl::simm::has_no_lset(link) {
+            return;
+        }
+        self.lset_get_failed(common, link, field);
+        crate::server::recgbl::rec_gbl_set_link_alarm(common, field);
+    }
+
+    /// A DB link whose target is not served here reads as the CA link C
+    /// makes it: value and raw remote alarm from the external resolver,
+    /// identical to the `Ca`/`Pva` arm of
+    /// [`Self::read_unresolved_link_value_and_alarm`].
+    fn read_db_external(
+        &self,
+        db: &crate::server::record::DbLink,
+    ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
+        let external = db.external();
+        (
+            self.resolve_external_pv(external),
+            self.external_link_alarm(external.name)
+                .map(SourceAlarm::external),
+        )
+    }
+
+    /// [`Self::read_link_value_and_alarm`] for every link that is not a DB
+    /// link with a cached target.
+    #[cold]
+    #[inline(never)]
+    fn read_unresolved_link_value_and_alarm(
         &self,
         link: &crate::server::record::ParsedLink,
     ) -> (Option<EpicsValue>, Option<SourceAlarm>) {
@@ -1232,19 +2315,12 @@ impl PvDatabase {
                 // link target spelled with an alias still propagates MS/NMS —
                 // and it comes off the cell the value was just read from, not
                 // a second lookup of the same name.
-                let (value, alarm) = match self.read_target(&target.record, &target.field) {
+                let (value, alarm) = match self.read_db_target_by_name(db) {
                     TargetValue::Record(value, rec, alarm) => {
-                        (value, Some(SourceAlarm::local(rec, alarm)))
+                        (value, alarm.map(|alarm| SourceAlarm::local(rec, alarm)))
                     }
                     TargetValue::NoRecord(value) => (value, None),
-                    TargetValue::External => {
-                        let external = db.pvname();
-                        return (
-                            self.resolve_external_pv(&external),
-                            self.external_link_alarm(&external)
-                                .map(SourceAlarm::external),
-                        );
-                    }
+                    TargetValue::External => return self.read_db_external(db),
                 };
                 (value.map(|v| filtered_read(target, v)), alarm)
             }
@@ -1268,46 +2344,41 @@ impl PvDatabase {
             // `processing.rs`. Without this, a connected external link
             // carrying a remote MINOR/MAJOR severity never folded into
             // the owning record's LINK_ALARM (B2).
+            //
+            // The name is `external_pv_name`'s, scheme and all: it is also the
+            // per-link identity key a structured link resolves by, so two
+            // same-PV links keep distinct configs (pvxs per-link
+            // `pvaLinkConfig`, ioc/pvalink.h:65).
             crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
             | crate::server::record::ParsedLink::Ca(_) => {
-                let name = link
-                    .external_pv_name()
+                let external = link
+                    .external()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                let value = self.resolve_external_pv(&name);
-                let alarm = self.external_link_alarm(&name).map(SourceAlarm::external);
+                let value = self.resolve_external_pv(external);
+                let alarm = self
+                    .external_link_alarm(external.name)
+                    .map(SourceAlarm::external);
                 (value, alarm)
             }
-            // A `lnkCalc` link computes its value from its own inputs; the
-            // jlink has no source record whose alarm could be inherited
-            // (`lnkCalc`'s lset implements no `getAlarm`), so it reads as a
-            // value with no alarm.
-            crate::server::record::ParsedLink::Calc(calc) => (self.evaluate_calc_link(calc), None),
+            // A `lnkCalc` link computes its value from its own inputs; its
+            // alarm is the `major`/`minor` one its `getValue` raises on the
+            // reader, not a source record's. The timestamp half is not
+            // here either — C keeps it on the link (`clink->time`) and serves
+            // it from the lset (`lnkCalc_getTimestampTag`), so this port
+            // answers it from `db_get_time_stamp_tag`, the one owner of
+            // link→timestamp.
+            crate::server::record::ParsedLink::Calc(calc) => self.read_calc_link(calc),
             // `lnkState`'s lset implements no `getAlarm`, so a state link
             // reads as a value with no alarm to inherit.
             crate::server::record::ParsedLink::State(st) => (Some(self.read_state_link(st)), None),
             // Hardware links carry no generic readable value; `None` links
-            // deliver nothing.
-            crate::server::record::ParsedLink::Hw(_) | crate::server::record::ParsedLink::None => {
-                (None, None)
-            }
+            // deliver nothing. A removed link has no lset, so `empty_read_fetch`
+            // makes its empty read `dbTryGetLink`'s `S_db_noLSET`.
+            crate::server::record::ParsedLink::Hw(_)
+            | crate::server::record::ParsedLink::None
+            | crate::server::record::ParsedLink::Removed(_) => (None, None),
         }
-    }
-
-    /// Every registered lset, as a snapshot.
-    ///
-    /// The bare-name link paths try each lset in turn, and every lset call is
-    /// now an await. Snapshotting the registry (rather than iterating it under
-    /// its read guard) keeps the registry lock off the await path, so an lset
-    /// that registers or unregisters another while resolving cannot deadlock
-    /// against the caller.
-    fn registered_link_sets(&self) -> Vec<crate::server::database::DynLinkSet> {
-        let registry = self.inner.link_sets.load();
-        registry
-            .schemes()
-            .iter()
-            .filter_map(|s| registry.get(s))
-            .collect()
     }
 
     /// Latched upstream timestamp from the lset, when the
@@ -1324,22 +2395,9 @@ impl PvDatabase {
     /// adopts the `userTag` into `common.utag`. The `userTag` is the
     /// remote `timeStamp.userTag` widened without sign extension, or `0`
     /// when the source carries none.
-    pub(crate) fn external_link_time(&self, name: &str) -> Option<(i64, i32, u64)> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            // Bare name — try every registered lset.
-            for lset in self.registered_link_sets() {
-                if let Some(ts) = lset.time_stamp(name) {
-                    return Some(ts);
-                }
-            }
-            return None;
-        };
-        let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.time_stamp(body)
+    pub(crate) fn external_link_time(&self, name: &[u8]) -> Option<(i64, i32, u64)> {
+        let (target, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.time_stamp(body))
     }
 
     /// Build a [`LinkAlarm`] from the registered lset's alarm
@@ -1350,40 +2408,24 @@ impl PvDatabase {
     /// [`crate::server::database::LinkSet::alarm_severity`]); when it
     /// is `Some`, the `stat` is `LINK_ALARM` and the message comes
     /// from `alarm_message`.
-    fn external_link_alarm(&self, name: &str) -> Option<LinkAlarm> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            // Bare name — try every registered lset until one reports
-            // a severity (mirrors `resolve_external_pv`'s bare path).
-            for lset in self.registered_link_sets() {
-                if let Some(sev) = lset.alarm_severity(name) {
-                    return Some(LinkAlarm {
-                        // prefer the remote STAT for MSS;
-                        // fall back to LINK_ALARM when the lset has none.
-                        stat: lset
-                            .alarm_status(name)
-                            .map(|s| s as u16)
-                            .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
-                        sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-                        amsg: lset.alarm_message(name).unwrap_or_default().into(),
-                    });
-                }
-            }
-            return None;
-        };
-        let lset = self.inner.link_sets.load().get(scheme)?;
-        let sev = lset.alarm_severity(body)?;
-        Some(LinkAlarm {
-            // remote STAT for MSS, else LINK_ALARM.
-            stat: lset
-                .alarm_status(body)
-                .map(|s| s as u16)
-                .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
-            sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
-            amsg: lset.alarm_message(body).unwrap_or_default().into(),
+    fn external_link_alarm(&self, name: &[u8]) -> Option<LinkAlarm> {
+        // A bare name tries every registered lset until one reports a
+        // severity (mirrors `resolve_external_pv`'s bare path).
+        let (target, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+            let sev = lset.alarm_severity(body)?;
+            Some(LinkAlarm {
+                // remote STAT for MSS, else LINK_ALARM.
+                stat: lset
+                    .alarm_status(body)
+                    .map(|s| s as u16)
+                    .unwrap_or(crate::server::recgbl::alarm_status::LINK_ALARM),
+                sevr: crate::server::record::AlarmSeverity::from_u16(sev as u16),
+                amsg: lset
+                    .alarm_message(body)
+                    .map(crate::server::record::SparseText::from)
+                    .unwrap_or_default(),
+            })
         })
     }
 
@@ -1407,22 +2449,10 @@ impl PvDatabase {
     /// dispatch mirrors `Self::external_link_alarm`.
     pub fn external_link_alarm_snapshot(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Option<crate::server::database::RemoteAlarm> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            for lset in self.registered_link_sets() {
-                if let Some(snap) = lset.remote_alarm(name) {
-                    return Some(snap);
-                }
-            }
-            return None;
-        };
-        let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.remote_alarm(body)
+        let (target, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.remote_alarm(body))
     }
 
     /// Remote display / control / valueAlarm metadata for an external
@@ -1443,22 +2473,10 @@ impl PvDatabase {
     /// has no cached value for the link (not yet connected).
     pub fn external_link_metadata(
         &self,
-        name: &str,
+        name: &[u8],
     ) -> Option<crate::server::database::LinkMetadata> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            for lset in self.registered_link_sets() {
-                if let Some(meta) = lset.link_metadata(name) {
-                    return Some(meta);
-                }
-            }
-            return None;
-        };
-        let lset = self.inner.link_sets.load().get(scheme)?;
-        lset.link_metadata(body)
+        let (target, body) = Self::split_external_link_name(name);
+        super::link_put_queue::find_lset(&self.inner, &target, |lset| lset.link_metadata(body))
     }
 
     /// C `dbGetControlLimits` / `dbGetGraphicLimits` / `dbGetAlarmLimits` /
@@ -1548,7 +2566,7 @@ impl PvDatabase {
     pub fn link_metadata(
         &self,
         link: &crate::server::record::ParsedLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
         use crate::server::record::ParsedLink;
         match link {
@@ -1557,7 +2575,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                self.external_link_metadata(&name)
+                self.external_link_metadata(name)
             }
             // Constant / unset / hardware / lnkCalc: no metadata lset slots.
             _ => None,
@@ -1628,9 +2646,9 @@ impl PvDatabase {
     fn db_link_metadata(
         &self,
         db: &crate::server::record::DbLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
-        let key = db.pvname();
+        let key = db.pvname().clone();
         // C `if (!(mutable_plink->flags & DBLINK_FLAG_VISITED))`
         // (`dbDbLink.c:253`): a re-entered link returns the `S_dbLib_badLink`
         // initialiser without touching the buffer.
@@ -1649,19 +2667,19 @@ impl PvDatabase {
     /// `dbInitLink`'s locality dispatch (`dbLink.c:118-130`): a target that
     /// is not in this IOC never gets `dbDb_lset` at all — it is made a CA
     /// link, so its metadata comes from the `dbCa` lset. Mirrors the same
-    /// split `read_target_value` makes for the value path.
+    /// split `read_db_link_value` makes for the value path.
     fn db_target_metadata(
         &self,
         db: &crate::server::record::DbLink,
-        visited: &mut HashSet<String>,
+        visited: &mut HashSet<RecordName>,
     ) -> Option<crate::server::database::LinkMetadata> {
         let target = db.target();
-        let record = match self.link_target(&target.record) {
+        let record = match self.db_link_target(db) {
             LinkTarget::Local(rec) => rec,
             // Local but not a record: no field to carry metadata, and C would
             // not have made this a CA link either.
             LinkTarget::LocalNotRecord => return None,
-            LinkTarget::External => return self.external_link_metadata(&db.pvname()),
+            LinkTarget::External => return self.external_link_metadata(db.pvname()),
         };
         // C `dbGet(paddr, DBR_DOUBLE, &buffer, &option, ...)` under the
         // target's lock (`dbDbLink.c:252-256` between `dbScanLock` /
@@ -1746,13 +2764,12 @@ impl PvDatabase {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
         }
-        let record = &db.target().record;
-        if let Some(src) = self.get_record(record) {
-            let is_passive = src.read().common.scan == crate::server::record::ScanType::Passive;
+        if let Some(at) = self.db_link_addr(db) {
+            let is_passive = at.rec.read().common.scan == crate::server::record::ScanType::Passive;
             if is_passive {
                 // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
-                let _ = self.process_record_with_links_recursive(record, visited);
+                let _ = self.process_record_with_links_recursive_at(&at.name, &at.rec, visited);
             }
         }
     }
@@ -1769,6 +2786,21 @@ impl PvDatabase {
         is_soft: bool,
         visited: &mut ProcStack,
     ) -> Option<EpicsValue> {
+        self.read_link_value_soft_with_alarm(link, is_soft, false, visited)
+            .0
+    }
+
+    /// [`Self::read_link_value_soft`] and the source's alarm off the SAME
+    /// read. The arms decide only WHETHER the link reads this cycle; the read
+    /// is [`Self::read_link_value_and_alarm_at_source`]'s, with the source's
+    /// `DBR_STRING` part when `render` asks for it.
+    pub(crate) fn read_link_value_soft_with_alarm(
+        &self,
+        link: &crate::server::record::ParsedLink,
+        is_soft: bool,
+        render: bool,
+        visited: &mut ProcStack,
+    ) -> RenderedRead {
         match link {
             // A CONSTANT input link delivers NOTHING at process time. C
             // `dbConstGetValue` (`dbConstLink.c:219-225`) returns status 0
@@ -1787,33 +2819,32 @@ impl PvDatabase {
             // into an aai/waveform whose INP is an unset/constant link, which
             // is how EVERY device-fed and client-fed array record is
             // configured) was clobbered on the next scan.
-            crate::server::record::ParsedLink::Constant(_) => None,
-            crate::server::record::ParsedLink::Db(db) if is_soft => {
-                // PP: process source record if Passive before reading
-                self.process_passive_db_source(db, visited);
-                self.read_db_link_value(db)
+            crate::server::record::ParsedLink::Constant(_) => (None, None, None),
+            crate::server::record::ParsedLink::Db(_) if is_soft => {
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
             | crate::server::record::ParsedLink::PvaJson(_)
                 if is_soft =>
             {
-                let name = link
-                    .external_pv_name()
-                    .expect("Ca/Pva/PvaJson link carries a PV name");
-                self.resolve_external_pv(&name)
+                self.read_link_value_and_alarm_at_source(link, render, visited)
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
             // soft path) or remote CA/PVA, but the calc evaluation
             // is uniform either way.
-            crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc),
+            crate::server::record::ParsedLink::Calc(_) => {
+                self.read_link_value_and_alarm_at_source(link, render, visited)
+            }
             // A state link answers whatever the DTYP, for the same reason a
             // calc link does: `lnkState`'s own lset implements `getValue`
             // (`lnkState.c:139-151`), so there is no device support to route
             // around and no target record to process first.
-            crate::server::record::ParsedLink::State(st) => Some(self.read_state_link(st)),
-            _ => None,
+            crate::server::record::ParsedLink::State(_) => {
+                self.read_link_value_and_alarm_at_source(link, render, visited)
+            }
+            _ => (None, None, None),
         }
     }
 
@@ -1848,19 +2879,28 @@ impl PvDatabase {
     /// (`dbDbLink.c:512` at R7.0.10) and lets `dbProcess`'s own already-active
     /// arm refuse it, which is what counts the refusal in LCNT
     /// (`dbAccess.c:536-556`). Gating the call here would skip that count.
-    pub(crate) fn process_target(
+    ///
+    /// The target is the `dbAddr`'s `precord` C's `processTarget` is handed,
+    /// already resolved.
+    ///
+    /// `held` is the caller's frame set, which a target merged into it is
+    /// written under without taking it again.
+    pub(crate) fn process_target_at(
         &self,
-        target_name: &str,
+        target_rec: &Arc<crate::server::record::RecordCell>,
         gate: ProcessTargetGate,
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
+        held: Option<&super::SetGuard>,
         visited: &mut ProcStack,
     ) {
-        let Some(target_rec) = self.get_record(target_name) else {
-            return;
-        };
         {
-            let mut tg = target_rec.write();
+            let mut tg = target_rec.write_under(held);
+            // A forward bound before the target was removed still reaches its
+            // cell (the record table keeps it); a removed record runs nothing.
+            if tg.is_destroyed() {
+                return;
+            }
             // The gate. A target that does not pass it never reaches
             // `processTarget`, so it gets no PUTF, no RPRO, and no put-notify
             // join — the join in particular would `enter` the wait-set without
@@ -1868,11 +2908,13 @@ impl PvDatabase {
             if !gate.admits(tg.common.scan) {
                 return;
             }
-            let pact = tg.is_processing();
-            if !pact {
+            // C's `pdst->pact` is both halves: a cycle on this chain (C's
+            // `processTarget` marker, `claim_dst` false) or an async wait.
+            let on_chain = visited.holds(target_rec);
+            if !on_chain && !tg.is_processing() {
                 tg.common.putf = src_putf;
                 tg.join_put_notify(src_notify);
-            } else if src_putf && !visited.holds(&target_rec) {
+            } else if src_putf && !on_chain {
                 tg.common.rpro = 1;
                 tg.common.putf = false;
             }
@@ -1882,33 +2924,12 @@ impl PvDatabase {
         // `dbProcess(pdst)` is: an active target is refused inside
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there.
-        let _ = self.process_record_with_links_recursive(target_name, visited);
+        let _ = self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited);
     }
 
-    /// Write a value through a DbLink, optionally processing the target if PP and Passive.
-    ///
-    /// Returns `true` when the write failed — C `dbPutLink` status `!= 0`:
-    /// the local `dbPut` was rejected (conversion error, missing field) or
-    /// the non-local external write returned `Err`. Callers that mirror a
-    /// record's `dbPutLink` status (e.g. dfanout `push_values` raising
-    /// `LINK_ALARM/MAJOR`, dfanoutRecord.c:312) fold this into the source's
-    /// alarm; the fanout/seq dispatch paths ignore it.
-    ///
-    /// `src_putf` carries the source record's `PUTF` bit so the target inherits
-    /// it the same way C `dbDbLink.c::processTarget` propagates it (lines 470-498):
-    ///
-    /// - target not pact: `target.putf = src_putf` (normal propagation),
-    /// - target pact AND `src_putf` AND target not on current process chain:
-    ///   `target.rpro = true`, `target.putf = false` so the in-flight cycle
-    ///   reprocesses on completion attributing the put to the originator,
-    /// - otherwise: no PUTF change (target is either being processed
-    ///   recursively by us, or wasn't triggered by a dbPutField).
-    ///
-    /// Without this, a CA WRITE_NOTIFY landing on an upstream calc/seq/dfanout
-    /// that fanned out via DB OUT links would see `target.putf = 0` on every
-    /// downstream record — breaking dbNotify completion attribution and any
-    /// device-support code that uses PUTF to distinguish operator-driven from
-    /// scan-driven processing.
+    /// C `dbDbPutValue` (`dbDbLink.c:372-392`) for a caller with no frame —
+    /// a test's direct write. Returns `true` when the put failed.
+    #[cfg(test)]
     pub(crate) fn write_db_link_value(
         &self,
         link: &crate::server::record::DbLink,
@@ -1916,103 +2937,274 @@ impl PvDatabase {
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
-        let target = link.target();
-        let target_name = local_pv_name(target);
-        // C `dbInitLink` locality (`dbLink.c:118-130`): a target record
-        // not present in this IOC is a CA link, so its write is routed
-        // through the external put path (`dbCaPutLink`), not a local
-        // `dbPut`. The alarm-inheritance / PUTF / `processTarget`
-        // machinery below is the local-DB `dbDbPutValue` body
-        // (dbDbLink.c:372-393), which `dbCaPutLink` performs none of —
-        // so a non-local target returns right after the remote write.
-        // OUTPUT-side twin of the `read_db_link_value` locality fallback.
-        if !self.has_name_no_resolve(&target.record) {
-            let external = link.pvname();
-            if let Err(e) = self.write_external_pv(&external, value, src.notify) {
-                eprintln!("OUT-link write to external PV '{external}' failed: {e}");
-                return true;
-            }
-            return false;
-        }
-        // an OUT-link write-back is an internal step of the
-        // processing chain that already holds the entry record's
-        // advisory write gate (`dbScanLock` analogue). It must use the
-        // `_already_locked` write so it does not re-acquire a gate: a
-        // self-referencing OUT link (`SELF PP`) would otherwise
-        // dead-lock on the entry record's own non-reentrant gate. C
-        // `dbDbPutValue` writes the OUT-link target under the same
-        // lock set the chain already owns.
-        // No put-notify restart is armed by this write, whether or not the
-        // `PP` / `.PROC` branch below drives a cycle: C's owner is the cycle
-        // tail (`recGblFwdLink` → `dbNotifyCompletion`), so a target whose park
-        // this releases replays on its next cycle and an NPP link — `gate` is
-        // `None` below — leaves it parked, exactly as C does.
-        let put_result = self.put_pv_already_locked(&target_name, value);
+        let link = Arc::new(crate::server::record::ParsedLink::Db(Arc::new(
+            link.clone(),
+        )));
+        let mut staged = None;
+        let mut out = LinkWriteOut {
+            staged: &mut staged,
+            visited,
+        };
+        let write = self.write_db_link_value_in(
+            None,
+            link,
+            super::field_io::PutSrc::Owned(value),
+            &src,
+            &mut out,
+        );
+        self.finish_db_link_write(write, out.staged, None, src, out.visited)
+    }
 
-        // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
-        // record's alarm into the destination via `recGblInheritSevrMsg`,
-        // AFTER the `dbPut` and BEFORE `processTarget`. The fields C reads
-        // there are `psrce->nsta/nsev/namsg` — the source's PENDING alarm,
-        // because the put runs inside the source's `process()`, before its
-        // `recGblResetAlarms`. Every OUT-put site in this port drives its
-        // writes in that same pre-commit window and hands them
-        // [`LinkAlarm::pending`]; a committed snapshot would carry the
-        // PREVIOUS cycle's severity. The inherited
-        // severity lands in the dest's PENDING nsev/nsta(/namsg for MSS);
-        // the dest commits it on its next `rec_gbl_reset_alarms` — its
-        // own process cycle, reached below for a `.PROC`/`PP` link, or a
-        // later independent scan otherwise. NMS (the common case) skips
-        // the dest lookup/lock entirely.
-        if link.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize {
-            if let Some(target_rec) = self.get_record(&target.record) {
-                let mut tg = target_rec.write();
-                inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
+    /// [`Self::write_db_link_value_in`] for a DB link whose target is not
+    /// served here: the `dbCaPutLink` of the CA link C made of it.
+    #[cold]
+    #[inline(never)]
+    fn write_db_external(
+        &self,
+        frame: Option<InFrame<'_>>,
+        db: &crate::server::record::DbLink,
+        src: super::field_io::PutSrc<'_>,
+        src_out: &OutLinkSrc<'_>,
+    ) -> DbLinkWrite {
+        let external = db.pvname();
+        let failed = match self.external_put_value(external, src) {
+            None => false,
+            Some(value) => {
+                match self.write_external_pv(
+                    src_out.link_id(frame),
+                    external,
+                    value,
+                    src_out.notify,
+                ) {
+                    Ok(()) => false,
+                    Err(refusal) => {
+                        refusal.report(external);
+                        true
+                    }
+                }
             }
-        }
+        };
+        DbLinkWrite::untargeted(failed)
+    }
 
-        // C `dbDbPutValue` (dbDbLink.c:384-385) returns the put status
-        // immediately after the alarm inheritance and BEFORE the
-        // `.PROC`/`PP` `processTarget` branch: only a successful write
-        // reaches target processing. A failed OUT-link write (missing
-        // field, record put rejection) must therefore NOT trigger the
-        // target's process cycle, which would otherwise run the target
-        // on its stale field value and diverge from C on side effects,
-        // FLNK, alarms, and put-notify completion ordering. The alarm
-        // inheritance above already ran (C folds it regardless of
-        // status), matching the C ordering exactly.
-        //
-        // An empty array into a scalar field is NOT such a failure: C
-        // `dbPut` accepts it, raises LINK/INVALID on the destination and
-        // returns 0 (`dbAccess.c:1370-1372`), so a `PP` link still
-        // processes its target — see `field_io::PutRequest`.
-        if put_result.is_err() {
+    /// The `dbPut` of C `dbDbPutValue` (`dbDbLink.c:372-380`) through `link`,
+    /// a DB link, and the one place its address lives: lent under `frame`'s
+    /// set (the writer's), or the owned answer on a route that holds none. The address and the handle end here, before anything that can
+    /// park and so let the owner's set go (a special's link write, PP): a
+    /// link swapped during a park is freed by the swapper, never by the
+    /// frame. What the rest of `dbDbPutValue` needs comes back owned.
+    ///
+    /// A target record not present in this IOC is a CA link (`dbInitLink`
+    /// locality, `dbLink.c:118-130`): its write goes to the external put
+    /// path (`dbCaPutLink`), which performs none of the inherit / PUTF /
+    /// `processTarget` body, so it comes back with no target.
+    pub(crate) fn write_db_link_value_in(
+        &self,
+        frame: Option<InFrame<'_>>,
+        link: Arc<crate::server::record::ParsedLink>,
+        src: super::field_io::PutSrc<'_>,
+        src_out: &OutLinkSrc<'_>,
+        out: &mut LinkWriteOut<'_>,
+    ) -> DbLinkWrite {
+        let held = frame.map(|f| f.set());
+        use crate::server::record::DbLinkAnswer;
+        use crate::server::record::record_instance::LinkTargetResolver;
+        let crate::server::record::ParsedLink::Db(db) = &*link else {
+            unreachable!("write_db_link_value_in takes a DB link");
+        };
+        let target = db.target();
+        let lent = held.and_then(|held| {
+            db.lend_out_addr(held, self.name_revision(), || self.resolve_db_link(db))
+        });
+        let owned;
+        let (at, shadow) = match lent {
+            Some(at) => (Some(at), None),
+            None => match self.db_link_answer(db) {
+                DbLinkAnswer::Local(at) => {
+                    owned = at;
+                    (Some(&owned), None)
+                }
+                DbLinkAnswer::Shadowed(pv) => (None, Some(pv)),
+                DbLinkAnswer::Absent => (None, None),
+                DbLinkAnswer::External => {
+                    return self.write_db_external(frame, db, src, src_out);
+                }
+            },
+        };
+        if let Some(at) = at {
+            let to = super::field_io::PutTarget {
+                name: &at.name,
+                rec: &at.rec,
+                field: &target.field,
+                at: &at.put,
+            };
+            let acts = TargetActs {
+                gate: ProcessTargetGate::of_put(db),
+                switch: db.monitor_switch,
+            };
+            return self.write_local_target(held, to, acts, src, out);
+        }
+        let mut tail = super::field_io::PutTail::default();
+        let failed = match shadow {
+            // `put_pv_body`'s simple-PV arm, with the PV already settled.
+            Some(pv) => {
+                pv.set(src.into_value());
+                false
+            }
+            None => {
+                let mut chain = super::field_io::PutChain::root(&mut *out.visited);
+                let put = self.put_pv_body(&local_pv_name(target), src.into_value(), &mut chain);
+                tail = chain.tail;
+                put.is_err()
+            }
+        };
+        if tail.has_report() {
+            self.emit_cycle_report(target.record.as_bytes(), &target.field, tail);
+        }
+        // No local target: no inherit and no `processTarget` to run.
+        DbLinkWrite::untargeted(failed)
+    }
+
+    /// [`Self::write_db_link_value_in`] at a local target: C `dbDbPutValue`'s
+    /// `dbPut` through `to`, the gate and MS its link settled.
+    ///
+    /// No put-notify restart is armed by this write, whether or not PP drives
+    /// a cycle: C's owner is the cycle tail (`recGblFwdLink` →
+    /// `dbNotifyCompletion`), so a target whose park this releases replays on
+    /// its next cycle. A refusal's report prints here, under the cycle's hold
+    /// as in C, and `special()`'s after-gate work is discarded.
+    #[inline(always)]
+    fn write_local_target(
+        &self,
+        held: Option<&super::SetGuard>,
+        to: super::field_io::PutTarget<'_>,
+        TargetActs { gate, switch }: TargetActs,
+        src: super::field_io::PutSrc<'_>,
+        out: &mut LinkWriteOut<'_>,
+    ) -> DbLinkWrite {
+        // C `dbPutLinkLS` (`dbLink.c:527-538`): only a `DBF_CHAR`/`DBF_UCHAR`
+        // field takes the characters; any other takes one `DBR_STRING`, lent
+        // from the source's buffer up to its NUL.
+        let ls_str = match src.long_string() {
+            Some(chars) if !takes_chars(held, to.rec, to.at, to.field) => {
+                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                Some(&chars[..end])
+            }
+            _ => None,
+        };
+        let mut tail = super::field_io::PutTail::default();
+        let put = self.db_put_at(
+            held,
+            to,
+            match ls_str {
+                Some(bytes) => super::field_io::PutReq::Str(bytes),
+                None => src.into(),
+            },
+            0,
+            super::field_io::PutVia::DbPut,
+            &mut tail,
+        );
+        // The report prints after the special's link writes, as `dbPut`'s
+        // own does; with none to run it prints here.
+        let failed = put.is_err();
+        if let Ok(Some((actions, rest))) = put {
+            let rest = rest.detach();
+            let report = tail.has_report().then(|| {
+                let field = rest.field();
+                (tail, field)
+            });
+            *out.staged = Some(LinkStage {
+                stage: (actions, rest),
+                report,
+            });
+        } else if tail.has_report() {
+            self.emit_cycle_report(to.name, to.field, tail);
+        }
+        // The owned target, a refcount bump, only for what still acts on it.
+        let needed = out.staged.is_some()
+            || switch != crate::server::record::MonitorSwitch::NoMaximize
+            || (gate.is_some() && !failed);
+        DbLinkWrite {
+            target: needed.then(|| Arc::clone(to.rec)),
+            switch,
+            gate,
+            failed,
+        }
+    }
+
+    /// The rest of C `dbDbPutValue` after its `dbPut`: the special's link
+    /// writes and the rest of that `dbPut` (`LinkTail`), then the source's
+    /// alarm inherited by the target (`dbDbLink.c:382-383`), then
+    /// `processTarget` on a successful put (`:384-390`). Returns `true` when
+    /// the put failed — C `dbPutLink` status `!= 0`.
+    ///
+    /// `source` is the writing record's frame (`None` only for a test's
+    /// frameless write, which inherits nothing).
+    fn finish_db_link_write(
+        &self,
+        write: DbLinkWrite,
+        staged: &mut Option<LinkStage>,
+        source: Option<InFrame<'_>>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        let held = source.map(|source| source.set());
+        let DbLinkWrite {
+            target,
+            switch,
+            gate,
+            mut failed,
+        } = write;
+        if staged.is_some()
+            && let Some(rec) = &target
+        {
+            failed |= self.finish_link_stage(rec, staged, held, visited);
+        }
+        // C `dbDbPutValue` (`dbDbLink.c:382-383`) folds the source's PENDING
+        // alarm into the destination after this put, whatever its status:
+        // `psrce->nsta/nsev/namsg` read now, so an earlier link's
+        // `setLinkAlarm` (`dbLink.c:445`) in the same cycle is part of
+        // it. NMS (the common case) reads nothing.
+        if switch != crate::server::record::MonitorSwitch::NoMaximize
+            && let Some(rec) = &target
+            && let Some(source) = source
+        {
+            let alarm = LinkAlarm::pending(&source.read().common);
+            let mut tg = rec.write_under(held);
+            inherit_sevr_msg(&mut tg.common, switch, &alarm);
+        }
+        // Only a successful write reaches target processing. An empty array
+        // into a scalar field is not a failure: C `dbPut` raises LINK/INVALID
+        // on the destination and returns 0 (`dbAccess.c:1370-1372`).
+        if failed {
             return true;
         }
-
-        // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target when the
-        // destination field is `.PROC` **or** the link carries `pvlOptPP` (an
-        // explicit ` PP` token → `ProcessPassive`) and the target is Passive.
-        // The two arms are different gates, not one: the `.PROC` arm is
-        // independent of both the PP flag and the target's SCAN (R18-94). It is
-        // therefore checked here in the write path rather than encoded as a
-        // parse-time policy: a modifier-less link defaults to `NoProcess`
-        // uniformly (INPUT and OUTPUT alike), and writing into a record's
-        // `.PROC` field still forces a process.
-        let gate = if target.field == "PROC" {
-            Some(ProcessTargetGate::ProcField)
-        } else if link.policy == crate::server::record::LinkProcessPolicy::ProcessPassive {
-            Some(ProcessTargetGate::ScanPassive)
-        } else {
-            None
-        };
-        if let Some(gate) = gate {
-            // Through the single `processTarget` owner, which holds the gate.
-            // Alias-aware: `process_target` resolves the name, as
-            // `process_record_with_links` does at entry.
-            self.process_target(&target.record, gate, src.putf, src.notify, visited);
+        if let (Some(gate), Some(rec)) = (gate, &target) {
+            self.process_target_at(rec, gate, src.putf, src.notify, held, visited);
         }
-        // Successful local write (C `dbPutLink` status 0).
         false
+    }
+
+    /// [`LinkStage`]'s owed work: the special's link writes, the rest of its
+    /// `dbPut`, then the report. `true` when the put failed.
+    #[cold]
+    fn finish_link_stage(
+        &self,
+        rec: &Arc<crate::server::record::RecordCell>,
+        staged: &mut Option<LinkStage>,
+        held: Option<&super::SetGuard>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        let Some(LinkStage { stage, report }) = staged.take() else {
+            return false;
+        };
+        let failed = self
+            .finish_put_stage(rec.name(), rec, Some(stage), held, visited)
+            .is_err();
+        if let Some((tail, field)) = report {
+            self.emit_cycle_report(rec.name(), &field, tail);
+        }
+        failed
     }
 
     /// Resolve an external OUT-link name to its put-queue target and ask C
@@ -2029,37 +3221,24 @@ impl PvDatabase {
     /// and the answer the write obeys cannot differ.
     fn external_put_gate<'a>(
         &self,
-        name: &'a str,
-    ) -> Result<(super::link_put_queue::LinkTarget, &'a str), String> {
-        use super::link_put_queue::LinkTarget;
+        name: &'a [u8],
+    ) -> Result<(super::link_put_queue::LinkTarget, &'a [u8]), ExternalPutRefusal> {
+        use super::link_put_queue::{LinkTarget, find_lset};
         use super::link_set::PutAdmission;
+        let shown = String::from_utf8_lossy(name);
 
-        let (target, body, lsets) = if let Some(rest) = name.strip_prefix("pva://") {
-            let lset = self
-                .inner
-                .link_sets
-                .load()
-                .get("pva")
-                .ok_or_else(|| format!("no 'pva' link set registered for '{name}'"))?;
-            (LinkTarget::Scheme("pva".to_string()), rest, vec![lset])
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            let lset = self
-                .inner
-                .link_sets
-                .load()
-                .get("ca")
-                .ok_or_else(|| format!("no 'ca' link set registered for '{name}'"))?;
-            (LinkTarget::Scheme("ca".to_string()), rest, vec![lset])
-        } else {
-            // Bare name — every registered lset is a candidate, first
-            // accepting write wins (mirrors `resolve_external_pv`'s
-            // bare-name path).
-            let lsets = self.registered_link_sets();
-            if lsets.is_empty() {
-                return Err(format!("no link set registered for external link '{name}'"));
-            }
-            (LinkTarget::Any, name, lsets)
-        };
+        // A bare name has every registered lset as a candidate, first
+        // accepting write wins (mirrors `resolve_external_pv`'s bare-name
+        // path).
+        let (target, body) = Self::split_external_link_name(name);
+        if !self.link_addressable(&target, body) {
+            return Err(ExternalPutRefusal::Unserviceable(match target {
+                LinkTarget::Scheme(scheme) => {
+                    format!("no '{scheme}' link set registered for '{shown}'")
+                }
+                LinkTarget::Any => format!("no link set registered for external link '{shown}'"),
+            }));
+        }
 
         // A database built with no tokio runtime anywhere has no reactor for
         // the queue's network half, and there is no second executor that could
@@ -2072,11 +3251,11 @@ impl PvDatabase {
         // worker unconditionally and blocks until it has started
         // (`db/dbCa.c:322` (`dbCaLinkInitImpl`), `:342`, `:344`; R7.0.10).
         if self.inner.link_puts.network().is_none() {
-            return Err(format!(
-                "external link '{name}' refused the write: this database was \
+            return Err(ExternalPutRefusal::Unserviceable(format!(
+                "external link '{shown}' refused the write: this database was \
                  built with no tokio runtime, so no link set can reach the \
                  network"
-            ));
+            )));
         }
 
         // A link that is known-down refuses the put and stages nothing, so the
@@ -2084,32 +3263,54 @@ impl PvDatabase {
         // state — this is the only lset call left inside the record's advisory
         // write gate, and it does no I/O.
         let mut admission = PutAdmission::Refused;
-        for lset in &lsets {
+        find_lset(&self.inner, &target, |lset| {
             match lset.put_admission(body) {
                 PutAdmission::Connected => {
                     admission = PutAdmission::Connected;
-                    break;
+                    Some(())
                 }
                 // Unopened outranks Refused: the write must still be
                 // staged so the lset's lazy open runs (see `PutAdmission`).
-                PutAdmission::Unopened => admission = PutAdmission::Unopened,
-                PutAdmission::Refused => {}
+                PutAdmission::Unopened => {
+                    admission = PutAdmission::Unopened;
+                    None
+                }
+                PutAdmission::Refused => None,
             }
-        }
+        });
         if admission == PutAdmission::Refused {
-            return Err(format!(
-                "external link '{name}' refused the write: not connected, or \
-                 connected without write access (db/dbCa.c:529-532 \
-                 (dbCaPutLinkCallback))"
-            ));
+            return Err(ExternalPutRefusal::NotConnected);
         }
         Ok((target, body))
     }
 
     /// Ask [`Self::external_put_gate`] on its own, staging nothing: `Ok` iff a
     /// put to `name` would be issued right now.
-    pub(crate) fn external_put_admitted(&self, name: &str) -> Result<(), String> {
+    pub(crate) fn external_put_admitted(&self, name: &[u8]) -> Result<(), ExternalPutRefusal> {
         self.external_put_gate(name).map(|_| ())
+    }
+
+    /// What an OUT put sends over an external link. A long string is C
+    /// `dbPutLinkLS`'s (`dbLink.c:527-538`), whose `dbGetLinkDBFtype` is the
+    /// channel's native type, or -1 while it is down (`pcaGetCheck`,
+    /// `dbCa.c:650-660`): then nothing is put and the status is 0. A
+    /// `DBF_CHAR`/`DBF_UCHAR` channel takes the characters; any other one
+    /// `DBR_STRING`.
+    fn external_put_value(
+        &self,
+        name: &[u8],
+        src: super::field_io::PutSrc<'_>,
+    ) -> Option<EpicsValue> {
+        let Some(chars) = src.long_string() else {
+            return Some(src.into_value());
+        };
+        match self.external_link_metadata(name)?.dbf_type? {
+            LinkDbfType::Char | LinkDbfType::UChar => Some(src.into_value()),
+            _ => {
+                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+                Some(EpicsValue::String(PvString::from(&chars[..end])))
+            }
+        }
     }
 
     /// Write a value to an external (`ca://` / `pva://`) OUT link
@@ -2169,12 +3370,13 @@ impl PvDatabase {
     /// reported through, so the two cannot disagree.
     pub(crate) fn write_external_pv(
         &self,
-        name: &str,
+        link: super::LinkId,
+        name: &[u8],
         value: EpicsValue,
         src_notify: Option<&Arc<NotifyWaitSet>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExternalPutRefusal> {
         let op = Self::external_put_op(src_notify);
-        use super::link_put_queue::LinkKey;
+        use super::link_put_queue::{Channel, LinkKey};
 
         let (target, body) = self.external_put_gate(name)?;
 
@@ -2182,8 +3384,11 @@ impl PvDatabase {
             .link_puts
             .ensure_owner(std::sync::Arc::downgrade(&self.inner));
         let key = LinkKey {
-            target,
-            name: body.to_string(),
+            link,
+            channel: Channel {
+                target,
+                name: body.into(),
+            },
         };
         match self.inner.link_puts.stage_put(key, value, op) {
             // `dbCaPutLink`: staged, signalled, returned (`dbCa.c:593-595`).
@@ -2246,46 +3451,30 @@ impl PvDatabase {
         self.inner.link_puts.completed_count()
     }
 
-    /// Fire a forward link (FLNK) whose target is an external
-    /// (`pva://` / `ca://`) PV — the FWD-link counterpart of
-    /// [`Self::write_external_pv`]. Resolves the scheme (or tries every
-    /// registered lset for a bare name, first to accept wins, exactly as
-    /// the OUT-write path does) and delegates to [`LinkSet::scan_forward`](super::LinkSet::scan_forward).
+    /// Fire a forward link whose target is an external PV, C `dbScanFwdLink`
+    /// → `plink->lset->scanForward` (`dbLink.c:475-480`). Returns the lset's
+    /// `Err` unchanged so the caller can raise LINK/INVALID on the owning
+    /// record (pvxs `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`).
     ///
-    /// Mirrors C `dbScanFwdLink` → `plink->lset->scanForward`
-    /// (`dbLink.c:475-480`): the database hands the forward link to the
-    /// link set, which (for pvalink) runs `pvaScanForward`. Returns the
-    /// lset's `Err` unchanged so the caller can raise LINK/INVALID on the
-    /// owning record (pvxs `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`).
-    pub(crate) fn scan_forward_external_pv(&self, name: &str) -> Result<(), String> {
-        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
-            ("pva", rest)
-        } else if let Some(rest) = name.strip_prefix("ca://") {
-            ("ca", rest)
-        } else {
-            // Bare name — try every registered lset in turn, first
-            // accepting the forward wins (mirrors `write_external_pv`'s
-            // bare-name path so FWD and OUT route a bare target alike).
-            let lsets = self.registered_link_sets();
-            if lsets.is_empty() {
-                return Err(format!("no link set registered for forward link '{name}'"));
-            }
-            let mut last_err = String::new();
-            for lset in lsets {
-                match lset.scan_forward(name) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => last_err = e,
+    /// A CA link is dbCa's `scanForward` (`dbCa.c:643-648`): a plain
+    /// `dbCaPutLink` of 1 when `pvlOptFWD` is set, nothing otherwise, and its
+    /// status is dropped, so it never alarms. A `pva` link runs the handle
+    /// its lset opened it with ([`Self::bind_external_forward`]).
+    pub(crate) fn scan_forward_external_pv(
+        &self,
+        link: super::LinkId,
+        target: crate::server::record::ExternalForward<'_>,
+    ) -> Result<(), super::LinkForwardRefused> {
+        use crate::server::record::ExternalForward;
+        match target {
+            ExternalForward::Ca { pv, fwd } => {
+                if fwd {
+                    let _ = self.write_external_pv(link, pv, EpicsValue::Short(1), None);
                 }
+                Ok(())
             }
-            return Err(last_err);
-        };
-        let lset = self
-            .inner
-            .link_sets
-            .load()
-            .get(scheme)
-            .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        lset.scan_forward(body)
+            ExternalForward::Pva(slot) => slot.scan_forward(),
+        }
     }
 
     /// Map a record's put-completion wait-set to the external-link put
@@ -2326,7 +3515,7 @@ impl PvDatabase {
     /// field: an array field reports its record's `NELM` when it has one and
     /// its current length otherwise; a scalar field reports 1.
     pub(crate) fn resolve_out_target(&self, link: &crate::server::record::ParsedLink) -> OutTarget {
-        let external = |name: String| {
+        let external = |name: crate::types::RecordName| {
             match self.external_link_metadata(&name) {
                 Some(m) => {
                     let field_type = m.dbf_type.map(link_dbf_to_field_type);
@@ -2343,24 +3532,45 @@ impl PvDatabase {
                             field_type,
                             Some(DbFieldType::String) | Some(DbFieldType::Enum)
                         ),
+                        constant_type: false,
                     }
                 }
                 None => OutTarget {
                     is_ca_link: true,
+                    constant_type: false,
                     ..OutTarget::UNRESOLVED
                 },
             }
         };
         match link {
             crate::server::record::ParsedLink::Db(db) => {
+                // A DB link is never `CONSTANT`, addressable or not.
+                const UNADDRESSED: OutTarget = OutTarget {
+                    constant_type: false,
+                    ..OutTarget::UNRESOLVED
+                };
                 let addressed = db.target();
-                let target = match self.link_target(&addressed.record) {
+                let target = match self.db_link_target(db) {
                     LinkTarget::Local(rec) => rec,
-                    LinkTarget::LocalNotRecord => return OutTarget::UNRESOLVED,
+                    LinkTarget::LocalNotRecord => return UNADDRESSED,
                     // Non-local ⇒ CA link in C (`dbInitLink` locality).
-                    LinkTarget::External => return external(db.pvname()),
+                    LinkTarget::External => return external(db.pvname().into()),
                 };
                 let guard = target.read();
+                // `dbGetLinkDBFtype` / `dbGetNelements` of a `$` address: the
+                // `DBF_CHAR` view and its `no_elements`.
+                if addressed.string_view {
+                    return match super::char_view::char_view(&guard, &addressed.field) {
+                        Some(view) => OutTarget {
+                            field_type: Some(DbFieldType::Char),
+                            element_count: (view.no_elements as i64).max(1),
+                            is_ca_link: false,
+                            puts_as_string: false,
+                            constant_type: false,
+                        },
+                        None => UNADDRESSED,
+                    };
+                }
                 let field_type = crate::server::record::record_instance::declared_field_type_of(
                     guard.record.as_ref(),
                     &addressed.field,
@@ -2389,6 +3599,7 @@ impl PvDatabase {
                     // port's DBR-typed `field_type` cannot name. The target
                     // record classifies its own field.
                     puts_as_string: guard.field_puts_as_string(&addressed.field),
+                    constant_type: false,
                 }
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -2397,7 +3608,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                external(name.to_string())
+                external(name.as_ref().into())
             }
             // C `lnkState_getDBFtype`/`lnkState_getElements`
             // (`lnkState.c:126-135`): one `DBF_SHORT` element, and never a
@@ -2407,10 +3618,14 @@ impl PvDatabase {
                 element_count: 1,
                 is_ca_link: false,
                 puts_as_string: false,
+                constant_type: false,
             },
-            // Constant / Hw / Calc / None: not a writable target — the write
-            // path no-ops, so the metadata is never used.
-            _ => OutTarget::UNRESOLVED,
+            // Constant / Hw / Calc / None / Removed: no target. The type is
+            // the one the link holds — a removed DB link's is `PV_LINK`.
+            _ => OutTarget {
+                constant_type: link.db_link_type() == crate::server::record::DbLinkType::Constant,
+                ..OutTarget::UNRESOLVED
+            },
         }
     }
 
@@ -2426,7 +3641,7 @@ impl PvDatabase {
     /// after `dbNameToAddr` / `dbCaGet*`.
     pub(crate) fn multi_out_buffer_choice(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         link_field: &str,
         link: &crate::server::record::ParsedLink,
         staged: EpicsValue,
@@ -2452,9 +3667,12 @@ impl PvDatabase {
     /// `sseq` once implemented `Record::multi_output_links` as well and was
     /// double-dispatched; the `multi_output_dispatch_owned` gate makes that
     /// structurally impossible rather than fixed at the record.
+    ///
+    /// Inline so the no-op answer of every type without pairs costs no call.
+    #[inline(always)]
     pub(crate) fn dispatch_multi_output_values(
         &self,
-        rec: &Arc<RecordCell>,
+        rec: InFrame<'_>,
         src: OutLinkSrc<'_>,
         skip_out: bool,
         plan: &crate::server::record::record_instance::ProcessPlan,
@@ -2480,6 +3698,17 @@ impl PvDatabase {
             );
             return;
         }
+        self.write_multi_output_pairs(rec, src, visited);
+    }
+
+    /// [`Self::dispatch_multi_output_values`] past its gate, out of line so a
+    /// type the gate turns away pays a branch and not this frame's prologue.
+    fn write_multi_output_pairs(
+        &self,
+        rec: InFrame<'_>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) {
         let pairs = {
             let instance = rec.read();
             debug_assert!(
@@ -2489,31 +3718,28 @@ impl PvDatabase {
             let links = instance.record.multi_output_links();
             let mut pairs = Vec::new();
             for &(link_field, val_field) in links {
-                let link_str = match instance.record.get_field(link_field) {
-                    Some(EpicsValue::String(s)) => s,
-                    _ => continue,
+                let link = match instance.stored_link_shared(link_field) {
+                    None => continue,
+                    Some(link) if matches!(**link, crate::server::record::ParsedLink::None) => {
+                        continue;
+                    }
+                    Some(link) => link,
                 };
-                if link_str.is_empty() {
-                    continue;
-                }
                 if let Some(val) = instance.record.get_field(val_field) {
-                    pairs.push((link_field, link_str, val));
+                    pairs.push((link_field, Arc::clone(link), val));
                 }
             }
             pairs
         };
-        for (link_field, link_str, val) in pairs {
+        for (link_field, parsed, val) in pairs {
             // `multi_output_links` carries record OUT links (scalcout /
             // acalcout `OUT` — `DBF_OUTLINK`) driven via `dbPutLink` →
             // `dbDbPutValue` (`dbDbLink.c:388`): a bare DB link is NPP, the
-            // value is written but the target is NOT processed.
-            // `parse_output_link_v2` applies that OUT-link-correct NPP default;
-            // `parse_link_v2` would wrongly default a bare link to
-            // ProcessPassive and re-process the target. An external
-            // `ca://`/`pva://` OUT link routes through the link set's
-            // `putValue` (C `dbLink.c::dbPutLink`, dbLink.c:434-448).
-            let parsed =
-                crate::server::record::parse_output_link_v2(link_str.as_str_lossy().as_ref());
+            // value is written but the target is NOT processed: the slot
+            // parsed the field under the OUT-link mask, whose NPP default
+            // that is. An external `ca://`/`pva://` OUT link routes through
+            // the link set's `putValue` (C `dbLink.c::dbPutLink`,
+            // dbLink.c:434-448).
             // Device-support write-buffer switch: the resolved target's DBF
             // type / element count decides which of the record's buffers C
             // would actually put (`devsCalcoutSoft.c:66-144`,
@@ -2521,8 +3747,8 @@ impl PvDatabase {
             let val = self.multi_out_buffer_choice(rec, link_field, &parsed, val);
             self.write_out_link_value(
                 rec,
-                &parsed,
-                val,
+                parsed,
+                super::PutSrc::Owned(val),
                 OutLinkSrc {
                     field: link_field,
                     ..src
@@ -2534,7 +3760,7 @@ impl PvDatabase {
 
     /// **The put owner** — C `dbLink.c::dbPutLink` (434-448). Writes a value
     /// through a parsed OUT link, dispatching DB links to
-    /// [`Self::write_db_link_value`] and external (`ca://`/`pva://`) links to
+    /// [`Self::write_db_link_value_in`] and external (`ca://`/`pva://`) links to
     /// [`Self::write_external_pv`], and — this is the part no caller may skip
     /// — raising the source record's `LINK_ALARM`/`INVALID` when the put
     /// fails:
@@ -2558,32 +3784,37 @@ impl PvDatabase {
     /// `src.field` names the link field for the alarm message, as C's
     /// `setLinkAlarm` does (`"field %s"`, `dbLinkFieldName(plink)`).
     ///
-    /// This is also the OUTPUT-side counterpart of [`Self::read_link_value`]'s
+    /// This is also the OUTPUT-side counterpart of [`Self::read_link_value_and_alarm_at_source`]'s
     /// scheme dispatch: the OUT-link write stage in `processing.rs`
     /// must route a `ParsedLink::Ca`/`Pva` through the link set, not
     /// only handle `ParsedLink::Db`.
     ///
-    /// `Constant`/`Hw`/`Calc`/`None` OUT links are not writable
-    /// targets and are silently skipped (C `dbPutLink` returns
-    /// `S_db_noLSET` for a link with no lset — the same no-op, and C does NOT
-    /// alarm on `S_db_noLSET`: `dbGetLink` explicitly maps it to a plain `-1`
-    /// with no `setLinkAlarm`).
+    /// A `Constant`/`None` OUT link takes the put as a successful no-op
+    /// (`dbConstPutValue`). A `Hw`/`Removed` one has no lset, so the put
+    /// fails `S_db_noLSET` without a `setLinkAlarm` (`dbLink.c:440-441`).
     ///
     /// Returns C's `dbPutLink` status as a bool — `true` when the put failed.
     /// A caller needs it only to reproduce a record-specific alarm C raises ON
     /// TOP of the put's own (dfanout's `LINK_ALARM`/`MAJOR`); the INVALID that
     /// every failing put owes the record is already raised here.
+    #[inline]
     pub(crate) fn write_out_link_value(
         &self,
-        src_rec: &Arc<RecordCell>,
-        link: &crate::server::record::ParsedLink,
-        value: EpicsValue,
+        src_rec: InFrame<'_>,
+        link: Arc<crate::server::record::ParsedLink>,
+        value: super::field_io::PutSrc<'_>,
         src: OutLinkSrc<'_>,
         visited: &mut ProcStack,
     ) -> bool {
-        let failed = match link {
-            crate::server::record::ParsedLink::Db(db) => {
-                self.write_db_link_value(db, value, src, visited)
+        let failed = match &*link {
+            crate::server::record::ParsedLink::Db(_) => {
+                let mut staged = None;
+                let mut out = LinkWriteOut {
+                    staged: &mut staged,
+                    visited,
+                };
+                let write = self.write_db_link_value_in(Some(src_rec), link, value, &src, &mut out);
+                self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -2591,39 +3822,191 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                match self.write_external_pv(&name, value, src.notify) {
-                    Ok(()) => false,
-                    Err(e) => {
-                        eprintln!("OUT-link write to external PV '{name}' failed: {e}");
-                        true
+                match self.external_put_value(name, value) {
+                    None => false,
+                    Some(value) => {
+                        match self.write_external_pv(
+                            src.link_id(Some(src_rec)),
+                            name,
+                            value,
+                            src.notify,
+                        ) {
+                            Ok(()) => false,
+                            Err(refusal) => {
+                                refusal.report(name);
+                                true
+                            }
+                        }
                     }
                 }
             }
             // C `lnkState_putValue` (`lnkState.c:153-203`) drives the named
             // bit; a DBR class it has no arm for is `S_db_badDbrtype`, which
-            // `dbPutLink` reports as a failed put.
+            // `dbPutLink` turns into the link alarm and nothing printed
+            // (`dbLink.c:443-446`).
             crate::server::record::ParsedLink::State(st) => {
-                match crate::server::record::StateLink::truth_of(&value) {
-                    Some(truth) => {
+                use crate::server::record::{StateLink, StatePut};
+                let owned;
+                let value = match value.value() {
+                    Some(v) => v,
+                    None => {
+                        owned = value.into_value();
+                        &owned
+                    }
+                };
+                match StateLink::put_of(value) {
+                    StatePut::Truth(truth) => {
                         self.db_state(&st.name).set(st.write(truth));
                         false
                     }
-                    None => {
-                        eprintln!(
-                            "OUT-link write to state '{}' failed: unsupported value type",
-                            st.name
-                        );
-                        true
-                    }
+                    StatePut::Nothing => false,
+                    StatePut::BadDbrType => true,
                 }
             }
-            // Constant / Hw / Calc / None are not writable OUT-link
-            // targets — no-op (C `dbPutLink` → `S_db_noLSET`).
-            _ => false,
+            crate::server::record::ParsedLink::Calc(calc) => {
+                self.put_calc_link(src_rec, calc, value, src, visited)
+            }
+            // A constant link's `dbConstPutValue` answers 0
+            // (`dbConstLink.c:228-232`). A hardware or removed link has no
+            // lset: `S_db_noLSET`, and no `setLinkAlarm` (`dbLink.c:440-441`).
+            other => return crate::server::recgbl::simm::has_no_lset(other),
         };
         if failed {
+            set_out_link_alarm(src_rec, src.field);
+        }
+        failed
+    }
+
+    /// [`Self::write_out_link_value`] for the write a frame captured.
+    #[inline(always)]
+    pub(crate) fn write_out(
+        &self,
+        src_rec: InFrame<'_>,
+        out: OutLinkWrite,
+        value: super::field_io::PutSrc<'_>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        match out.0 {
+            OutWrite::Lent(ref lent) => self.write_lent_out(src_rec, lent, value, src, visited),
+            OutWrite::Link(link) => self.write_out_link_value(src_rec, link, value, src, visited),
+        }
+    }
+
+    /// C `dbDbPutValue` at the lent target, which needs no link.
+    fn write_lent_out(
+        &self,
+        src_rec: InFrame<'_>,
+        lent: &LentOut,
+        value: super::field_io::PutSrc<'_>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        let held = src_rec.set();
+        // SAFETY: `OutLinkWrite::capture` read the target from this frame's
+        // record's OUT cache at the revision it checked.
+        let rec = unsafe { lent.target.lend(held, src_rec.unframed()) };
+        let put = lent.target.put();
+        let to = super::field_io::PutTarget {
+            name: rec.name(),
+            rec: &rec,
+            field: lent.field.name,
+            at: &put,
+        };
+        let mut staged = None;
+        let mut out = LinkWriteOut {
+            staged: &mut staged,
+            visited,
+        };
+        let write = self.write_local_target(Some(held), to, lent.acts, value, &mut out);
+        let failed = self.finish_db_link_write(write, out.staged, Some(src_rec), src, out.visited);
+        if failed {
+            set_out_link_alarm(src_rec, src.field);
+        }
+        failed
+    }
+
+    /// C `lnkCalc_putValue` (`lnkCalc.c:631-703`): the value, or `expr`
+    /// over the args when there is one, is checked by `major` then `minor`
+    /// and put through `out`. `true` is a non-zero status.
+    #[cold]
+    #[inline(never)]
+    fn put_calc_link(
+        &self,
+        src_rec: InFrame<'_>,
+        calc: &crate::server::record::CalcLink,
+        value: super::field_io::PutSrc<'_>,
+        src: OutLinkSrc<'_>,
+        visited: &mut ProcStack,
+    ) -> bool {
+        use crate::server::record::AlarmSeverity;
+        let Some(vars) = self.calc_link_args(calc) else {
+            return true;
+        };
+        // C `calcPerform(clink->arg, &val, expr)`: `VAL` reads the value
+        // the expression starts from.
+        let perform = |expr: &str, val: f64| {
+            let compiled = crate::calc::compile(expr).ok()?;
+            let mut inputs = crate::calc::engine::NumericInputs::with_vars(vars);
+            inputs.prev_val = val;
+            crate::calc::eval(&compiled, &mut inputs).ok()
+        };
+        let Some(mut val) = value.into_value().get_convert_f64() else {
+            return true;
+        };
+        if let Some(expr) = &calc.expr {
+            let Some(v) = perform(expr, val) else {
+                return true;
+            };
+            val = v;
+        }
+        calc.val.set(val);
+        // C copies "post_major error" into the link's own message for
+        // `minor` too (`lnkCalc.c:696`); the record's message is right.
+        let mut raised = false;
+        for (expr, sevr, msg) in [
+            (&calc.major, AlarmSeverity::Major, "post_major error"),
+            (&calc.minor, AlarmSeverity::Minor, "post_minor error"),
+        ] {
+            let Some(expr) = expr else { continue };
+            if raised {
+                break;
+            }
+            let Some(alval) = perform(expr, val) else {
+                return true;
+            };
+            if alval != 0.0 {
+                raised = true;
+                let mut inst = src_rec.write();
+                crate::server::recgbl::rec_gbl_set_sevr_msg(
+                    &mut inst.common,
+                    crate::server::recgbl::alarm_status::LINK_ALARM,
+                    sevr,
+                    msg,
+                );
+            }
+        }
+        let Some(out) = &calc.out else {
+            // A zeroed `clink->out` has no lset: `S_db_noLSET`.
+            return true;
+        };
+        // The child is no field of the record, so the alarm its failed put
+        // raises names `"????"` (`dbLinkFieldName`, `dbLink.c:52-66`); the
+        // parent's `setLinkAlarm` after it is a no-op, the record being
+        // INVALID already.
+        let unalarmed = src_rec.read().common.nsev < AlarmSeverity::Invalid;
+        let failed = self.write_out_link_value(
+            src_rec,
+            Arc::clone(out),
+            super::field_io::PutSrc::Owned(EpicsValue::Double(val)),
+            src,
+            visited,
+        );
+        if failed && unalarmed {
             let mut inst = src_rec.write();
-            crate::server::recgbl::rec_gbl_set_link_alarm(&mut inst.common, src.field);
+            if inst.common.nsev == AlarmSeverity::Invalid {
+                inst.common.namsg = crate::server::record::SparseText::link_field("????");
+            }
         }
         failed
     }
@@ -2651,14 +4034,6 @@ impl PvDatabase {
         crate::server::database::filters::sync::db_state_registry().get_or_create(name)
     }
 
-    /// Read a record String field, defaulting to empty.
-    fn field_str(instance: &RecordInstance, field: &str) -> String {
-        match instance.record.get_field(field) {
-            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-            _ => String::new(),
-        }
-    }
-
     /// Read a record numeric field as `i16`, defaulting to 0.
     fn field_i16(instance: &RecordInstance, field: &str) -> i16 {
         instance
@@ -2679,40 +4054,6 @@ impl PvDatabase {
             Some(EpicsValue::UShort(v)) => v,
             Some(other) => other.as_int_i64().unwrap_or(0) as u16,
             None => 0,
-        }
-    }
-
-    /// Apply a SELM-resolved out-of-range alarm to the record.
-    ///
-    /// C raises this alarm inside `process()` (before `recGblResetAlarms`)
-    /// via `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`. The Rust
-    /// multi-output dispatch runs after the record's own alarm reset,
-    /// so we apply the severity directly to `common.sevr/stat`, refresh
-    /// the live STAT/SEVR fields, and post the monitor — matching the
-    /// observable end state (record reads INVALID/SOFT_ALARM, a
-    /// `DBE_ALARM` subscriber on STAT/SEVR is notified).
-    fn apply_selm_alarm(rec: &Arc<RecordCell>, alarm: Option<(u16, AlarmSeverity)>) {
-        let Some((stat, sevr)) = alarm else {
-            return;
-        };
-        let posted = {
-            let mut inst = rec.write();
-            // Raise-only, mirroring recGblSetSevr.
-            if (sevr as u16) > (inst.common.sevr as u16) {
-                inst.common.sevr = sevr;
-                inst.common.stat = stat;
-                true
-            } else {
-                false
-            }
-        };
-        if posted {
-            // Write guard: a value-class post advances the record's
-            // already-published state (`RecordInstance::record_value_post`),
-            // so posting is a `&mut` operation.
-            let mut inst = rec.write();
-            inst.notify_field("SEVR", crate::server::recgbl::EventMask::ALARM);
-            inst.notify_field("STAT", crate::server::recgbl::EventMask::VALUE);
         }
     }
 
@@ -2742,39 +4083,40 @@ impl PvDatabase {
     ///
     /// `sseq` reads its own SELL→SELN in `SseqRecord::pre_input_link_actions`
     /// (the async machine owns the whole cycle), so it is not handled here.
-    pub(crate) fn read_sell_into_seln(&self, rec: &Arc<RecordCell>, phase: SellPhase) {
-        let sell = {
+    pub(crate) fn read_sell_into_seln(&self, rec: InFrame<'_>, phase: SellPhase) {
+        let parsed = {
             let instance = rec.read();
             let record_type = instance.record.record_type();
             if !reads_sell(record_type) {
                 return;
             }
-            match (record_type, phase) {
+            let reads = match (record_type, phase) {
                 ("dfanout", SellPhase::BeforeAlarms) | ("fanout", SellPhase::OutputDispatch) => {
-                    Some(Self::field_str(&instance, "SELL"))
+                    true
                 }
                 // seqSELM_All == 0 (seqRecord.dbd menu(seqSELM) order
                 // All/Specified/Mask).
-                ("seq", SellPhase::OutputDispatch) if Self::field_i16(&instance, "SELM") != 0 => {
-                    Some(Self::field_str(&instance, "SELL"))
-                }
-                _ => None,
+                ("seq", SellPhase::OutputDispatch) => Self::field_i16(&instance, "SELM") != 0,
+                _ => false,
+            };
+            if !reads {
+                return;
             }
+            // C reads SELL via `dbGetLink` for any link type; the pre-fix port
+            // only read a `ParsedLink::Db` SELL, so a SELL sourced over CA/PVA
+            // or given as a constant never updated SELN.
+            let parsed = instance.record_link(SELL[0]);
+            if matches!(**parsed, crate::server::record::ParsedLink::None) {
+                return;
+            }
+            parsed.clone()
         };
-        let Some(sell) = sell else { return };
-        if sell.is_empty() {
-            return;
-        }
-        // C reads SELL via `dbGetLink` for any link type; the pre-fix port only
-        // read a `ParsedLink::Db` SELL, so a SELL sourced over CA/PVA or given
-        // as a constant never updated SELN.
-        let parsed = crate::server::record::parse_link_v2(&sell);
         // Through the one classifier: a CONSTANT SELL delivers NOTHING here
         // (`dbConstGetValue`) — its value reached SELN once, at init
         // (`fanoutRecord.c:88`, `dfanoutRecord.c:102`, `seqRecord.c:121`
         // `recGblInitConstantLink(&sell, DBF_USHORT, &seln)`), so a
         // `caput REC.SELN` STAYS put.
-        if let Some(val) = self.db_get_link(rec, "SELL", &parsed).value() {
+        if let Some(val) = self.db_get_link_in(rec, "SELL", &parsed).value() {
             // The conversion routine is chosen by the SOURCE type — an integer
             // source wraps mod 2^16, a float source is UB. `dbr_ushort_cast`
             // owns that split. SELN is a `DBF_USHORT` (u16) field either way,
@@ -2793,56 +4135,36 @@ impl PvDatabase {
     /// (the pre-fix encoding could mis-split a link string that
     /// happened to contain an embedded NUL).
     ///
-    /// `phase` selects the dispatch phase — see [`MultiOutPhase`]. A record
-    /// whose links do not belong to the calling phase is skipped, so each
-    /// type dispatches exactly once per cycle.
+    /// All three run inside C's `process()`, before the `recGblResetAlarms`
+    /// that commits the cycle — fanout's `dbScanFwdLink`s included
+    /// (`fanoutRecord.c:103-146`) — so this is called from the output stage
+    /// alone, and returns the pending alarm `(stat, sevr)` the record raises
+    /// alongside its links — a failed `dbPutLink` (dfanout's own
+    /// `LINK_ALARM/MAJOR`, `dfanoutRecord.c:311-312`) or a `SELN` out of range
+    /// (`SOFT_ALARM/INVALID`, `fanoutRecord.c:116`, `dfanoutRecord.c:317`,
+    /// `seqRecord.c:157`) — for the caller to fold into `nsev` before that
+    /// commit.
     ///
-    /// In the [`MultiOutPhase::Output`] phase this returns the pending alarm
-    /// `(stat, sevr)` the C record raises alongside its puts — a failed
-    /// `dbPutLink` (dfanout's own `LINK_ALARM/MAJOR`,
-    /// `dfanoutRecord.c:311-312`) or a `SELN` out of range
-    /// (`SOFT_ALARM/INVALID`, `dfanoutRecord.c:317` / `seqRecord.c:157`) —
-    /// for the caller to fold into `nsev` before the alarm commit. The
-    /// [`MultiOutPhase::ForwardLink`] phase returns `None`: a fanout raises
-    /// its range alarm directly into the already-committed SEVR.
+    /// `skip_out` is the IVOA=Don't_drive veto as decided by the cycle's single
+    /// IVOA owner (`process_record_with_links_inner`) on the severity
+    /// `checkAlarms` produced: C's `if (prec->nsev < INVALID_ALARM)
+    /// push_values(); else switch (ivoa)` (`dfanoutRecord.c:128`). Only
+    /// dfanout reads it; fanout and seq have no IVOA.
+    /// `name` is the record's canonical name, the frame's.
     pub(crate) fn dispatch_multi_output(
         &self,
-        rec: &Arc<RecordCell>,
-        phase: MultiOutPhase,
+        name: &[u8],
+        rec: InFrame<'_>,
+        skip_out: bool,
         visited: &mut ProcStack,
     ) -> MultiOutDispatch {
-        // Phase gate, keyed on what the record's links ARE (see
-        // `multi_out_phase_of`), not on which argument the caller passed.
-        // The type name is read under the guard and dropped there: every
-        // record in the database reached this line each cycle, and a heap
-        // copy of `"calc"` was the first thing it paid for.
-        let is_value_phase = matches!(phase, MultiOutPhase::Output { .. });
-        {
-            let instance = rec.read();
-            let record_type = instance.record.record_type();
-            if !multi_output_dispatch_owned(record_type)
-                || matches!(multi_out_phase_of(record_type), MultiOutPhaseKind::Output)
-                    != is_value_phase
-            {
-                return MultiOutDispatch::default();
-            }
-        }
-
         // Snapshot the source record's PUTF bit + put-notify wait-set so
-        // every write_db_link_value call below propagates them to its
+        // every write_db_link_value_in call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value doc). The PENDING
-        // alarm travels the same way for `recGblInheritSevrMsg` MS-class
-        // propagation into each OUT-link target: the OUTn/LNKn puts precede
-        // the source's `recGblResetAlarms`, so C reads `psrce->nsta/nsev`
-        // here ([`LinkAlarm::pending`], dbDbLink.c:382-383).
-        let (src_putf, src_notify, src_alarm) = {
+        // wait-set invariants (see write_db_link_value_in doc).
+        let (src_putf, src_notify) = {
             let guard = rec.read();
-            (
-                guard.common.putf,
-                guard.notify.clone(),
-                LinkAlarm::pending(&guard.common),
-            )
+            (guard.common.putf, guard.notify.clone())
         };
         // One snapshot threaded to every OUT-link write below; each arm
         // overrides `field` with the link field it is driving (OUTn / LNKn),
@@ -2850,7 +4172,6 @@ impl PvDatabase {
         let out_src = OutLinkSrc {
             putf: src_putf,
             notify: src_notify.as_ref(),
-            alarm: &src_alarm,
             field: "",
         };
 
@@ -2866,20 +4187,9 @@ impl PvDatabase {
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (fanoutRecord.c:39): 16 forward links
                     // LNK0..LNKF. LNK0 is the natural first slot.
-                    let links: Vec<String> = LNK_LINK_FIELDS
-                        .iter()
-                        .map(|f| Self::field_str(&instance, f))
-                        .collect();
                     // SELM resolution with OFFS/SHFT bias (fanoutRecord.c).
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        links.len(),
-                    );
-                    Some((sel, MultiOut::Fanout(links), None))
+                    let sel = select_link_indices_ex(SelmKind::FanoutSeq, selm, seln, offs, shft);
+                    Some((sel, MultiOut::Fanout, None))
                 }
                 "dfanout" => {
                     let selm = Self::field_i16(&instance, "SELM");
@@ -2902,21 +4212,15 @@ impl PvDatabase {
                     // Reading `nsev` here instead would re-derive the decision
                     // AFTER the record's other outputs ran, off an alarm they
                     // may have raised themselves.
-                    let val = match phase {
-                        MultiOutPhase::Output { skip_out: true } => None,
-                        MultiOutPhase::Output { skip_out: false } => instance.record.val(),
-                        // Unreachable: the phase gate above already returned
-                        // for a dfanout reached in the forward-link tail.
-                        MultiOutPhase::ForwardLink => return MultiOutDispatch::default(),
+                    let val = if skip_out {
+                        None
+                    } else {
+                        instance.record.val()
                     };
-                    let links: Vec<String> = DFANOUT_LINK_FIELDS
-                        .iter()
-                        .map(|f| Self::field_str(&instance, f))
-                        .collect();
                     // dfanout Specified is 1-based; Mask has no SHFT
                     // (dfanoutRecord.c:308-339).
-                    let sel =
-                        select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0, links.len());
+                    let sel = select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0);
+                    let links = selected_links(&instance, sel);
                     Some((sel, MultiOut::Dfanout(links), val))
                 }
                 "seq" => {
@@ -2926,43 +4230,34 @@ impl PvDatabase {
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (seqRecord.c:86): 16 link groups 0..F,
                     // each DOLn / DOn (value storage) / DLYn / LNKn.
-                    let dol_names = [
-                        "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
-                        "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF",
-                    ];
-                    let lnk_names = LNK_LINK_FIELDS;
                     let dly_names = [
                         "DLY0", "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8",
                         "DLY9", "DLYA", "DLYB", "DLYC", "DLYD", "DLYE", "DLYF",
                     ];
-                    let do_names = [
-                        "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9",
-                        "DOA", "DOB", "DOC", "DOD", "DOE", "DOF",
-                    ];
-                    let groups: Vec<SeqGroup> = (0..16)
-                        .map(|i| SeqGroup {
-                            dol: Self::field_str(&instance, dol_names[i]),
-                            lnk: Self::field_str(&instance, lnk_names[i]),
-                            dly: instance
-                                .record
-                                .get_field(dly_names[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
-                            dov: instance
-                                .record
-                                .get_field(do_names[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
+                    let sel = select_link_indices_ex(SelmKind::FanoutSeq, selm, seln, offs, shft);
+                    let by_name = |field| {
+                        instance
+                            .record
+                            .get_field(field)
+                            .and_then(|v| v.to_f64())
+                            .unwrap_or(0.0)
+                    };
+                    let groups: Vec<SeqGroup> = sel
+                        .indices()
+                        .map(|i| {
+                            let (dly, dov) =
+                                instance.record.seq_group_cells(i).unwrap_or_else(|| {
+                                    (by_name(dly_names[i]), by_name(SEQ_DO_FIELDS[i]))
+                                });
+                            SeqGroup {
+                                idx: i,
+                                dol: instance.dol_row_link(i).clone(),
+                                lnk: instance.out_row_link(i).clone(),
+                                dly,
+                                dov,
+                            }
                         })
                         .collect();
-                    let sel = select_link_indices_ex(
-                        SelmKind::FanoutSeq,
-                        selm,
-                        seln,
-                        offs,
-                        shft,
-                        groups.len(),
-                    );
                     Some((sel, MultiOut::Seq(groups), None))
                 }
                 _ => None,
@@ -2973,7 +4268,7 @@ impl PvDatabase {
             Some(info) => info,
             None => return MultiOutDispatch::default(),
         };
-        debug_assert!(sel.indices.iter().all(|&i| i < payload.len()));
+        debug_assert!(sel.indices().all(|i| i < payload.len()));
         // Single-owner invariant: every record type that produces a
         // `MultiOut` payload here MUST be listed in
         // `multi_output_dispatch_owned` so the generic
@@ -2984,62 +4279,71 @@ impl PvDatabase {
 
         // C raises SOFT_ALARM/INVALID_ALARM when SELN/OFFS/SHFT resolve
         // out of range (fanoutRecord.c:116, dfanoutRecord.c:317,
-        // seqRecord.c:157). The value-put phase (dfanout/seq) runs PRE-commit,
-        // so its out-of-range alarm must fold into the pending nsev the caller
-        // commits THIS cycle — captured here and returned below, not
-        // raised+posted now (a direct SEVR raise would be clobbered by the
-        // caller's `recGblResetAlarms`). A fanout dispatches in the
-        // post-commit tail and raises it directly into the committed SEVR,
-        // posting SEVR/STAT immediately (apply_selm_alarm).
+        // seqRecord.c:157), folded into the pending nsev the caller commits
+        // THIS cycle — returned below, not raised now (a direct SEVR raise
+        // would be clobbered by the caller's `recGblResetAlarms`).
         let pending_selm_alarm = sel.alarm;
-        if !is_value_phase {
-            Self::apply_selm_alarm(rec, sel.alarm);
-        }
-        let indices = sel.indices;
+        let indices = sel.indices();
         // C `dfanoutRecord.c` push_values raises LINK_ALARM/MAJOR per failed
         // dbPutLink; accumulated across the selected OUT links below.
         let mut link_failed = false;
 
         match payload {
-            MultiOut::Fanout(links) => {
+            MultiOut::Fanout => {
                 for idx in indices {
-                    let link_str = &links[idx];
-                    if link_str.is_empty() {
-                        continue;
-                    }
-                    // fanout `LNK1`..`LNKF` are `DBF_FWDLINK`
-                    // (`fanoutRecord.dbd.pod:144`), so C masks their modifiers
-                    // to `pvlOptCA` alone (`dbStaticLib.c:2390`).
-                    let parsed = crate::server::record::parse_forward_link_v2(link_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        // C `fanoutRecord.c:110/121/138` dispatches each
-                        // selected LNKn via `dbScanFwdLink` →
-                        // `dbDbScanFwdLink` → `dbScanPassive`
-                        // (`dbDbLink.c:425-432`), which processes the
-                        // target ONLY when its SCAN is Passive
-                        // (`if (pto->scan != 0) return 0;`). A LNKn
-                        // pointing at a Periodic/Event/I/O-Intr record
-                        // must NOT be re-processed by the fanout — that
-                        // record runs on its own scan. `dbScanPassive`
-                        // then calls `processTarget`, which propagates
-                        // PUTF (and sets RPRO on a busy target) exactly
-                        // like the explicit FLNK path — so this goes
-                        // through the same single owner.
-                        self.process_target(
-                            &db.target().record,
-                            ProcessTargetGate::ScanPassive,
-                            src_putf,
-                            src_notify.as_ref(),
-                            visited,
-                        );
+                    use crate::server::record::ParsedLink;
+                    // A DB target's processing may put this record's LNKn, so
+                    // only its bound target leaves the borrow (unbound only
+                    // before `iocInit`); an external one is dispatched under
+                    // it; any other kind has no `scanForward` and C's
+                    // `dbScanFwdLink` does nothing.
+                    let db = match &**rec.read().out_row_link(idx) {
+                        ParsedLink::Db(db) => Some(db.forward()),
+                        link if link.external_forward().is_some() => None,
+                        _ => continue,
+                    };
+                    match db {
+                        Some(None) => {}
+                        Some(Some(target)) => {
+                            // C `fanoutRecord.c:110/121/138` dispatches each
+                            // selected LNKn via `dbScanFwdLink` →
+                            // `dbDbScanFwdLink` → `dbScanPassive`
+                            // (`dbDbLink.c:425-432`), which processes the
+                            // target ONLY when its SCAN is Passive
+                            // (`if (pto->scan != 0) return 0;`). A LNKn
+                            // pointing at a Periodic/Event/I/O-Intr record
+                            // must NOT be re-processed by the fanout — that
+                            // record runs on its own scan. `dbScanPassive`
+                            // then calls `processTarget`, which propagates
+                            // PUTF (and sets RPRO on a busy target) exactly
+                            // like the explicit FLNK path — so this goes
+                            // through the same single owner.
+                            if let Some(target) = self.record_at(target) {
+                                self.process_target_at(
+                                    target,
+                                    ProcessTargetGate::ScanPassive,
+                                    src_putf,
+                                    src_notify.as_ref(),
+                                    None,
+                                    visited,
+                                );
+                            }
+                        }
+                        // An external link goes to its lset's `scanForward`
+                        // (`dbLink.c:475-481`), the FLNK's own owner.
+                        None => self
+                            .scan_forward_external(rec, super::processing::ForwardLink::Row(idx)),
                     }
                 }
             }
-            MultiOut::Dfanout(links) => {
-                if let Some(ref val) = val {
+            MultiOut::Dfanout(mut links) => {
+                if let Some(val) = val {
                     for idx in indices {
-                        let link_str = &links[idx];
-                        if link_str.is_empty() {
+                        // Taken, so the handle ends inside the put.
+                        let Some(parsed) = links[idx].take() else {
+                            continue;
+                        };
+                        if matches!(*parsed, crate::server::record::ParsedLink::None) {
                             continue;
                         }
                         // C `dfanoutRecord.c:323` drives each OUTn via
@@ -3054,9 +4358,8 @@ impl PvDatabase {
                         // default and the `.PROC`/`PP` processing rule
                         // are both honoured by `parse_output_link_v2`
                         // (uniform NoProcess default) +
-                        // `write_db_link_value` (write-path target
+                        // `write_db_link_value_in` (write-path target
                         // processing), so no per-call downgrade is needed.
-                        let parsed = crate::server::record::parse_output_link_v2(link_str);
                         // Through the put owner, so a failed OUTn raises the
                         // record's LINK_ALARM/INVALID from inside the put (C
                         // `dbPutLink`'s `setLinkAlarm`) — an external
@@ -3068,8 +4371,8 @@ impl PvDatabase {
                         // (and is subsumed by) the put's INVALID.
                         if self.write_out_link_value(
                             rec,
-                            &parsed,
-                            val.clone(),
+                            parsed,
+                            super::PutSrc::Value(&val),
                             OutLinkSrc {
                                 field: DFANOUT_LINK_FIELDS[idx],
                                 ..out_src
@@ -3079,6 +4382,8 @@ impl PvDatabase {
                             link_failed = true;
                         }
                     }
+                    // VAL is a DBF_DOUBLE: nothing to free.
+                    val.release();
                 }
             }
             MultiOut::Seq(groups) => {
@@ -3091,13 +4396,8 @@ impl PvDatabase {
                 // it, even though nothing is driven. C builds this list into
                 // `pcb->grps[]` inside `process()` (`seqRecord.c:182-193`); the
                 // callback chain then walks it by `pcb->index`.
-                let active: Vec<usize> = indices
-                    .into_iter()
-                    .filter(|&i| {
-                        Self::seq_link_is_real(&groups[i].lnk)
-                            || Self::seq_link_is_real(&groups[i].dol)
-                    })
-                    .collect();
+                let mut active = groups;
+                active.retain(|g| Self::seq_link_is_real(&g.lnk) || Self::seq_link_is_real(&g.dol));
                 // C `seqRecord.c:189-196`: an empty group list is the ONLY
                 // synchronous exit — `if (!i) return asyncFinish(prec)`. With
                 // one or more groups, `process` sets `prec->pact = TRUE`
@@ -3124,17 +4424,17 @@ impl PvDatabase {
                 // `callbackSetPriority(prec->prio, &pcb->callback)` — so the
                 // band is taken here, under the same write lock that sets PACT.
                 if !active.is_empty() {
-                    let rec_name = rec.read().name.clone();
+                    let rec_name = name.to_owned();
                     let prio = {
                         let instance = rec.write();
                         instance.enter_pact();
                         instance.common.callback_priority()
                     };
                     let db = self.clone();
-                    let rec = rec.clone();
+                    let rec = Arc::clone(rec.unframed());
                     crate::runtime::task::spawn_background(prio, async move {
-                        for idx in active {
-                            let dly = groups[idx].dly;
+                        for grp in &active {
+                            let dly = grp.dly;
                             if dly > 0.0 {
                                 crate::runtime::task::sleep_background(
                                     crate::runtime::time::duration_from_secs(dly),
@@ -3144,10 +4444,13 @@ impl PvDatabase {
                             {
                                 // C `processCallback`'s `dbScanLock` /
                                 // `dbScanUnlock` pair (`seqRecord.c:252`,
-                                // `:274`) — held for this group alone.
-                                let _gate = db.lock_instance(&rec);
+                                // `:274`) — held for this group alone. The
+                                // seq is claimed as `processTarget`'s source.
                                 let mut visited = crate::server::database::ProcStack::new();
-                                db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited);
+                                visited.claim(&rec);
+                                db.with_frame(&rec, |frame| {
+                                    db.seq_group_step(frame, grp, &mut visited)
+                                });
                             }
                         }
                         // `pgrp == NULL` → `prec->rset->process(prec)`
@@ -3164,9 +4467,9 @@ impl PvDatabase {
             }
         }
 
-        // Value-put phase (dfanout / seq): return the pending alarm the C
-        // record raises alongside its puts, for the caller to fold into `nsev`
-        // before `recGblResetAlarms`. C raises at most one: SOFT_ALARM/INVALID
+        // The pending alarm the C record raises alongside its links, for the
+        // caller to fold into `nsev` before `recGblResetAlarms`. C raises at
+        // most one: SOFT_ALARM/INVALID
         // for a `seln` out of range (dfanoutRecord.c:317, seqRecord.c:157 — no
         // push at all) OR dfanout's own LINK_ALARM/MAJOR for a failed
         // dbPutLink (dfanoutRecord.c:312/324/333). They are mutually exclusive
@@ -3175,34 +4478,31 @@ impl PvDatabase {
         // — seq's failed LNKn put raises LINK_ALARM/INVALID from inside the put
         // owner (`write_out_link_value`), into the same pending alarm, and
         // seqRecord.c adds nothing on top of it.
-        if is_value_phase {
-            let link_alarm = if link_failed {
-                Some((
-                    crate::server::recgbl::alarm_status::LINK_ALARM,
-                    AlarmSeverity::Major,
-                ))
-            } else {
-                None
-            };
-            return MultiOutDispatch {
-                alarm: match (pending_selm_alarm, link_alarm) {
-                    (Some(a), Some(b)) => Some(if (a.1 as u16) >= (b.1 as u16) { a } else { b }),
-                    (a, b) => a.or(b),
-                },
-                went_async: false,
-            };
+        let link_alarm = if link_failed {
+            Some((
+                crate::server::recgbl::alarm_status::LINK_ALARM,
+                AlarmSeverity::Major,
+            ))
+        } else {
+            None
+        };
+        MultiOutDispatch {
+            alarm: match (pending_selm_alarm, link_alarm) {
+                (Some(a), Some(b)) => Some(if (a.1 as u16) >= (b.1 as u16) { a } else { b }),
+                (a, b) => a.or(b),
+            },
+            went_async: false,
         }
-        MultiOutDispatch::default()
     }
 
     /// C `dbLinkIsConstant` negated — a real link is a DB/CA/PVA PV
     /// reference, not an empty or numeric-literal field.
-    fn seq_link_is_real(s: &str) -> bool {
-        !s.is_empty()
-            && !matches!(
-                crate::server::record::parse_link_v2(s),
-                crate::server::record::ParsedLink::Constant(_)
-            )
+    fn seq_link_is_real(link: &crate::server::record::ParsedLink) -> bool {
+        !matches!(
+            link,
+            crate::server::record::ParsedLink::None
+                | crate::server::record::ParsedLink::Constant(_)
+        )
     }
 
     /// One `seq` link group — C `processCallback`'s body
@@ -3215,21 +4515,8 @@ impl PvDatabase {
     /// alarm HERE rather than once per dispatch, because C's `dbPutLink` reads
     /// `psrce->nsta/nsev` at put time (`dbDbLink.c:382-383`) — so a group whose
     /// LNKn put failed propagates that LINK_ALARM into the NEXT group's target.
-    fn seq_group_step(
-        &self,
-        rec: &Arc<RecordCell>,
-        rec_name: &str,
-        groups: &[SeqGroup],
-        idx: usize,
-        visited: &mut ProcStack,
-    ) {
-        // DOn value-storage field names (`linkGrp.dov`), index-aligned with
-        // the LNKn/DOLn groups.
-        const DO_NAMES: [&str; 16] = [
-            "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA", "DOB",
-            "DOC", "DOD", "DOE", "DOF",
-        ];
-        let grp = &groups[idx];
+    fn seq_group_step(&self, rec: InFrame<'_>, grp: &SeqGroup, visited: &mut ProcStack) {
+        let idx = grp.idx;
         let lnk_real = Self::seq_link_is_real(&grp.lnk);
         let dol_real = Self::seq_link_is_real(&grp.dol);
         // C `seqRecord.c:259` `dbGetLink(&dol, DBR_DOUBLE, &dov)`: read DOLn
@@ -3238,8 +4525,8 @@ impl PvDatabase {
         // DOLn raises `setLinkAlarm` (LINK/INVALID, AMSG `field DOL0`) on the
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
-            let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-            self.db_get_input_link(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited)
+            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, false, visited)
+                .0
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)
@@ -3253,7 +4540,7 @@ impl PvDatabase {
         // nothing at all; the only other call is `asyncFinish`'s (`:224`),
         // which lands the last hop's time on the record. Through the owner,
         // so TSEL is re-resolved per group exactly as C's re-entry does.
-        self.rec_gbl_get_time_stamp(rec);
+        self.rec_gbl_get_time_stamp_in(rec);
         // C `seqRecord.c:264` drives LNKn via `dbPutLink` (`DBR_DOUBLE,
         // &dov`), whose `DBF_OUTLINK` target is processed by `dbDbPutValue`
         // (`dbDbLink.c:388`) only when the link carries an explicit `PP`
@@ -3264,40 +4551,41 @@ impl PvDatabase {
         // both through the link set's `putValue` (dbLink.c:434-448). Only a
         // real LNK does anything; a constant LNK is a no-op.
         if lnk_real {
-            let (src_putf, src_notify, src_alarm) = {
+            let (src_putf, src_notify) = {
                 let guard = rec.read();
-                (
-                    guard.common.putf,
-                    guard.notify.clone(),
-                    LinkAlarm::pending(&guard.common),
-                )
+                (guard.common.putf, guard.notify.clone())
             };
-            let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
             // Through the put owner: a failed LNKn `dbPutLink` raises the seq
             // record's LINK_ALARM/INVALID from inside the put (C
             // `dbLink.c:444-446`).
             self.write_out_link_value(
                 rec,
-                &lnk_parsed,
-                EpicsValue::Double(new_dov),
+                Arc::clone(&grp.lnk),
+                super::PutSrc::Owned(EpicsValue::Double(new_dov)),
                 OutLinkSrc {
                     putf: src_putf,
                     notify: src_notify.as_ref(),
-                    alarm: &src_alarm,
                     field: LNK_LINK_FIELDS[idx],
                 },
                 visited,
             );
         }
         // C `seqRecord.c:266-268`: store DOn and post a DBE_VALUE|DBE_LOG
-        // monitor only when it changed. The field already holds the old value
-        // (snapshot read), so `post_fields` (write + post) is needed only on
-        // change.
+        // monitor only when it changed against `odov`, the value this group
+        // started with. The field already holds that value, so an unchanged
+        // DOn is neither written nor posted.
         if new_dov != grp.dov {
-            let _ = self.post_fields(
-                rec_name,
-                vec![(DO_NAMES[idx].to_string(), EpicsValue::Double(new_dov))],
-            );
+            let field = SEQ_DO_FIELDS[idx];
+            let mut inst = rec.write();
+            if inst
+                .put_internal_field(field, EpicsValue::Double(new_dov))
+                .is_ok()
+            {
+                inst.notify_field(
+                    field,
+                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+                );
+            }
         }
     }
 
@@ -3308,20 +4596,10 @@ impl PvDatabase {
     /// `SCAN="Event"` records whose `EVNT` resolves to that name.
     /// No-op for any other record type, or when `VAL` is empty /
     /// resolves to event 0 (`eventNameToHandle` returns NULL).
-    pub(crate) fn dispatch_event_record(&self, rec: &Arc<RecordCell>) {
-        let event_name = {
-            let instance = rec.read();
-            if !posts_software_event(instance.record.record_type()) {
-                return;
-            }
-            match instance.record.get_field("VAL") {
-                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                _ => return,
-            }
-        };
-        if event_name.trim().is_empty() {
+    pub(crate) fn dispatch_event_record(&self, rec: InFrame<'_>) {
+        let Some(event) = rec.read().record.software_event().cloned() else {
             return;
-        }
+        };
         // C `postEvent` queues callbacks on the scan ring buffer —
         // the event-scanned records run on a separate callback thread,
         // NOT recursively inside this process cycle. Spawn the routed
@@ -3336,143 +4614,59 @@ impl PvDatabase {
         crate::runtime::task::spawn_background(
             crate::runtime::task::CallbackPriority::Medium,
             async move {
-                db.post_event_named(&event_name).await;
+                db.post_event_named(event.name()).await;
             },
         );
     }
 
-    /// Register a CP link: when source_record changes, process target_record.
-    ///
-    /// Both names are normalised to canonical form so the cp_links
-    /// map's key/value always match the canonical record name that
-    /// `dispatch_cp_targets` uses for lookup. Without this, a user
-    /// who wrote `INP="ALIAS_NAME CP"` in their .db file would
-    /// register the CP edge under the alias key and then never see
-    /// the target processed (the source record's canonical-name
-    /// dispatch would miss).
-    /// `passive_only` is `true` for a CPP edge (process the target only when
-    /// its `SCAN` is Passive) and `false` for CP (always process). When the
-    /// same source→target edge is registered from both a CP and a CPP link,
-    /// CP dominates: the merged edge keeps `passive_only == false`, matching
-    /// C, where an unconditional CP `CA_DBPROCESS` overrides any CPP gate on
-    /// the same record.
-    pub async fn register_cp_link(
-        &self,
-        source_record: &str,
-        target_record: &str,
-        passive_only: bool,
-    ) {
-        let source = self
-            .resolve_alias(source_record)
-            .unwrap_or_else(|| source_record.to_string());
-        let target = self
-            .resolve_alias(target_record)
-            .unwrap_or_else(|| target_record.to_string());
-        self.inner.cp_links.update(|cp| {
-            let targets = cp.entry(source).or_default();
-            if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
-                existing.passive_only = existing.passive_only && passive_only;
-            } else {
-                targets.push(super::CpTarget {
-                    record: target,
-                    passive_only,
-                });
-            }
-        });
-    }
-
-    /// Whether any CP/CPP edge names this record as its source — the gate
-    /// [`Self::dispatch_cp_targets`] asks before it looks the edges up.
-    ///
-    /// The registry is keyed by record name, so the direct question costs a
-    /// hash of that name on every cycle of every record, and answers `false`
-    /// for all of them in an IOC that wires no CP link. The record caches the
-    /// answer against the registry's revision instead: an edit to `cp_links`
-    /// goes through [`SnapshotCell::update`](super::snapshot::SnapshotCell),
-    /// which moves that revision, so no cached `false` can outlive the
-    /// registration that makes it wrong.
-    pub(crate) fn sources_cp_edges(
-        &self,
-        source_record: &str,
-        rec: &crate::server::record::RecordCell,
-    ) -> bool {
-        // Revision first, map second — see `SnapshotCell::revision`.
-        let revision = self.inner.cp_links.revision();
-        if let Some(cached) = rec.cached_cp_edges(revision) {
-            return cached;
-        }
-        // Non-EMPTY, not merely present: dropping a holder record retains
-        // the source's key with an empty target list (`PvDatabase::
-        // remove_record`), and a source whose every holder is gone owes the
-        // dispatch nothing.
-        let present = self
-            .inner
-            .cp_links
-            .load()
-            .get(source_record)
-            .is_some_and(|targets| !targets.is_empty());
-        rec.cache_cp_edges(revision, present);
-        present
-    }
-
-    /// Get target edges to process when `source_record` changes (CP/CPP links).
-    pub fn get_cp_targets(&self, source_record: &str) -> Vec<super::CpTarget> {
-        self.inner
-            .cp_links
-            .load()
-            .get(source_record)
-            .cloned()
-            .unwrap_or_default()
+    fn canonical_name(&self, name: impl AsRef<[u8]>) -> RecordName {
+        let name = name.as_ref();
+        self.resolve_alias(name)
+            .unwrap_or_else(|| RecordName::from(name))
     }
 
     /// Register an EXTERNAL CP/CPP link: when the remote PV `external_pv`
     /// (a cross-IOC CA/PVA source, e.g. `OTHER:PV` from
     /// `INP="OTHER:PV CP"`) changes, process `target_record`.
     ///
-    /// Twin of [`Self::register_cp_link`] for cross-IOC sources. The key is
-    /// the **scheme-stripped external PV name** — it is not a local record,
-    /// so it is NOT alias-resolved. It MUST equal the name the calink/pvalink
+    /// The key is the **scheme-stripped PV name** — a channel name, so it is
+    /// NOT alias-resolved. It MUST equal the name the calink/pvalink
     /// monitor dispatches under: that monitor is opened through the lset,
     /// which strips the `ca://` / `pva://` scheme first, so its `pv_name`
-    /// (passed to [`Self::dispatch_external_cp_targets`]) is the bare PV.
+    /// (passed to [`super::ExternalCpProcess::new`]) is the bare PV.
     /// Stripping the same schemes here — the set `Self::resolve_external_pv`
     /// already knows — guarantees the registry key and the dispatch key can
     /// never diverge. The `target_record` (the local holder) IS alias-resolved
-    /// so the dispatch processes the canonical record. CP dominates CPP on a
-    /// merged edge, identical to the local path.
+    /// so the dispatch processes the canonical record. One edge per link,
+    /// keyed by the holder's link `field`.
     pub async fn register_external_cp_link(
         &self,
-        external_pv: &str,
-        target_record: &str,
+        external_pv: impl AsRef<[u8]>,
+        target_record: impl AsRef<[u8]>,
+        field: &str,
         passive_only: bool,
     ) {
-        let key = external_pv
-            .strip_prefix("ca://")
-            .or_else(|| external_pv.strip_prefix("pva://"))
-            .unwrap_or(external_pv);
-        let target = self
-            .resolve_alias(target_record)
-            .unwrap_or_else(|| target_record.to_string());
+        let key = RecordName::from(external_cp_key(external_pv.as_ref()));
+        let holder = self.canonical_name(target_record);
         self.inner.external_cp_links.update(|cp| {
-            let targets = cp.entry(key.to_string()).or_default();
-            if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
-                existing.passive_only = existing.passive_only && passive_only;
-            } else {
-                targets.push(super::CpTarget {
-                    record: target,
+            cp.set_link(
+                &holder,
+                field,
+                Some(super::CpSource {
+                    record: key,
                     passive_only,
-                });
-            }
+                }),
+            )
         });
     }
 
     /// Get holder edges to process when the remote PV `external_pv` changes
     /// (external CA/PVA CP/CPP links).
-    pub fn get_external_cp_targets(&self, external_pv: &str) -> Vec<super::CpTarget> {
+    pub fn get_external_cp_targets(&self, external_pv: &[u8]) -> Vec<super::CpTarget> {
         self.inner
             .external_cp_links
             .load()
-            .get(external_pv)
+            .targets(external_pv)
             .cloned()
             .unwrap_or_default()
     }
@@ -3480,13 +4674,13 @@ impl PvDatabase {
     /// Every external PV name that has at least one CP/CPP holder edge.
     /// The calink/pvalink integration warms (opens a monitor for) each of
     /// these at iocInit so the remote source has a live subscription whose
-    /// callback can drive [`Self::dispatch_external_cp_targets`] — a Passive
+    /// callback can drive an [`super::ExternalCpProcess`] — a Passive
     /// CP holder is otherwise never read and its monitor never opens.
-    pub async fn external_cp_pv_names(&self) -> Vec<String> {
+    pub async fn external_cp_pv_names(&self) -> Vec<RecordName> {
         self.inner
             .external_cp_links
             .load()
-            .keys()
+            .sources()
             .cloned()
             .collect()
     }
@@ -3508,15 +4702,15 @@ impl PvDatabase {
     /// link and counting it.
     ///
     /// Sorted, so a caller can print it as a stable operator-facing list.
-    pub async fn external_link_pv_names(&self) -> Vec<String> {
-        let mut seen: Vec<String> = Vec::new();
+    pub async fn external_link_pv_names(&self) -> Vec<RecordName> {
+        let mut seen: Vec<RecordName> = Vec::new();
         for record_name in &self.all_record_names().await {
             for (_field, _raw, parsed) in self.record_link_fields(record_name) {
                 let Some(pv) = parsed.external_pv_name() else {
                     continue;
                 };
-                if !seen.iter().any(|s| s == pv.as_ref()) {
-                    seen.push(pv.into_owned());
+                if !seen.iter().any(|s| *s == *pv) {
+                    seen.push(pv.as_ref().into());
                 }
             }
         }
@@ -3545,16 +4739,6 @@ impl PvDatabase {
     /// one. Restricting it to CP/CPP left every plain non-local `Db` link
     /// unconverted and unopened.
     ///
-    /// **Deviation, deliberate.** Because C skips `dbDbInitLink` for a
-    /// `CA`/`CP`/`CPP` link, C makes a CP link to a LOCAL record a CA link
-    /// too. This function does not: it leaves a local CP target as `Db`,
-    /// because the `ca` link set lives in `epics-ca-rs` and an IOC built on
-    /// `epics-base-rs` alone would be left with a local CP link that resolves
-    /// nowhere. What C buys with that conversion — a holder processed only on
-    /// a `DBE_VALUE|DBE_ALARM` post, never on a bare source process — is paid
-    /// for instead at the trigger, by the `CyclePosts` gate in
-    /// `PvDatabase::dispatch_cp_targets`.
-    ///
     /// **Decided once.** C sets `DBLINK_FLAG_INITIALIZED` on entry and
     /// returns early on every later call (`dbLink.c:96-100`), so a record
     /// added to the IOC *after* iocInit does NOT un-convert a link that was
@@ -3570,6 +4754,7 @@ impl PvDatabase {
     pub(crate) fn db_init_link_locality(
         &self,
         parsed: crate::server::record::ParsedLink,
+        ftype: crate::server::record::LinkFieldType,
     ) -> crate::server::record::ParsedLink {
         // "Parsed" must not be able to mean "serviceable". A link naming a
         // scheme whose [`LinkSet`](super::LinkSet) was never installed is
@@ -3589,233 +4774,417 @@ impl PvDatabase {
         // refused link). The diagnostic is printed once, by
         // `initialize_link_locality`; this classification is silent because
         // `record_link_fields` runs it on every call.
+        self.relink(&parsed, ftype).unwrap_or(parsed)
+    }
+
+    /// [`Self::db_init_link_locality`]'s rule, `None` when the link stays as
+    /// parsed. Also C `dbAddLink` (`dbLink.c:146-191`) for a runtime put of
+    /// a link field ([`PreparedLink::relink`](crate::server::record::PreparedLink::relink)),
+    /// which decides locality the same way and sets `pvlOptFWD` silently.
+    pub(crate) fn relink(
+        &self,
+        parsed: &crate::server::record::ParsedLink,
+        ftype: crate::server::record::LinkFieldType,
+    ) -> Option<crate::server::record::ParsedLink> {
         if let Some(scheme) = parsed.required_link_set_scheme()
             && self.inner.link_sets.load().get(scheme).is_none()
         {
-            return crate::server::record::ParsedLink::None;
+            return Some(crate::server::record::ParsedLink::None);
         }
-        let crate::server::record::ParsedLink::Db(db) = &parsed else {
-            return parsed;
+        let crate::server::record::ParsedLink::Db(db) = parsed else {
+            return None;
         };
-        if self.has_name_no_resolve(&db.target().record) {
-            return parsed;
+        if self.has_db_link_target(db.target().record.as_bytes(), db.field_as_written()) {
+            return None;
         }
-        crate::server::record::ParsedLink::Ca(crate::server::record::CaLink {
-            // `DbLink::channel_name` is the same string C keeps in
-            // `pv_link.pvname` across the `dbChannelCreate` → `dbCaAddLink`
-            // fallthrough, so the DB target and the CA channel cannot drift.
-            pv: db.pvname(),
-            monitor_switch: db.monitor_switch,
-            policy: db.policy,
-        })
+        Some(crate::server::record::ParsedLink::Ca(
+            crate::server::record::CaLink {
+                // `DbLink::channel_name` is the same string C keeps in
+                // `pv_link.pvname` across the `dbChannelCreate` → `dbCaAddLink`
+                // fallthrough, so the DB target and the CA channel cannot drift.
+                fwd: crate::server::record::ca_forward_flag(ftype, db.pvname()),
+                open: crate::server::record::OpenLatch::default(),
+                pv: db.pvname().clone(),
+                monitor_switch: db.monitor_switch,
+                policy: db.policy,
+            },
+        ))
     }
 
-    /// Commit C `dbInitLink`'s locality decision into every record's parsed
-    /// link cache — the iocInit pass that makes the rule STATE rather than a
-    /// test each read path repeats.
+    /// C `dbAddLink` (`dbLink.c:146-191`) for a link put: [`Self::relink`],
+    /// and a local forward that stays as parsed bound ([`Self::bind_forward`]).
+    /// An external one gets its handle from the put's open
+    /// ([`Self::open_put_link`]).
+    pub(crate) fn add_link(
+        &self,
+        parsed: &crate::server::record::ParsedLink,
+        ftype: crate::server::record::LinkFieldType,
+    ) -> Option<crate::server::record::ParsedLink> {
+        let next = self.relink(parsed, ftype);
+        if next.is_none() && ftype == crate::server::record::LinkFieldType::Fwd {
+            self.bind_forward(parsed, ftype);
+        }
+        next
+    }
+
+    /// The lset's `scanForward` handle stored in an external forward link, so
+    /// a dispatch only runs it. The one writer of a
+    /// [`ForwardSlot`](crate::server::record::ForwardSlot), called only for a
+    /// link its lset just opened ([`Self::bind_opened`]): one it opens with no
+    /// lset is `Removed` and forwards nothing (`dbLink.c:479`).
+    fn bind_external_forward(&self, parsed: &crate::server::record::ParsedLink) {
+        use crate::server::record::ParsedLink;
+        let (key, slot) = match parsed {
+            ParsedLink::Pva(p) => (p.name(), &p.forward),
+            ParsedLink::PvaJson(j) => (j.link_identity_key(), &j.forward),
+            _ => return,
+        };
+        let Some(scheme) = parsed.required_link_set_scheme() else {
+            return;
+        };
+        if let Some(lset) = self.inner.link_sets.load().get(scheme) {
+            slot.bind(|| lset.forward_handle(key.as_bytes()));
+        }
+    }
+
+    /// The open of every external forward link no lset was there to open, when
+    /// a link set registers after `iocInit`. Before it, the init open
+    /// ([`Self::open_record_links`]) is still to come and opens them itself.
+    pub(super) fn open_unopened_forwards(&self) {
+        use crate::server::record::ExternalForward;
+        if !self.ioc_is_running() {
+            return;
+        }
+        for (_, rec) in self.iterate_records() {
+            for (field, link) in forward_links(&rec) {
+                let unopened = matches!(
+                    link.external_forward(),
+                    Some(ExternalForward::Pva(slot)) if !slot.is_bound()
+                );
+                if !unopened {
+                    continue;
+                }
+                let holder =
+                    super::LinkHolder::new(rec.rdes().record_type, rec.name().as_bytes(), field);
+                if let Some(open) = self.open_external_link(holder, &link) {
+                    self.bind_opened(&mut rec.write(), field, open);
+                }
+            }
+        }
+    }
+
+    /// C `dbInitLink` for every forward link of every record, once the
+    /// `iocInit` barrier is crossed ([`Self::init_record_forwards`]).
+    pub(super) fn init_forward_links(&self) {
+        // C's `iterateRecords` order, which is its warnings' order.
+        for (_, rec) in self.iterate_records() {
+            self.init_record_forwards(&rec);
+        }
+    }
+
+    /// C `dbInitLink` for `rec`'s forward links: a DB link naming a local
+    /// record is bound to it, any other is the CA link `dbDbInitLink`'s
+    /// failure falls through to (`dbLink.c:118-130`). After it no forward is
+    /// left a DB link without a target. A record added after `iocInit` runs
+    /// it for its own links only; a link already made CA stays CA and
+    /// reaches a later record through CA, as C's would. An external link is
+    /// opened by [`Self::open_record_links`].
+    pub(super) fn init_record_forwards(&self, rec: &crate::server::record::RecordCell) {
+        use crate::server::record::{LinkFieldType, ParsedLink};
+        let mut rewrites: Vec<(&'static str, Arc<ParsedLink>)> = Vec::new();
+        for (field, link) in forward_links(rec) {
+            if !matches!(*link, ParsedLink::Db(_)) {
+                continue;
+            }
+            let Some(next) = self.relink(&link, LinkFieldType::Fwd) else {
+                self.bind_forward(&link, LinkFieldType::Fwd);
+                continue;
+            };
+            if let ParsedLink::Ca(ca) = &next {
+                warn_ca_forward_without_proc(rec.name(), field, ca);
+            }
+            rewrites.push((field, Arc::new(next)));
+        }
+        if rewrites.is_empty() {
+            return;
+        }
+        // Parsed above, and the replaced parses dropped after the hold.
+        let mut retired = Vec::with_capacity(rewrites.len());
+        {
+            let mut inst = rec.write();
+            for (field, link) in rewrites {
+                retired.push(inst.install_link_cache(field, link).unwrap_or_else(|l| l));
+            }
+        }
+        drop(retired);
+    }
+
+    /// C `dbDbInitLink`'s `precord` for a local forward link: the target's
+    /// record-table index, written into the link so a dispatch reads it and
+    /// resolves no name. Only [`Self::init_record_forwards`] and [`Self::add_link`]
+    /// call it.
+    pub(crate) fn bind_forward(
+        &self,
+        parsed: &crate::server::record::ParsedLink,
+        ftype: crate::server::record::LinkFieldType,
+    ) {
+        if ftype != crate::server::record::LinkFieldType::Fwd {
+            return;
+        }
+        let crate::server::record::ParsedLink::Db(db) = parsed else {
+            return;
+        };
+        if let Some(index) = self.db_link_addr(db).and_then(|at| at.rec.index()) {
+            db.bind_forward(index);
+        }
+    }
+
+    /// Commit C `dbInitLink`'s locality decision into every record's stored
+    /// links — the iocInit pass that makes the rule STATE rather than a test
+    /// each read path repeats.
     ///
     /// Runs after all records have loaded and before `setup_cp_links`, which
-    /// is C's ordering: `initPVLinks` walks the loaded database once. Only the
-    /// `COMMON_LINK_FIELDS`
-    /// have a parse cache to commit into; `INPA..`/`DOL..` and the `lnkCalc`
-    /// arguments are re-parsed from their raw text each process cycle and keep
-    /// the read path's runtime locality fallback
-    /// (`read_target_value`) instead.
+    /// is C's ordering: `initPVLinks` walks the loaded database once, every
+    /// `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` of every record
+    /// (`dbLink.c:92-143`). The fields come from the dbd table
+    /// (`Self::link_field_texts`), so a fanout `LNKn` or an `INPA` is
+    /// decided like `FLNK`.
     ///
-    /// The decision is taken from the field's RAW text, not from the cache:
-    /// the cache is only guaranteed fresh when the field was written through
-    /// `put_common_field`, and a link whose raw string was installed some
-    /// other way must still be initialised. Only a genuine `Db` → `Ca`
-    /// conversion is written back, so a cache that legitimately differs from
-    /// its raw text is left alone.
+    /// The decision is taken from the field's RAW text, not from the stored
+    /// parse: a link whose raw string was installed some other way must still
+    /// be initialised. Only a genuine `Db` → `Ca` conversion is written back,
+    /// so a stored link that legitimately differs from its raw text is left
+    /// alone. A CA forward link that will never forward is warned here, in
+    /// field order, as `dbInitLink` does (`dbLink.c:137-142`); the runtime
+    /// `dbAddLink` sets the flag silently.
     ///
     /// Returns the number of links converted.
     pub async fn initialize_link_locality(&self) -> usize {
-        use crate::server::record::record_instance::COMMON_LINK_FIELDS;
-        let names = self.all_record_names().await;
+        use crate::server::record::{LinkFieldType, ParsedLink};
         let mut converted = 0usize;
-        let mut refused = 0usize;
-        let installed_schemes = {
-            let mut s = self.inner.link_sets.load().schemes();
-            s.sort();
-            s
-        };
-        for name in &names {
-            let Some(rec) = self.get_record(name) else {
-                continue;
-            };
+        // C's `doResolveLinks` walk (`iocInit.c:484-506`), so its warnings
+        // print in softIoc's order.
+        for (name, rec) in self.iterate_records() {
             // Decide before taking the record's write lock: the locality query
             // reads the database's record map, and nothing else in this crate
             // holds a record-instance lock across that map.
-            let raw: Vec<(&str, String)> = {
-                let inst = rec.read();
-                COMMON_LINK_FIELDS
-                    .iter()
-                    .filter_map(|(field, _)| {
-                        inst.common_link_text(field)
-                            .filter(|t| !t.is_empty())
-                            .map(|t| (*field, t.to_string()))
-                    })
-                    .collect()
-            };
-            let mut rewrites: Vec<(&str, crate::server::record::ParsedLink)> = Vec::new();
-            for (field, text) in &raw {
-                let ftype = COMMON_LINK_FIELDS
-                    .iter()
-                    .find(|(f, _)| f == field)
-                    .map(|(_, t)| *t)
-                    .expect("field came from COMMON_LINK_FIELDS");
-                let parsed = crate::server::record::parse_link_field(text, ftype);
-                let unserviceable = parsed.required_link_set_scheme();
-                if unserviceable.is_none()
-                    && !matches!(parsed, crate::server::record::ParsedLink::Db(_))
-                {
+            let raw = Self::link_field_texts(&rec.read());
+            let mut rewrites: Vec<(String, Option<Arc<ParsedLink>>)> = Vec::new();
+            for (field, text, ftype) in raw {
+                if text.is_empty() {
                     continue;
                 }
-                let next = self.db_init_link_locality(parsed);
+                let parsed = crate::server::record::parse_link_field(&text, ftype);
+                let unserviceable = parsed.required_link_set_scheme();
+                let was_db = matches!(parsed, ParsedLink::Db(_));
+                let json = matches!(parsed, ParsedLink::PvaJson(_));
+                let next = self.db_init_link_locality(parsed, ftype);
+                if let ParsedLink::Ca(ca) = &next
+                    && ftype == LinkFieldType::Fwd
+                {
+                    warn_ca_forward_without_proc(&name, &field, ca);
+                }
                 match (&next, unserviceable) {
-                    (crate::server::record::ParsedLink::Ca(_), _) => rewrites.push((field, next)),
-                    // The refusal `db_init_link_locality` just made, said out
-                    // loud. This is the only pass that runs once per IOC, so
-                    // it is the only place the operator can be told without
-                    // the message repeating on every `record_link_fields`.
-                    (crate::server::record::ParsedLink::None, Some(scheme)) => {
-                        eprintln!(
-                            "iocInit: {name}.{field} names link type '{scheme}' but no \
-                             '{scheme}' link set is installed in this IOC (installed: \
-                             {installed_schemes:?}); the link is refused: {text}"
-                        );
-                        refused += 1;
-                        rewrites.push((field, next));
+                    (ParsedLink::Ca(_), _) if was_db => {
+                        rewrites.push((field, Some(Arc::new(next))))
+                    }
+                    // C names a `{pva:...}` with no `link(pva, ...)` loaded
+                    // (`dbJLink.c:264`); a `pva://` text is a CA link to C
+                    // (`dbLink.c:119-130`), refused silently.
+                    (ParsedLink::None, Some(scheme)) => {
+                        if json {
+                            crate::runtime::log::errlog_vprintf(format_args!(
+                                "dbJLinkInit: Link type '{scheme}' not found\n"
+                            ));
+                        }
+                        rewrites.push((field, Some(Arc::new(next))));
                     }
                     _ => {}
                 }
             }
-            if rewrites.is_empty() {
-                continue;
-            }
-            let mut inst = rec.write();
-            for (field, link) in rewrites {
-                let is_refusal = matches!(link, crate::server::record::ParsedLink::None);
-                if let Some(slot) = inst.common_link_cache_mut(field) {
-                    *slot = link;
-                    if !is_refusal {
-                        converted += 1;
+            if !rewrites.is_empty() {
+                // The parses were built above and the replaced ones leave in
+                // `retired`, reserved here: the hold only moves pointers.
+                let mut retired = Vec::with_capacity(rewrites.len());
+                {
+                    let mut inst = rec.write();
+                    // The names stay in `rewrites` until after the hold.
+                    for (field, link) in &mut rewrites {
+                        let Some(link) = link.take() else { continue };
+                        let is_refusal = matches!(*link, ParsedLink::None);
+                        match inst.install_link_cache(field, link) {
+                            Ok(old) => {
+                                converted += usize::from(!is_refusal);
+                                retired.push(old);
+                            }
+                            Err(link) => retired.push(link),
+                        }
                     }
                 }
+                drop((retired, rewrites));
             }
         }
         if converted > 0 {
-            eprintln!("iocInit: {converted} non-local DB link(s) made external");
-        }
-        if refused > 0 {
-            eprintln!(
-                "iocInit: {refused} link(s) refused — no link set is installed for the \
-                 scheme they name"
-            );
+            tracing::debug!("iocInit: {converted} non-local DB link(s) made external");
         }
         converted
     }
 
-    /// Classify one parsed CP/CPP link into the local or the external CP
-    /// trigger registry.
+    /// The CP/CPP edge one parsed link makes, if it makes one.
     ///
-    /// A link with no CP/CPP policy (`cp_passive_only() == None`), and
-    /// every non-`Db`/`Ca` variant, is ignored.
-    ///
-    /// `Ca`: an external `ca://OTHER CP` holder always drives the cross-IOC
-    /// path — C `dbCa.c` `eventCallback` adds `CA_DBPROCESS` for every CP link
-    /// (`dbCa.c:958-962`). Note `OTHER CP CA` is NOT such a link: `CA` and `CP`
-    /// are mutually exclusive process classes and `CA` is matched first
-    /// (`dbStaticLib.c:2369-2373`), so it is a plain CA link with no CP policy.
-    ///
-    /// `Db`: a *local* target only. The locality decision is not made here —
-    /// [`super::PvDatabase::record_link_fields`] has already mapped every
-    /// enumerated link through [`Self::db_init_link_locality`], so a CP/CPP
-    /// link to a non-local target arrives at the `Ca` arm above and lands in
-    /// `ext_links` by the same route an explicit `ca://OTHER CP` does. That
-    /// rule used to live in this method, which is why it applied to CP/CPP
-    /// links only.
-    fn classify_cp_link(
-        &self,
-        parsed: crate::server::record::ParsedLink,
-        target_name: &str,
-        db_links: &mut Vec<(String, String, bool)>,
-        ext_links: &mut Vec<(String, String, bool)>,
-    ) {
+    /// Only a `Ca` link can: C makes every CP/CPP link a CA link whatever its
+    /// target (`dbLink.c:118-122`), and `eventCallback` adds `CA_DBPROCESS`
+    /// for each one (`dbCa.c:958-962`). `OTHER CP CA` is not such a link: `CA`
+    /// and `CP` are one process class and `CA` is matched first
+    /// (`dbStaticLib.c:2369-2373`).
+    fn classify_cp_link(parsed: crate::server::record::ParsedLink) -> Option<CpEdge> {
         match parsed {
-            crate::server::record::ParsedLink::Db(db) => {
-                if let Some(passive_only) = db.policy.cp_passive_only() {
-                    db_links.push((
-                        db.target().record.clone(),
-                        target_name.to_string(),
-                        passive_only,
-                    ));
-                }
-            }
             crate::server::record::ParsedLink::Ca(ca) => {
-                if let Some(passive_only) = ca.policy.cp_passive_only() {
-                    ext_links.push((ca.pv, target_name.to_string(), passive_only));
-                }
+                ca.policy.cp_passive_only().map(|passive_only| CpEdge {
+                    pv: ca.pv.into(),
+                    passive_only,
+                })
             }
-            _ => {}
+            _ => None,
         }
     }
 
-    /// Scan all records for CP/CPP input links and register them. Local
-    /// `Db` links land in the local CP registry; external `Ca` links land
-    /// in the external CP registry, whose holders are processed by the
-    /// calink monitor callback.
+    /// Every CP/CPP link in the database, as `(holder, field, edge)`.
+    fn cp_links_of(
+        &self,
+        holders: impl IntoIterator<Item = RecordName>,
+    ) -> Vec<(RecordName, String, CpEdge)> {
+        let mut out = Vec::new();
+        for holder in holders {
+            // Enumerated through the single shared owner (`record_link_fields`)
+            // so this and the pvalink install scan never diverge on which
+            // fields count as links. A CP/CPP link is `Ca` whatever its
+            // target (`dbLink.c:118-127`).
+            for (field, _raw, parsed) in self.record_link_fields(&holder) {
+                if let Some(edge) = Self::classify_cp_link(parsed) {
+                    out.push((holder.clone(), field, edge));
+                }
+            }
+        }
+        out
+    }
+
+    /// Publish `links`' edges in one registry update, each replacing its
+    /// link's previous edge.
+    fn set_cp_links<'a>(&self, links: impl IntoIterator<Item = &'a (RecordName, String, CpEdge)>) {
+        let edges: Vec<(RecordName, &str, super::CpSource)> = links
+            .into_iter()
+            .map(|(holder, field, edge)| {
+                (
+                    self.canonical_name(holder),
+                    field.as_str(),
+                    Self::cp_source(edge),
+                )
+            })
+            .collect();
+        self.inner.external_cp_links.update(|cp| {
+            for (holder, field, source) in edges {
+                cp.set_link(&holder, field, Some(source));
+            }
+        });
+    }
+
+    /// `edge` as the registry keys it: by the PV its monitor dispatches under.
+    fn cp_source(edge: &CpEdge) -> super::CpSource {
+        super::CpSource {
+            record: RecordName::from(external_cp_key(&edge.pv)),
+            passive_only: edge.passive_only,
+        }
+    }
+
+    /// Scan all records for CP/CPP links, register them, and open each one's
+    /// channel. A Passive holder is never scanned, so its link would never
+    /// open lazily and the monitor that drives it would never exist; C's
+    /// `dbInitLink` → `dbCaAddLink` adds every CA link at init. A no-op
+    /// open when no matching link set is installed.
     pub async fn setup_cp_links(&self) {
         let names = self.all_record_names().await;
-        let mut db_links: Vec<(String, String, bool)> = Vec::new();
-        let mut ext_links: Vec<(String, String, bool)> = Vec::new();
-
-        for target_name in &names {
-            // Enumerate this record's link-bearing fields through the
-            // single shared owner (`record_link_fields`) so the CA CP/CPP
-            // setup here and the pvalink install scan can never diverge on
-            // which fields count as links. That owner already applies C
-            // `dbInitLink`'s locality fallthrough
-            // (`Self::db_init_link_locality`), so a CP/CPP link to a
-            // non-local target arrives here as `Ca` and needs no
-            // CP-specific conversion; the holder's own read path is rewired
-            // by `initialize_link_locality`, which commits the same decision
-            // into the parse cache for every link, CP or not.
-            for (_field, _raw, parsed) in self.record_link_fields(target_name) {
-                self.classify_cp_link(parsed, target_name, &mut db_links, &mut ext_links);
+        let links = self.cp_links_of(names);
+        self.set_cp_links(&links);
+        if !links.is_empty() {
+            let pvs = self.external_cp_pv_names().await;
+            for pv in &pvs {
+                let _ = self.resolve_external_pv(crate::server::record::ExternalRef::unlatched(pv));
             }
-        }
-
-        let db_count = db_links.len();
-        for (source, target, passive_only) in db_links {
-            self.register_cp_link(&source, &target, passive_only).await;
-        }
-        let ext_count = ext_links.len();
-        for (external_pv, target, passive_only) in ext_links {
-            self.register_external_cp_link(&external_pv, &target, passive_only)
-                .await;
-        }
-        if db_count > 0 {
-            eprintln!("iocInit: {db_count} CP link subscriptions");
-        }
-        // Warm external CP/CPP links. A Passive holder of an external CP
-        // link is never scanned, so its link never opens lazily and the
-        // calink monitor that drives `dispatch_external_cp_targets` is never
-        // created (chicken-and-egg). Open each external CP PV now so its
-        // monitor is live at iocInit — the C `dbCa.c` "add the link at init"
-        // analogue (`dbCaAddLink`). `resolve_external_pv` routes through the
-        // registered lset's lazy-open path (the same path a record read
-        // uses); a no-op when no matching lset is installed (calink off).
-        if ext_count > 0 {
-            let ext_pvs = self.external_cp_pv_names().await;
-            for pv in &ext_pvs {
-                let _ = self.resolve_external_pv(pv);
-            }
-            eprintln!(
-                "iocInit: {ext_count} external CP link subscriptions ({} PVs warmed)",
-                ext_pvs.len()
+            tracing::debug!(
+                "iocInit: {} CP link subscriptions ({} PVs opened)",
+                links.len(),
+                pvs.len()
             );
+        }
+    }
+
+    /// C `dbCaRun` (`iocInit.c:260`, after `scanRun` and the PINI=YES pass):
+    /// the CP/CPP processing the links' monitors requested while `dbCaTask`
+    /// was paused runs from here, so a holder's connect-time process follows
+    /// PINI. From here a relinked CP link also opens its own channel.
+    pub async fn process_cp_links_on_connect(&self) {
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.mark_connected());
+        self.inner.ca_run.run().await;
+    }
+
+    /// C `dbCaSync`, after `dbCaRun`: return once every event posted to a
+    /// local CA link before the call has run its CP/CPP processing.
+    pub async fn ca_sync(&self) {
+        self.inner.ca_links.sync().await;
+    }
+
+    /// The CP/CPP worker's wait for [`Self::process_cp_links_on_connect`].
+    pub(crate) async fn ca_run_reached(&self) {
+        self.inner.ca_run.reached().await;
+    }
+
+    /// A put to `holder`'s link `field` after `dbCaRun`: C `dbPutFieldLink`
+    /// drops the old `caLink` and opens a new one — `dbCaAddLink` stages its
+    /// `CA_CONNECT`, as [`Self::setup_external_link_opens`] does at iocInit —
+    /// whose first monitor event processes a CP holder. A link the put
+    /// removed and never added opens nothing. Called once the put's gate is
+    /// down.
+    pub(crate) fn relink_cp_link(&self, holder: &[u8], field: &str) {
+        if !self.inner.external_cp_links.load().connected() {
+            return;
+        }
+        let holder = self.canonical_name(holder);
+        let rec = self.get_record(&holder);
+        let removed = rec
+            .as_ref()
+            .is_some_and(|rec| rec.read().link_unadded(field));
+        let link = self
+            .record_link_fields(&holder)
+            .into_iter()
+            .find(|(f, _, _)| !removed && f.eq_ignore_ascii_case(field))
+            .map(|(_, _, parsed)| parsed);
+        if let Some(external) = link.as_ref().and_then(|l| l.external()) {
+            self.stage_external_link_open(external);
+        }
+        let edge = link.and_then(Self::classify_cp_link);
+        let field = rec.as_ref().map_or_else(
+            || crate::server::record::record_instance::upper_field(field),
+            |rec| rec.canonical_field(field),
+        );
+        let keyed = edge.as_ref().map(Self::cp_source);
+        self.inner
+            .external_cp_links
+            .update(|cp| cp.set_link(&holder, &field, keyed));
+        if let Some(edge) = edge {
+            let pv = external_cp_key(&edge.pv);
+            let (target, body) = Self::split_external_link_name(pv);
+            let holder = super::CpTarget {
+                record: holder,
+                passive_only: edge.passive_only,
+            };
+            super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+                lset.cp_link_added(body, holder.clone());
+                None::<()>
+            });
+            let _ = self.resolve_external_pv(crate::server::record::ExternalRef::unlatched(pv));
         }
     }
 
@@ -3850,8 +5219,8 @@ impl PvDatabase {
     /// The field enumeration is [`super::PvDatabase::record_link_fields`], the
     /// same single owner `setup_cp_links` uses, so "what is a link field"
     /// cannot diverge between the two passes. Staging goes through
-    /// `PvDatabase::stage_external_link_open_by_name` →
-    /// `stage_external_link_open`, so the connect still runs on the link work
+    /// `PvDatabase::stage_external_link_open`, which latches the link, so
+    /// the connect still runs on the link work
     /// owner and never on a record-processing thread; nothing here calls
     /// `LinkSet::connect_link` directly.
     ///
@@ -3872,24 +5241,114 @@ impl PvDatabase {
                 // `Constant`, a hardware link and a `lnkCalc` link all report
                 // `None` — C's `dbDbInitLink` / `dbConstInitLink` /
                 // `dbJLinkInit` paths, none of which reach `dbCaAddLink`.
-                let Some(pv) = parsed.external_pv_name() else {
+                let Some(external) = parsed.external() else {
                     continue;
                 };
-                if self.stage_external_link_open_by_name(&pv) {
+                if self.stage_external_link_open(external) {
                     staged += 1;
                 }
             }
         }
         if staged > 0 {
-            eprintln!("iocInit: {staged} external link opens staged");
+            tracing::debug!("iocInit: {staged} external link opens staged");
         }
         staged
     }
 }
 
+/// A `$` address's link read: the view is taken under `instance`'s hold and
+/// its `DBF_CHAR` image built after releasing it. `None` is a field `$` does
+/// not apply to, which `dbChannelTest` refuses.
+#[cold]
+#[inline(never)]
+fn char_image_after_hold(
+    instance: crate::server::record::record_instance::RecordRef<'_>,
+    field: &str,
+) -> Option<EpicsValue> {
+    let view = super::char_view::char_view(&instance, field);
+    drop(instance);
+    view.map(super::char_view::CharView::into_chars)
+}
+
+/// The source alarm a read of `db` reports, taken under the read's hold:
+/// only an `MS`/`MSS`/`MSI` link inherits one.
+#[inline(always)]
+fn db_link_alarm(
+    db: &crate::server::record::DbLink,
+    at: &crate::server::record::record_instance::ResolvedTarget,
+    instance: &crate::server::record::RecordInstance,
+) -> Option<SourceAlarm> {
+    (db.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize).then(|| {
+        SourceAlarm::local(
+            SourceId::of(&at.rec),
+            LinkAlarm::committed(&instance.common),
+        )
+    })
+}
+
+/// A link read with the source's part of its `DBR_STRING` conversion, when
+/// the reader asked for one.
+pub(crate) type RenderedRead = (
+    Option<EpicsValue>,
+    Option<SourceAlarm>,
+    Option<crate::server::record::record_instance::SourceRender>,
+);
+
+/// The fetch twin of [`RenderedRead`].
+pub(crate) type RenderedFetch = (
+    crate::server::recgbl::simm::LinkFetch,
+    Option<SourceAlarm>,
+    Option<crate::server::record::record_instance::SourceRender>,
+);
+
+/// The INVALID every failing OUT put owes its record (`setLinkAlarm`).
+#[cold]
+fn set_out_link_alarm(src_rec: InFrame<'_>, field: &'static str) {
+    let mut inst = src_rec.write();
+    crate::server::recgbl::rec_gbl_set_link_alarm(&mut inst.common, field);
+}
+
+/// Whether `at` addresses a `DBF_CHAR`/`DBF_UCHAR` field — C
+/// `dbGetLinkDBFtype` of a DB link (`dbDbGetDBFtype`). A runtime-typed field
+/// is typed by the variant it holds, as `cvt_dbaddr` is in the port.
+#[cold]
+fn takes_chars(
+    held: Option<&super::SetGuard>,
+    rec: &crate::server::record::RecordCell,
+    put: &crate::server::record::record_instance::PutAddr,
+    field: &str,
+) -> bool {
+    use crate::types::DbfCode;
+    let addr = put.field();
+    if addr.char_view() {
+        return true;
+    }
+    let Some(desc) = addr.desc else {
+        return false;
+    };
+    if !desc.runtime_typed {
+        let code = super::char_view::field_addr_types(desc, None).0;
+        return matches!(code, DbfCode::Char | DbfCode::UChar);
+    }
+    let guard = match held {
+        Some(held) => rec.read_in(held),
+        None => rec.read(),
+    };
+    // The primary field's variant, lent: a waveform VAL is not cloned.
+    if rec.rdes().is_primary(field, &*guard.record)
+        && let Some(view) = guard.record.monitor_value_view()
+    {
+        use crate::server::record::ValueView;
+        return matches!(view, ValueView::Char(_) | ValueView::UChar(_));
+    }
+    let value = guard.resolve_field(field);
+    let code = super::char_view::field_addr_types(desc, value.as_ref()).0;
+    matches!(code, DbfCode::Char | DbfCode::UChar)
+}
+
 #[cfg(test)]
 mod out_link_put_fail_tests {
-    use super::{LinkAlarm, OutLinkSrc};
+    use super::OutLinkSrc;
     use crate::server::database::PvDatabase;
     use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
     use crate::server::records::calc::CalcRecord;
@@ -3925,15 +5384,9 @@ mod out_link_put_fail_tests {
             LinkProcessPolicy::ProcessPassive, // ` PP` token
             MonitorSwitch::NoMaximize,
         );
-        let alarm = LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
-        };
         let src = OutLinkSrc {
             putf: false,
             notify: None,
-            alarm: &alarm,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -3976,15 +5429,9 @@ mod out_link_put_fail_tests {
             LinkProcessPolicy::ProcessPassive, // ` PP` token
             MonitorSwitch::NoMaximize,
         );
-        let alarm = LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
-        };
         let src = OutLinkSrc {
             putf: false,
             notify: None,
-            alarm: &alarm,
             field: "OUT",
         };
         let mut visited = crate::server::database::ProcStack::new();
@@ -4027,40 +5474,34 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for RecordingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
         async fn put_value(
             &self,
-            name: &str,
+            name: &[u8],
             value: EpicsValue,
             _op: LinkPutOp,
         ) -> Result<(), String> {
-            self.puts.lock().unwrap().push((name.to_string(), value));
+            self.puts
+                .lock()
+                .unwrap()
+                .push((String::from_utf8_lossy(name).into_owned(), value));
             Ok(())
         }
     }
 
-    fn out_src(alarm: &super::LinkAlarm) -> OutLinkSrc<'_> {
+    fn out_src() -> OutLinkSrc<'static> {
         OutLinkSrc {
             putf: false,
             notify: None,
-            alarm,
             field: "OUT",
-        }
-    }
-
-    fn no_alarm() -> super::LinkAlarm {
-        super::LinkAlarm {
-            stat: 0,
-            sevr: AlarmSeverity::NoAlarm,
-            amsg: crate::server::record::SparseText::default(),
         }
     }
 
@@ -4083,14 +5524,8 @@ mod nonlocal_db_link_write_tests {
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
         );
-        let alarm = no_alarm();
         let mut visited = crate::server::database::ProcStack::new();
-        db.write_db_link_value(
-            &link,
-            EpicsValue::Double(42.0),
-            out_src(&alarm),
-            &mut visited,
-        );
+        db.write_db_link_value(&link, EpicsValue::Double(42.0), out_src(), &mut visited);
         // Staged on the link-put queue and returned, as C `dbCaPutLink`
         // does (`dbCa.c:593-595`); `dbCaSync` (`dbCa.c:1126-1129`) is the
         // barrier that makes the wire write observable.
@@ -4124,14 +5559,8 @@ mod nonlocal_db_link_write_tests {
             LinkProcessPolicy::NoProcess,
             MonitorSwitch::NoMaximize,
         );
-        let alarm = no_alarm();
         let mut visited = crate::server::database::ProcStack::new();
-        db.write_db_link_value(
-            &link,
-            EpicsValue::Double(7.0),
-            out_src(&alarm),
-            &mut visited,
-        );
+        db.write_db_link_value(&link, EpicsValue::Double(7.0), out_src(), &mut visited);
 
         assert!(
             puts.lock().unwrap().is_empty(),
@@ -4143,7 +5572,7 @@ mod nonlocal_db_link_write_tests {
         );
     }
 
-    /// A link set that records every `scan_forward` it receives so a test
+    /// A link set whose forward handles record every `scan_forward` so a test
     /// can assert a non-DB FLNK reached the external forward path
     /// (C `dbScanFwdLink` → `lset->scanForward`) instead of being dropped
     /// by the DB-only `flnk_name` filter. `connected=false` models a
@@ -4154,27 +5583,43 @@ mod nonlocal_db_link_write_tests {
     }
     #[async_trait::async_trait]
     impl LinkSet for ForwardingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             self.connected
         }
-        fn get_cached_value(&self, _: &str) -> Option<EpicsValue> {
+        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn get_value(&self, name: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
             self.get_cached_value(name)
         }
-        fn scan_forward(&self, name: &str) -> Result<(), String> {
-            self.forwards.lock().unwrap().push(name.to_string());
+        fn forward_handle(&self, name: &[u8]) -> Box<dyn crate::server::database::LinkForward> {
+            Box::new(RecordedForward {
+                name: String::from_utf8_lossy(name).into_owned(),
+                forwards: self.forwards.clone(),
+                connected: self.connected,
+            })
+        }
+    }
+
+    struct RecordedForward {
+        name: String,
+        forwards: Arc<Mutex<Vec<String>>>,
+        connected: bool,
+    }
+
+    impl crate::server::database::LinkForward for RecordedForward {
+        fn scan_forward(&self) -> Result<(), crate::server::database::LinkForwardRefused> {
+            self.forwards.lock().unwrap().push(self.name.clone());
             if self.connected {
                 Ok(())
             } else {
-                Err("Disconn".into())
+                Err(crate::server::database::LinkForwardRefused)
             }
         }
     }
 
-    /// `scan_forward_external_pv` must resolve the scheme and delegate to
-    /// the registered lset's `scan_forward` — the FWD-link twin of
+    /// `scan_forward_external_pv` must run the handle the registered lset
+    /// opened the link with — the FWD-link twin of
     /// `write_external_pv` for OUT writes (C `dbScanFwdLink` →
     /// `lset->scanForward`).
     #[epics_macros_rs::epics_test]
@@ -4190,7 +5635,14 @@ mod nonlocal_db_link_write_tests {
         )
         .await;
 
-        db.scan_forward_external_pv("pva://OTHER:PROC")
+        let link = crate::server::record::ParsedLink::Pva("OTHER:PROC".into());
+        db.bind_external_forward(&link);
+        let flnk = crate::server::database::LinkId {
+            rec: None,
+            field: "FLNK",
+            install: crate::server::database::LinkInstall::Detached,
+        };
+        db.scan_forward_external_pv(flnk, link.external_forward().unwrap())
             .expect("a connected forward must succeed");
 
         let captured = forwards.lock().unwrap();
@@ -4199,7 +5651,7 @@ mod nonlocal_db_link_write_tests {
     }
 
     /// End-to-end: a record whose FLNK targets an external `pva://` PV
-    /// must fire the link set's `scan_forward` when it processes — the
+    /// must fire its forward handle when it processes — the
     /// non-DB FLNK dispatch the DB-only `flnk_name` filter previously
     /// dropped. C `recGblFwdLink` runs `dbScanFwdLink` for every FLNK
     /// regardless of link kind.
@@ -4223,6 +5675,8 @@ mod nonlocal_db_link_write_tests {
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
         }
+        // The lset opens the link at iocInit, as C's does.
+        db.ioc_init().await;
 
         let mut visited = crate::server::database::ProcStack::new();
         db.process_record_with_links("SRC", &mut visited)
@@ -4264,6 +5718,8 @@ mod nonlocal_db_link_write_tests {
             inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
                 .unwrap();
         }
+        // The lset opens the link at iocInit, as C's does.
+        db.ioc_init().await;
 
         let mut visited = crate::server::database::ProcStack::new();
         db.process_record_with_links("SRC", &mut visited)
@@ -4284,6 +5740,75 @@ mod nonlocal_db_link_write_tests {
         );
         assert_eq!(inst.common.namsg, "Disconn");
     }
+
+    /// C `dbAddLink` opens a link put at runtime (`dbLink.c:146-191`): a
+    /// `pva` FLNK written after the lset registered and after iocInit is
+    /// bound by the put itself and dispatches on the next process.
+    #[epics_macros_rs::epics_test]
+    async fn external_forward_link_added_at_runtime_dispatches() {
+        let db = PvDatabase::new();
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set(
+            "pva",
+            Arc::new(ForwardingLset {
+                forwards: forwards.clone(),
+                connected: true,
+            }),
+        )
+        .await;
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        db.ioc_init().await;
+        db.put_record_field_from_ca("SRC", "FLNK", EpicsValue::String("pva://TARGET".into()))
+            .await
+            .unwrap();
+
+        let mut visited = crate::server::database::ProcStack::new();
+        db.process_record_with_links("SRC", &mut visited)
+            .await
+            .unwrap();
+
+        assert_eq!(*forwards.lock().unwrap(), ["TARGET"]);
+        assert_eq!(
+            db.get_record("SRC").unwrap().read().common.nsev,
+            AlarmSeverity::NoAlarm
+        );
+    }
+
+    /// A forward whose slot no lset bound does nothing: with no `pva` lset
+    /// registered nothing opens `pva://TARGET`, and C `dbScanFwdLink` skips a
+    /// link with no `lset` (`dbLink.c:475-481`) without an alarm.
+    #[epics_macros_rs::epics_test]
+    async fn unbound_external_forward_link_is_a_silent_no_op() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        db.get_record("SRC")
+            .unwrap()
+            .write()
+            .put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+            .unwrap();
+        db.ioc_init().await;
+
+        let mut visited = crate::server::database::ProcStack::new();
+        db.process_record_with_links("SRC", &mut visited)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SRC").unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            (inst.common.nsev, inst.common.nsta),
+            (AlarmSeverity::NoAlarm, 0)
+        );
+        assert_eq!(inst.common.namsg, "");
+        assert_eq!(
+            (inst.common.sevr, inst.common.stat),
+            (AlarmSeverity::NoAlarm, 0)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4292,156 +5817,44 @@ mod cp_link_locality_tests {
     use crate::server::record::ParsedLink;
     use crate::server::records::ai::AiRecord;
 
-    /// A CP/CPP link with no explicit `CA` modifier whose target is NOT a
-    /// local record must be served as an external (CA) link — both the
-    /// trigger and the value read. C `dbInitLink` (`dbLink.c:118-122`) tests
-    /// the `CA`/`CP`/`CPP` modifier FIRST and skips `dbDbInitLink` entirely
-    /// when one is present, so in C a CP link is a CA link whether or not the
-    /// named record is local; `dbLink.c:128` computes `isLocal` only to pick
-    /// the init-callback hint. The port keeps a LOCAL CP target as a `Db`
-    /// link instead (see `cp_link_to_local_target_stays_db`) and restores the
-    /// C semantics at the trigger, so only the non-local case converts here.
-    ///
-    /// Here `INP="OTHER:PV CP"` parses to `ParsedLink::Db` (bare name, no
-    /// `CA`), but `OTHER:PV` is not local. The holder's `parsed_inp` must be
-    /// rewritten to `ParsedLink::Ca` (so the read routes through
-    /// `resolve_external_pv`) and `OTHER:PV` must be registered as an
-    /// external CP trigger.
-    ///
-    /// The two halves now have two owners, matching C's two calls:
-    /// `initialize_link_locality` is `dbInitLink`'s conversion and applies to
-    /// EVERY link, CP or not; `setup_cp_links` only registers the trigger.
-    /// The rewrite used to live inside `setup_cp_links`, which is why it
-    /// reached CP/CPP links alone.
+    /// C `dbInitLink` (`dbLink.c:118-122`) tests `CA`/`CP`/`CPP` before
+    /// locality and skips `dbDbInitLink` when one is set, so a CP link is a
+    /// CA link whether its record is here (`SRC`) or not (`OTHER:PV`), and
+    /// each is registered as the trigger of its holder.
     #[epics_macros_rs::epics_test]
-    async fn cp_link_to_nonlocal_target_forced_external() {
+    async fn a_cp_link_is_a_ca_link_whatever_its_target() {
         let db = PvDatabase::new();
-        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        {
-            let rec = db.get_record("HOLDER").unwrap();
-            rec.write().common.inp = "OTHER:PV CP".to_string();
-        }
-
-        db.initialize_link_locality().await;
-        db.setup_cp_links().await;
-
-        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
-        match inp {
-            ParsedLink::Ca(ca) => assert_eq!(
-                ca.pv, "OTHER:PV",
-                "non-local CP link must carry the verbatim PV name"
-            ),
-            other => panic!("non-local CP link must be forced to Ca, got {other:?}"),
-        }
-        assert!(
-            db.external_cp_pv_names()
-                .await
-                .contains(&"OTHER:PV".to_string()),
-            "non-local CP link must be registered as an external CP trigger"
-        );
-    }
-
-    /// A CP link whose target IS a local record keeps the `Db` SHAPE — and
-    /// that is a deliberate port DEVIATION, not C parity.
-    ///
-    /// C `dbInitLink` (`dbLink.c:118-122`) would make this link a CA link:
-    /// the modifier test precedes and short-circuits `dbDbInitLink`, so `SRC`
-    /// being local changes nothing about the link's class. The port cannot
-    /// follow that literally — the `ca` link set lives in `epics-ca-rs`, which
-    /// `epics-base-rs` does not depend on, so converting a local CP link to
-    /// `Ca` would leave it unresolvable (and its holder never processed) in a
-    /// bare `epics-base-rs` IOC.
-    ///
-    /// What this test therefore pins is the deviation TOGETHER with what
-    /// compensates for it: the link keeps the `Db` shape, it is NOT an
-    /// external CP trigger, and it IS registered in the LOCAL CP registry —
-    /// the registry `PvDatabase::dispatch_cp_targets` drives, and which since
-    /// the `CyclePosts` gate fires only on a `DBE_VALUE|DBE_ALARM` post from
-    /// `SRC`, exactly as C's CA subscription would (`dbCa.c:1225-1229` →
-    /// `cadef.h:2010-2011`). The observable rule is proven by
-    /// `tests/cp_link_trigger_is_a_post.rs`; a `Db` shape with no local
-    /// registration would satisfy the old assertion and still never process
-    /// the holder.
-    #[epics_macros_rs::epics_test]
-    async fn cp_link_to_local_target_stays_db() {
-        let db = PvDatabase::new();
-        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
-            .await
-            .unwrap();
-        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        {
-            let rec = db.get_record("HOLDER").unwrap();
-            let mut inst = rec.write();
-            inst.common.inp = "SRC CP".to_string();
-            // Seed the parse cache as load would, so the assertion proves
-            // setup_cp_links leaves a local CP link untouched.
-            inst.parsed_inp = crate::server::record::parse_link_v2("SRC CP");
-        }
-
-        db.initialize_link_locality().await;
-        db.setup_cp_links().await;
-
-        let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
-        assert!(
-            matches!(inp, ParsedLink::Db(_)),
-            "the port keeps a local CP link in the Db shape (C would make it a \
-             CA link); got {inp:?}"
-        );
-        assert!(
-            !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
-            "a local CP target must not be registered as an external CP link"
-        );
-        assert!(
-            db.get_cp_targets("SRC")
-                .iter()
-                .any(|t| t.record == "HOLDER" && !t.passive_only),
-            "the Db shape is only sound because the edge lands in the LOCAL CP \
-             registry, where the post gate drives it"
-        );
-    }
-
-    /// The gate's two boundaries: a record with no CP holder answers `false`
-    /// from its own cache after the first ask, and a registration made AFTER
-    /// that cache was filled still reaches it — the registry's revision is
-    /// what expires the cached answer, so nothing has to remember to.
-    #[epics_macros_rs::epics_test]
-    async fn cached_cp_edge_gate_expires_on_registration() {
-        use crate::server::records::ai::AiRecord;
-
-        let db = PvDatabase::new();
-        for name in ["SRC", "HOLDER"] {
+        for name in ["SRC", "LOCAL", "REMOTE"] {
             db.add_record(name, Box::new(AiRecord::new(0.0)))
                 .await
                 .unwrap();
         }
-        let src = db.get_record("SRC").unwrap();
+        for (holder, inp) in [("LOCAL", "SRC CP"), ("REMOTE", "OTHER:PV CPP")] {
+            let rec = db.get_record(holder).unwrap();
+            let mut inst = rec.write();
+            inst.common.text.inp = inp.into();
+            inst.install_link_cache(
+                "INP",
+                std::sync::Arc::new(crate::server::record::parse_link_v2(inp)),
+            )
+            .expect("INP is a common link");
+        }
 
-        assert!(
-            !db.sources_cp_edges("SRC", &src),
-            "no CP edge names SRC yet"
-        );
-        assert!(
-            !db.sources_cp_edges("SRC", &src),
-            "the second ask is the cached one and must answer the same"
-        );
+        db.initialize_link_locality().await;
+        db.setup_cp_links().await;
 
-        db.register_cp_link("SRC", "HOLDER", false).await;
-        assert!(
-            db.sources_cp_edges("SRC", &src),
-            "the registration moved the registry revision, so the cached \
-             `false` must not have survived it"
-        );
-
-        db.remove_record("HOLDER").await;
-        assert!(
-            !db.sources_cp_edges("SRC", &src),
-            "removing the holder drops the edge, and the same revision gate \
-             must expire the cached `true`"
-        );
+        for (holder, pv) in [("LOCAL", "SRC"), ("REMOTE", "OTHER:PV")] {
+            let inp = db.get_record(holder).unwrap().read().parsed_inp.clone();
+            match inp {
+                ParsedLink::Ca(ca) => assert_eq!(ca.pv, pv),
+                other => panic!("{holder}: a CP link is a CA link, got {other:?}"),
+            }
+            let targets = db.get_external_cp_targets(pv.as_bytes());
+            assert_eq!(targets.len(), 1, "{holder}");
+            assert_eq!(targets[0].record, holder);
+        }
+        assert!(!db.get_external_cp_targets(b"SRC")[0].passive_only);
+        assert!(db.get_external_cp_targets(b"OTHER:PV")[0].passive_only);
     }
 }
 
@@ -4475,12 +5888,18 @@ mod external_link_pv_name_tests {
 
         // Two records, one upstream PV, two spellings: the bare ` CA`
         // modifier and the explicit scheme. One registry entry.
-        db.get_record("IN1").unwrap().write().common.inp = "UP:ZED CP".to_string();
-        db.get_record("IN2").unwrap().write().common.inp = "ca://UP:ZED CP".to_string();
+        db.get_record("IN1").unwrap().write().common.text.inp = "UP:ZED CP".into();
+        db.get_record("IN2").unwrap().write().common.text.inp = "ca://UP:ZED CP".into();
         // An OUT link reaches `dbCaAddLink` in C exactly as an IN link does.
-        db.get_record("OUT1").unwrap().write().common.out = "ca://UP:ALPHA".to_string();
-        // A link to a record this IOC does have is local and must not count.
-        db.get_record("LOCAL_HOLDER").unwrap().write().common.inp = "LOCAL_SRC CP".to_string();
+        db.get_record("OUT1").unwrap().write().common.text.out = "ca://UP:ALPHA".into();
+        // A link to a record this IOC does have is local and must not count
+        // (a CP one would: it is a CA link, `dbLink.c:118-122`).
+        db.get_record("LOCAL_HOLDER")
+            .unwrap()
+            .write()
+            .common
+            .text
+            .inp = "LOCAL_SRC PP".into();
 
         db.initialize_link_locality().await;
 
@@ -4525,8 +5944,8 @@ mod nonlocal_db_link_read_tests {
     async fn plain_nonlocal_db_link_reads_via_external_resolver() {
         let db = PvDatabase::new();
         // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
-        db.set_external_resolver(Arc::new(|name: &str| {
-            (name == "OTHER:PV").then_some(EpicsValue::Double(42.0))
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"OTHER:PV").then_some(EpicsValue::Double(42.0))
         }))
         .await;
 
@@ -4537,7 +5956,9 @@ mod nonlocal_db_link_read_tests {
         );
 
         let mut visited = crate::server::database::ProcStack::new();
-        let v = db.read_link_value(&link, &mut visited);
+        let v = db
+            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
+            .0;
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -4553,13 +5974,13 @@ mod nonlocal_db_link_read_tests {
     #[epics_macros_rs::epics_test]
     async fn nonlocal_db_link_value_and_alarm_via_external() {
         let db = PvDatabase::new();
-        db.set_external_resolver(Arc::new(|name: &str| {
-            (name == "OTHER:PV").then_some(EpicsValue::Double(5.0))
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"OTHER:PV").then_some(EpicsValue::Double(5.0))
         }))
         .await;
 
         let link = parse_link_v2("OTHER:PV");
-        let (fetch, alarm) = db.read_link_with_alarm(&link);
+        let (fetch, alarm, _) = db.read_link_with_alarm(&link, false);
         assert_eq!(
             fetch.value(),
             Some(EpicsValue::Double(5.0)),
@@ -4582,12 +6003,14 @@ mod nonlocal_db_link_read_tests {
         db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
         // A resolver returning a DIFFERENT value proves the local read
         // wins and the external path is not taken for a local target.
-        db.set_external_resolver(Arc::new(|_name: &str| Some(EpicsValue::Double(-1.0))))
+        db.set_external_resolver(Arc::new(|_name: &[u8]| Some(EpicsValue::Double(-1.0))))
             .await;
 
         let link = parse_link_v2("SRC");
         let mut visited = crate::server::database::ProcStack::new();
-        let v = db.read_link_value(&link, &mut visited);
+        let v = db
+            .read_link_value_and_alarm_at_source(&link, false, &mut visited)
+            .0;
         assert_eq!(
             v,
             Some(EpicsValue::Double(7.0)),
@@ -4763,7 +6186,7 @@ mod link_metadata_tests {
         // key is `DbLink::pvname` — the link text itself, so two links whose
         // text differs stay separate entries even when they address the same
         // field.
-        visited.insert("SRC".to_string());
+        visited.insert("SRC".into());
         assert_eq!(
             db.link_metadata(&link, &mut visited),
             None,
@@ -4807,16 +6230,16 @@ mod no_reactor_gate_tests {
 
     #[async_trait::async_trait]
     impl LinkSet for WillingLset {
-        fn is_connected(&self, _: &str) -> bool {
+        fn is_connected(&self, _: &[u8]) -> bool {
             true
         }
-        fn put_admission(&self, _: &str) -> PutAdmission {
+        fn put_admission(&self, _: &[u8]) -> PutAdmission {
             PutAdmission::Connected
         }
-        async fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
             None
         }
-        async fn put_value(&self, _: &str, _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
+        async fn put_value(&self, _: &[u8], _: EpicsValue, _: LinkPutOp) -> Result<(), String> {
             Ok(())
         }
     }
@@ -4848,10 +6271,10 @@ mod no_reactor_gate_tests {
         .expect("a plain test thread is blockable");
 
         let err = db
-            .external_put_admitted("ca://SOME:PV")
+            .external_put_admitted(b"ca://SOME:PV")
             .expect_err("a database with no reactor must refuse the external put");
         assert!(
-            err.contains("no tokio runtime"),
+            err.to_string().contains("no tokio runtime"),
             "the refusal must name the missing reactor, got: {err}"
         );
     }
@@ -4859,8 +6282,8 @@ mod no_reactor_gate_tests {
 
 impl crate::server::record::record_instance::LinkTargetResolver for PvDatabase {
     fn name_revision(&self) -> u64 {
-        // Two monotonic counters, so their sum changes whenever either does.
-        self.inner.records.revision() + self.inner.aliases.revision()
+        // Monotonic counters, so their sum changes whenever any does.
+        self.inner.records.revision() + self.inner.aliases.revision() + self.simple_pvs_revision()
     }
 
     fn local_target(
@@ -4870,16 +6293,984 @@ impl crate::server::record::record_instance::LinkTargetResolver for PvDatabase {
         let crate::server::record::ParsedLink::Db(db) = link else {
             return None;
         };
-        let target = db.target();
-        match self.link_target(&target.record) {
-            LinkTarget::Local(rec) => {
-                let field = crate::server::record::record_instance::FieldAddr::resolve_in(
-                    &rec,
-                    &target.field,
-                );
-                Some(crate::server::record::record_instance::ResolvedTarget { rec, field })
-            }
-            LinkTarget::LocalNotRecord | LinkTarget::External => None,
+        self.db_link_addr(db)
+    }
+}
+
+#[cfg(test)]
+mod db_link_addr_tests {
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::record::{ParsedLink, parse_link_v2};
+    use crate::server::records::ai::AiRecord;
+    use crate::types::EpicsValue;
+    use std::sync::Arc;
+
+    fn read(db: &PvDatabase, link: &ParsedLink) -> Option<EpicsValue> {
+        db.read_link_value_and_alarm_at_source(link, false, &mut ProcStack::new())
+            .0
+    }
+
+    /// A simple PV spelling the target (`DST.HOPR`) is settled in the link's
+    /// answer like an address: once the first cycle has resolved it, a cycle
+    /// takes no `simple_pvs` lock (held here across it) and still reads the
+    /// PV, through the reader's `INP` and through a link read alike.
+    #[epics_macros_rs::epics_test]
+    async fn a_shadowed_target_is_settled_once_per_revision() {
+        let db = PvDatabase::new();
+        db.add_record("DST", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("RD", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record("RD")
+            .unwrap()
+            .write()
+            .put_common_field("INP", EpicsValue::String("DST.HOPR".into()))
+            .unwrap();
+        db.add_pv("DST.HOPR", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        let link = parse_link_v2("DST.HOPR");
+        db.process_record("RD").await.unwrap();
+        assert_eq!(read(&db, &link), Some(EpicsValue::Double(5.0)));
+
+        let held = db.inner.simple_pvs.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cycle = db.clone();
+        std::thread::spawn(move || {
+            let r = cycle.process_record_with_links_sync(b"RD", &mut ProcStack::new());
+            let v = read(&cycle, &link);
+            let _ = tx.send((r.is_ok(), v));
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        assert_eq!(
+            done.expect("a settled cycle took the simple_pvs lock"),
+            (true, Some(EpicsValue::Double(5.0)))
+        );
+        assert_eq!(db.get_pv("RD").unwrap(), EpicsValue::Double(5.0));
+    }
+
+    /// Unchanged name maps: the second read goes through the address the
+    /// first one resolved, not a second lookup.
+    #[epics_macros_rs::epics_test]
+    async fn an_unchanged_name_map_reuses_the_resolved_address() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let ParsedLink::Db(link) = parse_link_v2("SRC") else {
+            panic!("a record name parses to a Db link");
+        };
+        let first = db.db_link_addr(&link).expect("SRC is local");
+        let second = db.db_link_addr(&link).expect("SRC is local");
+        assert!(Arc::ptr_eq(&first.rec, &second.rec));
+    }
+
+    /// A record added after the answer settled `External` is found by the
+    /// next read, which re-resolves at the moved revision and settles the
+    /// answer: the read after it needs no resolve.
+    #[epics_macros_rs::epics_test]
+    async fn a_target_added_after_an_external_answer_is_re_resolved() {
+        use crate::server::record::DbLinkAnswer;
+        use crate::server::record::record_instance::LinkTargetResolver;
+        let db = PvDatabase::new();
+        let ParsedLink::Db(link) = parse_link_v2("NEW") else {
+            panic!("a record name parses to a Db link");
+        };
+        assert!(matches!(db.db_link_answer(&link), DbLinkAnswer::External));
+        db.add_record("NEW", Box::new(AiRecord::new(7.0)))
+            .await
+            .unwrap();
+        let super::TargetValue::Record(value, ..) = db.read_db_target(&link) else {
+            panic!("an added record reads as a record");
+        };
+        assert_eq!(value, Some(EpicsValue::Double(7.0)));
+        let settled = link.answer(db.name_revision(), || panic!("the answer was not settled"));
+        assert!(matches!(settled, DbLinkAnswer::Local(_)));
+    }
+
+    /// A record removed and re-added under the link's name moves the
+    /// revision: the link reads the new record, not the one it resolved.
+    #[epics_macros_rs::epics_test]
+    async fn a_re_added_target_is_re_resolved() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let link = parse_link_v2("SRC");
+        assert_eq!(read(&db, &link), Some(EpicsValue::Double(1.0)));
+        // Held, so the cached `Weak` still upgrades: only the revision can
+        // tell the link its address is stale.
+        let _old = db.get_record("SRC").unwrap();
+        assert!(db.remove_record("SRC").await);
+        db.add_record("SRC", Box::new(AiRecord::new(7.0)))
+            .await
+            .unwrap();
+        assert_eq!(read(&db, &link), Some(EpicsValue::Double(7.0)));
+    }
+
+    /// The read carries the source's alarm only for a link that inherits
+    /// it: NMS (the default) carries none, MS carries it.
+    #[epics_macros_rs::epics_test]
+    async fn only_an_inheriting_link_carries_the_source_alarm() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("READER", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let reader = db.get_record("READER").unwrap();
+        let alarm_of = |text: &str| {
+            let link = parse_link_v2(text);
+            let (value, alarm, _) =
+                db.read_link_value_and_alarm_at_source(&link, false, &mut ProcStack::new());
+            assert_eq!(value, Some(EpicsValue::Double(1.0)));
+            (
+                alarm.is_some(),
+                db.with_frame(&reader, |f| db.input_link_inheritance(f, &link, alarm))
+                    .is_some(),
+            )
+        };
+        assert_eq!(alarm_of("SRC"), (false, false));
+        assert_eq!(alarm_of("SRC NMS"), (false, false));
+        assert_eq!(alarm_of("SRC MS"), (true, true));
+    }
+
+    /// A target that leaves the database turns the link non-local: the
+    /// cached address is not read, the external resolver is.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_target_falls_through_to_the_external_path() {
+        let db = PvDatabase::new();
+        db.set_external_resolver(Arc::new(|name: &[u8]| {
+            (name == b"SRC").then_some(EpicsValue::Double(9.0))
+        }))
+        .await;
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let link = parse_link_v2("SRC");
+        assert_eq!(read(&db, &link), Some(EpicsValue::Double(1.0)));
+        // Held, so the cached `Weak` still upgrades: only the revision can
+        // tell the link its address is stale.
+        let _old = db.get_record("SRC").unwrap();
+        assert!(db.remove_record("SRC").await);
+        assert_eq!(read(&db, &link), Some(EpicsValue::Double(9.0)));
+    }
+
+    /// The shadow test is decided by the link's spelling: a `VAL` target
+    /// cannot be shadowed, a simple PV spelled `REC.FLD` shadows that field.
+    #[epics_macros_rs::epics_test]
+    async fn only_a_non_val_target_can_be_shadowed() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_pv("SRC.DESC", EpicsValue::Double(5.0))
+            .await
+            .unwrap();
+        for (text, is_val) in [
+            ("SRC", true),
+            ("SRC.VAL", true),
+            ("SRC.{\"arr\":{}}", true),
+            ("SRC.DESC", false),
+        ] {
+            let ParsedLink::Db(link) = parse_link_v2(text) else {
+                panic!("{text} parses to a Db link");
+            };
+            assert_eq!(link.target_is_val(), is_val, "{text}");
         }
+        assert_eq!(
+            read(&db, &parse_link_v2("SRC")),
+            Some(EpicsValue::Double(1.0))
+        );
+        assert_eq!(
+            read(&db, &parse_link_v2("SRC.DESC")),
+            Some(EpicsValue::Double(5.0))
+        );
+    }
+
+    async fn add_soft_ai(db: &PvDatabase, name: &str, inp: &str) {
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record(name)
+            .unwrap()
+            .write()
+            .put_common_field_db_load("INP", EpicsValue::String(inp.into()))
+            .unwrap();
+    }
+
+    async fn ai_val(db: &PvDatabase, name: &str) -> Option<EpicsValue> {
+        db.get_record(name).unwrap().read().resolve_field("VAL")
+    }
+
+    /// The held-guard INP read lends a strong address; removing the target
+    /// releases it (the owner sweep), and a target re-added under the name
+    /// is re-resolved and read on the next cycle.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_inp_target_releases_the_lent_address() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        add_soft_ai(&db, "READER", "SRC").await;
+        db.process_record("READER").await.unwrap();
+        assert_eq!(ai_val(&db, "READER").await, Some(EpicsValue::Double(1.0)));
+        let src = db.get_record("SRC").unwrap();
+        assert_eq!(
+            Arc::strong_count(&src),
+            4,
+            "the map, the record table, the lent address, this test"
+        );
+        assert!(db.remove_record("SRC").await);
+        assert_eq!(
+            Arc::strong_count(&src),
+            2,
+            "the lent address outlived the removal"
+        );
+        drop(src);
+        db.add_record("SRC", Box::new(AiRecord::new(7.0)))
+            .await
+            .unwrap();
+        db.process_record("READER").await.unwrap();
+        assert_eq!(ai_val(&db, "READER").await, Some(EpicsValue::Double(7.0)));
+    }
+
+    /// A destroyed reader drops its lent address: the target keeps only
+    /// the handles that are not the reader's.
+    #[epics_macros_rs::epics_test]
+    async fn a_removed_reader_releases_its_lent_address() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        add_soft_ai(&db, "READER", "SRC").await;
+        db.process_record("READER").await.unwrap();
+        let src = db.get_record("SRC").unwrap();
+        assert_eq!(Arc::strong_count(&src), 4);
+        let reader = db.get_record("READER").unwrap();
+        assert!(db.remove_record("READER").await);
+        assert_eq!(
+            Arc::strong_count(&src),
+            3,
+            "the map, the record table and this test"
+        );
+        drop(reader);
+    }
+
+    /// Two records whose INPs read each other hold each other through
+    /// their lent addresses; the database's drop still frees both.
+    #[epics_macros_rs::epics_test]
+    async fn dropping_the_database_frees_inps_that_read_each_other() {
+        let db = PvDatabase::new();
+        add_soft_ai(&db, "CYC:A", "CYC:B").await;
+        add_soft_ai(&db, "CYC:B", "CYC:A").await;
+        db.process_record("CYC:A").await.unwrap();
+        db.process_record("CYC:B").await.unwrap();
+        let a = db.get_record("CYC:A").unwrap();
+        let b = db.get_record("CYC:B").unwrap();
+        assert_eq!((Arc::strong_count(&a), Arc::strong_count(&b)), (4, 4));
+        let (weak_a, weak_b) = (Arc::downgrade(&a), Arc::downgrade(&b));
+        drop((a, b, db));
+        assert!(weak_a.upgrade().is_none() && weak_b.upgrade().is_none());
+    }
+
+    /// The `DBR_DOUBLE` read answers what the general path's `DBR_DOUBLE`
+    /// read does, alarm included, on each side of each boundary of its slot
+    /// path: a `VAL` slot with and without the alarm, a filtered `VAL`, a
+    /// non-`VAL` slot, a `VAL` with no slot, an array, a string that does
+    /// and does not convert, and a field that does not exist.
+    #[epics_macros_rs::epics_test]
+    async fn the_double_read_answers_what_the_general_read_does() {
+        use crate::server::record::{LinkReadAs, Record};
+        use crate::server::records::{
+            calc::CalcRecord, stringin::StringinRecord, waveform::WaveformRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let mut calc = CalcRecord::new("A");
+        calc.put_field("A", EpicsValue::Double(2.5)).unwrap();
+        calc.put_field("VAL", EpicsValue::Double(4.5)).unwrap();
+        db.add_record("C", Box::new(calc)).await.unwrap();
+        let mut wf = WaveformRecord::new(4, crate::types::DbFieldType::Double);
+        wf.put_field("VAL", EpicsValue::DoubleArray(vec![6.0, 7.0].into()))
+            .unwrap();
+        db.add_record("W", Box::new(wf)).await.unwrap();
+        db.add_record("S", Box::new(StringinRecord::new("3.25")))
+            .await
+            .unwrap();
+        db.add_record("T", Box::new(StringinRecord::new("abc")))
+            .await
+            .unwrap();
+        for (text, slot_path, expect) in [
+            ("C MS", true, Some(4.5)),
+            ("C NMS", true, Some(4.5)),
+            ("C.VAL MS", true, Some(4.5)),
+            ("C.{\"arr\":{}} MS", false, Some(4.5)),
+            ("C.A MS", false, Some(2.5)),
+            ("SRC MS", false, Some(1.5)),
+            ("W MS", false, Some(6.0)),
+            ("S MS", false, Some(3.25)),
+            ("T MS", false, None),
+        ] {
+            let parsed = parse_link_v2(text);
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            assert_eq!(
+                link.target_is_val()
+                    && link.target().json_suffix.is_none()
+                    && crate::server::database::field_io::double_slot(at.put.field()).is_some(),
+                slot_path,
+                "{text}"
+            );
+            let held = db.lock_record(&link.target().record);
+            let (value, alarm) = db.read_db_link_f64_at(held.set(), link, &at);
+            let (fetch, general_alarm) = db.read_link_value_as_with_alarm(
+                None,
+                &parsed,
+                LinkReadAs::Double,
+                &mut ProcStack::new(),
+            );
+            let general = match fetch {
+                crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
+                _ => None,
+            };
+            assert_eq!(value, expect, "{text}");
+            assert_eq!(value.map(EpicsValue::Double), general, "{text}");
+            assert_eq!(
+                alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
+                general_alarm
+                    .as_ref()
+                    .map(|a| (format!("{:?}", a.alarm), a.record)),
+                "{text}"
+            );
+        }
+        // `dbFindFieldPart` names neither, so the link has no address.
+        for text in ["C.NOPE MS", "C.val MS"] {
+            let ParsedLink::Db(link) = parse_link_v2(text) else {
+                panic!("{text} parses to a Db link");
+            };
+            assert!(db.db_link_addr(&link).is_none(), "{text}");
+        }
+        let ParsedLink::Db(link) = parse_link_v2("C.CALC$ MS") else {
+            panic!("C.CALC$ parses to a Db link");
+        };
+        assert!(
+            db.db_link_addr(&link).is_some(),
+            "the `$` is no part of the field"
+        );
+    }
+
+    /// `dbGetLink(DBR_CHAR)` of a non-char source converts it (softIoc
+    /// R7.0.10.1 printf `%ls`): one element of a numeric scalar, a string
+    /// parsed, and text that does not parse fails the read.
+    #[epics_macros_rs::epics_test]
+    async fn a_char_read_of_a_non_char_source_is_its_dbr_char_conversion() {
+        use crate::server::recgbl::simm::LinkFetch;
+        use crate::server::record::LinkReadAs;
+        use crate::server::records::{longin::LonginRecord, stringin::StringinRecord};
+        let db = PvDatabase::new();
+        for (name, v) in [("L7", 7), ("L300", 300), ("LN", -200)] {
+            db.add_record(name, Box::new(LonginRecord::new(v)))
+                .await
+                .unwrap();
+        }
+        for (name, v) in [("S42", "42"), ("SABC", "abc")] {
+            db.add_record(name, Box::new(StringinRecord::new(v)))
+                .await
+                .unwrap();
+        }
+        let read_as = LinkReadAs::CharArrayAsString { max_elements: 40 };
+        for (src, want) in [
+            ("L7", Some(&[7u8][..])),
+            ("L300", Some(&[44])),
+            ("LN", Some(&[56])),
+            ("S42", Some(&[42])),
+            ("SABC", None),
+        ] {
+            let (fetch, _) = db.read_link_value_as_with_alarm(
+                None,
+                &parse_link_v2(src),
+                read_as,
+                &mut ProcStack::new(),
+            );
+            let got = match fetch {
+                LinkFetch::Value(EpicsValue::String(s)) => Some(s.as_bytes().to_vec()),
+                _ => None,
+            };
+            assert_eq!(got.as_deref(), want, "{src}");
+        }
+    }
+
+    /// The read with the target in hand answers what the general path
+    /// does, alarm included, at every request type: a failed conversion
+    /// (an array as a string, `abc` as a double) inherits nothing.
+    #[epics_macros_rs::epics_test]
+    async fn the_held_target_read_answers_what_the_general_read_does() {
+        use crate::server::record::{LinkReadAs, Record};
+        use crate::server::records::{
+            calc::CalcRecord, stringin::StringinRecord, waveform::WaveformRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        let mut calc = CalcRecord::new("A");
+        calc.put_field("VAL", EpicsValue::Double(4.5)).unwrap();
+        db.add_record("C", Box::new(calc)).await.unwrap();
+        let mut wf = WaveformRecord::new(4, crate::types::DbFieldType::Char);
+        wf.put_field("VAL", EpicsValue::CharArray(b"hi".to_vec().into()))
+            .unwrap();
+        db.add_record("W", Box::new(wf)).await.unwrap();
+        db.add_record("T", Box::new(StringinRecord::new("abc")))
+            .await
+            .unwrap();
+        let requests = [
+            LinkReadAs::Native,
+            LinkReadAs::Double,
+            LinkReadAs::Long,
+            LinkReadAs::ULong,
+            LinkReadAs::UShort,
+            LinkReadAs::Int64,
+            LinkReadAs::Enum,
+            LinkReadAs::String,
+            LinkReadAs::CharArrayAsString { max_elements: 40 },
+        ];
+        for text in ["C MS", "C NMS", "SRC MS", "W MS", "T MS"] {
+            let parsed = parse_link_v2(text);
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            for read_as in requests {
+                let held = db.lock_record(&link.target().record);
+                let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
+                let (fetch, general_alarm) =
+                    db.read_link_value_as_with_alarm(None, &parsed, read_as, &mut ProcStack::new());
+                let general = match fetch {
+                    crate::server::recgbl::simm::LinkFetch::Value(v) => Some(v),
+                    _ => None,
+                };
+                assert_eq!(value, general, "{text} as {read_as:?}");
+                assert_eq!(
+                    alarm.as_ref().map(|a| (format!("{:?}", a.alarm), a.record)),
+                    general_alarm
+                        .as_ref()
+                        .map(|a| (format!("{:?}", a.alarm), a.record)),
+                    "{text} as {read_as:?}"
+                );
+            }
+        }
+    }
+
+    /// Each integer request on the edge C's GET table defines: an integer
+    /// source narrows by cast, a string parses with base auto-detect, and a
+    /// `DBR_ENUM` read of a string fails. A failed read inherits no alarm.
+    #[epics_macros_rs::epics_test]
+    async fn the_integer_requests_convert_as_c_dbget_does() {
+        use crate::server::record::LinkReadAs;
+        use crate::server::records::{
+            int64in::Int64inRecord, longin::LonginRecord, mbbi::MbbiRecord,
+            stringin::StringinRecord,
+        };
+        let db = PvDatabase::new();
+        db.add_record("BIG", Box::new(Int64inRecord::new(0x1_0000_0005)))
+            .await
+            .unwrap();
+        db.add_record("NEG", Box::new(LonginRecord::new(-1)))
+            .await
+            .unwrap();
+        db.add_record("HEX", Box::new(StringinRecord::new("0x10")))
+            .await
+            .unwrap();
+        db.add_record("EXP", Box::new(StringinRecord::new("1e3")))
+            .await
+            .unwrap();
+        db.add_record("WORD", Box::new(StringinRecord::new("One")))
+            .await
+            .unwrap();
+        db.add_record("M", Box::new(MbbiRecord::new(2)))
+            .await
+            .unwrap();
+        for (text, read_as, expect) in [
+            ("BIG", LinkReadAs::Long, Some(EpicsValue::Long(5))),
+            (
+                "BIG",
+                LinkReadAs::Int64,
+                Some(EpicsValue::Int64(0x1_0000_0005)),
+            ),
+            (
+                "BIG",
+                LinkReadAs::Double,
+                Some(EpicsValue::Double(4294967301.0)),
+            ),
+            ("NEG", LinkReadAs::UShort, Some(EpicsValue::UShort(65535))),
+            ("NEG", LinkReadAs::ULong, Some(EpicsValue::ULong(u32::MAX))),
+            ("NEG", LinkReadAs::Enum, Some(EpicsValue::Enum(65535))),
+            ("HEX", LinkReadAs::Long, Some(EpicsValue::Long(16))),
+            ("HEX", LinkReadAs::Int64, Some(EpicsValue::Int64(16))),
+            ("HEX", LinkReadAs::UShort, Some(EpicsValue::UShort(16))),
+            ("EXP", LinkReadAs::ULong, Some(EpicsValue::ULong(1000))),
+            ("WORD", LinkReadAs::Long, None),
+            ("WORD", LinkReadAs::Enum, None),
+            ("HEX", LinkReadAs::Enum, None),
+            ("M", LinkReadAs::Enum, Some(EpicsValue::Enum(2))),
+        ] {
+            let parsed = parse_link_v2(format!("{text} MS"));
+            let ParsedLink::Db(link) = &parsed else {
+                panic!("{text} parses to a Db link");
+            };
+            let at = db.db_link_addr(link).expect("a local target");
+            let held = db.lock_record(&link.target().record);
+            let (value, alarm) = db.read_db_link_as_at(held.set(), &parsed, &at, read_as);
+            assert_eq!(value, expect, "{text} as {read_as:?}");
+            assert_eq!(alarm.is_some(), expect.is_some(), "{text} as {read_as:?}");
+        }
+    }
+
+    /// A link reads through the cached slot exactly what the by-name read
+    /// answers, on each side of the slot boundary: a slot-addressed DOUBLE,
+    /// a string field, an undeclared name and a numeric field with no slot.
+    #[epics_macros_rs::epics_test]
+    async fn the_slot_read_answers_what_the_name_read_does() {
+        use crate::server::record::Record;
+        use crate::server::record::record_instance::FieldAddr;
+        use crate::server::records::calc::CalcRecord;
+        let db = PvDatabase::new();
+        let mut calc = CalcRecord::new("A+B");
+        calc.put_field("A", EpicsValue::Double(2.5)).unwrap();
+        calc.put_field("VAL", EpicsValue::Double(f64::NAN)).unwrap();
+        db.add_record("C", Box::new(calc)).await.unwrap();
+        db.add_record("SRC", Box::new(AiRecord::new(4.0)))
+            .await
+            .unwrap();
+        let cases = [
+            ("C.A", "C", "A", true),
+            ("C.VAL", "C", "VAL", true),
+            ("C.CALC", "C", "CALC", false),
+            ("C.NOPE", "C", "NOPE", false),
+            ("C.RTYP", "C", "RTYP", false),
+            ("SRC.VAL", "SRC", "VAL", false),
+        ];
+        for (text, rec, field, slotted) in cases {
+            let cell = db.get_record(rec).unwrap();
+            assert_eq!(
+                FieldAddr::resolve_in(&cell, field).slot().is_some(),
+                slotted,
+                "{text}"
+            );
+            let by_name = cell.read().resolve_field_upper(field);
+            let got = read(&db, &parse_link_v2(text));
+            match (&got, &by_name) {
+                (Some(EpicsValue::Double(a)), Some(EpicsValue::Double(b))) => {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{text}")
+                }
+                _ => assert_eq!(got, by_name, "{text}"),
+            }
+        }
+        assert_eq!(
+            read(&db, &parse_link_v2("C.A")),
+            Some(EpicsValue::Double(2.5))
+        );
+    }
+}
+
+#[cfg(test)]
+mod record_link_uses_tests {
+    use super::*;
+
+    fn instance(rtype: &str) -> RecordInstance {
+        let record = crate::server::db_loader::create_record(rtype).unwrap();
+        RecordInstance::new_boxed("R", record)
+    }
+
+    #[test]
+    fn every_record_link_use_names_a_slotted_link() {
+        for (rtype, _) in RECORD_LINK_USES {
+            check_record_links(&instance(rtype)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_type_reading_a_non_link_through_record_link_fails_to_load() {
+        let err = check_record_links_in(&instance("fanout"), &[("fanout", &[&["SELM"]])])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fanout.SELM"), "{err}");
+    }
+}
+
+/// One CP/CPP link's trigger: the channel it watches and CPP's gate.
+struct CpEdge {
+    /// The link's PV text.
+    pv: RecordName,
+    passive_only: bool,
+}
+
+/// The external registry's key: the PV the calink/pvalink monitor dispatches
+/// under, which the lset has stripped of its scheme.
+fn external_cp_key(pv: &[u8]) -> &[u8] {
+    pv.strip_prefix(b"ca://")
+        .or_else(|| pv.strip_prefix(b"pva://"))
+        .unwrap_or(pv)
+}
+/// Why [`PvDatabase::write_external_pv`] staged nothing.
+#[derive(Debug)]
+pub(crate) enum ExternalPutRefusal {
+    /// The link is down or read-only: C `dbCaPutLinkCallback`'s silent `-1`
+    /// (`db/dbCa.c:558-560`). The record's LINK alarm is the whole report.
+    NotConnected,
+    /// No link set or reactor can carry the write, a state C cannot reach.
+    Unserviceable(String),
+}
+
+impl ExternalPutRefusal {
+    /// What the refusal owes the errlog: nothing for a down link, as in C.
+    pub(crate) fn report(&self, name: &[u8]) {
+        if let Self::Unserviceable(why) = self {
+            crate::runtime::log::errlog_vprintf(format_args!(
+                "OUT-link write to external PV '{}' failed: {why}\n",
+                String::from_utf8_lossy(name)
+            ));
+        }
+    }
+}
+
+impl std::fmt::Display for ExternalPutRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str(
+                "not connected, or connected without write access \
+                 (db/dbCa.c:558-560 (dbCaPutLinkCallback))",
+            ),
+            Self::Unserviceable(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Spec §5 test 17: an OUT target outside the source's held set. Every DB
+/// link merges its two sets at iocInit, so the state is reached as
+/// breakpoint.rs's fixtures reach theirs: the link poked in after the sets
+/// were built. rs only; C has no observable equivalent.
+#[cfg(test)]
+mod out_link_held_set_tests {
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::record::{LinkFieldType, parse_link_field};
+    use crate::server::records::ao::AoRecord;
+    use crate::types::EpicsValue;
+
+    fn point_out(db: &PvDatabase, from: &str, to: &str) {
+        let rec = db.get_record(from).expect("record");
+        let mut inst = rec.write();
+        inst.common.text.out = to.into();
+        inst.set_link_cache("OUT", parse_link_field(to, LinkFieldType::Out));
+    }
+
+    fn num(db: &PvDatabase, pv: &str) -> f64 {
+        db.get_pv(pv).unwrap().to_f64().unwrap()
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): the runtime only awaits add_record and the frame; passes on the exec backend.
+    #[tokio::test]
+    async fn a_target_outside_the_held_set_is_written_like_one_inside() {
+        let db = PvDatabase::new();
+        for name in ["HS:IN", "HS:SI", "HS:OUT", "HS:SO"] {
+            db.add_record(name, Box::new(AoRecord::new(0.0)))
+                .await
+                .expect("add_record");
+        }
+        point_out(&db, "HS:SI", "HS:IN.VAL PP");
+        db.build_lock_sets();
+        point_out(&db, "HS:SO", "HS:OUT.VAL PP");
+        let members = |r: &str| db.lock_set_of(r).expect("a set").members;
+        assert!(members("HS:SI").iter().any(|n| n == "HS:IN"));
+        assert!(
+            !members("HS:SO").iter().any(|n| n == "HS:OUT"),
+            "the precondition: HS:OUT is outside HS:SO's set"
+        );
+
+        for (src, tgt) in [("HS:SI", "HS:IN"), ("HS:SO", "HS:OUT")] {
+            db.get_record(src)
+                .unwrap()
+                .write()
+                .record
+                .set_val(EpicsValue::Double(4.0))
+                .unwrap();
+            db.process_record_with_links(src, &mut ProcStack::new())
+                .await
+                .expect("process");
+            assert_eq!(num(&db, tgt), 4.0, "{tgt}");
+            assert_eq!(num(&db, &format!("{tgt}.UDF")), 0.0, "{tgt} processed");
+            assert_eq!(num(&db, &format!("{tgt}.SEVR")), 0.0, "{tgt}");
+            assert_eq!(num(&db, &format!("{src}.SEVR")), 0.0, "{src}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod enum_read_held_set_tests {
+    use crate::server::database::{ProcStack, PvDatabase};
+    use crate::server::recgbl::EventMask;
+    use crate::server::recgbl::simm::LinkFetch;
+    use crate::server::record::{LinkReadAs, Record, parse_link_v2};
+    use crate::server::records::{ao::AoRecord, bi::BiRecord};
+    use crate::types::{DbFieldType, EpicsValue};
+
+    /// `cvt_st_e` stores the source's VAL through `put_enum_str` and posts
+    /// nothing, from a reader whose set holds the source (the borrow) and
+    /// from one whose set does not (the acquire).
+    // RTEMS-EXEC-MODEL-ALLOW(1): the runtime only awaits add_record; passes on the exec backend.
+    #[tokio::test]
+    async fn a_state_name_read_stores_the_source_val_in_or_out_of_the_held_set() {
+        let db = PvDatabase::new();
+        let mut bsrc = BiRecord::new(0);
+        bsrc.put_field("ZNAM", EpicsValue::String("Low".into()))
+            .unwrap();
+        bsrc.put_field("ONAM", EpicsValue::String("High".into()))
+            .unwrap();
+        db.add_record("BSRC", Box::new(bsrc)).await.unwrap();
+        db.add_record("OTHER", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.build_lock_sets();
+        assert!(
+            !db.lock_set_of("OTHER")
+                .unwrap()
+                .members
+                .iter()
+                .any(|n| n == "BSRC")
+        );
+        let mut posts = db
+            .get_record("BSRC")
+            .unwrap()
+            .write()
+            .add_subscriber(
+                "VAL",
+                1,
+                DbFieldType::Enum,
+                (EventMask::VALUE | EventMask::LOG).bits(),
+            )
+            .unwrap();
+        while posts.try_recv().is_ok() {}
+
+        for (reader, field, want) in [("BSRC", "ONAM", 1), ("OTHER", "ZNAM", 0)] {
+            let held = db.lock_record(reader);
+            let (fetch, _) = db.read_link_value_as_with_alarm(
+                Some(held.set()),
+                &parse_link_v2(format!("BSRC.{field} NPP")),
+                LinkReadAs::Enum,
+                &mut ProcStack::new(),
+            );
+            drop(held);
+            assert!(
+                matches!(&fetch, LinkFetch::Value(EpicsValue::EnumArray(v)) if v.is_empty()),
+                "{reader}: the reader's buffer is unwritten, {fetch:?}"
+            );
+            assert_eq!(
+                db.get_pv("BSRC").unwrap(),
+                EpicsValue::Enum(want),
+                "{reader}"
+            );
+            assert!(posts.try_recv().is_err(), "{reader}: nothing posted");
+        }
+    }
+}
+
+/// An external forward link is dispatched from the record's own parse, as C
+/// hands `plink` to `scanForward`: while the lset runs, nothing but the
+/// record (and this test) holds the parse — no per-cycle `Arc` clone, whose
+/// count pair C does not pay.
+#[cfg(test)]
+mod external_forward_borrow_tests {
+    use crate::server::database::{LinkSet, ProcStack, PvDatabase};
+    use crate::server::ioc_builder::IocBuilder;
+    use crate::server::record::ParsedLink;
+    use crate::types::EpicsValue;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// A `pva` lset whose forward handle reads the count of `watched` as it
+    /// forwards.
+    #[derive(Default)]
+    struct CountAtForward(Arc<Counts>);
+
+    #[derive(Default)]
+    struct Counts {
+        watched: Mutex<Option<Arc<ParsedLink>>>,
+        seen: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LinkSet for CountAtForward {
+        fn is_connected(&self, _: &[u8]) -> bool {
+            true
+        }
+        async fn get_value(&self, _: &[u8]) -> Option<EpicsValue> {
+            None
+        }
+        fn forward_handle(&self, _: &[u8]) -> Box<dyn crate::server::database::LinkForward> {
+            Box::new(CountingForward(self.0.clone()))
+        }
+    }
+
+    struct CountingForward(Arc<Counts>);
+
+    impl crate::server::database::LinkForward for CountingForward {
+        fn scan_forward(&self) -> Result<(), crate::server::database::LinkForwardRefused> {
+            if let Some(link) = &*self.0.watched.lock().unwrap() {
+                self.0.seen.lock().unwrap().push(Arc::strong_count(link));
+            }
+            Ok(())
+        }
+    }
+
+    async fn counts_at_forward(db: &PvDatabase, lset: &CountAtForward, rec: &str, field: &str) {
+        let link = db
+            .get_record(rec)
+            .unwrap()
+            .read()
+            .stored_link_shared(field)
+            .cloned()
+            .unwrap();
+        assert!(matches!(*link, ParsedLink::Pva(_)), "{rec}.{field}");
+        *lset.0.watched.lock().unwrap() = Some(link);
+        lset.0.seen.lock().unwrap().clear();
+        db.process_record_with_links(rec, &mut ProcStack::new())
+            .await
+            .unwrap();
+        *lset.0.watched.lock().unwrap() = None;
+        // The record's and this test's.
+        assert_eq!(*lset.0.seen.lock().unwrap(), [2], "{rec}.{field}");
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn an_external_flnk_and_lnkn_are_dispatched_unshared() {
+        let db = IocBuilder::new()
+            .register_link_type("pva", |_db| async { Vec::new() })
+            .db_string(
+                r#"
+record(calc, "S") { field(CALC, "VAL+1") field(FLNK, "pva://T:A") }
+record(fanout, "F") { field(LNK1, "pva://T:B") }
+"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        let lset = Arc::new(CountAtForward::default());
+        db.register_link_set("pva", lset.clone()).await;
+        db.ioc_init().await;
+        counts_at_forward(&db, &lset, "S", "FLNK").await;
+        counts_at_forward(&db, &lset, "F", "LNK1").await;
+    }
+
+    /// What the target's subroutine sees: the count of the watched source
+    /// link and of the target's cell, as it processes.
+    type Watch = (
+        Option<(
+            Arc<crate::server::record::DbLink>,
+            Arc<crate::server::record::RecordCell>,
+        )>,
+        Vec<(usize, usize)>,
+    );
+    static WATCH: Mutex<Watch> = Mutex::new((None, Vec::new()));
+
+    #[epics_macros_rs::epics_test]
+    async fn a_db_flnk_and_lnkn_are_dispatched_unshared() {
+        let db = IocBuilder::new()
+            .register_subroutine("watch", |_| {
+                let mut w = WATCH.lock().unwrap();
+                let counts =
+                    w.0.as_ref()
+                        .map(|(link, cell)| (Arc::strong_count(link), Arc::strong_count(cell)));
+                w.1.extend(counts);
+                Ok(0)
+            })
+            .db_string(
+                r#"
+record(sub, "T") { field(SNAM, "watch") }
+record(calc, "S") { field(CALC, "VAL+1") field(FLNK, "T") }
+record(fanout, "F") { field(LNK1, "T") }
+"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        db.ioc_init().await;
+        let cell = db.get_record("T").unwrap();
+        for (rec, field) in [("S", "FLNK"), ("F", "LNK1")] {
+            let link = db
+                .get_record(rec)
+                .unwrap()
+                .read()
+                .stored_link_shared(field)
+                .cloned();
+            let Some(ParsedLink::Db(link)) = link.as_deref() else {
+                panic!("{rec}.{field} is not a DB link");
+            };
+            *WATCH.lock().unwrap() = (Some((link.clone(), cell.clone())), Vec::new());
+            let before = (Arc::strong_count(link), Arc::strong_count(&cell));
+            db.process_record_with_links(rec, &mut ProcStack::new())
+                .await
+                .unwrap();
+            let seen = std::mem::take(&mut *WATCH.lock().unwrap()).1;
+            // The forward shares neither the link nor the target.
+            assert_eq!(seen, [before], "{rec}.{field}");
+        }
+    }
+
+    /// After `iocInit` a forward is bound or CA, never a DB link without a
+    /// target: one naming no local record is made CA there, a record added
+    /// later binds its own forwards, and an existing CA forward stays CA.
+    #[epics_macros_rs::epics_test]
+    async fn a_forward_is_bound_or_ca_after_ioc_init() {
+        use crate::server::records::{calc::CalcRecord, fanout::FanoutRecord};
+        let db = IocBuilder::new()
+            .db_string(
+                r#"record(calc, "S") { field(FLNK, "LATE") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        db.ioc_init().await;
+        let flnk = |db: &PvDatabase| {
+            db.get_record("S")
+                .unwrap()
+                .read()
+                .stored_link_shared("FLNK")
+                .cloned()
+                .unwrap()
+        };
+        assert!(matches!(*flnk(&db), ParsedLink::Ca(_)), "{:?}", flnk(&db));
+
+        db.add_record("LATE", Box::new(CalcRecord::new("VAL+1")))
+            .await
+            .unwrap();
+        let mut fan = FanoutRecord::new();
+        fan.lnk1 = "LATE".into();
+        db.add_record("U", Box::new(fan)).await.unwrap();
+        assert!(
+            matches!(*flnk(&db), ParsedLink::Ca(_)),
+            "S.FLNK was rebound"
+        );
+        db.process_record_with_links("U", &mut ProcStack::new())
+            .await
+            .unwrap();
+        assert_eq!(db.get_pv("LATE").unwrap().to_f64(), Some(1.0));
     }
 }

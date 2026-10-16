@@ -419,6 +419,7 @@ impl AttrPlotState {
 }
 
 impl NDPluginProcess for AttrPlotProcessor {
+    const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 

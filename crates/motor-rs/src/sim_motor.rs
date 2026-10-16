@@ -6,8 +6,12 @@ use std::time::Instant;
 /// Simulated motor for testing.
 /// Uses time-based linear interpolation to simulate motion.
 pub struct SimMotor {
+    /// Physical position: limits and the home switch are tested against it.
     position: f64,
     encoder_position: f64,
+    /// User minus physical position, moved only by `set_position` (C
+    /// motorSimAxis `enc_offset_`).
+    offset: f64,
     target: f64,
     velocity: f64,
     moving: bool,
@@ -16,7 +20,6 @@ pub struct SimMotor {
     high_limit: f64,
     low_limit: f64,
     homed: bool,
-    powered: bool,
     closed_loop_enabled: bool,
     /// If true, velocity move mode (JOG)
     velocity_mode: bool,
@@ -44,6 +47,7 @@ impl SimMotor {
         Self {
             position: 0.0,
             encoder_position: 0.0,
+            offset: 0.0,
             target: 0.0,
             velocity: 1.0,
             moving: false,
@@ -52,7 +56,6 @@ impl SimMotor {
             high_limit: 1000.0,
             low_limit: -1000.0,
             homed: false,
-            powered: true,
             closed_loop_enabled: false,
             velocity_mode: false,
             velocity_direction: true,
@@ -145,7 +148,7 @@ impl AsynMotor for SimMotor {
             self.deferred_moves.push((position, velocity, acceleration));
             return Ok(());
         }
-        self.target = position;
+        self.target = position - self.offset;
         self.velocity = velocity.abs().max(0.001);
         self.start_position = self.position;
         self.moving = true;
@@ -166,7 +169,8 @@ impl AsynMotor for SimMotor {
         if self.deferred {
             // Honour deferred mode like move_absolute — queue the resolved
             // absolute target instead of moving immediately.
-            self.deferred_moves.push((target, velocity, acceleration));
+            self.deferred_moves
+                .push((target + self.offset, velocity, acceleration));
             return Ok(());
         }
         self.target = target;
@@ -232,7 +236,7 @@ impl AsynMotor for SimMotor {
             self.deferred = false;
             // Execute queued moves: use the last one's target position
             if let Some(&(position, velocity, _acceleration)) = self.deferred_moves.last() {
-                self.target = position;
+                self.target = position - self.offset;
                 self.velocity = velocity.abs().max(0.001);
                 self.start_position = self.position;
                 self.moving = true;
@@ -245,8 +249,7 @@ impl AsynMotor for SimMotor {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.position = position;
-        self.encoder_position = position;
+        self.offset = position - self.position;
         Ok(())
     }
 
@@ -284,7 +287,7 @@ impl AsynMotor for SimMotor {
     fn execute_profile(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // Simulate: just move to the last position
         if let Some(&last) = self.profile_positions.last() {
-            self.target = last;
+            self.target = last - self.offset;
             self.velocity = 1.0;
             self.start_position = self.position;
             self.moving = true;
@@ -308,25 +311,24 @@ impl AsynMotor for SimMotor {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         self.update();
         Ok(MotorStatus {
-            position: self.position,
-            encoder_position: self.encoder_position,
+            position: self.position + self.offset,
+            encoder_position: self.encoder_position + self.offset,
             velocity: if self.moving { self.velocity } else { 0.0 },
             done: !self.moving,
             moving: self.moving,
             high_limit: self.position >= self.high_limit,
             low_limit: self.position <= self.low_limit,
-            home: self.position == 0.0,
-            // The sim tracks a real encoder image (encoder_position,
-            // set_encoder_position), so it reports the encoder present
-            // — otherwise the record demotes UEIP=Yes to No on the
-            // first poll (C 3671-3675) and the EA_HOME path is dead.
-            // The encoder index asserts at the same physical home spot
-            // as the switch.
-            has_encoder: true,
-            encoder_home: self.encoder_position == 0.0,
-            powered: self.powered,
+            // motorSimDriver.cpp:471-477 sets only these bits: Home (EA_HOME,
+            // bit 7) at the home position, Direction from the signed
+            // velocity (0 at rest), and never AtHome or HasEncoder.
+            encoder_home: self.position == 0.0,
             problem: false,
-            direction: self.velocity_direction,
+            direction: self.moving
+                && if self.velocity_mode {
+                    self.velocity_direction
+                } else {
+                    self.target > self.start_position
+                },
             homed: self.homed,
             ..MotorStatus::default()
         })
@@ -346,23 +348,22 @@ mod tests {
         assert_eq!(status.position, 0.0);
         assert!(status.done);
         assert!(!status.moving);
+        // motorSimDriver.cpp's poll never sets motorStatusPowerOn_: MSTA 2.
+        assert!(!status.powered);
     }
 
     #[test]
-    fn test_sim_motor_reports_encoder_and_home_index() {
+    fn test_sim_motor_reports_home_on_encoder_home_bit_only() {
         let user = AsynUser::new(0);
         let mut motor = SimMotor::new();
         let at_home = motor.poll(&user).unwrap();
-        assert!(at_home.has_encoder, "sim encoder is present");
-        assert!(at_home.encoder_home, "encoder index asserts at home");
-        assert!(at_home.home);
+        assert!(at_home.encoder_home);
+        assert!(!at_home.home && !at_home.has_encoder && !at_home.direction);
 
         motor.move_absolute(&user, 10.0, 0.0, 10000.0, 1.0).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let away = motor.poll(&user).unwrap();
-        assert!(away.has_encoder);
-        assert!(!away.encoder_home, "index drops off the home position");
-        assert!(!away.home);
+        assert!(!away.encoder_home && !away.home);
     }
 
     #[test]
@@ -395,6 +396,15 @@ mod tests {
         motor.set_position(&user, 42.0).unwrap();
         let status = motor.poll(&user).unwrap();
         assert_eq!(status.position, 42.0);
+        // The switches stay physical, as motorSimAxis::setPosition moves
+        // only enc_offset_.
+        assert!(status.encoder_home);
+
+        motor.move_absolute(&user, 52.0, 0.0, 10000.0, 1.0).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let status = motor.poll(&user).unwrap();
+        assert_eq!(status.position, 52.0);
+        assert!(!status.encoder_home);
     }
 
     #[test]

@@ -48,7 +48,7 @@ use std::collections::BTreeSet;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
-use epics_oracle_rs::ioc::{CTools, PvxTools, Side, alloc_free_port};
+use epics_oracle_rs::ioc::{CTools, PvxTools, Side, claim_port};
 #[cfg(tokio_backend)]
 use epics_oracle_rs::ioc::{Ioc, PvaPair};
 use epics_oracle_rs::pvaread::{self, PvaReport};
@@ -194,6 +194,13 @@ fn boot(record_type: &str, rec: &str) -> (PvxTools, PvaPair) {
 #[test]
 fn the_pva_pair_boots_on_distinct_ports() {
     let (_t, pair) = boot("ai", "ORACLE:AI");
+    // The C side's number is a claim from the dedicated range, which the
+    // kernel's `bind(0)` never hands out (`ioc::claim_port`).
+    assert!(
+        (20000..=29999).contains(&pair.c.port()),
+        "pvxs side must sit on a claimed port, got {}",
+        pair.c.port()
+    );
     assert_ne!(pair.c.port(), 0, "pvxs side must report a real search port");
     assert_ne!(
         pair.rust.port(),
@@ -225,7 +232,8 @@ fn the_pva_pair_boots_on_distinct_ports() {
 #[test]
 fn concurrent_client_tools_do_not_break_each_other() {
     let t = tools();
-    let dead = alloc_free_port().expect("a port to aim at");
+    let dead_claim = claim_port().expect("a port to aim at");
+    let dead = dead_claim.port();
     let tool = PvaTools::new(&t, dead, Side::C);
 
     let results: Vec<_> = std::thread::scope(|s| {

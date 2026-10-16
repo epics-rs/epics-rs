@@ -13,7 +13,7 @@ use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::types::EpicsValue;
 
 fn parked_at_nan() -> RecordInstance {
-    let mut inst = RecordInstance::new("R5:NAN".to_string(), CalcRecord::default());
+    let mut inst = RecordInstance::new("R5:NAN", CalcRecord::default());
     inst.record
         .put_field("MDEL", EpicsValue::Double(0.0))
         .unwrap();

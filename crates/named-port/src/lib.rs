@@ -44,8 +44,39 @@
 //!
 //! Anything else the subject does is a failure and must reach the test as
 //! one.
+//!
+//! [`verdict`] reads the two IOC consoles for that evidence.
 
-use std::net::{TcpListener, UdpSocket};
+#[cfg(target_os = "linux")]
+pub mod port_holders;
+pub mod verdict;
+
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+
+use epics_libcom_rs::net::port_held;
+use socket2::{Domain, Socket, Type};
+
+/// Build `shim/getsockname_einval.c` into `dir` and return the `.so`: under
+/// `LD_PRELOAD` it fails `getsockname` with EINVAL on a listening socket, as
+/// RTEMS does on the CA listener, so a host run reaches the console
+/// [`verdict::LOCAL_ADDR_FAILED`] records. Panics when `cc` cannot build it.
+pub fn getsockname_einval_shim(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/shim/getsockname_einval.c");
+    let so = dir.join("getsockname_einval.so");
+    let out = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(src)
+        .arg("-ldl")
+        .output()
+        .expect("run cc");
+    assert!(
+        out.status.success(),
+        "cc could not build {src}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    so
+}
 
 /// How many candidates a test may burn before the run is called broken.
 ///
@@ -54,28 +85,90 @@ use std::net::{TcpListener, UdpSocket};
 /// is more useful than trying forever.
 pub const ATTEMPTS: usize = 16;
 
-/// Run `attempt` on candidate ports until one of them survives to the bind.
+/// Run `attempt` on candidate ports until one of them survives to the bind,
+/// never on the same number twice ([`Candidates`]).
 ///
 /// `attempt` returns `Some(value)` when the subject came up on the number it
 /// was given, and `None` **only** on evidence that this particular number was
 /// taken by somebody else — see the crate docs. Panics with the whole
 /// candidate list when [`ATTEMPTS`] have been lost, because at that point the
 /// number is not the problem.
-pub fn on_a_named_port<T>(mut attempt: impl FnMut(u16) -> Option<T>) -> T {
-    let mut tried = Vec::with_capacity(ATTEMPTS);
-    for _ in 0..ATTEMPTS {
-        let port = free_for_tcp_and_udp();
-        tried.push(port);
+pub fn on_a_named_port<T>(attempt: impl FnMut(u16) -> Option<T>) -> T {
+    on_a_named_port_from(free_for_tcp_and_udp, attempt)
+}
+
+/// [`on_a_named_port`] with the candidate drawn by `pick`, for a subject
+/// that needs more of the number than the same value free on TCP and UDP
+/// (see [`free_tcp_with_udp_successor`]).
+pub fn on_a_named_port_from<T>(
+    pick: impl FnMut() -> u16,
+    mut attempt: impl FnMut(u16) -> Option<T>,
+) -> T {
+    let mut candidates = Candidates::new(pick);
+    for port in candidates.by_ref() {
         if let Some(won) = attempt(port) {
             return won;
         }
     }
-    panic!(
-        "every one of {ATTEMPTS} candidate ports was taken before the subject \
-         could bind it: {tried:?}. That is no longer a lost race — something \
-         on this host is taking the numbers, or the subject is refusing every \
-         port for a reason its retry evidence is misreporting as a steal."
-    );
+    candidates.exhausted()
+}
+
+/// How many times [`Candidates`] re-draws a number the search already tried
+/// before it calls the pick broken.
+const REPICKS: usize = 64;
+
+/// The candidates of one search, each a number no earlier attempt of the
+/// search was given. A probe closes its socket before it returns, so the
+/// kernel can hand the same number back to the next probe; a repeat is
+/// drawn again here rather than retried.
+pub struct Candidates<P> {
+    pick: P,
+    tried: Vec<u16>,
+}
+
+impl<P: FnMut() -> u16> Candidates<P> {
+    pub fn new(pick: P) -> Self {
+        Self {
+            pick,
+            tried: Vec::with_capacity(ATTEMPTS),
+        }
+    }
+
+    /// Panic with every candidate given out: the search lost them all.
+    pub fn exhausted(&self) -> ! {
+        panic!(
+            "every one of {ATTEMPTS} candidate ports was taken before the subject \
+             could bind it: {:?}. That is no longer a lost race — something \
+             on this host is taking the numbers, or the subject is refusing every \
+             port for a reason its retry evidence is misreporting as a steal.",
+            self.tried
+        );
+    }
+}
+
+impl<P: FnMut() -> u16> Iterator for Candidates<P> {
+    type Item = u16;
+
+    /// The next untried candidate, `None` once [`ATTEMPTS`] have been given
+    /// out. Panics when `pick` returns only tried numbers 64 times
+    /// in a row.
+    fn next(&mut self) -> Option<u16> {
+        if self.tried.len() == ATTEMPTS {
+            return None;
+        }
+        for _ in 0..REPICKS {
+            let port = (self.pick)();
+            if !self.tried.contains(&port) {
+                self.tried.push(port);
+                return Some(port);
+            }
+        }
+        panic!(
+            "the candidate source returned only already-tried ports {REPICKS} times \
+             in a row; tried: {:?}",
+            self.tried
+        );
+    }
 }
 
 /// A port number that was free for both TCP and UDP a moment ago.
@@ -84,20 +177,111 @@ pub fn on_a_named_port<T>(mut attempt: impl FnMut(u16) -> Option<T>) -> T {
 /// socket on the same number, so probing one leaves the other free to
 /// collide. A hint, never a reservation — both probe sockets are closed
 /// before this returns, and they must be, or the subject could not bind.
+///
+/// Probed on the wildcard: a subject binds every NIC, and a number free on
+/// 127.0.0.1 can already be held on one of them.
 pub fn free_for_tcp_and_udp() -> u16 {
     for _ in 0..64 {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral TCP port");
+        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
         let port = tcp.local_addr().expect("read the ephemeral port").port();
-        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+        if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
             return port;
         }
     }
     panic!("no port was free for both TCP and UDP after 64 attempts");
 }
 
+/// A port number free on TCP whose successor is free on UDP: a PVA server
+/// started with only `EPICS_PVAS_SERVER_PORT` searches on `port + 1`
+/// whatever `EPICS_PVAS_BROADCAST_PORT` says. A hint, as
+/// [`free_for_tcp_and_udp`] is.
+pub fn free_tcp_with_udp_successor() -> u16 {
+    for _ in 0..64 {
+        let tcp = TcpListener::bind("0.0.0.0:0").expect("bind an ephemeral TCP port");
+        let port = tcp.local_addr().expect("read the ephemeral port").port();
+        if port < u16::MAX && UdpSocket::bind(("0.0.0.0", port + 1)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no TCP port with a free UDP successor after 64 attempts");
+}
+
+/// Whether another socket holds `port` on TCP now: the kernel's own answer,
+/// which is the evidence a test needs before it calls a missing bind a lost
+/// race and not a regression. On every interface, as [`udp_port_is_held`].
+pub fn tcp_port_is_held(port: u16) -> bool {
+    port_is_held(Type::STREAM, port)
+}
+
+/// [`tcp_port_is_held`] for UDP, on every interface as a PVA search socket
+/// binds it.
+pub fn udp_port_is_held(port: u16) -> bool {
+    port_is_held(Type::DGRAM, port)
+}
+
+/// A wildcard bind of `port` that only another socket on the number refuses.
+///
+/// Linux: `SO_REUSEADDR` on TCP, as std's `TcpListener` sets it, so a port
+/// left in TIME_WAIT reads free; Linux still refuses it beside a listener on
+/// any address. Darwin and the BSDs: none, because there `SO_REUSEADDR` lets
+/// a wildcard bind share the number with a socket on one address
+/// (`in_pcbbind`). Windows: `SO_EXCLUSIVEADDRUSE`, because a plain Winsock
+/// wildcard bind succeeds beside such a socket. Off Linux a port with
+/// connections left in TIME_WAIT may therefore read held.
+fn port_is_held(ty: Type, port: u16) -> bool {
+    let sock = Socket::new(Domain::IPV4, ty, None).expect("open a probe socket");
+    #[cfg(target_os = "linux")]
+    if ty == Type::STREAM {
+        sock.set_reuse_address(true)
+            .expect("SO_REUSEADDR on the probe");
+    }
+    #[cfg(windows)]
+    exclusive_address_use(&sock);
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    matches!(sock.bind(&addr.into()), Err(e) if port_held(&e))
+}
+
+#[cfg(windows)]
+fn exclusive_address_use(sock: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt};
+    let on: i32 = 1;
+    // SAFETY: a live socket handle, and `on` outlives the call.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as _,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            size_of::<i32>() as i32,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "SO_EXCLUSIVEADDRUSE on the probe: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The held/free boundary: a bound socket reads held, the number it
+    /// leaves behind reads free.
+    #[test]
+    fn a_bound_port_reads_held_and_a_released_one_free() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (t, u) = (
+            tcp.local_addr().unwrap().port(),
+            udp.local_addr().unwrap().port(),
+        );
+        assert!(tcp_port_is_held(t) && udp_port_is_held(u));
+        drop((tcp, udp));
+        assert!(!tcp_port_is_held(t) && !udp_port_is_held(u));
+    }
 
     /// The winning attempt's value comes back, and no further candidate is
     /// burned after it.
@@ -125,6 +309,29 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), seen.len(), "candidates repeated: {seen:?}");
+    }
+
+    /// A pick that hands back a number already tried — a closed probe's port
+    /// the kernel gave out again — is drawn again, never retried.
+    #[test]
+    fn a_repeated_pick_never_reaches_attempt_twice() {
+        let mut picks = [5, 5, 6, 5, 6, 7, 7, 8].into_iter();
+        let mut seen = Vec::new();
+        on_a_named_port_from(
+            || picks.next().unwrap(),
+            |p| {
+                seen.push(p);
+                (seen.len() == 4).then_some(())
+            },
+        );
+        assert_eq!(seen, [5, 6, 7, 8]);
+    }
+
+    /// A pick that only ever repeats is reported, not looped on.
+    #[test]
+    #[should_panic(expected = "returned only already-tried ports")]
+    fn a_pick_stuck_on_one_number_is_reached_loudly() {
+        on_a_named_port_from(|| 5, |_| -> Option<()> { None });
     }
 
     /// A subject that never wins is a failure, not an infinite loop — and the

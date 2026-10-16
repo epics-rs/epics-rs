@@ -16,7 +16,7 @@ use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::{PortHandle, QueueOutcome};
 use asyn_rs::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
-use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::CallbackPriority;
@@ -57,7 +57,7 @@ fn port(name: &str, can_block: bool) -> PortRuntimeHandle {
         base: PortDriverBase::new(name, 1, flags),
         n: 0,
     };
-    create_port_runtime(driver, RuntimeConfig::default())
+    create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .unwrap()
         .0
 }

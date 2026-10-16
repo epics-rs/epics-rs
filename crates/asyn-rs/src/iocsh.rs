@@ -1947,32 +1947,6 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
             let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
-            // C prints these first, before any refusal (drvAsynFTDIPort.cpp:522-526).
-            let mode = arg_int(args, 8).unwrap_or(0) as i32;
-            ctx.println(&format!(
-                "drvAsynFTDIPortConfigure: latency={}",
-                arg_int(args, 4).unwrap_or(0) as i32
-            ));
-            ctx.println(&format!(
-                "drvAsynFTDIPortConfigure: priority={}",
-                arg_int(args, 5).unwrap_or(0) as u32
-            ));
-            ctx.println(&format!(
-                "drvAsynFTDIPortConfigure: noAutoconnect={}",
-                arg_int(args, 6).unwrap_or(0) as i32
-            ));
-            ctx.println(&format!(
-                "drvAsynFTDIPortConfigure: noProcessEos={}",
-                arg_int(args, 7).unwrap_or(0) as i32
-            ));
-            ctx.println(&format!(
-                "drvAsynFTDIPortConfigure: mode={}",
-                if mode & crate::drivers::ftdi::UART_SPI_BIT != 0 {
-                    "SPI"
-                } else {
-                    "UART"
-                }
-            ));
             let driver = match DrvAsynFtdiPort::configure(
                 &port,
                 arg_int(args, 1).unwrap_or(0) as i32,
@@ -3829,9 +3803,10 @@ mod tests {
         cmd.handler.call(args, &make_ctx()).expect("the command");
     }
 
-    /// A Configure that succeeds prints nothing, except FTDI's five argument
-    /// lines, which C prints first (drvAsynIPPort.c:1017-1133,
-    /// drvAsynIPServerPort.c:544-743, drvAsynFTDIPort.cpp:522-526).
+    /// A Configure that succeeds prints nothing, except the server's
+    /// `createServerSocket` lines (drvAsynIPServerPort.c:439-443, :626) and
+    /// FTDI's five argument lines, which C prints first
+    /// (drvAsynIPPort.c:1017-1133, drvAsynFTDIPort.cpp:522-526).
     #[test]
     fn a_configure_that_succeeds_prints_only_what_c_prints() {
         const CHILD: &str = "ASYN_RS_CONFIGURE_QUIET_CHILD";
@@ -3884,7 +3859,9 @@ mod tests {
         let b = stdout.find("---end").expect("end");
         assert_eq!(
             &stdout[a..b],
-            "drvAsynFTDIPortConfigure: latency=16\n\
+            "serverAddr: 127.0.0.1:0\n\
+             serverPort: 0\n\
+             drvAsynFTDIPortConfigure: latency=16\n\
              drvAsynFTDIPortConfigure: priority=0\n\
              drvAsynFTDIPortConfigure: noAutoconnect=1\n\
              drvAsynFTDIPortConfigure: noProcessEos=0\n\

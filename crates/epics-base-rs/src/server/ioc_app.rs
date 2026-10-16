@@ -1695,7 +1695,6 @@ impl IocBuild {
             // on the error log and carried as that set's error status, so
             // one bad `.req` file no longer costs the IOC every other set.
             let mgr = Arc::new(builder.build().await);
-            eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
             if let Some(ref config) = autosave_startup {
                 config.lock().unwrap().manager = Some(mgr.clone());
             }

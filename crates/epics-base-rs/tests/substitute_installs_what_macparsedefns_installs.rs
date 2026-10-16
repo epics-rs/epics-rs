@@ -62,7 +62,9 @@ fn expanded(path: &Path, macros: &MacroDefs) -> String {
 
 /// Write `text` as a `.db`, expand it against `macros`, and give back the
 /// flattened result. A directive line contributes an empty line, which is
-/// how this reader keeps a diagnostic's line number the operator's.
+/// how this reader keeps a diagnostic's line number the operator's. The
+/// probes are `#` comments, which the reader expands like any line and the
+/// grammar skips.
 fn through_the_reader(text: &str, macros: &[(&str, &str)]) -> String {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sub.db");
@@ -82,10 +84,10 @@ fn through_the_reader(text: &str, macros: &[(&str, &str)]) -> String {
 #[serial_test::serial(db_load_stderr)]
 fn quotes_come_off_a_name_and_a_bare_name_deletes() {
     let got = through_the_reader(
-        "substitute \"'A'=1,B\"\nA=[$(A)] B=[$(B)]\n",
+        "substitute \"'A'=1,B\"\n#A=[$(A)] B=[$(B)]\n",
         &[("B", "preset")],
     );
-    assert_eq!(got, "\nA=[1] B=[$(B,undefined)]\n");
+    assert_eq!(got, "\n#A=[1] B=[$(B,undefined)]\n");
 }
 
 /// **Boundary: an escaped quote, which is where the directive scan and
@@ -97,8 +99,8 @@ fn quotes_come_off_a_name_and_a_bare_name_deletes() {
 #[test]
 #[serial_test::serial(db_load_stderr)]
 fn an_escaped_quote_survives_the_directive_and_the_value() {
-    let got = through_the_reader("substitute \"A=\\\"1\\\",B=2\"\nA=[$(A)] B=[$(B)]\n", &[]);
-    assert_eq!(got, "\nA=[\"1\"] B=[2]\n");
+    let got = through_the_reader("substitute \"A=\\\"1\\\",B=2\"\n#A=[$(A)] B=[$(B)]\n", &[]);
+    assert_eq!(got, "\n#A=[\"1\"] B=[2]\n");
 }
 
 /// **Boundary: an escaped quote in a NAME.**
@@ -110,8 +112,8 @@ fn an_escaped_quote_survives_the_directive_and_the_value() {
 #[test]
 #[serial_test::serial(db_load_stderr)]
 fn an_escaped_quote_in_a_name_is_a_literal_quote() {
-    let got = through_the_reader("substitute \"\\\"A\\\"=1\"\nA=[$(A)]\n", &[]);
-    assert_eq!(got, "\nA=[$(A,undefined)]\n");
+    let got = through_the_reader("substitute \"\\\"A\\\"=1\"\n#A=[$(A)]\n", &[]);
+    assert_eq!(got, "\n#A=[$(A,undefined)]\n");
 }
 
 /// **Boundary: the empty name.**
@@ -121,8 +123,8 @@ fn an_escaped_quote_in_a_name_is_a_literal_quote() {
 #[test]
 #[serial_test::serial(db_load_stderr)]
 fn an_empty_name_is_a_name() {
-    let got = through_the_reader("substitute \"=1,B=2\"\nempty:[$()] B=[$(B)]\n", &[]);
-    assert_eq!(got, "\nempty:[1] B=[2]\n");
+    let got = through_the_reader("substitute \"=1,B=2\"\n#empty:[$()] B=[$(B)]\n", &[]);
+    assert_eq!(got, "\n#empty:[1] B=[2]\n");
 }
 
 /// **Boundary: a deletion of a name the caller defined.**
@@ -134,20 +136,35 @@ fn an_empty_name_is_a_name() {
 #[serial_test::serial(db_load_stderr)]
 fn a_deletion_removes_the_callers_definition_too() {
     let got = through_the_reader(
-        "substitute \"X=1\"\nmid:[$(X)]\nsubstitute \"X\"\nafter:[$(X)]\n",
+        "substitute \"X=1\"\n#mid:[$(X)]\nsubstitute \"X\"\n#after:[$(X)]\n",
         &[("X", "outer")],
     );
-    assert_eq!(got, "\nmid:[1]\n\nafter:[$(X,undefined)]\n");
+    assert_eq!(got, "\n#mid:[1]\n\n#after:[$(X,undefined)]\n");
 }
 
 /// **Boundary: text after the closing quote.**
 ///
 /// msi requires blanks only between the closing quote and the end of the
-/// line; anything else and the line was never a command, so it is
-/// expanded as ordinary text and no macro is defined by it.
+/// line; anything else and the line was never a command, so it reaches the
+/// grammar as ordinary text, which has no `substitute`.
 #[test]
 #[serial_test::serial(db_load_stderr)]
 fn a_line_with_trailing_text_is_not_a_directive() {
-    let got = through_the_reader("substitute \"A=1\" junk\nA=[$(A)]\n", &[]);
-    assert_eq!(got, "substitute \"A=1\" junk\nA=[$(A,undefined)]\n");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sub.db");
+    std::fs::write(&path, "substitute \"A=1\" junk\n").expect("write the .db");
+    let mut faults = DbFaults::default();
+    let got = expand_includes(
+        &path,
+        MacroDefs::new(),
+        &DbLoadConfig::default(),
+        &mut faults,
+    );
+    faults.stop_reading();
+    match got {
+        Err(epics_base_rs::error::CaError::DbParseError { token, .. }) => {
+            assert_eq!(token, "substitute")
+        }
+        other => panic!("{other:?}"),
+    }
 }

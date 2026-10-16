@@ -7,10 +7,10 @@
 //! diagnostic can name the file, the line and the source text while the
 //! call site that raised it names none of them.
 //!
-//! This port has no line-at-a-time lexer: `expand_includes` flattens the
-//! whole include tree into one string before the parser sees a character,
-//! so a line number in that text is NOT a line number in any file the
-//! operator wrote. [`DbSource`] is what makes it one again — the flattened
+//! This port's parser reads one flattened text, which the reader
+//! (`reader.rs`) grows a line at a time from the whole include tree, so a
+//! line number in that text is NOT a line number in any file the operator
+//! wrote. [`DbSource`] is what makes it one again — the flattened
 //! text plus, per flattened line, the include stack that was open at it.
 //! Without the map the port could still print *a* number, and printing the
 //! wrong line is worse for the operator than printing none.
@@ -112,6 +112,16 @@ impl DbSource {
 
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Append the next line the reader handed the parser.
+    pub(super) fn push(&mut self, text: String, frames: Arc<[DbIncludeFrame]>) {
+        self.lines.push(text);
+        self.frames.push(frames);
     }
 }
 

@@ -2,13 +2,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::error::{CaError, CaResult};
+use crate::error::CaResult;
 
-use crate::runtime::log::ERL_ERROR;
-
+use super::reader::Feed;
 use super::{DbFaults, DbRecordDef, MacroDefs};
 
 /// Configuration for file-based DB loading with include support.
+#[derive(Clone)]
 pub struct DbLoadConfig {
     pub include_paths: Vec<PathBuf>,
     pub max_include_depth: usize,
@@ -111,323 +111,37 @@ pub(crate) fn parse_db_opened_held(
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<super::ParsedDb> {
-    // The include layer and the record parser both report through the
-    // same owner, so a recoverable failure in either reaches the caller
-    // as one set — see [`DbFaults`].
-    let mut faults = DbFaults::default();
-    // The expansion stage reports its OWN abort, because the parser's
-    // funnel cannot: a text that never got built has no
-    // [`super::DbSource`] to locate a diagnostic in, and these failures
-    // carry `line: 0` for exactly that reason. Between this and
-    // [`super::parse_db_expanded`] every rejection a `.db` read produces
-    // is on the operator's stream before the error value leaves — which
-    // is why no caller of this function prints one.
-    let expanded = match expand_includes_mapped(opened, macros, config, &mut faults) {
-        Ok(expanded) => expanded,
-        Err(e) => {
-            faults.abort(&e);
-            return Err(e);
-        }
-    };
-    // Already through `db_read_lines` once, inside the expansion — see
-    // [`super::parse_db_expanded`]. The faults carry the read-time notices
-    // of every line, which the load releases as it reaches each one.
-    Ok(super::parse_db_expanded(
-        &expanded.text,
-        expanded.source,
-        faults,
-    ))
-}
-
-/// The flattened include tree: the text the parser reads, and the map
-/// that says which file and line each of its lines came from.
-pub struct DbExpandedText {
-    /// Bytes, as C's lexer reads them: a `.db` need not be UTF-8.
-    pub text: Vec<u8>,
-    pub source: super::DbSource,
-}
-
-/// [`expand_includes`] keeping the per-line origin, which is what lets a
-/// diagnostic name the file the operator actually wrote rather than an
-/// offset into a string that exists only inside this process.
-pub fn expand_includes_mapped(
-    opened: &DbOpenedFile,
-    macros: impl Into<MacroDefs>,
-    config: &DbLoadConfig,
-    faults: &mut DbFaults,
-) -> CaResult<DbExpandedText> {
-    // ONE table for the whole read, includes and all. C `dbReadCOM`
-    // creates a single `MAC_HANDLE`, installs the caller's macros into it
-    // and reads `dbQuietMacroWarnings` into it once at open
-    // (`dbLexRoutines.c:256-300`), and `dbIncludeNew` pushes the included
-    // file onto `inputFileList` without touching the handle
-    // (`:443-461`) — so every line of every file in the tree is expanded
-    // through the same table. msi does the same with one `macCreateHandle`
-    // for the whole run (`msi.cpp:111`).
-    let mut table = super::MacroTable::new(
-        macros,
-        super::MacroExpandOptions {
-            suppress_warnings: super::db_quiet_macro_warnings(),
-            ..super::MacroExpandOptions::default()
-        },
-    );
-    let mut stack = Vec::new();
-    let mut out = Lines::default();
-    expand_includes_inner(opened, &mut table, config, &mut stack, faults, &mut out)?;
-    Ok(DbExpandedText {
-        text: out.text,
-        source: super::DbSource::new(out.lines, out.frames),
-    })
-}
-
-/// The accumulator `expand_includes_inner` writes into: one entry per
-/// line of the flattened text, so the text and its map cannot drift.
-#[derive(Default)]
-struct Lines {
-    text: Vec<u8>,
-    /// [`Self::text`] split for the diagnostics' echo, which prints it.
-    lines: Vec<String>,
-    frames: Vec<std::sync::Arc<[super::DbIncludeFrame]>>,
-    /// C's `inputFileList` while the read is running: the files open at
-    /// this point, outermost first, each parked at the line its reader
-    /// has reached.
-    open: Vec<super::DbIncludeFrame>,
-}
-
-impl Lines {
-    /// Append one expanded line, tagged with the include stack in force
-    /// at it. C prints that stack innermost-first (`dbIncludePrint`), so
-    /// it is reversed here — once, where the frame is built, rather than
-    /// at each of the places that read it.
-    fn push(&mut self, text: Vec<u8>) {
-        self.text.extend_from_slice(&text);
-        self.lines.push(String::from_utf8_lossy(&text).into_owned());
-        self.frames.push(std::sync::Arc::from(
-            self.open.iter().rev().cloned().collect::<Vec<_>>(),
-        ));
+    let mut feed = Feed::files(macros, config, DbFaults::default());
+    // A top-level file that cannot be read fails before the parser has a
+    // line to stand on (`line: 0`), so it is reported here; every later
+    // rejection leaves through the parser.
+    if let Err(e) = feed.open(opened) {
+        feed.faults.abort(&e);
+        return Err(e);
     }
+    Ok(super::parse_db_fed(feed).0)
 }
 
-/// Expand `include "..."` directives recursively.
+/// The text a load of `path` hands its parser: every file of the include
+/// tree, expanded, in the order C's lexer reads it. `Err` is the abort
+/// that ended the load, past which nothing was read.
 pub fn expand_includes(
     path: &Path,
     macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
     faults: &mut DbFaults,
 ) -> CaResult<Vec<u8>> {
-    Ok(expand_includes_mapped(&DbOpenedFile::taken_outright(path), macros, config, faults)?.text)
-}
-
-/// One file on C's `inputFileList` while the read is running.
-///
-/// TWO names, because the file has two jobs and they need different
-/// spellings: `identity` is the canonicalised path, which is what
-/// decides whether two `include` directives name one file, and `named`
-/// is what the operator wrote, which is the only one a diagnostic may
-/// print. Keeping both on the stack is what stops the identity from
-/// being the nearest string to hand when a message needs a file name —
-/// the way `/tmp/…/a.db -> /tmp/…/b.db -> /tmp/…/a.db` used to reach an
-/// operator who wrote `include "b.db"`.
-struct OpenFile {
-    identity: PathBuf,
-    named: String,
-}
-
-fn expand_includes_inner(
-    opened: &DbOpenedFile,
-    table: &mut super::MacroTable,
-    config: &DbLoadConfig,
-    stack: &mut Vec<OpenFile>,
-    faults: &mut DbFaults,
-    out: &mut Lines,
-) -> CaResult<()> {
-    let identity = opened
-        .resolved
-        .canonicalize()
-        .unwrap_or_else(|_| opened.resolved.clone());
-    let named = &opened.named;
-    // Circular include detection
-    if stack.iter().any(|f| f.identity == identity) {
-        let chain: Vec<&str> = stack.iter().map(|f| f.named.as_str()).collect();
-        return Err(CaError::DbParseError {
-            line: 0,
-            token: String::new(),
-            message: format!("circular include: {} -> {named}", chain.join(" -> ")),
-        });
+    let mut feed = Feed::files(macros, config, std::mem::take(faults));
+    if let Err(e) = feed.open(&DbOpenedFile::taken_outright(path)) {
+        *faults = feed.into_parts().1;
+        return Err(e);
     }
-
-    // Depth limit
-    if stack.len() >= config.max_include_depth {
-        return Err(CaError::DbParseError {
-            line: 0,
-            token: String::new(),
-            message: format!(
-                "include depth limit ({}) exceeded at '{named}'",
-                config.max_include_depth,
-            ),
-        });
+    let (mut parsed, text) = super::parse_db_fed(feed);
+    *faults = std::mem::take(&mut parsed.faults);
+    match parsed.aborted {
+        Some(abort) => Err(abort.error),
+        None => Ok(text),
     }
-
-    // Bytes, not text: C `fgets` hands its lexer whatever the file holds,
-    // and `dbLoadRecords` loads a record whose name is not UTF-8.
-    let content = std::fs::read(&identity).map_err(|e| CaError::DbParseError {
-        line: 0,
-        token: String::new(),
-        message: format!("cannot read '{named}': {e}"),
-    })?;
-
-    stack.push(OpenFile {
-        identity,
-        named: named.clone(),
-    });
-
-    // No per-file copy of the macros: a `substitute` inside an included
-    // file writes the shared table and its definition outlives the
-    // include, because msi shares one handle across `include` and pushes
-    // no scope for it (`msi.cpp:305-358`). Measured — a file defining
-    // `X=inner` under an outer `X=outer` leaves `after:[inner]` behind
-    // it, where this port used to restore `outer`.
-
-    // Include search path. Starts from the caller-supplied config and
-    // is mutated by `path`/`addpath` directives encountered in the
-    // file (L-3): C `dbPathCmd` replaces the path, `dbAddPathCmd`
-    // appends to it (`dbLexRoutines.c:433-441`).
-    let mut local_paths: Vec<PathBuf> = config.include_paths.clone();
-
-    // This file joins C's `inputFileList`; every line pushed while it is
-    // on top is attributed to it, at the line its own reader has reached.
-    let file_name = opened.named.clone();
-    out.open.push(super::DbIncludeFrame {
-        path: opened.found_under.clone(),
-        filename: Some(file_name.clone()),
-        line: 0,
-    });
-    // A directive line contributes no text but still costs a line number
-    // in the file the operator is reading, so it is replaced by an empty
-    // one. C never has to do this — its directives ARE grammar
-    // productions, so every source line reaches the lexer and its counter
-    // never skips.
-    let emit = |out: &mut Lines, n: u32, text: Vec<u8>| {
-        if let Some(frame) = out.open.last_mut() {
-            frame.line = n;
-        }
-        out.push(text);
-    };
-    for (i, raw) in content.split_inclusive(|&b| b == b'\n').enumerate() {
-        let line_num = i as u32 + 1;
-        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
-        if let Some(subst_str) = parse_substitute_directive(line) {
-            // msi is the reference for this one: C's `.db` grammar has no
-            // `substitute` directive at all. `makeSubstitutions` matches
-            // its two commands on the RAW line and sets `expand = 0`, so
-            // a command line is never itself expanded (`msi.cpp:305-358`),
-            // and `addMacroReplacements` hands the text between the outer
-            // quotes to `macParseDefns` and straight on to
-            // `macInstallMacros` (`:256-275`) — so what is installed is
-            // the RAW value. This port expanded it first, which froze a
-            // reference C leaves live.
-            for (name, value) in parse_macro_defns(subst_str) {
-                match value {
-                    Some(rawval) => table.define(&name, rawval),
-                    // C `macPutValue( handle, name, NULL )`: a definition
-                    // with no `=` deletes, uncovering an outer one.
-                    None => table.undefine(&name),
-                }
-            }
-            emit(out, line_num, b"\n".to_vec());
-            continue;
-        }
-        // Every other line goes through the file's one table exactly
-        // once, BEFORE anything looks at what it says. C `db_yyinput`
-        // (`dbLexRoutines.c:375-391`) expands each `fgets` line and hands
-        // the result to the lexer, so `include`, `path` and `addpath` are
-        // grammar productions reading already-expanded text and carry the
-        // same two per-line diagnostics as any other line. This port used
-        // to match them on the raw line and expand only the argument,
-        // which left an `include "$(NOPE)b.db"` line without the
-        // `WARNING: … has undefined macros` C prints for it.
-        // The flattened line this one's output starts at, which is where
-        // C's lexer stands when it reads it.
-        let at = out.lines.len() as u32 + 1;
-        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num, at, faults);
-        let line = expanded.strip_suffix(b"\n").unwrap_or(&expanded);
-        if let Some(dirs) = parse_path_directive(line, "path") {
-            // `path "a:b:c"` — replace the search path. C separates
-            // entries with the OS path separator.
-            local_paths = db_path(dirs);
-            emit(out, line_num, b"\n".to_vec());
-        } else if let Some(dirs) = parse_path_directive(line, "addpath") {
-            // `addpath "a:b"` — append to the search path.
-            local_paths.extend(db_add_path(dirs));
-            emit(out, line_num, b"\n".to_vec());
-        } else if let Some(expanded_filename) = parse_include_directive(line) {
-            // C `dbIncludeNew` (`dbLexRoutines.c:450-456`) prints this
-            // exact line and calls `yyerror(NULL)`, NOT `yyerrorAbort`:
-            // the include is skipped, everything already read stays, and
-            // the load's status goes non-zero at the end. The port used
-            // to propagate the failure out of the whole expansion, which
-            // discarded every record in the enclosing file.
-            // The directive's own line is where this file's reader is
-            // parked while the included one is read, which is what C's
-            // outer `dbIncludePrint` frame reports.
-            if let Some(frame) = out.open.last_mut() {
-                frame.line = line_num;
-            }
-            // C opens the file while reading this line, and the open's own
-            // `macEnvExpand` prints at once.
-            faults.read_through(at);
-            let Some(included) = db_open_file_located(&expanded_filename, &local_paths) else {
-                // `yyerror(NULL)` with the lexer on this line and `yytext`
-                // the quoted name. The line stays in the text, for the echo;
-                // the parser skips an `include` it meets.
-                faults.seek(at, &format!("\"{expanded_filename}\""));
-                faults.recoverable(format!(
-                    "{ERL_ERROR}: Can't open include file '{expanded_filename}'"
-                ));
-                faults.seek_end();
-                emit(out, line_num, expanded);
-                continue;
-            };
-            expand_includes_inner(&included, table, config, stack, faults, out)?;
-        } else {
-            emit(out, line_num, expanded);
-        }
-    }
-
-    out.open.pop();
-    stack.pop();
-    Ok(())
-}
-
-/// Parse an include directive line. Returns the filename if the line is an include directive.
-///
-/// The name comes back as text, because the file is opened through
-/// [`db_open_file_located`]'s `&str`: a non-UTF-8 byte in it shows as
-/// U+FFFD and names no file.
-pub(crate) fn parse_include_directive(line: impl AsRef<[u8]>) -> Option<String> {
-    directive_argument(line.as_ref(), b"include")
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
-}
-
-/// The text between the first two `"` after `keyword` on a directive line,
-/// for `include`, `path` and `addpath`.
-fn directive_argument<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
-    let trimmed = line.trim_ascii();
-    // Comment lines are not directives.
-    if trimmed.starts_with(b"#") {
-        return None;
-    }
-    let rest = trimmed.strip_prefix(keyword)?;
-    // The keyword must be followed by whitespace or a quote, so
-    // `pathological` is not mistaken for `path`.
-    let &first = rest.first()?;
-    if !first.is_ascii_whitespace() && first != b'"' {
-        return None;
-    }
-    let quote_start = rest.iter().position(|&b| b == b'"')?;
-    let after_quote = &rest[quote_start + 1..];
-    let quote_end = after_quote.iter().position(|&b| b == b'"')?;
-    Some(&after_quote[..quote_end])
 }
 
 /// Parse a `substitute` directive line.
@@ -471,21 +185,6 @@ pub(crate) fn parse_substitute_directive(line: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&after_quote[..end])
-}
-
-/// Parse a `path "..."` / `addpath "..."` directive line. `keyword`
-/// is `"path"` or `"addpath"`. Returns the quoted directory list if
-/// the line is that directive.
-///
-/// Mirrors C dbStatic (`dbYacc.y:71-81`): `tokenPATH`/`tokenADDPATH`
-/// followed by a quoted string.
-pub(crate) fn parse_path_directive<'a>(line: &'a [u8], keyword: &str) -> Option<&'a OsStr> {
-    let dirs = directive_argument(line, keyword.as_bytes())?;
-    // SAFETY: `dirs` is cut from `line` at ASCII `"` bytes only. On Unix an
-    // `OsStr` is any bytes; elsewhere the platform encoding is a superset
-    // of UTF-8 and this text came from a file, so a non-UTF-8 byte cannot
-    // reach here on a platform that would mind — see `db_add_path`.
-    Some(unsafe { OsStr::from_encoded_bytes_unchecked(dirs) })
 }
 
 /// C `OSI_PATH_LIST_SEPARATOR` (`osiFileName.h:22-28`) — ONE separator

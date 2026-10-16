@@ -147,20 +147,23 @@ WARNING: '{f}' line 4 has undefined macros
 #[serial_test::serial(db_load_stderr)]
 fn a_substitute_inside_an_include_outlives_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write(&dir, "inner.db", "substitute \"X=inner\"\nin:[$(X)]\n");
+    write(&dir, "inner.db", "substitute \"X=inner\"\n#in:[$(X)]\n");
     let main = write(
         &dir,
         "outer.db",
-        "before:[$(X)]\ninclude \"inner.db\"\nafter:[$(X)]\n",
+        "#before:[$(X)]\ninclude \"inner.db\"\n#after:[$(X)]\n",
     );
     let mut defs = MacroDefs::new();
     defs.put("X", "outer");
 
     let (text, _) = expand_and_notices(&main, &defs);
     // The `substitute` line contributes an empty line, which is how this
-    // reader keeps a diagnostic's line number the operator's; the
-    // `include` line contributes the included file instead.
-    assert_eq!(text, "before:[outer]\n\nin:[inner]\nafter:[inner]\n");
+    // reader keeps a diagnostic's line number the operator's; the rest of
+    // the `include` line is a line of its own, ahead of the included file.
+    assert_eq!(
+        text,
+        "#before:[outer]\ninclude \"inner.db\"\n\n\n#in:[inner]\n#after:[inner]\n"
+    );
 }
 
 /// **Boundary: a `substitute` value that mentions a macro redefined
@@ -184,13 +187,13 @@ fn a_substitute_value_is_installed_raw_and_stays_live() {
     let main = write(
         &dir,
         "live.db",
-        "substitute \"X=$(Y)\"\nsubstitute \"Y=2\"\nX=[$(X)]\n",
+        "substitute \"X=$(Y)\"\nsubstitute \"Y=2\"\n#X=[$(X)]\n",
     );
     let mut defs = MacroDefs::new();
     defs.put("Y", "1");
 
     let (text, _) = expand_and_notices(&main, &defs);
-    assert_eq!(text, "\n\nX=[2]\n");
+    assert_eq!(text, "\n\n#X=[2]\n");
 }
 
 /// **Boundary: the directive keyword itself comes from a macro.**
@@ -204,7 +207,7 @@ fn a_substitute_value_is_installed_raw_and_stays_live() {
 #[serial_test::serial(db_load_stderr)]
 fn the_directive_keyword_is_read_from_the_expanded_line() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write(&dir, "kb.db", "included\n");
+    write(&dir, "kb.db", "#included\n");
     let from_macro = write(&dir, "ka.db", "record(ai, \"T1\") {}\n$(INC) \"kb.db\"\n");
     let literal = write(&dir, "kl.db", "record(ai, \"T1\") {}\ninclude \"kb.db\"\n");
     let mut defs = MacroDefs::new();
@@ -212,7 +215,10 @@ fn the_directive_keyword_is_read_from_the_expanded_line() {
 
     let (from_macro, _) = expand_and_notices(&from_macro, &defs);
     let (literal, _) = expand_and_notices(&literal, &defs);
-    assert_eq!(from_macro, "record(ai, \"T1\") {}\nincluded\n");
+    assert_eq!(
+        from_macro,
+        "record(ai, \"T1\") {}\ninclude \"kb.db\"\n\n#included\n"
+    );
     assert_eq!(from_macro, literal);
 }
 

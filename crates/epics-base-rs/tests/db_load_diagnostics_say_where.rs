@@ -333,6 +333,70 @@ ERROR: Failed to load 'syn.db'
     assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
 }
 
+/// Run `dbLoadRecords("p.db")` over `parent` beside `ADBase.template` (one
+/// `ai` record `CHILD`), with the directory as the include path.
+fn stderr_with_adbase(parent: &str) -> (String, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("ADBase.template"),
+        "record(ai, \"CHILD\") {}\n",
+    )
+    .expect("write ADBase.template");
+    std::fs::write(dir.path().join("p.db"), parent).expect("write p.db");
+    let found_under = dir.path().display().to_string();
+
+    // SAFETY: the process-global env is why the callers are `serial`.
+    unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", &found_under) };
+    let got = stderr_of("dbLoadRecords(\"p.db\")", Arc::new(PvDatabase::new()));
+    unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
+    (got, found_under)
+}
+
+/// C pushes the included file when the grammar reduces `include`, while the
+/// rest of the line is still in the lexer's buffer: a token there is located
+/// in the included file at its line 0, echoing the including line. Measured
+/// on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn a_word_after_an_include_is_located_in_the_included_file() {
+    let (got, found_under) = stderr_with_adbase("include ADBase.template junk\n");
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'junk' in path \"{found_under}\"  file \"ADBase.template\" line 0
+ in path \"{found_under}\"  file \"p.db\" line 1
+
+ 0 | include ADBase.template junk
+
+ERROR: Failed to load 'p.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+}
+
+/// The included file is read before the line after the include, so a record
+/// body opened on the include's line meets the included file's text first.
+/// Measured on `softIoc` R7.0.10.
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(db_load_stderr)]
+async fn an_included_file_is_read_before_the_next_line() {
+    let (got, found_under) =
+        stderr_with_adbase("include ADBase.template record(ai, \"P\") {\n field(DESC, \"x\") }\n");
+    let want = format!(
+        "\
+ERROR: syntax error
+ at or before 'record' in path \"{found_under}\"  file \"ADBase.template\" line 1
+ in path \"{found_under}\"  file \"p.db\" line 1
+
+ 1 | record(ai, \"CHILD\") {{}}
+
+WARNING: dbReadCOM: Parser stack dirty w/o error. 1
+ERROR: Failed to load 'p.db'
+"
+    );
+    assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");
+}
+
 /// The other boundary: an abort that has no line in ANY file.
 ///
 /// The include layer raises these before a text exists to locate them in —
@@ -407,8 +471,8 @@ ERROR: Failed to load 'a.db'
 /// ```
 ///
 /// This port's file reader used to build a `MacroTable` per LINE, so the
-/// pair repeated three times for three lines; `expand_includes_mapped`
-/// now holds one for the whole include tree, which is why the count here
+/// pair repeated three times for three lines; the reader now holds one
+/// for the whole include tree, which is why the count here
 /// is C's.
 ///
 /// The load is driven by `dbLoadTemplate`, so the refusal is a ROW's, and C

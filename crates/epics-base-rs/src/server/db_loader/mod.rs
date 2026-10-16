@@ -6,13 +6,14 @@ use crate::runtime::log::{ERL_ERROR, ERL_WARNING};
 use crate::server::record::{FieldDesc, Record, check_link_text};
 use crate::types::{DbfCode, EpicsValue, PvString, RecordName};
 
+use reader::Feed;
+
 mod include;
 mod install;
 mod json_lex;
+mod reader;
 mod source;
 mod substitution;
-#[cfg(test)]
-pub(crate) use include::parse_include_directive;
 pub use include::{
     DbLoadConfig, DbOpenedFile, PATH_LIST_SEPARATOR, db_add_path, db_open_file,
     db_open_file_located, db_path, expand_includes, loaded_path, parse_db_file,
@@ -1333,6 +1334,26 @@ impl DbFaults {
         self.read_through(self.read);
     }
 
+    /// The lines read into the bound source so far.
+    fn source_len(&self) -> u32 {
+        self.source.as_ref().map_or(0, |source| source.len() as u32)
+    }
+
+    /// One more line read, with the include stack open at it.
+    fn read_line(&mut self, text: String, frames: std::sync::Arc<[DbIncludeFrame]>) {
+        self.source
+            .get_or_insert_with(Default::default)
+            .push(text, frames);
+    }
+
+    /// C `my_buffer`: the text of the line read last.
+    fn last_line_text(&self) -> String {
+        self.source
+            .as_ref()
+            .and_then(|source| source.at(source.len() as u32))
+            .map_or_else(String::new, |(_, text)| text.to_owned())
+    }
+
     /// Hold `notice` until the load reaches flattened `line`, after
     /// everything already held for that line.
     pub(crate) fn defer(&mut self, line: u32, notice: ReadNotice) {
@@ -1992,17 +2013,21 @@ pub fn set_db_quiet_macro_warnings(quiet: bool) {
     DB_QUIET_MACRO_WARNINGS.store(quiet, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// C `db_yyinput` (`dbLexRoutines.c:368-410`), as much of it as a port
-/// that flattens before it parses can have.
+/// One line through C's `macExpandString` call and the warning that
+/// follows it (`dbLexRoutines.c:378-387`) — the single seat for both
+/// macro diagnostics a `.db` load produces. Both are deferred to `faults`
+/// at flattened line `at`, where C's lexer reads this line.
 ///
-/// C reads one `fgets` line, hands it to `macExpandString`, and warns
-/// when the expansion reported an error — so both macro diagnostics an
-/// operator sees are per LINE and neither is raised by the parser. This
-/// is that seat: it expands line by line (quote state cannot leak across
-/// a newline), raises the loader's own warning for a line macLib could
-/// not fully resolve, and returns the flattened text together with the
-/// [`DbSource`] that maps a line of it back to the file and text C would
-/// have named.
+/// `raw` must carry its own trailing newline exactly as `fgets` leaves
+/// it, because macLib quotes the string it was given: C's console shows
+/// the closing `)` of `(expanding string …)` on the NEXT line for that
+/// reason, and a caller that trimmed first would print a different shape.
+///
+/// The table is always the caller's, and there is no variant that builds
+/// one per line: C has exactly one `MAC_HANDLE` for a whole `dbReadCOM`
+/// (`dbLexRoutines.c:256-300`) and msi one for a whole run
+/// (`msi.cpp:111`), so a per-line table can only ever announce a faulty
+/// definition once per line where C announces it once per file.
 ///
 /// The warning fires on C's `entry->error`, not on an undefined name:
 /// `macExpandString` returns the same negative length for a recursive
@@ -2028,56 +2053,6 @@ pub fn set_db_quiet_macro_warnings(quiet: bool) {
 /// `filename` is `None` for text that never came from a file — C has no
 /// such path (`dbReadDatabase` always names one), so the per-file warning
 /// is simply not raised rather than invented with a placeholder name.
-pub(crate) fn db_read_lines(
-    text: &[u8],
-    macros: impl Into<MacroDefs>,
-    filename: Option<&str>,
-    faults: &mut DbFaults,
-) -> (Vec<u8>, DbSource) {
-    // One table for the file, because C holds one `MAC_HANDLE` for the
-    // whole `.db` (`dbReadCOM`, `dbLexRoutines.c:256-300`) and reads
-    // `dbQuietMacroWarnings` into it once, at open. So a macro whose own
-    // value is faulty is expanded — and complained about — once here,
-    // not once per line that mentions it.
-    let mut table = MacroTable::new(
-        macros,
-        MacroExpandOptions {
-            suppress_warnings: db_quiet_macro_warnings(),
-            ..MacroExpandOptions::default()
-        },
-    );
-    let mut out = Vec::with_capacity(text.len());
-    let mut lines = Vec::new();
-    let mut frames = Vec::new();
-    for (i, raw) in text.split_inclusive(|&b| b == b'\n').enumerate() {
-        let line_num = i as u32 + 1;
-        let expanded = db_expand_line_in(&mut table, raw, filename, line_num, line_num, faults);
-        out.extend_from_slice(&expanded);
-        lines.push(String::from_utf8_lossy(&expanded).into_owned());
-        frames.push(std::sync::Arc::from(vec![DbIncludeFrame {
-            path: None,
-            filename: filename.map(str::to_string),
-            line: line_num,
-        }]));
-    }
-    (out, DbSource::new(lines, frames))
-}
-
-/// One line through C's `macExpandString` call and the warning that
-/// follows it (`dbLexRoutines.c:378-387`) — the single seat for both
-/// macro diagnostics a `.db` load produces. Both are deferred to `faults`
-/// at flattened line `at`, where C's lexer reads this line.
-///
-/// `raw` must carry its own trailing newline exactly as `fgets` leaves
-/// it, because macLib quotes the string it was given: C's console shows
-/// the closing `)` of `(expanding string …)` on the NEXT line for that
-/// reason, and a caller that trimmed first would print a different shape.
-///
-/// The table is always the caller's, and there is no variant that builds
-/// one per line: C has exactly one `MAC_HANDLE` for a whole `dbReadCOM`
-/// (`dbLexRoutines.c:256-300`) and msi one for a whole run
-/// (`msi.cpp:111`), so a per-line table can only ever announce a faulty
-/// definition once per line where C announces it once per file.
 pub(crate) fn db_expand_line_in(
     table: &mut MacroTable,
     raw: &[u8],
@@ -2129,34 +2104,19 @@ pub fn parse_db_with_breaktables(input: &str, macros: impl Into<MacroDefs>) -> C
 /// [`parse_db_with_breaktables`] for an installer: every positioned
 /// diagnostic, and an abort, stays held until the install reaches its line.
 pub(crate) fn parse_db_held(input: &str, macros: impl Into<MacroDefs>) -> ParsedDb {
-    // Per LINE, not per file: C's loader expands each `fgets` line
-    // separately (`dbLexRoutines.c:375-391`), so quote state cannot leak
-    // across lines — see [`db_read_lines`].
-    let mut faults = DbFaults::default();
-    let (expanded, source) = db_read_lines(input.as_bytes(), macros, None, &mut faults);
-    parse_db_expanded(&expanded, source, faults)
+    parse_db_fed(Feed::text(input.as_bytes(), macros, DbFaults::default())).0
 }
 
-/// The parser proper: text that has ALREADY been through
-/// [`db_read_lines`], plus the map that locates a line in it.
-///
-/// Split out so a `.db` text is macro-expanded exactly ONCE per load.
-/// The file path expanded twice — once in `expand_includes`, which must,
-/// because it has to resolve an `include` filename before it can open it,
-/// and again here — which was invisible while the expander said nothing
-/// and would have printed every `macLib:` line twice the moment it did.
-pub(crate) fn parse_db_expanded(
-    expanded: &[u8],
-    source: DbSource,
-    mut faults: DbFaults,
-) -> ParsedDb {
+/// The parser proper, pulling its text from `feed`; also returns the text
+/// it was handed.
+fn parse_db_fed(mut feed: Feed) -> (ParsedDb, Vec<u8>) {
     // C installs each record as the grammar reduces it, so an abort keeps
     // every record above it, the one it interrupted included, and is
     // reported only once they are in: the abort travels on the result for
     // the installer to raise at its line. See [`ParsedDb::raise_abort`].
-    faults.bind_source(source);
     let mut items = DbItems::default();
-    let mut parsed = parse_db_items(expanded, &mut faults, &mut items);
+    let mut parsed = parse_db_items(&mut feed, &mut items);
+    let (text, mut faults) = feed.into_parts();
     let lexed = std::mem::take(&mut items.lexed);
     // Past a lexer abort, a rejection with no token is the EOF the abort
     // made: bison's `syntax error`, with the lexer still on the abort's line.
@@ -2178,14 +2138,15 @@ pub(crate) fn parse_db_expanded(
         stack_dirty: items.temp_list > 0 && !items.yy_abort && lexed.eof.is_none(),
         yyerror_null: items.yyerror_null,
     });
-    ParsedDb {
+    let parsed = ParsedDb {
         records: items.records,
         breaktables: items.breaktables,
         file_aliases: items.file_aliases,
         faults,
         dbd: items.dbd,
         aborted,
-    }
+    };
+    (parsed, text)
 }
 
 /// What one text yields before its faults are attached — filled as the
@@ -2212,10 +2173,10 @@ struct DbItems {
 /// `dbYacc.y` declares no `error` productions, so a genuine syntax error
 /// ends `yyparse` and the whole text is lost in C too: every `?` below
 /// is abort-class by C's own choice, and all of them leave through
-/// [`parse_db_expanded`], which reports them. Only the semantic actions
+/// [`parse_db_fed`], which reports them. Only the semantic actions
 /// C guards with `yyerror(NULL)` are recoverable, and those live in the
 /// layers that own a database — see [`DbFaults`].
-fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -> CaResult<()> {
+fn parse_db_items(chars: &mut Feed, items: &mut DbItems) -> CaResult<()> {
     // `.dbd` declarations: C parses these through the same `yyparse` as
     // `record`, so they are accepted here rather than rejected. Standalone
     // `alias("record","newname")` directives (dbYacc.y:275) are run by the
@@ -2230,46 +2191,31 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         yyerror_null,
         lexed,
     } = items;
-    let mut chars: Vec<u8> = expanded.to_vec();
     let mut pos = 0;
     let mut line = 1;
     let mut col = 1;
 
-    while pos < chars.len() {
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        if pos >= chars.len() {
+    loop {
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        if chars.get(pos).is_none() {
             break;
         }
 
         // Top-level keyword. C dbStatic (`dbYacc.y:48-62`) accepts
         // `record`/`grecord` plus the directives below at file scope.
-        let word = read_word(&chars, &mut pos, &mut col);
+        let word = read_word(chars, &mut pos, &mut col);
         if word.is_empty() {
             pos += 1;
             col += 1;
             continue;
         }
 
-        // `path "dir"` / `addpath "dir"` — search-path directives
-        // (dbYacc.y:71-81). Include resolution is handled by the
-        // file-expansion layer (`expand_includes`); by the time raw
-        // text reaches `parse_db` the path is already fixed, so these
-        // are accepted and skipped rather than erroring out.
         if word == "path" || word == "addpath" {
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _dir = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+            reduce_path(chars, &mut pos, &mut line, &mut col, word == "addpath")?;
             continue;
         }
-
-        // `include "file"` (dbYacc.y:65-69). Includes are normally
-        // inlined by `expand_includes` before `parse_db` runs; a bare
-        // `include` reaching here means the caller parsed un-expanded
-        // text. Accept the directive so the grammar matches C, but the
-        // file is NOT loaded at this layer — that is the expansion
-        // layer's job.
         if word == "include" {
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let _file = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+            reduce_include(chars, &mut pos, &mut line, &mut col)?;
             continue;
         }
 
@@ -2279,20 +2225,20 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         // all records are parsed (the target may appear later in the
         // file).
         if word == "alias" {
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b'(', line)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let target = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b',', line)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b')', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b'(', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            let target = read_token_string(chars, &mut pos, &mut line, &mut col)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b',', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            let alias_name = read_token_string(chars, &mut pos, &mut line, &mut col)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b')', line)?;
             // `dbAlias` checks the new name, then the target, and stops at
             // the first refusal (`dbLexRoutines.c:1505`).
-            db_record_name_validate(&alias_name, line, faults, yy_abort, yyerror_null)?;
-            db_record_name_validate(&target, line, faults, yy_abort, yyerror_null)?;
+            db_record_name_validate(&alias_name, line, &mut chars.faults, yy_abort, yyerror_null)?;
+            db_record_name_validate(&target, line, &mut chars.faults, yy_abort, yyerror_null)?;
             global_aliases.push(DbFileAlias {
                 target: RecordName::from(target),
                 alias: DbAlias {
@@ -2310,14 +2256,14 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         // `BrkTable::build` computes the interval slopes and validates the
         // table (>= 2 points, monotonic, no zero slope).
         if word == "breaktable" {
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b'(', line)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let bt_name = read_token_text(&chars, &mut pos, &mut line, &mut col)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b')', line)?;
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, b'{', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b'(', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            let bt_name = read_token_text(chars, &mut pos, &mut line, &mut col)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b')', line)?;
+            skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+            expect_char(chars, &mut pos, &mut col, b'{', line)?;
 
             // Read numeric tokens until the closing brace. Numbers are
             // separated by whitespace and/or commas (C `tokenVALUE` lexing).
@@ -2325,37 +2271,37 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
                 |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'+' | b':' | b'.');
             let mut nums: Vec<f64> = Vec::new();
             loop {
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                if pos >= chars.len() {
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                let Some(c) = chars.get(pos) else {
                     return Err(CaError::DbParseError {
                         line,
                         token: String::new(),
                         message: "unexpected end of file in breaktable body".into(),
                     });
-                }
-                if chars[pos] == b'}' {
+                };
+                if c == b'}' {
                     pos += 1;
                     col += 1;
                     break;
                 }
-                if chars[pos] == b',' {
+                if c == b',' {
                     pos += 1;
                     col += 1;
                     continue;
                 }
                 let mut tok = String::new();
-                while pos < chars.len() && is_number_char(chars[pos]) {
-                    tok.push(char::from(chars[pos]));
+                while let Some(c) = chars.get(pos).filter(|&c| is_number_char(c)) {
+                    tok.push(char::from(c));
                     pos += 1;
                     col += 1;
                 }
                 if tok.is_empty() {
                     return Err(CaError::DbParseError {
                         line,
-                        token: yytext_at(&chars, pos),
+                        token: yytext_at(chars, pos),
                         message: format!(
                             "breaktable {bt_name}: expected a number, got '{}'",
-                            char::from(chars[pos])
+                            char::from(c)
                         ),
                     });
                 }
@@ -2397,16 +2343,16 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         // parenthesised argument list.
         if word == "menu" {
             dbd.menus
-                .push(parse_menu(&chars, &mut pos, &mut line, &mut col)?);
+                .push(parse_menu(chars, &mut pos, &mut line, &mut col)?);
             continue;
         }
         if word == "recordtype" {
             dbd.record_types
-                .push(parse_recordtype(&chars, &mut pos, &mut line, &mut col)?);
+                .push(parse_recordtype(chars, &mut pos, &mut line, &mut col)?);
             continue;
         }
         if word == "device" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 4, 4)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 4, 4)?;
             dbd.devices.push(DbdDevice {
                 record_type: a[0].clone(),
                 link_type: a[1].clone(),
@@ -2416,12 +2362,12 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
             continue;
         }
         if word == "driver" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.drivers.push(a[0].clone());
             continue;
         }
         if word == "link" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 2, 2)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 2, 2)?;
             dbd.link_types.push(DbdLinkType {
                 key: a[0].clone(),
                 lset: a[1].clone(),
@@ -2429,19 +2375,19 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
             continue;
         }
         if word == "registrar" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.registrars.push(a[0].clone());
             continue;
         }
         if word == "function" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.functions.push(a[0].clone());
             continue;
         }
         if word == "variable" {
             // C `dbYacc.y:192-202`: the one-argument form is
             // `dbVariable($3, "int")`.
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 2)?;
+            let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 1, 2)?;
             dbd.variables.push(DbdVariable {
                 name: a[0].clone(),
                 dtype: a.get(1).cloned().unwrap_or_else(|| "int".to_string()),
@@ -2458,20 +2404,20 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         }
 
         let keyword_line = line as u32;
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        expect_char(&chars, &mut pos, &mut col, b'(', line)?;
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        expect_char(chars, &mut pos, &mut col, b'(', line)?;
 
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let rec_type = read_token_text(&chars, &mut pos, &mut line, &mut col)?;
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        let rec_type = read_token_text(chars, &mut pos, &mut line, &mut col)?;
 
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        expect_char(&chars, &mut pos, &mut col, b',', line)?;
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        expect_char(chars, &mut pos, &mut col, b',', line)?;
 
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        let name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        let name = read_token_string(chars, &mut pos, &mut line, &mut col)?;
 
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        expect_char(&chars, &mut pos, &mut col, b')', line)?;
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+        expect_char(chars, &mut pos, &mut col, b')', line)?;
         // Where C's lexer is parked when `dbRecordHead` reduces, which is the
         // line every refusal of the head itself is reported on.
         let head_line = line as u32;
@@ -2482,7 +2428,7 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         // `softIoc` @`R7.0.10`, while `record(ai, "")` prints the empty-name
         // refusal located at `)`. Validating before the paren gave both of
         // them the name refusal.
-        db_record_name_validate(&name, line, faults, yy_abort, yyerror_null)?;
+        db_record_name_validate(&name, line, &mut chars.faults, yy_abort, yyerror_null)?;
 
         // C's `dbRecordHead` has created the record: from here every field
         // reduced lands on it, and an abort leaves it in place.
@@ -2497,39 +2443,36 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
         let def = records.last_mut().expect("pushed above");
         *temp_list = 1;
 
-        skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+        skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
         // C `dbYacc.y:237-241`: `record_body: /* empty */` is the FIRST
         // alternative, ahead of `'{' '}'` and `'{' record_field_list '}'`,
         // and `tokenRECORD` and `tokenGRECORD` share it — so
         // `record(ai,"TEMP")` with no braces is an all-defaults record,
         // not a syntax error. `record`/`grecord` reach this through the
         // same path above, so both forms are covered here.
-        if pos < chars.len() && chars[pos] == b'{' {
+        if chars.get(pos) == Some(b'{') {
             pos += 1;
             col += 1;
             loop {
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                if pos >= chars.len() {
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                let Some(c) = chars.get(pos) else {
                     return Err(CaError::DbParseError {
                         line,
                         token: String::new(),
                         message: "unexpected end of file in record body".into(),
                     });
-                }
-                if chars[pos] == b'}' {
+                };
+                if c == b'}' {
                     pos += 1;
                     col += 1;
-                    faults.body_spans(keyword_line, line as u32);
+                    chars.faults.body_spans(keyword_line, line as u32);
                     break;
                 }
 
-                let kw = read_word(&chars, &mut pos, &mut col);
-                // `record_field: ... | include` (`dbYacc.y:271`). As at
-                // file scope, the expansion layer owns the file; the
-                // directive is accepted so the grammar matches C.
+                let kw = read_word(chars, &mut pos, &mut col);
+                // `record_field: ... | include` (`dbYacc.y:271`).
                 if kw == "include" {
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    let _file = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+                    reduce_include(chars, &mut pos, &mut line, &mut col)?;
                     continue;
                 }
                 if kw != "field" && kw != "info" && kw != "alias" {
@@ -2542,13 +2485,19 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
 
                 if kw == "alias" {
                     // alias("name") — capture and validate per PR #336.
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    expect_char(&chars, &mut pos, &mut col, b'(', line)?;
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    expect_char(&chars, &mut pos, &mut col, b')', line)?;
-                    db_record_name_validate(&alias_name, line, faults, yy_abort, yyerror_null)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    expect_char(chars, &mut pos, &mut col, b'(', line)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    let alias_name = read_token_string(chars, &mut pos, &mut line, &mut col)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    expect_char(chars, &mut pos, &mut col, b')', line)?;
+                    db_record_name_validate(
+                        &alias_name,
+                        line,
+                        &mut chars.faults,
+                        yy_abort,
+                        yyerror_null,
+                    )?;
                     def.aliases.push(DbAlias {
                         name: RecordName::from(alias_name),
                         line: line as u32,
@@ -2570,42 +2519,40 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
                     // NAME is — and only the value is a `jsonSTRING` that
                     // `dbRecordInfo` runs `dbTranslateEscape` over
                     // (dbLexRoutines.c:1435-1440). Hence the two different readers.
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    expect_char(&chars, &mut pos, &mut col, b'(', line)?;
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    let tag = read_token_text(&chars, &mut pos, &mut line, &mut col)?;
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    expect_char(&chars, &mut pos, &mut col, b',', line)?;
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    let value = read_field_value(&chars, &mut pos, &mut line, &mut col, lexed)?;
-                    if let Some(eof) = lexed.eof {
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    expect_char(chars, &mut pos, &mut col, b'(', line)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    let tag = read_token_text(chars, &mut pos, &mut line, &mut col)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    expect_char(chars, &mut pos, &mut col, b',', line)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    let value = read_field_value(chars, &mut pos, &mut line, &mut col, lexed)?;
+                    if lexed.eof.is_some() {
                         *yy_abort = true;
-                        chars.truncate(eof);
                     }
-                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                    expect_char(&chars, &mut pos, &mut col, b')', line)?;
+                    skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                    expect_char(chars, &mut pos, &mut col, b')', line)?;
                     def.info_tags.push((tag, value.as_str_lossy().into_owned()));
                     continue;
                 }
 
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                expect_char(&chars, &mut pos, &mut col, b'(', line)?;
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                expect_char(chars, &mut pos, &mut col, b'(', line)?;
 
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let field_name = read_token_text(&chars, &mut pos, &mut line, &mut col)?;
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                let field_name = read_token_text(chars, &mut pos, &mut line, &mut col)?;
 
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                expect_char(&chars, &mut pos, &mut col, b',', line)?;
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                expect_char(chars, &mut pos, &mut col, b',', line)?;
 
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let field_value = read_field_value(&chars, &mut pos, &mut line, &mut col, lexed)?;
-                if let Some(eof) = lexed.eof {
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                let field_value = read_field_value(chars, &mut pos, &mut line, &mut col, lexed)?;
+                if lexed.eof.is_some() {
                     *yy_abort = true;
-                    chars.truncate(eof);
                 }
 
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                expect_char(&chars, &mut pos, &mut col, b')', line)?;
+                skip_whitespace_and_comments(chars, &mut pos, &mut line, &mut col);
+                expect_char(chars, &mut pos, &mut col, b')', line)?;
                 // Field names are judged where the body is applied, against
                 // the record it lands on — see [`field_name_refusal`].
                 let field_line = line as u32;
@@ -2624,7 +2571,7 @@ fn parse_db_items(expanded: &[u8], faults: &mut DbFaults, items: &mut DbItems) -
     // point (the install loop, an alias resolved against the database)
     // must seek for itself rather than inherit wherever the parse
     // stopped. See [`DbFaults::seek_end`].
-    faults.seek_end();
+    chars.faults.seek_end();
     Ok(())
 }
 
@@ -2635,6 +2582,35 @@ pub use crate::runtime::mac_lib::{
     substitute_macros, substitute_macros_per_line,
 };
 
+/// `include tokenSTRING` (`dbYacc.y:65-69`), reduced: the reader opens the
+/// file, as the action's `dbIncludeNew` does, and reads it next.
+fn reduce_include(
+    chars: &mut Feed,
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) -> CaResult<()> {
+    skip_whitespace_and_comments(chars, pos, line, col);
+    let start = *pos;
+    let file = read_token_string(chars, pos, line, col)?;
+    let yytext = String::from_utf8_lossy(chars.bytes(start..*pos)).into_owned();
+    chars.include(&file, &yytext, *pos, *line as u32)
+}
+
+/// `path tokenSTRING` / `addpath tokenSTRING` (`dbYacc.y:71-81`), reduced.
+fn reduce_path(
+    chars: &mut Feed,
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+    add: bool,
+) -> CaResult<()> {
+    skip_whitespace_and_comments(chars, pos, line, col);
+    let dirs = read_token_string(chars, pos, line, col)?;
+    chars.path(&dirs, add);
+    Ok(())
+}
+
 /// Read `( a , b , ... )` and return the strings. `min`/`max` bound the
 /// count the way C's grammar does by having one production per arity.
 ///
@@ -2644,7 +2620,7 @@ pub use crate::runtime::mac_lib::{
 /// with the parser never reaching the `)` — and an argument too few at the `)`
 /// that ended the list, which is where `alias("C8")` reports.
 fn parse_arg_list(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -2689,7 +2665,7 @@ fn parse_arg_list(
 /// `menu(name) { choice(id, "string") ... }` (`dbYacc.y:82-101`). The body
 /// also admits `include` (`:101`).
 fn parse_menu(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -2722,10 +2698,7 @@ fn parse_menu(
                 let value = a.remove(1);
                 choices.push((a.remove(0), value));
             }
-            "include" => {
-                skip_whitespace_and_comments(chars, pos, line, col);
-                let _file = read_token_string(chars, pos, line, col)?;
-            }
+            "include" => reduce_include(chars, pos, line, col)?,
             _ => {
                 return Err(CaError::DbParseError {
                     line: *line,
@@ -2757,7 +2730,7 @@ fn parse_menu(
 /// production (`dbRecordtypeEmpty`) and is accepted here as an empty
 /// field list.
 fn parse_recordtype(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -2789,11 +2762,11 @@ fn parse_recordtype(
                 *pos += 1;
                 *col += 1;
                 let start = *pos;
-                while chars.get(*pos).is_some_and(|&c| c != b'\n') {
+                while chars.get(*pos).is_some_and(|c| c != b'\n') {
                     *pos += 1;
                     *col += 1;
                 }
-                cdefs.push(String::from_utf8_lossy(&chars[start..*pos]).into_owned());
+                cdefs.push(String::from_utf8_lossy(chars.bytes(start..*pos)).into_owned());
                 continue;
             }
             _ => {}
@@ -2801,10 +2774,7 @@ fn parse_recordtype(
         let kw = read_word(chars, pos, col);
         match kw.as_str() {
             "field" => fields.push(parse_recordtype_field(chars, pos, line, col, &name)?),
-            "include" => {
-                skip_whitespace_and_comments(chars, pos, line, col);
-                let _file = read_token_string(chars, pos, line, col)?;
-            }
+            "include" => reduce_include(chars, pos, line, col)?,
             _ => {
                 return Err(CaError::DbParseError {
                     line: *line,
@@ -2823,7 +2793,7 @@ fn parse_recordtype(
 
 /// `field(NAME, DBF_TYPE) { item(value) ... }` (`dbYacc.y:132-153`).
 fn parse_recordtype_field(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -2874,9 +2844,14 @@ fn parse_recordtype_field(
     })
 }
 
-fn skip_whitespace_and_comments(chars: &[u8], pos: &mut usize, line: &mut usize, col: &mut usize) {
-    while *pos < chars.len() {
-        match chars[*pos] {
+fn skip_whitespace_and_comments(
+    chars: &mut Feed,
+    pos: &mut usize,
+    line: &mut usize,
+    col: &mut usize,
+) {
+    while let Some(c) = chars.get(*pos) {
+        match c {
             b' ' | b'\t' | b'\r' => {
                 *pos += 1;
                 *col += 1;
@@ -2888,7 +2863,7 @@ fn skip_whitespace_and_comments(chars: &[u8], pos: &mut usize, line: &mut usize,
             }
             b'#' => {
                 // Line comment
-                while *pos < chars.len() && chars[*pos] != b'\n' {
+                while chars.get(*pos).is_some_and(|c| c != b'\n') {
                     *pos += 1;
                 }
             }
@@ -2897,10 +2872,13 @@ fn skip_whitespace_and_comments(chars: &[u8], pos: &mut usize, line: &mut usize,
     }
 }
 
-fn read_word(chars: &[u8], pos: &mut usize, col: &mut usize) -> String {
+fn read_word(chars: &mut Feed, pos: &mut usize, col: &mut usize) -> String {
     let mut word = String::new();
-    while *pos < chars.len() && (chars[*pos].is_ascii_alphanumeric() || chars[*pos] == b'_') {
-        word.push(char::from(chars[*pos]));
+    while let Some(c) = chars
+        .get(*pos)
+        .filter(|&c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        word.push(char::from(c));
         *pos += 1;
         *col += 1;
     }
@@ -2908,12 +2886,12 @@ fn read_word(chars: &[u8], pos: &mut usize, col: &mut usize) -> String {
 }
 
 fn read_quoted_string(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<Vec<u8>> {
-    if *pos >= chars.len() || chars[*pos] != b'"' {
+    if chars.get(*pos) != Some(b'"') {
         return Err(CaError::DbParseError {
             line: *line,
             token: yytext_at(chars, *pos),
@@ -2940,8 +2918,12 @@ fn read_quoted_string(
     // purposes — `\"` does not terminate the string — but both bytes are
     // emitted verbatim.
     let mut s = Vec::new();
-    while *pos < chars.len() && chars[*pos] != b'"' {
-        if chars[*pos] == b'\\' && *pos + 1 < chars.len() && chars[*pos + 1] != b'\n' {
+    while let Some(c) = chars.get(*pos).filter(|&c| c != b'"') {
+        let escaped = (c == b'\\')
+            .then(|| chars.get(*pos + 1))
+            .flatten()
+            .filter(|&e| e != b'\n');
+        if let Some(e) = escaped {
             // Emit both the backslash and the escaped char raw.
             //
             // The `!= '\n'` guard is required: C `{escape}` is
@@ -2951,10 +2933,10 @@ fn read_quoted_string(
             // lets the newline fall through to the `Newline in string`
             // error below (dbLex.l:131-133).
             s.push(b'\\');
-            s.push(chars[*pos + 1]);
+            s.push(e);
             *pos += 2;
             *col += 2;
-        } else if chars[*pos] == b'\n' {
+        } else if c == b'\n' {
             // dbLex.l:131-133: a newline inside an unterminated quoted
             // string is a hard parse error (`yyerrorAbort("Newline in
             // string, closing quote missing")`), not a literal char.
@@ -2964,13 +2946,13 @@ fn read_quoted_string(
                 message: "Newline in string, closing quote missing".into(),
             });
         } else {
-            s.push(chars[*pos]);
+            s.push(c);
             *pos += 1;
             *col += 1;
         }
     }
 
-    if *pos >= chars.len() {
+    if chars.get(*pos).is_none() {
         return Err(CaError::DbParseError {
             line: *line,
             token: String::new(),
@@ -3004,13 +2986,13 @@ fn read_quoted_string(
 /// literal text `uHHHH` — reproduced, because a `.db` in the field may rely on
 /// what C actually stores.
 fn read_json_string(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<PvString> {
     let quote = match chars.get(*pos) {
-        Some(&c @ (b'"' | b'\'')) => c,
+        Some(c @ (b'"' | b'\'')) => c,
         _ => {
             return Err(CaError::DbParseError {
                 line: *line,
@@ -3026,7 +3008,7 @@ fn read_json_string(
     *pos += 1;
     *col += 1;
 
-    let err = |line: usize, message: &str| CaError::DbParseError {
+    let err = |chars: &mut Feed, line: usize, message: &str| CaError::DbParseError {
         line,
         token: yytext_at(chars, quote_start),
         message: message.into(),
@@ -3036,8 +3018,8 @@ fn read_json_string(
     // quote characters `dbGetFieldValue` steps over.
     let mut escaped = Vec::new();
     loop {
-        let Some(&c) = chars.get(*pos) else {
-            return Err(err(*line, "unterminated string"));
+        let Some(c) = chars.get(*pos) else {
+            return Err(err(chars, *line, "unterminated string"));
         };
         if c == quote {
             *pos += 1;
@@ -3048,25 +3030,29 @@ fn read_json_string(
             // dbLex.l:131-133 — the JSON string rule cannot match a newline
             // (`normalchar` excludes every control character), and the
             // catch-all reports the missing quote.
-            return Err(err(*line, "Newline in string, closing quote missing"));
+            return Err(err(
+                chars,
+                *line,
+                "Newline in string, closing quote missing",
+            ));
         }
         if c == b'\\' {
-            let Some(&esc) = chars.get(*pos + 1) else {
-                return Err(err(*line, "unterminated string"));
+            let Some(esc) = chars.get(*pos + 1) else {
+                return Err(err(chars, *line, "unterminated string"));
             };
             // `escapedchar` is `{backslash}[^ux1-9]`; `x` and `u` introduce the
             // fixed-width `latinchar`/`unicodechar` forms, and `\1`..`\9` are
             // not escapes at all (C has no octal here).
-            let hex = |n: usize| {
-                chars
-                    .get(*pos + 2..*pos + 2 + n)
-                    .is_some_and(|ds| ds.iter().all(|d| d.is_ascii_hexdigit()))
+            let at = *pos + 2;
+            let mut hex = |n: usize| {
+                (at..at + n).all(|i| chars.get(i).is_some_and(|d| d.is_ascii_hexdigit()))
             };
             let width = match esc {
                 b'x' if hex(2) => 4,
                 b'u' if hex(4) => 6,
                 b'x' | b'u' | b'1'..=b'9' => {
                     return Err(err(
+                        chars,
                         *line,
                         "invalid escape sequence (\\x needs 2 hex digits, \
                          \\u needs 4, and \\1..\\9 are not escapes)",
@@ -3077,7 +3063,7 @@ fn read_json_string(
             // `\<newline>` is a legal escape here (the class `[^ux1-9]` matches
             // a newline where the name rule's `.` does not), so the line
             // counter has to follow it.
-            let consumed = &chars[*pos..*pos + width];
+            let consumed = chars.bytes(*pos..*pos + width);
             escaped.extend_from_slice(consumed);
             *pos += width;
             if consumed.contains(&b'\n') {
@@ -3090,6 +3076,7 @@ fn read_json_string(
         }
         if c < 0x20 {
             return Err(err(
+                chars,
                 *line,
                 "a control character must be escaped inside a quoted value",
             ));
@@ -3137,7 +3124,7 @@ pub(crate) fn invalid_character_message(b: u8) -> String {
 /// through here is what makes the two forms indistinguishable to the caller,
 /// as they are to C.
 fn read_token_string(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -3147,19 +3134,10 @@ fn read_token_string(
     }
 
     let mut s = Vec::new();
-    while let Some(&c) = chars.get(*pos) {
-        if c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                b'_' | b'-' | b'+' | b':' | b'.' | b'[' | b']' | b'<' | b'>' | b';'
-            )
-        {
-            s.push(c);
-            *pos += 1;
-            *col += 1;
-        } else {
-            break;
-        }
+    while let Some(c) = chars.get(*pos).filter(|&c| is_bareword_char(c)) {
+        s.push(c);
+        *pos += 1;
+        *col += 1;
     }
     if s.is_empty() {
         return Err(CaError::DbParseError {
@@ -3175,7 +3153,7 @@ fn read_token_string(
 /// of ASCII names (a record type, a field, a `.dbd` argument) or printed: a
 /// non-UTF-8 byte there matches nothing, as in C, and shows as U+FFFD.
 fn read_token_text(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -3191,7 +3169,7 @@ fn read_token_text(
 /// unquoted forms (`jsonBARE`, `jsonNUMBER`) carry no escapes and are taken
 /// verbatim, as C does.
 fn read_field_value(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
@@ -3255,15 +3233,15 @@ const SYNTAX_ERROR: &str = "syntax error";
 /// bareword is the whole `{bareword}` run (`dbLex.l:20`), and anything else is
 /// the single character. End of input matched no token at all and answers with
 /// the empty string.
-fn yytext_at(chars: &[u8], pos: usize) -> String {
-    let Some(&c) = chars.get(pos) else {
+fn yytext_at(chars: &mut Feed, pos: usize) -> String {
+    let Some(c) = chars.get(pos) else {
         return String::new();
     };
     let end = if c == b'"' || c == b'\'' {
         // `{doublequote}({dqschar}|{escape})*{doublequote}` (`dbLex.l:88-92`):
         // the escape is two characters and neither of them closes the string.
         let mut i = pos + 1;
-        while let Some(&d) = chars.get(i) {
+        while let Some(d) = chars.get(i) {
             i += 1;
             if d == b'\\' {
                 if chars.get(i).is_some() {
@@ -3277,14 +3255,15 @@ fn yytext_at(chars: &[u8], pos: usize) -> String {
         }
         i
     } else if is_bareword_char(c) {
-        pos + chars[pos..]
-            .iter()
-            .take_while(|&&d| is_bareword_char(d))
-            .count()
+        let mut i = pos + 1;
+        while chars.get(i).is_some_and(is_bareword_char) {
+            i += 1;
+        }
+        i
     } else {
         pos + 1
     };
-    String::from_utf8_lossy(&chars[pos..end]).into_owned()
+    String::from_utf8_lossy(chars.bytes(pos..end)).into_owned()
 }
 
 /// `bareword [a-zA-Z0-9_\-+:.\[\]<>;]` (`dbLex.l:20`).
@@ -3297,13 +3276,13 @@ fn is_bareword_char(c: u8) -> bool {
 }
 
 fn expect_char(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     col: &mut usize,
     expected: u8,
     line: usize,
 ) -> CaResult<()> {
-    if *pos >= chars.len() || chars[*pos] != expected {
+    if chars.get(*pos) != Some(expected) {
         return Err(CaError::DbParseError {
             line,
             token: yytext_at(chars, *pos),
@@ -4852,37 +4831,92 @@ record(ai, "T") { field(LINR, "typeJdegC") }
 
     // ===== include / parse_db_file tests =====
 
-    #[test]
-    fn test_parse_include_directive() {
-        // Normal include
-        assert_eq!(
-            parse_include_directive(r#"include "foo.template""#),
-            Some("foo.template".to_string())
-        );
-        // With leading whitespace
-        assert_eq!(
-            parse_include_directive(r#"  include "bar.db""#),
-            Some("bar.db".to_string())
-        );
-        // With trailing comment
-        assert_eq!(
-            parse_include_directive(r#"include "baz.template" # a comment"#),
-            Some("baz.template".to_string())
-        );
-        // No quote — not an include
-        assert_eq!(parse_include_directive("include something"), None);
-        // Comment line
-        assert_eq!(parse_include_directive(r#"# include "ignored.db""#), None);
-        // Not an include keyword
-        assert_eq!(parse_include_directive("record(ai, \"X\") {"), None);
-        // "includes" is not "include"
-        assert_eq!(parse_include_directive(r#"includes "nope.db""#), None);
+    /// Load `parent` (written into a directory that also holds
+    /// `ADBase.template`, one `ai` record `CHILD`) and give back the record
+    /// names in the order the parser reduced them, plus the abort.
+    fn load_with_adbase(parent: &str) -> (Vec<String>, Option<CaError>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ADBase.template"),
+            "record(ai, \"CHILD\") {}\n",
+        )
+        .unwrap();
+        let path = dir.path().join("p.db");
+        std::fs::write(&path, parent).unwrap();
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let mut parsed = parse_db_opened_held(
+            &DbOpenedFile::taken_outright(&path),
+            &HashMap::new(),
+            &config,
+        )
+        .unwrap();
+        parsed.faults.stop_reading();
+        let names = parsed.records.iter().map(|r| r.name.to_string()).collect();
+        (names, parsed.aborted.take().map(|abort| abort.error))
     }
 
+    /// C lexes the rest of the include's line before the included file:
+    /// `softIoc` R7.0.10 `dbl` lists `P` above `CHILD` for both spellings.
     #[test]
-    fn test_commented_include_ignored() {
-        assert_eq!(parse_include_directive(r#"# include "file.db""#), None);
-        assert_eq!(parse_include_directive(r#"  # include "file.db""#), None);
+    fn an_include_reads_the_rest_of_its_line_first() {
+        for parent in [
+            "include \"ADBase.template\" record(ai, \"P\") {}\n",
+            "include ADBase.template record(ai, \"P\") {}\n",
+        ] {
+            let (names, aborted) = load_with_adbase(parent);
+            assert!(aborted.is_none(), "{parent:?}: {aborted:?}");
+            assert_eq!(names, ["P", "CHILD"], "{parent:?}");
+        }
+    }
+
+    /// The argument is a token, so it may sit on the next line.
+    #[test]
+    fn an_include_argument_on_the_next_line_loads() {
+        let (names, aborted) =
+            load_with_adbase("include\n\"ADBase.template\"\nrecord(ai, \"P\") {}\n");
+        assert!(aborted.is_none(), "{aborted:?}");
+        assert_eq!(names, ["CHILD", "P"]);
+    }
+
+    /// A token after the argument is the grammar's, and `junk` is not one.
+    #[test]
+    fn a_word_after_an_include_argument_is_a_syntax_error() {
+        let (names, aborted) = load_with_adbase("include ADBase.template junk\n");
+        assert!(names.is_empty());
+        match aborted {
+            Some(CaError::DbParseError { token, message, .. }) => {
+                assert_eq!((token.as_str(), message.as_str()), ("junk", SYNTAX_ERROR));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A comment ends the argument line; a commented include is a comment.
+    #[test]
+    fn a_comment_is_not_an_include_argument() {
+        let (names, aborted) =
+            load_with_adbase("include ADBase.template # a comment\n# include \"nope.db\"\n");
+        assert!(aborted.is_none(), "{aborted:?}");
+        assert_eq!(names, ["CHILD"]);
+    }
+
+    /// `include` with no argument, or `includes`, is no include.
+    #[test]
+    fn an_include_needs_its_keyword_and_its_argument() {
+        for (parent, token) in [
+            ("include\n", ""),
+            ("includes \"ADBase.template\"\n", "includes"),
+        ] {
+            let (names, aborted) = load_with_adbase(parent);
+            assert!(names.is_empty(), "{parent:?}");
+            match aborted {
+                Some(CaError::DbParseError { token: got, .. }) => assert_eq!(got, token),
+                other => panic!("{parent:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -4920,6 +4954,37 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         assert!(result.contains(r#"record(ai, "CHILD")"#));
 
         // Verify it parses correctly
+        let records = parse_db(&result, &HashMap::new()).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn test_expand_bareword_include() {
+        // NDDriverStdArrays.template's `include ADBase.template`: C loads it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ADBase.template"),
+            "record(ai, \"CHILD\") {}\n",
+        )
+        .unwrap();
+        let parent_path = dir.path().join("parent.template");
+        std::fs::write(
+            &parent_path,
+            "include ADBase.template\nrecord(ao, \"PARENT\") {}\n",
+        )
+        .unwrap();
+
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let result = expand_includes(
+            &parent_path,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
         let records = parse_db(&result, &HashMap::new()).unwrap();
         assert_eq!(records.len(), 2);
     }
@@ -5382,8 +5447,8 @@ record(lsi, "longstr4") {
 
     #[test]
     fn parse_db_accepts_path_and_addpath() {
-        // `path`/`addpath` at file scope are accepted and skipped —
-        // include resolution is the expansion layer's job.
+        // `path`/`addpath` at file scope are accepted; a string has no
+        // include to resolve against them.
         let src = r#"
             path "/opt/epics/db"
             addpath "/extra/db"
@@ -5397,7 +5462,7 @@ record(lsi, "longstr4") {
     #[test]
     fn parse_db_accepts_top_level_include() {
         // A bare `include` at file scope is accepted (grammar parity);
-        // the file is not loaded at this layer.
+        // a string has no file system to open it from.
         let src = r#"
             include "common.db"
             record(ai, "REC") { field(VAL, "1") }

@@ -11,6 +11,8 @@
 
 use crate::error::{CaError, CaResult, JsonLexFault};
 
+use super::reader::Feed;
+
 /// The lexer's `yyerrorAbort`s over one text (`dbLex.l:129-153`).
 #[derive(Default)]
 pub(super) struct LexAborts {
@@ -19,7 +21,8 @@ pub(super) struct LexAborts {
     pub(super) line: usize,
     pub(super) faults: Vec<JsonLexFault>,
     /// Where the text now ends: past the newline of [`Self::line`]
-    /// (`db_yyinput` hands the lexer nothing more, `dbLexRoutines.c:374`).
+    /// (`db_yyinput` hands the lexer nothing more, `dbLexRoutines.c:374`,
+    /// and the feed is closed there).
     pub(super) eof: Option<usize>,
 }
 
@@ -43,7 +46,7 @@ struct Token {
 }
 
 struct Lexer<'a> {
-    chars: &'a [u8],
+    chars: &'a mut Feed,
     pos: &'a mut usize,
     line: &'a mut usize,
     col: &'a mut usize,
@@ -135,7 +138,7 @@ fn is_json_string_body(body: &[u8]) -> bool {
 
 impl Lexer<'_> {
     fn advance(&mut self) {
-        if self.chars[*self.pos] == b'\n' {
+        if self.chars.get(*self.pos) == Some(b'\n') {
             *self.line += 1;
             *self.col = 0;
         } else {
@@ -148,13 +151,16 @@ impl Lexer<'_> {
     /// began at `start`.
     fn refuse_at(&mut self, start: usize, line: usize, fault: JsonLexFault) {
         if self.aborts.eof.is_none() {
+            let read = self.chars.read_len();
+            let eof = self
+                .chars
+                .bytes(start..read)
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(read, |at| start + at + 1);
             self.aborts.line = line;
-            self.aborts.eof = Some(
-                self.chars[start..]
-                    .iter()
-                    .position(|&c| c == b'\n')
-                    .map_or(self.chars.len(), |at| start + at + 1),
-            );
+            self.aborts.eof = Some(eof);
+            self.chars.close_at(eof);
         }
         self.aborts.faults.push(fault);
     }
@@ -172,13 +178,13 @@ impl Lexer<'_> {
     fn token(&mut self) -> Token {
         loop {
             // Whitespace and `#` comments.
-            while let Some(&c) = self.chars.get(*self.pos) {
+            while let Some(c) = self.chars.get(*self.pos) {
                 if c == b'\n' && self.aborted() {
                     // `yyAbort`: the next line read is EOF.
                     return self.eof();
                 }
                 if c == b'#' {
-                    while self.chars.get(*self.pos).is_some_and(|&c| c != b'\n') {
+                    while self.chars.get(*self.pos).is_some_and(|c| c != b'\n') {
                         self.advance();
                     }
                 } else if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
@@ -187,7 +193,7 @@ impl Lexer<'_> {
                     break;
                 }
             }
-            let Some(&c) = self.chars.get(*self.pos) else {
+            let Some(c) = self.chars.get(*self.pos) else {
                 return self.eof();
             };
             let (start, line) = (*self.pos, *self.line);
@@ -202,8 +208,8 @@ impl Lexer<'_> {
             if c == b'"' || c == b'\'' {
                 match self.string_end(c) {
                     Some(end) => {
-                        let text = self.chars[start..=end].to_vec();
-                        let valid = is_json_string_body(&self.chars[start + 1..end]);
+                        let text = self.chars.bytes(start..end + 1).to_vec();
+                        let valid = is_json_string_body(&text[1..text.len() - 1]);
                         while *self.pos <= end {
                             self.advance();
                         }
@@ -224,10 +230,10 @@ impl Lexer<'_> {
                 continue;
             }
             if is_barechar(c) {
-                while self.chars.get(*self.pos).is_some_and(|&c| is_barechar(c)) {
+                while self.chars.get(*self.pos).is_some_and(is_barechar) {
                     self.advance();
                 }
-                let text = self.chars[start..*self.pos].to_vec();
+                let text = self.chars.bytes(start..*self.pos).to_vec();
                 let key = !(matches!(text.as_slice(), b"null" | b"true" | b"false")
                     || is_json_number(&text));
                 return Token {
@@ -245,10 +251,10 @@ impl Lexer<'_> {
     /// error rule `{q}({schar}|{escape})*{q}` (`dbLex.l:131-141`): it ends at
     /// the first unescaped quote on the line, and an escape needs a
     /// character that is not the newline.
-    fn string_end(&self, quote: u8) -> Option<usize> {
+    fn string_end(&mut self, quote: u8) -> Option<usize> {
         let mut j = *self.pos + 1;
         loop {
-            match *self.chars.get(j)? {
+            match self.chars.get(j)? {
                 b'\n' => return None,
                 b'\\' => match self.chars.get(j + 1) {
                     Some(b'\n') | None => return None,
@@ -268,12 +274,12 @@ impl Lexer<'_> {
     /// moving past that token.
     fn lookahead(&mut self) {
         loop {
-            while let Some(&c) = self.chars.get(*self.pos) {
+            while let Some(c) = self.chars.get(*self.pos) {
                 if c == b'\n' && self.aborted() {
                     return;
                 }
                 if c == b'#' {
-                    while self.chars.get(*self.pos).is_some_and(|&c| c != b'\n') {
+                    while self.chars.get(*self.pos).is_some_and(|c| c != b'\n') {
                         self.advance();
                     }
                 } else if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
@@ -282,7 +288,7 @@ impl Lexer<'_> {
                     break;
                 }
             }
-            let Some(&c) = self.chars.get(*self.pos) else {
+            let Some(c) = self.chars.get(*self.pos) else {
                 return;
             };
             let start = *self.pos;
@@ -293,24 +299,20 @@ impl Lexer<'_> {
                     Some(_) => return,
                     None => {
                         let line = *self.line;
-                        while let Some(&c) = self.chars.get(*self.pos) {
+                        while let Some(c) = self.chars.get(*self.pos) {
                             self.advance();
                             if c == b'\n' {
                                 break;
                             }
                         }
-                        let text = lossy(&self.chars[start..*self.pos]);
+                        let text = lossy(self.chars.bytes(start..*self.pos));
                         self.refuse_at(start, line, JsonLexFault::NewlineInString(text));
                         continue;
                     }
                 }
             }
-            let is_initial_token = matches!(c, b'{' | b'}' | b'(' | b')' | b',' | b'%')
-                || c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    b'_' | b'-' | b'+' | b':' | b'.' | b'[' | b']' | b'<' | b'>' | b';'
-                );
+            let is_initial_token =
+                matches!(c, b'{' | b'}' | b'(' | b')' | b',' | b'%') || super::is_bareword_char(c);
             if is_initial_token {
                 return;
             }
@@ -424,14 +426,14 @@ impl Lexer<'_> {
 /// completes if the grammar lets it; only the grammar's own rejection is an
 /// error, its `syntax error`.
 pub(super) fn read_json_value(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,
     aborts: &mut LexAborts,
 ) -> CaResult<Vec<u8>> {
     let start_line = *line;
-    let close = if chars.get(*pos) == Some(&b'[') {
+    let close = if chars.get(*pos) == Some(b'[') {
         ']'
     } else {
         '}'
@@ -466,7 +468,7 @@ pub(super) fn read_json_value(
 /// What the lexer refuses between a value that parsed and the token that
 /// follows it, which it does not consume.
 pub(super) fn after_value(
-    chars: &[u8],
+    chars: &mut Feed,
     pos: &mut usize,
     line: &mut usize,
     col: &mut usize,

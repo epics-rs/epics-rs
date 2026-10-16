@@ -59,7 +59,7 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       # One platform failing must not cancel the others — each cell
       # reports portability independently.
@@ -74,6 +74,9 @@ jobs:
             os: macos-latest
           - name: macos-x86_64
             os: macos-15-intel
+            # Build 18-26 min + nextest 11-15 min on 4 vCPU: 41 min measured
+            # against the 45 min default.
+            timeout: 75
           - name: windows-x86_64
             os: windows-latest
           - name: windows-arm64

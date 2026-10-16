@@ -2203,19 +2203,46 @@ fn test_stup_busy_ack_callback_skips_completion() {
     assert!(rec.stat.dmov);
 }
 
-#[test]
-fn test_hls_blocks_positive_move() {
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hls = true;
-    rec.stat.msta = MstaFlags::DONE;
-    rec.pos.dval = 50.0;
+/// Drive `rec` from rest on a struck limit switch through a put of `target`
+/// and the stopped callback that follows, as C does: the move block has no
+/// hardware-limit gate, so the command goes out, the controller refuses or
+/// stops at the switch, and the LS-error branch (motorRecord.cc:1367-1380)
+/// hands postProcess (827-849) the readback. Returns the dispatch effects.
+fn put_onto_struck_limit(
+    rec: &mut MotorRecord,
+    hls: bool,
+    lls: bool,
+    target: f64,
+) -> ProcessEffects {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let on_limit = MotorStatus {
+        position: 100.0,
+        done: true,
+        high_limit: hls,
+        low_limit: lls,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    rec.do_process();
+    rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
+    let effects = rec.do_process();
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit));
+    rec.do_process();
+    effects
+}
 
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
-    assert!(rec.stat.dmov); // no motion started
+#[test]
+fn test_hls_positive_move_dispatches_then_adopts_readback() {
+    // Oracle (C motorSim): VAL 160 at the +100 switch reads back VAL 100.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 200.0;
+    rec.limits.dllm = -200.0;
+    let effects = put_onto_struck_limit(&mut rec, true, false, 160.0);
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 100.0, "VAL adopts the limit readback");
+    assert_eq!(rec.pos.dval, 100.0);
 }
 
 #[test]
@@ -2234,17 +2261,15 @@ fn test_hls_allows_negative_move() {
 }
 
 #[test]
-fn test_lls_blocks_negative_move() {
+fn test_lls_negative_move_dispatches_then_adopts_readback() {
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.lls = true;
-    rec.stat.msta = MstaFlags::DONE;
-    rec.pos.dval = -50.0;
-
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 200.0;
+    rec.limits.dllm = -200.0;
+    let effects = put_onto_struck_limit(&mut rec, false, true, 50.0);
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 100.0, "VAL adopts the limit readback");
 }
 
 #[test]
@@ -2262,22 +2287,17 @@ fn test_lls_allows_positive_move() {
 }
 
 #[test]
-fn test_both_limits_block_all_moves() {
-    let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.01;
-    rec.limits.dhlm = 100.0;
-    rec.limits.dllm = -100.0;
-    rec.limits.hls = true;
-    rec.limits.lls = true;
-    rec.stat.msta = MstaFlags::DONE;
-
-    rec.pos.dval = 10.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
-
-    rec.pos.dval = -10.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
+fn test_both_limits_struck_moves_adopt_readback() {
+    for target in [150.0, 50.0] {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.limits.dhlm = 200.0;
+        rec.limits.dllm = -200.0;
+        let effects = put_onto_struck_limit(&mut rec, true, true, target);
+        assert!(!effects.commands.is_empty());
+        assert!(rec.stat.dmov);
+        assert_eq!(rec.pos.val, 100.0, "target {target} adopts the readback");
+    }
 }
 
 #[test]
@@ -9420,35 +9440,41 @@ fn test_init_record_pass1_restores_dmov_after_load_time_blink() {
 }
 
 #[test]
-fn test_blinked_put_blocked_by_hw_limit_completes_with_lasts_adopted() {
-    // A blinked put whose first leg is blocked by an active hardware
-    // limit switch: C dispatches it (no hw-limit gate in the move
-    // block), the driver stops at the switch, and maybeRetry's
-    // limit-switch escape (1049) completes it with the lasts already
-    // adopted at dispatch (2469-2471). The Rust refusal skips the
-    // controller command but lands the same end state — the written
-    // target stays in VAL/DVAL, the lasts adopt it (no dangling
-    // re-dispatch on a later SPMG pass), and the pending pulse
-    // completes with DMOV=1 (the blink must not stay latched low).
+fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
+    // A blinked put whose leg runs into an active hardware limit switch:
+    // C dispatches it, the axis stops at the switch, and the LS-error
+    // completion (1367-1380 -> postProcess 827-849) adopts the readback
+    // into VAL/DVAL; the pulse completes with DMOV=1 and no stale target
+    // is left for a later SPMG pass to dispatch.
+    use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
-    rec.stat.msta = MstaFlags::DONE;
     rec.conv.mres = 0.001;
-    rec.limits.hls = true; // parked on the high limit switch
+    let on_limit = MotorStatus {
+        position: 0.0,
+        done: true,
+        high_limit: true,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    rec.do_process();
 
     rec.special("VAL", false).unwrap();
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let effects = rec.do_process();
-    assert!(effects.commands.is_empty(), "blocked move sends nothing");
-    assert!(rec.stat.dmov, "refusal completes the pending pulse");
-    assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert_eq!(rec.pos.val, 10.0, "the written target stays (C parity)");
-    assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts adopt the target");
+    assert!(!effects.commands.is_empty(), "C dispatches into the switch");
+    assert!(!rec.stat.dmov);
 
-    // No dangling re-dispatch: an SPMG=Go pass finds nothing pending.
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit));
+    rec.do_process();
+    assert!(rec.stat.dmov, "the stopped callback completes the pulse");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.pos.val, 0.0, "VAL adopts the limit readback");
+    assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts follow the sync");
+
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(
         effects.commands.is_empty(),
-        "no stale target dispatches after the refusal"
+        "no stale target dispatches after the sync"
     );
 }

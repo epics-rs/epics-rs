@@ -774,40 +774,6 @@ impl MotorRecord {
             self.pos.dval
         };
 
-        // Check hardware limits based on first move direction
-        let dir = if move_target > self.pos.drbv {
-            MotionDirection::Positive
-        } else {
-            MotionDirection::Negative
-        };
-        if self.is_blocked_by_hw_limit(dir) {
-            tracing::warn!("hardware limit active, blocking {dir:?} move");
-            // C has no hardware-limit gate in the move block: it
-            // dispatches (2455-2540, adopting the lasts at 2469-2471),
-            // the driver stops at the switch, and maybeRetry's
-            // limit-switch escape (1049, `hls && user_cdir`) completes
-            // the move as close-enough. This refusal skips the futile
-            // controller command but must land the same end state:
-            // lasts adopted (the written target stays in VAL/DVAL like
-            // C, and no dangling `dval != ldvl` re-dispatches on a
-            // later SPMG pass), an armed retry collapsed, and a
-            // pending pulse completed — a blinked put (special pass-0,
-            // 2591-2620) must not leave DMOV latched low with nothing
-            // in flight to restore it.
-            self.internal.ldvl = self.pos.dval;
-            self.internal.lval = self.pos.val;
-            self.internal.lrvl = self.pos.rval;
-            if self.stat.mip.contains(MipFlags::RETRY) {
-                self.stat.mip = MipFlags::empty();
-                self.mark(m::MIP);
-            }
-            if self.stat.mip.is_empty() && !self.stat.dmov {
-                self.set_dmov(true);
-                self.set_phase(MotionPhase::Idle);
-            }
-            return;
-        }
-
         // DMOV pulse: set false before starting
         self.set_dmov(false);
         // MISS is not cleared at dispatch: C touches it only inside

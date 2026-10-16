@@ -1,6 +1,6 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(17): this file does not build on the exec backend -
+// RTEMS-EXEC-MODEL-ALLOW(18): this file does not build on the exec backend -
 // server_native/mod.rs declares it under #[cfg(tokio_backend)] mod runtime;.
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -115,6 +115,10 @@ pub struct PvaServer {
     /// pre-pointed at the actual bound TCP port without re-reading env
     /// vars (which may have changed since startup).
     effective_config: PvaServerConfig,
+    /// [`pvxs_config_text`] of the bound server.
+    pvxs_config: Arc<str>,
+    /// The served registry, for the `pvxsr` source list.
+    source: DynSource,
     /// Bound TCP socket address — useful when the configured port was
     /// 0, or the requested port was taken, and the OS picked one. This
     /// is the actually-bound port (`start()` stamps it back from
@@ -227,18 +231,7 @@ impl PvaServer {
     /// listeners disabled) and `start()`. The ports are final here, ephemeral
     /// and fallen-back ones included, and a held search port fails here.
     pub fn bind(config: PvaServerConfig) -> PvaResult<BoundPvaServer> {
-        // `?` and not a fallback: a host with no entropy source must fail to
-        // start rather than advertise a guessable identity — see `random_guid`
-        // for why every consumer of a GUID collision degrades silently, which
-        // makes this the last moment the problem is visible.
-        let guid = random_guid()?;
-        // the TCP-circuit SEARCH handler reads this guid
-        // out of the per-connection config copy to populate the
-        // SEARCH_RESPONSE body. Stamp it onto a local mut copy so
-        // every per-conn task sees the same identity the UDP path
-        // does.
         let mut config = config;
-        config.guid = guid;
         // PVX-82: refuse to start when the env named interface(s) that all
         // failed to resolve — binding the wildcard `0.0.0.0` here would
         // silently listen on every interface instead of the requested
@@ -350,14 +343,26 @@ impl PvaServer {
         // `src/server.cpp:426`).
         // The v6 companion's socket is bound here as well, on the same
         // number, so a start that cannot hold both families fails here.
+        let requested_udp_port = config.udp_port;
         let udp = crate::server_native::udp::bind_udp(
             config.udp_port,
             &interfaces,
             config.enable_ipv6_udp,
         )?;
         config.udp_port = udp.port;
+        // After the sockets, as pvxs draws it (`server.cpp:497-539`).
+        // `?` and not a fallback: a host with no entropy source must fail to
+        // start rather than advertise a guessable identity — see `random_guid`
+        // for why every consumer of a GUID collision degrades silently, which
+        // makes this the last moment the problem is visible.
+        let guid = random_guid()?;
+        // The TCP-circuit SEARCH handler reads this guid out of the
+        // per-connection config copy, so it is stamped on before any copy.
+        config.guid = guid;
+        let pvxs_config = pvxs_config_text(&config, &interfaces, requested_udp_port).into();
         Ok(BoundPvaServer {
             config,
+            pvxs_config,
             guid,
             interfaces,
             tcp_listeners,
@@ -526,10 +531,14 @@ impl PvaServer {
             tls_enabled: self.effective_config.tls.is_some(),
             ignore_addrs: self.effective_config.ignore_addrs.len(),
             beacon_period_secs: self.effective_config.beacon_period.as_secs(),
+            pvxs_config: self.pvxs_config.clone(),
             peers: self.peers.clone(),
-            tcp_abort: self.tcp_abort.clone(),
-            udp_abort: self.udp_abort.clone(),
-            udp_v6_abort: self.udp_v6_abort.clone(),
+            running: Some(RunningTasks {
+                source: self.source.clone(),
+                tcp_abort: self.tcp_abort.clone(),
+                udp_abort: self.udp_abort.clone(),
+                udp_v6_abort: self.udp_v6_abort.clone(),
+            }),
         }
     }
 
@@ -592,6 +601,8 @@ impl PvaServer {
 /// [`Self::start`], as pvxs's do until `Server::Pvt::start` (`server.cpp:555`).
 pub struct BoundPvaServer {
     config: PvaServerConfig,
+    /// [`pvxs_config_text`] of the bound server.
+    pvxs_config: Arc<str>,
     guid: [u8; 12],
     interfaces: ServerInterfaces,
     tcp_listeners: Vec<tokio::net::TcpListener>,
@@ -606,6 +617,22 @@ impl BoundPvaServer {
         self.bound_tcp_port
     }
 
+    /// The report of a server that has not started: pvxs's `Stopped`, with
+    /// no sources and no peers.
+    pub fn report_handle(&self) -> ServerReportHandle {
+        ServerReportHandle {
+            bound_tcp_port: self.bound_tcp_port,
+            udp_port: self.config.udp_port,
+            bound_tls_port: self.bound_tls_port,
+            tls_enabled: self.config.tls.is_some(),
+            ignore_addrs: self.config.ignore_addrs.len(),
+            beacon_period_secs: self.config.beacon_period.as_secs(),
+            pvxs_config: self.pvxs_config.clone(),
+            peers: crate::server_native::peers::PeerRegistry::new(),
+            running: None,
+        }
+    }
+
     /// Serve `source` on the bound sockets; see [`PvaServer::start`].
     pub fn start<S>(self, source: Arc<S>) -> PvaResult<PvaServer>
     where
@@ -613,6 +640,7 @@ impl BoundPvaServer {
     {
         let BoundPvaServer {
             config,
+            pvxs_config,
             guid,
             interfaces,
             tcp_listeners,
@@ -632,6 +660,7 @@ impl BoundPvaServer {
         let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
         let dyn_source: DynSource = super::server_info::compose_with_server_info(user_source)
             .map_err(|e| PvaError::Protocol(format!("PvaServer::start: {e}")))?;
+        let report_source = dyn_source.clone();
 
         // One server-wide channel-invalidation fan-out. A source that can
         // invalidate a channel out of band (the PVA gateway, on an operator
@@ -738,12 +767,91 @@ impl BoundPvaServer {
             udp_v6_abort,
             tcp_abort,
             effective_config: config,
+            pvxs_config,
+            source: report_source,
             bound_tcp_port,
             bound_tls_port,
             interrupt: Arc::new(tokio::sync::Notify::new()),
             peers,
         })
     }
+}
+
+/// pvxs `operator<<(server::Config)` (`config.cpp:526-541`) of
+/// `Server::config()`: the `EPICS_PVAS_*` keys of `updateDefs`
+/// (`config.cpp:474-483`) in key order, as the constructor leaves them —
+/// expanded, so the auto beacon list reads `NO` with its broadcasts in the
+/// explicit list, and with the bound ports (`server.cpp:397-486`).
+///
+/// pvxs keeps a list entry's text, so a port shows only where the entry
+/// named one; the lists here are parsed with the search port filled in, so
+/// a beacon entry on the search port prints without it, also when its text
+/// named that port. A multicast interface entry's derived interfaces
+/// (`config.cpp:497-509`, `addGroups`) are not printed.
+fn pvxs_config_text(
+    config: &PvaServerConfig,
+    interfaces: &ServerInterfaces,
+    requested_udp_port: u16,
+) -> String {
+    use crate::config::env::sock_addr_text;
+    // pvxs `operator<<(SockEndpoint)` (`config.cpp:125-135`); its `ttl`
+    // defaults to -1, which prints.
+    let endpoint = |ep: &crate::config::Endpoint| {
+        let mut text = sock_addr_text(ep.addr);
+        if ep.addr.ip().is_multicast() {
+            match ep.ttl {
+                Some(0) => {}
+                Some(ttl) => text.push_str(&format!(",{ttl}")),
+                None => text.push_str(",-1"),
+            }
+            if let Some(iface) = &ep.iface {
+                text.push_str(&format!("@{iface}"));
+            }
+        }
+        text
+    };
+    let join = |texts: Vec<String>| texts.join(" ");
+    let beacon = crate::server_native::udp::effective_beacon_destinations(
+        config.beacon_destinations.clone(),
+        config.auto_beacon,
+        config.enable_ipv6_udp,
+        &interfaces.v4(),
+        0,
+    );
+    let beacon = join(
+        beacon
+            .iter()
+            .map(|ep| {
+                let mut ep = ep.clone();
+                if ep.addr.port() == requested_udp_port {
+                    ep.addr.set_port(0);
+                }
+                endpoint(&ep)
+            })
+            .collect(),
+    );
+    let ignore = join(
+        config
+            .ignore_addrs
+            .iter()
+            .map(|&(ip, port)| sock_addr_text(SocketAddr::new(ip, port)))
+            .collect(),
+    );
+    // An empty list binds `bind_ip`, pvxs's `0.0.0.0` unless a caller set it.
+    let intf = if config.interfaces.is_empty() {
+        sock_addr_text(SocketAddr::new(config.bind_ip, 0))
+    } else {
+        join(config.interfaces.iter().map(endpoint).collect())
+    };
+    format!(
+        "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO\n\
+         EPICS_PVAS_BEACON_ADDR_LIST={beacon}\n\
+         EPICS_PVAS_BROADCAST_PORT={}\n\
+         EPICS_PVAS_IGNORE_ADDR_LIST={ignore}\n\
+         EPICS_PVAS_INTF_ADDR_LIST={intf}\n\
+         EPICS_PVAS_SERVER_PORT={}\n",
+        config.udp_port, config.tcp_port,
+    )
 }
 
 /// Snapshot returned by [`PvaServer::report`].
@@ -826,7 +934,16 @@ pub struct ServerReportHandle {
     tls_enabled: bool,
     ignore_addrs: usize,
     beacon_period_secs: u64,
+    pvxs_config: Arc<str>,
     peers: Arc<crate::server_native::peers::PeerRegistry>,
+    /// `None` for a [`BoundPvaServer`], which serves nothing yet.
+    running: Option<RunningTasks>,
+}
+
+/// What a started server adds to its [`ServerReportHandle`].
+#[derive(Clone)]
+struct RunningTasks {
+    source: DynSource,
     tcp_abort: tokio::task::AbortHandle,
     udp_abort: tokio::task::AbortHandle,
     udp_v6_abort: Option<tokio::task::AbortHandle>,
@@ -850,6 +967,8 @@ impl ServerReportHandle {
     }
 
     pub fn report(&self) -> ServerReport {
+        let alive = |a: &tokio::task::AbortHandle| !a.is_finished();
+        let running = self.running.as_ref();
         assemble_report(ReportFields {
             tcp_port: self.bound_tcp_port,
             udp_port: self.udp_port,
@@ -857,16 +976,34 @@ impl ServerReportHandle {
             tls_enabled: self.tls_enabled,
             ignore_addrs: self.ignore_addrs,
             beacon_period_secs: self.beacon_period_secs,
-            udp_alive: !self.udp_abort.is_finished(),
-            udp_v6_alive: self
-                .udp_v6_abort
-                .as_ref()
-                .map(|a| !a.is_finished())
-                .unwrap_or(false),
-            tcp_alive: !self.tcp_abort.is_finished(),
+            udp_alive: running.is_some_and(|r| alive(&r.udp_abort)),
+            udp_v6_alive: running
+                .and_then(|r| r.udp_v6_abort.as_ref())
+                .is_some_and(alive),
+            tcp_alive: running.is_some_and(|r| alive(&r.tcp_abort)),
             peers: &self.peers,
             zero: false,
         })
+    }
+
+    /// Whether the server was started: pvxs's `Running` against `Stopped`.
+    pub fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// pvxs `operator<<(Server::config())`: `KEY=VALUE` lines.
+    pub fn pvxs_config(&self) -> &str {
+        &self.pvxs_config
+    }
+
+    /// pvxs's `Server` source map as `(name, order)`, in consultation
+    /// order. Before the start only the server's own source, which pvxs's
+    /// constructor adds (`server.cpp:542-547`) and `start` always composes.
+    pub fn source_list(&self) -> Vec<(String, i32)> {
+        match &self.running {
+            Some(r) => r.source.registry_entries().unwrap_or_default(),
+            None => vec![(super::server_info::SERVER_SOURCE_NAME.to_owned(), -1)],
+        }
     }
 }
 
@@ -973,14 +1110,14 @@ mod tcp_fallback_tests {
             beacon_destinations: Vec::new(),
             ..Default::default()
         };
-        let (server, logged) = logged_at_warn(|| {
+        let (server, logged) = pvxs_logged(|| {
             PvaServer::start(Arc::new(SharedSource::new()), config).expect("fallback")
         });
         let bound = server.report().tcp_port;
         assert_eq!(
             logged,
             format!(
-                " WARN Server unable to bind port {blocked_port}, falling back to 127.0.0.1:{bound}\n"
+                "WARN pvxs.tcp.setup Server unable to bind port {blocked_port}, falling back to 127.0.0.1:{bound}\n"
             )
         );
         drop(server);
@@ -1017,14 +1154,14 @@ mod tcp_fallback_tests {
                 beacon_destinations: Vec::new(),
                 ..Default::default()
             };
-            logged_at_warn(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
+            pvxs_logged(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
         };
 
         let (err, logged) = start(Vec::new());
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 192.0.2.1:{port} fails with {errno}\n")
+            format!("ERR pvxs.tcp.setup Bind to 192.0.2.1:{port} fails with {errno}\n")
         );
 
         let (err, logged) = start(vec![
@@ -1034,7 +1171,9 @@ mod tcp_fallback_tests {
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 192.0.2.1:{port} fails after fallback with {errno}\n")
+            format!(
+                "ERR pvxs.tcp.setup Bind to 192.0.2.1:{port} fails after fallback with {errno}\n"
+            )
         );
     }
 
@@ -1073,20 +1212,22 @@ mod tcp_fallback_tests {
                 beacon_destinations: Vec::new(),
                 ..config
             };
-            logged_at_warn(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
+            pvxs_logged(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
         };
 
         let (err, logged) = start("192.0.2.1 127.0.0.1");
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 192.0.2.1:{port} fails after fallback with {errno}\n")
+            format!(
+                "ERR pvxs.tcp.setup Bind to 192.0.2.1:{port} fails after fallback with {errno}\n"
+            )
         );
         let (err, logged) = start("9.9.9.9 192.0.2.1");
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 192.0.2.1:{port} fails with {errno}\n")
+            format!("ERR pvxs.tcp.setup Bind to 192.0.2.1:{port} fails with {errno}\n")
         );
     }
 
@@ -1122,21 +1263,23 @@ mod tcp_fallback_tests {
                 beacon_destinations: Vec::new(),
                 ..config
             };
-            logged_at_warn(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
+            pvxs_logged(|| PvaServer::start(Arc::new(SharedSource::new()), config).err())
         };
 
         let (err, logged) = start("127.0.0.1 192.0.2.1", port);
         assert!(err.is_some());
         let (warn, err_line) = logged.split_once('\n').unwrap();
         assert!(
-            warn.trim_start().starts_with(&format!(
-                "WARN Server unable to bind port {port}, falling back to 127.0.0.1:"
+            warn.starts_with(&format!(
+                "WARN pvxs.tcp.setup Server unable to bind port {port}, falling back to 127.0.0.1:"
             )),
             "{logged}"
         );
         assert_eq!(
             err_line,
-            format!("ERROR Bind to 192.0.2.1:{port} fails after fallback with {errno}\n")
+            format!(
+                "ERR pvxs.tcp.setup Bind to 192.0.2.1:{port} fails after fallback with {errno}\n"
+            )
         );
         drop(held);
 
@@ -1144,7 +1287,9 @@ mod tcp_fallback_tests {
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 192.0.2.1:6000 fails after fallback with {errno}\n")
+            format!(
+                "ERR pvxs.tcp.setup Bind to 192.0.2.1:6000 fails after fallback with {errno}\n"
+            )
         );
     }
 
@@ -1189,38 +1334,30 @@ mod tcp_fallback_tests {
             ..config
         };
         let (err, logged) =
-            logged_at_warn(|| PvaServer::start(Arc::new(SharedSource::new()), config).err());
+            pvxs_logged(|| PvaServer::start(Arc::new(SharedSource::new()), config).err());
         assert!(err.is_some());
         assert_eq!(
             logged,
-            format!("ERROR Bind to 0.0.0.0:{port} fails after fallback with {in_use}\n")
+            format!(
+                "ERR pvxs.tcp.setup Bind to 0.0.0.0:{port} fails after fallback with {in_use}\n"
+            )
         );
     }
 
-    /// What `f` logs at WARN and above, in the fmt layer's plain text.
-    fn logged_at_warn<T>(f: impl FnOnce() -> T) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
+    /// The pvxs log lines `f` prints, each without its timestamp.
+    fn pvxs_logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use epics_base_rs::runtime::log;
+        let heard = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
             }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::WARN)
-            .without_time()
-            .with_target(false)
-            .with_ansi(false)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        });
+        let out = f();
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        let logged = heard.lock().unwrap().clone();
         (out, logged)
     }
 
@@ -2145,5 +2282,51 @@ mod ports_are_read_back_not_probed {
         let cfg = super::PvaServerConfig::isolated();
         assert_eq!(cfg.tcp_port, 0);
         assert_eq!(cfg.udp_port, 0);
+    }
+}
+
+#[cfg(test)]
+mod pvxs_report_tests {
+    use super::*;
+    use crate::server_native::SharedSource;
+
+    /// pvxs `operator<<(Server)` before and after `start`: `config()` with the
+    /// bound ports, then the source map, which a nested registry joins.
+    #[tokio::test]
+    async fn a_bound_server_reports_its_config_and_the_server_source() {
+        let bound = PvaServer::bind(PvaServerConfig::isolated()).expect("bind");
+        let handle = bound.report_handle();
+        assert!(!handle.is_running());
+        let tcp = bound.bound_tcp_port();
+        let udp = handle.report().udp_port;
+        assert_eq!(
+            handle.pvxs_config(),
+            format!(
+                "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO\n\
+                 EPICS_PVAS_BEACON_ADDR_LIST=\n\
+                 EPICS_PVAS_BROADCAST_PORT={udp}\n\
+                 EPICS_PVAS_IGNORE_ADDR_LIST=\n\
+                 EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1\n\
+                 EPICS_PVAS_SERVER_PORT={tcp}\n"
+            )
+        );
+        assert_eq!(handle.source_list(), [("__server".to_owned(), -1)]);
+
+        let app = crate::server_native::CompositeSource::new();
+        app.add_source("qsrvSingle", Arc::new(SharedSource::new()), 0)
+            .unwrap();
+        app.add_source("qsrvGroup", Arc::new(SharedSource::new()), 1)
+            .unwrap();
+        let server = bound.start(app).expect("start");
+        let handle = server.report_handle();
+        assert!(handle.is_running());
+        assert_eq!(
+            handle.source_list(),
+            [
+                ("__server".to_owned(), -1),
+                ("qsrvSingle".to_owned(), 0),
+                ("qsrvGroup".to_owned(), 1),
+            ]
+        );
     }
 }

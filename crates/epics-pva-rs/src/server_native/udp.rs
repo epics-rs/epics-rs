@@ -459,6 +459,42 @@ pub async fn run_udp_responder_with_config(
     .await
 }
 
+/// pvxs `Config::expand`'s `beaconDestinations` (`config.cpp:488-523`): the
+/// explicit list, plus under `auto_beacon` the broadcasts of `interfaces`
+/// (`expandAddrList`) and, with v6 UDP on, the `ff0e::400` group, then
+/// `removeDups` (by `(addr, iface)`, longest TTL kept). Without
+/// `auto_beacon` an empty list beacons nowhere, as pvxs's does. The one
+/// owner of the list the responder beacons to and `pvxsr` prints.
+pub(crate) fn effective_beacon_destinations(
+    destinations: Vec<Endpoint>,
+    auto_beacon: bool,
+    enable_ipv6_udp: bool,
+    interfaces: &[Ipv4Addr],
+    udp_port: u16,
+) -> Vec<Endpoint> {
+    let mut beacon_destinations = destinations;
+    if auto_beacon {
+        beacon_destinations.extend(
+            crate::config::env::expand_addr_list(interfaces, udp_port)
+                .into_iter()
+                .map(Endpoint::from),
+        );
+    }
+    if enable_ipv6_udp && auto_beacon {
+        let v6_mcast: Endpoint = SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400),
+            udp_port,
+            0,
+            0,
+        ))
+        .into();
+        if !beacon_destinations.iter().any(|e| e.addr == v6_mcast.addr) {
+            beacon_destinations.push(v6_mcast);
+        }
+    }
+    crate::config::env::dedup_endpoints(beacon_destinations)
+}
+
 /// Like [`run_udp_responder_with_config`] but serves an **already-bound**
 /// socket whose port the caller has read back from the bind.
 ///
@@ -493,50 +529,15 @@ pub(crate) async fn run_udp_responder_on_socket(
     let socket = Arc::new(socket);
     debug!(?udp_port, "UDP search responder started");
 
-    // Resolve beacon destinations once at startup. pvxs re-resolves
-    // on interface change but we keep it static for now; restart the
-    // server to pick up new NICs.
-    //
-    // when `auto_beacon=false` AND `destinations` is empty,
-    // the operator has explicitly opted out of broadcast beaconing
-    // (matching pvxs `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` semantics).
-    // Pre-fix this branch fell through to limited broadcast, leaking
-    // beacon frames against site policy. Mirror the CA fix.
-    // pvxs `Config::expand` (`config.cpp:488-516`): the explicit list, plus
-    // `expandAddrList(ifaces)` under `auto_beacon`.
-    let mut beacon_destinations = destinations;
-    if auto_beacon {
-        beacon_destinations.extend(
-            crate::config::env::expand_addr_list(&interfaces, udp_port)
-                .into_iter()
-                .map(Endpoint::from),
-        );
-    }
-    // PR #205 IPv6 Stage 5: when v6 UDP is enabled AND auto_beacon is
-    // on (i.e. the operator hasn't explicitly disabled beacon
-    // emission), add the default v6 multicast group as a beacon
-    // destination. Mirrors pvxs' v6 group `ff0e::400`.
-    if enable_ipv6_udp && auto_beacon {
-        let v6_mcast: Endpoint = SocketAddr::V6(std::net::SocketAddrV6::new(
-            std::net::Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400),
-            udp_port,
-            0,
-            0,
-        ))
-        .into();
-        if !beacon_destinations.iter().any(|e| e.addr == v6_mcast.addr) {
-            beacon_destinations.push(v6_mcast);
-        }
-    }
-    // Collapse duplicate beacon destinations by (addr, iface), keeping the
-    // longest TTL and first-appearance order — pvxs `removeDups<SockEndpoint>`
-    // applied to `beaconDestinations` in `Config::expand()` (config.cpp:523).
-    // Runs AFTER auto-broadcast / v6-group expansion (matching pvxs, which
-    // dedups after `expandAddrList`/`addGroups`) so synthesized destinations
-    // are deduped too. Single owner for all sources: env, programmatic
-    // `PvaServerConfig::beacon_destinations`, and the gateway CLI all flow
-    // their beacon lists into this responder.
-    beacon_destinations = crate::config::env::dedup_endpoints(beacon_destinations);
+    // Resolved once at startup. pvxs re-resolves on interface change but we
+    // keep it static for now; restart the server to pick up new NICs.
+    let beacon_destinations = effective_beacon_destinations(
+        destinations,
+        auto_beacon,
+        enable_ipv6_udp,
+        &interfaces,
+        udp_port,
+    );
     // Send-only v6 socket used for beacon emission to v6 destinations.
     // The receive side (SEARCH on `[::]:udp_port`) is handled by the
     // companion `run_udp_responder_v6` task — keeping the beacon TX

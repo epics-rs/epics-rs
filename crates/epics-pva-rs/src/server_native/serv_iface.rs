@@ -5,11 +5,12 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use super::config::PvaServerConfig;
 use super::search_engine::ServerInterfaces;
 use crate::error::{PvaError, PvaResult};
+use crate::pvxs_log::{self, Level, TCP_SETUP};
 
 /// Resolve the TCP listener bind addresses from the server interface
 /// list.
@@ -143,17 +144,26 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
                     )
                 })?;
                 if addr.port() != 0 && name.port() != addr.port() {
-                    warn!(
-                        "Server unable to bind port {}, falling back to {name}",
-                        addr.port()
+                    pvxs_log::log(
+                        TCP_SETUP,
+                        Level::Warn,
+                        format_args!(
+                            "Server unable to bind port {}, falling back to {name}",
+                            addr.port()
+                        ),
                     );
                 }
                 return Ok((listener, name.port()));
             }
             Err(e) if fallback && epics_base_rs::net::bind_falls_back(&e) => {
-                debug!(
-                    "Address {} in use or not permitted: {e}",
-                    crate::config::env::sock_addr_text(bind_addr)
+                pvxs_log::log(
+                    TCP_SETUP,
+                    Level::Debug,
+                    format_args!(
+                        "Address {} in use or not permitted: {}",
+                        crate::config::env::sock_addr_text(bind_addr),
+                        epics_base_rs::net::sock_err_string(&e)
+                    ),
                 );
                 bind_addr.set_port(0);
                 fallback = false;
@@ -161,11 +171,15 @@ fn bind_serv_iface(addr: SocketAddr, mut fallback: bool) -> PvaResult<(TcpListen
             Err(e) => {
                 // pvxs's suffix tracks the flag, so an interface bound
                 // without a fallback says "after fallback" too.
-                error!(
-                    "Bind to {} fails{} with {}",
-                    crate::config::env::sock_addr_text(bind_addr),
-                    if fallback { "" } else { " after fallback" },
-                    e.raw_os_error().unwrap_or(0)
+                pvxs_log::log(
+                    TCP_SETUP,
+                    Level::Err,
+                    format_args!(
+                        "Bind to {} fails{} with {}",
+                        crate::config::env::sock_addr_text(bind_addr),
+                        if fallback { "" } else { " after fallback" },
+                        e.raw_os_error().unwrap_or(0)
+                    ),
                 );
                 return Err(PvaError::Io(e));
             }

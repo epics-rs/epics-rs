@@ -5266,52 +5266,7 @@ fn post_event_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult 
     Ok(CommandOutcome::Continue)
 }
 
-/// C `epicsStrnGlobMatch` (`epicsString.c:282-312`) — the matcher
-/// `dbglob` and `epicsEnvShow` both call. `?` consumes exactly one
-/// character: the trailing `while (*pattern == '*') pattern++` skips
-/// only `*`, so a `?` left over once the string is exhausted fails the
-/// match. `dbglob`'s help text (`dbIocRegister.c:243`) says "0 or
-/// one characters", but the code is what runs, and this is a
-/// transcription of the code.
-pub(super) fn epics_strn_glob_match(s: &[u8], len: usize, pattern: &[u8]) -> bool {
-    let len = len.min(s.len());
-    let at = |p: usize| pattern.get(p).copied().unwrap_or(0);
-    let mut mp: Option<usize> = None;
-    let mut cp: usize = 0;
-    let mut i: usize = 0;
-    let mut p: usize = 0;
-
-    while i < len && at(p) != b'*' {
-        if at(p) != s[i] && at(p) != b'?' {
-            return false;
-        }
-        p += 1;
-        i += 1;
-    }
-    while i < len {
-        if at(p) == b'*' {
-            p += 1;
-            if at(p) == 0 {
-                return true;
-            }
-            mp = Some(p);
-            cp = i + 1;
-        } else if at(p) == s[i] || at(p) == b'?' {
-            p += 1;
-            i += 1;
-        } else {
-            // The first loop returns on any mismatch, so this branch
-            // is only reachable after a `*` set `mp`.
-            p = mp.unwrap_or(0);
-            i = cp;
-            cp += 1;
-        }
-    }
-    while at(p) == b'*' {
-        p += 1;
-    }
-    at(p) == 0
-}
+pub(super) use epics_libcom_rs::runtime::epics_string::epics_strn_glob_match;
 
 /// [`epics_strn_glob_match`] over whole strings — C `epicsStrGlobMatch`.
 fn glob_match(pattern: &[u8], text: &[u8]) -> bool {

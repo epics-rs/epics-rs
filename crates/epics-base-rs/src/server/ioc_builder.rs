@@ -53,7 +53,16 @@ pub struct IocBuilder {
     /// port can be registered to its `interruptAccept` before the records
     /// load.
     database: Option<Arc<PvDatabase>>,
+    /// [`Self::register_server_init`], in registration order.
+    server_inits: Vec<(&'static str, BuilderServerInit)>,
 }
+
+/// A server's `dbServer.init` for [`IocBuilder::build_ioc`].
+type BuilderServerInit = Box<
+    dyn FnOnce() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = CaResult<Box<dyn std::any::Any + Send>>> + Send>,
+        > + Send,
+>;
 
 /// Whether the build runs the link passes of C `initDatabase`.
 enum LinkInit {
@@ -139,7 +148,36 @@ impl IocBuilder {
             link_set_installers: Vec::new(),
             json_link_types: Vec::new(),
             database: None,
+            server_inits: Vec::new(),
         }
+    }
+
+    /// A server's `dbServer.init`, which [`Self::build_ioc`] runs at C's
+    /// `dbInitServers()` (`iocInit.c:222`), after `initialProcess`; an `Err`
+    /// fails the build. [`BareIoc::servers`] hands back what it returned
+    /// under `name`.
+    pub fn register_server_init<F, Fut, T>(
+        mut self,
+        name: &'static str,
+        args: crate::server::ioc_app::ServerInitArgs,
+        init: F,
+    ) -> Self
+    where
+        F: FnOnce(crate::server::ioc_app::ServerInitArgs) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = CaResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.server_inits.push((
+            name,
+            Box::new(move || {
+                Box::pin(async move {
+                    init(args)
+                        .await
+                        .map(|state| Box::new(state) as Box<dyn std::any::Any + Send>)
+                })
+            }),
+        ));
+        self
     }
 
     /// Build into `db` instead of a fresh database. The caller owns the
@@ -404,15 +442,21 @@ impl IocBuilder {
     /// with [`BareIoc::run`].
     ///
     /// Once per process: a second call is refused as C's `iocBuild` is.
-    pub async fn build_ioc(self) -> CaResult<BareIoc> {
+    pub async fn build_ioc(mut self) -> CaResult<BareIoc> {
+        let server_inits = std::mem::take(&mut self.server_inits);
         let (db, autosave_config, build) = self
             .build_through(crate::server::ioc_app::BareBuild::begin, LinkInit::Build)
             .await?;
         crate::server::ioc_app::initial_process(&db);
+        let mut servers = crate::server::ioc_app::InitializedServers::default();
+        for (name, init) in server_inits {
+            servers.push(name, init().await?);
+        }
         build.finish();
         Ok(BareIoc {
             db,
             autosave_config,
+            servers,
         })
     }
 
@@ -573,6 +617,7 @@ impl IocBuilder {
 pub struct BareIoc {
     db: Arc<PvDatabase>,
     autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
+    servers: crate::server::ioc_app::InitializedServers,
 }
 
 impl BareIoc {
@@ -582,6 +627,11 @@ impl BareIoc {
 
     pub fn autosave_config(&self) -> Option<&autosave::SaveSetConfig> {
         self.autosave_config.as_ref().map(|(c, _)| c)
+    }
+
+    /// What the [`IocBuilder::register_server_init`] inits bound.
+    pub fn servers(&mut self) -> &mut crate::server::ioc_app::InitializedServers {
+        &mut self.servers
     }
 
     /// C `iocRun` (`iocInit.c:246-276`): opens the scan gate the build's

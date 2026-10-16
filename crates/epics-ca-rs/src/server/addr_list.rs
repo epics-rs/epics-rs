@@ -369,22 +369,6 @@ pub fn discover_broadcast_addrs() -> Vec<Ipv4Addr> {
     epics_base_rs::net::iface_v4::broadcast_addrs()
 }
 
-/// C `osiLocalAddr` (libcom `osi/osdNetIfAddrs.c:167-215`, `osiLocalAddrOnce`):
-/// the address of the FIRST interface that is up (`IFF_UP`), `AF_INET`, and
-/// NOT loopback (`IFF_LOOPBACK`). When only loopback exists — or interface
-/// enumeration fails — C falls back to `INADDR_LOOPBACK`, and so do we.
-///
-/// C computes this once per process behind `epicsThreadOnce` and hands out the
-/// cached result; the `OnceLock` mirrors that (an interface list that changes
-/// under a running client is not re-read by C either).
-///
-/// The `IFF_UP` caveat this used to carry is gone: the enumeration behind it
-/// now reports the flag, so a down interface is skipped here as it is in C.
-pub fn osi_local_addr() -> Ipv4Addr {
-    static CACHED: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(epics_base_rs::net::iface_v4::local_addr)
-}
-
 /// Return the IPv4 broadcast address of the up, non-loopback interface
 /// whose primary IP equals `match_ip`. Mirrors the
 /// `pMatchAddr->ia.sin_addr.s_addr != htonl(INADDR_ANY)` branch in libcom

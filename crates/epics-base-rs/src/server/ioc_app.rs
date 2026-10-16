@@ -613,6 +613,10 @@ type ServerInit = Box<
 pub struct InitializedServers(Vec<(&'static str, Box<dyn std::any::Any + Send>)>);
 
 impl InitializedServers {
+    pub(crate) fn push(&mut self, name: &'static str, state: Box<dyn std::any::Any + Send>) {
+        self.0.push((name, state));
+    }
+
     /// Take the state `name`'s init produced. `None` when no such init ran —
     /// a runner given an `IocRunConfig` by hand binds for itself.
     pub fn take<T: 'static>(&mut self, name: &str) -> Option<T> {
@@ -1767,7 +1771,7 @@ impl IocBuild {
             tcp_port: protocol.tcp_port,
         };
         for (name, init) in server_inits {
-            servers.0.push((name, init(args).await?));
+            servers.push(name, init(args).await?);
         }
         announce!(InitHookState::AfterCaServerInit);
         announce!(InitHookState::AfterIocBuilt);

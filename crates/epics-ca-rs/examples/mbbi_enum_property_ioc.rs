@@ -40,7 +40,7 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
-use epics_ca_rs::server::CaServer;
+use epics_ca_rs::server::CaServerBuilder;
 use std::collections::HashMap;
 
 /// `device(mbbi, CONSTANT, devMbbiEnumProp, "enumProp")`, with the
@@ -123,22 +123,31 @@ record(mbbi, "RIG:MBBI") {
     field(SCAN, "Passive")
 }
 "#;
-    let ioc = IocBuilder::new()
+    let args = epics_base_rs::server::ioc_app::ServerInitArgs {
+        port,
+        tcp_port: Some(port),
+    };
+    let mut ioc = IocBuilder::new()
         .db_string(db, &HashMap::new())?
         .register_device_support("mbbi", &ENUM_PROP, || Box::new(EnumProp::new()))
+        .register_server_init(
+            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            args,
+            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+        )
         .build_ioc()
         .await?;
-    let db = ioc.database().clone();
-    ioc.run().await;
-    let server = CaServer::from_parts(
-        db,
-        port,
-        Some(port),
+    let server = CaServerBuilder::serving(
+        ioc.database().clone(),
         epics_base_rs::server::access_security::new_acf_cell(None),
         None,
         None,
     )
-    .await?;
+    .port(port)
+    .tcp_port(port)
+    .bound_at_init(ioc.servers());
+    ioc.run().await;
+    let server = server.build().await?;
     eprintln!("[ioc] serving RIG:MBBI on CA port {port}");
     server.run().await
 }

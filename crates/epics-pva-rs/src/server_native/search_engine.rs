@@ -68,6 +68,18 @@ use super::source::DynSource;
 pub fn random_guid() -> io::Result<[u8; 12]> {
     let mut buf = [0u8; 12];
     fill_entropy(&mut buf)?;
+    // pvxs XORs the host into the second word (`server.cpp:516-522`) beside
+    // time and pid, which stay out (see the guard test below). The host word
+    // reads `osiLocalAddr`, which is where softIocPVX on a loopback-only host
+    // prints its fallback line.
+    let host = epics_base_rs::net::iface_v4::broadcast_addrs()
+        .into_iter()
+        .fold(
+            u32::from(epics_base_rs::net::iface_v4::osi_local_addr()),
+            |h, b| h ^ u32::from(b),
+        );
+    let word = u32::from_ne_bytes(buf[4..8].try_into().unwrap()) ^ host;
+    buf[4..8].copy_from_slice(&word.to_ne_bytes());
     Ok(buf)
 }
 

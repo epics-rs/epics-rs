@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 #[cfg(tokio_backend)]
-use epics_ca_rs::server::CaServer;
+use epics_ca_rs::server::CaServerBuilder;
 use epics_oracle_rs::{port_ioc_builder, register_port_ioc_devices};
 #[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
@@ -149,15 +149,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The network half of C's dbCa, libca, for names this IOC does not serve.
     let reactor =
         epics_base_rs::runtime::task::Reactor::current().expect("main runs on the IOC's reactor");
-    let ioc = match port_ioc_builder()
+    let mut builder = port_ioc_builder()
         .register_link_type("ca", move |db| {
             epics_ca_rs::calink::calink_link_set_install(db, reactor)
         })
         .with_database(boot_db)
-        .db_file(&db_path, &macros)?
-        .build_ioc()
-        .await
-    {
+        .db_file(&db_path, &macros)?;
+    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`: its address-list
+    // warnings come between the PINI=YES and PINI=RUN passes.
+    if !args.pva {
+        builder = builder.register_server_init(
+            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            epics_base_rs::server::ioc_app::ServerInitArgs {
+                port: args.port,
+                tcp_port: None,
+            },
+            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+        );
+    }
+    let mut ioc = match builder.build_ioc().await {
         Ok(ioc) => ioc,
         // `softIoc -d`: `dbLoadRecords` has printed its own lines, and
         // `errIf` exits 2 with an empty message (`softMain.cpp:198`).
@@ -176,23 +186,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // initialProcess and scanRun, so the Rust IOC runs its `iocRun` itself,
     // before serving either protocol.
     let db = Arc::clone(ioc.database());
+    let server = CaServerBuilder::serving(
+        db.clone(),
+        epics_base_rs::server::access_security::new_acf_cell(None),
+        None,
+        None,
+    )
+    .port(args.port)
+    .bound_at_init(ioc.servers());
     ioc.run().await;
 
     if args.pva {
         return serve_pva(db, args.port).await;
     }
 
-    // `from_parts` binds first and reports the port it actually bound, which
-    // the harness checks against the one it claimed.
-    let server = CaServer::from_parts(
-        db,
-        args.port,
-        None,
-        epics_base_rs::server::access_security::new_acf_cell(None),
-        None,
-        None,
-    )
-    .await?;
+    // The server reports the port `iocInit` bound, which the harness checks
+    // against the one it claimed.
+    let server = server.build().await?;
     let port = server.udp_port();
 
     // Announce only after the sockets exist. The harness blocks on this line,

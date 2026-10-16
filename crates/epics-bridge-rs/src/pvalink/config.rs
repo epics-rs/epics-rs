@@ -646,7 +646,8 @@ fn apply_or_warn<T>(
 /// it twice only because C parses the text twice, at `dbLoadRecords`
 /// (`dbPutString` → `dbParseLink`) and again at iocInit (`dbStaticLib.c:2217`).
 fn warn_ignored_jlink(key: &str, val: &JlinkValue) {
-    let warn = |message| crate::pvxs_log::warn("pvxs.ioc.link.parse", message);
+    use epics_pva_rs::pvxs_log::{Level, log};
+    let warn = |message| log("pvxs.ioc.link.parse", Level::Warn, message);
     match val {
         JlinkValue::Null => warn(format_args!(
             "pva link parsing unknown none depth=1 key=\"{key}\""

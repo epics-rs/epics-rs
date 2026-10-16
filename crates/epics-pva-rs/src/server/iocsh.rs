@@ -4,18 +4,17 @@
 //! streams the running `server()` through `operator<<(Server)` at the
 //! raw detail level (`src/server.cpp:281-379`). The detail thresholds
 //! follow that operator exactly:
-//!   - **always**: the server-config summary (pvxs prints `config()` plus
-//!     the registered-source list, `src/server.cpp:289-305`);
-//!   - **`detail >= 2`**: the per-connection block (`src/server.cpp:308`
-//!     `if(detail<2) return`), one line per peer with its auth *method*
-//!     (`src/server.cpp:335-338`);
+//!   - **always**: `config()`'s `EPICS_PVAS_*` lines and the source list
+//!     (`src/server.cpp:289-305`);
+//!   - **`detail >= 2`**: the `State:` line and the per-connection block
+//!     (`src/server.cpp:308` `if(detail<2) return`), one line per peer
+//!     with its auth *method* (`src/server.cpp:335-338`);
 //!   - **`detail >= 3`**: the full per-peer credentials (`src/server.cpp:339`
 //!     `if(detail>2)`) and the per-channel tx/rx listing
 //!     (`src/server.cpp:342` `if(detail<=2) continue`).
 //!
-//! `ServerReport` does not model pvxs's env dump, registered-source list,
-//! or per-peer backlog/state, so the config level here is the
-//! bound-endpoint summary and those pvxs lines are omitted.
+//! The peer and channel lines are this port's: `ServerReport` does not
+//! model pvxs's per-peer backlog or per-operation state.
 //!
 //! Wiring is pvxs's, and pvxs's is a registrar: `pvxsBaseRegistrar`
 //! (`ioc/iochooks.cpp:461-476`, exported with `epicsExportRegistrar`) runs
@@ -25,9 +24,10 @@
 //! with `if (auto srv = server())` (`iochooks.cpp:188-193`).
 //!
 //! [`register_pvxs_commands`] is that registrar for an
-//! [`epics_base_rs::server::ioc_app::IocApplication`]; the native server
-//! publishes what the command reads through [`publish_pvxs_report`] the
-//! instant it starts serving. `PvaServer::run_with_shell` and
+//! [`epics_base_rs::server::ioc_app::IocApplication`]; the registrar
+//! publishes the bound server through [`publish_pvxs_report`], and the
+//! native server publishes again the instant it starts serving.
+//! `PvaServer::run_with_shell` and
 //! `run_with_source_and_shell` still register the same command on the
 //! interactive shell, which is the half a registrar at the head cannot
 //! reach for a caller that has no `IocApplication` at all.
@@ -41,20 +41,19 @@ use epics_base_rs::server::iocsh::registry::{
 
 use crate::server_native::{BoundPvaServer, PvaServerConfig, ServerReportHandle};
 
-/// pvxs's `server()` singleton as this port can spell it: `None` until the
-/// native server starts, which is the state `pvxsr` is registered
-/// in and must answer from.
+/// pvxs's `server()` singleton as this port can spell it: `None` until a
+/// server is bound, which is the state `pvxsr` is registered in.
 fn report_cell() -> &'static RwLock<Option<ServerReportHandle>> {
     static CELL: OnceLock<RwLock<Option<ServerReportHandle>>> = OnceLock::new();
     CELL.get_or_init(|| RwLock::new(None))
 }
 
 /// The single writer — pvxs `initialisePvxsServer` filling the singleton the
-/// already-registered `pvxsr` reads. Called from the one place that has the
-/// handle and knows the server is serving
-/// (`server_native::runtime::serve_reporting`'s start callback).
-/// Last write wins: a process that stands up a second PVA server has
-/// replaced the first, which is the only state pvxs can be in at all.
+/// already-registered `pvxsr` reads: [`pvxs_base_registrar`] with the bound
+/// server, then `server_native::runtime::serve_reporting`'s start callback
+/// with the started one. Last write wins: a process that stands up a second
+/// PVA server has replaced the first, which is the only state pvxs can be in
+/// at all.
 pub fn publish_pvxs_report(handle: ServerReportHandle) {
     *report_cell().write().unwrap() = Some(handle);
 }
@@ -62,7 +61,7 @@ pub fn publish_pvxs_report(handle: ServerReportHandle) {
 /// The singleton's only reader — pvxs's `if (auto srv = server())`, which
 /// guards every hook that needs the running server (`pvxsr`
 /// (`iochooks.cpp:188`), `qReport` and `qStats`
-/// (`singlesourcehooks.cpp:76`, `:88`)). `None` until the server starts.
+/// (`singlesourcehooks.cpp:76`, `:88`)). `None` until a server is bound.
 ///
 /// Returns the handle by clone so no caller holds the lock across its report.
 pub fn pvxs_report() -> Option<ServerReportHandle> {
@@ -87,6 +86,41 @@ pub fn pvxs_report() -> Option<ServerReportHandle> {
 pub fn register_pvxs_commands(app: IocApplication) -> IocApplication {
     app.register_startup_command(pvxsr_command())
         .register_shell_command(pvxsr_command())
+        .register_startup_command(pvxs_log_config_command())
+        .register_shell_command(pvxs_log_config_command())
+        .register_startup_command(pvxs_log_clear_command())
+        .register_shell_command(pvxs_log_clear_command())
+}
+
+/// `pvxs_log_config "KEY=VAL,…"` (`ioc/iochooks.cpp:478-480`).
+fn pvxs_log_config_command() -> CommandDef {
+    CommandDef::new(
+        "pvxs_log_config",
+        vec![ArgDesc {
+            name: "KEY=VAL,KEY=VAL,...",
+            arg_type: ArgType::String,
+        }],
+        "Append logger configuration.  eg. pvxs_log_config \"pvxs.*=DEBUG\"",
+        |args: &[ArgValue], _: &CommandContext| {
+            if let Some(ArgValue::String(config)) = args.first() {
+                crate::pvxs_log::logger_config_str(&String::from_utf8_lossy(config.as_bytes()));
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `pvxs_log_clear` (`ioc/iochooks.cpp:481-483`).
+fn pvxs_log_clear_command() -> CommandDef {
+    CommandDef::new(
+        "pvxs_log_clear",
+        vec![],
+        "Reset logger configuration to defaults",
+        |_: &[ArgValue], _: &CommandContext| {
+            crate::pvxs_log::logger_level_clear();
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
 /// The name [`pvxs_base_registrar`] hands its server to the runner under.
@@ -106,10 +140,23 @@ pub struct PvxsServer(pub(crate) Option<BoundPvaServer>);
 ///
 /// Must be called on the IOC's runtime, which the bound sockets register with.
 pub fn pvxs_base_registrar(app: IocApplication) -> IocApplication {
+    pvxs_base_registrar_with_enable2(app, || ())
+}
+
+/// [`pvxs_base_registrar`] with QSRV's `enable2()` decision run where pvxs
+/// runs it: after `logger_config_env()`, before the commands and the bind
+/// (`ioc/iochooks.cpp:461-476`).
+pub fn pvxs_base_registrar_with_enable2(
+    app: IocApplication,
+    enable2: impl FnOnce(),
+) -> IocApplication {
+    crate::pvxs_log::logger_config_env();
+    enable2();
     let app = register_pvxs_commands(app);
     let bound = match crate::server_native::PvaServer::bind(PvaServerConfig::default().with_env()) {
         Ok(bound) => {
             publish_server_port(bound.bound_tcp_port());
+            publish_pvxs_report(bound.report_handle());
             Some(bound)
         }
         Err(e) => {
@@ -147,17 +194,14 @@ pub(crate) fn publish_server_port(port: u16) {
 ///
 /// Detail thresholds track pvxs `operator<<(Server)`
 /// (`src/server.cpp:281-379`), which `pvxsr` invokes with the raw detail
-/// (`iochooks.cpp:188-195`): `detail < 2` prints only the server-config
-/// summary; `detail >= 2` adds one line per live connection (channels,
-/// byte counters, auth method); `detail >= 3` adds the full credentials
-/// and each channel's tx/rx bytes.
+/// (`iochooks.cpp:188-195`): `detail < 2` prints `config()` and the source
+/// list; `detail >= 2` adds the `State:` line and one line per live
+/// connection (channels, byte counters, auth method); `detail >= 3` adds
+/// the full credentials and each channel's tx/rx bytes.
 ///
-/// The handle is read through [`publish_pvxs_report`], filled the moment the
-/// server starts. Before that — which is the whole startup script, since
-/// the protocol runner is Phase 3 — the command reports the server as not
-/// yet started. pvxs prints nothing at all there; the line is kept because
-/// an operator who typed `pvxsr` is better served by being told why the
-/// report is empty than by silence.
+/// From [`pvxs_base_registrar`] on, the server is bound and `Stopped`, so
+/// `pvxsr` in `st.cmd` reports it; with no server, as after a failed bind,
+/// it prints nothing.
 pub fn pvxsr_command() -> CommandDef {
     CommandDef::new(
         "pvxsr",
@@ -172,41 +216,28 @@ pub fn pvxsr_command() -> CommandDef {
                 _ => 0,
             };
 
-            let report = match pvxs_report() {
-                Some(handle) => handle.report(),
-                None => {
-                    ctx.println("pvAccess server: not yet started");
-                    return Ok(CommandOutcome::Continue);
-                }
+            let Some(handle) = pvxs_report() else {
+                return Ok(CommandOutcome::Continue);
             };
-
-            let updown = |alive: bool| if alive { "up" } else { "down" };
-
-            // Config-level summary — pvxs prints config()+source list at
-            // every level (src/server.cpp:289-305); this is the modeled subset.
-            ctx.println(&format!(
-                "pvAccess server: tcp :{} ({}), udp :{} ({}), beacon period {}s",
-                report.tcp_port,
-                updown(report.tcp_alive),
-                report.udp_port,
-                updown(report.udp_alive),
-                report.beacon_period_secs,
-            ));
-            if report.tls_enabled {
-                ctx.println(&format!("    tls :{} (enabled)", report.tls_port));
+            for line in handle.pvxs_config().lines() {
+                ctx.println(line);
             }
-            if report.udp_v6_alive {
-                ctx.println("    udp/IPv6: up");
-            }
-            if report.ignore_addrs > 0 {
-                ctx.println(&format!("    ignoring {} address(es)", report.ignore_addrs));
+            for (name, order) in handle.source_list() {
+                ctx.println(&format!("Source: {name} prio={order} "));
             }
 
-            // Per-connection block — pvxs gates this at detail >= 2
-            // (src/server.cpp:308 `if(detail<2) return`). The connection count
-            // and peer lines are part of this block, not the config level.
+            // pvxs's `if(detail<2) return` (src/server.cpp:308).
             if detail >= 2 {
-                ctx.println(&format!("{} active connection(s)", report.peer_count));
+                let report = handle.report();
+                ctx.println(&format!(
+                    "State: {} TCP_Port: {}",
+                    if handle.is_running() {
+                        "Running"
+                    } else {
+                        "Stopped"
+                    },
+                    report.tcp_port,
+                ));
                 for (addr, peer) in &report.peers {
                     // Peer line carries only the auth *method* at this level
                     // (src/server.cpp:338 `auth=<method>`); the account is part

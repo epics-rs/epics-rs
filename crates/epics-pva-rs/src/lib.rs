@@ -88,6 +88,7 @@ pub mod peer_buf;
 pub mod proto;
 pub mod pv_request;
 pub mod pvdata;
+pub mod pvxs_log;
 pub mod server;
 pub mod server_native;
 pub mod service;

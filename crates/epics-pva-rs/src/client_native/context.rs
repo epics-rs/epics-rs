@@ -1193,6 +1193,14 @@ impl PvaClient {
         }
     }
 
+    /// Open the search sockets now rather than at the first search: pvxs
+    /// does it in the `Context` constructor (`src/client.cpp:560-690`),
+    /// where an empty search list is reported. A failure here is met again,
+    /// and returned, by the first operation that searches.
+    pub async fn start(&self) -> PvaResult<()> {
+        self.search_engine().await.map(|_| ())
+    }
+
     /// Send a DISCOVER ping (empty SEARCH) to broadcast targets so
     /// reachable servers reply immediately. Pair with the discovery
     /// stream from the search engine to learn about servers without

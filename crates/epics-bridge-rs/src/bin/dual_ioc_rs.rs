@@ -31,7 +31,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 #[cfg(tokio_backend)]
-use epics_ca_rs::server::CaServer;
+use epics_ca_rs::server::CaServerBuilder;
 #[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
 
@@ -186,7 +186,27 @@ async fn main() -> ExitCode {
         };
     }
 
-    let ioc = match builder.build_ioc().await {
+    // Flag > EPICS environment > compiled default. `RsrvSockets::bind` takes a
+    // literal port, so its fallback is resolved here;
+    // `PvaServer::from_parts` resolves its own from `None`.
+    let ca_port = args
+        .ca_port
+        .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
+    let pva_port = args.pva_port;
+
+    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`.
+    if !args.no_ca {
+        builder = builder.register_server_init(
+            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            epics_base_rs::server::ioc_app::ServerInitArgs {
+                port: ca_port,
+                tcp_port: None,
+            },
+            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+        );
+    }
+
+    let mut ioc = match builder.build_ioc().await {
         Ok(ioc) => ioc,
         Err(e) => {
             eprintln!("error building IOC: {e}");
@@ -200,31 +220,25 @@ async fn main() -> ExitCode {
     // any redundant start parked, so the shared database never
     // double-scans.
     let db = ioc.database().clone();
-    ioc.run().await;
-
-    // Flag > EPICS environment > compiled default. `CaServer::from_parts`
-    // takes a literal port, so its fallback is resolved here;
-    // `PvaServer::from_parts` resolves its own from `None`.
-    let ca_port = args
-        .ca_port
-        .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
-    let pva_port = args.pva_port;
 
     // One live policy cell for both protocol servers, so an ACF
     // (re)load gates CA and PVA together.
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
+    let ca_server = CaServerBuilder::serving(db.clone(), acf.clone(), None, None)
+        .port(ca_port)
+        .bound_at_init(ioc.servers());
+    ioc.run().await;
 
     let ca_handle = if args.no_ca {
         None
     } else {
-        let server =
-            match CaServer::from_parts(db.clone(), ca_port, None, acf.clone(), None, None).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error binding CA server on port {ca_port}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let server = match ca_server.build().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error binding CA server on port {ca_port}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         Some(tokio::spawn(async move {
             tracing::info!(port = ca_port, "CA listener starting");
             server.run().await

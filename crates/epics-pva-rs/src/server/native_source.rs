@@ -1827,8 +1827,13 @@ fn report_subscribe_refused(
     name: &RecordName,
 ) {
     if why == epics_base_rs::server::pv::SubscribeRefused::CapReached {
-        tracing::error!(
-            "Client {peer} Monitor \"{name}\" onSubscribe() error: Failed to create db subscription"
+        crate::pvxs_log::log(
+            crate::pvxs_log::TCP_SETUP,
+            crate::pvxs_log::Level::Err,
+            format_args!(
+                "Client {peer} Monitor \"{name}\" onSubscribe() error: \
+                 Failed to create db subscription"
+            ),
         );
     }
 }
@@ -6692,38 +6697,25 @@ ASG(PLAIN) {
             .access()
             .check("AI:CAP", "h", "alice", "anonymous", "")
             .await;
-        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = buf.clone();
-        let _log = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(move || LogBuf(writer.clone()))
-                .with_max_level(tracing::Level::WARN)
-                .without_time()
-                .with_target(false)
-                .with_ansi(false)
-                .finish(),
-        );
+        let heard = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = heard.clone();
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
+            }
+        });
         let opened = source
             .subscribe_checked_opts_marked(checked, ctx, MonitorOptions::default())
             .await;
         assert!(opened.is_none(), "the cap refuses the monitor");
+        epics_base_rs::runtime::log::errlog_flush();
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
         assert_eq!(
-            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            *heard.lock().unwrap(),
             format!(
-                "ERROR Client {peer} Monitor \"AI:CAP\" onSubscribe() error: Failed to create db subscription\n"
+                "ERR pvxs.tcp.setup Client {peer} Monitor \"AI:CAP\" onSubscribe() error: Failed to create db subscription\n"
             )
         );
-    }
-
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     /// pvxs opens the value subscription with the client's

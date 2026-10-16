@@ -858,6 +858,9 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
     // B3: give the resolver the DB handle so the scan-on-update
     // forwarder can process owning records.
     resolver.attach_database((**db).clone());
+    // pvxs `linkGlobal_t::alloc` builds the link client's Context here, at
+    // `initHookAfterCaLinkInit` (`ioc/iochooks.cpp:338-341`).
+    let _ = resolver.registry.client().start().await;
     db.register_link_set("pva", Arc::new(resolver.clone()))
         .await;
 

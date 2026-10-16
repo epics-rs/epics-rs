@@ -2,7 +2,9 @@
 //! `iocBuild` (`initialProcess`, `iocInit.c:194-195`), RUN at
 //! `initHookAtIocRun` and RUNNING at `initHookAfterIocRunning`, either side
 //! of the `iocRun` line; the CP holder DST processes at `dbCaRun`
-//! (`iocInit.c:260`), before the line. `oracleIoc st.cmd` with
+//! (`iocInit.c:260`), before the line. Between YES and RUN, `rsrv_init` at
+//! `dbInitServers()` (`iocInit.c:222`) drops the beacon list's second
+//! `127.0.0.1`, the auto-beacon broadcast of the pinned interface. `oracleIoc st.cmd` with
 //! `DB=pini.db`, stdout unbuffered (`stdbuf -o0`) and merged with stderr:
 //!
 //! ```text
@@ -10,6 +12,7 @@
 //! ############################################################################
 //! ...
 //! _main_: dbProcess of 'PY'
+//! Warning: Duplicate EPICS CA Address list entry "127.0.0.1:5065" discarded
 //! _main_: dbProcess of 'PR'
 //! dbCaLink: dbProcess of 'DST'
 //! iocRun: All initialization complete
@@ -88,6 +91,7 @@ fn pini_passes_bracket_the_ioc_run_line_as_in_oracle_ioc() {
         [
             "Starting iocInit",
             "PY",
+            "Warning: Duplicate EPICS CA Address list entry \"127.0.0.1:5065\" discarded",
             "PR",
             "DST",
             "iocRun: All initialization complete",

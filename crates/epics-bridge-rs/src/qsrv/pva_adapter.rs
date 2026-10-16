@@ -450,9 +450,13 @@ async fn open_monitor(
     if let Err(e) = monitor.start().await {
         // servermon.cpp:598, logging what `onSubscribe` threw.
         if matches!(e, crate::error::BridgeError::SubscriptionFailed) {
-            tracing::error!(
-                "Client {} Monitor \"{name}\" onSubscribe() error: {e}",
-                ctx.peer
+            epics_pva_rs::pvxs_log::log(
+                epics_pva_rs::pvxs_log::TCP_SETUP,
+                epics_pva_rs::pvxs_log::Level::Err,
+                format_args!(
+                    "Client {} Monitor \"{name}\" onSubscribe() error: {e}",
+                    ctx.peer
+                ),
             );
         }
         return None;
@@ -1522,9 +1526,9 @@ pub async fn run_ca_pva_qsrv_ioc_app(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::error::CaResult<()> {
     let app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
-    // pvxsBaseRegistrar decides QSRV2 (`enable2`) before it binds the server.
-    qsrv2_decision();
-    let app = epics_pva_rs::server::iocsh::pvxs_base_registrar(app);
+    let app = epics_pva_rs::server::iocsh::pvxs_base_registrar_with_enable2(app, || {
+        qsrv2_decision();
+    });
     // No `group_files`: this IOC's `dbLoadGroup` requests sit on the base
     // startup queue, put there by the iocsh command during st.cmd.
     run_qsrv_ioc_app(app, Vec::new(), serve_ca_pva_qsrv).await
@@ -2713,17 +2717,13 @@ mod tests {
         .install_channel_sources(&db, &composite)
         .expect("qsrv sources mount");
 
-        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = buf.clone();
-        let _log = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(move || LogBuf(writer.clone()))
-                .with_max_level(tracing::Level::WARN)
-                .without_time()
-                .with_target(false)
-                .with_ansi(false)
-                .finish(),
-        );
+        let heard = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = heard.clone();
+        let listener = epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
+            }
+        });
         let peer: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
         for name in ["CAP:b", "CAP:GRP"] {
             let checked = AccessGate::open()
@@ -2748,11 +2748,13 @@ mod tests {
                 .await;
             assert!(opened.is_none(), "{name}: the cap refuses the monitor");
         }
+        epics_base_rs::runtime::log::errlog_flush();
+        epics_base_rs::runtime::log::errlog_remove_listener(listener);
         assert_eq!(
-            String::from_utf8(buf.lock().unwrap().clone()).unwrap(),
+            *heard.lock().unwrap(),
             format!(
-                "ERROR Client {peer} Monitor \"CAP:b\" onSubscribe() error: Failed to create db subscription\n\
-                 ERROR Client {peer} Monitor \"CAP:GRP\" onSubscribe() error: Failed to create db subscription\n"
+                "ERR pvxs.tcp.setup Client {peer} Monitor \"CAP:b\" onSubscribe() error: Failed to create db subscription\n\
+                 ERR pvxs.tcp.setup Client {peer} Monitor \"CAP:GRP\" onSubscribe() error: Failed to create db subscription\n"
             )
         );
         // A new subscriber reaps closed rows first, so only it remains when
@@ -2767,17 +2769,6 @@ mod tests {
             1,
             "the failed group keeps no subscription on its other member"
         );
-    }
-
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     /// Regression: `get_value_checked` must forward the INIT

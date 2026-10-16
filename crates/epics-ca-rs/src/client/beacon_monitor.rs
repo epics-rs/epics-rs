@@ -968,7 +968,7 @@ async fn send_repeater_registration(
     repeater_port: u16,
 ) -> Result<(), ()> {
     let addr = if attempt & 1 == 1 {
-        crate::server::addr_list::osi_local_addr()
+        epics_base_rs::net::iface_v4::osi_local_addr()
     } else {
         Ipv4Addr::LOCALHOST
     };
@@ -1196,7 +1196,7 @@ mod repeater_registration_tests {
         // C's rule verbatim: even → loopback, odd → osiLocalAddr(). On a
         // loopback-only host `osi_local_addr()` IS loopback and C sends
         // loopback for both — the expectation below still holds.
-        let local = crate::server::addr_list::osi_local_addr();
+        let local = epics_base_rs::net::iface_v4::osi_local_addr();
         assert_eq!(
             announced,
             vec![Ipv4Addr::LOCALHOST, local, Ipv4Addr::LOCALHOST, local],

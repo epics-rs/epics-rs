@@ -934,6 +934,15 @@ pub trait ChannelSource: Send + Sync + 'static {
         0
     }
 
+    /// The `(name, order)` entries this source puts in pvxs's one `Server`
+    /// source map, which `pvxsr` lists (`src/server.cpp:293-305`). `None`
+    /// for a leaf, which is the single entry it was added under; a
+    /// [`crate::server_native::CompositeSource`] nested as one entry stands
+    /// for its own entries, which pvxs would have added to the server.
+    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+        None
+    }
+
     /// Enumerate every PV name this source can serve.
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<RecordName>> + Send;
 
@@ -2785,6 +2794,8 @@ pub trait ChannelSourceObj: Send + Sync {
     fn access_gate(&self) -> &AccessGate;
     /// Source-registry beacon-change counter. Dyn forwarder.
     fn beacon_change(&self) -> u64;
+    /// Registry entries for `pvxsr`. Dyn forwarder.
+    fn registry_entries(&self) -> Option<Vec<(String, i32)>>;
     /// Monitor reload revalidation owner.
     fn revalidate_read<'a>(
         &'a self,
@@ -3086,6 +3097,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn beacon_change(&self) -> u64 {
         <Self as ChannelSource>::beacon_change(self)
+    }
+    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+        <Self as ChannelSource>::registry_entries(self)
     }
     fn revalidate_read<'a>(
         &'a self,

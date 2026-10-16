@@ -698,7 +698,14 @@ impl ServerConn {
             .map_err(PvaError::Io)?;
 
         // Step 4: wait for CONNECTION_VALIDATED.
-        wait_for_validated(&mut reader, &mut rx_buf, op_timeout, max_message_size).await?;
+        wait_for_validated(
+            target,
+            &mut reader,
+            &mut rx_buf,
+            op_timeout,
+            max_message_size,
+        )
+        .await?;
 
         // Spawn background tasks.
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -1048,7 +1055,12 @@ impl ServerConn {
                         let last = last_rx_hb.load(Ordering::SeqCst);
                         let elapsed = hb_clock.now_nanos().saturating_sub(last);
                         if elapsed > hb_timeout.as_nanos() as u64 {
-                            warn!("PVA connection idle > {hb_timeout:?}, closing");
+                            // pvxs's bufferevent read timeout (`conn.cpp:137-139`).
+                            crate::pvxs_log::log(
+                                crate::pvxs_log::TCP_IO,
+                                crate::pvxs_log::Level::Warn,
+                                format_args!("connection to Server {target} timeout"),
+                            );
                             break;
                         }
                         // Heartbeat probe = application CMD_ECHO with an
@@ -1466,6 +1478,7 @@ pub(super) async fn read_handshake_init<R: tokio::io::AsyncRead + Unpin>(
 }
 
 pub(super) async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
+    peer: SocketAddr,
     reader: &mut R,
     rx_buf: &mut Vec<u8>,
     op_timeout: Duration,
@@ -1488,7 +1501,11 @@ pub(super) async fn wait_for_validated<R: tokio::io::AsyncRead + Unpin>(
             // server: the connection tore down and reconnected forever.
             let st = decode_connection_validated(&frame)?;
             if !st.is_success() {
-                warn!("server refused auth ({st:?}); proceeding without credentials");
+                crate::pvxs_log::log(
+                    crate::pvxs_log::CLIENT_IO,
+                    crate::pvxs_log::Level::Err,
+                    format_args!("Server {peer} refuses auth.  Trying to proceed w/o cred"),
+                );
             }
             return Ok(());
         }
@@ -2240,7 +2257,14 @@ mod tests {
 
         let mut reader = std::io::Cursor::new(frame);
         let mut rx_buf = Vec::new();
-        let res = wait_for_validated(&mut reader, &mut rx_buf, Duration::from_secs(1), None).await;
+        let res = wait_for_validated(
+            "127.0.0.1:5075".parse().unwrap(),
+            &mut reader,
+            &mut rx_buf,
+            Duration::from_secs(1),
+            None,
+        )
+        .await;
         assert!(
             res.is_ok(),
             "non-success CONNECTION_VALIDATED must proceed anonymously (pvxs parity), got {res:?}"

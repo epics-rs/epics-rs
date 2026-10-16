@@ -477,10 +477,10 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
     } else if raw.eq_ignore_ascii_case("NO") || raw == "0" {
         Some(false)
     } else {
-        tracing::warn!(
-            var = name,
-            value = raw,
-            "invalid PVA boolean env value (expected YES/NO); keeping default"
+        crate::pvxs_log::log(
+            crate::pvxs_log::CONFIG,
+            crate::pvxs_log::Level::Err,
+            format_args!("{name} invalid bool value (YES/NO) : '{raw}'"),
         );
         None
     }
@@ -575,11 +575,13 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 pub fn parse_timeout_env(name: &str, raw: &str) -> Option<f64> {
     match parse_double_pvxs(raw) {
         Some(v) if v.is_finite() && v > 0.0 && v <= TIMEOUT_SECS_MAX => Some(v),
+        // pvxs takes zero without a word.
+        Some(0.0) => None,
         _ => {
-            tracing::warn!(
-                var = name,
-                value = raw,
-                "invalid double value; keeping default"
+            crate::pvxs_log::log(
+                crate::pvxs_log::SERVER_SETUP,
+                crate::pvxs_log::Level::Err,
+                format_args!("{name} invalid double value : '{raw}'"),
             );
             None
         }
@@ -631,7 +633,11 @@ pub fn parse_port_env(raw: &str) -> Option<u16> {
 pub fn broadcast_port() -> u16 {
     match getenv("EPICS_PVA_BROADCAST_PORT").and_then(|s| parse_port_env(&s)) {
         Some(0) => {
-            tracing::warn!("ignoring EPICS_PVA_BROADCAST_PORT=0; using default 5076");
+            crate::pvxs_log::log(
+                crate::pvxs_log::CLIENT_SETUP,
+                crate::pvxs_log::Level::Warn,
+                format_args!("ignoring EPICS_PVA_BROADCAST_PORT=0"),
+            );
             5076
         }
         Some(p) => p,

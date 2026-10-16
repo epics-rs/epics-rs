@@ -1112,8 +1112,9 @@ impl BridgeProvider {
             // `resolveTriggerReferences`, before `createGroups` refuses any
             // group (groupconfigprocessor.cpp:327-331).
             if !def.has_triggers() {
-                crate::pvxs_log::warn(
+                epics_pva_rs::pvxs_log::log(
                     "pvxs.ioc.group.processor",
+                    epics_pva_rs::pvxs_log::Level::Warn,
                     format_args!(
                         "Group {} defines no +trigger mappings.  \
                          Default to individual/split monitor updates.",

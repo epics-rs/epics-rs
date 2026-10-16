@@ -125,6 +125,11 @@ pub fn set_global_handle(handle: FilterReloadHandle) {
 pub fn install_cli_logging(debug: bool) {
     use tracing_subscriber::prelude::*;
 
+    crate::pvxs_log::logger_config_env();
+    if debug {
+        crate::pvxs_log::logger_level_set("pvxs.*", crate::pvxs_log::Level::Debug);
+    }
+
     let (filter, handle) = init_filter();
     let installed = tracing_subscriber::registry()
         .with(filter)

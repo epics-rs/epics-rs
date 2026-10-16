@@ -4552,10 +4552,11 @@ pub(super) async fn handle_connection_io(
                     // choice, so it does not count as peer silence; re-arm on
                     // the full period and look again.
                     if !reads_paused_writer.load(Ordering::Relaxed) && silent >= idle_timeout {
-                        warn!(
-                            peer = ?writer_peer,
-                            ?idle_timeout,
-                            "writer task: peer sent nothing for the inactivity timeout, dropping connection"
+                        // pvxs's bufferevent read timeout (`conn.cpp:137-139`).
+                        crate::pvxs_log::log(
+                            crate::pvxs_log::TCP_IO,
+                            crate::pvxs_log::Level::Warn,
+                            format_args!("connection to Client {writer_peer} timeout"),
                         );
                         break;
                     }

@@ -232,6 +232,39 @@ pub fn local_addr() -> Ipv4Addr {
         .unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
+/// C `osiLocalAddr` itself: [`local_addr`] computed once per process behind
+/// `epicsThreadOnce`, printing C's line when it falls back to loopback
+/// (`osdNetIfAddrs.c:167-216`, `WIN32/osdNetIntf.c:47-129`). Every caller
+/// shares the one computation, so the line prints once, for whichever of the
+/// pvxs server GUID or the CA repeater registration asks first.
+pub fn osi_local_addr() -> Ipv4Addr {
+    static ONCE: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        use crate::runtime::log::errlog_vprintf;
+        match enumerate() {
+            Ok(ifaces) => ifaces
+                .into_iter()
+                .find(|i| i.is_eligible())
+                .map(|i| i.ip)
+                .unwrap_or_else(|| {
+                    errlog_vprintf(format_args!("osiLocalAddr(): only loopback found\n"));
+                    Ipv4Addr::LOCALHOST
+                }),
+            Err(e) => {
+                if cfg!(windows) {
+                    errlog_vprintf(format_args!(
+                        "WSAIoctl SIO_GET_INTERFACE_LIST failed {}\n",
+                        e.raw_os_error().unwrap_or(0)
+                    ));
+                } else {
+                    errlog_vprintf(format_args!("osiLocalAddrOnce(): getifaddrs failed.\n"));
+                }
+                Ipv4Addr::LOCALHOST
+            }
+        }
+    })
+}
+
 #[cfg(unix)]
 mod sys {
     //! Unix, hosted and embedded alike: `getifaddrs(3)`.

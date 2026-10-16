@@ -246,6 +246,18 @@ impl ChannelSource for CompositeSource {
         CompositeSource::beacon_change(self)
     }
 
+    /// Each entry in consultation order, a nested composite's in its place.
+    fn registry_entries(&self) -> Option<Vec<(String, i32)>> {
+        let mut out = Vec::new();
+        for ((order, name), source) in self.entries.read().iter() {
+            match source.registry_entries() {
+                Some(inner) => out.extend(inner),
+                None => out.push((name.clone(), *order)),
+            }
+        }
+        Some(out)
+    }
+
     /// Monitor-reload READ
     /// revalidation owner for composite sources.
     ///

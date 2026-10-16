@@ -851,11 +851,13 @@ impl SearchEngine {
         // the name-servers-only configuration, so the missing clause is
         // restored here rather than left to misreport the stage-1 path.
         if transport.has_no_udp_destinations() && name_servers.is_empty() {
-            tracing::warn!(
-                target: "epics_pva_rs::client",
-                "PVA client context created with no search destinations \
-                 (no UDP addr_list, auto_addr_list disabled, and no TCP \
-                 name servers). All searches will time out."
+            crate::pvxs_log::log(
+                crate::pvxs_log::CLIENT_SETUP,
+                crate::pvxs_log::Level::Err,
+                format_args!(
+                    "Client context created with no search destinations.  \
+                     Nothing much will happen now"
+                ),
             );
         }
 
@@ -2646,11 +2648,13 @@ fn handle_search_response(
                 // place that holds more than one reply for a name, so the
                 // diagnostic lives here.
                 if let Some(other) = accumulated.iter().find(|h| h.guid != hit.guid) {
-                    tracing::error!(
-                        pv = %entry.pv_name,
-                        from = %other.server,
-                        and = %hit.server,
-                        "Duplicate PV name claimed by servers with different GUIDs"
+                    crate::pvxs_log::log(
+                        crate::pvxs_log::CLIENT_DUP,
+                        crate::pvxs_log::Level::Err,
+                        format_args!(
+                            "Duplicate PV name {} from {} and {}",
+                            entry.pv_name, other.server, hit.server
+                        ),
                     );
                 }
                 if !accumulated.iter().any(|h| h.server == hit.server) {
@@ -3096,7 +3100,7 @@ async fn ns_run_once(
         &super::server_conn::auth_groups(negotiated_auth),
     );
     ns_write_all(&mut writer, &reply, handshake_timeout).await?;
-    wait_for_validated(&mut reader, &mut rx_buf, handshake_timeout, None)
+    wait_for_validated(ns_addr, &mut reader, &mut rx_buf, handshake_timeout, None)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -4161,27 +4165,23 @@ mod tests {
     /// `handle_search_response` drops the ERROR event and fails this test.
     #[test]
     fn duplicate_pv_different_guid_logs_diagnostic() {
+        use epics_base_rs::runtime::log;
         use std::sync::{Arc, Mutex};
         use tokio::sync::oneshot;
-        use tracing::Level;
-        use tracing_subscriber::layer::{Context, Layer};
-        use tracing_subscriber::prelude::*;
-
-        struct LevelCapture(Arc<Mutex<Vec<Level>>>);
-        impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
-            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-                self.0.lock().unwrap().push(*event.metadata().level());
-            }
-        }
 
         const G_A: [u8; 12] = [0xA1u8; 12];
         const G_B: [u8; 12] = [0xB2u8; 12];
         let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
         let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5076);
 
-        let levels = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(LevelCapture(levels.clone()));
-        tracing::subscriber::with_default(subscriber, || {
+        let heard = Arc::new(Mutex::new(String::new()));
+        let sink = heard.clone();
+        let listener = log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
+            }
+        });
+        {
             let (tx, _rx) = oneshot::channel::<Vec<SearchHit>>();
             // First reply (GUID A from server A) already accumulated.
             let seed = SearchHit {
@@ -4231,12 +4231,12 @@ mod tests {
                 peer_b,
                 false,
             );
-        });
-        let got = levels.lock().unwrap().clone();
-        assert!(
-            got.contains(&Level::ERROR),
-            "a second found reply with a different GUID must emit the pvxs \
-             duplicate-PV ERROR diagnostic; captured levels: {got:?}"
+        }
+        log::errlog_flush();
+        log::errlog_remove_listener(listener);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            "ERR pvxs.client.dup Duplicate PV name dut from 10.0.0.1:5075 and 10.0.0.2:5075\n"
         );
     }
 

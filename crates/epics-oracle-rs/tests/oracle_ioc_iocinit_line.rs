@@ -1,11 +1,13 @@
 //! `oracle-ioc` says `Starting iocInit` where `oracleIoc` does: on stderr,
 //! before the database's `init_record` reports, with the `coreRelease`
 //! banner on stdout (C `iocBuild_1`, `iocInit.c:129` and `:147`).
-//! `oracleIoc st.cmd` with `DB=badsub.db`, the two streams captured apart:
+//! `oracleIoc st.cmd` with `DB=badsub.db` and the oracle's loopback CA
+//! lists, the two streams captured apart:
 //!
 //! ```text
 //! err: Starting iocInit
 //!      BADSUB.SNAM ERROR function 'noSuchSub' not found
+//!      Warning: Duplicate EPICS CA Address list entry "127.0.0.1:5065" discarded
 //!      iocRun: All initialization complete
 //! out: (the st.cmd echo, then)
 //!      ############################################################################
@@ -64,6 +66,7 @@ fn starting_ioc_init_precedes_the_init_record_report_as_in_oracle_ioc() {
         [
             "Starting iocInit",
             "BADSUB.SNAM \x1b[31;1mERROR\x1b[0m function 'noSuchSub' not found",
+            "Warning: Duplicate EPICS CA Address list entry \"127.0.0.1:5065\" discarded",
             "iocRun: All initialization complete",
         ]
     );

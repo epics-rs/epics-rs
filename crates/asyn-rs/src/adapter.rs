@@ -1898,15 +1898,21 @@ impl CellBody for DeviceJob {
             return;
         };
         self.keep_spare(op);
+        // Nothing cancels the request and it has no timeout callback, so only
+        // a port shutting down with it queued leaves it unrun.
         let e = match why {
             Unrun::Refused(e) => e,
-            // Nothing cancels the request, and its user arms no queue timer:
-            // this is the device-not-connected exit (asynManager.c:878-888).
-            Unrun::TimedOut | Unrun::Canceled => AsynError::QueueTimeout {
-                port: String::new(),
-            },
+            Unrun::TimedOut | Unrun::Canceled => unreachable!("devAsyn request {why:?}"),
         };
         self.ran(finish, Err(e));
+    }
+
+    /// devAsynInt32.c:212, devAsynInt64.c:192, devAsynUInt32Digital.c:193,
+    /// devAsynFloat64.c:152, devAsynOctet.c:273: `createAsynUser(callback, 0)`.
+    /// A request on a disconnected device runs, and the driver's refusal is
+    /// what the dset reports.
+    fn timeout_user(&self) -> bool {
+        false
     }
 
     /// C `processCallbackOutput`/`processCallbackInput`'s last line,

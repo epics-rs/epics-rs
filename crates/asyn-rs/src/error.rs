@@ -539,6 +539,8 @@ pub enum QueueRefusal<'a> {
     PortNotConnected(&'a str),
     /// The user is already on a queue (:1586-1591).
     AlreadyQueued,
+    /// A queue timeout for a request with no timeout callback (:1592-1597).
+    NoTimeoutUser,
     /// The port's queue is gone.
     ShutDown,
 }
@@ -548,7 +550,7 @@ impl QueueRefusal<'_> {
         match self {
             Self::PortDisabled(_) => AsynStatus::Disabled,
             Self::PortNotConnected(_) => AsynStatus::Disconnected,
-            Self::AlreadyQueued | Self::ShutDown => AsynStatus::Error,
+            Self::AlreadyQueued | Self::NoTimeoutUser | Self::ShutDown => AsynStatus::Error,
         }
     }
 }
@@ -559,6 +561,9 @@ impl fmt::Display for QueueRefusal<'_> {
             Self::PortDisabled(port) => write!(f, "port {port} disabled"),
             Self::PortNotConnected(port) => write!(f, "port {port} not connected"),
             Self::AlreadyQueued => f.write_str("asynManager::queueRequest is already queued"),
+            Self::NoTimeoutUser => f.write_str(
+                "asynManager::queueRequest timeout requested but no timeout callback was passed to createAsynUser",
+            ),
             Self::ShutDown => f.write_str("port shut down"),
         }
     }

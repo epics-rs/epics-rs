@@ -251,6 +251,14 @@ impl ActorMessage {
         self.refuse(AsynError::QueueTimeout { port });
     }
 
+    /// C `timeoutUser != 0`: a waiter's reply channel always is one.
+    fn timeout_user(&self) -> bool {
+        match &self.op {
+            RequestOp::Cell(cell) => cell.timeout_user(),
+            _ => true,
+        }
+    }
+
     /// The dequeue (asynManager.c:894-895).
     fn claim(&self) -> Claim {
         match &self.op {
@@ -1376,11 +1384,12 @@ impl PortActor {
                 // (:1592-1597). Here the reply channel *is* that callback, so
                 // the request reports the same queue timeout its own timer
                 // would.
-                if self
-                    .driver
-                    .base()
-                    .check_device_connected(msg.user.addr)
-                    .is_err()
+                if msg.timeout_user()
+                    && self
+                        .driver
+                        .base()
+                        .check_device_connected(msg.user.addr)
+                        .is_err()
                 {
                     msg.time_out(self.driver.base().port_name.to_string());
                     return;

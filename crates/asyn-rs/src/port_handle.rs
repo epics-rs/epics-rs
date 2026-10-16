@@ -1748,6 +1748,52 @@ mod tests {
         assert_eq!(on.as_deref(), Some("test-handle-actor"));
     }
 
+    /// asynManager.c:886: a request on a disconnected device goes to its
+    /// `timeoutUser` only when it has one; without one, `processUser` runs.
+    #[test]
+    fn a_disconnected_device_runs_a_cell_without_a_timeout_user() {
+        use crate::request::{CellBody, Unrun};
+        use std::sync::mpsc as std_mpsc;
+
+        struct Body {
+            tx: std_mpsc::SyncSender<&'static str>,
+            timeout_user: bool,
+        }
+        impl CellBody for Body {
+            fn process(&self, _: &mut dyn PortCalls) {
+                self.tx.send("process").unwrap();
+            }
+            fn unrun(&self, _: Unrun) {
+                self.tx.send("unrun").unwrap();
+            }
+            fn done(self: Arc<Self>) {}
+            fn timeout_user(&self) -> bool {
+                self.timeout_user
+            }
+        }
+
+        for (timeout_user, ran) in [(false, "process"), (true, "unrun")] {
+            let mut base = PortDriverBase::new(
+                "dev_down",
+                2,
+                PortFlags {
+                    multi_device: true,
+                    can_block: true,
+                    ..PortFlags::default()
+                },
+            );
+            base.set_auto_connect_addr(1, false);
+            base.set_addr_connected(1, false);
+            let handle = make_handle(TestDriver { base });
+            let (tx, rx) = std_mpsc::sync_channel(1);
+            let cell = handle.new_cell(Arc::new(Body { tx, timeout_user }));
+            handle
+                .queue_request(&cell, &AsynUser::new(0).with_addr(1))
+                .unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), ran);
+        }
+    }
+
     /// C `connectDevice` runs on the caller's thread under `asynManagerLock`
     /// (asynManager.c:1324-1356): it binds on a port whose actor is not running,
     /// and the device it created is the one the actor reports.

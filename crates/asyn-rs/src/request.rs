@@ -89,6 +89,13 @@ pub trait CellBody: Send + Sync + 'static {
     fn process(&self, port: &mut dyn PortCalls);
     /// C `timeoutUser`, or the other ways the request never ran.
     fn unrun(&self, why: Unrun);
+    /// Whether C's `createAsynUser` was given a `timeoutUser`. Without one
+    /// (`false`) a request on a disconnected device runs [`Self::process`]
+    /// (asynManager.c:886), and a queue timeout is refused at queue time
+    /// (:1592-1597), so only a cancel or a port shutdown reaches `unrun`.
+    fn timeout_user(&self) -> bool {
+        true
+    }
     /// Runs after each `process` or `unrun` returns. The cell may already be
     /// queued again by then, from inside the callback, as C allows.
     fn done(self: Arc<Self>);
@@ -213,6 +220,10 @@ impl RequestCell {
                 return Err(QueueRefusal::AlreadyQueued);
             }
         };
+        if user.queue_timeout.is_some() && !self.body.timeout_user() {
+            slot.state = was;
+            return Err(QueueRefusal::NoTimeoutUser);
+        }
         let seq = crate::port_actor::next_seq();
         slot.request = CellRequest {
             reason: user.reason,
@@ -255,6 +266,11 @@ impl RequestCell {
         self.end_callback();
         self.queue.poke();
         true
+    }
+
+    /// [`CellBody::timeout_user`].
+    pub(crate) fn timeout_user(&self) -> bool {
+        self.body.timeout_user()
     }
 
     pub(crate) fn queues_on(&self, queue: &Arc<CellQueue>) -> bool {
@@ -1668,6 +1684,27 @@ mod tests {
         cell.queue(&user).unwrap();
         assert_eq!(cell.lock().state, ACTIVE_QUEUED);
         assert_eq!(cell.queue(&user), Err(QueueRefusal::AlreadyQueued));
+    }
+
+    /// asynManager.c:1592-1597: a queue timeout needs a timeout callback.
+    #[test]
+    fn a_queue_timeout_without_a_timeout_user_is_refused() {
+        struct NoTimeoutUser;
+        impl CellBody for NoTimeoutUser {
+            fn process(&self, _: &mut dyn PortCalls) {}
+            fn unrun(&self, _: Unrun) {}
+            fn done(self: Arc<Self>) {}
+            fn timeout_user(&self) -> bool {
+                false
+            }
+        }
+        let queue = Arc::new(CellQueue::default());
+        let cell = queue.new_cell(Arc::new(NoTimeoutUser));
+        let timed =
+            crate::user::AsynUser::new(0).with_queue_timeout(std::time::Duration::from_secs(1));
+        assert_eq!(cell.queue(&timed), Err(QueueRefusal::NoTimeoutUser));
+        assert_eq!(cell.lock().state, CellState::Idle);
+        cell.queue(&crate::user::AsynUser::new(0)).unwrap();
     }
 
     /// C `state == callbackActive` with `isQueued` clear: a cancel finds

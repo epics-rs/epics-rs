@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::{CaServer, CaServerBuilder};
 use std_rs::snl::delay_do::{DelayDoConfig, DelayDoState};
@@ -239,6 +240,40 @@ async fn a_delay_change_mid_wait_does_not_retime_the_wait_in_flight() {
         })
         .await,
         "the armed 0.15 s delay must still be the one that fires"
+    );
+    task.abort();
+}
+
+/// `{P}{R}:delay` is a monitor var (`delayDo.st:26`), written as it arrives:
+/// a delay posted just before `activeCalc` drops already times the wait the
+/// drop arms, though the active event is taken first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delay_posted_before_the_active_drop_times_its_wait() {
+    let server = delay_do_ioc().await;
+    let db = (**server.database()).clone();
+    let task = tokio::spawn(std_rs::snl::delay_do::run(
+        DelayDoConfig::new(P, R),
+        db.clone(),
+    ));
+    assert!(eventually(async || state_of(&server).await == "idle").await);
+    ca_put(&server, &format!("{P}{R}:delay"), EpicsValue::Double(30.0)).await;
+    put_calc(&server, "activeCalc", 1.0).await;
+    assert!(eventually(async || state_of(&server).await == "active").await);
+
+    // No await between the posts: on this one-thread runtime the runner
+    // finds both queued.
+    for (leaf, v) in [("delay", 0.05), ("activeCalc", 0.0)] {
+        let rec = db.get_record(format!("{P}{R}:{leaf}")).unwrap();
+        let mut inst = rec.write();
+        inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
+        inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+    }
+    assert!(
+        eventually(async || {
+            server.get("TEST:dd:sink").await.unwrap() == EpicsValue::Double(7.0)
+        })
+        .await,
+        "the wait must be the 0.05 s delay, not the 30 s one"
     );
     task.abort();
 }

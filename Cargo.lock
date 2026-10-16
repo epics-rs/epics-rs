@@ -2662,6 +2662,7 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
+ "motor-rs",
  "tokio",
  "tracing",
 ]

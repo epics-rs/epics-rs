@@ -274,7 +274,6 @@ pub async fn run(
     let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAck"), my_origin);
     let ch_put_vals = DbChannel::with_origin(&db, &config.pv("Put"), my_origin);
     let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("Mode"), my_origin);
-    let ch_cc_mode = DbChannel::with_origin(&db, &config.pv("Mode2"), my_origin);
     let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
 
     // D-spacing parameters
@@ -408,8 +407,6 @@ pub async fn run(
         config.pv("Order"),
         config.pv("D"),
         config.pv("Put"),
-        config.pv("Mode"),
-        config.pv("Mode2"),
         config.pv("OperAck"),
         config.motor_pv(&config.m_theta, ".RBV"),
         config.motor_pv(&config.m_theta2, ".RBV"),
@@ -426,6 +423,12 @@ pub async fn run(
         config.pv("ThetaDec"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
+    // waitForCmnd `when` tests them (ml_monoCtl.st:55-64, :624-774): they
+    // are written on arrival and only read.
+    monitor
+        .add_vars(&db, &[config.pv("Mode"), config.pv("Mode2")])
+        .await;
     println!(
         "ml_monoCtl: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -483,9 +486,7 @@ pub async fn run(
     let mut e_val = lambda_to_energy(lambda_val);
     let _ = ch_e.put_f64_process(e_val).await;
 
-    let mut auto_mode = false;
     let mut use_set_mode = false;
-    let mut cc_mode = MlMonoMode::from_i16(ch_cc_mode.get_i16().await);
     let mut y_offset_val = config.y_offset;
     let mut _caused_move = false;
 
@@ -503,6 +504,7 @@ pub async fn run(
     let pv_put_vals = config.pv("Put");
     let pv_auto_mode = config.pv("Mode");
     let pv_cc_mode = config.pv("Mode2");
+    let cc_mode_of = |m: &mut DbMultiMonitor| MlMonoMode::from_i16(m.var(&pv_cc_mode) as i16);
     let pv_oper_ack = config.pv("OperAck");
     let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
     let pv_theta2_mot_rbv = config.motor_pv(&config.m_theta2, ".RBV");
@@ -537,39 +539,30 @@ pub async fn run(
         };
 
         if changed_pv == pv_e {
-            let new_e = new_val;
-            if (new_e - e_val).abs() > 1e-12 {
-                e_val = new_e;
-                lambda_val = energy_to_lambda(e_val);
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                if lambda_val > two_d {
-                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                }
-                proceed_to_theta_changed = true;
+            e_val = new_val;
+            lambda_val = energy_to_lambda(e_val);
+            let _ = ch_lambda.put_f64_process(lambda_val).await;
+            if lambda_val > two_d {
+                let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                let _ = ch_alert.put_i16_process(1).await;
+            } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                theta_val = th;
+                let _ = ch_theta.put_f64_process(theta_val).await;
             }
+            proceed_to_theta_changed = true;
         } else if changed_pv == pv_lambda {
-            let new_l = new_val;
-            if (new_l - lambda_val).abs() > 1e-12 {
-                lambda_val = new_l;
-                if lambda_val > two_d {
-                    let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                }
-                proceed_to_theta_changed = true;
+            lambda_val = new_val;
+            if lambda_val > two_d {
+                let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
+                let _ = ch_alert.put_i16_process(1).await;
+            } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                theta_val = th;
+                let _ = ch_theta.put_f64_process(theta_val).await;
             }
+            proceed_to_theta_changed = true;
         } else if changed_pv == pv_theta {
-            let new_th = new_val;
-            if (new_th - theta_val).abs() > 1e-12 {
-                theta_val = new_th;
-                proceed_to_theta_changed = true;
-            }
+            theta_val = new_val;
+            proceed_to_theta_changed = true;
         } else if changed_pv == pv_e_inc || changed_pv == pv_e_dec {
             // C ml_monoCtl.st:711-730 — E tweak by ± ETweakVal, limit-checked,
             // then (on success) eChanged→lChanged→thChanged recompute & move.
@@ -655,7 +648,6 @@ pub async fn run(
             // from the Order<1 check and dInputChanged pvPuts it
             // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
             let _ = ch_alert.put_i16_process(err as i16).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
@@ -672,7 +664,6 @@ pub async fn run(
             // from the Order<1 check and dInputChanged pvPuts it
             // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
             let _ = ch_alert.put_i16_process(err as i16).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
             let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
@@ -684,10 +675,6 @@ pub async fn run(
             if new_val as i16 != 0 {
                 proceed_to_theta_changed = true;
             }
-        } else if changed_pv == pv_auto_mode {
-            auto_mode = new_val as i16 != 0;
-        } else if changed_pv == pv_cc_mode {
-            cc_mode = MlMonoMode::from_i16(new_val as i16);
         } else if changed_pv == pv_oper_ack {
             if new_val as i16 != 0 {
                 let _ = ch_alert.put_i16_process(0).await;
@@ -732,7 +719,6 @@ pub async fn run(
             let _ = ch_lambda_lo.put_f64_process(ll).await;
         } else if changed_pv == pv_y_offset {
             y_offset_val = new_val;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg1
                 .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
@@ -749,7 +735,6 @@ pub async fn run(
             // recompute is driven inline rather than via a yOffset re-trigger).
             y_offset_val = new_val;
             let _ = ch_y_offset.put_f64_process(y_offset_val).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg1
                 .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
@@ -774,7 +759,6 @@ pub async fn run(
                 .put_string_process("Theta constrained to LIMIT")
                 .await;
             let _ = ch_alert.put_i16_process(1).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
         }
@@ -802,7 +786,7 @@ pub async fn run(
         let _ = ch_z_set.put_f64_process(z_mot_desired).await;
 
         // Check Z limits
-        if !cc_mode.z_frozen() {
+        if !cc_mode_of(&mut monitor).z_frozen() {
             let z_hi = ch_z_mot_hilim.get_f64().await;
             let z_lo = ch_z_mot_lolim.get_f64().await;
             if z_mot_desired < z_lo || z_mot_desired > z_hi {
@@ -811,14 +795,13 @@ pub async fn run(
                     .await;
                 let _ = ch_msg2.put_string_process("Setting to Manual Mode").await;
                 let _ = ch_alert.put_i16_process(1).await;
-                auto_mode = false;
                 let _ = ch_auto_mode.put_i16_process(0).await;
             }
         }
 
         // -- Move --
         let put_requested = ch_put_vals.get_i16().await != 0;
-        if auto_mode || put_requested || use_set_mode {
+        if monitor.var(&pv_auto_mode) != 0.0 || put_requested || use_set_mode {
             let th_speed = ch_theta_mot_velo.get_f64().await;
             let z_speed = ch_z_mot_velo.get_f64().await;
             // Save the pre-coordination motor speeds for restoration after the
@@ -837,17 +820,17 @@ pub async fn run(
                 z_mot_desired - ch_z_mot_rbv.get_f64().await,
                 th_speed,
                 z_speed,
-                cc_mode,
+                cc_mode_of(&mut monitor),
             );
             let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
             let _ = ch_theta2_mot_velo.put_f64_process(new_th).await;
-            if !cc_mode.z_frozen() {
+            if !cc_mode_of(&mut monitor).z_frozen() {
                 let _ = ch_z_mot_velo.put_f64_process(new_z).await;
             }
 
             let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
             let _ = ch_theta2_mot_cmd.put_f64_process(theta2_mot_desired).await;
-            if !cc_mode.z_frozen() {
+            if !cc_mode_of(&mut monitor).z_frozen() {
                 let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
             }
             let _ = ch_put_vals.put_i16_process(0).await;
@@ -869,7 +852,6 @@ pub async fn run(
                         .put_string_process("Theta Motor hit a limit switch!")
                         .await;
                     let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_theta_mot_stop.put_i16_process(1).await;
                     let _ = ch_theta2_mot_stop.put_i16_process(1).await;
@@ -877,14 +859,13 @@ pub async fn run(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
-                if !cc_mode.z_frozen()
+                if !cc_mode_of(&mut monitor).z_frozen()
                     && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
                 {
                     let _ = ch_msg1
                         .put_string_process("Z Motor hit a limit switch!")
                         .await;
                     let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_theta_mot_stop.put_i16_process(1).await;
                     let _ = ch_theta2_mot_stop.put_i16_process(1).await;
@@ -916,7 +897,7 @@ pub async fn run(
             // restored alongside it.
             let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
             let _ = ch_theta2_mot_velo.put_f64_process(old_th2_speed).await;
-            if !cc_mode.z_frozen() {
+            if !cc_mode_of(&mut monitor).z_frozen() {
                 let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
             }
 

@@ -306,6 +306,16 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-pva-rs", "tests/ui25_same_process_discovery.rs"),
     ("mca-rs", "tests/a_remote_siml_is_a_ca_link.rs"),
     ("optics-rs", "tests/integration_tests.rs"),
+    (
+        "optics-rs",
+        "tests/kohzu_init_runs_the_theta_command_path.rs",
+    ),
+    (
+        "optics-rs",
+        "tests/kohzu_soft_init_runs_the_connect_time_passes.rs",
+    ),
+    ("optics-rs", "tests/ml_mono_reads_monitor_vars.rs"),
+    ("optics-rs", "tests/hr_reads_monitor_vars.rs"),
     ("optics-rs", "tests/table_link_kind.rs"),
     ("regression-ioc", "tests/families.rs"),
     ("regression-ioc", "tests/motor.rs"),

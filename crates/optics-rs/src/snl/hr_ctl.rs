@@ -463,7 +463,6 @@ pub async fn run(
         config.pv("L2AO"),
         config.pv("A2AO"),
         config.pv("PutBO"),
-        config.pv("ModeBO"),
         config.pv("OperAckBO"),
         config.motor_pv(&config.m_phi1, ".RBV"),
         config.motor_pv(&config.m_phi2, ".RBV"),
@@ -476,6 +475,10 @@ pub async fn run(
         config.pv("Moving"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    // C `monitor autoMode;` syncs no event flag and no waitForCmnd `when`
+    // tests it (hrCtl.st:64-66, :693-826): it is written on arrival and only
+    // read.
+    monitor.add_vars(&db, &[config.pv("ModeBO")]).await;
     println!(
         "hrCtl: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -512,7 +515,6 @@ pub async fn run(
     let mut phi1_off = ch_phi1_off.get_f64().await;
     let mut phi2_off = ch_phi2_off.get_f64().await;
     let mut world_off = ch_world_off.get_f64().await;
-    let mut auto_mode = false;
     let mut use_set_mode = false;
     let mut _caused_move = false;
 
@@ -645,7 +647,6 @@ pub async fn run(
             let (d, _, _) = calc_2d_spacing(a1, h1, k1, l1);
             d1 = d;
             let _ = ch_d1.put_f64_process(d1).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
         } else if changed_pv == pv_h2
             || changed_pv == pv_k2
@@ -659,14 +660,11 @@ pub async fn run(
             let (d, _, _) = calc_2d_spacing(a2, h2, k2, l2);
             d2 = d;
             let _ = ch_d2.put_f64_process(d2).await;
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
         } else if changed_pv == pv_put_vals {
             if new_val as i16 != 0 {
                 proceed_to_theta_changed = true;
             }
-        } else if changed_pv == pv_auto_mode {
-            auto_mode = new_val as i16 != 0;
         } else if changed_pv == pv_oper_ack {
             if new_val as i16 != 0 {
                 let _ = ch_alert.put_i16_process(0).await;
@@ -704,12 +702,10 @@ pub async fn run(
             use_set_mode = new_val as i16 != 0;
         } else if changed_pv == pv_op_mode {
             op_mode = HrOpMode::from_i16(new_val as i16);
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
         } else if changed_pv == pv_geom {
             geom = HrGeometry::from_i16(new_val as i16);
-            auto_mode = false;
             let _ = ch_auto_mode.put_i16_process(0).await;
             let _ = ch_msg1
                 .put_string_process("New geometry. Switch Phi 2 motor dir.")
@@ -854,7 +850,7 @@ pub async fn run(
 
         // -- Move motors --
         let put_requested = ch_put_vals.get_i16().await != 0;
-        if (auto_mode || put_requested) && !use_set_mode {
+        if (monitor.var(&pv_auto_mode) != 0.0 || put_requested) && !use_set_mode {
             let _ = ch_phi1_mot_cmd.put_f64_process(phi1_mot_desired).await;
             if op_mode != HrOpMode::Single {
                 let _ = ch_phi2_mot_cmd.put_f64_process(phi2_mot_desired).await;
@@ -872,7 +868,6 @@ pub async fn run(
                         .put_string_process("Theta 1 motor hit a limit switch!")
                         .await;
                     let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_phi1_mot_stop.put_i16_process(1).await;
                     if op_mode != HrOpMode::Single {
@@ -888,7 +883,6 @@ pub async fn run(
                         .put_string_process("Theta 2 motor hit a limit switch!")
                         .await;
                     let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
                     let _ = ch_auto_mode.put_i16_process(0).await;
                     let _ = ch_phi1_mot_stop.put_i16_process(1).await;
                     let _ = ch_phi2_mot_stop.put_i16_process(1).await;

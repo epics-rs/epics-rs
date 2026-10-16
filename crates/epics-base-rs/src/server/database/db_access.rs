@@ -1092,6 +1092,9 @@ pub struct DbMultiMonitor {
     /// Each subscription beside the name its caller asked for, which is what
     /// [`Self::wait_change`] answers with.
     subs: Vec<(String, DbSubscription)>,
+    /// SNL `monitor` variables with no event flag, each with the last value
+    /// posted to it.
+    vars: Vec<(String, DbSubscription, f64)>,
 }
 
 impl DbMultiMonitor {
@@ -1111,7 +1114,46 @@ impl DbMultiMonitor {
                 subs.push((name.clone(), sub));
             }
         }
-        Self { subs }
+        Self {
+            subs,
+            vars: Vec::new(),
+        }
+    }
+
+    /// Monitor `names` as SNL `monitor` variables that no event flag is
+    /// `sync`ed to: C writes such a variable as each monitor arrives, so it
+    /// raises no [`Self::wait_change`] and [`Self::var`] reads its last post.
+    /// Not origin-filtered, as the sequencer's own `pvPut` monitors reach it
+    /// too. Returns how many of `names` were subscribed.
+    pub async fn add_vars(&mut self, db: &PvDatabase, names: &[String]) -> usize {
+        let before = self.vars.len();
+        for name in names {
+            if let Ok(sub) = DbSubscription::subscribe(db, name).await {
+                let seed = db.get_pv(name).ok().and_then(|v| v.to_f64());
+                self.vars.push((name.clone(), sub, seed.unwrap_or(0.0)));
+            }
+        }
+        self.vars.len() - before
+    }
+
+    /// The last value posted to the variable `name` added by
+    /// [`Self::add_vars`], or 0 if there is none.
+    pub fn var(&mut self, name: &str) -> f64 {
+        self.drain_vars();
+        self.vars
+            .iter()
+            .find(|(var, ..)| var == name)
+            .map_or(0.0, |(.., last)| *last)
+    }
+
+    fn drain_vars(&mut self) {
+        for (_, sub, last) in &mut self.vars {
+            while let Ok(event) = sub.try_next_event() {
+                if let Some(v) = event.value().as_value().and_then(EpicsValue::to_f64) {
+                    *last = v;
+                }
+            }
+        }
     }
 
     /// Number of active subscriptions.
@@ -1119,13 +1161,29 @@ impl DbMultiMonitor {
         self.subs.len()
     }
 
-    /// Wait for any subscribed PV to change. Returns (pv_name, new_value).
-    /// Silently skips events matching the subscription's `ignore_origin`.
+    /// Drop the events queued for `name`, as SNL's `efClear` on a sync'd
+    /// event flag discards the monitors that raised it.
+    pub fn clear(&mut self, name: &str) {
+        for (sub_name, sub) in &mut self.subs {
+            if sub_name == name {
+                while sub.try_next_event().is_ok() {}
+            }
+        }
+    }
+
+    /// Wait for any subscribed PV to change. Returns (pv_name, new_value)
+    /// with the newest value queued for that PV: one SNL sync'd event flag
+    /// stands for every monitor since it was last cleared, and its variable
+    /// holds the last of them. Silently skips events matching the
+    /// subscription's `ignore_origin`.
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
             for (name, sub) in &mut self.subs {
                 match sub.try_next_event() {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        while let Ok(newer) = sub.try_next_event() {
+                            event = newer;
+                        }
                         let val = event
                             .value()
                             .as_value()
@@ -1141,6 +1199,117 @@ impl DbMultiMonitor {
             // blocking connection thread that has no runtime.
             crate::runtime::task::sleep_background(Duration::from_millis(10)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_monitor_tests {
+    use super::*;
+
+    /// A cleared channel's queued events are gone; the others' still arrive.
+    #[epics_macros_rs::epics_test]
+    async fn clear_drops_only_that_channels_queued_events() {
+        let db = PvDatabase::new();
+        for name in ["X", "Y"] {
+            db.add_record(
+                name,
+                Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+            )
+            .await
+            .unwrap();
+        }
+        let names = ["X".to_string(), "Y".to_string()];
+        let mut monitor = DbMultiMonitor::new(&db, &names).await;
+        db.put_pv_and_post("X", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        db.put_pv_and_post("X", EpicsValue::Double(2.0))
+            .await
+            .unwrap();
+        db.put_pv_and_post("Y", EpicsValue::Double(3.0))
+            .await
+            .unwrap();
+        monitor.clear("X");
+        assert_eq!(monitor.wait_change().await, ("Y".to_string(), 3.0));
+        db.put_pv_and_post("X", EpicsValue::Double(4.0))
+            .await
+            .unwrap();
+        assert_eq!(monitor.wait_change().await, ("X".to_string(), 4.0));
+    }
+
+    /// Two queued events on one channel arrive as one, with the later value.
+    #[epics_macros_rs::epics_test]
+    async fn queued_events_arrive_as_the_latest_value() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "X",
+            Box::new(crate::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await
+        .unwrap();
+        let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
+        for v in [1.0, 2.0] {
+            db.put_pv_and_post("X", EpicsValue::Double(v))
+                .await
+                .unwrap();
+        }
+        assert_eq!(monitor.wait_change().await, ("X".to_string(), 2.0));
+        monitor.clear("X");
+        db.put_pv_and_post("X", EpicsValue::Double(3.0))
+            .await
+            .unwrap();
+        assert_eq!(monitor.wait_change().await, ("X".to_string(), 3.0));
+    }
+
+    async fn db_with(records: &[(&str, f64)]) -> PvDatabase {
+        let db = PvDatabase::new();
+        for &(name, v) in records {
+            db.add_record(name, Box::new(crate::server::records::ai::AiRecord::new(v)))
+                .await
+                .unwrap();
+        }
+        db
+    }
+
+    /// A var reads its current value before any post and its last post
+    /// after, and its posts raise no change: the flagged channel's event is
+    /// the one returned, though the var's were posted first. An absent name
+    /// is not counted.
+    #[epics_macros_rs::epics_test]
+    async fn a_var_reads_its_last_post_and_raises_no_change() {
+        let db = db_with(&[("M", 5.0), ("X", 0.0)]).await;
+        let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
+        assert_eq!(
+            monitor
+                .add_vars(&db, &["M".to_string(), "NONE".to_string()])
+                .await,
+            1
+        );
+        assert_eq!(monitor.var("M"), 5.0);
+        for v in [1.0, 2.0] {
+            db.put_pv_and_post("M", EpicsValue::Double(v))
+                .await
+                .unwrap();
+        }
+        db.put_pv_and_post("X", EpicsValue::Double(3.0))
+            .await
+            .unwrap();
+        assert_eq!(monitor.wait_change().await, ("X".to_string(), 3.0));
+        assert_eq!(monitor.var("M"), 2.0);
+    }
+
+    /// The sequencer's own puts reach its vars, as its pvPut monitors do in
+    /// C, while its flagged channels still skip them.
+    #[epics_macros_rs::epics_test]
+    async fn a_var_takes_the_ignored_origins_posts() {
+        let db = db_with(&[("M", 0.0), ("X", 0.0)]).await;
+        let mut monitor = DbMultiMonitor::new_filtered(&db, &["X".to_string()], 7).await;
+        monitor.add_vars(&db, &["M".to_string()]).await;
+        DbChannel::with_origin(&db, "M", 7)
+            .put_f64_process(4.0)
+            .await
+            .unwrap();
+        assert_eq!(monitor.var("M"), 4.0);
     }
 }
 

@@ -6,7 +6,9 @@
 //! PV naming: `{P}{MONO}E`, `{P}{MONO}Lambda`, `{P}{MONO}Theta`, etc.
 //! Motor PVs still use `{P}{M_THETA}`, `{P}{M_Y}`, `{P}{M_Z}`.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -16,9 +18,10 @@ use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 
 // Re-use physics from kohzu_ctl.
 use crate::snl::kohzu_ctl::{
-    CrystalMode, Geometry, calc_2d_spacing, calc_y_position, calc_z_position, clamp_theta,
-    compute_energy_lambda_limits, compute_theta_limits, coordinate_speeds, energy_to_lambda,
-    lambda_to_energy, lambda_to_theta, theta_to_lambda,
+    CrystalMode, Geometry, LimitSwitches, calc_2d_spacing, calc_y_position, calc_z_position,
+    clamp_theta, compute_energy_lambda_limits, compute_theta_limits, coordinate_speeds,
+    echo_motor_fields, energy_to_lambda, lambda_to_energy, lambda_to_theta, theta_to_lambda,
+    update_set,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,6 +32,7 @@ use crate::snl::kohzu_ctl::{
 pub enum KohzuSoftState {
     Init,
     InitSequence,
+    WaitForCommandEnter,
     WaitForCommand,
     DInputChanged,
     ThetaLimits,
@@ -94,6 +98,57 @@ pub async fn run(
     config: KohzuSoftConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut echoes = Vec::new();
+    for (m, axis) in [
+        (&config.m_theta, "Theta"),
+        (&config.m_y, "Y"),
+        (&config.m_z, "Z"),
+    ] {
+        if axis != "Theta" {
+            echoes.push((
+                config.motor_pv(m, ".RBV"),
+                config.mono_pv(&format!("{axis}Rdbk")),
+            ));
+        }
+        echoes.push((
+            config.motor_pv(m, ".VELO"),
+            config.mono_pv(&format!("{axis}Vel")),
+        ));
+        echoes.push((
+            config.motor_pv(m, ""),
+            config.mono_pv(&format!("{axis}Cmd")),
+        ));
+        echoes.push((
+            config.motor_pv(m, ".DMOV"),
+            config.mono_pv(&format!("{axis}Dmov")),
+        ));
+    }
+    // updatePsuedo_soft (kohzuCtl_soft.st:1168-1235).
+    let echoes = echo_motor_fields(db.clone(), echoes);
+    let use_set_pv = config.mono_pv("UseSet");
+    let use_set_mode = Arc::new(AtomicBool::new(
+        DbChannel::new(&db, &use_set_pv).get_i16().await != 0,
+    ));
+    // updateSet (kohzuCtl_soft.st:1243-1286).
+    let update_set = update_set(
+        db.clone(),
+        use_set_pv,
+        [&config.m_theta, &config.m_y, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
+        use_set_mode.clone(),
+    );
+    tokio::select! {
+        r = kohzu_ctl_soft(config, db, use_set_mode) => r,
+        () = echoes => Ok(()),
+        () = update_set => Ok(()),
+    }
+}
+
+/// The kohzuCtl_soft state set.
+async fn kohzu_ctl_soft(
+    config: KohzuSoftConfig,
+    db: PvDatabase,
+    use_set_mode: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
         "kohzuCtl_soft: starting for prefix={}{}",
         config.prefix, config.mono
@@ -109,7 +164,6 @@ pub async fn run(
     let ch_oper_ack = DbChannel::with_origin(&db, &config.mono_pv("OperAck"), my_origin);
     let ch_put_vals = DbChannel::with_origin(&db, &config.mono_pv("Put"), my_origin);
     let ch_auto_mode = DbChannel::with_origin(&db, &config.mono_pv("Mode"), my_origin);
-    let ch_cc_mode = DbChannel::with_origin(&db, &config.mono_pv("Mode2"), my_origin);
     let ch_moving = DbChannel::with_origin(&db, &config.mono_pv("Moving"), my_origin);
 
     // Crystal parameters
@@ -140,9 +194,9 @@ pub async fn run(
     let ch_y_mot_name = DbChannel::with_origin(&db, &config.mono_pv("YPv"), my_origin);
     let ch_z_mot_name = DbChannel::with_origin(&db, &config.mono_pv("ZPv"), my_origin);
 
-    let _ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ThetaCmd"), my_origin);
-    let _ch_y_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("YCmd"), my_origin);
-    let _ch_z_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ZCmd"), my_origin);
+    let ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ThetaCmd"), my_origin);
+    let ch_y_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("YCmd"), my_origin);
+    let ch_z_cmd_echo = DbChannel::with_origin(&db, &config.mono_pv("ZCmd"), my_origin);
     let ch_theta_rdbk_echo =
         DbChannel::with_origin(&db, &config.mono_pv("ThetaMotRdbk"), my_origin);
     let ch_y_rdbk_echo = DbChannel::with_origin(&db, &config.mono_pv("YRdbk"), my_origin);
@@ -164,15 +218,6 @@ pub async fn run(
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
     let ch_y_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".DMOV"), my_origin);
     let ch_z_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".DMOV"), my_origin);
-
-    let ch_theta_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLS"), my_origin);
-    let ch_theta_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLS"), my_origin);
-    let ch_y_hls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".HLS"), my_origin);
-    let ch_y_lls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".LLS"), my_origin);
-    let ch_z_hls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLS"), my_origin);
-    let ch_z_lls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLS"), my_origin);
 
     let ch_theta_set_ao = DbChannel::with_origin(&db, &config.mono_pv("ThetaSet"), my_origin);
     let ch_y_set_ao = DbChannel::with_origin(&db, &config.mono_pv("YSet"), my_origin);
@@ -212,20 +257,14 @@ pub async fn run(
     let ch_z_mot_rbv =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".RBV"), my_origin);
 
-    let _ch_use_set = DbChannel::with_origin(&db, &config.mono_pv("UseSet"), my_origin);
-    let ch_theta_mot_set =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".SET"), my_origin);
-    let ch_y_mot_set =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".SET"), my_origin);
-    let ch_z_mot_set =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".SET"), my_origin);
-
     let ch_speed_ctrl = DbChannel::with_origin(&db, &config.mono_pv("SpeedCtrl"), my_origin);
     let ch_y_offset = DbChannel::with_origin(&db, &config.mono_pv("yOffset"), my_origin);
     let ch_y_offset_hi = DbChannel::with_origin(&db, &config.mono_pv("yOffset.DRVH"), my_origin);
     let ch_y_offset_lo = DbChannel::with_origin(&db, &config.mono_pv("yOffset.DRVL"), my_origin);
 
-    // Wait for key channels
+    let limit_switches = LimitSwitches::new(&db, my_origin, |m, f| {
+        config.motor_pv([&config.m_theta, &config.m_y, &config.m_z][m], f)
+    });
 
     // Build multi-monitor for all event-driving PVs
     let monitored_pvs: Vec<String> = vec![
@@ -237,16 +276,19 @@ pub async fn run(
         config.mono_pv("L"),
         config.mono_pv("A"),
         config.mono_pv("Put"),
-        config.mono_pv("Mode"),
-        config.mono_pv("Mode2"),
         config.mono_pv("OperAck"),
         config.motor_pv(&config.m_theta, ".RBV"),
         config.motor_pv(&config.m_theta, ".HLM"),
         config.motor_pv(&config.m_theta, ".LLM"),
         config.mono_pv("yOffset"),
-        config.mono_pv("UseSet"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
+    // waitForCmnd `when` tests them (kohzuCtl_soft.st:74-81, :628-692): they
+    // are written on arrival and only read.
+    monitor
+        .add_vars(&db, &[config.mono_pv("Mode"), config.mono_pv("Mode2")])
+        .await;
     println!(
         "kohzuCtl_soft: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -255,15 +297,10 @@ pub async fn run(
 
     let geom = config.geom;
 
-    // Motor names
-    let theta_name = format!("{}{}", config.prefix, config.m_theta);
-    let y_name = format!("{}{}", config.prefix, config.m_y);
-    let z_name = format!("{}{}", config.prefix, config.m_z);
-    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
-    let _ = ch_y_mot_name.put_string_process(&y_name).await;
-    let _ = ch_z_mot_name.put_string_process(&z_name).await;
-
-    // Geometry init
+    // C initSeq=0 (kohzuCtl_soft.st:478-539).
+    let _ = ch_put_vals.put_i16_process(0).await;
+    let _ = ch_auto_mode.put_i16_process(0).await;
+    let _ = ch_oper_ack.put_i16_process(0).await;
     match geom {
         Geometry::Standard => {
             let _ = ch_y_offset_hi.put_f64_process(17.5 + 0.000001).await;
@@ -277,67 +314,38 @@ pub async fn run(
             let _ = ch_y_set_lo.put_f64_process(0.0).await;
         }
     }
+    let theta_name = format!("{}{}", config.prefix, config.m_theta);
+    let y_name = format!("{}{}", config.prefix, config.m_y);
+    let z_name = format!("{}{}", config.prefix, config.m_z);
+    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
+    let _ = ch_y_mot_name.put_string_process(&y_name).await;
+    let _ = ch_z_mot_name.put_string_process(&z_name).await;
+    let mut init_seq = 1;
 
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
+    let mut two_d = 0.0;
+    // C's thetaHi/thetaLo are assigned, not monitored: zero until
+    // thetaLimits, which first runs on the connect-time thetaMotHiLim monitor.
+    let mut theta_hi = 0.0;
+    let mut theta_lo = 0.0;
+    // C's E/lambda/theta and the three setpoints are monitored globals;
+    // prev_* are snapshotted only by waitForCmndEnter once initSeqDone.
+    let mut theta_val = ch_theta.get_f64().await;
+    let mut lambda_val = ch_lambda.get_f64().await;
+    let mut e_val = ch_e.get_f64().await;
+    let (mut prev_e, mut prev_theta, mut prev_lambda) = (0.0, 0.0, 0.0);
+    let mut desired = [0.0; 3];
+    let mut prev_desired = [0.0; 3];
+    let mut old_speeds = [0.0; 3];
+    let mut new_speeds = [0.0; 3];
 
-    // Crystal parameters
-    let mut h = ch_h.get_f64().await;
-    let mut k = ch_k.get_f64().await;
-    let mut l = ch_l.get_f64().await;
-    let mut a = ch_a.get_f64().await;
-    let (mut two_d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
-    let _ = ch_d.put_f64_process(two_d).await;
-    let _ = ch_seq_msg1.put_string_process(msg).await;
-    // C calc2dSpacing sets opAlert from the forbidden-reflection check (1/0).
-    let _ = ch_alert.put_i16_process(forbidden as i16).await;
-
-    // Theta/energy limits
-    let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
-    let mut theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
-    let (mut theta_hi, mut theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-    let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-    let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-    let (e_hi, e_lo, l_hi, l_lo) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-    let _ = ch_e_hi.put_f64_process(e_hi).await;
-    let _ = ch_e_lo.put_f64_process(e_lo).await;
-    let _ = ch_lambda_hi.put_f64_process(l_hi).await;
-    let _ = ch_lambda_lo.put_f64_process(l_lo).await;
-
-    // Initial readbacks
-    let theta_mot_rdbk = ch_theta_mot_rbv.get_f64().await;
-    let mut theta_rdbk_val = theta_mot_rdbk;
-    let mut lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-    let mut e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-    let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-    let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-    let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-    let mut theta_val = theta_mot_rdbk;
-    let _ = ch_theta.put_f64_process(theta_val).await;
-    let mut lambda_val = theta_to_lambda(theta_val, two_d);
-    let _ = ch_lambda.put_f64_process(lambda_val).await;
-    let mut e_val = lambda_to_energy(lambda_val);
-    let _ = ch_e.put_f64_process(e_val).await;
-
-    let mut auto_mode = false;
-    let mut use_set_mode = false;
-    let mut cc_mode = CrystalMode::from_i16(ch_cc_mode.get_i16().await);
     let mut y_offset_val = ch_y_offset.get_f64().await;
-    let mut _caused_move = false;
+    let mut caused_move = false;
+    let mut will_violate = false;
+    let mut kohzu_done = false;
+    let mut init_seq_done = false;
     let risk_averse = false;
-
-    // Last *accepted* motor setpoints, restored when a command would violate a
-    // limit. C kohzuCtl_soft snapshots prev_thetaMotDesired/prev_yMotDesired/
-    // prev_zMotDesired at waitForCmnd entry (kohzuCtl_soft.st:618-620) and
-    // restores them in the `when (willViolateLimit)` block (kohzuCtl_soft.st:899-903).
-    let mut last_theta_set = theta_val;
-    let mut last_y_set = calc_y_position(geom, theta_val, y_offset_val);
-    let mut last_z_set = calc_z_position(geom, theta_val, y_offset_val);
-
-    let _ = ch_seq_msg1.put_string_process("Kohzu Control Ready").await;
-    let _ = ch_seq_msg2.put_string_process(" ").await;
+    // The connect-time monitor events waitForCmnd takes before any live one.
+    let mut connect_events: VecDeque<(String, f64)> = VecDeque::new();
 
     info!(
         "Kohzu soft controller initialized for {}{}",
@@ -355,431 +363,512 @@ pub async fn run(
     let pv_put_vals = config.mono_pv("Put");
     let pv_auto_mode = config.mono_pv("Mode");
     let pv_cc_mode = config.mono_pv("Mode2");
+    let cc_mode_of = |m: &mut DbMultiMonitor| CrystalMode::from_i16(m.var(&pv_cc_mode) as i16);
     let pv_oper_ack = config.mono_pv("OperAck");
     let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
     let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
     let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
     let pv_y_offset = config.mono_pv("yOffset");
-    let pv_use_set = config.mono_pv("UseSet");
 
-    println!(
-        "kohzuCtl_soft: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
-        two_d, theta_lo, theta_hi
-    );
+    // C's thetaRdbk/lambdaRdbk/ERdbk, recomputed from a theta readback.
+    let put_readbacks = async |rbv: f64, two_d: f64| {
+        let lambda = theta_to_lambda(rbv, two_d);
+        let _ = ch_theta_rdbk.put_f64_process(rbv).await;
+        let _ = ch_lambda_rdbk.put_f64_process(lambda).await;
+        let _ = ch_e_rdbk.put_f64_process(lambda_to_energy(lambda)).await;
+    };
+    // C's lambdaHi, lambdaLo, EHi, ELo puts, in its order.
+    let put_limits = async |theta_hi: f64, theta_lo: f64, two_d: f64| {
+        let (e_hi, e_lo, lambda_hi, lambda_lo) =
+            compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
+        let _ = ch_lambda_hi.put_f64_process(lambda_hi).await;
+        let _ = ch_lambda_lo.put_f64_process(lambda_lo).await;
+        let _ = ch_e_hi.put_f64_process(e_hi).await;
+        let _ = ch_e_lo.put_f64_process(e_lo).await;
+    };
+    let all_done = async || {
+        ch_theta_dmov.get_i16().await != 0
+            && ch_y_dmov.get_i16().await != 0
+            && ch_z_dmov.get_i16().await != 0
+    };
 
-    let mut deferred_events: HashMap<String, f64> = HashMap::new();
-    // -- Main loop --
+    let mut state = KohzuSoftState::DInputChanged;
     loop {
-        // Snapshot the last-accepted bragg state for limit-violation rollback
-        // (C kohzuCtl_soft.st:615-620, snapshotted at waitForCmnd entry).
-        let prev_e = e_val;
-        let prev_theta = theta_val;
-        let prev_lambda = lambda_val;
-
-        let mut proceed_to_theta_changed = false;
-
-        let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
-            let val = deferred_events.remove(&key).unwrap();
-            (key, val)
-        } else {
-            monitor.wait_change().await
-        };
-
-        if changed_pv == pv_e {
-            let new_e = new_val;
-            if (new_e - e_val).abs() > 1e-12 {
-                e_val = new_e;
-                lambda_val = energy_to_lambda(e_val);
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                if lambda_val > two_d {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Wavelength > 2d spacing.")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
+        state = match state {
+            KohzuSoftState::Init | KohzuSoftState::InitSequence => match init_seq {
+                // kohzuCtl_soft.st:541-560
+                1 => {
+                    init_seq = 2;
+                    KohzuSoftState::CheckMotorLimits
                 }
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_lambda {
-            let new_l = new_val;
-            if (new_l - lambda_val).abs() > 1e-12 {
-                lambda_val = new_l;
-                if lambda_val > two_d {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Wavelength > 2d spacing.")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                    theta_val = th;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
+                2 => {
+                    init_seq = 3;
+                    KohzuSoftState::UpdateReadback
                 }
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_theta {
-            let new_th = new_val;
-            if (new_th - theta_val).abs() > 1e-12 {
-                theta_val = new_th;
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_h
-            || changed_pv == pv_k
-            || changed_pv == pv_l
-            || changed_pv == pv_a
-        {
-            h = ch_h.get_f64().await;
-            k = ch_k.get_f64().await;
-            l = ch_l.get_f64().await;
-            a = ch_a.get_f64().await;
-            let (d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
-            two_d = d;
-            let _ = ch_d.put_f64_process(two_d).await;
-            let _ = ch_seq_msg1.put_string_process(msg).await;
-            // C kohzuCtl_soft_calc2dSpacing sets opAlert from the (H,K,L) parity
-            // check and pvPuts it (kohzuCtl_soft.st:700,711): forbidden -> 1,
-            // valid -> 0 (cleared on return to a valid reflection).
-            let _ = ch_alert.put_i16_process(forbidden as i16).await;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 {
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_auto_mode {
-            auto_mode = new_val as i16 != 0;
-        } else if changed_pv == pv_cc_mode {
-            cc_mode = CrystalMode::from_i16(new_val as i16);
-        } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_seq_msg1.put_string_process(" ").await;
-                let _ = ch_seq_msg2.put_string_process(" ").await;
+                _ => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let _ = ch_seq_msg1.put_string_process("Kohzu Control Ready").await;
+                    let _ = ch_seq_msg2.put_string_process(" ").await;
+                    init_seq_done = true;
+                    theta_val = ch_theta_mot_rbv.get_f64().await;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
+                    // The monitors waitForCmndEnter does not clear, in
+                    // waitForCmnd's order (kohzuCtl_soft.st:641-680).
+                    for ch in [&ch_theta_mot_hilim, &ch_theta_mot_rbv, &ch_y_offset] {
+                        connect_events.push_back((ch.name().to_string(), ch.get_f64().await));
+                    }
+                    KohzuSoftState::ThetaChanged
+                }
+            },
+            KohzuSoftState::WaitForCommandEnter if !init_seq_done => KohzuSoftState::InitSequence,
+            KohzuSoftState::WaitForCommandEnter => {
+                // kohzuCtl_soft.st:563-622
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                for pv in [&pv_h, &pv_k, &pv_l, &pv_a, &pv_e, &pv_lambda, &pv_theta] {
+                    monitor.clear(pv);
+                }
+                let _ = ch_theta_rdbk_echo
+                    .put_f64_process(ch_theta_mot_rbv.get_f64().await)
+                    .await;
+                let _ = ch_y_rdbk_echo
+                    .put_f64_process(ch_y_mot_rbv.get_f64().await)
+                    .await;
+                let _ = ch_z_rdbk_echo
+                    .put_f64_process(ch_z_mot_rbv.get_f64().await)
+                    .await;
+                let _ = ch_theta_vel_echo
+                    .put_f64_process(ch_theta_mot_velo.get_f64().await)
+                    .await;
+                let _ = ch_y_vel_echo
+                    .put_f64_process(ch_y_mot_velo.get_f64().await)
+                    .await;
+                let _ = ch_z_vel_echo
+                    .put_f64_process(ch_z_mot_velo.get_f64().await)
+                    .await;
+                let _ = ch_theta_cmd_echo
+                    .put_f64_process(ch_theta_mot_cmd.get_f64().await)
+                    .await;
+                let _ = ch_y_cmd_echo
+                    .put_f64_process(ch_y_mot_cmd.get_f64().await)
+                    .await;
+                let _ = ch_z_cmd_echo
+                    .put_f64_process(ch_z_mot_cmd.get_f64().await)
+                    .await;
+                let _ = ch_theta_dmov_echo
+                    .put_i16_process(ch_theta_dmov.get_i16().await)
+                    .await;
+                let _ = ch_y_dmov_echo
+                    .put_i16_process(ch_y_dmov.get_i16().await)
+                    .await;
+                let _ = ch_z_dmov_echo
+                    .put_i16_process(ch_z_dmov.get_i16().await)
+                    .await;
+                if monitor.var(&pv_auto_mode) != 0.0 || use_set_mode.load(Ordering::Relaxed) {
+                    put_readbacks(ch_theta_mot_rbv.get_f64().await, two_d).await;
+                }
                 let _ = ch_oper_ack.put_i16_process(0).await;
+                if kohzu_done && ch_moving.get_i16().await != 0 {
+                    kohzu_done = false;
+                    let _ = ch_moving.put_i16_process(0).await;
+                }
+                prev_theta = theta_val;
+                prev_e = e_val;
+                prev_lambda = lambda_val;
+                prev_desired = [
+                    ch_theta_set_ao.get_f64().await,
+                    ch_y_set_ao.get_f64().await,
+                    ch_z_set_ao.get_f64().await,
+                ];
+                will_violate = false;
+                KohzuSoftState::WaitForCommand
             }
-        } else if changed_pv == pv_theta_mot_rbv {
-            let rbv = new_val;
-            let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-        } else if changed_pv == pv_theta_hilim {
-            theta_mot_hi = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_theta_lolim {
-            theta_mot_lo = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_y_offset {
-            y_offset_val = new_val;
-            auto_mode = false;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_seq_msg1
-                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
-                .await;
-            let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_use_set {
-            use_set_mode = new_val as i16 != 0;
-            let sv = if use_set_mode { 1i16 } else { 0 };
-            let _ = ch_theta_mot_set.put_i16_process(sv).await;
-            let _ = ch_y_mot_set.put_i16_process(sv).await;
-            let _ = ch_z_mot_set.put_i16_process(sv).await;
-        }
-
-        if !proceed_to_theta_changed {
-            continue;
-        }
-
-        // -- Theta-changed processing --
-        let mut will_violate = false;
-        let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
-        if was_clamped {
-            theta_val = clamped_theta;
-            let _ = ch_seq_msg1
-                .put_string_process("Theta constrained to LIMIT")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-            if risk_averse {
-                auto_mode = false;
+            KohzuSoftState::WaitForCommand => {
+                // kohzuCtl_soft.st:628-691
+                let (pv, val) = match connect_events.pop_front() {
+                    Some(event) => event,
+                    None => monitor.wait_change().await,
+                };
+                if pv == pv_h || pv == pv_k || pv == pv_l || pv == pv_a {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Lattice Spacing Changed")
+                        .await;
+                    for pv in [&pv_h, &pv_k, &pv_l, &pv_a] {
+                        monitor.clear(pv);
+                    }
+                    let _ = ch_seq_msg2.put_string_process(" ").await;
+                    KohzuSoftState::DInputChanged
+                } else if pv == pv_theta_hilim || pv == pv_theta_lolim {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Theta Motor Soft Limits Changed")
+                        .await;
+                    let _ = ch_seq_msg2.put_string_process(" ").await;
+                    monitor.clear(&pv_theta_hilim);
+                    monitor.clear(&pv_theta_lolim);
+                    KohzuSoftState::ThetaLimits
+                } else if pv == pv_theta_mot_rbv {
+                    // updatePsuedo_soft's thetaMotRdbkPseudo_mon echo.
+                    let _ = ch_theta_rdbk_echo.put_f64_process(val).await;
+                    KohzuSoftState::UpdateReadback
+                } else if pv == pv_e {
+                    e_val = val;
+                    KohzuSoftState::EChanged
+                } else if pv == pv_lambda {
+                    lambda_val = val;
+                    KohzuSoftState::LambdaChanged
+                } else if pv == pv_theta {
+                    theta_val = val;
+                    KohzuSoftState::ThetaChanged
+                } else if pv == pv_put_vals && val as i16 != 0 {
+                    desired = [
+                        ch_theta_set_ao.get_f64().await,
+                        ch_y_set_ao.get_f64().await,
+                        ch_z_set_ao.get_f64().await,
+                    ];
+                    KohzuSoftState::MoveKohzu
+                } else if pv == pv_y_offset {
+                    y_offset_val = val;
+                    let _ = ch_auto_mode.put_i16_process(0).await;
+                    let _ = ch_seq_msg1
+                        .put_string_process(&format!("y offset changed to {y_offset_val:.6}"))
+                        .await;
+                    let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
+                    KohzuSoftState::CalcMovements
+                } else if pv == pv_oper_ack && val as i16 != 0 {
+                    let _ = ch_alert.put_i16_process(0).await;
+                    let _ = ch_seq_msg1.put_string_process(" ").await;
+                    let _ = ch_seq_msg2.put_string_process(" ").await;
+                    KohzuSoftState::WaitForCommandEnter
+                } else {
+                    KohzuSoftState::WaitForCommand
+                }
+            }
+            KohzuSoftState::DInputChanged => {
+                // kohzuCtl_soft.st:693-713
                 let _ = ch_auto_mode.put_i16_process(0).await;
                 let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
-            } else {
-                // C kohzuCtl_soft.st:783-784 — outside risk-averse mode a
-                // theta-limit hit sets willViolateLimit, rolling back the command.
-                will_violate = true;
+                let (d, forbidden, msg) = calc_2d_spacing(
+                    ch_a.get_f64().await,
+                    ch_h.get_f64().await,
+                    ch_k.get_f64().await,
+                    ch_l.get_f64().await,
+                );
+                two_d = d;
+                let _ = ch_d.put_f64_process(two_d).await;
+                let _ = ch_seq_msg1.put_string_process(msg).await;
+                put_limits(theta_hi, theta_lo, two_d).await;
+                let _ = ch_alert.put_i16_process(forbidden as i16).await;
+                KohzuSoftState::ThetaChanged
             }
-        }
-
-        lambda_val = theta_to_lambda(theta_val, two_d);
-        let _ = ch_lambda.put_f64_process(lambda_val).await;
-        e_val = lambda_to_energy(lambda_val);
-        let _ = ch_e.put_f64_process(e_val).await;
-
-        let current_rbv = ch_theta_mot_rbv.get_f64().await;
-        theta_rdbk_val = current_rbv;
-        lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-        e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-        let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-        let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-        let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-        // -- Calc movements --
-        let theta_mot_desired = theta_val;
-        let y_mot_desired = calc_y_position(geom, theta_val, y_offset_val);
-        let z_mot_desired = calc_z_position(geom, theta_val, y_offset_val);
-        let _ = ch_theta_set_ao.put_f64_process(theta_mot_desired).await;
-        let _ = ch_y_set_ao.put_f64_process(y_mot_desired).await;
-        let _ = ch_z_set_ao.put_f64_process(z_mot_desired).await;
-
-        // Check limits
-        let y_hi = ch_y_mot_hilim.get_f64().await;
-        let y_lo = ch_y_mot_lolim.get_f64().await;
-        let z_hi = ch_z_mot_hilim.get_f64().await;
-        let z_lo = ch_z_mot_lolim.get_f64().await;
-
-        if !cc_mode.y_frozen() && (y_mot_desired < y_lo || y_mot_desired > y_hi) {
-            let _ = ch_seq_msg1
-                .put_string_process("Y will exceed soft limits")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-            will_violate = true;
-        }
-        if !cc_mode.z_frozen() && (z_mot_desired < z_lo || z_mot_desired > z_hi) {
-            let _ = ch_seq_msg1
-                .put_string_process("Z will exceed soft limits")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-            will_violate = true;
-        }
-
-        if will_violate {
-            // C kohzuCtl_soft.st:892-905 (`when (willViolateLimit)`): restore
-            // E/theta/lambda and the three motor setpoints to their pre-command
-            // values, pvPut each, message "Command ignored". Without this the
-            // rejected out-of-range setpoints stay on the PVs.
-            e_val = prev_e;
-            theta_val = prev_theta;
-            lambda_val = prev_lambda;
-            let _ = ch_e.put_f64_process(e_val).await;
-            let _ = ch_theta.put_f64_process(theta_val).await;
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            let _ = ch_theta_set_ao.put_f64_process(last_theta_set).await;
-            let _ = ch_y_set_ao.put_f64_process(last_y_set).await;
-            let _ = ch_z_set_ao.put_f64_process(last_z_set).await;
-            let _ = ch_seq_msg2.put_string_process("Command ignored").await;
-            let _ = ch_moving.put_i16_process(0).await;
-            continue;
-        }
-
-        // Command accepted — record the setpoints to revert to next time
-        // (C snapshots them as prev_*MotDesired at the next waitForCmnd entry).
-        last_theta_set = theta_mot_desired;
-        last_y_set = y_mot_desired;
-        last_z_set = z_mot_desired;
-
-        // -- Move if appropriate --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if auto_mode || put_requested || use_set_mode {
-            let speed_control = ch_speed_ctrl.get_i16().await != 0;
-            // Save the pre-coordination motor speeds for restoration after the
-            // move. Without it each coordinated move leaves a reduced `.VELO`
-            // that the next move reads back as its baseline, decaying the
-            // speeds geometrically toward zero. C `kohzuCtl_soft.st` saves
-            // oldThSpeed/oldYSpeed/oldZSpeed (kohzuCtl_soft.st:854-856) and
-            // restores them once the motors stop (kohzuCtl_soft.st:1040-1044).
-            let mut old_th_speed = 0.0;
-            let mut old_y_speed = 0.0;
-            let mut old_z_speed = 0.0;
-            let mut speeds_coordinated = false;
-            if speed_control {
-                let th_speed = ch_theta_mot_velo.get_f64().await;
-                let y_speed = ch_y_mot_velo.get_f64().await;
-                let z_speed = ch_z_mot_velo.get_f64().await;
-                old_th_speed = th_speed;
-                old_y_speed = y_speed;
-                old_z_speed = z_speed;
-                speeds_coordinated = true;
-                let (new_th, new_y, new_z) = coordinate_speeds(
-                    theta_val - current_rbv,
+            KohzuSoftState::ThetaLimits => {
+                // kohzuCtl_soft.st:715-741
+                let theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
+                let theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
+                (theta_hi, theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
+                if theta_mot_hi > theta_hi {
+                    let _ = ch_seq_msg2
+                        .put_string_process("ThetaHiLim > 89 deg. (Using 89 deg.)")
+                        .await;
+                }
+                if theta_mot_lo < theta_lo {
+                    let _ = ch_seq_msg2
+                        .put_string_process("ThetaLoLim < 1 deg. (Using 1 deg.)")
+                        .await;
+                }
+                let _ = ch_theta_hi.put_f64_process(theta_hi).await;
+                let _ = ch_theta_lo.put_f64_process(theta_lo).await;
+                put_limits(theta_hi, theta_lo, two_d).await;
+                KohzuSoftState::CheckDone
+            }
+            KohzuSoftState::CheckDone => {
+                // kohzuCtl_soft.st:946-956
+                if all_done().await {
+                    kohzu_done = true;
+                    KohzuSoftState::WaitForCommandEnter
+                } else {
+                    KohzuSoftState::UpdateReadback
+                }
+            }
+            KohzuSoftState::EChanged => {
+                lambda_val = energy_to_lambda(e_val);
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
+                KohzuSoftState::LambdaChanged
+            }
+            KohzuSoftState::LambdaChanged => {
+                // kohzuCtl_soft.st:751-766
+                if lambda_val > two_d {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Wavelength > 2d spacing.")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                    theta_val = th;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
+                }
+                KohzuSoftState::ThetaChanged
+            }
+            KohzuSoftState::ThetaChanged => {
+                // kohzuCtl_soft.st:768-800
+                let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
+                if was_clamped {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Theta constrained to LIMIT")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    theta_val = clamped_theta;
+                    if risk_averse {
+                        let _ = ch_auto_mode.put_i16_process(0).await;
+                        let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
+                    } else {
+                        will_violate = true;
+                    }
+                }
+                lambda_val = theta_to_lambda(theta_val, two_d);
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
+                e_val = lambda_to_energy(lambda_val);
+                let _ = ch_e.put_f64_process(e_val).await;
+                put_readbacks(ch_theta_mot_rbv.get_f64().await, two_d).await;
+                KohzuSoftState::CalcMovements
+            }
+            KohzuSoftState::CalcMovements => {
+                // kohzuCtl_soft.st:802-888
+                desired = [
+                    theta_val,
+                    calc_y_position(geom, theta_val, y_offset_val),
+                    calc_z_position(geom, theta_val, y_offset_val),
+                ];
+                let [_, y_mot_desired, z_mot_desired] = desired;
+                let y_out = y_mot_desired < ch_y_mot_lolim.get_f64().await
+                    || y_mot_desired > ch_y_mot_hilim.get_f64().await;
+                let z_out = z_mot_desired < ch_z_mot_lolim.get_f64().await
+                    || z_mot_desired > ch_z_mot_hilim.get_f64().await;
+                for (out, msg) in [
+                    (
+                        !cc_mode_of(&mut monitor).y_frozen() && y_out,
+                        "Y will exceed soft limits",
+                    ),
+                    (
+                        !cc_mode_of(&mut monitor).z_frozen() && z_out,
+                        "Z will exceed soft limits",
+                    ),
+                ] {
+                    if !out {
+                        continue;
+                    }
+                    let _ = ch_seq_msg1.put_string_process(msg).await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    if risk_averse {
+                        let _ = ch_seq_msg2
+                            .put_string_process("Setting to Manual Mode")
+                            .await;
+                        let _ = ch_alert.put_i16_process(1).await;
+                        let _ = ch_auto_mode.put_i16_process(0).await;
+                    } else {
+                        will_violate = true;
+                    }
+                }
+                let _ = ch_theta_set_ao.put_f64_process(desired[0]).await;
+                let _ = ch_y_set_ao.put_f64_process(y_mot_desired).await;
+                let _ = ch_z_set_ao.put_f64_process(z_mot_desired).await;
+                old_speeds = [
+                    ch_theta_mot_velo.get_f64().await,
+                    ch_y_mot_velo.get_f64().await,
+                    ch_z_mot_velo.get_f64().await,
+                ];
+                let (th, y, z) = coordinate_speeds(
+                    theta_val - ch_theta_mot_rbv.get_f64().await,
                     y_mot_desired - ch_y_mot_rbv.get_f64().await,
                     z_mot_desired - ch_z_mot_rbv.get_f64().await,
-                    th_speed,
-                    y_speed,
-                    z_speed,
-                    cc_mode,
+                    old_speeds[0],
+                    old_speeds[1],
+                    old_speeds[2],
+                    cc_mode_of(&mut monitor),
                 );
-                let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
-                if !cc_mode.y_frozen() {
-                    let _ = ch_y_mot_velo.put_f64_process(new_y).await;
-                }
-                if !cc_mode.z_frozen() {
-                    let _ = ch_z_mot_velo.put_f64_process(new_z).await;
+                new_speeds = [th, y, z];
+                KohzuSoftState::MoveKohzu
+            }
+            KohzuSoftState::MoveKohzu => {
+                // kohzuCtl_soft.st:890-944: unlike kohzuCtl, a limit
+                // violation is rolled back only when a move was asked for.
+                if !(monitor.var(&pv_auto_mode) != 0.0
+                    || ch_put_vals.get_i16().await != 0
+                    || use_set_mode.load(Ordering::Relaxed))
+                {
+                    KohzuSoftState::WaitForCommandEnter
+                } else if will_violate {
+                    e_val = prev_e;
+                    let _ = ch_e.put_f64_process(e_val).await;
+                    theta_val = prev_theta;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
+                    lambda_val = prev_lambda;
+                    let _ = ch_lambda.put_f64_process(lambda_val).await;
+                    desired = prev_desired;
+                    let _ = ch_theta_set_ao.put_f64_process(desired[0]).await;
+                    let _ = ch_y_set_ao.put_f64_process(desired[1]).await;
+                    let _ = ch_z_set_ao.put_f64_process(desired[2]).await;
+                    let _ = ch_seq_msg2.put_string_process("Command ignored").await;
+                    KohzuSoftState::UpdateReadback
+                } else {
+                    if ch_speed_ctrl.get_i16().await != 0 {
+                        let _ = ch_theta_mot_velo.put_f64_process(new_speeds[0]).await;
+                        if !cc_mode_of(&mut monitor).y_frozen() {
+                            let _ = ch_y_mot_velo.put_f64_process(new_speeds[1]).await;
+                        }
+                        if !cc_mode_of(&mut monitor).z_frozen() {
+                            let _ = ch_z_mot_velo.put_f64_process(new_speeds[2]).await;
+                        }
+                    }
+                    let _ = ch_theta_mot_cmd.put_f64_process(desired[0]).await;
+                    if !cc_mode_of(&mut monitor).y_frozen() {
+                        let _ = ch_y_mot_cmd.put_f64_process(desired[1]).await;
+                    }
+                    if !cc_mode_of(&mut monitor).z_frozen() {
+                        let _ = ch_z_mot_cmd.put_f64_process(desired[2]).await;
+                    }
+                    let _ = ch_put_vals.put_i16_process(0).await;
+                    caused_move = true;
+                    KohzuSoftState::UpdateReadback
                 }
             }
-
-            let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
-            match cc_mode {
-                CrystalMode::Normal => {
-                    let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await;
-                    let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
-                }
-                CrystalMode::ChannelCut => {}
-                CrystalMode::FreezeZ => {
-                    let _ = ch_y_mot_cmd.put_f64_process(y_mot_desired).await;
-                }
-                CrystalMode::FreezeY => {
-                    let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
+            KohzuSoftState::UpdateReadback => {
+                // kohzuCtl_soft.st:958-1035
+                if will_violate {
+                    KohzuSoftState::WaitForCommandEnter
+                } else if ch_theta_mot_rbv.get_f64().await == 0.0 {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Theta Motor Readback is 0 !")
+                        .await;
+                    let _ = ch_seq_msg2
+                        .put_string_process("Monochromator stopped")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    KohzuSoftState::WaitForCommandEnter
+                } else if all_done().await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let rbv = ch_theta_mot_rbv.get_f64().await;
+                    put_readbacks(rbv, two_d).await;
+                    kohzu_done = true;
+                    let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
+                    monitor.clear(&pv_theta_mot_rbv);
+                    KohzuSoftState::ThetaMotorStopped
+                } else if let Some(msg) = limit_switches.hit(cc_mode_of(&mut monitor)).await {
+                    let _ = ch_seq_msg1.put_string_process(msg).await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    let _ = ch_auto_mode.put_i16_process(0).await;
+                    let _ = ch_seq_msg2
+                        .put_string_process("Setting to Manual Mode")
+                        .await;
+                    KohzuSoftState::StopKohzu
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    put_readbacks(ch_theta_mot_rbv.get_f64().await, two_d).await;
+                    KohzuSoftState::UpdateReadback
                 }
             }
-
-            let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
-
-            // Wait for motors
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let th_dmov = ch_theta_dmov.get_i16().await;
-                let y_dmov = ch_y_dmov.get_i16().await;
-                let z_dmov = ch_z_dmov.get_i16().await;
-
-                if ch_theta_hls.get_i16().await != 0 || ch_theta_lls.get_i16().await != 0 {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Theta Motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_y_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
+            KohzuSoftState::ThetaMotorStopped if caused_move => {
+                // kohzuCtl_soft.st:1038-1050
+                if ch_speed_ctrl.get_i16().await != 0 {
+                    let _ = ch_theta_mot_velo.put_f64_process(old_speeds[0]).await;
+                    let _ = ch_y_mot_velo.put_f64_process(old_speeds[1]).await;
+                    let _ = ch_z_mot_velo.put_f64_process(old_speeds[2]).await;
                 }
-                if !cc_mode.y_frozen()
-                    && (ch_y_hls.get_i16().await != 0 || ch_y_lls.get_i16().await != 0)
-                {
-                    let _ = ch_seq_msg1
-                        .put_string_process("Y Motor hit a limit switch!")
-                        .await;
+                caused_move = false;
+                KohzuSoftState::WaitForCommandEnter
+            }
+            KohzuSoftState::ThetaMotorStopped => {
+                // Someone moved the theta motor directly (kohzuCtl_soft.st:1052-1071).
+                if init_seq_done {
                     let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_y_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
-                }
-                if !cc_mode.z_frozen()
-                    && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
-                {
                     let _ = ch_seq_msg1
-                        .put_string_process("Z Motor hit a limit switch!")
+                        .put_string_process("Only Theta Motor Moved")
                         .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    auto_mode = false;
+                    let _ = ch_seq_msg2
+                        .put_string_process("Hit MOVE to Adjust Y & Z")
+                        .await;
                     let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_y_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
                 }
-
-                // Update readbacks while moving
+                theta_val = ch_theta_mot_rbv.get_f64().await;
+                let _ = ch_theta.put_f64_process(theta_val).await;
+                lambda_val = theta_to_lambda(theta_val, two_d);
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
+                e_val = lambda_to_energy(lambda_val);
+                let _ = ch_e.put_f64_process(e_val).await;
+                KohzuSoftState::ThetaChanged
+            }
+            KohzuSoftState::CheckMotorLimits => {
+                // chkMotorLimits / chkMotorLimitsExit (kohzuCtl_soft.st:1074-1143).
+                // C re-checks on its delay(2.), so init holds here at that
+                // period until every readback is nonzero and inside its limits.
                 let rbv = ch_theta_mot_rbv.get_f64().await;
-                theta_rdbk_val = rbv;
-                lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-                if th_dmov != 0 && y_dmov != 0 && z_dmov != 0 {
-                    break;
+                put_readbacks(rbv, two_d).await;
+                let cc_mode = cc_mode_of(&mut monitor);
+                let axes = [
+                    (
+                        !cc_mode.y_frozen(),
+                        ch_y_mot_rbv.get_f64().await,
+                        ch_y_mot_lolim.get_f64().await,
+                        ch_y_mot_hilim.get_f64().await,
+                        "Y",
+                    ),
+                    (
+                        !cc_mode.z_frozen(),
+                        ch_z_mot_rbv.get_f64().await,
+                        ch_z_mot_lolim.get_f64().await,
+                        ch_z_mot_hilim.get_f64().await,
+                        "Z",
+                    ),
+                    (
+                        true,
+                        rbv,
+                        ch_theta_mot_lolim.get_f64().await,
+                        ch_theta_mot_hilim.get_f64().await,
+                        "Theta",
+                    ),
+                ];
+                let mut alert = false;
+                for (checked, rdbk, lo, hi, axis) in axes {
+                    if !checked {
+                        continue;
+                    }
+                    if rdbk == 0.0 {
+                        let _ = ch_seq_msg1
+                            .put_string_process(&format!("{axis} Readback of 0 not reasonable"))
+                            .await;
+                        alert = true;
+                    }
+                    if rdbk < lo || rdbk > hi {
+                        let _ = ch_seq_msg1
+                            .put_string_process(&format!("{axis} Readback outside Motor Limits"))
+                            .await;
+                        alert = true;
+                    }
+                }
+                if alert {
+                    let _ = ch_alert.put_i16_process(1).await;
+                    let _ = ch_auto_mode.put_i16_process(0).await;
+                    let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                    let _ = ch_seq_msg2
+                        .put_string_process("Modify Motor Positions/Limits")
+                        .await;
+                    KohzuSoftState::CheckMotorLimits
+                } else {
+                    let _ = ch_alert.put_i16_process(0).await;
+                    let _ = ch_seq_msg1
+                        .put_string_process("All motors within limits")
+                        .await;
+                    KohzuSoftState::WaitForCommandEnter
                 }
             }
-
-            // Restore the pre-coordination motor speeds now the move has
-            // stopped (C `kohzuCtl_soft.st` state thetaMotStopped).
-            if speeds_coordinated {
-                let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
-                if !cc_mode.y_frozen() {
-                    let _ = ch_y_mot_velo.put_f64_process(old_y_speed).await;
-                }
-                if !cc_mode.z_frozen() {
-                    let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
-                }
+            KohzuSoftState::StopKohzu => {
+                // stopKohzu / stoppedKohzuWait (kohzuCtl_soft.st:1145-1158).
+                let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                let _ = ch_y_stop.put_i16_process(1).await;
+                let _ = ch_z_stop.put_i16_process(1).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                KohzuSoftState::UpdateReadback
             }
-
-            _caused_move = false;
-
-            // Final readback
-            let rbv = ch_theta_mot_rbv.get_f64().await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            let _ = ch_moving.put_i16_process(0).await;
-        }
-
-        // Update echoes
-        let _ = ch_theta_rdbk_echo
-            .put_f64_process(ch_theta_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_y_rdbk_echo
-            .put_f64_process(ch_y_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_z_rdbk_echo
-            .put_f64_process(ch_z_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_theta_vel_echo
-            .put_f64_process(ch_theta_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_y_vel_echo
-            .put_f64_process(ch_y_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_z_vel_echo
-            .put_f64_process(ch_z_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_theta_dmov_echo
-            .put_i16_process(ch_theta_dmov.get_i16().await)
-            .await;
-        let _ = ch_y_dmov_echo
-            .put_i16_process(ch_y_dmov.get_i16().await)
-            .await;
-        let _ = ch_z_dmov_echo
-            .put_i16_process(ch_z_dmov.get_i16().await)
-            .await;
+        };
     }
 }
 

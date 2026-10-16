@@ -376,11 +376,9 @@ fn debug_print(debug_flag: i32, level: i32, msg: &str) {
 /// reached by stepping while [`DelayDoState::is_transient`] holds. It then
 /// blocks — on monitors alone, or on whichever of a monitor and the armed
 /// `delay(delayPeriod)` clause comes first. `{P}{R}:delay` and `{P}{R}:debug`
-/// appear in no `when` condition, only inside action blocks, so a monitor on
-/// either updates the runner and does NOT re-evaluate: an evaluation runs
-/// `efTestAndClear` on the flags its clauses name, and one triggered by a
-/// variable no clause tests would consume an event that had not been acted
-/// on.
+/// are `PV(..., Monitor)` with no flag (`:22`, `:26`) and appear in no `when`
+/// condition, so they are monitor vars: written as they arrive, read at each
+/// evaluation, and never a wake-up.
 ///
 /// One deviation, and it is loud rather than silent: a PV that `delayDo.db`
 /// never loaded leaves C in `init` forever, because `pvConnectCount()` never
@@ -398,19 +396,12 @@ pub async fn run(
     let pv_active = config.pv("activeCalc");
     let pv_delay = config.pv("delay");
     let pv_debug = config.pv("debug");
-    let monitored = vec![
-        pv_enable.clone(),
-        pv_standby.clone(),
-        pv_active.clone(),
-        pv_delay.clone(),
-        pv_debug.clone(),
-    ];
+    let monitored = vec![pv_enable.clone(), pv_standby.clone(), pv_active.clone()];
+    let vars = [pv_delay.clone(), pv_debug.clone()];
 
     let ch_enable = DbChannel::with_origin(&db, &pv_enable, origin);
     let ch_standby = DbChannel::with_origin(&db, &pv_standby, origin);
     let ch_active = DbChannel::with_origin(&db, &pv_active, origin);
-    let ch_delay = DbChannel::with_origin(&db, &pv_delay, origin);
-    let ch_debug = DbChannel::with_origin(&db, &pv_debug, origin);
 
     // `PV(..., NoMon)` — the two outputs. `doSeq` is assigned to the field
     // `.PROC` (`:27`), so the put processes the sseq rather than setting a
@@ -419,18 +410,19 @@ pub async fn run(
     let ch_doseq = DbChannel::with_origin(&db, &format!("{}.PROC", config.pv("doSeq")), origin);
 
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored, origin).await;
-    if monitor.sub_count() != monitored.len() {
+    let subscribed = monitor.sub_count() + monitor.add_vars(&db, &vars).await;
+    let assigned = monitored.len() + vars.len();
+    if subscribed != assigned {
         return Err(format!(
-            "delayDo: {} of the {} PVs it assigns are not in the database ({})",
-            monitored.len() - monitor.sub_count(),
-            monitored.len(),
-            monitored.join(", ")
+            "delayDo: {} of the {assigned} PVs it assigns are not in the database ({}, {})",
+            assigned - subscribed,
+            monitored.join(", "),
+            vars.join(", ")
         )
         .into());
     }
 
-    let mut debug_flag = ch_debug.get_i32().await;
-    let mut ctrl = DelayDoController::new(ch_delay.get_f64().await);
+    let mut ctrl = DelayDoController::default();
     // SNL's `monitor` delivers the variable's current value at connect, so the
     // machine starts on levels rather than on zeroes. `enable` is a `short`
     // and the two calcs are `int` (`:23-25`), and C truncates on the way in —
@@ -447,6 +439,8 @@ pub async fn run(
     loop {
         loop {
             let previous = ctrl.state;
+            ctrl.delay_period =
+                epics_base_rs::runtime::time::duration_from_secs(monitor.var(&pv_delay));
             let (action, state) = ctrl.step(&inputs);
             // One evaluation consumes the monitor events it was given; a
             // transient state's re-evaluation is not a second arrival.
@@ -460,7 +454,11 @@ pub async fn run(
                 let _ = ch_doseq.put_i32_process(1).await;
             }
             if state != previous {
-                debug_print(debug_flag, 3, &format!("{previous} -> {state}"));
+                debug_print(
+                    monitor.var(&pv_debug) as i32,
+                    3,
+                    &format!("{previous} -> {state}"),
+                );
                 if state.is_published() {
                     let _ = ch_state.put_string_process(&state.to_string()).await;
                 }
@@ -470,33 +468,23 @@ pub async fn run(
             }
         }
 
-        loop {
-            let woken = match ctrl.delay_remaining() {
-                Some(remaining) => tokio::time::timeout(remaining, monitor.wait_change())
-                    .await
-                    .ok(),
-                None => Some(monitor.wait_change().await),
-            };
-            let Some((pv, value)) = woken else {
-                // The armed `delay(delayPeriod)` clause came first.
-                break;
-            };
+        let woken = match ctrl.delay_remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, monitor.wait_change())
+                .await
+                .ok(),
+            None => Some(monitor.wait_change().await),
+        };
+        // `None`: the armed `delay(delayPeriod)` clause came first.
+        if let Some((pv, value)) = woken {
             if pv == pv_enable {
                 inputs.enable = (value as i16) != 0;
                 inputs.enable_changed = true;
-                break;
             } else if pv == pv_standby {
                 inputs.standby = (value as i32) != 0;
                 inputs.standby_changed = true;
-                break;
             } else if pv == pv_active {
                 inputs.active = (value as i32) != 0;
                 inputs.active_changed = true;
-                break;
-            } else if pv == pv_delay {
-                ctrl.delay_period = epics_base_rs::runtime::time::duration_from_secs(value);
-            } else if pv == pv_debug {
-                debug_flag = value as i32;
             }
         }
     }

@@ -2,7 +2,7 @@
 //!
 //! Corresponds to C++ QSRV's `PDBSinglePV` / `PDBSingleChannel`.
 
-// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use crate::error::{BridgeError, BridgeResult};
 // `epics_bridge_rs::qsrv::{ProcessMode, PutOptions,
 // dbe_mask_from_pv_request}` is a published path.
 pub use epics_base_rs::server::database::ProcessMode;
+use epics_pva_rs::pvdata::encode::default_value_for;
+use epics_pva_rs::server_native::source::RecordPutKind;
 pub use epics_pva_rs::server_native::source::{PutOptions, dbe_mask_from_pv_request};
 
 /// parse `record._options.atomic` from a group operation
@@ -678,6 +680,28 @@ impl BridgeChannel {
             )));
         }
 
+        // pvxs `SingleSource::onPut`'s decision on whether `value` is
+        // marked, the owner the native PVA source routes through too; here a
+        // present `value` is a marked one.
+        let desc = build_field_desc_for_nt(self.nt_type, dbf_to_scalar_type(self.value_dbf));
+        let value_marked = value.get_field("value").is_some();
+        let defaulted;
+        let value = match RecordPutKind::decide(&desc, value_marked, &opts) {
+            RecordPutKind::Write if value_marked => value,
+            RecordPutKind::Write => match default_value_for(&desc) {
+                PvField::Structure(s) => {
+                    defaulted = s;
+                    &defaulted
+                }
+                other => unreachable!("an NT type is a structure, not {other}"),
+            },
+            kind => {
+                return self
+                    .put_unwritten(grant, kind == RecordPutKind::PostProcess, opts)
+                    .await;
+            }
+        };
+
         // Extract value from the NormativeType structure
         let raw_val = pv_structure_to_epics(value).ok_or_else(|| BridgeError::TypeMismatch {
             expected: "extractable value".into(),
@@ -788,14 +812,7 @@ impl BridgeChannel {
         // `dbr_type` is the channel's final field type
         // (`dbChannelFinalCAType`); `value_str`/`no_elements` are
         // rendered from the value inside the helper.
-        let meta = super::trap_write::TrapWriteMeta {
-            pv_name: &self.pv_name,
-            user: self.access.creds.user.as_bytes(),
-            host: &self.access.creds.host,
-            peer: &self.access.creds.host,
-            dbr_type: self.value_dbf as u16,
-        };
-        super::trap_write::put_with_trap(grant, meta, epics_val, |value| async move {
+        super::trap_write::put_with_trap(grant, self.trap_meta(), epics_val, |value| async move {
             // The whole `record._options.process`/`block` decision tree —
             // link-field override included — is the database's
             // `put_field_from_client`, shared with the native PVA source so
@@ -812,6 +829,50 @@ impl BridgeChannel {
                 .map_err(|e| BridgeError::PutRejected(e.to_string()))
         })
         .await
+    }
+}
+
+impl BridgeChannel {
+    /// A put that writes nothing: the null-array post-process, or the
+    /// blocking `processRequest` that waits out a busy record. The put log
+    /// names the field as it stands, which is what the record holds after.
+    async fn put_unwritten(
+        &self,
+        grant: super::provider::WriteGrant,
+        post_process: bool,
+        opts: PutOptions,
+    ) -> BridgeResult<()> {
+        let rec = self
+            .db
+            .get_record(&self.record_name)
+            .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.to_string()))?;
+        let current = rec
+            .read()
+            .client_field_value(&self.field)
+            .unwrap_or(EpicsValue::Long(0));
+        super::trap_write::put_with_trap(grant, self.trap_meta(), current, |_| async move {
+            let done = if post_process {
+                self.db
+                    .process_field_from_client(&self.record_name, &self.field, opts.process)
+                    .await
+            } else {
+                self.db
+                    .notify_unwritten_from_client(&self.record_name, &self.field)
+                    .await
+            };
+            done.map_err(|e| BridgeError::PutRejected(e.to_string()))
+        })
+        .await
+    }
+
+    fn trap_meta(&self) -> super::trap_write::TrapWriteMeta<'_> {
+        super::trap_write::TrapWriteMeta {
+            pv_name: &self.pv_name,
+            user: self.access.creds.user.as_bytes(),
+            host: &self.access.creds.host,
+            peer: &self.access.creds.host,
+            dbr_type: self.value_dbf as u16,
+        }
     }
 }
 
@@ -1078,13 +1139,9 @@ mod tests {
     // ---- Force + block (record[process=true,block=true]) end-to-end wiring ----
 
     /// End-to-end proof that `put_with_options(Force, block)` routes a
-    /// *synchronous* forced put through the put-notify barrier
-    /// (`process_record_with_notify`) and returns only after the full
-    /// processing cycle — including the OUT link write — has run. This is the
-    /// `BridgeChannel` PUT-path twin of the `epics-base-rs`
-    /// `force_block_sync_record_returns_none_and_processes` primitive test:
-    /// the primitive proves the database method drives the OUT link; this
-    /// proves the bridge Force+block branch actually calls it.
+    /// *synchronous* put through the put-notify barrier and returns only
+    /// after the full processing cycle — including the OUT link write — has
+    /// run.
     #[tokio::test]
     async fn put_force_block_sync_drives_out_link_before_returning() {
         use epics_base_rs::server::record::Record;
@@ -1107,9 +1164,11 @@ mod tests {
             .unwrap();
         db.add_record("SC0", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), b"SC0")
+        // `A` is pp(TRUE): only a pp field or PROC processes under a
+        // blocking put (`dbNotify.c:243-247`).
+        let ch = BridgeChannel::new(db.clone(), b"SC0.A")
             .await
-            .expect("channel over scalcout VAL must create");
+            .expect("channel over scalcout A must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
         put.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
@@ -1165,9 +1224,11 @@ mod tests {
             .unwrap();
         db.add_record("SC1", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), b"SC1")
+        // `A` is pp(TRUE): only a pp field or PROC processes under a
+        // blocking put (`dbNotify.c:243-247`).
+        let ch = BridgeChannel::new(db.clone(), b"SC1.A")
             .await
-            .expect("channel over scalcout VAL must create");
+            .expect("channel over scalcout A must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
         put.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
@@ -1236,9 +1297,11 @@ mod tests {
             .unwrap();
         db.add_record("SC2", Box::new(sc)).await.unwrap();
 
-        let ch = BridgeChannel::new(db.clone(), b"SC2")
+        // `A` is pp(TRUE): only a pp field or PROC processes under a
+        // blocking put (`dbNotify.c:243-247`).
+        let ch = BridgeChannel::new(db.clone(), b"SC2.A")
             .await
-            .expect("channel over scalcout VAL must create");
+            .expect("channel over scalcout A must create");
         let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
         put.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(0.0))));
@@ -1412,6 +1475,96 @@ mod tests {
         .await;
         let n = lines.iter().filter(|l| l.contains(BAD_FILTER_LINE)).count();
         assert_eq!(n, 1, "{lines:?}");
+    }
+
+    // ---- unmarked value: pvxs `SingleSource::onPut` (singlesource.cpp:347-383) ----
+
+    async fn ioc_db(text: &str) -> Arc<PvDatabase> {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(text, &std::collections::HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db
+    }
+
+    /// A record that has never processed still carries the EPICS epoch in
+    /// `TIME`; a processing cycle stamps it from the wall clock.
+    fn has_processed(db: &PvDatabase, record: &str) -> bool {
+        db.get_record(record)
+            .unwrap()
+            .read()
+            .common
+            .time
+            .unix_secs()
+            > 700_000_000
+    }
+
+    fn put_options(block: bool) -> PutOptions {
+        PutOptions {
+            process: ProcessMode::Passive,
+            block,
+        }
+    }
+
+    /// A non-blocking put that marks no scalar `value` writes the type
+    /// default, as pvxs writes a fresh unmarked value.
+    #[tokio::test]
+    async fn unmarked_scalar_put_writes_the_default() {
+        let db = ioc_db(r#"record(ao, "AO") { field(VAL, "5") }"#).await;
+        let ch = BridgeChannel::new(db.clone(), b"AO").await.unwrap();
+        ch.put_with_options(
+            &PvStructure::new("epics:nt/NTScalar:1.0"),
+            put_options(false),
+        )
+        .await
+        .expect("an unmarked put is not a type mismatch");
+        let val = db.get_record("AO").unwrap().read().resolve_field("VAL");
+        assert_eq!(val.and_then(|v| v.to_f64()), Some(0.0));
+        assert!(has_processed(&db, "AO"));
+    }
+
+    /// A blocking unmarked put is `processRequest`, which on a PACT record
+    /// replies only once the cycle ends (`dbNotify.c:225-231`).
+    #[tokio::test]
+    async fn blocking_unmarked_put_on_a_busy_record_waits_for_it() {
+        let db = ioc_db(r#"record(calcout, "CO") { field(ODLY, "0.3") field(CALC, "1") }"#).await;
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links("CO", &mut visited)
+            .await
+            .unwrap();
+        let busy = || db.get_record("CO").unwrap().read().is_processing();
+        assert!(busy(), "ODLY holds the record PACT");
+        let ch = BridgeChannel::new(db.clone(), b"CO").await.unwrap();
+        ch.put_with_options(
+            &PvStructure::new("epics:nt/NTScalar:1.0"),
+            put_options(true),
+        )
+        .await
+        .expect("PUT must succeed");
+        assert!(!busy(), "the reply came while the record was still PACT");
+    }
+
+    /// An unmarked array is dropped before any `dbPut`
+    /// (`iocsource.cpp:542-543`) and the record still processes.
+    #[tokio::test]
+    async fn unmarked_array_put_writes_nothing_and_processes() {
+        let db =
+            ioc_db(r#"record(waveform, "WF") { field(FTVL, "DOUBLE") field(NELM, "4") }"#).await;
+        db.put_pv("WF", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into()))
+            .await
+            .unwrap();
+        let ch = BridgeChannel::new(db.clone(), b"WF").await.unwrap();
+        ch.put_with_options(
+            &PvStructure::new("epics:nt/NTScalarArray:1.0"),
+            put_options(false),
+        )
+        .await
+        .expect("PUT must succeed");
+        let val = db.get_record("WF").unwrap().read().resolve_field("VAL");
+        assert_eq!(val.map(|v| v.count()), Some(3), "elements untouched");
+        assert!(has_processed(&db, "WF"));
     }
 
     // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend

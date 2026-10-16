@@ -4369,16 +4369,15 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     .unwrap();
     // Non-Passive: C's `if (precord->scan)` guard is satisfied, so the
     // scanOnce actually spawns (a Passive record would be skipped — its own
-    // pp(TRUE) pass already processed it). A non-Passive record also gets no
-    // process from a plain pp put, which is exactly why C uses scanOnce; the
-    // Force/`process_record_with_notify` entry (rsrv `write_notify` with the
-    // process bit) is the unconditional-process WRITE_NOTIFY boundary.
+    // pp(TRUE) pass already processed it). A non-Passive record gets no
+    // process from a plain pp put, which is exactly why C uses scanOnce; a
+    // WRITE_NOTIFY to PROC is the one that processes it (`dbNotify.c:243-247`).
     {
         db.get_record("SO").unwrap().write().common.scan = ScanType::SEC1;
     }
 
     let completion = db
-        .process_record_with_notify("SO")
+        .put_record_field_from_ca("SO", "PROC", EpicsValue::Char(1))
         .await
         .expect("the WRITE_NOTIFY process is accepted");
     assert!(

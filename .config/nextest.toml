@@ -307,6 +307,15 @@ test-group = 'ioc_unthrottled'
 filter = 'binary(boot_stderr_matches_softioc) | binary(softioc_a_ca_put_never_waits_on_the_console) | binary(softioc_errlog_reports_lost_messages) | binary(softioc_undeclared_json_link_type) | binary(a_ca_forward_link_processes_the_remote_record) | binary(gw_upstream_unresponsive_window) | binary(softioc_db_path_bytes) | binary(qsrv_rs_db_path_bytes) | binary(st_cmd_boots_through_iocinit)'
 test-group = 'ca_softioc'
 
+# epics-bridge-rs lib tests: two pvalink tests spawn softIocPVX (interop
+# profile only) — 0 failures in 20 runs, 2 at a time at host load 38-193.
+# A lib binary is declared only by `package()`, so this block sits after
+# every block naming a bridge binary and first-match leaves those where
+# they are.
+[[profile.default.overrides]]
+filter = 'package(epics-bridge-rs)'
+test-group = 'ioc_unthrottled'
+
 [test-groups]
 # PVA listener-binding tests serialise process-wide. With max-threads
 # higher than 1 we observed flakes in `stability` (auto-reconnect,

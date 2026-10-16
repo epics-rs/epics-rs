@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use epics_base_rs::runtime::task::{self, TaskAbortHandle};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::CacheAction;
-use epics_pva_rs::client_native::ops_v2::{MonitorEvent, MonitorEventMask, PutLeaf};
+use epics_pva_rs::client_native::ops_v2::{
+    MonitorEvent, MonitorEventMask, PutLeaf, effective_typed_put_path,
+};
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
@@ -324,8 +326,7 @@ enum QueuedPut {
     /// path so the text is coerced against the channel's native
     /// scalar type, not forced to a `String` field.
     Str(String),
-    /// From [`PvaLink::write_pv_field`] — replayed verbatim via the
-    /// typed `pvput_pv_field` path.
+    /// From [`PvaLink::write_pv_field`] — assigned into the PUT verbatim.
     Field(PvField),
 }
 
@@ -929,10 +930,8 @@ impl PvaLink {
     /// Flush every staged field into ONE combined upstream PUT. Mirrors
     /// pvxs `pvaLinkChannel::put` (`pvxs/ioc/pvalink_channel.cpp:220-263`).
     ///
-    /// A single staged field keeps the typed path (a typed array PUT
-    /// must NOT round-trip through `Display` + parse); multiple fields
-    /// are assigned into one prototype via `pvput_fields` so siblings
-    /// land in one PUT (`linkBuildPut`, `pvxs/ioc/pvalink_channel.cpp:127-184`).
+    /// Every staged field is assigned into the readback so siblings land
+    /// in one PUT (`linkBuildPut`, `pvxs/ioc/pvalink_channel.cpp:127-184`).
     /// The process option is resolved across all participating links — PP/CP/CPP
     /// forces processing over NPP (`pvxs/ioc/pvalink_channel.cpp:257-263`).
     ///
@@ -976,55 +975,32 @@ impl PvaLink {
         let block = staged.iter().any(|(_, s)| s.block);
         let req = build_put_request(combined_proc, block);
 
-        let put_result = if staged.is_empty() {
-            // Forced with nothing staged: pvxs's `build()` put fetches the
-            // present value first (`_doGet`, `src/clientget.cpp:678-692`) and
-            // `linkBuildPut` returns it untouched, so the target's own value
-            // goes back marked as the readback marked it. An empty bitset
-            // instead has a QSRV server write `value`'s type default.
-            match self
-                .client
-                .pvput_begin(&self.config.pv_name, Some(&req), true)
-                .await
-            {
-                Ok(mut op) => {
-                    let (value, changed) = op.take_present().unwrap_or_else(|| {
-                        let desc = op.introspection();
-                        (
-                            epics_pva_rs::pvdata::encode::default_value_for(desc),
-                            epics_pva_rs::proto::BitSet::new(),
-                        )
-                    });
-                    op.commit(&value, &changed).await
-                }
-                Err(e) => Err(e),
+        // pvxs `build()` put: the `GetOPut` readback is the prototype
+        // (`_doGet`, `src/clientget.cpp:678-692`) and `linkBuildPut` assigns
+        // each staged leaf into it (`pvxs/ioc/pvalink_channel.cpp:127-184`),
+        // so every leaf the readback marked goes back with the staged ones —
+        // on a group target the other members are rewritten too. A forced
+        // put with nothing staged sends the readback untouched.
+        let put_result = match self
+            .client
+            .pvput_begin(&self.config.pv_name, Some(&req), true)
+            .await
+        {
+            Ok(op) => {
+                let intro = op.introspection().clone();
+                let assignments: Vec<(String, PutLeaf)> = staged
+                    .iter()
+                    .map(|(field, sp)| {
+                        let leaf = match &sp.value {
+                            QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
+                            QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
+                        };
+                        (effective_typed_put_path(&intro, field), leaf)
+                    })
+                    .collect();
+                op.commit_fields_onto_present(&assignments).await
             }
-        } else if staged.len() == 1 {
-            let (field, sp) = &staged[0];
-            self.put_single(field, &sp.value, &req).await
-        } else {
-            // One combined PUT assigning every staged field into the
-            // same prototype (pvxs `linkBuildPut`,
-            // pvxs/ioc/pvalink_channel.cpp:127-184). Each leaf travels as typed
-            // pvData: a staged `PvField` is assigned into the descriptor
-            // leaf verbatim — matching pvxs `value = tosend` for an array
-            // leaf — instead of being stringified into a bracketed list the
-            // field parser would re-split on commas, which corrupts a typed
-            // scalar array. String writes still lower through the CLI parser
-            // so the text is coerced against the native scalar type.
-            let assignments: Vec<(String, PutLeaf)> = staged
-                .iter()
-                .map(|(field, sp)| {
-                    let leaf = match &sp.value {
-                        QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
-                        QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
-                    };
-                    (put_field_path(field), leaf)
-                })
-                .collect();
-            self.client
-                .pvput_fields_typed(&self.config.pv_name, &assignments, Some(&req))
-                .await
+            Err(e) => Err(e),
         };
 
         match put_result {
@@ -1093,41 +1069,6 @@ impl PvaLink {
             return Ok(0);
         }
         self.flush_scratch().await
-    }
-
-    /// Issue one single-field PUT, choosing the string vs typed path
-    /// and root vs sub-field targeting (pvxs `linkBuildPut:138`:
-    /// `top[fieldName]` when `fieldName` is non-empty).
-    async fn put_single(
-        &self,
-        field: &str,
-        value: &QueuedPut,
-        req: &PvRequestExpr,
-    ) -> Result<(), epics_pva_rs::error::PvaError> {
-        match value {
-            QueuedPut::Str(s) => {
-                if is_subfield(field) {
-                    self.client
-                        .pvput_field_with_request(&self.config.pv_name, field, req, s)
-                        .await
-                } else {
-                    self.client
-                        .pvput_with_request(&self.config.pv_name, req, s)
-                        .await
-                }
-            }
-            QueuedPut::Field(f) => {
-                if is_subfield(field) {
-                    self.client
-                        .pvput_pv_field_field_with_request(&self.config.pv_name, field, req, f)
-                        .await
-                } else {
-                    self.client
-                        .pvput_pv_field_with_request(&self.config.pv_name, req, f)
-                        .await
-                }
-            }
-        }
     }
 
     /// Fire this link's forward link (FLNK): trigger the remote target to
@@ -1874,14 +1815,6 @@ fn build_put_request(proc: ProcMode, block: bool) -> PvRequestExpr {
     }
 }
 
-/// True iff `field` names a non-default sub-field (not `""` or `"value"`).
-/// When true, PUT must use `pvput_field_with_request` to target that
-/// specific field in the DATA phase. Mirrors pvxs `linkBuildPut:138`:
-/// `top[fieldName]` when `fieldName` is non-empty.
-fn is_subfield(field: &str) -> bool {
-    !field.is_empty() && field != "value"
-}
-
 /// Resolve the combined `record._options.process` mode across all
 /// fields participating in one PUT. Mirrors pvxs
 /// `pvxs/ioc/pvalink_channel.cpp:257-263`: PP/CP/CPP force processing
@@ -1903,21 +1836,6 @@ fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
         ProcMode::Npp
     } else {
         ProcMode::Default
-    }
-}
-
-/// Render a queued OUT value to its PUT string form for a combined
-/// multi-field PUT. A typed `PvField` is rendered via `Display`: the
-/// combined `pvput_fields` path is the documented scalar-field
-/// coalescing case (`pvalink.rst:111-113`), while a lone typed array
-/// stays on the single-field typed path (see [`PvaLink::flush_scratch`]).
-/// The dotted field path for a staged write's `pvput_fields_typed`
-/// assignment: a root write (`""`) targets `value`.
-fn put_field_path(field: &str) -> String {
-    if field.is_empty() {
-        "value".to_string()
-    } else {
-        field.to_string()
     }
 }
 
@@ -4191,8 +4109,7 @@ mod tests {
     ///
     /// On main: `build_put_request` did not exist — no pvRequest was built
     /// and `record._options.process` / `block` never reached the server.
-    /// After fix: `build_put_request` produces the correct pvRequest, and
-    /// `is_subfield` gates field-targeted vs. value-targeted dispatch.
+    /// After fix: `build_put_request` produces the correct pvRequest.
     ///
     /// pvxs parity:
     ///   pvxs/ioc/pvalink_channel.cpp:31-38 (putReq template)
@@ -4235,17 +4152,6 @@ mod tests {
                 .any(|(k, v)| k == "block" && *v == ScalarValue::Boolean(false)),
             "block=false must appear in pvRequest"
         );
-
-        // field="" and field="value" are NOT sub-fields (use pvput_with_request)
-        assert!(!is_subfield(""), "empty field is not a sub-field");
-        assert!(!is_subfield("value"), "\"value\" is not a sub-field");
-
-        // field="DESC" IS a sub-field (use pvput_field_with_request)
-        assert!(
-            is_subfield("DESC"),
-            "\"DESC\" must be treated as a sub-field"
-        );
-        assert!(is_subfield("alarm.severity"), "dotted path is a sub-field");
 
         // A deferred write with field="DESC" and proc=PP queues the
         // value; when flushed the replay uses build_put_request.
@@ -4769,6 +4675,62 @@ mod tests {
                 };
                 assert_eq!(value(&after), value(&before), "{pv}");
             }
+        });
+    }
+
+    /// pvxs builds a pvalink PUT from the `GetOPut` readback, so a write
+    /// to one member of a softIocPVX group sends the others back marked
+    /// and the group put rewrites and processes them too: here member `b`
+    /// processes and its FLNK counts.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_group_member_write_rewrites_the_other_marked_members() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("grp.db");
+        std::fs::write(
+            &db,
+            "record(ao, \"GRP:A\") { field(VAL, \"1\")\n\
+               info(Q:group, {\"GRP:G\":{\"a\":{\"+channel\":\"VAL\", \"+putorder\":0}}}) }\n\
+             record(ao, \"GRP:B\") { field(VAL, \"2\") field(FLNK, \"GRP:CNT\")\n\
+               info(Q:group, {\"GRP:G\":{\"b\":{\"+channel\":\"VAL\", \"+putorder\":1}}}) }\n\
+             record(calc, \"GRP:CNT\") { field(INPA, \"GRP:CNT\") field(CALC, \"A+1\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(5))
+                .build();
+            let mut cfg = PvaLinkConfig::defaults_for("GRP:G", LinkDirection::Out);
+            cfg.field = "a".into();
+            cfg.proc = ProcMode::Pp;
+            let link = PvaLink::for_test_with_client(cfg, client.clone());
+            link.write("7").await.expect("member write");
+            let value = |v: PvField| match v {
+                PvField::Structure(s) => match s.get_field("value") {
+                    Some(PvField::Scalar(ScalarValue::Double(d))) => Some(*d),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let a = value(client.pvget("GRP:A").await.expect("read A"));
+            let b = value(client.pvget("GRP:B").await.expect("read B"));
+            let cnt = value(client.pvget("GRP:CNT").await.expect("read CNT"));
+            assert_eq!(a, Some(7.0));
+            assert_eq!(b, Some(2.0));
+            assert_eq!(cnt, Some(1.0), "member b was not rewritten");
         });
     }
 }

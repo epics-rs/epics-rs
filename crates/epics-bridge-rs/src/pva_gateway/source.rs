@@ -1561,9 +1561,8 @@ impl ChannelSource for GatewayChannelSource {
         // gateway's default request. Fall back to the default empty
         // pvRequest when the downstream sent none.
         //
-        // The relay sends cmd 16, not the empty-PUT spelling that
-        // originating paths use (`Context::pvput_empty_with_request`,
-        // `pvalink/link.rs:947`), even though pvxs has no PROCESS handler
+        // The relay sends cmd 16, not the empty-PUT spelling
+        // (`Context::pvput_empty_with_request`), even though pvxs has no PROCESS handler
         // and an upstream pvxs IOC drains the frame at `conn.cpp:249-253`'s
         // `default:` without replying. pva2pva forwards the request
         // unchanged (`p2pApp/channel.cpp:98-107`), and translating it here

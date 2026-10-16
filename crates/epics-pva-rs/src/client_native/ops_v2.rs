@@ -1524,9 +1524,10 @@ async fn op_put_value_field_with_request_attempt(
 
 /// Resolve the effective leaf path for a typed field-targeted PUT.
 /// If the field at `field_path` is an NT-style structure that has a
-/// `value` sub-field, returns `<field_path>.value`; otherwise returns
-/// `field_path` unchanged. Mirrors pvxs `linkBuildPut:138-143`.
-fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
+/// `value` sub-field, returns `<field_path>.value` (`value` for the
+/// root); otherwise returns `field_path` unchanged. Mirrors pvxs
+/// `linkBuildPut:138-143`.
+pub fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
     let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
     let mut cursor = intro;
     for seg in &parts {
@@ -1540,7 +1541,11 @@ fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
     }
     if let FieldDesc::Structure { fields, .. } = cursor {
         if fields.iter().any(|(n, _)| n == "value") {
-            return format!("{field_path}.value");
+            return if parts.is_empty() {
+                "value".to_string()
+            } else {
+                format!("{field_path}.value")
+            };
         }
     }
     field_path.to_string()
@@ -2221,6 +2226,24 @@ impl PutOp {
     /// one-call multi-field PUTs use, so both produce identical wire deltas.
     pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
         let (value, changed) = build_field_delta(&self.intro, assignments)?;
+        self.commit(&value, &changed).await
+    }
+
+    /// [`Self::commit`] of the readback with `assignments` applied on top:
+    /// every leaf the readback marked goes back, plus each assigned leaf.
+    /// pvxs's `build()` put hands the `GetOPut` readback to the builder as
+    /// the prototype (`clientget.cpp:286-291`), so its marks ride the PUT.
+    /// With no readback the prototype default stands in, as for
+    /// [`Self::commit_fields_typed`].
+    pub async fn commit_fields_onto_present(
+        mut self,
+        assignments: &[(String, PutLeaf)],
+    ) -> PvaResult<()> {
+        let (base, marked) = self
+            .present
+            .take()
+            .unwrap_or_else(|| (default_value_for(&self.intro), BitSet::new()));
+        let (value, changed) = assign_fields(&self.intro, base, marked, assignments)?;
         self.commit(&value, &changed).await
     }
 }
@@ -5829,8 +5852,22 @@ fn build_field_delta(
     intro: &FieldDesc,
     assignments: &[(String, PutLeaf)],
 ) -> PvaResult<(PvField, BitSet)> {
-    let mut value = crate::pvdata::encode::default_value_for(intro);
-    let mut changed = BitSet::new();
+    assign_fields(
+        intro,
+        crate::pvdata::encode::default_value_for(intro),
+        BitSet::new(),
+        assignments,
+    )
+}
+
+/// Apply `assignments` onto `value`, adding each assigned leaf's bit to
+/// `changed`.
+fn assign_fields(
+    intro: &FieldDesc,
+    mut value: PvField,
+    mut changed: BitSet,
+    assignments: &[(String, PutLeaf)],
+) -> PvaResult<(PvField, BitSet)> {
     for (path, leaf) in assignments {
         let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
         let bit = intro.bit_for_path(path).ok_or_else(|| {

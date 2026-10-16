@@ -1326,6 +1326,28 @@ enum NotifyRequest {
     Deferred(crate::runtime::sync::oneshot::Sender<()>),
 }
 
+/// What [`PvDatabase::install_notify_and_process_already_locked`] did with a
+/// `processGetRequest`.
+enum NotifyInstall {
+    /// Queued behind the record's owner; the replay processes.
+    Queued,
+    /// Not Passive: completed without a process (`dbNotify.c:248-250`).
+    Settled,
+    /// Armed and processed.
+    Armed(std::sync::Arc<crate::server::record::NotifyWaitSet>),
+}
+
+#[cfg(test)]
+impl NotifyInstall {
+    fn is_queued(&self) -> bool {
+        matches!(self, NotifyInstall::Queued)
+    }
+
+    fn is_armed(&self) -> bool {
+        matches!(self, NotifyInstall::Armed(_))
+    }
+}
+
 /// Which of C `processNotifyCommon`'s two entries a put-notify arrives on
 /// (its `first` argument, dbNotify.c:207).
 ///
@@ -3433,45 +3455,72 @@ impl PvDatabase {
         };
         self.check_external_put_preconditions(record_name, field)
             .await?;
+        if block && process != ProcessMode::Inhibit {
+            // pvxs hands every blocking put that may process to
+            // `dbProcessNotify` as `putProcessRequest`
+            // (`singlesource.cpp:347-368`), which processes only for PROC or
+            // a pp field of a Passive record (`dbNotify.c:243-247`):
+            // `process=true` does not force it.
+            let completion = self
+                .put_record_field_from_ca(record_name, field, value)
+                .await?;
+            self.await_completion(record_name, completion).await;
+            return Ok(());
+        }
         match process {
             ProcessMode::Inhibit => {
                 self.put_pv([record_name, b".", field.as_bytes()].concat(), value)
                     .await
             }
             ProcessMode::Passive => {
-                if block {
-                    let completion = self
-                        .put_record_field_from_ca(record_name, field, value)
-                        .await?;
-                    self.await_completion(record_name, completion).await;
-                    Ok(())
-                } else {
-                    self.put_record_field_from_ca_no_notify(record_name, field, value)
-                        .await
-                }
+                self.put_record_field_from_ca_no_notify(record_name, field, value)
+                    .await
             }
             ProcessMode::Force => {
                 self.put_pv([record_name, b".", field.as_bytes()].concat(), value)
                     .await?;
-                if block {
-                    // A blocking forced put is C `dbProcessNotify`
-                    // (`singlesource.cpp:360-369`): the reply waits for the
-                    // whole chain, async device completion included. The
-                    // bare `process_record_with_links` returns as soon as
-                    // the record goes PACT.
-                    let completion = self.process_record_with_notify(record_name).await?;
-                    self.await_completion(record_name, completion).await;
-                    Ok(())
-                } else {
-                    // `doPostProcessing(forceProcessing == True)`
-                    // (`iocsource.cpp:404-419`) splits on PACT: an
-                    // async-active record takes `rpro = TRUE` and does not
-                    // process, an idle one takes `putf = TRUE` and does.
-                    // `put_driven_process` is that transition's owner.
-                    self.put_driven_process(record_name).await
-                }
+                // `doPostProcessing(forceProcessing == True)`
+                // (`iocsource.cpp:404-419`) splits on PACT: an
+                // async-active record takes `rpro = TRUE` and does not
+                // process, an idle one takes `putf = TRUE` and does.
+                // `put_driven_process` is that transition's owner.
+                self.put_driven_process(record_name).await
             }
         }
+    }
+
+    /// A blocking external put that marked no value: pvxs sends it to
+    /// `dbProcessNotify` as `processRequest` (`ioc/singlesource.cpp:363-368`),
+    /// which writes and processes nothing but replies only once the record
+    /// is free of an in-flight cycle or another notify (`dbNotify.c:213-231`).
+    pub async fn notify_unwritten_from_client(
+        &self,
+        record_name: impl AsRef<[u8]>,
+        field: &str,
+    ) -> CaResult<()> {
+        let record_name = record_name.as_ref();
+        self.check_external_put_preconditions(record_name, field)
+            .await?;
+        let rx = {
+            let _record_gate = self.acquire_put_gate(record_name, "", None);
+            let rec = self.get_record(record_name).ok_or_else(|| {
+                CaError::ChannelNotFound(String::from_utf8_lossy(record_name).into_owned())
+            })?;
+            self.cancel_unanswerable_notify(record_name);
+            let mut guard = rec.write();
+            if !guard.notify_put_is_owned() {
+                return Ok(());
+            }
+            let (tx, rx) = crate::runtime::sync::oneshot::channel();
+            guard.queue_notify_put(crate::server::record::DeferredNotify::Wait { completion: tx });
+            rx
+        };
+        self.await_completion(
+            record_name,
+            crate::server::record::ProcessCompletion::Async(rx),
+        )
+        .await;
+        Ok(())
     }
 
     /// An external non-blocking put that writes nothing but still owes its
@@ -3606,23 +3655,18 @@ impl PvDatabase {
         self.settle_held(held, link_text, put, tail)
     }
 
-    /// Process a record UNCONDITIONALLY with a put-notify wait-set, returning
-    /// the completion receiver — the QSRV `record[process=true,block=true]`
-    /// (Force + block) barrier.
+    /// C `dbProcessNotify` with `processGetRequest` (`dbtpn` with no value,
+    /// `dbNotify.c:607`): process a Passive record with a put-notify wait-set
+    /// and return the completion receiver; any other record completes at once
+    /// (`dbNotify.c:248-250`).
     ///
-    /// C `dbProcessNotify`: pvxs routes a blocking forced put through
-    /// `dbProcessNotify` (`singlesource.cpp:360-369`), whose completion fires
-    /// only after the record's whole processing chain — including async device
-    /// work (a motor move, an asyn-backed AO) — settles. The value is written
-    /// by the caller's preceding [`Self::put_pv`] (the `dbPut` analogue, no
-    /// process); this entry then mints the wait-set, registers it into the
-    /// record's `notify` slot so PACT records join it, and runs the full
-    /// unconditional [`Self::process_record_with_links`] cycle (C `dbProcess`,
-    /// the Force analogue). A fully synchronous chain returns `Ok(None)` (the
-    /// wait-set already drained); an async record returns `Ok(Some(rx))` for
-    /// the caller to await. A notify already in flight on the record does not
-    /// refuse this one: it joins the record's restart queue and replays when
-    /// the record frees, which is C's only outcome here.
+    /// The completion fires only after the record's whole processing chain —
+    /// including async device work (a motor move, an asyn-backed AO) —
+    /// settles. A fully synchronous chain returns `Sync` (the wait-set already
+    /// drained); an async record returns `Async(rx)` for the caller to await.
+    /// A notify already in flight on the record does not refuse this one: it
+    /// joins the record's restart queue and replays when the record frees,
+    /// which is C's only outcome here.
     pub async fn process_record_with_notify(
         &self,
         record_name: impl AsRef<[u8]>,
@@ -3647,10 +3691,11 @@ impl PvDatabase {
         }?;
         // The wait-set fires the oneshot only after the whole FLNK/OUT chain
         // (sync + async) settles. Already-completed ==> fully synchronous ==>
-        // report immediate success. Queued (`None`) or still pending ==> hand
-        // the receiver back to await the deferred completion.
+        // report immediate success. Queued or still pending ==> hand the
+        // receiver back to await the deferred completion.
         match installed {
-            Some(notify) if notify.completed() => {
+            NotifyInstall::Settled => Ok(crate::server::record::ProcessCompletion::Sync),
+            NotifyInstall::Armed(notify) if notify.completed() => {
                 Ok(crate::server::record::ProcessCompletion::Sync)
             }
             _ => Ok(crate::server::record::ProcessCompletion::Async(
@@ -3774,11 +3819,23 @@ impl PvDatabase {
                     );
                     (field, link_text, put, tail)
                 }
+                // C `processRequest` on restart: no put, no process; the
+                // next entry is checked before the callback (`dbNotify.c:263-270`).
+                crate::server::record::DeferredNotify::Wait { completion } => {
+                    let _ = completion.send(());
+                    continue;
+                }
                 // C `processGetRequest` on restart: `processNotifyCommon`
                 // re-enters with no `putCallback`, so the replay is the process
                 // alone. The gate is already held, so this takes the
                 // already-locked entry.
                 crate::server::record::DeferredNotify::Process { completion } => {
+                    // Only a Passive record is processed (`dbNotify.c:248-250`);
+                    // any other completes and the next entry is checked.
+                    if rec.read().common.scan != crate::server::record::ScanType::Passive {
+                        let _ = completion.send(());
+                        continue;
+                    }
                     let _ = self.install_notify_and_process_already_locked(
                         record_name,
                         completion,
@@ -3827,15 +3884,13 @@ impl PvDatabase {
     /// so the gate cannot be held across a suspension.
     ///
     /// Returns the wait-set so the caller can ask whether the chain settled
-    /// synchronously. `Ok(None)` means this call drove nothing -- the notify
-    /// queued behind the record's current owner, and the replay is what
-    /// processes, so processing here too would run one client request twice.
+    /// synchronously.
     fn install_notify_and_process_already_locked(
         &self,
         record_name: &[u8],
         completion: crate::runtime::sync::oneshot::Sender<()>,
         arrival: NotifyArrival,
-    ) -> CaResult<Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>> {
+    ) -> CaResult<NotifyInstall> {
         // Collect-then-act: clone the handle under a brief map read, drop the
         // map lock before taking the per-record write lock.
         //
@@ -3855,20 +3910,25 @@ impl PvDatabase {
                 guard.queue_notify_put(crate::server::record::DeferredNotify::Process {
                     completion,
                 });
-                return Ok(None);
+                return Ok(NotifyInstall::Queued);
+            }
+            // C `processGetRequest` processes only a Passive record
+            // (`dbNotify.c:248-250`); any other completes at once.
+            if guard.common.scan != crate::server::record::ScanType::Passive {
+                return Ok(NotifyInstall::Settled);
             }
             // Through the one install owner. Assigning the slot here instead
             // would drop the prior client's Sender, and its receiver then wakes
             // with the RecvError the CA dispatcher reads as success.
             match guard.install_or_queue_notify(completion) {
                 Some(notify) => notify,
-                None => return Ok(None),
+                None => return Ok(NotifyInstall::Queued),
             }
         };
         let mut visited = crate::server::database::ProcStack::new();
         self.process_record_with_links_already_locked(record_name, &mut visited)
             .or_else(CaError::unless_process_status)?;
-        Ok(Some(notify))
+        Ok(NotifyInstall::Armed(notify))
     }
 
     /// C `dbNotifyCancel` (`dbNotify.c:385-430`) as `rsrvFreePutNotify` reaches
@@ -5271,7 +5331,7 @@ mod tests {
                 NotifyArrival::Replay
             )
             .expect("the record is loaded")
-            .is_none(),
+            .is_queued(),
             "the slot is owned, so the replay must drive no process cycle"
         );
         assert!(
@@ -5509,7 +5569,7 @@ mod tests {
                 NotifyArrival::Replay
             )
             .expect("the record is loaded")
-            .is_some(),
+            .is_armed(),
             "a free slot installs and processes"
         );
         assert!(

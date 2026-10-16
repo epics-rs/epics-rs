@@ -572,6 +572,11 @@ pub enum DeferredNotify {
     /// C `putProcessRequest` / `putProcessGetRequest`: write the field, then
     /// process; the callback fires on the replayed cycle.
     Put(DeferredNotifyPut),
+    /// C `processRequest`: write nothing, process nothing; the callback
+    /// fires once the record is free (`dbNotify.c:213-231`, `:263-270`).
+    Wait {
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+    },
     /// C `processGetRequest`: process the record, write nothing.
     Process {
         /// The client's completion channel, armed on the replayed process.

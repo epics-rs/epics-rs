@@ -170,6 +170,43 @@ impl Default for PutOptions {
     }
 }
 
+/// What a record channel's PUT does to the record, decided once for every
+/// IOC source as pvxs `SingleSource::onPut` decides it
+/// (`singlesource.cpp:347-383`): a blocking put whose `value` is unmarked is
+/// `processRequest`, which neither writes nor processes (`dbNotify.c:233-252`);
+/// a non-blocking one whose unmarked `value` is a numeric array writes
+/// nothing (`putArray` of a null array) and still post-processes; any other
+/// put writes `value`, its type default when unmarked
+/// (`iocsource.cpp:589-591`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordPutKind {
+    Write,
+    PostProcess,
+    Nothing,
+}
+
+impl RecordPutKind {
+    /// `desc` is the channel's type; `value_marked` whether the client
+    /// marked its `value`.
+    pub fn decide(desc: &FieldDesc, value_marked: bool, opts: &PutOptions) -> Self {
+        let numeric_array = match desc {
+            FieldDesc::Structure { fields, .. } => fields.iter().any(|(n, d)| {
+                n == "value"
+                    && matches!(d, FieldDesc::ScalarArray(t) if *t != crate::pvdata::ScalarType::String)
+            }),
+            _ => false,
+        };
+        // `forceProcessing == False` clears `doWait` (`singlesource.cpp:349-351`).
+        if opts.block && opts.process != ProcessMode::Inhibit && !value_marked {
+            Self::Nothing
+        } else if !opts.block && !value_marked && numeric_array {
+            Self::PostProcess
+        } else {
+            Self::Write
+        }
+    }
+}
+
 /// Map a present `record._options.process` field to a [`ProcessMode`],
 /// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448)
 /// including which values it reports to the client:

@@ -939,3 +939,77 @@ async fn a_fire_and_forget_put_on_a_pact_record_still_writes_and_sets_rpro() {
         "and marks it for the reprocess that carries the value to the device"
     );
 }
+
+/// C `processRequest` (`dbNotify.c:213-231`, `:263-270`): queued on a PACT
+/// record it writes nothing, and its restart hands the record straight to the
+/// next queued put-notify.
+#[epics_macros_rs::epics_test]
+async fn an_unwritten_notify_waits_and_passes_the_record_on() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let f = busy_record().await;
+
+    let mut wait = Box::pin(f.db.notify_unwritten_from_client("ASY", "VAL"));
+    let parked = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx).is_pending())).await;
+    assert!(parked, "the record is PACT: the wait queues");
+    let put =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued behind the wait");
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    let timeout = std::time::Duration::from_secs(5);
+    epics_base_rs::runtime::task::timeout(timeout, wait)
+        .await
+        .expect("the wait answers after the cycle")
+        .unwrap();
+    epics_base_rs::runtime::task::timeout(timeout, put)
+        .await
+        .expect("the put behind it replays")
+        .unwrap();
+    assert_eq!(val(&f.db).await, 7);
+    assert_eq!(f.seen.lock().unwrap().clone(), vec![5, 7]);
+}
+
+/// `dbNotify.c:248-250` on restart: a queued `processGetRequest` whose record
+/// is no longer Passive completes without processing and passes the record on.
+#[epics_macros_rs::epics_test]
+async fn a_queued_process_notify_skips_a_record_no_longer_passive() {
+    let f = busy_record().await;
+
+    let process =
+        f.db.process_record_with_notify("ASY")
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued on the PACT record");
+    let put =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("queued behind it");
+    f.db.get_record("ASY").unwrap().write().common.scan = ScanType::SEC1;
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    let timeout = std::time::Duration::from_secs(5);
+    epics_base_rs::runtime::task::timeout(timeout, process)
+        .await
+        .expect("the process notify answers")
+        .unwrap();
+    // A replayed put that drove no process answers by dropping its sender.
+    let _ = epics_base_rs::runtime::task::timeout(timeout, put)
+        .await
+        .expect("the put behind it replays");
+    assert_eq!(val(&f.db).await, 7);
+    assert_eq!(
+        f.seen.lock().unwrap().clone(),
+        vec![5],
+        "neither the process notify nor the put to a non-Passive record processes"
+    );
+}

@@ -1,16 +1,12 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): a multi-thread-flavored tokio test — the gated install has to block on a second worker; runs and passes in the exec-backend suite.
-//! `PvDatabase::process_record_with_notify` — the QSRV
-//! `record[process=true,block=true]` (Force + block) completion barrier.
+//! `PvDatabase::process_record_with_notify` — C `dbProcessNotify` with
+//! `processGetRequest` (`dbtpn`, `dbNotify.c:607`), and the blocking put
+//! route of `put_field_from_client`.
 //!
-//! pvxs routes a blocking forced put through `dbProcessNotify`
-//! (`ioc/singlesource.cpp:360-369`; `if forceProcessing==False doWait=false`
-//! clears the wait for Inhibit only, never for Force), so the reply is withheld
-//! until processing — including async device completion — finishes. The Rust
-//! primitive mints a put-notify wait-set, registers it into the record's
-//! `notify` slot, runs the full unconditional `process_record_with_links`
-//! cycle (C `dbProcess`), and returns the completion receiver only when the
-//! chain went async. A fully synchronous chain drains the wait-set inside
-//! processing and returns `Ok(None)`.
+//! The completion is withheld until processing — including async device
+//! completion — finishes. Only a Passive record is processed
+//! (`dbNotify.c:243-250`); a blocking put processes only for PROC or a pp
+//! field of a Passive record, whatever `process` the client asked for.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -172,4 +168,73 @@ async fn force_block_install_waits_for_the_record_put_gate() {
         !rec.read().has_notify(),
         "the cycle drains the wait-set it installed"
     );
+}
+
+fn scanned_ai(db: &PvDatabase, name: &str) {
+    db.get_record(name).unwrap().write().common.scan =
+        epics_base_rs::server::record::ScanType::SEC1;
+}
+
+fn has_processed(db: &PvDatabase, name: &str) -> bool {
+    db.get_record(name).unwrap().read().common.time.unix_secs() > 700_000_000
+}
+
+/// `dbNotify.c:243-247`: `process=true` does not reach a blocking put.
+#[epics_macros_rs::epics_test]
+async fn a_blocking_forced_put_leaves_a_scanned_record_alone() {
+    use epics_base_rs::server::database::ProcessMode;
+
+    let db = PvDatabase::new();
+    db.add_record("SCN", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    scanned_ai(&db, "SCN");
+    db.put_field_from_client(
+        "SCN",
+        "VAL",
+        EpicsValue::Double(5.0),
+        ProcessMode::Force,
+        true,
+    )
+    .await
+    .unwrap();
+    let val = db.get_record("SCN").unwrap().read().record.get_field("VAL");
+    assert_eq!(val, Some(EpicsValue::Double(5.0)));
+    assert!(!has_processed(&db, "SCN"));
+}
+
+/// The PROC arm of the same rule processes a scanned record.
+#[epics_macros_rs::epics_test]
+async fn a_blocking_proc_put_processes_a_scanned_record() {
+    use epics_base_rs::server::database::ProcessMode;
+
+    let db = PvDatabase::new();
+    db.add_record("SCP", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    scanned_ai(&db, "SCP");
+    db.put_field_from_client("SCP", "PROC", EpicsValue::Char(1), ProcessMode::Force, true)
+        .await
+        .unwrap();
+    assert!(has_processed(&db, "SCP"));
+}
+
+/// `dbNotify.c:248-250`: `processGetRequest` completes without processing a
+/// record that is not Passive.
+#[epics_macros_rs::epics_test]
+async fn process_notify_leaves_a_scanned_record_alone() {
+    let db = PvDatabase::new();
+    db.add_record("SCG", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    scanned_ai(&db, "SCG");
+    if let Some(rx) = db
+        .process_record_with_notify("SCG")
+        .await
+        .unwrap()
+        .into_handle()
+    {
+        rx.await.unwrap();
+    }
+    assert!(!has_processed(&db, "SCG"));
 }

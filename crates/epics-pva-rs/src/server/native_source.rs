@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::channel_shape::ChannelShape;
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
-use crate::server_native::source::{ProcessMode, PutOptions, SourceRead};
+use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 use epics_base_rs::server::database::char_view::{DollarView, PvaDollar, long_string_text};
 
@@ -1558,26 +1558,16 @@ impl ChannelSource for PvDatabaseSource {
                 prune_to_marked(&desc, &changed, 0, &delta),
                 Some(PvField::Structure(s)) if s.get_field("value").is_some()
             );
-            let null_array = match &*desc {
-                FieldDesc::Structure { fields, .. } => fields.iter().any(|(n, d)| {
-                    n == "value"
-                        && matches!(d, FieldDesc::ScalarArray(t) if *t != ScalarType::String)
-                }),
-                _ => false,
-            };
-            // `forceProcessing == False` clears `doWait` (`singlesource.cpp:349-351`).
-            let put = if opts.block && opts.process != ProcessMode::Inhibit && !value_marked {
-                RecordPut::Nothing
-            } else if !opts.block && !value_marked && null_array {
-                RecordPut::PostProcess
-            } else {
-                RecordPut::Write(fill_unmarked_from_prior(
+            let put = match RecordPutKind::decide(&desc, value_marked, &opts) {
+                RecordPutKind::Nothing => RecordPut::Nothing,
+                RecordPutKind::PostProcess => RecordPut::PostProcess,
+                RecordPutKind::Write => RecordPut::Write(fill_unmarked_from_prior(
                     &desc,
                     &changed,
                     0,
                     delta,
                     &default_value_for(&desc),
-                ))
+                )),
             };
             put_record(&db, &checked, &ctx, &cn, &rec, put, &opts).await
         }
@@ -2312,7 +2302,7 @@ fn scalar_shaped(
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
 
 /// `write` inside the `asTrapWrite` put-log bracket pvxs's `SecurityLogger`
-/// opens for every record put ([`acs::put_with_trap`]).
+/// opens for every record put ([`epics_base_rs::server::access_security::put_with_trap`]).
 async fn trapped_put<F, Fut>(
     checked: &epics_base_rs::server::access_security::AccessChecked,
     ctx: &crate::server_native::ChannelContext,
@@ -2360,7 +2350,8 @@ enum RecordPut {
     Write(PvField),
     /// Write nothing and post-process: pvxs's `putArray` of a null array.
     PostProcess,
-    /// Write nothing, process nothing: pvxs's blocking `processRequest`.
+    /// Write nothing, process nothing, reply once the record is free:
+    /// pvxs's blocking `processRequest`.
     Nothing,
 }
 
@@ -2399,7 +2390,7 @@ async fn put_record(
         }
         RecordPut::Nothing => {
             trapped_put(checked, ctx, cn, rec, current(), |_| async {
-                db.check_external_put_preconditions(&cn.record, &cn.field)
+                db.notify_unwritten_from_client(&cn.record, &cn.field)
                     .await
                     .map_err(failed)
             })
@@ -6330,6 +6321,46 @@ ASG(PLAIN) {
         assert!(!has_processed(&db, "MB"));
     }
 
+    /// A blocking `processRequest` on a PACT record waits on its restart list
+    /// (`dbNotify.c:225-231`), so the reply comes only once the cycle ends.
+    #[epics_macros_rs::epics_test]
+    async fn blocking_unmarked_put_on_a_busy_record_waits_for_it() {
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(calcout, "CO") { field(ODLY, "0.3") field(CALC, "1") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_with_links("CO", &mut visited)
+            .await
+            .unwrap();
+        let busy = || db.get_record("CO").unwrap().read().is_processing();
+        assert!(busy(), "ODLY holds the record PACT");
+        let source = PvDatabaseSource::new(db.clone());
+        let desc = Arc::new(source.get_introspection(b"CO").await.expect("desc"));
+        let delta = crate::pvdata::encode::default_value_for(&desc);
+        let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
+        let checked = source
+            .access()
+            .check(
+                "CO",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .put_delta_checked(checked, desc, crate::proto::BitSet::new(), &delta, ctx)
+            .await
+            .expect("PUT must succeed");
+        assert!(!busy(), "the reply came while the record was still PACT");
+    }
+
     #[epics_macros_rs::epics_test]
     async fn blocking_marked_enum_put_writes_and_processes() {
         let ctx = ctx_with_options(&[("block", PvField::Scalar(ScalarValue::Boolean(true)))]);
@@ -6450,14 +6481,12 @@ ASG(PLAIN) {
         );
     }
 
-    /// `record[process=true,block=true]` routes through the put-notify
-    /// barrier (`dbProcessNotify`, `ioc/singlesource.cpp:361-370`) instead
-    /// of the fire-and-forget post-processing call. A fully synchronous
-    /// record settles inside the call either way; what this pins is that
-    /// the blocking route is reached and completes rather than being
-    /// dropped on the floor as it was before.
+    /// `record[process=true,block=true]` is `dbProcessNotify`'s
+    /// `putProcessRequest` (`ioc/singlesource.cpp:361-368`), which processes
+    /// only for PROC or a pp field of a Passive record (`dbNotify.c:243-247`):
+    /// the value lands and a scanned record is left alone.
     #[epics_macros_rs::epics_test]
-    async fn put_option_block_true_takes_the_notify_route() {
+    async fn blocking_put_with_process_true_leaves_a_scanned_record_alone() {
         use epics_base_rs::server::record::ScanType;
 
         let db = ai_db("AI:BLOCK").await;
@@ -6475,10 +6504,7 @@ ASG(PLAIN) {
             .await
             .expect("PUT must succeed");
         assert_eq!(val_of(&db, "AI:BLOCK"), 5.0);
-        assert!(
-            has_processed(&db, "AI:BLOCK"),
-            "a blocking forced put must have processed by the time it returns"
-        );
+        assert!(!has_processed(&db, "AI:BLOCK"));
     }
 
     /// Drive `f` in place until it parks — poll it, and keep polling for as

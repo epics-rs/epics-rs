@@ -3980,6 +3980,58 @@ const EXTRA_DIM_NAME_PARAMS: [&str; MAX_EXTRA_DIMS] = [
     "HDF5_extraDimName9",
 ];
 
+/// `HDF5_chunkSize2..9` (C `str_NDFileHDF5_chunkSize[2..]`).
+const CHUNK_SIZE_PARAMS: [&str; 8] = [
+    "HDF5_chunkSize2",
+    "HDF5_chunkSize3",
+    "HDF5_chunkSize4",
+    "HDF5_chunkSize5",
+    "HDF5_chunkSize6",
+    "HDF5_chunkSize7",
+    "HDF5_chunkSize8",
+    "HDF5_chunkSize9",
+];
+
+/// C `str_NDFileHDF5_extraDimChunk`; this port creates X..9 only.
+const EXTRA_DIM_CHUNK_PARAMS: [&str; MAX_EXTRA_DIMS] = [
+    "HDF5_extraDimChunkN",
+    "HDF5_extraDimChunkX",
+    "HDF5_extraDimChunkY",
+    "HDF5_extraDimChunk3",
+    "HDF5_extraDimChunk4",
+    "HDF5_extraDimChunk5",
+    "HDF5_extraDimChunk6",
+    "HDF5_extraDimChunk7",
+    "HDF5_extraDimChunk8",
+    "HDF5_extraDimChunk9",
+];
+
+const POS_NAME_PARAMS: [&str; MAX_EXTRA_DIMS] = [
+    "HDF5_posNameDimN",
+    "HDF5_posNameDimX",
+    "HDF5_posNameDimY",
+    "HDF5_posNameDim3",
+    "HDF5_posNameDim4",
+    "HDF5_posNameDim5",
+    "HDF5_posNameDim6",
+    "HDF5_posNameDim7",
+    "HDF5_posNameDim8",
+    "HDF5_posNameDim9",
+];
+
+const POS_INDEX_PARAMS: [&str; MAX_EXTRA_DIMS] = [
+    "HDF5_posIndexDimN",
+    "HDF5_posIndexDimX",
+    "HDF5_posIndexDimY",
+    "HDF5_posIndexDim3",
+    "HDF5_posIndexDim4",
+    "HDF5_posIndexDim5",
+    "HDF5_posIndexDim6",
+    "HDF5_posIndexDim7",
+    "HDF5_posIndexDim8",
+    "HDF5_posIndexDim9",
+];
+
 impl NDPluginProcess for Hdf5FileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
@@ -4089,6 +4141,70 @@ impl NDPluginProcess for Hdf5FileProcessor {
         self.hdf5_params.layout_filename = base.find_param("HDF5_layoutFilename");
         self.hdf5_params.layout_valid = base.find_param("HDF5_layoutValid");
         self.hdf5_params.layout_error_msg = base.find_param("HDF5_layoutErrorMsg");
+
+        // C's constructor defaults (NDFileHDF5.cpp:2321-2383). The PINI
+        // outputs read these back at init and write them again, so an unset
+        // or zero param here is written as 0 at boot and refused
+        // (extraDimSize must be > 0).
+        let int32: [(&str, i32); 25] = [
+            ("HDF5_chunkSizeAuto", 1),
+            ("HDF5_nFramesChunks", 0),
+            ("HDF5_NDAttributeChunk", 0),
+            ("HDF5_chunkBoundaryAlign", 0),
+            ("HDF5_chunkBoundaryThreshold", 65536),
+            ("HDF5_nExtraDims", 0),
+            ("HDF5_storeAttributes", 1),
+            ("HDF5_storePerformance", 1),
+            ("HDF5_flushNthFrame", 0),
+            ("HDF5_compressionType", 0),
+            ("HDF5_nbitsPrecision", 8),
+            ("HDF5_nbitsOffset", 0),
+            ("HDF5_szipNumPixels", 16),
+            ("HDF5_zCompressLevel", 6),
+            ("HDF5_bloscShuffleType", 1),
+            ("HDF5_bloscCompressor", 0),
+            ("HDF5_bloscCompressLevel", 5),
+            ("HDF5_dimAttDatasets", 0),
+            ("HDF5_jpegQuality", 90),
+            ("HDF5_layoutValid", 1),
+            ("HDF5_posRunning", 0),
+            ("HDF5_SWMRFlushNow", 0),
+            ("HDF5_SWMRCbCounter", 0),
+            ("HDF5_SWMRMode", 0),
+            ("HDF5_SWMRRunning", 0),
+        ];
+        let chunk_sizes = ["HDF5_nRowChunks", "HDF5_nColChunks"]
+            .into_iter()
+            .chain(CHUNK_SIZE_PARAMS)
+            .map(|n| (n, 0));
+        let extra_dims = EXTRA_DIM_SIZE_PARAMS
+            .iter()
+            .map(|&n| (n, 1))
+            .chain(EXTRA_DIM_CHUNK_PARAMS.iter().map(|&n| (n, 0)));
+        for (name, value) in int32.into_iter().chain(chunk_sizes).chain(extra_dims) {
+            if let Some(idx) = base.find_param(name) {
+                base.set_int32_param(idx, 0, value)?;
+            }
+        }
+        for name in ["HDF5_totalRuntime", "HDF5_totalIoSpeed", "HDF5_fillValue"] {
+            if let Some(idx) = base.find_param(name) {
+                base.set_float64_param(idx, 0, 0.0)?;
+            }
+        }
+        let empty = ["HDF5_layoutErrorMsg", "HDF5_layoutFilename"]
+            .into_iter()
+            .chain(POS_NAME_PARAMS)
+            .chain(POS_INDEX_PARAMS)
+            .map(|n| (n, String::new()));
+        let dim_names = EXTRA_DIM_NAME_PARAMS
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, format!("scan dimension {i}")));
+        for (name, value) in empty.chain(dim_names) {
+            if let Some(idx) = base.find_param(name) {
+                base.set_string_param(idx, 0, value)?;
+            }
+        }
 
         // Report SWMR as always supported
         if let Some(idx) = self.hdf5_params.swmr_supported {
@@ -4237,6 +4353,41 @@ mod tests {
         base.find_param(name).unwrap()
     }
 
+    /// The template's PINI outputs read their param back at init and write
+    /// it again, so every seeded default they carry must pass its own write
+    /// rule (C seeds extraDimSize = 1; a 0 here is refused at boot).
+    #[test]
+    fn every_pini_output_accepts_its_seeded_default() {
+        let (proc, base) = hdf5_port();
+        let template = include_str!("../../ad-core-rs/db/NDFileHDF5.template");
+        let mut refused = Vec::new();
+        for record in template.split("\nrecord(").skip(1) {
+            let is_output = ["bo,", "mbbo,", "longout,"]
+                .iter()
+                .any(|t| record.starts_with(t));
+            if !is_output || !record.contains(r#"field(PINI, "YES")"#) {
+                continue;
+            }
+            let Some(name) = record
+                .lines()
+                .find(|l| l.contains("field(OUT"))
+                .and_then(|l| l.rsplit(')').nth(1))
+                .map(|n| n.trim_end_matches('"'))
+            else {
+                continue;
+            };
+            let idx = idx(&base, name);
+            let value = base.get_int32_param(idx, 0).unwrap();
+            let verdict = proc
+                .validate_int32(idx, 0, value, WriteVerdict::Accept(value), &base)
+                .verdict;
+            if verdict != WriteVerdict::Accept(value) {
+                refused.push(format!("{name}={value}"));
+            }
+        }
+        assert!(refused.is_empty(), "refused: {refused:?}");
+    }
+
     #[test]
     fn writes_are_refused_and_reverted_as_c_write_int32_does() {
         let (proc, mut base) = hdf5_port();
@@ -4259,13 +4410,13 @@ mod tests {
 
         assert_eq!(v(zlevel, 9), WriteVerdict::Accept(9));
         assert_eq!(v(zlevel, 10), refused(6));
-        assert_eq!(v(idx(&base, "HDF5_szipNumPixels"), 33), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_szipNumPixels"), 33), refused(16));
         assert_eq!(v(extra, 9), WriteVerdict::Accept(9));
         assert_eq!(v(extra, 10), refused(0));
         assert_eq!(v(idx(&base, "HDF5_compressionType"), 9), refused(0));
         assert_eq!(v(flush, 3), refused(0));
         assert_eq!(v(flush, 4), WriteVerdict::Accept(4));
-        assert_eq!(v(idx(&base, "HDF5_extraDimSizeX"), 0), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_extraDimSizeX"), 0), refused(1));
         assert_eq!(v(idx(&base, "HDF5_chunkSize3"), -1), refused(0));
         assert_eq!(v(idx(&base, "NUM_CAPTURE"), -1), refused(0));
         assert_eq!(v(idx(&base, "HDF5_SWMRSupported"), 0), refused(1));
@@ -4290,7 +4441,7 @@ mod tests {
         }
         assert_eq!(v(zlevel, 3), refused(6));
         assert_eq!(v(chunks, 8), refused(4));
-        assert_eq!(v(idx(&base, "HDF5_storeAttributes"), 0), refused(0));
+        assert_eq!(v(idx(&base, "HDF5_storeAttributes"), 0), refused(1));
         assert_eq!(
             v(idx(&base, "HDF5_SWMRFlushNow"), 1),
             WriteVerdict::Accept(1)

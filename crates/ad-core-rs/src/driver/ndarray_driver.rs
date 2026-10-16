@@ -994,36 +994,31 @@ pub(crate) fn check_path(
     Ok(exists)
 }
 
-/// Handle a write to an Octet parameter, mirroring the relevant branches of
-/// C++ `asynNDArrayDriver::writeOctet`.
-///
-/// - `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`: reload the attribute
-///   definitions via [`DriverAttributes::read_file`].
-/// - `FILE_PATH`: run `checkPath`; if the directory does not exist, attempt
-///   `createFilePath` bounded by `CREATE_DIR`, then re-check.
-///
-/// The caller is expected to have already stored `value` into the parameter
-/// library. Returns `true` when `param_index` was a recognized parameter.
+/// C++ `asynNDArrayDriver::writeOctet`: store the text, reload the attribute
+/// set on `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`, run `checkPath` (and
+/// `createFilePath` bounded by `CREATE_DIR`) on `FILE_PATH`, then do the
+/// callbacks. A driver's `write_octet` falls back to this for every
+/// parameter it does not own, as C drivers call `ADDriver::writeOctet`.
 pub(crate) fn handle_write_octet(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
     attributes: &mut DriverAttributes,
-    param_index: usize,
-    value: &str,
-) -> AsynResult<bool> {
-    if param_index == params.attributes_file || param_index == params.attributes_macros {
+    user: &AsynUser,
+    data: &[u8],
+) -> AsynResult<usize> {
+    let (function, addr) = (user.reason, user.addr);
+    // C receives a NUL-terminated `char *`.
+    let value = octet_text(data.split(|&b| b == 0).next().unwrap_or(&[]));
+    port_base.set_string_param(function, addr, value.clone())?;
+    if function == params.attributes_file || function == params.attributes_macros {
         let _ = attributes.read_file(port_base, params);
-        Ok(true)
-    } else if param_index == params.file_path {
-        if !check_path(port_base, params)? {
-            let depth = port_base.get_int32_param(params.create_dir, 0).unwrap_or(0);
-            let _ = NDArrayDriverBase::create_file_path(value, depth);
-            check_path(port_base, params)?;
-        }
-        Ok(true)
-    } else {
-        Ok(false)
+    } else if function == params.file_path && !check_path(port_base, params)? {
+        let depth = port_base.get_int32_param(params.create_dir, 0).unwrap_or(0);
+        let _ = NDArrayDriverBase::create_file_path(&value, depth);
+        check_path(port_base, params)?;
     }
+    port_base.call_param_callbacks(addr)?;
+    Ok(data.len())
 }
 
 pub struct NDArrayDriverBase {
@@ -1288,15 +1283,14 @@ impl NDArrayDriverBase {
         Ok(())
     }
 
-    /// The octet-write branches of C++ `asynNDArrayDriver::writeOctet`; see
-    /// `handle_write_octet`.
-    pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
+    /// C++ `asynNDArrayDriver::writeOctet`; see `handle_write_octet`.
+    pub fn write_octet(&mut self, user: &AsynUser, data: &[u8]) -> AsynResult<usize> {
         handle_write_octet(
             &mut self.port_base,
             &self.params,
             &mut self.attributes,
-            param_index,
-            value,
+            user,
+            data,
         )
     }
 
@@ -2304,12 +2298,16 @@ pub(crate) mod tests {
         drv.port_base
             .set_int32_param(drv.params.create_dir, 0, 1)
             .unwrap();
-        drv.port_base
-            .set_string_param(drv.params.file_path, 0, path.clone())
+        let user = AsynUser::new(drv.params.file_path);
+        drv.write_octet(&user, format!("{path}\0").as_bytes())
             .unwrap();
-        let handled = drv.write_octet(drv.params.file_path, &path).unwrap();
-        assert!(handled);
         assert!(target.is_dir());
+        assert_eq!(
+            drv.port_base
+                .get_string_param(drv.params.file_path, 0)
+                .unwrap(),
+            path.as_bytes()
+        );
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.file_path_exists, 0)

@@ -266,17 +266,15 @@ impl ADDriverBase {
         )
     }
 
-    /// The octet-write branches of C++ `asynNDArrayDriver::writeOctet`
-    /// (`NDAttributesFile` / `NDAttributesMacros` reload, `FilePath` check).
-    /// The caller has already stored `value`; returns `true` when
-    /// `param_index` was one of those parameters.
-    pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
+    /// C++ `ADDriver::writeOctet`, which is `asynNDArrayDriver::writeOctet`;
+    /// see `handle_write_octet`.
+    pub fn write_octet(&mut self, user: &AsynUser, data: &[u8]) -> AsynResult<usize> {
         crate::driver::ndarray_driver::handle_write_octet(
             &mut self.port_base,
             &self.params.base,
             &mut self.attributes,
-            param_index,
-            value,
+            user,
+            data,
         )
     }
 
@@ -685,9 +683,8 @@ mod tests {
             <Attribute name="Gain" type="PARAM" source="GAIN" datatype="DOUBLE"/>
         </Attributes>"#;
         let file = ad.params.base.attributes_file;
-        ad.port_base.set_string_param(file, 0, xml).unwrap();
-        assert!(ad.write_octet(file, xml).unwrap());
-        assert!(!ad.write_octet(ad.params.string_to_server, "x").unwrap());
+        ad.write_octet(&AsynUser::new(file), xml.as_bytes())
+            .unwrap();
 
         for gain in [2.5, 4.0] {
             ad.port_base

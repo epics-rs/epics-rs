@@ -502,8 +502,8 @@ impl TraceManager {
     /// `dpCommon` and records its attributes in the same call that claims the
     /// name.
     ///
-    /// Called from [`crate::registry::PortRegistry::register`], the one site
-    /// that claims a port name in this process, so the attribute cannot go
+    /// Called from [`crate::registry::PortClaim::publish`], the one site
+    /// that publishes a port name in this process, so the attribute cannot go
     /// unrecorded for a port that exists. A port whose registration this
     /// manager never saw is treated as single-device, which is C's default
     /// (`attributes` is whatever the driver passed, and `ASYN_MULTIDEVICE` is

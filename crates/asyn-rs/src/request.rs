@@ -46,9 +46,11 @@ impl std::fmt::Debug for DriverCall {
 
 /// The port as a [`RequestCell`] body sees it: each call goes straight
 /// to the driver, as C's callback calls the interfaces it holds, with no
-/// further `queueRequest`.
+/// further `queueRequest`. The driver reads `op` and its data in place, as C
+/// passes the record's own buffer, so a body keeps one op's buffer from
+/// process to process.
 pub trait PortCalls {
-    fn call(&mut self, op: RequestOp, user: crate::user::AsynUser) -> AsynResult<RequestResult>;
+    fn call(&mut self, op: &RequestOp, user: crate::user::AsynUser) -> AsynResult<RequestResult>;
 }
 
 /// Why a queued [`RequestCell`] left its queue without running — the three
@@ -615,7 +617,7 @@ impl QueueTimer {
 /// supported type — `Int64`, `Int8Array`, `Int16Array`, `Int64Array`,
 /// `Float32Array`, `Enum`, `GenericPointer` — simply had no variant to put it in.
 /// Carrying the store's own value type means the two type sets cannot drift
-/// apart again: the actor applies it through the single [`crate::param::ParamList::set_value`]
+/// apart again: the actor applies it through the single `ParamList::set_value`
 /// dispatch, whose exhaustive match makes a new `ParamValue` variant a compile
 /// error rather than an update that never arrives.
 #[derive(Debug, Clone)]
@@ -1543,7 +1545,7 @@ mod tests {
 
     struct NoPort;
     impl PortCalls for NoPort {
-        fn call(&mut self, _: RequestOp, _: crate::user::AsynUser) -> AsynResult<RequestResult> {
+        fn call(&mut self, _: &RequestOp, _: crate::user::AsynUser) -> AsynResult<RequestResult> {
             unreachable!("a probe calls no port")
         }
     }

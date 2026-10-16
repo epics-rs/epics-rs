@@ -434,6 +434,14 @@ impl CommandContext {
         let _ = writeln!(err, "{msg}");
     }
 
+    /// Fail the line as C's iocsh fails a command that threw
+    /// (`iocsh.cpp:1275-1285`): `C++ error: <what>` in red on the diagnostic
+    /// stream.
+    pub fn cxx_error(&self, what: impl std::fmt::Display) -> CommandOutcome {
+        self.eprintln(&super::paint_error(&format!("C++ error: {what}")));
+        CommandOutcome::Failed
+    }
+
     /// Read one line from the current INPUT stream (stdin, or the file a `<`
     /// redirect installed) — C `fgets(..., epicsGetThreadStdin())`. `Ok(0)`
     /// is end of input.

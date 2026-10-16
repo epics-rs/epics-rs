@@ -1158,6 +1158,11 @@ impl NDPluginProcess for ColorConvertProcessor {
     fn plugin_type(&self) -> &str {
         "NDPluginColorConvert"
     }
+
+    /// NDPluginColorConvert.cpp:665
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
 }
 
 #[cfg(test)]

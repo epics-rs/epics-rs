@@ -38,7 +38,7 @@ use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -94,7 +94,7 @@ async fn enum_ioc(
     choices: Vec<EnumEntry>,
 ) -> (Arc<PvDatabase>, PortHandle) {
     let (runtime, _join) =
-        create_port_runtime(EnumPort::new(port, choices), RuntimeConfig::default())
+        create_port_runtime_unclaimed(EnumPort::new(port, choices), RuntimeConfig::default())
             .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
     // The port belongs to the database its records load into, and the

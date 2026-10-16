@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle, ProcessResult};
+use ad_core_rs::plugin::runtime::{
+    ArraySource, NDPluginProcess, PluginRuntimeHandle, ProcessResult,
+};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use parking_lot::Mutex;
 
@@ -50,8 +52,8 @@ impl NDPluginProcess for StdArraysProcessor {
 
     /// C `NDPluginStdArrays.cpp:343` sets `NDArrayCallbacks = 0`: this plugin
     /// serves pixel data via the StdArray waveforms, not downstream callbacks.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     /// C `NDPluginStdArrays` passes `compressionAware=true`
@@ -70,9 +72,9 @@ impl NDPluginProcess for StdArraysProcessor {
 
 /// Create a StdArrays plugin runtime.
 pub fn create_std_arrays_runtime(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     pool: Arc<NDArrayPool>,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
@@ -84,13 +86,8 @@ pub fn create_std_arrays_runtime(
     let data_handle = processor.data_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        port_name,
-        processor,
-        pool,
-        1, // LatestOnly semantics
-        ndarray_port,
-        wiring,
-        threads,
+        claim, processor, pool, 1, // LatestOnly semantics
+        source, wiring, threads,
     );
 
     (handle, data_handle, data_jh)
@@ -144,7 +141,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, data, _jh) = create_std_arrays_runtime(
-            "IMAGE1",
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool,
             "",
             wiring,
@@ -176,7 +173,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
-            "IMAGE1",
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool,
             "",
             wiring,
@@ -195,7 +192,7 @@ mod tests {
     fn test_terminal_plugins_do_not_do_array_callbacks() {
         // C disables NDArrayCallbacks in the constructor of `NDPluginStdArrays.cpp` (`:343`),
         // `NDPluginAttribute.cpp` (`:203`), and `NDPluginFile.cpp` (`:948`, base of every
-        // file writer). Each Rust counterpart overrides `does_array_callbacks()` to false so
+        // file writer). Each Rust counterpart seeds `array_callbacks_seed()` with false so
         // the initial param reflects this.
         use crate::attribute::AttributeProcessor;
         use crate::file_hdf5::Hdf5FileProcessor;
@@ -206,17 +203,38 @@ mod tests {
         use crate::file_tiff::TiffFileProcessor;
         use crate::passthrough::PassthroughProcessor;
 
-        assert!(!StdArraysProcessor::new().does_array_callbacks());
-        assert!(!AttributeProcessor::new("attr", 1).does_array_callbacks());
-        assert!(!Hdf5FileProcessor::new().does_array_callbacks());
-        assert!(!JpegFileProcessor::new(85).does_array_callbacks());
-        assert!(!TiffFileProcessor::new().does_array_callbacks());
-        assert!(!NetcdfFileProcessor::new().does_array_callbacks());
-        assert!(!NexusFileProcessor::new().does_array_callbacks());
-        assert!(!MagickFileProcessor::new().does_array_callbacks());
+        assert_eq!(
+            StdArraysProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            AttributeProcessor::new("attr", 1).array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(Hdf5FileProcessor::new().array_callbacks_seed(), Some(false));
+        assert_eq!(
+            JpegFileProcessor::new(85).array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(TiffFileProcessor::new().array_callbacks_seed(), Some(false));
+        assert_eq!(
+            NetcdfFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            NexusFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
+        assert_eq!(
+            MagickFileProcessor::new().array_callbacks_seed(),
+            Some(false)
+        );
 
-        // A non-terminal plugin keeps the default: it does deliver downstream.
-        assert!(PassthroughProcessor::new("NDPluginProcess").does_array_callbacks());
+        // A plugin whose C constructor does not set it leaves it to the template.
+        assert_eq!(
+            PassthroughProcessor::new("NDPluginProcess").array_callbacks_seed(),
+            None
+        );
     }
 
     #[test]
@@ -238,7 +256,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, data, _jh) = create_std_arrays_runtime(
-            "IMAGE1",
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool,
             "",
             wiring,
@@ -305,7 +323,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
-            "IMAGE1",
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool,
             "",
             wiring,
@@ -367,7 +385,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
         let (handle, _data, _jh) = create_std_arrays_runtime(
-            "IMAGE1",
+            &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
             pool,
             "",
             wiring,

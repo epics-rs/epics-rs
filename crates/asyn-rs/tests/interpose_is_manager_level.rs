@@ -25,7 +25,7 @@ use asyn_rs::error::AsynResult;
 use asyn_rs::interpose::EomReason;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::RequestOp;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 
 /// Reads bytes off a canned device stream and records every write as the driver
@@ -90,7 +90,7 @@ impl PortDriver for RawDeviceDriver {
 fn an_installed_eos_interpose_serves_a_driver_that_never_dispatches_it() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let driver = RawDeviceDriver::new("R1860R", b"ab\ncd\n", writes);
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
     let handle = rt.port_handle().clone();
 
@@ -131,7 +131,7 @@ fn an_installed_eos_interpose_serves_a_driver_that_never_dispatches_it() {
 fn an_interpose_pushed_after_configure_serves_the_write_path() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let driver = RawDeviceDriver::new("R1860W", b"", writes.clone());
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
     let handle = rt.port_handle().clone();
 

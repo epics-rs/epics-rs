@@ -1125,6 +1125,7 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
         }
     }
 
+    let claim = asyn_rs::manager::claim_port_driver("EPID_OUT_PORT").unwrap();
     let mut base = PortDriverBase::new("EPID_OUT_PORT", 1, PortFlags::default());
     let reason = base.create_param("OUTPUT", ParamType::Float64).unwrap();
     // Preload the output port's present value (the real DAC output).
@@ -1132,7 +1133,7 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
 
     let manager = PortManager::new();
     manager
-        .register_port(OutputPort { base }, &asyn_rs::registry::open_owner())
+        .register_port(claim, OutputPort { base }, &asyn_rs::registry::open_owner())
         .unwrap();
 
     let sync_io = SyncIOHandle::connect(&manager, "EPID_OUT_PORT", 0, Duration::from_secs(1))

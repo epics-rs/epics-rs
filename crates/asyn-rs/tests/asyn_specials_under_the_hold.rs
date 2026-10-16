@@ -14,7 +14,7 @@ use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::{get_port, register_port};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -27,7 +27,7 @@ async fn enbl_and_auct_puts_store_without_a_port_round_trip() {
         std::thread::sleep(Duration::from_secs(30));
     });
     let driver = DrvAsynIPPort::new("ENAUHOLD", &addr.to_string()).unwrap();
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default()).unwrap();
     assert!(
         rt.port_handle().can_block(),
         "precondition: a blocking port"
@@ -94,7 +94,8 @@ async fn drvinfo_put_resolves_on_a_blocking_port_under_the_exemption() {
     );
     base.create_param("P0", ParamType::Int32).unwrap();
     base.create_param("P1", ParamType::Int32).unwrap();
-    let (rt, _jh) = create_port_runtime(Blocking { base }, RuntimeConfig::default()).unwrap();
+    let (rt, _jh) =
+        create_port_runtime_unclaimed(Blocking { base }, RuntimeConfig::default()).unwrap();
     assert!(
         rt.port_handle().can_block(),
         "precondition: a blocking port"

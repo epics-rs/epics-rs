@@ -275,7 +275,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             array_counter += 1;
 
             frame.unique_id = array_counter;
-            frame.update_time_stamps_now();
+            // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
+            // the callbacks after it carry the port's updated stamp.
+            let stamp = ctx
+                .port_handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| std::time::SystemTime::now());
+            frame.update_time_stamps(stamp.into());
 
             // C `simDetector::computeImage` publishes the converted array's
             // size beside the frame it belongs to (simDetector.cpp:709-712):
@@ -377,7 +384,14 @@ mod tests {
 
     #[test]
     fn test_single_mode_auto_stop() {
-        let rt = create_sim_detector("SIM_TEST", 32, 32, 1_000_000, NDArrayOutput::new()).unwrap();
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_TEST").unwrap(),
+            32,
+            32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
         let handle = rt.port_handle();
 
         handle
@@ -410,7 +424,14 @@ mod tests {
 
     #[test]
     fn test_continuous_mode_produces_frames() {
-        let rt = create_sim_detector("SIM_CONT", 16, 16, 1_000_000, NDArrayOutput::new()).unwrap();
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_CONT").unwrap(),
+            16,
+            16,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
         let handle = rt.port_handle();
 
         handle
@@ -449,7 +470,14 @@ mod tests {
 
     #[test]
     fn test_stop_during_acquisition() {
-        let rt = create_sim_detector("SIM_STOP", 8, 8, 1_000_000, NDArrayOutput::new()).unwrap();
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_STOP").unwrap(),
+            8,
+            8,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
         let handle = rt.port_handle();
 
         handle

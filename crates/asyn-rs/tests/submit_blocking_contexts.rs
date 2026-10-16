@@ -38,7 +38,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::RequestOp;
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use asyn_rs::user::AsynUser;
 
 /// Every test blocks a thread on purpose; a regression must surface as a
@@ -98,8 +98,9 @@ impl PortDriver for PlainDriver {
 /// `can call blocking only when running on the multi-threaded runtime`.
 #[test]
 fn submit_blocking_from_foreign_current_thread_runtime_succeeds() {
-    let (handle, _join) = create_port_runtime(PlainDriver::new("ctx_a"), RuntimeConfig::default())
-        .expect("the port runtime thread must start");
+    let (handle, _join) =
+        create_port_runtime_unclaimed(PlainDriver::new("ctx_a"), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
 
     run_with_watchdog("ctx-a", move || {
@@ -177,7 +178,7 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
         got_error: got_error.clone(),
     };
 
-    let (handle, _join) = create_port_runtime(driver, RuntimeConfig::default())
+    let (handle, _join) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
     let port: PortHandle = handle.port_handle().clone();
     *self_handle.lock() = Some(port.clone());

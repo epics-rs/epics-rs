@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::port::PortDriver;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
 /// The IP port connects with no request ever submitted: the TCP server sees the
 /// connection land by itself.
@@ -44,7 +44,7 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
         driver.base().is_auto_connect(),
         "drvAsynIPPortConfigure leaves autoConnect on unless noAutoConnect is given"
     );
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
 
     // No I/O request is submitted anywhere in this test: registration itself must
@@ -94,7 +94,7 @@ fn a_no_auto_connect_port_stays_down_at_registration() {
 
     let mut driver = DrvAsynIPPort::new("R1861N", &format!("127.0.0.1:{port}")).unwrap();
     driver.base_mut().init_auto_connect(false);
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
 
     assert!(

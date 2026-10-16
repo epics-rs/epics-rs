@@ -54,22 +54,24 @@ impl CommandHandler for ConfigHandler {
 
         println!("scopeSimulatorConfig: port={port_name}");
 
+        let claim = asyn_rs::manager::claim_port_driver(&port_name).map_err(|e| e.to_string())?;
         let notify = Arc::new(Notify::new());
         let driver = ScopeSimulator::new(&port_name, notify.clone());
         let indices = driver.param_indices();
 
         // Create the port runtime (actor thread + PortHandle)
         let (runtime_handle, _actor_jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| e.to_string())?;
+            create_port_runtime(&claim, driver, RuntimeConfig::default())
+                .map_err(|e| e.to_string())?;
 
         // Register port in global registry so universal asyn device support can find it
         let port_handle = runtime_handle.port_handle().clone();
-        asyn_rs::asyn_record::register_port(
-            &port_name,
-            port_handle.clone(),
-            ctx.db().scan_control().interrupt_gate(),
-        )
-        .map_err(|e| e.to_string())?;
+        claim
+            .publish(
+                port_handle.clone(),
+                ctx.db().scan_control().interrupt_gate(),
+            )
+            .map_err(|e| e.to_string())?;
 
         // Start background simulation task using the PortHandle API
         let sim_notify = notify.clone();

@@ -212,7 +212,14 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             array_counter += 1;
 
             frame.unique_id = array_counter;
-            frame.update_time_stamps_now();
+            // C updateTimeStamps (asynNDArrayDriver.cpp:832-836): the frame and
+            // the callbacks after it carry the port's updated stamp.
+            let stamp = ctx
+                .port_handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| std::time::SystemTime::now());
+            frame.update_time_stamps(stamp.into());
 
             // C `simDetector::computeImage` publishes the converted array's
             // size beside the frame it belongs to (simDetector.cpp:709-712):

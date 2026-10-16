@@ -1162,24 +1162,38 @@ impl PortDriver for ModbusPortDriver {
         let mut parts = drv_info.splitn(2, '=');
         let base_info = parts.next().unwrap_or(drv_info).trim();
         let suffix = parts.next();
-        let reason = self
-            .base
-            .find_param(base_info)
-            .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
-        let datatype = self.reason_to_datatype.get(reason).copied().flatten();
-        if datatype.is_some() {
-            // C runs `getAddr` + `checkOffset` ONLY inside the data-type-match
-            // branch (:378-384), before the suffix switch; a non-data drvInfo
-            // (statistics/control) falls through to the base class with no offset
-            // check. Reject an out-of-range offset here at bind so the record
-            // fails init instead of binding and alarming on every I/O.
-            self.engine.check_offset(addr).map_err(to_asyn)?;
+        // A drvInfo that names no data type (statistics/control) goes to the
+        // base class whole, suffix included (:432-433).
+        let Some((reason, datatype)) = self.base.find_param(base_info).and_then(|reason| {
+            let dt = self.reason_to_datatype.get(reason).copied().flatten()?;
+            Some((reason, dt))
+        }) else {
+            return self.base.drv_user_create(req);
+        };
+        // C runs `getAddr` + `checkOffset` in the data-type branch only
+        // (:378-384). Reject an out-of-range offset here at bind so the record
+        // fails init instead of binding and alarming on every I/O.
+        if let Err(e) = self.engine.check_offset(addr) {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "drvModbusAsyn::drvUserCreate port {} invalid offset {addr}",
+                    self.base.port_name
+                ),
+            );
+            return Err(to_asyn(e));
         }
         let mut max_octet_len = None;
         if let Some(suffix) = suffix {
-            let is_string = datatype.is_some_and(|dt| dt.is_string());
-            if !is_string {
+            if !datatype.is_string() {
                 // C: the `=` length suffix is invalid for a non-string type.
+                self.base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "drvModbusAsyn::drvUserCreate port {} invalid drvUser: {drv_info}",
+                        self.base.port_name
+                    ),
+                );
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("invalid drvUser (length suffix on non-string): {drv_info}"),
@@ -1192,6 +1206,13 @@ impl PortDriver for ModbusPortDriver {
                 None => {
                     // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
                     // guard rejects garbage or a negative length.
+                    self.base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "drvModbusAsyn::drvUserCreate port {} invalid string length: {suffix}",
+                            self.base.port_name
+                        ),
+                    );
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!("invalid string length: {suffix}"),
@@ -2002,6 +2023,12 @@ impl CommandHandler for ModbusConfigHandler {
     fn call(&self, args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
         let (port_name, octet_port, config) =
             parse_configure_args(args).map_err(|e| e.to_string())?;
+        // `drvModbusAsyn` is an `asynPortDriver` subclass (drvModbusAsyn.h:123):
+        // its base registers the port before the body builds anything.
+        let claim = match asyn_rs::manager::claim_port_driver(&port_name) {
+            Ok(claim) => claim,
+            Err(e) => return Ok(ctx.cxx_error(e)),
+        };
         let interpose = take_interpose(&octet_port);
         let link = interpose.link;
         // The read poller is started only for a relative-addressing read port.
@@ -2044,30 +2071,32 @@ impl CommandHandler for ModbusConfigHandler {
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
 
-        // A port whose actor thread the OS refused is not a port: fail the
-        // command before the registration below claims the name for it. Same
-        // end state as C by a different route — `drvModbusAsyn` is an
-        // `asynPortDriver` subclass (drvModbusAsyn.h:123) built with a bare
-        // `new` (drvModbusAsyn.cpp:3134), so a failed `registerPort` throws
-        // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
-        // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
-        // The `?` is the same error channel the duplicate-name failure below
-        // already uses.
-        let (runtime, _jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
-                asyn_rs::manager::report_port_driver_register_failure(&port_name);
-                e.to_string()
-            })?;
+        // A port whose actor thread the OS refused is not a port: dropping the
+        // claim frees the name. Same end state as C by a different route — a
+        // failed `registerPort` throws out of the constructor
+        // (asynPortDriver.cpp:4036-4040), iocsh catches it
+        // (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
+        // Both failures below report as that throw.
+        let Ok((runtime, _jh)) = create_port_runtime(&claim, driver, RuntimeConfig::default())
+        else {
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
+        };
         let port_handle = runtime.port_handle().clone();
         // Owned by the database this command's IOC runs, so its seed waits
         // for that database's open.
         let owner = ctx.db().scan_control().interrupt_gate();
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
-        {
+        if claim.publish(port_handle.clone(), owner).is_err() {
             // Nothing published this port, so ask the actor to stop.
-            asyn_rs::manager::report_port_driver_register_failure(&port_name);
             runtime.shutdown();
-            return Err(e.to_string());
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
         }
         // The registry above holds a live `PortHandle` for this port, which is
         // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
@@ -2182,6 +2211,7 @@ pub fn register_modbus_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 
     fn args(v: Vec<ArgValue>) -> Vec<ArgValue> {
         v
@@ -2373,7 +2403,7 @@ mod tests {
         const EXCHANGES: usize = 200;
 
         let shared = Arc::new(std::sync::Mutex::new(TagLog::default()));
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             TaggedOctetPort {
                 base: PortDriverBase::new("MB_OCTET_TAGGED", 1, PortFlags::default()),
                 shared: Arc::clone(&shared),
@@ -2461,7 +2491,7 @@ mod tests {
     /// the wrong reason and hides the one diagnosis an operator can act on.
     #[test]
     fn a_port_read_timeout_reaches_the_records_as_a_timeout() {
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             TimingOutOctetPort {
                 base: PortDriverBase::new("MB_OCTET_SILENT", 1, PortFlags::default()),
             },
@@ -2554,8 +2584,8 @@ mod tests {
             replies: std::collections::VecDeque::from(vec![fresh]),
             written: Arc::new(Mutex::new(Vec::new())),
         };
-        let (runtime, _jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).expect("port runtime must start");
+        let (runtime, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+            .expect("port runtime must start");
         let sync = SyncIOHandle::from_handle(
             runtime.port_handle().clone(),
             0,
@@ -2659,7 +2689,7 @@ mod tests {
         let (a, b) = frame.split_at(140);
 
         let chunks = Arc::new(std::sync::Mutex::new(vec![a.to_vec(), b.to_vec()]));
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             SplitReplyPort {
                 base: PortDriverBase::new("MB_OCTET_SPLIT", 1, PortFlags::default()),
                 chunks,
@@ -2747,7 +2777,7 @@ mod tests {
         Arc<Mutex<usize>>,
     ) {
         let reads = Arc::new(Mutex::new(0usize));
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             CountedReplyPort {
                 base: PortDriverBase::new(name, 1, PortFlags::default()),
                 chunks: Arc::new(Mutex::new(chunks.into())),
@@ -2983,6 +3013,64 @@ mod tests {
         );
     }
 
+    /// A drvInfo naming no data type goes to the base class, which prints the
+    /// unknown name (drvModbusAsyn.cpp:432-433, asynPortDriver.cpp:3570-3574);
+    /// a refused data-type drvInfo prints drvModbusAsyn's own line (:405-409).
+    #[test]
+    fn a_refused_drv_user_create_prints_its_c_line() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let driver = ModbusPortDriver::new(
+            "MB_DU_TRACE",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        let path =
+            std::env::temp_dir().join(format!("modbus_MB_DU_TRACE_{}.trace", std::process::id()));
+        let services = PortServices::new();
+        services.trace().set_trace_file(
+            Some("MB_DU_TRACE"),
+            TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).expect("the trace sink must open"),
+            ))),
+        );
+        let (runtime, _jh) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect("the modbus port runtime must start");
+        let handle = runtime.port_handle();
+        assert!(matches!(
+            handle.drv_user_create_blocking(&DrvUserRequest::new("NOPE=5", 0)),
+            Err(AsynError::ParamNotFound(_))
+        ));
+        assert!(
+            handle
+                .drv_user_create_blocking(&DrvUserRequest::new("INT16=5", 0))
+                .is_err()
+        );
+        runtime.shutdown();
+
+        let logged = std::fs::read_to_string(&path).expect("the trace sink must be readable");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains("asynPortDriver:drvUserCreate: addr=0, cannot find parameter NOPE=5\n"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains(
+                "drvModbusAsyn::drvUserCreate port MB_DU_TRACE invalid drvUser: INT16=5\n"
+            ),
+            "{logged}"
+        );
+    }
+
     /// R52: `connect_addr` rejects an out-of-range register offset (the asyn
     /// `addr`), mirroring C `connect` (drvModbusAsyn.cpp:455-467) which returns
     /// `asynError` so a misconfigured record fails to connect rather than
@@ -3072,14 +3160,18 @@ mod tests {
                 .drv_user_create(&DrvUserRequest::new("INT16", 99))
                 .is_err()
         );
-        // A non-data (statistics) reason carries no offset → C skips
-        // `checkOffset`, so an out-of-range addr must NOT reject it.
+        // A non-data (statistics) reason skips `checkOffset` and goes to the
+        // base class, whose `getAddress` still refuses an address past the
+        // port's (asynPortDriver.cpp:1901-1914).
         assert!(
             driver
-                .drv_user_create(&DrvUserRequest::new("READ_OK", 99))
-                .is_ok(),
-            "statistics params fall through to the base class with no offset check"
+                .drv_user_create(&DrvUserRequest::new("READ_OK", 0))
+                .is_ok()
         );
+        assert!(matches!(
+            driver.drv_user_create(&DrvUserRequest::new("READ_OK", 99)),
+            Err(AsynError::AddressOutOfRange(99))
+        ));
     }
 
     /// A valid `TYPE=N` suffix on a string type yields the per-record octet cap
@@ -3424,8 +3516,8 @@ mod tests {
         // The on-demand configuration: `drvModbusAsynConfigure(... pollMsec=0)`.
         poll_delay.store(0.0f64.to_bits(), Ordering::Relaxed);
 
-        let (runtime, _jh) =
-            create_port_runtime(driver, RuntimeConfig::default()).expect("runtime must start");
+        let (runtime, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+            .expect("runtime must start");
         let handle = runtime.port_handle().clone();
         let poller = tokio::spawn(read_poller(
             handle,
@@ -3485,7 +3577,7 @@ mod tests {
     /// `drvModbusAsyn` derives from `asynPortDriver`, so a configure whose
     /// `registerPort` is refused prints C's two stdout lines — the manager's
     /// `already registered` (asynManager.c:2056) and the constructor's
-    /// (asynPortDriver.cpp:4036-4040) — and the command fails.
+    /// (asynPortDriver.cpp:4036-4040) — and the command fails as a C++ throw.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_duplicate_modbus_port_prints_the_two_register_port_lines() {
         use epics_base_rs::server::iocsh::registry::ArgValue;
@@ -3506,7 +3598,7 @@ mod tests {
                 replies: Default::default(),
                 written: Arc::new(Mutex::new(Vec::new())),
             };
-            let (octet_rt, _jh) = create_port_runtime(octet, RuntimeConfig::default())
+            let (octet_rt, _jh) = create_port_runtime_unclaimed(octet, RuntimeConfig::default())
                 .expect("octet runtime must start");
             asyn_rs::asyn_record::register_port(
                 "OCTET_DUPLINE",
@@ -3528,19 +3620,30 @@ mod tests {
                 ArgValue::Int(0),
             ];
             handler.call(&args, &make_ctx()).expect("first configure");
-            println!("SECOND={}", handler.call(&args, &make_ctx()).is_err());
+            println!(
+                "SECOND={}",
+                matches!(
+                    handler.call(&args, &make_ctx()),
+                    Ok(epics_base_rs::server::iocsh::registry::CommandOutcome::Failed)
+                )
+            );
             return;
         }
         let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
             .args(["--exact", TEST, "--nocapture"])
             .env(CHILD, "1")
+            .env("NO_COLOR", "1")
             .output()
             .expect("re-exec the test binary");
         let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        // iocsh's report of the constructor's throw (iocsh.cpp:1275-1279).
         assert!(
-            out.status.success(),
-            "{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
+            stderr
+                .lines()
+                .any(|l| l == "C++ error: asynPortDriver:asynPortDriver ERROR: Can't register port: MB_DUPLINE"),
+            "{stderr}"
         );
         let lines: Vec<&str> = stdout.lines().collect();
         let at = lines
@@ -3583,8 +3686,8 @@ mod tests {
             replies: (0..64).map(|_| reply.clone()).collect(),
             written: Arc::clone(&requests),
         };
-        let (octet_rt, _jh) =
-            create_port_runtime(octet, RuntimeConfig::default()).expect("octet runtime must start");
+        let (octet_rt, _jh) = create_port_runtime_unclaimed(octet, RuntimeConfig::default())
+            .expect("octet runtime must start");
         asyn_rs::asyn_record::register_port(
             "OCTET_LATESTART",
             octet_rt.port_handle().clone(),
@@ -4886,7 +4989,7 @@ mod tests {
                 std::fs::File::create(&path).expect("the trace sink must open"),
             ))),
         );
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             driver,
             RuntimeConfig {
                 services,
@@ -5031,7 +5134,7 @@ mod tests {
                 std::fs::File::create(&path).expect("the trace sink must open"),
             ))),
         );
-        let (runtime, _jh) = create_port_runtime(
+        let (runtime, _jh) = create_port_runtime_unclaimed(
             driver,
             RuntimeConfig {
                 services,
@@ -6300,7 +6403,7 @@ mod tests {
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
 
-        let (runtime, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        let (runtime, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
             .expect("the port runtime thread must start");
         let handle = runtime.port_handle().clone();
         let poller = tokio::spawn(read_poller(

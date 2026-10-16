@@ -16,7 +16,7 @@ use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::register_port;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -128,7 +128,8 @@ async fn a_blocking_port_reentry_allocates_nothing() {
             ..PortFlags::default()
         },
     );
-    let (rt, _jh) = create_port_runtime(Device { base }, RuntimeConfig::default()).unwrap();
+    let (rt, _jh) =
+        create_port_runtime_unclaimed(Device { base }, RuntimeConfig::default()).unwrap();
     assert!(
         rt.port_handle().can_block(),
         "precondition: a blocking port"

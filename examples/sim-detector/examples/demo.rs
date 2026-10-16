@@ -6,7 +6,14 @@ fn main() {
     println!("SimDetector Demo");
     println!("================");
 
-    let rt = create_sim_detector("SIM_DEMO", 256, 256, 50_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("SIM_DEMO").unwrap(),
+        256,
+        256,
+        50_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     // Configure: UInt16, Continuous, LinearRamp

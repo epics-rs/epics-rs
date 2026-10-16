@@ -418,7 +418,21 @@ pub enum WriteStart {
     Completed,
     /// The write was submitted to a worker queue and the record stays PACT;
     /// the device ends the cycle through the source's
-    /// [`WriteDone`](crate::server::database::WriteDone) when the write lands.
+    /// [`DeviceDone`](crate::server::database::DeviceDone) when the write lands.
+    Pending,
+}
+
+/// What [`DeviceSupport::read_begin`] did with the record's input.
+pub enum ReadStart {
+    /// No submit-only path this pass: the framework runs
+    /// [`DeviceSupport::read`] now, under the record lock.
+    Synchronous,
+    /// The read was queued to a worker and the record stays PACT. The pass
+    /// ends with no value, alarm, monitor or forward link (C `process()`'s
+    /// `if (!pact && prec->pact) return 0`, aiRecord.c:149); the device
+    /// re-enters it through the source's
+    /// [`DeviceDone::reprocess`](crate::server::database::DeviceDone::reprocess),
+    /// and that pass's [`DeviceSupport::read`] applies what was read.
     Pending,
 }
 
@@ -960,13 +974,26 @@ pub trait DeviceSupport: Send + Sync + 'static {
         false
     }
 
+    /// Begin the record's input read — C devAsyn's `queueRequest` on a
+    /// `canBlock` port with `pr->pact = 1` (devAsynInt32.c:838-842). Asked
+    /// only on a pass the record entered idle; the pass a
+    /// [`ReadStart::Pending`] completion re-enters calls [`read`](Self::read)
+    /// alone. The default has no submit-only path.
+    fn read_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        _done: &crate::server::database::DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        Ok(ReadStart::Synchronous)
+    }
+
     /// Begin the record's output write — see [`WriteStart`] for the three
     /// outcomes. The default has no submit-only path and asks for
     /// [`write()`](DeviceSupport::write).
     fn write_begin(
         &mut self,
         _record: &mut dyn Record,
-        _done: &crate::server::database::WriteDoneSource<'_>,
+        _done: &crate::server::database::DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         Ok(WriteStart::Synchronous)
     }

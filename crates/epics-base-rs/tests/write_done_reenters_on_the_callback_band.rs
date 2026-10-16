@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::CallbackPriority;
-use epics_base_rs::server::database::{PvDatabase, WriteDone, WriteDoneSource};
+use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource, PvDatabase};
 use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 
-type Pending = Arc<Mutex<Option<(WriteDone, CallbackPriority)>>>;
+type Pending = Arc<Mutex<Option<(DeviceDone, CallbackPriority)>>>;
 
 /// Submits every write and hands its completion to the test, which plays the
 /// port thread.
@@ -29,9 +29,9 @@ impl DeviceSupport for Submits {
     fn write_begin(
         &mut self,
         _record: &mut dyn Record,
-        done: &WriteDoneSource<'_>,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        *self.0.lock().unwrap() = Some((done.write_done(), done.priority()));
+        *self.0.lock().unwrap() = Some((done.device_done(), done.priority()));
         Ok(WriteStart::Pending)
     }
     fn dtyp(&self) -> &str {
@@ -130,4 +130,33 @@ async fn a_low_prio_write_completes_once_on_cb_low() {
     let passes = completes_on(0).await;
     assert_eq!(passes.len(), 1, "one completing pass: {passes:?}");
     assert!(passes[0].starts_with("cbLow"), "{passes:?}");
+}
+
+/// C `iocShutdown` stops the callback threads right after the scan facility
+/// (iocInit.c:733-735): a write a closing port completes at exit ends no cycle.
+#[epics_macros_rs::epics_test]
+async fn a_completion_after_the_scan_stopped_processes_nothing() {
+    let db = PvDatabase::new();
+    db.add_record("AO", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.ioc_init().await;
+    let pending: Pending = Arc::default();
+    {
+        let rec = db.get_record("AO").unwrap();
+        let mut inst = rec.write();
+        inst.common.udf = 0;
+        inst.common.dtyp = "Submits".into();
+        inst.device = Some(Box::new(Submits(Arc::clone(&pending))));
+    }
+    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    db.scan_control().stop();
+    let (done, band) = pending.lock().unwrap().take().expect("submitted");
+    std::thread::spawn(move || done.complete(band, Ok(())).unwrap())
+        .join()
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
+    assert!(db.get_record("AO").unwrap().read().is_processing());
 }

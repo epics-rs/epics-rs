@@ -1,7 +1,7 @@
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
-use crate::plugin::runtime::{PluginThreads, plugin_threads};
+use crate::plugin::runtime::{ArraySource, PluginThreads, plugin_threads};
 
 /// Standard C-compatible arg descriptors for plugin configure commands.
 ///
@@ -126,10 +126,11 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
     ]
 }
 
-/// Extract port_name, queue_size, and ndarray_port from C-compatible plugin args.
+/// Extract `portName`, `queueSize` and the `NDArrayPort`/`NDArrayAddr`
+/// source from C-compatible plugin args.
 ///
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`
-pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String), String> {
+pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, ArraySource), String> {
     let port_name = match &args[0] {
         ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
@@ -138,11 +139,15 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, String),
         Some(ArgValue::Int(n)) => *n as usize,
         _ => 20,
     };
-    let ndarray_port = match args.get(3) {
+    let port = match args.get(3) {
         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
     };
-    Ok((port_name, queue_size, ndarray_port))
+    let addr = match args.get(4) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
+    };
+    Ok((port_name, queue_size, ArraySource { port, addr }))
 }
 
 /// The `maxThreads` argument of a plugin `*Configure` command, as written.

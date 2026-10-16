@@ -40,10 +40,94 @@ pub struct PortEntry {
     pub handle: PortHandle,
 }
 
+/// A name in the registry: claimed while its port is being built, then
+/// published.
+enum Slot {
+    Claimed,
+    Published(PortEntry),
+}
+
 /// Shared port registry — can be injected into multiple IOC instances.
 #[derive(Clone)]
 pub struct PortRegistry {
-    inner: Arc<Mutex<HashMap<String, PortEntry>>>,
+    inner: Arc<Mutex<HashMap<String, Slot>>>,
+}
+
+/// A port name held for a port still being built. C's `asynPortDriver`
+/// constructor registers the port before it builds anything else
+/// (asynPortDriver.cpp:4036-4040), so a refused name leaves nothing behind;
+/// a claim taken first gives the same order. Dropped unpublished, it frees
+/// the name.
+pub struct PortClaim {
+    registry: PortRegistry,
+    name: String,
+    published: bool,
+}
+
+impl PortClaim {
+    /// The claimed name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Publish `handle` under the claimed name.
+    ///
+    /// `owner` is the gate of the database this port serves
+    /// (`ctx.db().scan_control().interrupt_gate()`): the port accepts
+    /// callbacks while it is open, and no other gate is read.
+    /// A port is ownerless only between construction and this call, and
+    /// reads closed then, so a seed written in the constructor is kept; the
+    /// owner's `false → true` edge flushes it once (C `callbackThread`,
+    /// `asynPortDriver.cpp:923-937`), immediately if the owner is already
+    /// open here.
+    ///
+    /// The entry's trace manager is the handle's own — the one the driver was
+    /// bound to at `create_port_runtime` — so a mask set through the registry
+    /// (`asynSetTraceMask`, asynRecord `TMSK`) is the mask the driver's
+    /// `trace_print` reads. C has one `tracePvt` per port, reached through
+    /// the port (asynManager.c:451-461); a registration that named a second
+    /// manager published masks nothing printed against.
+    pub fn publish(mut self, handle: PortHandle, owner: &Arc<InterruptGate>) -> AsynResult<()> {
+        // C `registerPort` builds the port's `dpCommon` and records its
+        // attributes in the same call that adds it to the port list
+        // (asynManager.c:2047-2097), so the trace facility can never be asked
+        // about a port whose `ASYN_MULTIDEVICE` bit it does not know.
+        if !handle.interrupts().set_owner(owner.clone()) {
+            return Err(AsynError::PortAlreadyOwned(self.name.clone()));
+        }
+        handle
+            .trace()
+            .register_port(&self.name, handle.is_multi_device());
+        let registry = self.registry.clone();
+        let mut reg = registry.inner.lock().unwrap();
+        // Only this claim's own `Drop` frees a claimed slot, so it is still ours.
+        match reg.get_mut(&self.name) {
+            Some(slot @ Slot::Claimed) => *slot = Slot::Published(PortEntry { handle }),
+            _ => unreachable!("claimed slot {} left its claim", self.name),
+        }
+        self.published = true;
+        // By name, so the gate does not keep a withdrawn port's actor alive.
+        let (flush, port) = (registry.clone(), self.name.clone());
+        owner.on_open(move || flush.flush_in_background(&port));
+        if owner.is_open() {
+            // Behind the lock held here: the lookup sees the entry.
+            registry.flush_in_background(&self.name);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PortClaim {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Ok(mut reg) = self.registry.inner.lock()
+            && matches!(reg.get(&self.name), Some(Slot::Claimed))
+        {
+            reg.remove(&self.name);
+        }
+    }
 }
 
 impl Default for PortRegistry {
@@ -67,27 +151,24 @@ impl PortRegistry {
     /// new port, silently shadowing legitimate I/O. To replace a port,
     /// [`Self::remove`] it first.
     ///
-    /// `owner` is the gate of the database this port serves
-    /// (`ctx.db().scan_control().interrupt_gate()`): the port accepts
-    /// callbacks while it is open, and no other gate is read.
-    /// A port is ownerless only between construction and this call, and
-    /// reads closed then, so a seed written in the constructor is kept; the
-    /// owner's `false → true` edge flushes it once (C `callbackThread`,
-    /// `asynPortDriver.cpp:923-937`), immediately if the owner is already
-    /// open here.
-    ///
-    /// The entry's trace manager is the handle's own — the one the driver was
-    /// bound to at `create_port_runtime` — so a mask set through the registry
-    /// (`asynSetTraceMask`, asynRecord `TMSK`) is the mask the driver's
-    /// `trace_print` reads. C has one `tracePvt` per port, reached through
-    /// the port (asynManager.c:451-461); a registration that named a second
-    /// manager published masks nothing printed against.
+    /// This claims after the port was built, so it exists only for test
+    /// fixtures (`test-support`): a port creator takes [`Self::claim`] before
+    /// it builds and publishes through the [`PortClaim`], so a refused name
+    /// builds nothing. `owner` is as for [`PortClaim::publish`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register(
         &self,
         name: &str,
         handle: PortHandle,
         owner: &Arc<InterruptGate>,
     ) -> AsynResult<()> {
+        self.claim(name)?.publish(handle, owner)
+    }
+
+    /// Hold `name` for a port about to be built. Errors with
+    /// [`AsynError::PortAlreadyRegistered`] if it is published or claimed,
+    /// as C `registerPort` refuses a duplicate.
+    pub fn claim(&self, name: &str) -> AsynResult<PortClaim> {
         let mut reg = self.inner.lock().unwrap();
         match reg.entry(name.to_string()) {
             Entry::Occupied(_) => {
@@ -95,26 +176,12 @@ impl PortRegistry {
                 Err(AsynError::PortAlreadyRegistered(name.to_string()))
             }
             Entry::Vacant(slot) => {
-                // C `registerPort` builds the port's `dpCommon` and records
-                // its attributes in the same call that adds it to the port
-                // list (asynManager.c:2047-2097), so the trace facility can
-                // never be asked about a port whose `ASYN_MULTIDEVICE` bit it
-                // does not know. This is the one site that claims a name in
-                // this process, so it is the one place that has to say so.
-                if !handle.interrupts().set_owner(owner.clone()) {
-                    return Err(AsynError::PortAlreadyOwned(name.to_string()));
-                }
-                handle.trace().register_port(name, handle.is_multi_device());
-                slot.insert(PortEntry { handle });
-                // By name, so the gate does not keep a withdrawn port's
-                // actor alive.
-                let (registry, port) = (self.clone(), name.to_string());
-                owner.on_open(move || registry.flush_in_background(&port));
-                if owner.is_open() {
-                    // Behind the lock held here: the lookup sees the entry.
-                    self.flush_in_background(name);
-                }
-                Ok(())
+                slot.insert(Slot::Claimed);
+                Ok(PortClaim {
+                    registry: self.clone(),
+                    name: name.to_string(),
+                    published: false,
+                })
             }
         }
     }
@@ -136,7 +203,10 @@ impl PortRegistry {
 
     pub fn get(&self, name: &str) -> Option<PortEntry> {
         let reg = self.inner.lock().ok()?;
-        reg.get(name).cloned()
+        match reg.get(name)? {
+            Slot::Published(entry) => Some(entry.clone()),
+            Slot::Claimed => None,
+        }
     }
 
     /// Names of every published port, in arbitrary order.
@@ -146,15 +216,23 @@ impl PortRegistry {
     /// that list.
     pub fn names(&self) -> Vec<String> {
         match self.inner.lock() {
-            Ok(reg) => reg.keys().cloned().collect(),
+            Ok(reg) => reg
+                .iter()
+                .filter(|(_, slot)| matches!(slot, Slot::Published(_)))
+                .map(|(name, _)| name.clone())
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    /// Withdraw a port. A name that was never published is a no-op.
+    /// Withdraw a published port. A name that was never published, or is
+    /// claimed by a port still being built, is a no-op.
     pub fn remove(&self, name: &str) {
-        if let Ok(mut reg) = self.inner.lock() {
-            reg.remove(name);
+        if let Ok(mut reg) = self.inner.lock()
+            && let Entry::Occupied(slot) = reg.entry(name.to_string())
+            && matches!(slot.get(), Slot::Published(_))
+        {
+            slot.remove();
         }
     }
 }
@@ -174,13 +252,20 @@ fn global_registry() -> &'static PortRegistry {
     GLOBAL_PORT_REGISTRY.get_or_init(PortRegistry::new)
 }
 
-/// Register a port via the global registry, owned by `owner`'s database.
-/// Prefer using a shared `PortRegistry` instance for better test isolation.
+/// Register an already-built port via the global registry, owned by `owner`'s
+/// database; test fixtures only, see [`PortRegistry::register`].
 ///
 /// Errors with [`AsynError::PortAlreadyRegistered`] on a duplicate name —
 /// see [`PortRegistry::register`].
+#[cfg(any(test, feature = "test-support"))]
 pub fn register_port(name: &str, handle: PortHandle, owner: &Arc<InterruptGate>) -> AsynResult<()> {
     global_registry().register(name, handle, owner)
+}
+
+/// Hold `name` in the global registry for a port about to be built; see
+/// [`PortRegistry::claim`].
+pub fn claim_port(name: &str) -> AsynResult<PortClaim> {
+    global_registry().claim(name)
 }
 
 /// Deliver a port's accumulated changed params once: C
@@ -252,6 +337,52 @@ mod tests {
         }
         // The original entry survives the rejected attempt.
         assert!(reg.get("regdup").is_some());
+    }
+
+    /// A claim holds the name against a second claim and a register, is not
+    /// a port to `get`/`names`, and frees the name when dropped unpublished.
+    #[test]
+    fn a_claim_holds_the_name_until_published_or_dropped() {
+        let reg = PortRegistry::new();
+        let claim = reg.claim("claimed").unwrap();
+        assert!(matches!(
+            reg.claim("claimed"),
+            Err(AsynError::PortAlreadyRegistered(_))
+        ));
+        assert!(matches!(
+            reg.register("claimed", dummy_handle("claimed"), &open_owner()),
+            Err(AsynError::PortAlreadyRegistered(_))
+        ));
+        assert!(reg.get("claimed").is_none());
+        assert!(reg.names().is_empty());
+        drop(claim);
+        let claim = reg
+            .claim("claimed")
+            .expect("a dropped claim frees the name");
+        claim
+            .publish(dummy_handle("claimed"), &open_owner())
+            .unwrap();
+        assert!(reg.get("claimed").is_some());
+        assert_eq!(reg.names(), ["claimed"]);
+    }
+
+    /// `remove()` withdraws published ports only: a claim survives it, so no
+    /// other creator can take the name before the claim publishes.
+    #[test]
+    fn remove_leaves_a_pending_claim_alone() {
+        let reg = PortRegistry::new();
+        let claim = reg.claim("pending").unwrap();
+        reg.remove("pending");
+        assert!(matches!(
+            reg.claim("pending"),
+            Err(AsynError::PortAlreadyRegistered(_))
+        ));
+        claim
+            .publish(dummy_handle("pending"), &open_owner())
+            .unwrap();
+        assert!(reg.get("pending").is_some());
+        reg.remove("pending");
+        assert!(reg.get("pending").is_none());
     }
 
     /// Boundary: `remove()` frees the name for re-registration.

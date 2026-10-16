@@ -1079,7 +1079,7 @@ mod tests {
         use crate::driver::MqttDriver;
         use asyn_rs::port::{DrvUserRequest, PortDriver};
         use asyn_rs::runtime::config::RuntimeConfig;
-        use asyn_rs::runtime::port::create_port_runtime;
+        use asyn_rs::runtime::port::create_port_runtime_unclaimed;
         use std::sync::atomic::AtomicBool;
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1095,7 +1095,7 @@ mod tests {
             .drv_user_create(&DrvUserRequest::new(spec, 0))
             .expect("bind the STRING topic")
             .reason;
-        let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+        let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
             .expect("the port actor thread must start");
         let port = rt.port_handle().clone();
 
@@ -1212,7 +1212,7 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let (runtime, _jh) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _jh) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig::default(),
         )
@@ -1317,7 +1317,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _jh) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _jh) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             RuntimeConfig {
                 services,
@@ -1449,7 +1449,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig {
                 services,
@@ -1537,7 +1537,7 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let (runtime, actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig::default(),
         )
@@ -1605,7 +1605,7 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig::default(),
         )
@@ -1687,7 +1687,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig {
                 services,
@@ -1825,7 +1825,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig {
                 services,
@@ -1954,7 +1954,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig {
                 services,
@@ -2110,7 +2110,7 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig::default(),
         )
@@ -2202,7 +2202,7 @@ mod tests {
         let connected_param = driver.connected_param;
         let shutdown = driver.shutdown_signal();
         let teardown_done = driver.teardown_ack();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig::default(),
         )
@@ -2419,7 +2419,7 @@ mod tests {
         let teardown_done = driver.teardown_ack();
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime_unclaimed(
             driver,
             asyn_rs::runtime::config::RuntimeConfig {
                 services,

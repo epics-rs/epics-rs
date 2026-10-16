@@ -12,7 +12,7 @@ use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
@@ -41,7 +41,7 @@ impl PortDriver for BlockingPort {
     }
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.writes.lock().unwrap().push(this_thread());
-        self.base.params.set_float64(user.reason, user.addr, value)
+        self.base.set_float64_param(user.reason, user.addr, value)
     }
 }
 
@@ -94,7 +94,7 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
         },
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
-    let (runtime, _actor) = create_port_runtime(
+    let (runtime, _actor) = create_port_runtime_unclaimed(
         BlockingPort {
             base,
             writes: writes.clone(),

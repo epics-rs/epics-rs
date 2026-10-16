@@ -601,6 +601,7 @@ impl NDPluginProcess for PosPluginProcessor {
             output_arrays: vec![Arc::new(out)],
             param_updates: updates,
             scatter: false,
+            addressed: vec![],
         }
     }
 

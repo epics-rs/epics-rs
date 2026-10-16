@@ -28,7 +28,7 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::PortRegistry;
 use asyn_rs::runtime::port::PortRuntimeHandle;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
 /// A driver whose entire teardown is observable: it reports its own `Drop`.
 /// Stands in for every driver with a protocol goodbye to send.
@@ -87,7 +87,7 @@ const SETTLE: Duration = Duration::from_secs(5);
 fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
     // ---- port 1: a driver that reports its own Drop --------------------
     let (torn_down_tx, torn_down) = std::sync::mpsc::channel();
-    let (recorder, _recorder_thread) = create_port_runtime(
+    let (recorder, _recorder_thread) = create_port_runtime_unclaimed(
         TeardownDriver::new("MQ4:RECORDER", torn_down_tx),
         RuntimeConfig::default(),
     )
@@ -109,7 +109,7 @@ fn ioc_shutdown_stops_every_port_actor_and_runs_each_drivers_teardown() {
         let mut sink = [0u8; 1];
         let _ = peer_saw.send(conn.read(&mut sink));
     });
-    let (ip_port, _ip_thread) = create_port_runtime(
+    let (ip_port, _ip_thread) = create_port_runtime_unclaimed(
         DrvAsynIPPort::new("MQ4:IP", &format!("127.0.0.1:{device_port}")).expect("configure"),
         RuntimeConfig::default(),
     )
@@ -169,7 +169,7 @@ mod serial {
 
     use asyn_rs::drivers::serial_port::DrvAsynSerialPort;
     use asyn_rs::registry::PortRegistry;
-    use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+    use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
     /// The pty master, kept open so the slave's fate is observable.
     pub struct Pty {
@@ -231,7 +231,7 @@ mod serial {
         unsafe { libc::close(slave) };
         unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) };
 
-        let (port, _thread) = create_port_runtime(
+        let (port, _thread) = create_port_runtime_unclaimed(
             DrvAsynSerialPort::new("MQ4:SERIAL", &device).expect("configure"),
             RuntimeConfig::default(),
         )

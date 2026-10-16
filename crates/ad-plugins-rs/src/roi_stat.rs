@@ -9,7 +9,8 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult,
+    ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
+    ProcessResult,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
@@ -19,7 +20,6 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 #[cfg(feature = "parallel")]
 use crate::par_util;
 use crate::stats::{StatsElem, merge_range};
-use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -66,21 +66,6 @@ pub enum TSMode {
 
 /// Number of statistics tracked per ROI (min, max, mean, total, net).
 const NUM_STATS: usize = 5;
-
-/// Per-ROI stat names used for time series channel naming.
-const ROI_STAT_NAMES: [&str; NUM_STATS] = ["MinValue", "MaxValue", "MeanValue", "Total", "Net"];
-
-/// Generate time series channel names for ROIStat with the given number of ROIs.
-/// Produces names like "TS1:MinValue", "TS1:MaxValue", ..., "TS2:MinValue", etc.
-pub fn roi_stat_ts_channel_names(num_rois: usize) -> Vec<String> {
-    let mut names = Vec::with_capacity(num_rois * NUM_STATS);
-    for roi_idx in 0..num_rois {
-        for stat_name in &ROI_STAT_NAMES {
-            names.push(format!("TS{}:{}", roi_idx + 1, stat_name));
-        }
-    }
-    names
-}
 
 /// Parameter indices for NDROIStat plugin-specific params.
 ///
@@ -134,8 +119,6 @@ struct ROIStatState {
 
 pub struct ROIStatProcessor {
     state: Mutex<ROIStatState>,
-    /// Optional sender to push flattened stats to a TimeSeriesPortDriver.
-    ts_sender: Option<TimeSeriesSender>,
     /// Registered asyn param indices.
     params: ROIStatParams,
     /// Shared cell to export params after register_params is called.
@@ -157,7 +140,6 @@ impl ROIStatProcessor {
                 ts_num_points,
                 ts_current: 0,
             }),
-            ts_sender: None,
             params: ROIStatParams::default(),
             params_out: Arc::new(Mutex::new(ROIStatParams::default())),
         }
@@ -207,11 +189,6 @@ impl ROIStatProcessor {
         } else {
             Vec::new()
         }
-    }
-
-    /// Set the sender for pushing time series data to a TimeSeriesPortDriver.
-    pub fn set_ts_sender(&mut self, sender: TimeSeriesSender) {
-        self.ts_sender = Some(sender);
     }
 
     /// Clamp a ROI's geometry to the array dimensions, mirroring the C
@@ -492,19 +469,6 @@ impl NDPluginProcess for ROIStatProcessor {
             }
         }
 
-        // Send flattened stats to TimeSeriesPortDriver if connected
-        if let Some(ref sender) = self.ts_sender {
-            let mut values = Vec::with_capacity(state.results.len() * NUM_STATS);
-            for result in &state.results {
-                values.push(result.min);
-                values.push(result.max);
-                values.push(result.mean);
-                values.push(result.total);
-                values.push(result.net);
-            }
-            let _ = sender.try_send(TimeSeriesData { values });
-        }
-
         // Build per-ROI param updates (only for enabled ROIs)
         let p = &self.params;
         let mut updates = Vec::new();
@@ -740,45 +704,29 @@ impl NDPluginProcess for ROIStatProcessor {
     }
 }
 
-/// Create a ROIStat plugin runtime. The TS receiver is stored in the registry
-/// for later pickup by `NDTimeSeriesConfigure`.
+/// Create a ROIStat plugin runtime.
 pub fn create_roi_stat_runtime(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     num_rois: usize,
-    ts_registry: &crate::time_series::TsReceiverRegistry,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
     ROIStatParams,
     std::thread::JoinHandle<()>,
 ) {
-    let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
-
     let rois: Vec<ROIStatROI> = (0..num_rois).map(|_| ROIStatROI::default()).collect();
-    let mut processor = ROIStatProcessor::new(rois, 2048);
-    processor.set_ts_sender(ts_tx);
+    let processor = ROIStatProcessor::new(rois, 2048);
     let params_handle = processor.params_handle();
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        port_name,
-        processor,
-        pool,
-        queue_size,
-        ndarray_port,
-        wiring,
-        num_rois,
-        threads,
+        claim, processor, pool, queue_size, source, wiring, num_rois, threads,
     );
 
     let roi_stat_params = *params_handle.lock();
-
-    // Store the TS receiver for NDTimeSeriesConfigure to pick up
-    let channel_names = roi_stat_ts_channel_names(num_rois);
-    ts_registry.store(port_name, ts_rx, channel_names);
 
     (handle, roi_stat_params, data_jh)
 }
@@ -1051,55 +999,6 @@ mod tests {
         let r = &proc.results()[0];
         assert!((r.min - 1.0).abs() < 1e-10);
         assert!((r.max - 16.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_ts_channel_names() {
-        let names = roi_stat_ts_channel_names(2);
-        assert_eq!(names.len(), 10); // 2 ROIs * 5 stats
-        assert_eq!(names[0], "TS1:MinValue");
-        assert_eq!(names[1], "TS1:MaxValue");
-        assert_eq!(names[4], "TS1:Net");
-        assert_eq!(names[5], "TS2:MinValue");
-        assert_eq!(names[9], "TS2:Net");
-    }
-
-    #[test]
-    fn test_ts_sender_integration() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TimeSeriesData>(16);
-
-        let rois = vec![
-            ROIStatROI {
-                enabled: true,
-                offset: [0, 0],
-                size: [4, 4],
-                bgd_width: 0,
-            },
-            ROIStatROI {
-                enabled: true,
-                offset: [0, 0],
-                size: [2, 2],
-                bgd_width: 0,
-            },
-        ];
-
-        let mut proc = ROIStatProcessor::new(rois, 0);
-        proc.set_ts_sender(tx);
-
-        let pool = NDArrayPool::new(1_000_000);
-        let arr = make_2d_array(4, 4, |_, _| 7.0);
-        proc.process_array(&Arc::new(arr), &pool);
-
-        let data = rx.try_recv().unwrap();
-        // 2 ROIs * 5 stats = 10 values
-        assert_eq!(data.values.len(), 10);
-        // ROI1: min=7, max=7, mean=7, total=112 (4*4*7), net=112
-        assert!((data.values[0] - 7.0).abs() < 1e-10); // min
-        assert!((data.values[1] - 7.0).abs() < 1e-10); // max
-        assert!((data.values[2] - 7.0).abs() < 1e-10); // mean
-        assert!((data.values[3] - 112.0).abs() < 1e-10); // total
-        // ROI2: 2x2 region, total=28 (2*2*7)
-        assert!((data.values[8] - 28.0).abs() < 1e-10); // total
     }
 
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {

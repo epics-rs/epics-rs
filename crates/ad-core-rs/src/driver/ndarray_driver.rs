@@ -860,11 +860,12 @@ impl DriverAttributes {
     /// (paramAttribute.cpp:131-151), which dispatches on `paramType` to the
     /// matching `getXxxParam` and publishes a fixed `NDAttrDataType`.
     ///
-    /// Returns `None` (leaving the attribute's cell at its prior / `Undefined`
-    /// value) when the param is unknown, the value is undefined, the read type
-    /// mismatches the param's actual type, or the `datatype` was unrecognized
-    /// (`ParamAttrType::Unknown` — C's `paramAttrTypeUnknown`, which never
-    /// refreshes the attribute).
+    /// C sets the value whatever the getter's status, so an undefined value
+    /// or a mismatched read type publishes the getter's zero-initialized
+    /// local (`0` / `""`). Returns `None` (leaving the attribute's cell at its
+    /// prior value) only when the param is unknown or the `datatype` was
+    /// unrecognized (`ParamAttrType::Unknown` — C's `paramAttrTypeUnknown`,
+    /// which never refreshes the attribute).
     fn read_param_value(
         port_base: &PortDriverBase,
         src: &crate::attributes::ParamAttributeSource,
@@ -873,26 +874,21 @@ impl DriverAttributes {
         let index = port_base.params.find_param(&src.param_name)?;
         let addr = src.addr;
         match src.param_type {
-            ParamAttrType::Int32 => port_base
-                .params
-                .get_int32(index, addr)
-                .ok()
-                .map(NDAttrValue::Int32),
-            ParamAttrType::Int64 => port_base
-                .params
-                .get_int64(index, addr)
-                .ok()
-                .map(NDAttrValue::Int64),
-            ParamAttrType::Float64 => port_base
-                .params
-                .get_float64(index, addr)
-                .ok()
-                .map(NDAttrValue::Float64),
-            ParamAttrType::String => port_base
-                .params
-                .get_string(index, addr)
-                .ok()
-                .map(|s| NDAttrValue::String(octet_text(s))),
+            ParamAttrType::Int32 => Some(NDAttrValue::Int32(
+                port_base.get_int32_param(index, addr).unwrap_or(0),
+            )),
+            ParamAttrType::Int64 => Some(NDAttrValue::Int64(
+                port_base.get_int64_param(index, addr).unwrap_or(0),
+            )),
+            ParamAttrType::Float64 => Some(NDAttrValue::Float64(
+                port_base.get_float64_param(index, addr).unwrap_or(0.0),
+            )),
+            ParamAttrType::String => Some(NDAttrValue::String(
+                port_base
+                    .get_string_param(index, addr)
+                    .map(octet_text)
+                    .unwrap_or_default(),
+            )),
             ParamAttrType::Unknown => None,
         }
     }
@@ -1166,13 +1162,13 @@ impl NDArrayDriverBase {
     /// Stamp `epicsTS` and the derived double `timeStamp` on `array`.
     ///
     /// C++ `asynNDArrayDriver::updateTimeStamps` (asynNDArrayDriver.cpp:832-836).
-    /// The time comes from the port's registered timestamp source, so a driver
-    /// with a hardware clock stamps from it (C `updateTimeStamp`), and
-    /// `timeStamp` is always derived from `epicsTS` — the two cannot disagree.
-    /// `NDArrayPool::alloc` sets neither; this is the only place that sets them
-    /// for a newly produced frame.
-    pub fn update_time_stamps(&self, array: &mut NDArray) {
-        array.update_time_stamps(self.port_base.current_timestamp().into());
+    /// The time is the port's `updateTimeStamp`, so the frame and the
+    /// callbacks that follow carry the same stamp, from a registered source
+    /// when there is one; `timeStamp` is always derived from `epicsTS` — the
+    /// two cannot disagree. `NDArrayPool::alloc` sets neither; this is the
+    /// only place that sets them for a newly produced frame.
+    pub fn update_time_stamps(&mut self, array: &mut NDArray) {
+        array.update_time_stamps(self.port_base.update_time_stamp().into());
     }
 
     /// Check whether the `FILE_PATH` directory exists, normalizing the path.
@@ -1308,7 +1304,7 @@ pub(crate) mod tests {
             ("ND_ATTRIBUTES_MACROS", params.attributes_macros, ""),
         ] {
             assert_eq!(
-                base.get_string_param_strict(index, 0)
+                base.get_string_param(index, 0)
                     .unwrap_or_else(|e| { panic!("{name} unset after construction: {e:?}") }),
                 want.as_bytes(),
                 "{name}"
@@ -1344,7 +1340,7 @@ pub(crate) mod tests {
             ("NUM_QUEUED_ARRAYS", params.num_queued_arrays, 0),
         ] {
             assert_eq!(
-                base.get_int32_param_strict(index, 0)
+                base.get_int32_param(index, 0)
                     .unwrap_or_else(|e| panic!("{name} unset after construction: {e:?}")),
                 want,
                 "{name}"
@@ -1352,7 +1348,7 @@ pub(crate) mod tests {
         }
 
         assert_eq!(
-            base.get_float64_param_strict(params.timestamp_rbv, 0)
+            base.get_float64_param(params.timestamp_rbv, 0)
                 .expect("TIME_STAMP unset after construction"),
             0.0
         );
@@ -1366,22 +1362,22 @@ pub(crate) mod tests {
         max_memory_mb: f64,
     ) {
         assert_eq!(
-            base.get_int32_param_strict(params.pool_alloc_buffers, 0)
+            base.get_int32_param(params.pool_alloc_buffers, 0)
                 .expect("POOL_ALLOC_BUFFERS unset after construction"),
             0
         );
         assert_eq!(
-            base.get_int32_param_strict(params.pool_free_buffers, 0)
+            base.get_int32_param(params.pool_free_buffers, 0)
                 .expect("POOL_FREE_BUFFERS unset after construction"),
             0
         );
         assert_eq!(
-            base.get_float64_param_strict(params.pool_used_memory, 0)
+            base.get_float64_param(params.pool_used_memory, 0)
                 .expect("POOL_USED_MEMORY unset after construction"),
             0.0
         );
         assert_eq!(
-            base.get_float64_param_strict(params.pool_max_memory, 0)
+            base.get_float64_param(params.pool_max_memory, 0)
                 .expect("POOL_MAX_MEMORY unset after construction"),
             max_memory_mb
         );
@@ -2136,8 +2132,9 @@ pub(crate) mod tests {
         let snap = drv.update_attributes();
         assert_eq!(
             snap.get("AsDouble").unwrap().value,
-            NDAttrValue::Undefined,
-            "datatype=DOUBLE on an Int32 param must not coerce — stays Undefined"
+            NDAttrValue::Float64(0.0),
+            "datatype=DOUBLE on an Int32 param publishes the wrong-type read's 0 \
+             (paramAttribute.cpp:141-145)"
         );
         assert_eq!(snap.get("AsInt").unwrap().value, NDAttrValue::Int32(42));
     }

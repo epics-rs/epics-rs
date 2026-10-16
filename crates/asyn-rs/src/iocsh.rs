@@ -1850,25 +1850,31 @@ fn publish_configured_port<D: PortDriver>(
             GPIB_REFUSAL
         }
     };
+    // Before the port thread exists: an actor would auto-connect a refused
+    // duplicate to its device (C's registerPort creates the thread).
+    let Ok(claim) = crate::asyn_record::claim_port(port) else {
+        ctx.println(refusal);
+        return None;
+    };
     let config = RuntimeConfig {
         services: services.clone(),
         priority,
         stack_size,
         ..RuntimeConfig::default()
     };
-    let (handle, _jh) = match create_port_runtime(driver, config) {
+    let (handle, _jh) = match create_port_runtime(&claim, driver, config) {
         Ok(v) => v,
         Err(_) => {
             ctx.println(refusal);
             return None;
         }
     };
-    if crate::asyn_record::register_port(
-        port,
-        handle.port_handle().clone(),
-        ctx.db().scan_control().interrupt_gate(),
-    )
-    .is_err()
+    if claim
+        .publish(
+            handle.port_handle().clone(),
+            ctx.db().scan_control().interrupt_gate(),
+        )
+        .is_err()
     {
         ctx.println(refusal);
         handle.shutdown();
@@ -2226,7 +2232,7 @@ mod tests {
     fn fresh_mgr_with_port(name: &str) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr
-            .register_port(DummyDriver::new(name), &crate::registry::open_owner())
+            .register_port_unclaimed(DummyDriver::new(name), &crate::registry::open_owner())
             .unwrap();
         mgr
     }
@@ -2238,7 +2244,7 @@ mod tests {
     fn fresh_mgr_with_multi_device_port(name: &str, max_addr: usize) -> Arc<PortManager> {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr
-            .register_port(
+            .register_port_unclaimed(
                 DummyDriver::multi_device(name, max_addr),
                 &crate::registry::open_owner(),
             )
@@ -2537,14 +2543,14 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let _ = mgr
-            .register_port_with_config(
+            .register_port_unclaimed_with_config(
                 DummyDriver::disconnected("wc_late"),
                 cfg.clone(),
                 &crate::registry::open_owner(),
             )
             .unwrap();
         let _ = mgr
-            .register_port_with_config(
+            .register_port_unclaimed_with_config(
                 DummyDriver::disconnected("wc_never"),
                 cfg,
                 &crate::registry::open_owner(),
@@ -2660,7 +2666,7 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(
+            .register_port_unclaimed(
                 OctetDriver::new("eos_cfg", b"line1\nline2\n", written.clone()),
                 &crate::registry::open_owner(),
             )
@@ -2736,7 +2742,7 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         let written = Arc::new(Mutex::new(Vec::new()));
         let _ = mgr
-            .register_port(
+            .register_port_unclaimed(
                 OctetDriver::new("flush_cfg", b"stale", written.clone()),
                 &crate::registry::open_owner(),
             )
@@ -2806,13 +2812,13 @@ mod tests {
     fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
         let mgr = Arc::new(PortManager::new());
         let _ = mgr
-            .register_port(
+            .register_port_unclaimed(
                 DummyDriver::new("edp_single"),
                 &crate::registry::open_owner(),
             )
             .unwrap();
         let _ = mgr
-            .register_port(
+            .register_port_unclaimed(
                 DummyDriver::multi_device("edp_multi", 2),
                 &crate::registry::open_owner(),
             )
@@ -2976,7 +2982,7 @@ mod tests {
 
         let rec = Recorded::default();
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(
+        mgr.register_port_unclaimed(
             RecordingDriver {
                 base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
                 rec: rec.clone(),
@@ -3079,7 +3085,7 @@ mod tests {
         }
 
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(
+        mgr.register_port_unclaimed(
             MultiPort {
                 base: PortDriverBase::new(
                     "eos_multi",
@@ -3258,7 +3264,7 @@ mod tests {
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(
+        mgr.register_port_unclaimed(
             InterposedDriver {
                 base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
                 link: EchoingLink {
@@ -3367,7 +3373,7 @@ mod tests {
 
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let mgr = Arc::new(PortManager::new());
-        mgr.register_port(
+        mgr.register_port_unclaimed(
             InterposedDriver {
                 base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
                 link: CountingLink {
@@ -3476,7 +3482,7 @@ mod tests {
 
         const PORT: &str = "report_by_hand";
         let reports = Arc::new(AtomicUsize::new(0));
-        let (runtime, _actor) = crate::runtime::port::create_port_runtime(
+        let (runtime, _actor) = crate::runtime::port::create_port_runtime_unclaimed(
             Reporting {
                 base: PortDriverBase::new(PORT, 1, PortFlags::default()),
                 reports: reports.clone(),
@@ -3528,7 +3534,7 @@ mod tests {
     #[test]
     fn asyn_set_trace_mask_writes_the_named_ports_own_trace() {
         const PORT: &str = "iocsh_foreign_mgr_port";
-        let (runtime, _actor) = crate::runtime::create_port_runtime(
+        let (runtime, _actor) = crate::runtime::create_port_runtime_unclaimed(
             DummyDriver::new(PORT),
             crate::runtime::RuntimeConfig::default(),
         )
@@ -3693,6 +3699,31 @@ mod tests {
             crate::asyn_record::get_port("iocsh_ip_cfg_test").is_some(),
             "port must be resolvable via the asyn_record registry"
         );
+    }
+
+    /// A refused duplicate `drvAsynIPPortConfigure` never dials the device:
+    /// the name is claimed before the port thread, whose auto-connect would
+    /// otherwise open a second circuit to the host.
+    #[test]
+    fn a_refused_duplicate_ip_port_never_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let cmd = drv_asyn_ip_port_configure_command(PortServices::new());
+        let ctx = make_ctx();
+        let args = [
+            ArgValue::String("iocsh_ip_dup_test".into()),
+            ArgValue::String(host.as_str().into()),
+        ];
+        cmd.handler.call(&args, &ctx).unwrap();
+        let first = listener.accept().expect("the first port connects");
+        cmd.handler.call(&args, &ctx).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            listener.accept().is_err(),
+            "the refused duplicate opened a circuit"
+        );
+        drop(first);
     }
 
     /// C drvAsynIPPort.c:1119-1120: an IP port gets an EOS interpose by

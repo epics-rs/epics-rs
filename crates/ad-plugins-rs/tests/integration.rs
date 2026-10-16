@@ -44,14 +44,12 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 fn test_driver_to_stats_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
-    let ts_registry = ad_plugins_rs::time_series::TsReceiverRegistry::new();
     let (stats_handle, stats_data, _params, _jh) = create_stats_runtime(
-        "STATS1",
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         pool.clone(),
         10,
         "SIM1",
         wiring,
-        &ts_registry,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
     );
 
@@ -101,7 +99,7 @@ fn test_driver_to_std_arrays_pipeline() {
     let pool = ad_core_rs::ndarray_pool::NDArrayPool::new(10_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
-        "IMAGE1",
+        &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
         pool.clone(),
         "SIM1",
         wiring,
@@ -219,7 +217,7 @@ fn test_rewire_ndarray_port_at_runtime() {
     };
 
     let (handle, _jh) = create_plugin_runtime(
-        "STATS1",
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
         pool,
         10,
@@ -321,7 +319,7 @@ fn test_rewire_through_real_roi_plugin() {
         auto_size: false,
     };
     let (roi_handle, _roi_jh) = create_plugin_runtime(
-        "ROI1",
+        &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
         ROIProcessor::new(roi_config),
         pool.clone(),
         10,
@@ -367,7 +365,7 @@ fn test_rewire_through_real_roi_plugin() {
     };
 
     let (stats_handle, _stats_jh) = create_plugin_runtime(
-        "STATS1",
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
         pool.clone(),
         10,
@@ -446,7 +444,7 @@ fn test_roi_param_change_enables_output() {
 
     // Create ROI1 with DEFAULT config (size=0) — like the real IOC
     let (roi_handle, roi_params, _roi_jh) = ad_plugins_rs::roi::create_roi_runtime(
-        "ROI1",
+        &asyn_rs::asyn_record::claim_port("ROI1").unwrap(),
         pool.clone(),
         10,
         "SIM1",
@@ -490,7 +488,7 @@ fn test_roi_param_change_enables_output() {
         last_id: last_id.clone(),
     };
     let (stats_handle, _jh) = create_plugin_runtime(
-        "STATS1",
+        &asyn_rs::asyn_record::claim_port("STATS1").unwrap(),
         proc,
         pool.clone(),
         10,
@@ -693,10 +691,14 @@ fn test_circular_buff_trigger_flow() {
     let result = proc.process_array(&Arc::new(arr4), &pool);
 
     // Should have captured: 2 pre + 1 post = 3 frames
-    assert_eq!(result.output_arrays.len(), 3);
-    assert_eq!(result.output_arrays[0].unique_id, 2);
-    assert_eq!(result.output_arrays[1].unique_id, 3);
-    assert_eq!(result.output_arrays[2].unique_id, 4);
+    // posted at address 0 as C's doCallbacksGenericPointer does.
+    let ids: Vec<_> = result
+        .addressed
+        .iter()
+        .map(|(addr, a)| (*addr, a.unique_id))
+        .collect();
+    assert_eq!(ids, vec![(0, 2), (0, 3), (0, 4)]);
+    assert!(result.output_arrays.is_empty());
 }
 
 #[test]
@@ -784,7 +786,7 @@ fn test_process_and_publish_writes_array_size_params() {
     let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
-        "IMG_SZ",
+        &asyn_rs::asyn_record::claim_port("IMG_SZ").unwrap(),
         pool.clone(),
         "DRV1",
         wiring,

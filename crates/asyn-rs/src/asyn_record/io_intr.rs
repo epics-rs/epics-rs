@@ -270,7 +270,7 @@ impl IoIntrScan {
 
         let filter = InterruptFilter {
             reason: Some(binding.reason),
-            addr: Some(binding.addr),
+            addr: Some(binding.handle.param_list(binding.addr)),
             // C passes the record's UI32MASK to
             // `pasynUInt32->registerInterruptUser` (:635); the driver then fires
             // only when the changed bits overlap it. No other interface carries

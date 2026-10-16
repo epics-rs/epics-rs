@@ -40,16 +40,16 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
 
                 println!("simDetectorConfig: port={port_name}, size={size_x}x{size_y}, maxMemory={max_memory}");
 
-                let runtime = create_sim_detector(&port_name, size_x, size_y, max_memory, NDArrayOutput::new())
+                // ADDriver is an asynPortDriver: the name is registered before
+                // the detector or its acquisition task exist.
+                let claim = asyn_rs::manager::claim_port_driver(&port_name).map_err(|e| e.to_string())?;
+                let runtime = create_sim_detector(&claim, size_x, size_y, max_memory, NDArrayOutput::new())
                     .map_err(|e| format!("failed to create SimDetector: {e}"))?;
 
                 let port_handle = runtime.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
+                claim
+                    .publish(port_handle, ctx.db().scan_control().interrupt_gate())
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

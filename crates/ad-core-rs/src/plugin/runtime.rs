@@ -13,10 +13,10 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked, not waived — all 7 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(9): checked, not waived — all 9 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 377/377). ad-core-rs became a census subject when its
+// --all-features`, 385/385). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -26,10 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use asyn_rs::error::AsynResult;
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
+use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec, ThreadPriority};
 
@@ -45,7 +46,7 @@ use super::channel::{
     WeakNDArraySender, ndarray_channel,
 };
 use super::params::PluginBaseParams;
-use super::wiring::{WiringRegistry, upstream_key};
+use super::wiring::WiringRegistry;
 
 /// Message sent through the param channel from control plane to data plane.
 ///
@@ -64,6 +65,10 @@ enum PluginParamMsg {
     /// while an older array still waits in the queue would retroactively
     /// change how that array is processed.
     Barrier(std::sync::mpsc::SyncSender<()>),
+    /// Acknowledged as soon as it is read, so every earlier `Change` has been
+    /// applied but the array queue may still hold work.
+    #[cfg(test)]
+    Fence(std::sync::mpsc::SyncSender<()>),
 }
 
 /// Value sent through the param change channel from control plane to data plane.
@@ -201,6 +206,12 @@ pub struct ProcessResult {
     /// (C++ `NDPluginScatter::nextClient_`); the processor only marks the frame
     /// as a scatter frame.
     pub scatter: bool,
+    /// Arrays the plugin posts itself with C `doCallbacksGenericPointer(pArray,
+    /// NDArrayData, addr)` (e.g. NDPluginStats.cpp:586 at address 1): each
+    /// reaches only the subscribers of its address, and, being outside
+    /// `endProcessCallbacks`, ignores NDArrayCallbacks, the throttle and the
+    /// sort buffer. Published before `output_arrays`.
+    pub addressed: Vec<(usize, Arc<NDArray>)>,
 }
 
 impl ProcessResult {
@@ -210,6 +221,7 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates,
             scatter: false,
+            addressed: vec![],
         }
     }
 
@@ -219,6 +231,7 @@ impl ProcessResult {
             output_arrays,
             param_updates: vec![],
             scatter: false,
+            addressed: vec![],
         }
     }
 
@@ -230,6 +243,7 @@ impl ProcessResult {
             output_arrays: vec![Arc::clone(input)],
             param_updates,
             scatter: false,
+            addressed: vec![],
         }
     }
 
@@ -239,6 +253,7 @@ impl ProcessResult {
             output_arrays: vec![],
             param_updates: vec![],
             scatter: false,
+            addressed: vec![],
         }
     }
 
@@ -250,6 +265,7 @@ impl ProcessResult {
             output_arrays: vec![Arc::clone(input)],
             param_updates: vec![],
             scatter: true,
+            addressed: vec![],
         }
     }
 }
@@ -273,6 +289,8 @@ fn run_processor<P: NDPluginProcess + ?Sized>(
 pub struct ParamChangeResult {
     pub output_arrays: Vec<Arc<NDArray>>,
     pub param_updates: Vec<ParamUpdate>,
+    /// As `ProcessResult::addressed`, posted from the write itself.
+    pub addressed: Vec<(usize, Arc<NDArray>)>,
 }
 
 impl ParamChangeResult {
@@ -280,6 +298,7 @@ impl ParamChangeResult {
         Self {
             output_arrays: vec![],
             param_updates,
+            addressed: vec![],
         }
     }
 
@@ -287,6 +306,7 @@ impl ParamChangeResult {
         Self {
             output_arrays,
             param_updates: vec![],
+            addressed: vec![],
         }
     }
 
@@ -294,6 +314,7 @@ impl ParamChangeResult {
         Self {
             output_arrays,
             param_updates,
+            addressed: vec![],
         }
     }
 
@@ -301,6 +322,7 @@ impl ParamChangeResult {
         Self {
             output_arrays: vec![],
             param_updates: vec![],
+            addressed: vec![],
         }
     }
 }
@@ -313,6 +335,75 @@ impl ParamChangeResult {
 /// plugin that carries state owns the interior mutability for it — one lock
 /// over the whole per-frame state, not one lock per field, so a frame's
 /// reads and writes stay atomic against a concurrent frame.
+/// What a write to a plugin port leaves in the parameter library.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WriteVerdict<T> {
+    /// Store this value (the written one, or the clamp C stores) and succeed.
+    Accept(T),
+    /// Store `keep` (C's clamp, or the old value C reverts to) and fail the
+    /// write with `message`, as C's override returns `asynError`.
+    Refuse { keep: T, message: String },
+}
+
+impl<T: Copy> WriteVerdict<T> {
+    fn kept(&self) -> T {
+        match self {
+            Self::Accept(v) | Self::Refuse { keep: v, .. } => *v,
+        }
+    }
+
+    fn is_refused(&self) -> bool {
+        matches!(self, Self::Refuse { .. })
+    }
+
+    fn into_result(self) -> AsynResult<()> {
+        match self {
+            Self::Accept(_) => Ok(()),
+            Self::Refuse { message, .. } => Err(write_refused(message)),
+        }
+    }
+}
+
+/// The `validate_*` half of an `NDPluginProcess`, callable through the port
+/// driver, which does not know the plugin's type.
+trait ValidateWrite: Send + Sync {
+    fn int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        base: &PortDriverBase,
+    ) -> WriteVerdict<i32>;
+    fn float64(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: f64,
+        base: &PortDriverBase,
+    ) -> WriteVerdict<f64>;
+}
+
+impl<P: NDPluginProcess> ValidateWrite for P {
+    fn int32(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: i32,
+        base: &PortDriverBase,
+    ) -> WriteVerdict<i32> {
+        self.validate_int32(reason, addr, value, base)
+    }
+    fn float64(
+        &self,
+        reason: usize,
+        addr: i32,
+        value: f64,
+        base: &PortDriverBase,
+    ) -> WriteVerdict<f64> {
+        self.validate_float64(reason, addr, value, base)
+    }
+}
+
 pub trait NDPluginProcess: Send + Sync + 'static {
     /// The `asynFlags` C's plugin hands its `NDPluginDriver` constructor:
     /// only a can-block port gets a port thread, at the `*Configure` line's
@@ -337,15 +428,19 @@ pub trait NDPluginProcess: Send + Sync + 'static {
         false
     }
 
-    /// Whether this plugin delivers arrays to downstream plugins, i.e. the
-    /// initial `NDArrayCallbacks` param value. Defaults to `true`: most plugins
-    /// do array callbacks. Terminal plugins that never deliver downstream
-    /// (`NDPluginStdArrays`, `NDPluginAttribute`, every `NDPluginFile` writer)
-    /// override this to `false` so the param reflects the behaviour, matching C
-    /// (e.g. `NDPluginFile.cpp:948` `setIntegerParam(NDArrayCallbacks, 0)`).
-    fn does_array_callbacks(&self) -> bool {
-        true
+    /// The `NDArrayCallbacks` value this plugin's C constructor sets: 0 in
+    /// NDPluginFile/StdArrays/Attribute (e.g. NDPluginFile.cpp:948), 1 in
+    /// Codec/CircularBuff/ColorConvert/Process/Transform/BadPixel/Overlay.
+    /// `None`, the default, is every other plugin, which leaves it to the
+    /// template.
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        None
     }
+
+    /// Hands the processor a read view of the runtime's NDArrayCallbacks, for
+    /// work C does only inside its own `if (arrayCallbacks)` (e.g.
+    /// NDPluginTimeSeries.cpp:341-385). Called once, before the port exists.
+    fn bind_array_callbacks(&mut self, _array_callbacks: ArrayCallbacks) {}
 
     /// How many `(NDArrayPort, NDArrayAddr)` pairs this plugin reads as its
     /// array sources: the pair at address `a` for every `a` below this.
@@ -365,6 +460,31 @@ pub trait NDPluginProcess: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The synchronous half of a C plugin's `writeInt32` override: run on the
+    /// port before the store, it decides what the param keeps and whether
+    /// the write fails. `params` is the port's parameter library as it stands
+    /// before the store. `on_param_change` then sees the kept value.
+    fn validate_int32(
+        &self,
+        _reason: usize,
+        _addr: i32,
+        value: i32,
+        _params: &PortDriverBase,
+    ) -> WriteVerdict<i32> {
+        WriteVerdict::Accept(value)
+    }
+
+    /// `validate_int32` for a C `writeFloat64` override.
+    fn validate_float64(
+        &self,
+        _reason: usize,
+        _addr: i32,
+        value: f64,
+        _params: &PortDriverBase,
+    ) -> WriteVerdict<f64> {
+        WriteVerdict::Accept(value)
+    }
+
     /// Called when a param changes. Reason is the param index.
     /// Return param updates to be written back to the port driver.
     fn on_param_change(&self, _reason: usize, _params: &PluginParamSnapshot) -> ParamChangeResult {
@@ -376,6 +496,26 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// via readInt8Array/readInt16Array/etc.
     fn array_data_handle(&self) -> Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>> {
         None
+    }
+}
+
+/// NDArrayCallbacks as the runtime holds it. The runtime's ARRAY_CALLBACKS
+/// write is its only writer; a processor gets clones that can only read.
+#[derive(Clone, Debug)]
+pub struct ArrayCallbacks(Arc<AtomicBool>);
+
+impl ArrayCallbacks {
+    /// A view that holds `on` until a runtime binds its own in its place.
+    pub fn new(on: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(on)))
+    }
+
+    fn set(&self, on: bool) {
+        self.0.store(on, Ordering::Release);
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -514,7 +654,9 @@ impl SortBuffer {
 /// Shared processor state protected by a mutex, accessible from both
 /// the data thread (non-blocking mode) and the caller thread (blocking mode).
 struct SharedProcessorInner {
-    output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    /// One output per port address: what C's asynGenericPointer interrupt
+    /// list is per address. Index 0 is the `endProcessCallbacks` output.
+    outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
     pool: Arc<NDArrayPool>,
     ndarray_params: NDArrayDriverParams,
     plugin_params: PluginBaseParams,
@@ -531,9 +673,13 @@ struct SharedProcessorInner {
     /// 257-265) returns before the sort/throttle/`doCallbacksGenericPointer`
     /// path. Distinct from `enabled` (`EnableCallbacks`), which gates whether
     /// the plugin processes the input at all.
-    array_callbacks: bool,
+    array_callbacks: ArrayCallbacks,
     /// Sort mode: 0 = disabled, 1 = sorted output.
     sort_mode: i32,
+    /// C `sortingThreadId_ != 0`: SortMode has been Sorted at least once.
+    /// Only the sort path writes SortFree (NDPluginDriver.cpp:301, :667), so
+    /// until then it stays undefined.
+    sorting_started: bool,
     /// Sort time: seconds — per-element staleness deadline for the sort buffer.
     sort_time: f64,
     /// Sort size: maximum number of uniqueId entries in the sort buffer.
@@ -566,9 +712,7 @@ struct SharedProcessorInner {
     dims_prev: Vec<i32>,
     /// Source address selected via the NDArrayAddr PV (C++ `NDArrayAddr`, G6).
     nd_array_addr: i32,
-    /// MaxThreads — the clamp ceiling for NumThreads (C++ `MaxThreads`).
-    max_threads: i32,
-    /// NumThreads — validated/clamped to [1, MaxThreads] on write (G4).
+    /// NumThreads as the port's write path accepted it.
     num_threads: i32,
     /// The band and stack every callback thread gets.
     threads: PluginThreads,
@@ -651,6 +795,21 @@ impl SharedProcessorInner {
         self.prev_input_array = Some(Arc::clone(array));
     }
 
+    fn senders_for(&self, output: &ProcessOutput) -> OutputSenders {
+        let by_addr = if output.addressed.is_empty() {
+            Vec::new()
+        } else {
+            self.outputs
+                .iter()
+                .map(|o| o.lock().senders_clone())
+                .collect()
+        };
+        OutputSenders {
+            main: self.outputs[0].lock().senders_clone(),
+            by_addr,
+        }
+    }
+
     /// Process array and return a `ProcessOutput`. Does NOT send to actor.
     /// Direct interrupts (std_array_data_param) happen here (sync).
     /// The returned output must be published and flushed by the caller in async context.
@@ -697,7 +856,7 @@ impl SharedProcessorInner {
         if let Some(last) = result.output_arrays.last() {
             self.last_output_array = Some(Arc::clone(last));
         }
-        let ready = if self.array_callbacks || self.std_array_data_param.is_some() {
+        let ready = if self.array_callbacks.get() || self.std_array_data_param.is_some() {
             self.route_output_arrays(result.output_arrays)
         } else {
             Vec::new()
@@ -713,11 +872,12 @@ impl SharedProcessorInner {
             result.param_updates,
             result.scatter,
             Some(array.as_ref()),
-            elapsed_ms,
-            self.array_callbacks,
+            Some(elapsed_ms),
+            self.array_callbacks.get(),
             count_frame,
         );
         output.batch.merge(self.build_status_params_batch());
+        output.addressed = result.addressed;
         output
     }
 
@@ -774,6 +934,7 @@ impl SharedProcessorInner {
             arrays: vec![],
             scatter: false,
             batch,
+            addressed: vec![],
         })
     }
 
@@ -784,6 +945,7 @@ impl SharedProcessorInner {
             arrays: vec![],
             scatter: false,
             batch: self.build_status_params_batch(),
+            addressed: vec![],
         }
     }
 
@@ -810,7 +972,7 @@ impl SharedProcessorInner {
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(arrays, vec![], false, None, 0.0, true, true);
+            let output = self.build_publish_batch(arrays, vec![], false, None, None, true, true);
             all_arrays.extend(output.arrays);
             combined.merge(output.batch);
         }
@@ -819,19 +981,14 @@ impl SharedProcessorInner {
             arrays: all_arrays,
             scatter: false,
             batch: combined,
+            addressed: vec![],
         }
     }
 
     fn build_sort_params_batch(&self) -> ParamBatch {
         use asyn_rs::request::ParamSetValue;
-        let sort_free = self.sort_size - self.sort_buffer.len();
-        ParamBatch {
+        let mut batch = ParamBatch {
             addr0: vec![
-                ParamSetValue::new(
-                    self.plugin_params.sort_free,
-                    0,
-                    ParamValue::Int32(sort_free),
-                ),
                 ParamSetValue::new(
                     self.plugin_params.disordered_arrays,
                     0,
@@ -844,7 +1001,15 @@ impl SharedProcessorInner {
                 ),
             ],
             extra: std::collections::HashMap::new(),
+        };
+        if self.sorting_started {
+            batch.addr0.push(ParamSetValue::new(
+                self.plugin_params.sort_free,
+                0,
+                ParamValue::Int32(self.sort_size - self.sort_buffer.len()),
+            ));
         }
+        batch
     }
 
     /// Build a param batch carrying the runtime status counters:
@@ -909,13 +1074,16 @@ impl SharedProcessorInner {
     /// delivery — the STD_ARRAY_DATA generic-pointer interrupt and the returned
     /// `ProcessOutput.arrays` — is suppressed, while the metadata params from
     /// `beginProcessCallbacks` (counter, dims, datatype, …) are still set.
+    ///
+    /// `elapsed_ms` is `None` off the input-array path: C sets ExecutionTime
+    /// only around `processCallbacks` (NDPluginDriver.cpp:422, :521).
     fn build_publish_batch(
         &mut self,
         output_arrays: Vec<Arc<NDArray>>,
         param_updates: Vec<ParamUpdate>,
         scatter: bool,
         fallback_array: Option<&NDArray>,
-        elapsed_ms: f64,
+        elapsed_ms: Option<f64>,
         deliver: bool,
         count_frame: bool,
     ) -> ProcessOutput {
@@ -1150,11 +1318,13 @@ impl SharedProcessorInner {
             }
         }
 
-        addr0.push(ParamSetValue::new(
-            self.plugin_params.execution_time,
-            0,
-            ParamValue::Float64(elapsed_ms),
-        ));
+        if let Some(ms) = elapsed_ms {
+            addr0.push(ParamSetValue::new(
+                self.plugin_params.execution_time,
+                0,
+                ParamValue::Float64(ms),
+            ));
+        }
 
         // ArrayRate_RBV is computed by a calc record in the DB template
         // (SCAN "1 second", reading ArrayCounter_RBV delta), not in Rust.
@@ -1228,6 +1398,7 @@ impl SharedProcessorInner {
             arrays: if deliver { output_arrays } else { Vec::new() },
             scatter,
             batch: ParamBatch { addr0, extra },
+            addressed: vec![],
         }
     }
 }
@@ -1237,6 +1408,17 @@ struct ProcessOutput {
     arrays: Vec<Arc<NDArray>>,
     scatter: bool,
     batch: ParamBatch,
+    /// `ProcessResult::addressed`, published before `arrays`.
+    addressed: Vec<(usize, Arc<NDArray>)>,
+}
+
+/// The downstream senders a `ProcessOutput` is published to, cloned under
+/// the shared lock and used after it is released.
+struct OutputSenders {
+    /// Address 0, where `endProcessCallbacks` delivers.
+    main: Vec<NDArraySender>,
+    /// Per address; filled only when the output has addressed arrays.
+    by_addr: Vec<Vec<NDArraySender>>,
 }
 
 impl ProcessOutput {
@@ -1247,7 +1429,14 @@ impl ProcessOutput {
     /// via `scatter_publish`, which advances the persistent `scatter_cursor`.
     /// Arrays are published in order — the next array's fan-out starts only
     /// after the previous one completes.
-    async fn publish_arrays(&self, senders: &[NDArraySender], scatter_cursor: &mut usize) {
+    async fn publish_arrays(&self, senders: &OutputSenders, scatter_cursor: &mut usize) {
+        for (addr, arr) in &self.addressed {
+            if let Some(subscribers) = senders.by_addr.get(*addr) {
+                let futs = subscribers.iter().map(|s| s.publish(arr.clone()));
+                futures_util::future::join_all(futs).await;
+            }
+        }
+        let senders = senders.main.as_slice();
         for arr in &self.arrays {
             if self.scatter {
                 Self::scatter_publish(arr, senders, scatter_cursor).await;
@@ -1349,10 +1538,10 @@ impl ParamBatch {
     }
 }
 
-/// The `NDArrayAddr`, `maxThreads` and initial `numThreads` that C takes as
-/// `NDPluginDriver` constructor arguments (NDPluginDriver.cpp:153, :158, :159).
+/// The `maxThreads` and initial `numThreads` that C takes as `NDPluginDriver`
+/// constructor arguments (NDPluginDriver.cpp:158, :159).
 ///
-/// The port's `*Configure` entry points take none of them, so the defaults
+/// The port's `*Configure` entry points take neither, so the defaults
 /// stand in: `maxThreads` floored at 1 as C floors it (`:117`) and published
 /// to `MaxThreads` (`:158`), `numThreads` starting at 1 (`:159`). Both are
 /// writable at run time, and a `NumThreads` or `QueueSize` write respawns the
@@ -1360,9 +1549,47 @@ impl ParamBatch {
 /// than inlined so the constructor's param block and `SharedProcessorInner`'s
 /// initial state cannot drift — publishing one value to the RBV and running on
 /// another is what a reader of MaxThreads_RBV would have no way to detect.
-const PLUGIN_NDARRAY_ADDR: i32 = 0;
 const PLUGIN_MAX_THREADS: i32 = 1;
 const PLUGIN_NUM_THREADS: i32 = 1;
+
+/// The `NDArrayPort` and `NDArrayAddr` constructor arguments: the source C
+/// seeds both params with (NDPluginDriver.cpp:152-153) and connects to.
+/// A bare port name is address 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArraySource {
+    pub port: String,
+    pub addr: i32,
+}
+
+impl From<&str> for ArraySource {
+    fn from(port: &str) -> Self {
+        Self {
+            port: port.to_string(),
+            addr: 0,
+        }
+    }
+}
+
+impl From<&String> for ArraySource {
+    fn from(port: &String) -> Self {
+        port.as_str().into()
+    }
+}
+
+impl From<&ArraySource> for ArraySource {
+    fn from(source: &ArraySource) -> Self {
+        source.clone()
+    }
+}
+
+impl From<(&str, i32)> for ArraySource {
+    fn from((port, addr): (&str, i32)) -> Self {
+        Self {
+            port: port.to_string(),
+            addr,
+        }
+    }
+}
 
 /// asyn's `0`, `ASYN_CANBLOCK` and `ASYN_MULTIDEVICE` (asynDriver.h), for
 /// [`NDPluginProcess::ASYN_FLAGS`].
@@ -1391,6 +1618,11 @@ pub struct PluginPortDriver {
     array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
     /// Param index for STD_ARRAY_DATA (triggers I/O Intr on ArrayData waveform).
     std_array_data_param: Option<usize>,
+    /// Where an NDArrayPort/NDArrayAddr write is checked to resolve.
+    wiring: Arc<WiringRegistry>,
+    /// The plugin, for the checks its C `writeInt32`/`writeFloat64` override
+    /// makes before the store.
+    validator: Arc<dyn ValidateWrite>,
 }
 
 impl PluginPortDriver {
@@ -1398,13 +1630,14 @@ impl PluginPortDriver {
         port_name: &str,
         plugin_type_name: &str,
         queue_size: usize,
-        ndarray_port: &str,
+        source: &ArraySource,
         max_addr: usize,
         param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
-        processor: &mut P,
+        mut processor: P,
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
         pool: &NDArrayPool,
-    ) -> AsynResult<Self> {
+        wiring: Arc<WiringRegistry>,
+    ) -> AsynResult<(Self, Arc<P>)> {
         let mut base = PortDriverBase::new(port_name, max_addr, P::ASYN_FLAGS);
 
         let ndarray_params = NDArrayDriverParams::create(&mut base)?;
@@ -1419,8 +1652,8 @@ impl PluginPortDriver {
         // record it feeds sits UDF/INVALID until something else happens to
         // write it — which for MaxThreads_RBV (SCAN "I/O Intr", no PINI, no
         // output partner) is never.
-        base.set_string_param(plugin_params.nd_array_port, 0, ndarray_port)?;
-        base.set_int32_param(plugin_params.nd_array_addr, 0, PLUGIN_NDARRAY_ADDR)?;
+        base.set_string_param(plugin_params.nd_array_port, 0, &source.port)?;
+        base.set_int32_param(plugin_params.nd_array_addr, 0, source.addr)?;
         base.set_int32_param(plugin_params.dropped_arrays, 0, 0)?;
         base.set_int32_param(plugin_params.dropped_output_arrays, 0, 0)?;
         base.set_int32_param(plugin_params.queue_size, 0, queue_size as i32)?;
@@ -1434,8 +1667,6 @@ impl PluginPortDriver {
         // port has no such argument and starts `blocking_mode` false.
         base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
 
-        // EnableCallbacks=0 (Disable) by default, matching EPICS ADCore.
-        base.set_int32_param(plugin_params.enable_callbacks, 0, 0)?;
         base.set_string_param(plugin_params.plugin_type, 0, plugin_type_name)?;
 
         // C++ `NDPluginDriver` derives from `asynNDArrayDriver`, so the base
@@ -1447,17 +1678,9 @@ impl PluginPortDriver {
             port_name,
         )?;
         crate::driver::ndarray_driver::refresh_pool_stats(&mut base, &ndarray_params, pool)?;
-        // Not in C's block: NDArrayCallbacks is a database parameter there,
-        // but a plugin that never emits arrays must publish 0 rather than let
-        // the DB turn its output on.
-        base.set_int32_param(
-            ndarray_params.array_callbacks,
-            0,
-            processor.does_array_callbacks() as i32,
-        )?;
-        // Not in C's block either — `NDFullFileName_RBV` is only written by a
-        // file plugin after a successful write.
-        base.set_string_param(ndarray_params.full_file_name, 0, "")?;
+        if let Some(seed) = processor.array_callbacks_seed() {
+            base.set_int32_param(ndarray_params.array_callbacks, 0, seed as i32)?;
+        }
         // Create STD_ARRAY_DATA param for StdArrays plugins (triggers I/O Intr on ArrayData waveform)
         let std_array_data_param = if array_data.is_some() {
             Some(base.create_param("STD_ARRAY_DATA", asyn_rs::param::ParamType::GenericPointer)?)
@@ -1468,14 +1691,100 @@ impl PluginPortDriver {
         // Let the processor register its plugin-specific params
         processor.register_params(&mut base)?;
 
-        Ok(Self {
+        let processor = Arc::new(processor);
+        let driver = Self {
             base,
             ndarray_params,
             plugin_params,
             param_change_tx,
             array_data,
             std_array_data_param,
+            wiring,
+            validator: processor.clone(),
+        };
+        Ok((driver, processor))
+    }
+
+    /// What an int32 write keeps: C `NDPluginDriver::writeInt32` for its own
+    /// params, else the plugin's override (`validate_int32`). For NumThreads
+    /// and QueueSize C stores the written value and lets
+    /// `createCallbackThreads` overwrite it with the clamp
+    /// (NDPluginDriver.cpp:973-994), so the write fails and the readback
+    /// shows what runs.
+    fn verdict_int32(&self, reason: usize, addr: i32, value: i32) -> AsynResult<WriteVerdict<i32>> {
+        let p = &self.plugin_params;
+        // The line C's createCallbackThreads/connectToArrayPort prints
+        // before writeInt32 returns the error (NDPluginDriver.cpp:606, :973-990).
+        let refuse = |keep, message: String| {
+            self.base
+                .trace_print(TraceMask::ERROR, format_args!("{message}"));
+            Ok(WriteVerdict::Refuse { keep, message })
+        };
+        let threads_error = "NDPluginDriver::createCallbackThreads error";
+        if reason == p.num_threads {
+            let max = self.base.get_int32_param(p.max_threads, 0)?;
+            if value > max {
+                return refuse(
+                    max,
+                    format!(
+                        "{threads_error}, numThreads={value} must be <= maxThreads={max}, setting to {max}"
+                    ),
+                );
+            }
+            if value < 1 {
+                return refuse(
+                    1,
+                    format!("{threads_error}, numThreads={value} must be >= 1, setting to 1"),
+                );
+            }
+        } else if reason == p.queue_size && value < 1 {
+            return refuse(
+                1,
+                format!("{threads_error}, queueSize={value} must be >= 1, setting to 1"),
+            );
+        } else if reason == p.nd_array_addr {
+            // connectToArrayPort reads list 0 (NDPluginDriver.cpp:590).
+            let port = String::from_utf8_lossy(self.base.get_string_param(p.nd_array_port, 0)?)
+                .into_owned();
+            if let Some(message) = self.unresolved(&port, value) {
+                return refuse(value, message);
+            }
+        } else {
+            return Ok(self.validator.int32(reason, addr, value, &self.base));
+        }
+        Ok(WriteVerdict::Accept(value))
+    }
+
+    /// C `connectToArrayPort` fails when `connectDevice` finds no such port
+    /// (NDPluginDriver.cpp:605-611).
+    fn unresolved(&self, port: &str, addr: i32) -> Option<String> {
+        let key = self.wiring.key(port, addr);
+        (!port.is_empty() && self.wiring.lookup_output(&key).is_none()).then(|| {
+            format!(
+                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice \
+                 to array port {port} address {addr}, status=3, \
+                 error=asynManager:connectDevice port {port} not found"
+            )
         })
+    }
+
+    /// C's `connectedToArrayPort_` as `writeInt32` reports it.
+    fn connected(&self) -> bool {
+        let p = &self.plugin_params;
+        let port = self
+            .base
+            .get_string_param(p.nd_array_port, 0)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let addr = self.base.get_int32_param(p.nd_array_addr, 0).unwrap_or(0);
+        !port.is_empty() && self.unresolved(&port, addr).is_none()
+    }
+}
+
+fn write_refused(message: String) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message,
     }
 }
 
@@ -1684,34 +1993,81 @@ impl PortDriver for PluginPortDriver {
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
+        let verdict = self.verdict_int32(reason, addr, value)?;
+        let value = verdict.kept();
+        let reverted =
+            verdict.is_refused() && self.base.get_int32_param(reason, addr).ok() == Some(value);
         self.base.set_int32_param(reason, addr, value)?;
+        let p = &self.plugin_params;
+        if reason == p.queue_size || reason == p.num_threads {
+            // C `createCallbackThreads` ends with QueueFree = QueueSize
+            // (NDPluginDriver.cpp:1024), success or not.
+            let depth = self.base.get_int32_param(p.queue_size, 0)?;
+            self.base.set_int32_param(p.queue_use, 0, depth)?;
+        }
         self.base.call_param_callbacks(addr)?;
-        // B14: reliable send on an unbounded channel — never drop param changes.
-        let _ = self.param_change_tx.send(PluginParamMsg::Change(
-            reason,
-            addr,
-            ParamChangeValue::Int32(value),
-        ));
-        Ok(())
+        if verdict.is_refused()
+            && (reason == p.num_threads || reason == p.queue_size || reason == p.nd_array_addr)
+        {
+            // NDPluginDriver.cpp:769-771
+            let name = self.base.params.param_name(reason).unwrap_or("");
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, \
+                     paramName={name}, value={value}, connectedToArrayPort_={}",
+                    u8::from(self.connected())
+                ),
+            );
+        }
+        // A refusal that reverts leaves nothing for the data plane to apply,
+        // as C's override skips its side effect.
+        if !reverted {
+            // B14: reliable send on an unbounded channel — never drop param changes.
+            let _ = self.param_change_tx.send(PluginParamMsg::Change(
+                reason,
+                addr,
+                ParamChangeValue::Int32(value),
+            ));
+        }
+        verdict.into_result()
     }
 
     fn io_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
+        let verdict = self.validator.float64(reason, addr, value, &self.base);
+        let value = verdict.kept();
+        let reverted =
+            verdict.is_refused() && self.base.get_float64_param(reason, addr).ok() == Some(value);
         self.base.set_float64_param(reason, addr, value)?;
         self.base.call_param_callbacks(addr)?;
-        let _ = self.param_change_tx.send(PluginParamMsg::Change(
-            reason,
-            addr,
-            ParamChangeValue::Float64(value),
-        ));
-        Ok(())
+        if !reverted {
+            let _ = self.param_change_tx.send(PluginParamMsg::Change(
+                reason,
+                addr,
+                ParamChangeValue::Float64(value),
+            ));
+        }
+        verdict.into_result()
     }
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
         let addr = user.addr;
         let s = String::from_utf8_lossy(data).into_owned();
+        // C `writeOctet` ignores connectToArrayPort's status
+        // (NDPluginDriver.cpp:834-836): the write succeeds, the line is printed.
+        if reason == self.plugin_params.nd_array_port {
+            // connectToArrayPort reads list 0 (NDPluginDriver.cpp:591).
+            let nd_addr = self
+                .base
+                .get_int32_param(self.plugin_params.nd_array_addr, 0)?;
+            if let Some(line) = self.unresolved(&s, nd_addr) {
+                self.base
+                    .trace_print(TraceMask::ERROR, format_args!("{line}"));
+            }
+        }
         self.base.set_string_param(reason, addr, &s)?;
         self.base.call_param_callbacks(addr)?;
         let _ = self.param_change_tx.send(PluginParamMsg::Change(
@@ -1778,15 +2134,31 @@ impl PortDriver for PluginPortDriver {
 pub struct PluginRuntimeHandle {
     port_runtime: PortRuntimeHandle,
     array_sender: NDArraySender,
-    array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    array_outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
     port_name: String,
     param_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
     pub ndarray_params: NDArrayDriverParams,
     pub plugin_params: PluginBaseParams,
     threads: PluginThreads,
+    /// The constructor's source, for [`Self::connect_to_array_port`].
+    source: ArraySource,
 }
 
 impl PluginRuntimeHandle {
+    /// Subscribe to the constructor's `NDArrayPort`/`NDArrayAddr`, as each C
+    /// plugin constructor ends with `connectToArrayPort()` (e.g.
+    /// NDPluginROI.cpp:353). Later moves are the data loop's.
+    pub fn connect_to_array_port(&self, wiring: &WiringRegistry) -> Result<(), String> {
+        if self.source.port.is_empty() {
+            return Ok(());
+        }
+        wiring.rewire(
+            &self.array_sender,
+            "",
+            &wiring.key(&self.source.port, self.source.addr),
+        )
+    }
+
     /// The band and stack its threads were built with.
     pub fn threads(&self) -> PluginThreads {
         self.threads
@@ -1800,8 +2172,14 @@ impl PluginRuntimeHandle {
         &self.array_sender
     }
 
+    /// The address-0 output, where `endProcessCallbacks` delivers.
     pub fn array_output(&self) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
-        &self.array_output
+        &self.array_outputs[0]
+    }
+
+    /// The output of address `addr`, if the port has that address.
+    pub fn array_output_at(&self, addr: usize) -> Option<&Arc<parking_lot::Mutex<NDArrayOutput>>> {
+        self.array_outputs.get(addr)
     }
 
     /// Block until the plugin's data thread has applied every control-plane
@@ -1838,28 +2216,15 @@ impl PluginRuntimeHandle {
     /// operator's only route to the ceiling. `create_plugin_runtime*` takes no
     /// such argument, so the configure command applies it here instead.
     ///
-    /// It goes through the one owner allowed to assign `max_threads` — the
-    /// data loop's `MAX_THREADS` arm, which floors the value, clamps
-    /// `NumThreads` to the new ceiling and writes both readbacks back. Seeding
-    /// the shared state from a second site instead would let the ceiling the
-    /// pool runs on drift from the one `MaxThreads_RBV` publishes, which is
-    /// the one disagreement a reader of that record cannot detect.
-    ///
-    /// Blocks until the data thread has applied it, so the ceiling is in place
-    /// before the configure command returns, as it is in C.
+    /// Blocks until the port holds it, so the ceiling is in place before the
+    /// configure command returns, as it is in C.
     pub fn set_max_threads(&self, max_threads: i32) {
-        if self
-            .param_tx
-            .send(PluginParamMsg::Change(
-                self.plugin_params.max_threads,
-                0,
-                ParamChangeValue::Int32(max_threads),
-            ))
-            .is_err()
-        {
-            return;
-        }
-        let _ = self.wait_params_applied(std::time::Duration::from_secs(5));
+        // C `if (maxThreads < 1) maxThreads = 1;` (NDPluginDriver.cpp:117).
+        let _ = self.port_runtime.port_handle().write_int32_blocking(
+            self.plugin_params.max_threads,
+            0,
+            max_threads.max(1),
+        );
     }
 
     pub fn port_name(&self) -> &str {
@@ -1948,23 +2313,16 @@ pub fn plugin_threads(priority: i64, stack_size: i64) -> PluginThreads {
 /// - `PortRuntimeHandle` for param I/O
 /// - `JoinHandle` for the data processing thread
 pub fn create_plugin_runtime<P: NDPluginProcess>(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     processor: P,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
     create_plugin_runtime_multi_addr(
-        port_name,
-        processor,
-        pool,
-        queue_size,
-        ndarray_port,
-        wiring,
-        1,
-        threads,
+        claim, processor, pool, queue_size, source, wiring, 1, threads,
     )
 }
 
@@ -1972,15 +2330,17 @@ pub fn create_plugin_runtime<P: NDPluginProcess>(
 ///
 /// `max_addr` specifies the number of addresses (sub-devices) the port supports.
 pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
-    port_name: &str,
-    mut processor: P,
+    claim: &asyn_rs::registry::PortClaim,
+    processor: P,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     max_addr: usize,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
+    let port_name = claim.name();
+    let source = source.into();
     // Param change channel (control plane -> data plane)
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
@@ -1991,20 +2351,25 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // Capture plugin type and array data handle before mutable borrow
     let plugin_type_name = processor.plugin_type().to_string();
     let compression_aware = processor.compression_aware();
-    let does_array_callbacks = processor.does_array_callbacks();
+    let array_callbacks_seed = processor.array_callbacks_seed();
+    // Unseeded, the template's VAL 1 (NDArrayBase.template:758) applies.
+    let array_callbacks = ArrayCallbacks::new(array_callbacks_seed.unwrap_or(true));
+    let mut processor = processor;
+    processor.bind_array_callbacks(array_callbacks.clone());
     let array_data = processor.array_data_handle();
 
     // Create the port driver for control plane
-    let driver = PluginPortDriver::new(
+    let (driver, processor) = PluginPortDriver::new(
         port_name,
         &plugin_type_name,
         queue_size,
-        ndarray_port,
+        &source,
         max_addr,
         param_tx,
-        &mut processor,
+        processor,
         array_data,
         &pool,
+        wiring.clone(),
     )
     .expect("failed to create plugin port driver");
 
@@ -2022,7 +2387,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // (iocsh.cpp:1269-1279) and the script continues by default
     // (iocsh.cpp:995, :1123), leaving the C IOC serving without the port. We
     // deviate on purpose: see `port_runtime_unavailable`.
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, threads.port_config())
+    let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Clone port handle for the data thread to write params back
@@ -2036,14 +2401,17 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let blocking_mode = Arc::new(AtomicBool::new(false));
 
     // Shared processor (accessible from data thread)
-    let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let array_output_for_handle = array_output.clone();
-    // B13/G6: register this plugin's output so the WiringRegistry is the
+    let array_outputs: Vec<_> = (0..max_addr.max(1))
+        .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
+        .collect();
+    // B13/G6: register this plugin's outputs so the WiringRegistry is the
     // single source of truth for runtime rewiring (PluginManager::add_plugin
-    // would also register it, but direct callers must not bypass the
-    // registry). Registered under every address in 0..max_addr so a
-    // downstream plugin can select a non-zero NDArrayAddr.
-    wiring.register_output_addrs(port_name, max_addr, array_output.clone());
+    // would also register address 0, but direct callers must not bypass the
+    // registry). A downstream plugin at NDArrayAddr N gets only what is
+    // posted at address N, as on C's per-address interrupt list.
+    for (addr, output) in array_outputs.iter().enumerate() {
+        wiring.register_output_at(port_name, addr as i32, output.clone());
+    }
     // G1/B1: the DroppedArrays counter is owned by this plugin and shared with
     // every upstream sender so full-queue drops on our input queue are counted.
     let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
@@ -2054,19 +2422,17 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // The processor is shared with the callback threads rather than owned by
     // `SharedProcessorInner`: the whole point of `&self` on `process_array` is
     // that it runs off the data loop, outside this mutex.
-    let processor = Arc::new(processor);
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
-        output: array_output,
+        outputs: array_outputs.clone(),
         pool,
         ndarray_params,
         plugin_params,
         port_handle,
         array_counter: 0,
         std_array_data_param,
-        // C++ default NDArrayCallbacks = 1 (deliver downstream); terminal
-        // plugins (StdArrays/Attribute/File) override `does_array_callbacks` to 0.
-        array_callbacks: does_array_callbacks,
+        array_callbacks,
         sort_mode: 0,
+        sorting_started: false,
         sort_time: 0.0,
         sort_size: 10,
         sort_buffer: SortBuffer::new(),
@@ -2077,8 +2443,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         last_output_array: None,
         num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
-        nd_array_addr: PLUGIN_NDARRAY_ADDR,
-        max_threads: PLUGIN_MAX_THREADS,
+        nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
     }));
@@ -2095,7 +2460,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
 
     // Capture wiring info for data loop
     let sender_port_name = port_name.to_string();
-    let initial_upstream = ndarray_port.to_string();
+    let initial_upstream = source.clone();
 
     // Spawn data processing thread
     let data_jh = MandatoryThread::new(
@@ -2123,12 +2488,13 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let handle = PluginRuntimeHandle {
         port_runtime,
         array_sender,
-        array_output: array_output_for_handle,
+        array_outputs,
         port_name: port_name.to_string(),
         param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
         threads,
+        source,
     };
 
     (handle, data_jh)
@@ -2156,22 +2522,6 @@ fn queue_status_batch(
         ],
         extra: std::collections::HashMap::new(),
     }
-}
-
-/// Write a validated/clamped int32 value back into the param library so the
-/// RBV reflects the accepted value (G4 NumThreads/MaxThreads clamping).
-async fn clamp_writeback(port: &PortHandle, reason: usize, value: i32) {
-    use asyn_rs::request::ParamSetValue;
-    let _ = port
-        .set_params_and_notify(
-            0,
-            vec![ParamSetValue::new(
-                reason,
-                0,
-                asyn_rs::param::ParamValue::Int32(value),
-            )],
-        )
-        .await;
 }
 
 /// One array handed to a callback thread.
@@ -2375,7 +2725,7 @@ async fn complete_frame(
     let (output, senders, port) = {
         let mut guard = shared.lock();
         let output = guard.post_process(&msg.array, result, elapsed_ms);
-        let senders = guard.output.lock().senders_clone();
+        let senders = guard.senders_for(&output);
         let port = guard.port_handle.clone();
         (output, senders, port)
     };
@@ -2387,30 +2737,21 @@ async fn complete_frame(
 /// Move one array-source slot from its `(port, addr)` to another: what
 /// `NDPluginDriver::connectToArrayPort` does for its one source
 /// (NDPluginDriver.cpp:581-640) and `NDPluginGather::connectToArrayPort` for
-/// each of its `maxPorts_` (NDPluginGather.cpp:134-186). On success the slot
-/// holds the new pair; on failure it is unchanged and wired as before. A
-/// slot leaving an empty port has no sender in any output to move, so it is
-/// given a fresh clone of the port's.
+/// each of its `maxPorts_` (NDPluginGather.cpp:134-186). As in C the slot is
+/// disconnected first, so a source that does not resolve leaves it holding
+/// the new pair and receiving nothing.
 fn rewire_source(
     wiring: &WiringRegistry,
-    sender_port: &str,
     sender: &WeakNDArraySender,
     slot: &mut (String, i32),
     new_port: &str,
     new_addr: i32,
 ) -> Result<(), String> {
-    let old_key = upstream_key(&slot.0, slot.1);
-    let new_key = upstream_key(new_port, new_addr);
-    if old_key != new_key {
-        if old_key.is_empty() {
-            let sender = sender.upgrade().ok_or("input queue closed")?;
-            wiring.rewire(&sender, "", &new_key)?;
-        } else {
-            wiring.rewire_by_name(sender_port, &old_key, &new_key)?;
-        }
-    }
+    let old_key = wiring.key(&slot.0, slot.1);
+    let new_key = wiring.key(new_port, new_addr);
     *slot = (new_port.to_string(), new_addr);
-    Ok(())
+    let sender = sender.upgrade().ok_or("input queue closed")?;
+    wiring.rewire(&sender, &old_key, &new_key)
 }
 
 /// The source slot an `NDArrayPort`/`NDArrayAddr` write at `addr` moves, with
@@ -2438,7 +2779,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
     enabled: Arc<AtomicBool>,
     blocking_mode: Arc<AtomicBool>,
     sender_port_name: String,
-    initial_upstream: String,
+    initial_upstream: ArraySource,
     wiring: Arc<WiringRegistry>,
 ) {
     let enable_callbacks_reason = plugin_params.enable_callbacks;
@@ -2452,15 +2793,14 @@ fn plugin_data_loop<P: NDPluginProcess>(
     let process_plugin_reason = plugin_params.process_plugin;
     let max_byte_rate_reason = plugin_params.max_byte_rate;
     let num_threads_reason = plugin_params.num_threads;
-    let max_threads_reason = plugin_params.max_threads;
     let queue_size_reason = plugin_params.queue_size;
     let array_callbacks_reason = shared.lock().ndarray_params.array_callbacks;
     // The array sources: one `(NDArrayPort, NDArrayAddr)` pair per address
     // the processor reads (`num_array_sources`), each wired under its
-    // `upstream_key`. Slot 0 starts on the constructor's port, as
+    // `WiringRegistry::key`. Slot 0 starts on the constructor's port, as
     // NDPluginDriver.cpp:152-153 seeds it.
     let mut sources = vec![(String::new(), 0i32); processor.num_array_sources().max(1)];
-    sources[0].0 = initial_upstream;
+    sources[0] = (initial_upstream.port, initial_upstream.addr);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2594,6 +2934,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         Some(PluginParamMsg::Barrier(ack)) => {
                             held_barriers.push(ack);
                         }
+                        #[cfg(test)]
+                        Some(PluginParamMsg::Fence(ack)) => {
+                            let _ = ack.send(());
+                        }
                         Some(PluginParamMsg::Change(reason, addr, value)) => {
                             // The base-class pool branch, which a plugin port
                             // inherits (NDPluginDriver.cpp:690-692). Answered
@@ -2623,7 +2967,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // 257-265). Processing still runs; only delivery is
                             // suppressed when 0.
                             if reason == array_callbacks_reason {
-                                shared.lock().array_callbacks = value.as_i32() != 0;
+                                shared.lock().array_callbacks.set(value.as_i32() != 0);
                             }
                             // Handle MinCallbackTime param change
                             // The gate is on the producer side, where C reads
@@ -2639,33 +2983,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 guard.max_byte_rate = rate;
                                 guard.throttler.reset(rate);
                             }
-                            // G4: NumThreads / MaxThreads are validated and
-                            // clamped on write (C++ `createCallbackThreads`,
-                            // NDPluginDriver.cpp:955-971), and the accepted
-                            // value is written back so the RBV reports what is
-                            // actually running.
-                            if reason == max_threads_reason {
-                                // Scope the guard so it is released before await.
-                                let (port, clamped, mt) = {
-                                    let mut guard = shared.lock();
-                                    guard.max_threads = value.as_i32().max(1);
-                                    let clamped =
-                                        guard.num_threads.clamp(1, guard.max_threads);
-                                    guard.num_threads = clamped;
-                                    (guard.port_handle.clone(), clamped, guard.max_threads)
-                                };
-                                clamp_writeback(&port, num_threads_reason, clamped).await;
-                                clamp_writeback(&port, max_threads_reason, mt).await;
-                            }
                             if reason == num_threads_reason {
-                                let (port, clamped) = {
-                                    let mut guard = shared.lock();
-                                    let clamped =
-                                        value.as_i32().clamp(1, guard.max_threads.max(1));
-                                    guard.num_threads = clamped;
-                                    (guard.port_handle.clone(), clamped)
-                                };
-                                clamp_writeback(&port, num_threads_reason, clamped).await;
+                                shared.lock().num_threads = value.as_i32();
                             }
                             // C `writeInt32` (NDPluginDriver.cpp:730-733): a
                             // NumThreads or QueueSize write deletes the
@@ -2732,10 +3051,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 // (`:1008`).
                                 last_queue_free = None;
                             }
-                            if reason == num_threads_reason
-                                || reason == max_threads_reason
-                                || reason == queue_size_reason
-                            {
+                            if reason == num_threads_reason || reason == queue_size_reason {
                                 let want = shared.lock().num_threads.max(1) as usize;
                                 if reason == queue_size_reason || want != pool.size() {
                                     let (new_pool, new_done) = spawn_worker_pool(
@@ -2769,20 +3085,18 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             if reason == nd_array_addr_reason {
                                 if let Some((index, slot)) = source_slot(&mut sources, addr) {
                                     let port = slot.0.clone();
-                                    match rewire_source(
+                                    // A failure was reported by the port write path.
+                                    if rewire_source(
                                         &wiring,
-                                        &sender_port_name,
                                         &sender,
                                         slot,
                                         &port,
                                         value.as_i32(),
-                                    ) {
-                                        Ok(()) => {
-                                            if index == 0 {
-                                                shared.lock().nd_array_addr = slot.1;
-                                            }
-                                        }
-                                        Err(e) => eprintln!("NDArrayAddr reconnect failed: {e}"),
+                                    )
+                                    .is_ok()
+                                        && index == 0
+                                    {
+                                        shared.lock().nd_array_addr = slot.1;
                                     }
                                 }
                             }
@@ -2858,8 +3172,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                     let mut guard = shared.lock();
                                                     let output = guard
                                                         .process_and_publish(&*processor, &array);
-                                                    let senders =
-                                                        guard.output.lock().senders_clone();
+                                                    let senders = guard.senders_for(&output);
                                                     let port = guard.port_handle.clone();
                                                     (output, senders, port)
                                                 };
@@ -2910,9 +3223,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 let flush_work = {
                                     let mut guard = shared.lock();
                                     guard.sort_mode = mode;
+                                    guard.sorting_started |= mode == 1;
                                     if mode == 0 {
                                         let output = guard.flush_sort_buffer();
-                                        let senders = guard.output.lock().senders_clone();
+                                        let senders = guard.senders_for(&output);
                                         let port = guard.port_handle.clone();
                                         sort_flush_active = false;
                                         Some((output, senders, port))
@@ -2955,16 +3269,14 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     (source_slot(&mut sources, addr), value.as_string())
                                 {
                                     let source_addr = slot.1;
-                                    if let Err(e) = rewire_source(
+                                    // A failure was reported by the port write path.
+                                    let _ = rewire_source(
                                         &wiring,
-                                        &sender_port_name,
                                         &sender,
                                         slot,
                                         new_port,
                                         source_addr,
-                                    ) {
-                                        eprintln!("NDArrayPort rewire failed: {e}");
-                                    }
+                                    );
                                 }
                             }
                             let snapshot = PluginParamSnapshot {
@@ -2975,19 +3287,22 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             };
                             let (process_output, senders, port) = {
                                 let mut guard = shared.lock();
-                                let t0 = std::time::Instant::now();
                                 let result = processor.on_param_change(reason, &snapshot);
-                                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                let output = if !result.output_arrays.is_empty() || !result.param_updates.is_empty() {
-                                    let deliver = guard.array_callbacks;
-                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, false, None, elapsed_ms, deliver, true))
+                                let output = if !result.output_arrays.is_empty()
+                                    || !result.param_updates.is_empty()
+                                    || !result.addressed.is_empty()
+                                {
+                                    let deliver = guard.array_callbacks.get();
+                                    let mut output = guard.build_publish_batch(result.output_arrays, result.param_updates, false, None, None, deliver, true);
+                                    output.addressed = result.addressed;
+                                    Some(output)
                                 } else {
                                     None
                                 };
-                                let senders = guard.output.lock().senders_clone();
+                                let senders = output.as_ref().map(|o| guard.senders_for(o));
                                 (output, senders, guard.port_handle.clone())
                             };
-                            if let Some(po) = process_output {
+                            if let (Some(po), Some(senders)) = (process_output, senders) {
                                 po.publish_arrays(&senders, &mut scatter_cursor).await;
                                 po.batch.flush(&port).await;
                             }
@@ -3001,7 +3316,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                     let (output, senders, port) = {
                         let mut guard = shared.lock();
                         let output = guard.tick_sort_buffer();
-                        let senders = guard.output.lock().senders_clone();
+                        let senders = guard.senders_for(&output);
                         let port = guard.port_handle.clone();
                         (output, senders, port)
                     };
@@ -3018,22 +3333,24 @@ fn plugin_data_loop<P: NDPluginProcess>(
 /// B13: the upstream's `array_output` is the same `Arc` that every
 /// `create_plugin_runtime*` entry point registers in the `WiringRegistry`, so
 /// adding a sender here mutates the registry-tracked output — the registry
-/// remains the single source of truth for `rewire_by_name`.
+/// remains the single source of truth for `rewire_source`.
 pub fn wire_downstream(upstream: &PluginRuntimeHandle, downstream_sender: NDArraySender) {
     upstream.array_output().lock().add(downstream_sender);
 }
 
 /// Create a plugin runtime with a pre-wired output (for testing and direct wiring).
 pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
-    port_name: &str,
-    mut processor: P,
+    claim: &asyn_rs::registry::PortClaim,
+    processor: P,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
     output: NDArrayOutput,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
     threads: PluginThreads,
 ) -> (PluginRuntimeHandle, thread::JoinHandle<()>) {
+    let port_name = claim.name();
+    let source = source.into();
     // B14: unbounded so control-plane param changes (e.g. autosave restoring
     // hundreds of PVs at IOC init) are never silently dropped before the
     // data plane sees them.
@@ -3042,18 +3359,23 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let plugin_type_name = processor.plugin_type().to_string();
     let compression_aware = processor.compression_aware();
-    let does_array_callbacks = processor.does_array_callbacks();
+    let array_callbacks_seed = processor.array_callbacks_seed();
+    // Unseeded, the template's VAL 1 (NDArrayBase.template:758) applies.
+    let array_callbacks = ArrayCallbacks::new(array_callbacks_seed.unwrap_or(true));
+    let mut processor = processor;
+    processor.bind_array_callbacks(array_callbacks.clone());
     let array_data = processor.array_data_handle();
-    let driver = PluginPortDriver::new(
+    let (driver, processor) = PluginPortDriver::new(
         port_name,
         &plugin_type_name,
         queue_size,
-        ndarray_port,
+        &source,
         1,
         param_tx,
-        &mut processor,
+        processor,
         array_data,
         &pool,
+        wiring.clone(),
     )
     .expect("failed to create plugin port driver");
 
@@ -3064,7 +3386,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // Fatal for the same reason as `create_plugin_runtime_multi_addr` above:
     // a constructor-shaped creator has nowhere to report to, and the only
     // alternative is a handle to a port that does not exist.
-    let (port_runtime, _actor_jh) = create_port_runtime(driver, threads.port_config())
+    let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     let port_handle = port_runtime.port_handle().clone();
@@ -3074,12 +3396,11 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let enabled = Arc::new(AtomicBool::new(false));
     let blocking_mode = Arc::new(AtomicBool::new(false));
 
-    let array_output = Arc::new(parking_lot::Mutex::new(output));
-    let array_output_for_handle = array_output.clone();
+    let array_outputs = vec![Arc::new(parking_lot::Mutex::new(output))];
     // B13: register this plugin's output so the WiringRegistry is the single
     // source of truth — an output created via this entry point is otherwise
     // invisible to runtime rewiring.
-    wiring.register_output(port_name, array_output.clone());
+    wiring.register_output(port_name, array_outputs[0].clone());
     // G1/B1: DroppedArrays counter shared with upstream senders.
     let dropped_arrays_counter = array_sender.dropped_arrays_counter().clone();
     // The pre-queue gate: C runs both halves of `driverCallback` on the
@@ -3089,19 +3410,17 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // The processor is shared with the callback threads rather than owned by
     // `SharedProcessorInner`: the whole point of `&self` on `process_array` is
     // that it runs off the data loop, outside this mutex.
-    let processor = Arc::new(processor);
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
-        output: array_output,
+        outputs: array_outputs.clone(),
         pool,
         ndarray_params,
         plugin_params,
         port_handle,
         array_counter: 0,
         std_array_data_param,
-        // C++ default NDArrayCallbacks = 1 (deliver downstream); terminal
-        // plugins (StdArrays/Attribute/File) override `does_array_callbacks` to 0.
-        array_callbacks: does_array_callbacks,
+        array_callbacks,
         sort_mode: 0,
+        sorting_started: false,
         sort_time: 0.0,
         sort_size: 10,
         sort_buffer: SortBuffer::new(),
@@ -3112,8 +3431,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         last_output_array: None,
         num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
-        nd_array_addr: PLUGIN_NDARRAY_ADDR,
-        max_threads: PLUGIN_MAX_THREADS,
+        nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
     }));
@@ -3130,7 +3448,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     // Capture wiring info for data loop
     let sender_port_name = port_name.to_string();
-    let initial_upstream = ndarray_port.to_string();
+    let initial_upstream = source.clone();
 
     let data_jh = MandatoryThread::new(
         format!("plugin-data-{port_name}"),
@@ -3157,12 +3475,13 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let handle = PluginRuntimeHandle {
         port_runtime,
         array_sender,
-        array_output: array_output_for_handle,
+        array_outputs,
         port_name: port_name.to_string(),
         param_tx: handle_param_tx,
         ndarray_params,
         plugin_params,
         threads,
+        source,
     };
 
     (handle, data_jh)
@@ -3241,6 +3560,106 @@ mod tests {
         }
     }
 
+    /// Clamps `LIMIT` to 0..=10 and reverts any negative `GAIN`, as C plugin
+    /// overrides do; records what reached the data plane.
+    #[derive(Default)]
+    struct ValidatingProcessor {
+        limit: usize,
+        gain: usize,
+        applied: Arc<parking_lot::Mutex<Vec<usize>>>,
+        ids: Arc<parking_lot::Mutex<(usize, usize)>>,
+    }
+
+    impl NDPluginProcess for ValidatingProcessor {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "Validating"
+        }
+        fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+            self.limit = base.create_param("LIMIT", asyn_rs::param::ParamType::Int32)?;
+            self.gain = base.create_param("GAIN", asyn_rs::param::ParamType::Float64)?;
+            base.set_float64_param(self.gain, 0, 1.0)?;
+            *self.ids.lock() = (self.limit, self.gain);
+            Ok(())
+        }
+        fn validate_int32(
+            &self,
+            reason: usize,
+            _addr: i32,
+            value: i32,
+            _params: &PortDriverBase,
+        ) -> WriteVerdict<i32> {
+            if reason == self.limit && value > 10 {
+                return WriteVerdict::Refuse {
+                    keep: 10,
+                    message: "limit".into(),
+                };
+            }
+            WriteVerdict::Accept(value)
+        }
+        fn validate_float64(
+            &self,
+            reason: usize,
+            addr: i32,
+            value: f64,
+            params: &PortDriverBase,
+        ) -> WriteVerdict<f64> {
+            if reason == self.gain && value < 0.0 {
+                return WriteVerdict::Refuse {
+                    keep: params.get_float64_param(reason, addr).unwrap(),
+                    message: "gain".into(),
+                };
+            }
+            WriteVerdict::Accept(value)
+        }
+        fn on_param_change(
+            &self,
+            reason: usize,
+            _params: &PluginParamSnapshot,
+        ) -> ParamChangeResult {
+            self.applied.lock().push(reason);
+            ParamChangeResult::empty()
+        }
+    }
+
+    /// The port asks the plugin before it stores: a clamp is stored and
+    /// fails, a revert keeps the old value, fails, and never reaches
+    /// `on_param_change`.
+    #[test]
+    fn plugin_validate_hook_clamps_and_reverts_before_the_store() {
+        let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ids = Arc::new(parking_lot::Mutex::new((0, 0)));
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("VALIDATE").unwrap(),
+            ValidatingProcessor {
+                applied: applied.clone(),
+                ids: ids.clone(),
+                ..Default::default()
+            },
+            NDArrayPool::new(1_000_000),
+            10,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let (limit, gain) = *ids.lock();
+
+        assert!(port.write_int32_blocking(limit, 0, 5).is_ok());
+        assert!(port.write_int32_blocking(limit, 0, 50).is_err());
+        assert_eq!(port.read_int32_blocking(limit, 0).unwrap(), 10);
+
+        assert!(port.write_float64_blocking(gain, 0, 2.0).is_ok());
+        assert!(port.write_float64_blocking(gain, 0, -1.0).is_err());
+        assert_eq!(port.read_float64_blocking(gain, 0).unwrap(), 2.0);
+
+        params_applied(&handle);
+        assert_eq!(*applied.lock(), vec![limit, limit, gain]);
+    }
+
     /// A processor that serves its latest frame, as NDPluginStdArrays does.
     struct ServingProcessor {
         served: Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>,
@@ -3315,33 +3734,21 @@ mod tests {
     /// Fence for tests that deliberately keep the input queue occupied.
     ///
     /// `params_applied` cannot serve there: its barrier also waits for the
-    /// array queue to drain, which is the very state these tests hold. The
-    /// param channel is FIFO, so a later write whose *accepted* value only the
-    /// data thread can produce is enough — NumThreads is clamped to
-    /// `[1, MaxThreads]` and written back (NDPluginDriver.cpp:955-971), so an
-    /// out-of-range write reading back as the clamp proves every earlier param
-    /// message has been applied.
+    /// array queue to drain, which is the very state these tests hold.
     ///
     /// Timing out here is itself the finding these tests exist for: the data
     /// thread is the one that applies params, so a param that never lands
     /// means the loop is stuck inside work a callback thread should be doing.
     fn param_fifo_drained(handle: &PluginRuntimeHandle) {
-        let port = handle.port_runtime().port_handle();
-        port.write_int32_blocking(handle.plugin_params.num_threads, 0, 99)
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while port
-            .read_int32_blocking(handle.plugin_params.num_threads, 0)
-            .unwrap()
-            != 1
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the data thread stopped applying param writes — it is busy \
-                 inside work a callback thread should be doing"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        handle.param_tx.send(PluginParamMsg::Fence(ack_tx)).unwrap();
+        assert!(
+            ack_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok(),
+            "the data thread stopped applying param writes — it is busy \
+             inside work a callback thread should be doing"
+        );
     }
 
     /// Poll `cond` until it holds; panic after 10 s. Waits on the observable
@@ -3394,7 +3801,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "PASS1",
+            &asyn_rs::asyn_record::claim_port("PASS1").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3418,7 +3825,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let (handle, _data_jh) = create_plugin_runtime(
-            "SINK1",
+            &asyn_rs::asyn_record::claim_port("SINK1").unwrap(),
             SinkProcessor {
                 count: std::sync::atomic::AtomicUsize::new(0),
             },
@@ -3448,7 +3855,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let (handle, _data_jh) = create_plugin_runtime(
-            "TYPE_TEST",
+            &asyn_rs::asyn_record::claim_port("TYPE_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3475,7 +3882,7 @@ mod tests {
         let mut output = NDArrayOutput::new();
         output.add(ds);
         let (handle, _jh) = create_plugin_runtime_with_output(
-            "TS_PARAM",
+            &asyn_rs::asyn_record::claim_port("TS_PARAM").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3519,7 +3926,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
 
         let (handle, data_jh) = create_plugin_runtime(
-            "SHUTDOWN_TEST",
+            &asyn_rs::asyn_record::claim_port("SHUTDOWN_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3538,21 +3945,113 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// The writes C `NDPluginDriver::writeInt32`/`writeOctet` fail
+    /// (NDPluginDriver.cpp:605-611, 973-994) fail here too, so the record
+    /// takes its WRITE alarm; a clamp is what the readback shows.
     #[test]
-    fn test_wire_to_nonzero_ndarray_addr() {
-        // G6: a multi-address upstream plugin registers its output under every
-        // address in 0..max_addr. A downstream consumer must be able to select
-        // NDArrayAddr=1 and actually receive arrays — previously the output was
-        // registered under the bare port name only, so the "PORT:1" key was
-        // missing and rewire failed with "not found".
-        use crate::plugin::wiring::upstream_key;
+    fn refused_plugin_writes_return_an_error() {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = test_wiring();
-
-        // Upstream plugin advertises 2 addresses.
-        let (up_handle, _up_jh) = create_plugin_runtime_multi_addr(
-            "UP_MULTI",
+        let up_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        wiring.register_output("UP", up_output);
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("REFUSE").unwrap(),
             PassthroughProcessor,
+            pool,
+            10,
+            "UP",
+            wiring,
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.plugin_params;
+        let log = std::env::temp_dir().join(format!("refuse-trace-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        port.trace().set_trace_file(
+            Some("REFUSE"),
+            asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+
+        assert!(port.write_int32_blocking(p.num_threads, 0, 2).is_err());
+        assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 1);
+        assert!(port.write_int32_blocking(p.num_threads, 0, 0).is_err());
+        assert!(port.write_int32_blocking(p.num_threads, 0, 1).is_ok());
+
+        // C `writeInt32` has no MaxThreads arm: lowering the ceiling leaves
+        // the accepted NumThreads alone.
+        port.write_int32_blocking(p.max_threads, 0, 4).unwrap();
+        port.write_int32_blocking(p.num_threads, 0, 3).unwrap();
+        port.write_int32_blocking(p.max_threads, 0, 1).unwrap();
+        params_applied(&handle);
+        assert_eq!(port.read_int32_blocking(p.num_threads, 0).unwrap(), 3);
+        assert_eq!(port.read_int32_blocking(p.max_threads, 0).unwrap(), 1);
+
+        assert!(port.write_int32_blocking(p.queue_size, 0, 0).is_err());
+        assert_eq!(port.read_int32_blocking(p.queue_size, 0).unwrap(), 1);
+        assert_eq!(port.read_int32_blocking(p.queue_use, 0).unwrap(), 1);
+        port.write_int32_blocking(p.queue_size, 0, 7).unwrap();
+        assert_eq!(port.read_int32_blocking(p.queue_use, 0).unwrap(), 7);
+
+        // A single-address upstream takes any NDArrayAddr.
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, 3).is_ok());
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, 0).is_ok());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            rt.block_on(port.write_octet(p.nd_array_port, 0, b"NOPE".to_vec()))
+                .is_ok()
+        );
+        assert!(
+            rt.block_on(port.write_octet(p.nd_array_port, 0, b"UP".to_vec()))
+                .is_ok()
+        );
+
+        // The lines C prints for the same writes (NDPluginDriver.cpp:606,
+        // :973-990, :769-771).
+        let trace = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        for line in [
+            "NDPluginDriver::createCallbackThreads error, numThreads=2 must be <= maxThreads=1, setting to 1".to_string(),
+            format!(
+                "NDPluginDriver::writeInt32 ERROR, status=3, function={}, paramName=NUM_THREADS, value=1, connectedToArrayPort_=1",
+                p.num_threads
+            ),
+            "NDPluginDriver::createCallbackThreads error, numThreads=0 must be >= 1, setting to 1".to_string(),
+            "NDPluginDriver::createCallbackThreads error, queueSize=0 must be >= 1, setting to 1".to_string(),
+            "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port NOPE address 0, status=3, error=asynManager:connectDevice port NOPE not found".to_string(),
+        ] {
+            assert!(trace.contains(&line), "missing {line:?} in\n{trace}");
+        }
+    }
+
+    #[test]
+    fn arrays_reach_only_the_subscribers_of_their_address() {
+        // C doCallbacksGenericPointer(pArray, NDArrayData, addr) calls only the
+        // clients registered at `addr` (NDPluginStats.cpp:586 posts its time
+        // series at 1, endProcessCallbacks posts the image at 0), and a post
+        // made outside endProcessCallbacks ignores NDArrayCallbacks.
+        struct Posting;
+        impl NDPluginProcess for Posting {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let mut result = ProcessResult::forward(array, vec![]);
+                result
+                    .addressed
+                    .push((1, make_test_array(array.unique_id + 1000)));
+                result
+            }
+            fn plugin_type(&self) -> &str {
+                "Posting"
+            }
+        }
+        let pool = NDArrayPool::new(1_000_000);
+        let wiring = test_wiring();
+        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+            &asyn_rs::asyn_record::claim_port("UP_MULTI").unwrap(),
+            Posting,
             pool,
             10,
             "",
@@ -3560,30 +4059,166 @@ mod tests {
             2,
             DEFAULT_PLUGIN_THREADS,
         );
-        enable_callbacks(&up_handle);
-
-        // The "PORT:1" key must resolve to the same output as the bare port.
-        let addr0 = wiring.lookup_output("UP_MULTI");
-        let addr1 = wiring.lookup_output(&upstream_key("UP_MULTI", 1));
-        assert!(addr0.is_some(), "addr 0 output must be registered");
-        assert!(
-            addr1.is_some(),
-            "addr 1 output must be registered for a max_addr=2 port"
-        );
-
-        // Wire a downstream consumer to UP_MULTI address 1.
-        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWN_ADDR1", 10);
+        enable_callbacks(&up);
+        let (down0, mut rx0) = ndarray_channel("DOWN0", 10);
+        let (down1, mut rx1) = ndarray_channel("DOWN1", 10);
         wiring
-            .rewire(&downstream_sender, "", &upstream_key("UP_MULTI", 1))
-            .expect("wiring a consumer to NDArrayAddr=1 must succeed");
+            .rewire(&down0, "", &wiring.key("UP_MULTI", 0))
+            .unwrap();
+        wiring
+            .rewire(&down1, "", &wiring.key("UP_MULTI", 1))
+            .unwrap();
 
-        // An array sent through the upstream must reach the addr-1 consumer.
-        send_array(up_handle.array_sender(), make_test_array(99));
-        let received = downstream_rx.blocking_recv().unwrap();
+        // Each consumer's next array proves the previous one never crossed.
+        for id in [99, 100] {
+            send_array(up.array_sender(), make_test_array(id));
+            assert_eq!(rx1.blocking_recv().unwrap().unique_id, id + 1000);
+            assert_eq!(rx0.blocking_recv().unwrap().unique_id, id);
+        }
+
+        let port = up.port_runtime().port_handle();
+        port.write_int32_blocking(up.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        params_applied(&up);
+        send_array(up.array_sender(), make_test_array(101));
+        assert_eq!(rx1.blocking_recv().unwrap().unique_id, 1101);
+        port.write_int32_blocking(up.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        params_applied(&up);
+        send_array(up.array_sender(), make_test_array(102));
+        assert_eq!(rx1.blocking_recv().unwrap().unique_id, 1102);
         assert_eq!(
-            received.unique_id, 99,
-            "consumer wired to NDArrayAddr=1 must receive upstream arrays"
+            rx0.blocking_recv().unwrap().unique_id,
+            102,
+            "NDArrayCallbacks=0 withheld 101 from address 0 only"
         );
+    }
+
+    #[test]
+    fn a_processor_gates_its_work_on_the_runtimes_ndarray_callbacks() {
+        // C NDPluginTimeSeries does its per-address work inside its own
+        // `if (arrayCallbacks)` (NDPluginTimeSeries.cpp:341), from a frame or
+        // a write alike; an ungated post (NDPluginStats.cpp:586) ignores it.
+        #[derive(Default)]
+        struct Gated {
+            array_callbacks: Option<ArrayCallbacks>,
+            gated_frames: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Gated {
+            fn on(&self) -> bool {
+                self.array_callbacks.as_ref().unwrap().get()
+            }
+        }
+        impl NDPluginProcess for Gated {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
+                self.array_callbacks = Some(array_callbacks);
+            }
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let mut result = ProcessResult::sink(vec![]);
+                result
+                    .addressed
+                    .push((1, make_test_array(array.unique_id + 1000)));
+                if self.on() {
+                    self.gated_frames.fetch_add(1, Ordering::Relaxed);
+                    result
+                        .addressed
+                        .push((1, make_test_array(array.unique_id + 2000)));
+                }
+                result
+            }
+            fn on_param_change(
+                &self,
+                _reason: usize,
+                params: &PluginParamSnapshot,
+            ) -> ParamChangeResult {
+                let mut result = ParamChangeResult::empty();
+                if self.on() {
+                    result
+                        .addressed
+                        .push((1, make_test_array(5000 + params.value.as_i32())));
+                }
+                result
+            }
+            fn plugin_type(&self) -> &str {
+                "Gated"
+            }
+        }
+        let gated = Gated::default();
+        let gated_frames = gated.gated_frames.clone();
+        let pool = NDArrayPool::new(1_000_000);
+        let wiring = test_wiring();
+        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+            &asyn_rs::asyn_record::claim_port("UP_GATED").unwrap(),
+            gated,
+            pool,
+            10,
+            "",
+            wiring.clone(),
+            2,
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&up);
+        let (down1, mut rx1) = ndarray_channel("DOWN_GATED", 10);
+        wiring
+            .rewire(&down1, "", &wiring.key("UP_GATED", 1))
+            .unwrap();
+        let port = up.port_runtime().port_handle();
+        let mut next = || rx1.blocking_recv().unwrap().unique_id;
+
+        send_array(up.array_sender(), make_test_array(99));
+        assert_eq!((next(), next()), (1099, 2099));
+        port.write_int32_blocking(up.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        params_applied(&up);
+        send_array(up.array_sender(), make_test_array(101));
+        port.write_int32_blocking(up.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        params_applied(&up);
+        send_array(up.array_sender(), make_test_array(102));
+        // The write of 0 already sees 0, so 5000 and 2101 were never made.
+        assert_eq!((next(), next(), next(), next()), (1101, 5001, 1102, 2102));
+        assert_eq!(gated_frames.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn the_constructor_source_address_is_seeded_and_connected() {
+        // C seeds NDArrayAddr from the constructor argument (:153) and the
+        // plugin constructor connects there; an unseeded 0 is what the
+        // NDArrayAddress record's init readback then copies over its VAL.
+        let pool = NDArrayPool::new(1_000_000);
+        let wiring = test_wiring();
+        let (up, _up_jh) = create_plugin_runtime_multi_addr(
+            &asyn_rs::asyn_record::claim_port("UP_SEED").unwrap(),
+            PassthroughProcessor,
+            pool.clone(),
+            10,
+            "",
+            wiring.clone(),
+            2,
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&up);
+        let (down, _down_jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("DOWN_SEED").unwrap(),
+            PassthroughProcessor,
+            pool,
+            10,
+            ("UP_SEED", 1),
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = down.port_runtime().port_handle();
+        assert_eq!(
+            port.read_int32_blocking(down.plugin_params.nd_array_addr, 0)
+                .unwrap(),
+            1
+        );
+        down.connect_to_array_port(&wiring).unwrap();
+        let at_addr1 = wiring
+            .lookup_output(&wiring.key("UP_SEED", 1))
+            .expect("UP_SEED:1");
+        assert_eq!(at_addr1.lock().num_senders(), 1);
     }
 
     #[test]
@@ -3610,7 +4245,7 @@ mod tests {
         let mut ups = Vec::new();
         for name in ["UP_A", "UP_B"] {
             let (up, jh) = create_plugin_runtime_multi_addr(
-                name,
+                &asyn_rs::asyn_record::claim_port(name).unwrap(),
                 PassthroughProcessor,
                 pool.clone(),
                 10,
@@ -3623,7 +4258,7 @@ mod tests {
             ups.push((up, jh));
         }
         let (handle, _jh) = create_plugin_runtime_multi_addr(
-            "GATHERING",
+            &asyn_rs::asyn_record::claim_port("GATHERING").unwrap(),
             Gathering,
             pool,
             10,
@@ -3669,6 +4304,22 @@ mod tests {
             4,
             "an emptied slot 1 delivers nothing; slot 0 still does"
         );
+
+        // C connectToArrayPort disconnects before it connects
+        // (NDPluginDriver.cpp:600-611): a port that does not resolve leaves
+        // the slot receiving nothing, and the next good write reconnects it.
+        let (probe, mut probe_rx) = ndarray_channel("PROBE", 10);
+        wiring.rewire(&probe, "", "UP_A").unwrap();
+        write_port(0, "NOPE");
+        send_array(ups[0].0.array_sender(), make_test_array(5));
+        assert_eq!(probe_rx.blocking_recv().unwrap().unique_id, 5);
+        write_port(0, "UP_A");
+        send_array(ups[0].0.array_sender(), make_test_array(6));
+        assert_eq!(
+            down_rx.blocking_recv().unwrap().unique_id,
+            6,
+            "array 5 went out while slot 0 was on NOPE"
+        );
     }
 
     #[test]
@@ -3679,7 +4330,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "NB_TEST",
+            &asyn_rs::asyn_record::claim_port("NB_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3704,7 +4355,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "SWITCH_TEST",
+            &asyn_rs::asyn_record::claim_port("SWITCH_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3749,7 +4400,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "ENABLE_TEST",
+            &asyn_rs::asyn_record::claim_port("ENABLE_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3801,7 +4452,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "DISABLE_MID",
+            &asyn_rs::asyn_record::claim_port("DISABLE_MID").unwrap(),
             processor,
             pool,
             8,
@@ -3868,7 +4519,7 @@ mod tests {
     fn a_plugin_port_answers_the_pool_control_writes() {
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _jh) = create_plugin_runtime(
-            "POOLCTL",
+            &asyn_rs::asyn_record::claim_port("POOLCTL").unwrap(),
             PassthroughProcessor,
             Arc::clone(&pool),
             4,
@@ -3934,7 +4585,7 @@ mod tests {
         output.add(ds2);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "DS_TEST",
+            &asyn_rs::asyn_record::claim_port("DS_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -3974,7 +4625,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "PARAM_TEST",
+            &asyn_rs::asyn_record::claim_port("PARAM_TEST").unwrap(),
             ParamTracker,
             pool,
             10,
@@ -4002,6 +4653,52 @@ mod tests {
         send_array(handle.array_sender(), make_test_array(2));
         let received = downstream_rx.blocking_recv().unwrap();
         assert_eq!(received.unique_id, 2);
+    }
+
+    #[test]
+    fn a_param_write_does_not_define_execution_time() {
+        struct Echo;
+        impl NDPluginProcess for Echo {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::arrays(vec![Arc::clone(array)])
+            }
+            fn on_param_change(
+                &self,
+                reason: usize,
+                params: &PluginParamSnapshot,
+            ) -> ParamChangeResult {
+                ParamChangeResult::updates(vec![ParamUpdate::int32(reason, params.value.as_i32())])
+            }
+            fn plugin_type(&self) -> &str {
+                "Echo"
+            }
+        }
+
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("EXEC_TIME").unwrap(),
+            Echo,
+            NDArrayPool::new(1_000_000),
+            10,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        enable_callbacks(&handle);
+        params_applied(&handle);
+        assert!(
+            port.read_float64_blocking(handle.plugin_params.execution_time, 0)
+                .is_err()
+        );
+
+        send_array(handle.array_sender(), make_test_array(1));
+        params_applied(&handle);
+        assert!(
+            port.read_float64_blocking(handle.plugin_params.execution_time, 0)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -4114,12 +4811,12 @@ mod tests {
         // MaxThreads_RBV read UDF/INVALID.
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "CTOR_TEST",
+            &asyn_rs::asyn_record::claim_port("CTOR_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             20,
             NDArrayOutput::new(),
-            "",
+            ("CTOR_UP", 3),
             test_wiring(),
             DEFAULT_PLUGIN_THREADS,
         );
@@ -4132,10 +4829,7 @@ mod tests {
         // C `:153` / `:158` / `:159`. These have no other writer: MaxThreads
         // is a longin with SCAN "I/O Intr", no PINI and no output partner, so
         // an unset param leaves it UDF forever.
-        assert_eq!(
-            read(handle.plugin_params.nd_array_addr).unwrap(),
-            PLUGIN_NDARRAY_ADDR
-        );
+        assert_eq!(read(handle.plugin_params.nd_array_addr).unwrap(), 3);
         assert_eq!(
             read(handle.plugin_params.max_threads).unwrap(),
             PLUGIN_MAX_THREADS
@@ -4210,7 +4904,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let probe = OverlapProbe::default();
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "NTHREADS_TEST",
+            &asyn_rs::asyn_record::claim_port("NTHREADS_TEST").unwrap(),
             OverlapProcessor {
                 probe: probe.clone(),
                 want: 4,
@@ -4332,7 +5026,7 @@ mod tests {
         };
         let probe = StackProbe::default();
         let (handle, _data_jh) = create_plugin_runtime(
-            &format!("STACK_{raw}"),
+            &asyn_rs::asyn_record::claim_port(&format!("STACK_{raw}")).unwrap(),
             probe.clone(),
             NDArrayPool::new(1_000_000),
             10,
@@ -4417,7 +5111,7 @@ mod tests {
             let port = format!("PRIO_{with_output}_{raw}");
             let (handle, _data_jh) = if with_output {
                 create_plugin_runtime_with_output(
-                    &port,
+                    &asyn_rs::asyn_record::claim_port(&port).unwrap(),
                     PassthroughProcessor,
                     NDArrayPool::new(1_000_000),
                     10,
@@ -4428,7 +5122,7 @@ mod tests {
                 )
             } else {
                 create_plugin_runtime(
-                    &port,
+                    &asyn_rs::asyn_record::claim_port(&port).unwrap(),
                     PassthroughProcessor,
                     NDArrayPool::new(1_000_000),
                     10,
@@ -4492,7 +5186,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let probe = OverlapProbe::default();
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "NTHREADS1_TEST",
+            &asyn_rs::asyn_record::claim_port("NTHREADS1_TEST").unwrap(),
             OverlapProcessor {
                 probe: probe.clone(),
                 want: 2,
@@ -4526,7 +5220,7 @@ mod tests {
         // path a record takes: an unwritten param comes back as an error.
         let pool = NDArrayPool::new(2_097_152);
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "NDCTOR_TEST",
+            &asyn_rs::asyn_record::claim_port("NDCTOR_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             20,
@@ -4586,6 +5280,23 @@ mod tests {
                 .expect("TIME_STAMP unset after construction"),
             0.0
         );
+        // Only NDPluginFile writes NDFullFileName (NDPluginFile.cpp:52, :157).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            rt.block_on(port.read_octet(p.full_file_name, 0, 256))
+                .is_err()
+        );
+        // NDPluginDriver.cpp:152-160 leaves EnableCallbacks to the template,
+        // whose `$(ENABLED)` a defined value would override at init.
+        assert!(
+            port.read_int32_blocking(handle.plugin_params.enable_callbacks, 0)
+                .is_err()
+        );
+        // An unseeded plugin leaves NDArrayCallbacks to the template too.
+        assert!(port.read_int32_blocking(p.array_callbacks, 0).is_err());
     }
 
     /// A full sort buffer refuses arrays from the very first frame, because
@@ -4605,7 +5316,7 @@ mod tests {
         let mut output = NDArrayOutput::new();
         output.add(downstream_sender);
         let (handle, _jh) = create_plugin_runtime_with_output(
-            "SORT_FULL",
+            &asyn_rs::asyn_record::claim_port("SORT_FULL").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4661,7 +5372,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "SORT_TEST",
+            &asyn_rs::asyn_record::claim_port("SORT_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4728,6 +5439,42 @@ mod tests {
     }
 
     #[test]
+    fn sort_free_stays_undefined_until_sorted_mode() {
+        let pool = NDArrayPool::new(1_000_000);
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("SORT_FREE_UDF").unwrap(),
+            PassthroughProcessor,
+            pool,
+            10,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        enable_callbacks(&handle);
+        port.write_int32_blocking(handle.plugin_params.sort_mode, 0, 0)
+            .unwrap();
+        send_array(handle.array_sender(), make_test_array(1));
+        params_applied(&handle);
+        assert!(
+            port.read_int32_blocking(handle.plugin_params.sort_free, 0)
+                .is_err(),
+            "unsorted processing and a SortMode=0 write leave SortFree undefined"
+        );
+
+        port.write_int32_blocking(handle.plugin_params.sort_mode, 0, 1)
+            .unwrap();
+        send_array(handle.array_sender(), make_test_array(2));
+        params_applied(&handle);
+        assert_eq!(
+            port.read_int32_blocking(handle.plugin_params.sort_free, 0)
+                .unwrap(),
+            10
+        );
+    }
+
+    #[test]
     fn test_control_plane_write_resets_every_mirrored_counter() {
         // B12/B15 boundary test. C++ holds ArrayCounter, DroppedArrays,
         // DroppedOutputArrays and DisorderedArrays in the param library and
@@ -4740,7 +5487,7 @@ mod tests {
         // boundary for all four regardless of how they came to be non-zero.
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _data_jh) = create_plugin_runtime(
-            "COUNTER_RESET_TEST",
+            &asyn_rs::asyn_record::claim_port("COUNTER_RESET_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4799,7 +5546,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "THROTTLE_TEST",
+            &asyn_rs::asyn_record::claim_port("THROTTLE_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4864,7 +5611,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "PROCESS_PLUGIN_TEST",
+            &asyn_rs::asyn_record::claim_port("PROCESS_PLUGIN_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4906,7 +5653,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "MIN_CB_TEST",
+            &asyn_rs::asyn_record::claim_port("MIN_CB_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -4965,7 +5712,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "ARRAY_CB_TEST",
+            &asyn_rs::asyn_record::claim_port("ARRAY_CB_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -5052,7 +5799,7 @@ mod tests {
             let mut output = NDArrayOutput::new();
             output.add(ds);
             let (handle, _jh) = create_plugin_runtime_with_output(
-                "CODEC_RAW",
+                &asyn_rs::asyn_record::claim_port("CODEC_RAW").unwrap(),
                 PassthroughProcessor,
                 pool,
                 10,
@@ -5082,7 +5829,7 @@ mod tests {
             let mut output = NDArrayOutput::new();
             output.add(ds);
             let (handle, _jh) = create_plugin_runtime_with_output(
-                "CODEC_CMP",
+                &asyn_rs::asyn_record::claim_port("CODEC_CMP").unwrap(),
                 CompressProcessor,
                 pool,
                 10,
@@ -5116,7 +5863,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "PROCESS_THROTTLE_TEST",
+            &asyn_rs::asyn_record::claim_port("PROCESS_THROTTLE_TEST").unwrap(),
             PassthroughProcessor,
             pool,
             10,
@@ -5178,7 +5925,7 @@ mod tests {
         output.add(downstream_sender);
 
         let (handle, _data_jh) = create_plugin_runtime_with_output(
-            "G3_TEST",
+            &asyn_rs::asyn_record::claim_port("G3_TEST").unwrap(),
             PassthroughProcessor, // compression_aware() defaults to false
             pool,
             10,
@@ -5232,7 +5979,7 @@ mod tests {
 
         // Downstream plugin with queue size 1 and a slow processor.
         let (downstream_handle, _ds_jh) = create_plugin_runtime(
-            "B1_DOWNSTREAM",
+            &asyn_rs::asyn_record::claim_port("B1_DOWNSTREAM").unwrap(),
             SlowProcessor,
             pool,
             1,
@@ -5486,8 +6233,8 @@ mod tests {
         fn plugin_type(&self) -> &str {
             "Gated"
         }
-        fn does_array_callbacks(&self) -> bool {
-            false
+        fn array_callbacks_seed(&self) -> Option<bool> {
+            Some(false)
         }
     }
 
@@ -5506,7 +6253,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, _entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "QSIZE_TEST",
+            &asyn_rs::asyn_record::claim_port("QSIZE_TEST").unwrap(),
             processor,
             pool,
             2,
@@ -5574,7 +6321,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "MINCB_PRESSURE",
+            &asyn_rs::asyn_record::claim_port("MINCB_PRESSURE").unwrap(),
             processor,
             pool,
             DEPTH,
@@ -5650,7 +6397,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "COMPR_PRESSURE",
+            &asyn_rs::asyn_record::claim_port("COMPR_PRESSURE").unwrap(),
             processor,
             pool,
             2,
@@ -5697,7 +6444,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "PPORDER_TEST",
+            &asyn_rs::asyn_record::claim_port("PPORDER_TEST").unwrap(),
             processor,
             pool,
             8,
@@ -5749,7 +6496,7 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         let (processor, entered, gated) = GatedProcessor::new();
         let (handle, _jh) = create_plugin_runtime(
-            "PPFULL_TEST",
+            &asyn_rs::asyn_record::claim_port("PPFULL_TEST").unwrap(),
             processor,
             pool,
             1,

@@ -144,18 +144,17 @@ async fn main() -> CaResult<()> {
                     sim_config.energy_bandwidth * 100.0,
                 );
 
+                let claim =
+                    asyn_rs::manager::claim_port_driver("XRT").map_err(|e| e.to_string())?;
                 let xrt_output = NDArrayOutput::new();
                 let xrt_rt =
-                    create_xrt_detector("XRT", size_x, size_y, max_mem, xrt_output, sim_config)
+                    create_xrt_detector(&claim, size_x, size_y, max_mem, xrt_output, sim_config)
                         .map_err(|e| format!("failed to create XRT detector: {e}"))?;
 
                 let xrt_handle = xrt_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port(
-                    "XRT",
-                    xrt_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(xrt_handle, ctx.db().scan_control().interrupt_gate())
+                    .map_err(|e| e.to_string())?;
 
                 mgr_c.set_driver(Arc::new(ad_core_rs::ioc::GenericDriverContext::new(
                     xrt_rt.pool().clone(),

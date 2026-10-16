@@ -122,6 +122,14 @@ impl CommandHandler for MqttConfigHandler {
             ..MqttConfig::default()
         };
 
+        // `MqttDriver` derives from `Autoparam::Driver` and so from
+        // `asynPortDriver` (drvMqtt.h:23, autoparamDriver.h:245): its base
+        // registers the port before the body builds anything.
+        let claim = match asyn_rs::manager::claim_port_driver(&port_name) {
+            Ok(claim) => claim,
+            Err(e) => return Ok(ctx.cxx_error(e)),
+        };
+
         // Pre-bind config overlay (Z2M `normalize_on_off`); empty for generic
         // MQTT. Topic params themselves are created on demand when records bind.
         let overlay = take_pending_topics(&port_name);
@@ -145,30 +153,32 @@ impl CommandHandler for MqttConfigHandler {
         // port actor takes the driver, for the same reason `shutdown` is.
         let teardown_done = driver.teardown_ack();
 
-        // A port whose actor thread the OS refused is not a port: fail the
-        // command before the registration below claims the name for it. Same
-        // end state as C by a different route — `MqttDriver` derives from
-        // `Autoparam::Driver` and so from `asynPortDriver` (drvMqtt.h:23,
-        // autoparamDriver.h:245) and `mqttDriverConfigure` builds it with a
-        // bare `new` (drvMqtt.cpp:736-739), so a failed `registerPort` throws
-        // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
-        // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
-        // The `?` is the same error channel the duplicate-name failure below
-        // already uses.
-        let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
-            .map_err(|e| {
-                asyn_rs::manager::report_port_driver_register_failure(&port_name);
-                e.to_string()
-            })?;
+        // A port whose actor thread the OS refused is not a port: dropping the
+        // claim frees the name. Same end state as C by a different route — a
+        // failed `registerPort` throws out of the constructor
+        // (asynPortDriver.cpp:4036-4040), iocsh catches it
+        // (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
+        // Both failures below report as that throw.
+        let Ok((runtime_handle, _actor_jh)) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default())
+        else {
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
+        };
         let port_handle = runtime_handle.port_handle().clone();
 
         let owner = ctx.db().scan_control().interrupt_gate();
-        if let Err(e) = asyn_rs::asyn_record::register_port(&port_name, port_handle.clone(), owner)
-        {
+        if claim.publish(port_handle.clone(), owner).is_err() {
             // Nothing published this port, so ask the actor to stop.
-            asyn_rs::manager::report_port_driver_register_failure(&port_name);
             runtime_handle.shutdown();
-            return Err(e.to_string());
+            return Ok(
+                ctx.cxx_error(asyn_rs::manager::report_port_driver_register_failure(
+                    &port_name,
+                )),
+            );
         }
         // The registry above holds a live `PortHandle` for this port, which is
         // what keeps its actor alive; the `PortRuntimeHandle` may drop here.

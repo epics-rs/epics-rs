@@ -354,7 +354,7 @@ impl MqttDriver {
         } else {
             // Surfaces ParamUndefined as an error (C asynParamUndefined); the
             // merge must not assume zero for the unknown bits.
-            let current = self.base.params.get_uint32_strict(user.reason, user.addr)?;
+            let current = self.base.get_uint32_param(user.reason, user.addr)?;
             // C: auxVal |= (value & mask); auxVal &= (value | ~mask)
             //  ≡ (current & ~mask) | (value & mask) (drvMqtt.cpp:620-621).
             (current & !mask) | (value & mask)
@@ -413,11 +413,18 @@ impl PortDriver for MqttDriver {
         let parsed = match TopicAddress::parse(drv_info) {
             Ok(addr) => addr,
             Err(_) => {
-                let reason = self
-                    .base()
-                    .params
-                    .find_param(drv_info)
-                    .ok_or_else(|| AsynError::ParamNotFound(drv_info.to_string()))?;
+                let base = self.base();
+                let Some(reason) = base.params.find_param(drv_info) else {
+                    // Autoparam/autoparamDriver.cpp:167-171.
+                    base.trace_print(
+                        asyn_rs::trace::TraceMask::ERROR,
+                        format_args!(
+                            "Autoparam::Driver: port={} could not parse '{drv_info}'",
+                            base.port_name
+                        ),
+                    );
+                    return Err(AsynError::ParamNotFound(drv_info.to_string()));
+                };
                 return Ok(DrvUserInfo::from_reason(reason));
             }
         };
@@ -558,7 +565,7 @@ mod tests {
     /// console.
     #[test]
     fn a_failed_write_prints_c_s_trace_error_line() {
-        use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+        use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use asyn_rs::services::PortServices;
         use asyn_rs::trace::TraceFile;
 
@@ -572,7 +579,7 @@ mod tests {
             .reason;
         let services = PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = create_port_runtime(
+        let (runtime, _actor) = create_port_runtime_unclaimed(
             driver,
             RuntimeConfig {
                 services,
@@ -717,6 +724,47 @@ mod tests {
             driver
                 .drv_user_create(&DrvUserRequest::new("not a topic address", 0))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unparsable_drvinfo_prints_could_not_parse() {
+        use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let (driver, _rx) = make_driver(&[]);
+        let port = driver.base.port_name.clone();
+        let path =
+            std::env::temp_dir().join(format!("mqtt_drvuser_trace_{}.trace", std::process::id()));
+        let services = PortServices::new();
+        services.trace().set_trace_file(
+            Some(&port),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        let (runtime, _jh) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .port_handle()
+                .drv_user_create_blocking(&DrvUserRequest::new("not a topic address", 0))
+                .is_err()
+        );
+        runtime.shutdown();
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains(&format!(
+                "Autoparam::Driver: port={port} could not parse 'not a topic address'\n"
+            )),
+            "{logged}"
         );
     }
 
@@ -951,8 +999,7 @@ mod tests {
         // full-mask *write* does not, so the merge below reads this value only.
         driver
             .base
-            .params
-            .set_uint32(reason, 0, 0x00f0, 0xffff_ffff, 0)
+            .set_uint32_param(reason, 0, 0x00f0, 0xffff_ffff, 0)
             .unwrap();
 
         // Partial mask now merges into the inbound 0x00f0:
@@ -1014,7 +1061,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().payload, b"42");
         assert!(
             matches!(
-                driver.base.params.get_int32_strict(reason, 0),
+                driver.base.get_int32_param(reason, 0),
                 Err(AsynError::ParamUndefined(_))
             ),
             "a successful scalar write must not commit the param cache"

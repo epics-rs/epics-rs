@@ -215,9 +215,12 @@ pub fn register_port_ioc_devices(
     use asyn_rs::drivers::ip_port::DrvAsynIPPort;
     use asyn_rs::manager::PortManager;
 
+    let claim = asyn_rs::registry::claim_port(ORACLE_ASYN_PORT)
+        .map_err(|e| format!("register {ORACLE_ASYN_PORT}: {e}"))?;
     let manager = PortManager::new();
     let port = manager
         .register_port(
+            claim,
             DrvAsynIPPort::new_configured(
                 ORACLE_ASYN_PORT,
                 "localhost:1",

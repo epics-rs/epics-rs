@@ -647,17 +647,21 @@ impl NDPluginProcess for CircularBuffProcessor {
         // Stream frames downstream as the C++ plugin does: pre-buffer frames
         // are flushed at the trigger and each post-trigger frame is forwarded
         // immediately, rather than being withheld until the sequence ends.
-        if push_result.forward.is_empty() {
-            ProcessResult::sink(updates)
-        } else {
-            let mut result = ProcessResult::arrays(push_result.forward);
-            result.param_updates = updates;
-            result
-        }
+        // C posts them with doCallbacksGenericPointer, never through
+        // endProcessCallbacks (NDPluginCircularBuff.cpp:171, :212-214), so
+        // NDArrayCallbacks does not stop them.
+        let mut result = ProcessResult::sink(updates);
+        result.addressed = push_result.forward.into_iter().map(|a| (0, a)).collect();
+        result
     }
 
     fn plugin_type(&self) -> &str {
         "NDPluginCircularBuff"
+    }
+
+    /// NDPluginCircularBuff.cpp:453
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
     }
 
     fn register_params(
@@ -851,7 +855,9 @@ impl NDPluginProcess for CircularBuffProcessor {
                 if state.buffer.flushes_on_soft_trigger() {
                     let flushed = state.buffer.flush_pre_buffer();
                     if !flushed.is_empty() {
-                        return ParamChangeResult::combined(flushed, updates);
+                        let mut result = ParamChangeResult::updates(updates);
+                        result.addressed = flushed.into_iter().map(|a| (0, a)).collect();
+                        return result;
                     }
                 }
             }
@@ -1791,7 +1797,7 @@ mod tests {
         let r = soft_trigger_write(&mut p, 0);
         assert!(!p.buffer().is_triggered(), "SoftTrigger 0 must not arm");
         assert!(!latched(&r), "SoftTrigger 0 must not post Triggered=1");
-        assert!(r.output_arrays.is_empty(), "SoftTrigger 0 must not flush");
+        assert!(r.addressed.is_empty(), "SoftTrigger 0 must not flush");
         assert_eq!(p.buffer().pre_buffer_len(), 2);
 
         // FlushOnSoftTrig = 0: a nonzero value latches, and the ring stays put
@@ -1800,17 +1806,14 @@ mod tests {
         let r = soft_trigger_write(&mut p, 1);
         assert!(p.buffer().is_triggered());
         assert!(latched(&r));
-        assert!(
-            r.output_arrays.is_empty(),
-            "no flush when FlushOnSoftTrig = 0"
-        );
+        assert!(r.addressed.is_empty(), "no flush when FlushOnSoftTrig = 0");
         assert_eq!(p.buffer().pre_buffer_len(), 2);
 
         // FlushOnSoftTrig = 1: the write itself flushes the pre-buffer, in order.
         let mut p = processor(1);
         let r = soft_trigger_write(&mut p, 1);
         assert!(p.buffer().is_triggered());
-        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        let ids: Vec<_> = r.addressed.iter().map(|(_, a)| a.unique_id).collect();
         assert_eq!(ids, vec![1, 2], "pre-buffer flushed from the write");
         assert_eq!(p.buffer().pre_buffer_len(), 0);
         assert!(latched(&r));
@@ -1822,7 +1825,7 @@ mod tests {
         let mut a = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         a.unique_id = 3;
         let r = p.process_array(&Arc::new(a), &pool);
-        let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+        let ids: Vec<_> = r.addressed.iter().map(|(_, a)| a.unique_id).collect();
         assert_eq!(ids, vec![3], "pre-buffer already flushed, not re-emitted");
     }
 
@@ -1876,12 +1879,12 @@ mod tests {
             let r = write(&mut p, SOFT_TRIG, 1);
             assert!(p.buffer().is_triggered());
             if expect_flush {
-                let ids: Vec<_> = r.output_arrays.iter().map(|a| a.unique_id).collect();
+                let ids: Vec<_> = r.addressed.iter().map(|(_, a)| a.unique_id).collect();
                 assert_eq!(ids, vec![1, 2], "FlushOnSoftTrig = {flush_on}: flushed");
                 assert_eq!(p.buffer().pre_buffer_len(), 0);
             } else {
                 assert!(
-                    r.output_arrays.is_empty(),
+                    r.addressed.is_empty(),
                     "FlushOnSoftTrig = {flush_on}: C does not flush from the write"
                 );
                 assert_eq!(p.buffer().pre_buffer_len(), 2);

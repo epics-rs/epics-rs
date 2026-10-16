@@ -7,6 +7,7 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::port_handle::PortHandle;
+use asyn_rs::registry::PortClaim;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
@@ -137,8 +138,7 @@ impl PortDriver for XrtDetector {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
             self.ad.port_base.call_param_callback(0, reason)?;
         }
 
@@ -149,8 +149,7 @@ impl PortDriver for XrtDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         if self.motor_param_set.contains(&reason) {
             self.dirty.lock().set();
@@ -204,13 +203,14 @@ impl XrtDetectorRuntime {
 
 /// Create an XRT detector with actor-based runtime and acquisition task.
 pub fn create_xrt_detector(
-    port_name: &str,
+    claim: &PortClaim,
     size_x: i32,
     size_y: i32,
     max_memory: usize,
     array_output: NDArrayOutput,
     sim_config: SimConfig,
 ) -> AsynResult<XrtDetectorRuntime> {
+    let port_name = claim.name();
     let (acq_tx, acq_rx) = rt::command_channel(16);
     let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
     dirty.lock().set();
@@ -221,7 +221,7 @@ pub fn create_xrt_detector(
     let xrt_params = det.xrt_params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
     let shared_output = Arc::new(parking_lot::Mutex::new(array_output));
     let queued_counter = Arc::new(QueuedArrayCounter::new());

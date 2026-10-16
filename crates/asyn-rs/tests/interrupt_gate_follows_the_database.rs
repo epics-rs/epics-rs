@@ -18,7 +18,7 @@ use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
@@ -41,7 +41,8 @@ fn unregistered(name: &str) -> PortHandle {
     let mut base = PortDriverBase::new(name, 1, PortFlags::default());
     base.create_param("VAL", ParamType::Int32).unwrap();
     let (runtime, _join) =
-        create_port_runtime(IntPort { base }, RuntimeConfig::default()).expect("port runtime");
+        create_port_runtime_unclaimed(IntPort { base }, RuntimeConfig::default())
+            .expect("port runtime");
     let handle = runtime.port_handle().clone();
     drop(runtime);
     handle

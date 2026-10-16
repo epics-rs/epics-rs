@@ -731,7 +731,7 @@ mod tests {
         let pv = processor.handle();
         let pool = NDArrayPool::new(1_000_000);
         let (handle, _jh) = create_plugin_runtime(
-            "PVA1",
+            &asyn_rs::asyn_record::claim_port("PVA1").unwrap(),
             processor,
             pool,
             10,

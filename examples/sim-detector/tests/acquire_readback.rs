@@ -42,7 +42,14 @@ async fn acquire_bo_returns_to_zero_after_single() {
     let db = Arc::new(PvDatabase::new());
     db.scan_control().run();
 
-    let rt = create_sim_detector("RBK_TEST", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("RBK_TEST").unwrap(),
+        32,
+        32,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle().clone();
     // What `simDetectorConfig` does: the port is owned by its database's gate.
     asyn_rs::asyn_record::register_port(

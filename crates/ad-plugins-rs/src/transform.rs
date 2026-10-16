@@ -508,6 +508,11 @@ impl NDPluginProcess for TransformProcessor {
         "NDPluginTransform"
     }
 
+    /// NDPluginTransform.cpp:613
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,

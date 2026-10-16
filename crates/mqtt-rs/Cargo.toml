@@ -27,4 +27,5 @@ ioc = ["dep:epics-base-rs", "dep:epics-ca-rs", "asyn-rs/epics"]
 libc = "0.2"
 
 [dev-dependencies]
+asyn-rs = { workspace = true, features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }

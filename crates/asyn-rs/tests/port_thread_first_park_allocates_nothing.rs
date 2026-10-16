@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 
 const PORTS: usize = 100;
@@ -108,7 +108,7 @@ fn a_port_thread_s_first_contended_lock_allocates_nothing() {
         // Disconnected, so registration hands the thread a connect before it
         // ever idles: tokio's idle park would otherwise build the park state.
         base.set_connected(false);
-        let (rt, jh) = create_port_runtime(
+        let (rt, jh) = create_port_runtime_unclaimed(
             Device {
                 base,
                 gate,

@@ -175,9 +175,8 @@ fn each_configure_command_s_port_has_c_s_asyn_flags() {
         );
         assert_eq!(port_flags(&port), want, "{name} ({file}: {expr})");
     }
-    // NDTimeSeriesConfigure on a Stats upstream builds its port from the
-    // upstream's receiver; C builds the same plugin, `ASYN_MULTIDEVICE` only
-    // (NDPluginTimeSeries.cpp:54).
+    // NDTimeSeriesConfigure on a Stats upstream builds the same
+    // NDPluginTimeSeries port, `ASYN_MULTIDEVICE` only (NDPluginTimeSeries.cpp:54).
     run(&shell, r#"NDStatsConfigure("AFST", 20, 0, "AFUP", 0)"#);
     run(
         &shell,
@@ -186,7 +185,7 @@ fn each_configure_command_s_port_has_c_s_asyn_flags() {
     assert_eq!(
         port_flags("AFTS"),
         (false, true, false),
-        "NDTimeSeries on a receiver"
+        "NDTimeSeries on a Stats upstream"
     );
 }
 

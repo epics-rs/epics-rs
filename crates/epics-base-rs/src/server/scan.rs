@@ -167,8 +167,8 @@ pub enum ScanCtl {
 /// that may stop the facility; another database's owner cannot reach it.
 pub struct ScanControl {
     /// Why the facility is not running: [`SCAN_CTL_PAUSE`] or
-    /// [`SCAN_CTL_EXIT`]. Read only while `gate` is closed; whether the
-    /// facility runs is `gate` alone.
+    /// [`SCAN_CTL_EXIT`]. Whether the facility runs is `gate` alone; EXIT is
+    /// stored before `stop` closes the gate and cleared before `run` opens it.
     stopped_as: std::sync::atomic::AtomicU8,
     claimed: std::sync::atomic::AtomicBool,
     /// This database's `interruptAccept`, written only by `run`/`pause`/`stop`
@@ -203,6 +203,12 @@ impl ScanControl {
             SCAN_CTL_EXIT => ScanCtl::Exit,
             _ => ScanCtl::Pause,
         }
+    }
+
+    /// Whether [`Self::stop`] has begun and no [`Self::run`] has followed —
+    /// [`ScanCtl::Exit`] without reading the gate.
+    pub fn is_exiting(&self) -> bool {
+        self.stopped_as.load(std::sync::atomic::Ordering::Acquire) == SCAN_CTL_EXIT
     }
 
     /// True while asynchronous scan sources may fire — the single test C

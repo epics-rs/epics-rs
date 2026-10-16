@@ -47,6 +47,22 @@ impl<const N: usize> FixedText<N> {
     }
 }
 
+/// Bytes shown as text, an invalid sequence as U+FFFD, decoded only when
+/// formatted: a trace line whose mask is off costs nothing.
+pub struct LossyText<'a>(pub &'a [u8]);
+
+impl fmt::Display for LossyText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for chunk in self.0.utf8_chunks() {
+            f.write_str(chunk.valid())?;
+            if !chunk.invalid().is_empty() {
+                fmt::Write::write_char(f, char::REPLACEMENT_CHARACTER)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<const N: usize> fmt::Write for FixedText<N> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         let n = s.floor_char_boundary(N - self.len);

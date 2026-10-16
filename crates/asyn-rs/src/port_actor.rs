@@ -1683,11 +1683,16 @@ impl PortActor {
                 //     including bytes already on the warm line.
                 // Both run atomically here: the actor owns the port for the whole
                 // op, the queueLockPort equivalent.
+                use crate::error::OctetStep;
                 if *flush {
-                    self.octet_flush(user)?;
+                    self.octet_flush(user)
+                        .map_err(|e| e.in_octet_step(OctetStep::Flush))?;
                 }
-                self.octet_write(user, data)?;
-                let (buf, n, eom) = self.octet_read(user, *buf_size)?;
+                self.octet_write(user, data)
+                    .map_err(|e| e.in_octet_step(OctetStep::Write))?;
+                let (buf, n, eom) = self
+                    .octet_read(user, *buf_size)
+                    .map_err(|e| e.in_octet_step(OctetStep::Read))?;
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
             RequestOp::Int32Write { value } => {
@@ -2076,7 +2081,7 @@ impl PortActor {
                             reason,
                             addr,
                             value,
-                        } => base.params.set_value(*reason, *addr, value.clone()),
+                        } => base.set_param_value(*reason, *addr, value.clone()),
                         crate::request::ParamSetValue::UInt32Digital {
                             reason,
                             addr,
@@ -2239,12 +2244,9 @@ impl PortActor {
                     .params
                     .get_param_status(user.reason, user.addr)
                     .unwrap_or((crate::error::AsynStatus::Success, 0, 0));
-                let ts = self
-                    .driver
-                    .base()
-                    .params
-                    .get_timestamp(user.reason, user.addr)
-                    .unwrap_or(None);
+                // C's parameter reads set `pasynUser->timestamp` from
+                // getTimeStamp (asynPortDriver.cpp:1970-1979).
+                let ts = Some(self.driver.base().get_time_stamp());
                 // C devAsynInt32.c:844-847 — a non-success read/param status
                 // maps to a record alarm (asynStatusToEpicsAlarm) and is
                 // recGblSetSevr'd together with the explicit setParamAlarm.
@@ -2274,9 +2276,9 @@ impl PortActor {
 struct ActorCalls<'a>(&'a mut PortActor);
 
 impl PortCalls for ActorCalls<'_> {
-    fn call(&mut self, op: RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
+    fn call(&mut self, op: &RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
         user.trace = self.0.user_trace();
-        self.0.dispatch_io(&mut user, &op)
+        self.0.dispatch_io(&mut user, op)
     }
 }
 
@@ -2506,6 +2508,21 @@ mod tests {
             combine_read_alarm(AsynStatus::Error, al::COMM_ALARM, major),
             (al::COMM_ALARM, major)
         );
+    }
+
+    #[test]
+    fn actor_read_carries_the_port_time_stamp() {
+        // C readInt32 sets pasynUser->timestamp from getTimeStamp
+        // (asynPortDriver.cpp:1970-1979), never a fresh clock.
+        let mut drv = TestDriver::new();
+        drv.base.params.set_int32(0, 0, 5).unwrap();
+        let ts = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567);
+        drv.base.set_time_stamp(ts);
+        let tx = spawn_actor(drv);
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
+        assert_eq!(result.timestamp, Some(ts));
     }
 
     #[test]
@@ -3448,7 +3465,7 @@ mod tests {
     /// wakes it.
     #[test]
     fn idle_auto_connect_port_reconnects_without_queued_traffic() {
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct FlappyDriver {
@@ -3503,7 +3520,7 @@ mod tests {
             link_up: link_up.clone(),
             fail_first: 1,
         };
-        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+        let (handle, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
 
         // Drop the link. `Disconnect` is a lifecycle op, so this is the last
@@ -3749,11 +3766,11 @@ mod tests {
     /// so the actor's own `select!` must wake for it.
     #[test]
     fn a_parked_request_still_times_out_on_its_queue_timer() {
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         let mut drv = multi_device_driver(true);
         drv.base.disable_addr(1);
-        let (handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+        let (handle, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
 
         let started = Instant::now();
@@ -4273,12 +4290,12 @@ mod tests {
     /// [`PortHandle`]: crate::port_handle::PortHandle
     #[test]
     fn a_port_handle_waives_only_cs_connect_queue_pair() {
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         let mut drv = multi_device_driver(true);
         drv.base.init_auto_connect(false);
         drv.base.set_connected(false);
-        let (runtime, _jh) = create_port_runtime(drv, RuntimeConfig::default()).unwrap();
+        let (runtime, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle();
         let get = |user: AsynUser| {
             let user = user.with_queue_timeout(Duration::from_secs(1));
@@ -5537,7 +5554,7 @@ mod tests {
         }
 
         let mgr = PortManager::new();
-        mgr.register_port(
+        mgr.register_port_unclaimed(
             TraceSpy(PortDriverBase::new("trace_link", 1, PortFlags::default())),
             &crate::registry::open_owner(),
         )

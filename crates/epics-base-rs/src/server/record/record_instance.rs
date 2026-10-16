@@ -4685,7 +4685,7 @@ pub struct RecordInstance {
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     /// The record's device-write completion, which carries the lock-free copy
     /// of `PRIO`: [`Self::set_prio`] is the one store of both.
-    pub(crate) write_done: crate::server::database::WriteDone,
+    pub(crate) device_done: crate::server::database::DeviceDone,
     /// C `prec->dpvt` for the soft dsets; see [`Dpvt`](crate::server::device_support::Dpvt).
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
@@ -6501,13 +6501,13 @@ impl RecordInstance {
         }
     }
 
-    /// Store `PRIO` and the copy the record's [`WriteDone`] reads without
+    /// Store `PRIO` and the copy the record's [`DeviceDone`] reads without
     /// the record lock.
     ///
-    /// [`WriteDone`]: crate::server::database::WriteDone
+    /// [`DeviceDone`]: crate::server::database::DeviceDone
     pub fn set_prio(&mut self, prio: i16) {
         self.common.prio = prio;
-        self.write_done.set_prio(prio);
+        self.device_done.set_prio(prio);
     }
 
     pub fn new_boxed(name: impl Into<crate::types::RecordName>, record: Box<dyn Record>) -> Self {
@@ -6591,7 +6591,7 @@ impl RecordInstance {
 
         Self {
             destroyed: false,
-            write_done: crate::server::database::WriteDone::detached(common.prio),
+            device_done: crate::server::database::DeviceDone::detached(common.prio),
             name: name.into(),
             record,
             common,
@@ -12972,7 +12972,7 @@ mod record_cell_layout_tests {
             link_slots,
             link_rows,
             device,
-            write_done,
+            device_done,
             dpvt,
             subroutine,
             reprocess_generation,

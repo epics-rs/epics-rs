@@ -3,6 +3,7 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::port_handle::PortHandle;
+use asyn_rs::registry::PortClaim;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
@@ -124,8 +125,7 @@ impl PortDriver for MovingDotDetector {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
             if reason == self.dot_params.shutter_open
                 || reason == self.ad.params.bin_x
                 || reason == self.ad.params.bin_y
@@ -142,8 +142,7 @@ impl PortDriver for MovingDotDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         if reason == self.dot_params.motor_x_pos
             || reason == self.dot_params.motor_y_pos
@@ -207,14 +206,14 @@ impl MovingDotRuntime {
 
 /// Create a MovingDot detector with actor-based runtime and acquisition task.
 pub fn create_moving_dot(
-    port_name: &str,
+    claim: &PortClaim,
     size_x: i32,
     size_y: i32,
     max_memory: usize,
     array_output: NDArrayOutput,
 ) -> AsynResult<MovingDotRuntime> {
     create_moving_dot_with_config(
-        port_name,
+        claim,
         size_x,
         size_y,
         max_memory,
@@ -225,13 +224,14 @@ pub fn create_moving_dot(
 
 /// Create a MovingDot detector with custom image generation config.
 pub fn create_moving_dot_with_config(
-    port_name: &str,
+    claim: &PortClaim,
     size_x: i32,
     size_y: i32,
     max_memory: usize,
     array_output: NDArrayOutput,
     image_config: MovingDotImageConfig,
 ) -> AsynResult<MovingDotRuntime> {
+    let port_name = claim.name();
     let (acq_tx, acq_rx) = rt::command_channel(16);
     let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
     dirty.lock().set();
@@ -242,7 +242,7 @@ pub fn create_moving_dot_with_config(
     let dot_params = det.dot_params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
     let shared_output = Arc::new(parking_lot::Mutex::new(array_output));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
@@ -276,7 +276,14 @@ mod tests {
 
     #[test]
     fn test_create_moving_dot() {
-        let rt = create_moving_dot("DOT_TEST", 640, 480, 10_000_000, NDArrayOutput::new()).unwrap();
+        let rt = create_moving_dot(
+            &asyn_rs::registry::claim_port("DOT_TEST").unwrap(),
+            640,
+            480,
+            10_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
         let handle = rt.port_handle();
         assert_eq!(
             handle
@@ -294,7 +301,14 @@ mod tests {
 
     #[test]
     fn test_single_frame_acquisition() {
-        let rt = create_moving_dot("DOT_SINGLE", 64, 48, 1_000_000, NDArrayOutput::new()).unwrap();
+        let rt = create_moving_dot(
+            &asyn_rs::registry::claim_port("DOT_SINGLE").unwrap(),
+            64,
+            48,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
         let handle = rt.port_handle();
 
         handle

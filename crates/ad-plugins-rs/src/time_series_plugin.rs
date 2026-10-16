@@ -5,10 +5,9 @@
 //! signal, a time-series waveform. Every `numAverage` input time points are
 //! averaged into one output point and written into a per-signal circular buffer.
 //!
-//! This is distinct from the receiver-fed [`crate::time_series`] port driver: that
-//! one accumulates already-derived per-frame scalars from Stats/ROIStat/Attribute
-//! (C's *embedded* time series), whereas this plugin is the standalone areaDetector
-//! `NDPluginTimeSeries` that consumes raw detector arrays.
+//! Stats and Attribute feed it as C does: each frame they post a 1-D Float64
+//! array of their per-frame values at address 1 ([`time_series_point`]), and an
+//! `NDTimeSeriesConfigure(…, "STATS1", 1, …)` port reads that address.
 //!
 //! Output form matches C exactly: `TS_TIME_SERIES` is read at `addr == signal`
 //! (NDTimeSeriesN.template binds `@asyn($(PORT),$(SIGNAL),...)TS_TIME_SERIES` with
@@ -25,21 +24,20 @@
 //! this port has done since `d8f27b88` (2026-07-13) — it matches current
 //! upstream C and yields the correct `200`.
 //!
-//! Residual (documented, not a parity gap for the waveform records): C also fires
-//! `doCallbacksGenericPointer` downstream NDArrays — a 2-D array at `addr ==
-//! numSignals_` and a 1-D array per signal — when `NDArrayCallbacks` is set. This
-//! port does not yet emit those downstream NDArrays (the per-address NDArray
-//! delivery is not expressible in the broadcast `ProcessResult` model); the
-//! observable waveform/scalar records are fully implemented.
+//! With `NDArrayCallbacks` set, each waveform callback also posts NDArrays: the
+//! 2-D `[numTimePoints, numSignals]` array at `addr == numSignals_` and a 1-D
+//! array per signal at `addr == signal` (NDPluginTimeSeries.cpp:341-385).
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
+    ArrayCallbacks, NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot,
+    ProcessResult,
 };
+use ad_core_rs::timestamp::EpicsTimestamp;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
@@ -182,6 +180,12 @@ fn coalesce_updates(updates: Vec<ParamUpdate>) -> Vec<ParamUpdate> {
 /// Standalone `NDPluginTimeSeries` processor.
 pub struct TimeSeriesProcessor {
     state: Mutex<TimeSeriesState>,
+    /// The port's pool, which C's posts allocate from on both the frame and
+    /// the write path.
+    pool: Arc<NDArrayPool>,
+    /// The runtime's NDArrayCallbacks; the posts and the copy, allocation and
+    /// uniqueId they take happen only while it is set (C :341-385).
+    array_callbacks: ArrayCallbacks,
 }
 
 /// Every field C's `NDPluginTimeSeries` mutates from a frame or a param write.
@@ -224,15 +228,22 @@ struct TimeSeriesState {
     time_stamp: Vec<f64>,
     /// C `startTime_`.
     start_time: Instant,
+    /// C `uniqueId_`, the uniqueId of the next posted NDArray.
+    unique_id: i32,
+    /// The port timestamp C stamps on its posts (`getTimeStamp`): the last
+    /// input's epicsTS, set by `beginProcessCallbacks` (NDPluginDriver.cpp:232).
+    epics_ts: EpicsTimestamp,
     p: Params,
 }
 
 impl TimeSeriesProcessor {
     /// Create a processor for `max_signals` signals (clamped to at least 1, per C
     /// `if (maxSignals < 1) maxSignals = 1`).
-    pub fn new(max_signals: usize) -> Self {
+    pub fn new(max_signals: usize, pool: Arc<NDArrayPool>) -> Self {
         Self {
             state: Mutex::new(TimeSeriesState::new(max_signals)),
+            pool,
+            array_callbacks: ArrayCallbacks::new(true),
         }
     }
 }
@@ -261,6 +272,8 @@ impl TimeSeriesState {
             circular: vec![0.0; max_signals * num_time_points],
             time_stamp: vec![0.0; num_time_points],
             start_time: Instant::now(),
+            unique_id: 0,
+            epics_ts: EpicsTimestamp::default(),
             p: Params::sentinel(),
         }
     }
@@ -325,11 +338,70 @@ impl TimeSeriesState {
         updates
     }
 
+    /// C `doTimeSeriesCallbacks` (NDPluginTimeSeries.cpp:296-385): the
+    /// waveforms, then, with NDArrayCallbacks set (:341), the NDArray posts
+    /// into `posts`.
+    fn do_time_series_callbacks(
+        &mut self,
+        array_callbacks: &ArrayCallbacks,
+        pool: &NDArrayPool,
+        posts: &mut Vec<(usize, Arc<NDArray>)>,
+    ) -> Vec<ParamUpdate> {
+        let updates = self.time_series_waveforms();
+        if array_callbacks.get() {
+            self.post_time_series_arrays(pool, posts);
+        }
+        updates
+    }
+
+    /// C :341-385: the whole series as a 2-D `[numTimePoints, numSignals]`
+    /// array at `addr == numSignals_`, then each signal's row as a 1-D array at
+    /// `addr == signal`. Fixed mode copies the buffer as is; Circular mode
+    /// rotates it so the oldest point is first.
+    fn post_time_series_arrays(
+        &mut self,
+        pool: &NDArrayPool,
+        posts: &mut Vec<(usize, Arc<NDArray>)>,
+    ) {
+        let ntp = self.num_time_points;
+        let ns = self.num_signals;
+        let cur = self.current_time_point;
+        let mut series = Vec::with_capacity(ns * ntp);
+        for ring in self.circular.chunks(ntp).take(ns) {
+            match self.acquire_mode {
+                AcquireMode::Fixed => series.extend_from_slice(ring),
+                AcquireMode::Circular => {
+                    series.extend_from_slice(&ring[cur..]);
+                    series.extend_from_slice(&ring[..cur]);
+                }
+            }
+        }
+        let unique_id = self.unique_id;
+        self.unique_id = self.unique_id.wrapping_add(1);
+        let time_stamp = EpicsTimestamp::now().as_f64();
+        let epics_ts = self.epics_ts;
+        let data_type = self.data_type;
+        let make = |dims: Vec<NDDimension>, values: &[f64]| -> Option<Arc<NDArray>> {
+            let mut arr = pool.alloc(dims, data_type).ok()?;
+            arr.data.fill_from_f64(values);
+            arr.unique_id = unique_id;
+            arr.time_stamp = time_stamp;
+            arr.timestamp = epics_ts;
+            Some(Arc::new(arr))
+        };
+        posts.extend(
+            make(vec![NDDimension::new(ntp), NDDimension::new(ns)], &series).map(|a| (ns, a)),
+        );
+        for (signal, row) in series.chunks(ntp).enumerate() {
+            posts.extend(make(vec![NDDimension::new(ntp)], row).map(|a| (signal, a)));
+        }
+    }
+
     /// C `doTimeSeriesCallbacksT` (NDPluginTimeSeries.cpp:263-290): emit one
     /// `TS_TIME_SERIES` Float64Array per signal at `addr == signal`. Fixed mode
     /// emits the filled prefix (`currentTimePoint_` points); Circular mode emits
     /// the full ring rotated so the oldest point is first.
-    fn do_time_series_callbacks(&self) -> Vec<ParamUpdate> {
+    fn time_series_waveforms(&self) -> Vec<ParamUpdate> {
         let ntp = self.num_time_points;
         let mut updates = Vec::with_capacity(self.num_signals);
         match self.acquire_mode {
@@ -372,7 +444,13 @@ impl TimeSeriesState {
     /// the integer-truncated average into the circular buffer and advance. In
     /// Fixed mode a full buffer stops acquisition and fires the per-signal
     /// callbacks; in Circular mode the write position wraps.
-    fn add_to_time_series(&mut self, array: &NDArray) -> Vec<ParamUpdate> {
+    fn add_to_time_series(
+        &mut self,
+        array: &NDArray,
+        array_callbacks: &ArrayCallbacks,
+        pool: &NDArrayPool,
+        posts: &mut Vec<(usize, Arc<NDArray>)>,
+    ) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
         let num_signals_in = self.num_signals_in.max(0) as usize;
         if num_signals_in == 0 {
@@ -417,7 +495,7 @@ impl TimeSeriesState {
                         // C setIntegerParam(P_TSAcquire, 0); doTimeSeriesCallbacks(); break.
                         self.acquiring = false;
                         updates.push(ParamUpdate::int32(self.p.ts_acquire, 0));
-                        updates.extend(self.do_time_series_callbacks());
+                        updates.extend(self.do_time_series_callbacks(array_callbacks, pool, posts));
                         break;
                     }
                     AcquireMode::Circular => {
@@ -447,8 +525,10 @@ impl NDPluginProcess for TimeSeriesProcessor {
         }
 
         let mut state = self.state.lock();
+        state.epics_ts = array.timestamp;
 
         let mut updates: Vec<ParamUpdate> = Vec::new();
+        let mut posts = Vec::new();
 
         // C: reallocate when the data type or the input signal count changes.
         let num_signals_in = array.dims[0].size;
@@ -462,10 +542,21 @@ impl NDPluginProcess for TimeSeriesProcessor {
 
         // C: only accumulate while P_TSAcquire is set.
         if state.acquiring {
-            updates.extend(state.add_to_time_series(array));
+            updates.extend(state.add_to_time_series(
+                array,
+                &self.array_callbacks,
+                &self.pool,
+                &mut posts,
+            ));
         }
 
-        ProcessResult::sink(coalesce_updates(updates))
+        let mut result = ProcessResult::sink(coalesce_updates(updates));
+        result.addressed = posts;
+        result
+    }
+
+    fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
+        self.array_callbacks = array_callbacks;
     }
 
     fn plugin_type(&self) -> &str {
@@ -511,6 +602,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
     fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         let mut state = self.state.lock();
         let mut updates = Vec::new();
+        let mut posts = Vec::new();
         if reason == state.p.ts_num_points {
             // C writeInt32 P_TSNumPoints -> allocateArrays().
             state.num_time_points = params.value.as_i32().max(1) as usize;
@@ -531,11 +623,19 @@ impl NDPluginProcess for TimeSeriesProcessor {
                 updates.extend(state.acquire_reset());
             } else {
                 state.acquiring = false;
-                updates.extend(state.do_time_series_callbacks());
+                updates.extend(state.do_time_series_callbacks(
+                    &self.array_callbacks,
+                    &self.pool,
+                    &mut posts,
+                ));
             }
         } else if reason == state.p.ts_read {
             // C writeInt32 P_TSRead -> doTimeSeriesCallbacks().
-            updates.extend(state.do_time_series_callbacks());
+            updates.extend(state.do_time_series_callbacks(
+                &self.array_callbacks,
+                &self.pool,
+                &mut posts,
+            ));
         } else if reason == state.p.ts_time_per_point {
             // C writeFloat64 P_TSTimePerPoint -> computeNumAverage().
             state.time_per_point = params.value.as_f64();
@@ -545,14 +645,36 @@ impl NDPluginProcess for TimeSeriesProcessor {
             state.averaging_time_requested = params.value.as_f64();
             updates.extend(state.compute_num_average());
         }
-        ParamChangeResult::updates(updates)
+        let mut result = ParamChangeResult::updates(updates);
+        result.addressed = posts;
+        result
     }
+}
+
+/// The 1-D Float64 array Stats and Attribute post at address 1 for an
+/// NDPluginTimeSeries port (NDPluginStats.cpp:555-586,
+/// NDPluginAttribute.cpp:98-108): one element per value, carrying the
+/// source frame's uniqueId, timeStamp and epicsTS.
+pub(crate) fn time_series_point(
+    pool: &NDArrayPool,
+    src: &NDArray,
+    values: &[f64],
+) -> Option<Arc<NDArray>> {
+    let mut arr = pool
+        .alloc(vec![NDDimension::new(values.len())], NDDataType::Float64)
+        .ok()?;
+    if let NDDataBuffer::F64(v) = &mut arr.data {
+        v.copy_from_slice(values);
+    }
+    arr.unique_id = src.unique_id;
+    arr.time_stamp = src.time_stamp;
+    arr.timestamp = src.timestamp;
+    Some(Arc::new(arr))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ad_core_rs::ndarray::NDDimension;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
     // ---- averaged_value: divide first, then narrow (CBUG-B25) ----
@@ -617,10 +739,79 @@ mod tests {
     // ---- process_array end-to-end ----
 
     fn make_proc(max_signals: usize, port: &str) -> TimeSeriesProcessor {
-        let mut proc = TimeSeriesProcessor::new(max_signals);
+        let mut proc = TimeSeriesProcessor::new(max_signals, NDArrayPool::new(0));
         let mut base = PortDriverBase::new(port, max_signals + 1, PortFlags::default());
         proc.register_params(&mut base).unwrap();
         proc
+    }
+
+    /// A 2-signal UInt16 port with a 3-point Fixed buffer, filled by one
+    /// 2-D frame `[[1,10],[2,20],[3,30]]`.
+    fn filled_fixed_u16(port: &str) -> (TimeSeriesProcessor, ProcessResult) {
+        let proc = make_proc(2, port);
+        {
+            let mut st = proc.state.lock();
+            st.num_time_points = 3;
+            let _ = st.allocate_arrays();
+            st.acquiring = true;
+        }
+        let arr = NDArray::with_data(
+            vec![NDDimension::new(2), NDDimension::new(3)],
+            NDDataBuffer::U16(vec![1, 10, 2, 20, 3, 30]),
+        );
+        let res = proc.process_array(&Arc::new(arr), &NDArrayPool::new(0));
+        (proc, res)
+    }
+
+    fn u16s(arr: &NDArray) -> Vec<u16> {
+        match &arr.data {
+            NDDataBuffer::U16(v) => v.clone(),
+            _ => panic!("not UInt16"),
+        }
+    }
+
+    /// C NDPluginTimeSeries.cpp:368 and :382: a full Fixed buffer posts the
+    /// `[numTimePoints, numSignals]` array at `addr == numSignals_` and each
+    /// signal's row at `addr == signal`, in the input's data type.
+    #[test]
+    fn test_full_fixed_buffer_posts_the_series_and_each_signal() {
+        let (_proc, res) = filled_fixed_u16("TST_TS_POST");
+        let at = |addr: usize| {
+            res.addressed
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, arr)| arr.clone())
+                .expect("posted")
+        };
+        assert_eq!(res.addressed.len(), 3);
+        let all = at(2);
+        assert_eq!(
+            all.dims.iter().map(|d| d.size).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(u16s(&all), vec![1, 2, 3, 10, 20, 30]);
+        assert_eq!(u16s(&at(0)), vec![1, 2, 3]);
+        assert_eq!(u16s(&at(1)), vec![10, 20, 30]);
+        assert!(res.addressed.iter().all(|(_, a)| a.unique_id == 0));
+    }
+
+    /// A TSAcquire 0 write posts from the write path (C writeInt32 :468), and
+    /// each post takes the next uniqueId (:367).
+    #[test]
+    fn test_stop_write_posts_with_the_next_unique_id() {
+        let (proc, _) = filled_fixed_u16("TST_TS_STOP");
+        let acquire = proc.state.lock().p.ts_acquire;
+        let res = proc.on_param_change(
+            acquire,
+            &PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: acquire,
+                addr: 0,
+                value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(0),
+            },
+        );
+        assert_eq!(res.addressed.len(), 3);
+        assert!(res.addressed.iter().all(|(_, a)| a.unique_id == 1));
     }
 
     fn find_array(res: &ProcessResult, reason: usize, addr: i32) -> Option<Vec<f64>> {
@@ -719,7 +910,7 @@ mod tests {
         assert!(proc.state.lock().acquiring);
         assert_eq!(proc.state.lock().current_time_point, 2);
         // Reading rotates so the oldest point is first: [3,4,5].
-        let updates = proc.state.lock().do_time_series_callbacks();
+        let updates = proc.state.lock().time_series_waveforms();
         let wf = updates
             .iter()
             .find_map(|u| match u {

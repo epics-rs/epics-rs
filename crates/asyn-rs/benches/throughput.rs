@@ -7,7 +7,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::sync_io::SyncIOHandle;
 
 // -- Minimal test driver for benchmarking --
@@ -38,8 +38,9 @@ impl PortDriver for BenchPort {
 // -- Helpers --
 
 fn make_sync_io(name: &str) -> SyncIOHandle {
-    let (handle, _jh) = create_port_runtime(BenchPort::new(name), RuntimeConfig::default())
-        .expect("the port runtime thread must start");
+    let (handle, _jh) =
+        create_port_runtime_unclaimed(BenchPort::new(name), RuntimeConfig::default())
+            .expect("the port runtime thread must start");
     SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1))
 }
 

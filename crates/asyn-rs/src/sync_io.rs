@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::param::ParamType;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
-    use crate::runtime::{RuntimeConfig, create_port_runtime};
+    use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
     struct TestPort {
         base: PortDriverBase,
@@ -269,8 +269,9 @@ mod tests {
     use crate::runtime::PortRuntimeHandle;
 
     fn make_sync_io() -> (SyncIOHandle, PortRuntimeHandle) {
-        let (handle, _jh) = create_port_runtime(TestPort::new(), RuntimeConfig::default())
-            .expect("the port runtime thread must start");
+        let (handle, _jh) =
+            create_port_runtime_unclaimed(TestPort::new(), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
         let sio =
             SyncIOHandle::from_handle(handle.port_handle().clone(), 0, Duration::from_secs(1));
         (sio, handle)
@@ -352,7 +353,7 @@ mod tests {
             base: PortDriverBase::new("wr_seq", 1, PortFlags::default()),
             seq: Arc::clone(&seq),
         };
-        let (rt, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+        let (rt, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
         let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let reply = sio
@@ -381,7 +382,7 @@ mod tests {
             }
         }
 
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             Transport(PortDriverBase::new(
                 "syncnodrvuser",
                 1,
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn test_sync_io_via_manager() {
         let mgr = PortManager::new();
-        mgr.register_port(TestPort::new(), &crate::registry::open_owner())
+        mgr.register_port_unclaimed(TestPort::new(), &crate::registry::open_owner())
             .unwrap();
         let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
@@ -471,7 +472,7 @@ mod tests {
             }
         }
 
-        let (handle, _jh) = create_port_runtime(
+        let (handle, _jh) = create_port_runtime_unclaimed(
             PartialThenTimeout(PortDriverBase::new("syncpartial", 1, PortFlags::default())),
             RuntimeConfig::default(),
         )

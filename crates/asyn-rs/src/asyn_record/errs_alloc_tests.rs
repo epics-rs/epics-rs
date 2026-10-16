@@ -420,7 +420,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
 fn a_connect_to_a_shut_down_port_reports_without_allocating() {
     test_ioc_thread(|| {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct Port(PortDriverBase);
         impl PortDriver for Port {
@@ -437,7 +437,7 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
             destructible: true,
             ..PortFlags::default()
         };
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             Port(PortDriverBase::new(name, 1, flags)),
             RuntimeConfig::default(),
         )
@@ -660,7 +660,7 @@ fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
                 ..PortFlags::default()
             },
         );
-        let (rt, _jh) = crate::runtime::create_port_runtime(
+        let (rt, _jh) = crate::runtime::create_port_runtime_unclaimed(
             Blocking { base },
             crate::runtime::RuntimeConfig::default(),
         )

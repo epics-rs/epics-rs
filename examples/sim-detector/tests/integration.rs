@@ -4,7 +4,14 @@ use sim_detector::create_sim_detector;
 
 #[test]
 fn test_single_mode_one_frame() {
-    let rt = create_sim_detector("INT_SINGLE", 64, 64, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_SINGLE").unwrap(),
+        64,
+        64,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle
@@ -34,7 +41,14 @@ fn test_single_mode_one_frame() {
 
 #[test]
 fn test_mode_switch_during_continuous() {
-    let rt = create_sim_detector("INT_SWITCH", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_SWITCH").unwrap(),
+        32,
+        32,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle
@@ -84,7 +98,14 @@ fn test_mode_switch_during_continuous() {
 
 #[test]
 fn test_rgb1_mode_acquisition() {
-    let rt = create_sim_detector("INT_RGB", 16, 16, 10_000_000, NDArrayOutput::new()).unwrap();
+    let rt = create_sim_detector(
+        &asyn_rs::registry::claim_port("INT_RGB").unwrap(),
+        16,
+        16,
+        10_000_000,
+        NDArrayOutput::new(),
+    )
+    .unwrap();
     let handle = rt.port_handle();
 
     handle

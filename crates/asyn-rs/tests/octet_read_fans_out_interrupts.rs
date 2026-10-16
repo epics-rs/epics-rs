@@ -17,7 +17,7 @@ use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamValue;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::sync_io::SyncIOHandle;
 
 /// A device that answers one line. The record on the other end is scanned
@@ -35,7 +35,7 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
     });
 
     let driver = DrvAsynIPPort::new("R1859", &format!("127.0.0.1:{port}")).unwrap();
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
 
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));

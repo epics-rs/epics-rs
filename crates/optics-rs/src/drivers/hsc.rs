@@ -377,8 +377,7 @@ impl asyn_rs::port::PortDriver for HscDriver {
         self.base().check_ready()?;
         let reason = user.reason;
         self.base_mut()
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
         self.handle_float64_write(reason, value)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
@@ -386,7 +385,7 @@ impl asyn_rs::port::PortDriver for HscDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base().check_ready()?;
         let reason = user.reason;
-        self.base_mut().params.set_int32(reason, user.addr, value)?;
+        self.base_mut().set_int32_param(reason, user.addr, value)?;
 
         if reason == self.params.poll {
             // `poll` publishes the readbacks and fires the callbacks itself.
@@ -533,6 +532,8 @@ impl HscHolder {
                     _ => return Err("pollMs must be an integer".into()),
                 };
 
+                let claim = asyn_rs::asyn_record::claim_port(&port)
+                    .map_err(|e| format!("failed to register HSC port: {e}"))?;
                 let sim = Arc::new(Mutex::new(SimHsc::new()));
                 let driver = match HscDriver::new(&port, sim) {
                     Ok(d) => d,
@@ -541,6 +542,7 @@ impl HscHolder {
                 let poll_reason = driver.params.poll;
 
                 let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    &claim,
                     driver,
                     asyn_rs::runtime::config::RuntimeConfig::default(),
                 ) {
@@ -549,9 +551,7 @@ impl HscHolder {
                 };
                 let port_handle = runtime.port_handle().clone();
                 let owner = ctx.db().scan_control().interrupt_gate();
-                if let Err(e) =
-                    asyn_rs::asyn_record::register_port(&port, port_handle.clone(), owner)
-                {
+                if let Err(e) = claim.publish(port_handle.clone(), owner) {
                     runtime.shutdown();
                     return Err(format!("failed to register HSC port: {e}"));
                 }

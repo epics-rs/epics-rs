@@ -1891,6 +1891,11 @@ impl NDPluginProcess for CodecProcessor {
         "NDPluginCodec"
     }
 
+    /// NDPluginCodec.cpp:1117
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
+
     /// C `NDPluginCodec` passes `compressionAware=true` to the base constructor
     /// (`NDPluginCodec.cpp:865-870`), unconditionally regardless of mode, so
     /// compressed arrays reach it for decompression. Without this override the
@@ -2196,7 +2201,7 @@ mod tests {
         let mut output = NDArrayOutput::new();
         output.add(ds_sender);
         let (handle, _jh) = create_plugin_runtime_with_output(
-            "CODEC_DECOMP",
+            &asyn_rs::asyn_record::claim_port("CODEC_DECOMP").unwrap(),
             CodecProcessor::new(CodecMode::Decompress),
             pool,
             10,

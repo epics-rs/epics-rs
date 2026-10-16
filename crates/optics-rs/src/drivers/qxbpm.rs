@@ -266,7 +266,7 @@ impl asyn_rs::port::PortDriver for QxbpmDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base().check_ready()?;
         let reason = user.reason;
-        self.base_mut().params.set_int32(reason, user.addr, value)?;
+        self.base_mut().set_int32_param(reason, user.addr, value)?;
 
         if reason == self.params.poll {
             // `poll` publishes the readbacks and fires the callbacks itself.
@@ -434,6 +434,8 @@ impl QxbpmHolder {
                     _ => return Err("pollMs must be an integer".into()),
                 };
 
+                let claim = asyn_rs::asyn_record::claim_port(&port)
+                    .map_err(|e| format!("failed to register QXBPM port: {e}"))?;
                 let sim = Arc::new(Mutex::new(SimQxbpm::new(x_pos, y_pos)));
                 let driver = match QxbpmDriver::new(&port, sim) {
                     Ok(d) => d,
@@ -442,6 +444,7 @@ impl QxbpmHolder {
                 let poll_reason = driver.params.poll;
 
                 let (runtime, _actor) = match asyn_rs::runtime::port::create_port_runtime(
+                    &claim,
                     driver,
                     asyn_rs::runtime::config::RuntimeConfig::default(),
                 ) {
@@ -450,9 +453,7 @@ impl QxbpmHolder {
                 };
                 let port_handle = runtime.port_handle().clone();
                 let owner = ctx.db().scan_control().interrupt_gate();
-                if let Err(e) =
-                    asyn_rs::asyn_record::register_port(&port, port_handle.clone(), owner)
-                {
+                if let Err(e) = claim.publish(port_handle.clone(), owner) {
                     runtime.shutdown();
                     return Err(format!("failed to register QXBPM port: {e}"));
                 }

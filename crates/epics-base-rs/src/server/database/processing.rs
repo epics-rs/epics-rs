@@ -302,35 +302,54 @@ impl crate::runtime::background::CallbackBody for ProcessReentry {
     }
 }
 
-/// The completion of an asynchronous device write: C devAsyn's
+/// The completion of an asynchronous device read or write: C devAsyn's
 /// `callbackRequestProcessCallback(&pPvt->processCallback, pr->prio, pr)` from
-/// the port thread once the driver write ran, which re-enters the record's
-/// `process()` on a callback band to end the cycle (devAsynFloat64.c:351).
+/// the port thread once the driver call ran, which re-enters the record's
+/// `process()` on a callback band to end the cycle (devAsynFloat64.c:351,
+/// devAsynInt32.c:582).
 ///
 /// One per record, built at `add_loaded_record` as C's `processCallback` sits
-/// in `devPvt` from init, so no put allocates; requested per write, with the
-/// outcome riding in it to the completing pass as `pPvt->result.status` does.
+/// in `devPvt` from init, so no request allocates; a write's outcome rides in
+/// it to the completing pass as `pPvt->result.status` does, a read's stays
+/// with the device support that ran it.
 #[derive(Clone)]
-pub struct WriteDone(Arc<crate::runtime::background::CallbackCell<WriteReentry>>);
+pub struct DeviceDone(Arc<crate::runtime::background::CallbackCell<DeviceReentry>>);
 
-impl WriteDone {
-    /// The cell for record `name` of `db`, on the band `prio` selects.
-    pub fn new(db: &PvDatabase, name: RecordName, prio: i16) -> Self {
-        Self::with_db(Arc::downgrade(&db.inner), name, prio)
+impl DeviceDone {
+    /// The cell for `record` of `db`, on the band its `PRIO` selects.
+    pub fn new(db: &PvDatabase, record: &crate::server::record::RecordInstance) -> Self {
+        Self::with_db(
+            Arc::downgrade(&db.inner),
+            record.name.clone(),
+            record.common.prio,
+            record.reprocess_generation.clone(),
+        )
     }
 
     /// A cell no database owns, whose completion runs nothing: the
     /// `RecordInstance` default until `add_loaded_record` installs its own.
     pub(crate) fn detached(prio: i16) -> Self {
-        Self::with_db(std::sync::Weak::new(), RecordName::from(&b""[..]), prio)
+        Self::with_db(
+            std::sync::Weak::new(),
+            RecordName::from(&b""[..]),
+            prio,
+            Arc::default(),
+        )
     }
 
-    fn with_db(db: std::sync::Weak<super::PvDatabaseInner>, name: RecordName, prio: i16) -> Self {
-        WriteDone(crate::runtime::background::CallbackCell::new(
-            WriteReentry {
+    fn with_db(
+        db: std::sync::Weak<super::PvDatabaseInner>,
+        name: RecordName,
+        prio: i16,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        DeviceDone(crate::runtime::background::CallbackCell::new(
+            DeviceReentry {
                 db,
                 name,
                 band: std::sync::atomic::AtomicU8::new(band_index(prio)),
+                generation,
+                epoch: AtomicU64::new(0),
                 outcome: std::sync::Mutex::new(None),
             },
         ))
@@ -367,20 +386,47 @@ impl WriteDone {
         priority: crate::runtime::task::CallbackPriority,
         outcome: CaResult<()>,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        *self.0.body().outcome.lock().unwrap() = Some(outcome);
+        *self.0.body().outcome.lock().unwrap() = Some(Completion::Write(outcome));
+        crate::runtime::task::request_cell(priority, &self.0)
+    }
+
+    /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
+    /// read on `priority`: the record's `process()` again with PACT set, whose
+    /// [`DeviceSupport::read`](crate::server::device_support::DeviceSupport::read)
+    /// applies what the device read. `Err` is a full band.
+    pub fn reprocess(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+    ) -> Result<(), crate::runtime::background::CallbackError> {
+        *self.0.body().outcome.lock().unwrap() = Some(Completion::Read);
         crate::runtime::task::request_cell(priority, &self.0)
     }
 }
 
-/// What [`DeviceSupport::write_begin`](crate::server::device_support::DeviceSupport::write_begin)
-/// is given to answer [`WriteStart::Pending`](crate::server::device_support::WriteStart::Pending):
-/// the record's [`WriteDone`] and the band its `PRIO` selects.
-pub struct WriteDoneSource<'a> {
-    done: &'a WriteDone,
+/// Which pass a [`DeviceDone`] request runs.
+enum Completion {
+    /// The tail after an asynchronous write, with its outcome.
+    Write(CaResult<()>),
+    /// The record's `process()` re-entered after an asynchronous read.
+    Read,
 }
 
-impl<'a> WriteDoneSource<'a> {
-    pub fn new(done: &'a WriteDone) -> Self {
+/// What [`DeviceSupport::write_begin`](crate::server::device_support::DeviceSupport::write_begin)
+/// and [`DeviceSupport::read_begin`](crate::server::device_support::DeviceSupport::read_begin)
+/// are given to answer `Pending`: the record's [`DeviceDone`] and the band its
+/// `PRIO` selects.
+pub struct DeviceDoneSource<'a> {
+    done: &'a DeviceDone,
+}
+
+impl<'a> DeviceDoneSource<'a> {
+    /// Taken under the record's hold just before the device may queue: the
+    /// generation now current is the one a read's completion re-enters on, so
+    /// a cancel or a newer token in between makes that re-entry a no-op.
+    pub fn new(done: &'a DeviceDone) -> Self {
+        let body = done.0.body();
+        body.epoch
+            .store(body.generation.load(Ordering::Acquire), Ordering::Release);
         Self { done }
     }
 
@@ -390,12 +436,12 @@ impl<'a> WriteDoneSource<'a> {
     }
 
     /// The record's completion cell; a reference count, never an allocation.
-    pub fn write_done(&self) -> WriteDone {
+    pub fn device_done(&self) -> DeviceDone {
         self.done.clone()
     }
 }
 
-/// `PRIO` as the band index [`WriteDone::priority`] decodes, folded as
+/// `PRIO` as the band index [`DeviceDone::priority`] decodes, folded as
 /// [`crate::runtime::task::CallbackPriority::from_record_prio`] folds it.
 fn band_index(prio: i16) -> u8 {
     match crate::runtime::task::CallbackPriority::from_record_prio(prio) {
@@ -405,23 +451,42 @@ fn band_index(prio: i16) -> u8 {
     }
 }
 
-/// The body of a [`WriteDone`].
-struct WriteReentry {
+/// The body of a [`DeviceDone`].
+struct DeviceReentry {
     db: std::sync::Weak<super::PvDatabaseInner>,
     name: RecordName,
     band: std::sync::atomic::AtomicU8,
-    outcome: std::sync::Mutex<Option<CaResult<()>>>,
+    /// The record's `reprocess_generation`, and its value when the request
+    /// was queued.
+    generation: Arc<AtomicU64>,
+    epoch: AtomicU64,
+    outcome: std::sync::Mutex<Option<Completion>>,
 }
 
-impl crate::runtime::background::CallbackBody for WriteReentry {
+impl crate::runtime::background::CallbackBody for DeviceReentry {
     fn run(&self) {
-        let Some(outcome) = self.outcome.lock().unwrap().take() else {
+        let Some(completion) = self.outcome.lock().unwrap().take() else {
             return;
         };
         let Some(inner) = self.db.upgrade() else {
             return;
         };
-        let _ = PvDatabase { inner }.complete_async_write(&self.name, outcome);
+        let db = PvDatabase { inner };
+        match completion {
+            Completion::Write(outcome) => {
+                let _ = db.complete_async_write(&self.name, outcome);
+            }
+            Completion::Read => {
+                let Some(rec) = db.get_record_no_resolve(&self.name) else {
+                    return;
+                };
+                let _ = db.reenter_if_current(
+                    ProcessTarget::Resolved(&self.name, &rec),
+                    &self.generation,
+                    self.epoch.load(Ordering::Acquire),
+                );
+            }
+        }
     }
 }
 
@@ -2762,10 +2827,18 @@ impl PvDatabase {
         generation: &AtomicU64,
         epoch: u64,
     ) -> CaResult<()> {
-        if generation.load(Ordering::Acquire) != epoch {
+        if generation.load(Ordering::Acquire) != epoch || !self.accepts_reentry() {
             return Ok(());
         }
         self.run_process_frame(target, &mut ProcStack::new(), true, true, false)
+    }
+
+    /// Whether a callback-band re-entry may still process: not once the
+    /// database's scan facility has stopped. C `iocShutdown` runs
+    /// `callbackStop` right after `scanStop` (iocInit.c:733-735), so a
+    /// completion a port delivers while closing at exit processes nothing.
+    fn accepts_reentry(&self) -> bool {
+        !self.scan_control().is_exiting()
     }
 
     /// Cancel any outstanding async re-entry token for `name` (C
@@ -5751,7 +5824,27 @@ impl PvDatabase {
                         // device support reads `dbCommon` directly
                         // (`devTimeOfDay.c:122` uses `psi->phas`).
                         dev.set_process_context(&instance.common.process_context());
-                        match dev.read(&mut *instance.record) {
+                        // C devAsyn's `if (!pr->pact) queueRequest` on a canBlock
+                        // port (devAsynInt32.c:836-839): a pass entered idle may
+                        // queue the read and end here; the pass its completion
+                        // re-enters reads what landed.
+                        let begun = if is_continuation {
+                            Ok(crate::server::device_support::ReadStart::Synchronous)
+                        } else {
+                            let done = DeviceDoneSource::new(&instance.device_done);
+                            dev.read_begin(&mut *instance.record, &done)
+                        };
+                        if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
+                            instance.enter_pact();
+                            instance.device = Some(dev);
+                            self.apply_pact_exit(name, cycle_end.take());
+                            return Ok(());
+                        }
+                        let read = match begun {
+                            Ok(_) => dev.read(&mut *instance.record),
+                            Err(e) => Err(e),
+                        };
+                        match read {
                             Ok(read_outcome) => {
                                 let status = read_outcome.status;
                                 device_did_compute = status.skips_conversion();
@@ -6815,11 +6908,11 @@ impl PvDatabase {
                             if let Some(mut dev) = instance.device.take() {
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
-                                let done = WriteDoneSource::new(&instance.write_done);
+                                let done = DeviceDoneSource::new(&instance.device_done);
                                 match dev.write_begin(&mut *instance.record, &done) {
                                     Ok(WriteStart::Pending) => {
                                         // Async write submitted -- set PACT, return early.
-                                        // The device's `WriteDone` re-enters the record
+                                        // The device's `DeviceDone` re-enters the record
                                         // on a callback band when the write lands, and
                                         // `complete_async_write` ends the cycle there.
                                         instance.enter_pact();
@@ -7922,7 +8015,7 @@ impl PvDatabase {
     /// under the SAME exclusion as the cycle that started it, and a put that
     /// arrived during the async window has either already been serialised
     /// ahead of it or waits behind it. Every caller reaches this from a
-    /// completion task holding no gate (a [`WriteDone`]'s
+    /// completion task holding no gate (a [`DeviceDone`]'s
     /// callback band, the seq DLYn chain, the tests); nothing calls it with the gate
     /// held, which would dead-lock on the non-reentrant gate.
     pub fn complete_async_record<'a>(
@@ -7950,8 +8043,11 @@ impl PvDatabase {
     }
 
     /// [`Self::complete_async_record_with_outcome`] on the calling thread: a
-    /// [`WriteDone`]'s callback band runs it.
+    /// [`DeviceDone`]'s callback band runs it.
     fn complete_async_write(&self, name: &[u8], outcome: CaResult<()>) -> CaResult<()> {
+        if !self.accepts_reentry() {
+            return Ok(());
+        }
         // Alias-aware entry — same pattern as
         // `process_record_with_links_inner`. `name` may arrive as an alias
         // from an async device-support callback that captured the original
@@ -10804,7 +10900,7 @@ mod write_done_prio_tests {
             .await
             .unwrap();
         let rec = db.get_record("P:AO").unwrap();
-        let cell = rec.read().write_done.clone();
+        let cell = rec.read().device_done.clone();
         assert_eq!(cell.priority(), CallbackPriority::Medium);
 
         db.put_pv("P:AO.PRIO", EpicsValue::String("HIGH".into()))

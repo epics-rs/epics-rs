@@ -281,7 +281,7 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let gate = epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened();
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(TestScopeDriver::new(&unique_name("SCOPE")), &gate)
+        .register_port_unclaimed(TestScopeDriver::new(&unique_name("SCOPE")), &gate)
         .unwrap();
     let handle = rt.port_handle().clone();
     (mgr, handle)
@@ -290,7 +290,7 @@ fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
 fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(
+        .register_port_unclaimed(
             EchoDriver::new(&unique_name("ECHO")),
             &asyn_rs::registry::open_owner(),
         )
@@ -302,7 +302,7 @@ fn setup_echo() -> (PortManager, asyn_rs::port_handle::PortHandle) {
 fn setup_error() -> (PortManager, asyn_rs::port_handle::PortHandle) {
     let mgr = PortManager::new();
     let rt = mgr
-        .register_port(
+        .register_port_unclaimed(
             ErrorDriver::new(&unique_name("ERRTEST")),
             &asyn_rs::registry::open_owner(),
         )

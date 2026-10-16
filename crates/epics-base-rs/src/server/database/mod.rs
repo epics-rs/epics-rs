@@ -35,8 +35,8 @@ pub(crate) use links::{
 };
 pub(crate) use processing::NotifiedRead;
 pub use processing::{
-    AsyncDbHandle, AsyncToken, CaLinkInit, ExternalCpProcess, InputLinkTexts, PostItem, PostRule,
-    ProcStack, ProcessCallback, TokenWatch, WriteDone, WriteDoneSource,
+    AsyncDbHandle, AsyncToken, CaLinkInit, DeviceDone, DeviceDoneSource, ExternalCpProcess,
+    InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
 };
 pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
 pub use record_lock::{
@@ -3391,8 +3391,7 @@ impl PvDatabase {
         }
 
         // After the load, so the cell starts on the loaded `PRIO`.
-        instance.write_done =
-            crate::server::database::WriteDone::new(self, name.clone(), instance.common.prio);
+        instance.device_done = crate::server::database::DeviceDone::new(self, &instance);
 
         // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
         // calls `init_record(pass 0)`. Both lines are here, in that order,

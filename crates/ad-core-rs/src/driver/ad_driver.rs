@@ -195,9 +195,12 @@ impl ADDriverBase {
     /// C++ never writes `ADShutterStatus` here — the actual shutter status is
     /// driven by the shutter hardware / EPICS records, not assumed.
     pub fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        // C ignores the get*Param statuses (ADDriver.cpp:36-38); ADDriver
+        // seeds none of the three, so an unset one reads as 0.
         let mode = ShutterMode::from_i32(
             self.port_base
-                .get_int32_param(self.params.shutter_mode, 0)?,
+                .get_int32_param(self.params.shutter_mode, 0)
+                .unwrap_or(0),
         );
 
         match mode {
@@ -209,10 +212,12 @@ impl ADDriverBase {
             Some(ShutterMode::EpicsOnly) => {
                 let open_delay = self
                     .port_base
-                    .get_float64_param(self.params.shutter_open_delay, 0)?;
+                    .get_float64_param(self.params.shutter_open_delay, 0)
+                    .unwrap_or(0.0);
                 let close_delay = self
                     .port_base
-                    .get_float64_param(self.params.shutter_close_delay, 0)?;
+                    .get_float64_param(self.params.shutter_close_delay, 0)
+                    .unwrap_or(0.0);
                 self.port_base.set_int32_param(
                     self.params.shutter_control_epics,
                     0,
@@ -412,9 +417,11 @@ mod tests {
             ("NumExposures", ad.params.num_exposures),
             ("ShutterMode", ad.params.shutter_mode),
         ] {
-            assert_eq!(
-                ad.port_base.get_int32_param(idx, 0).unwrap(),
-                0,
+            assert!(
+                matches!(
+                    ad.port_base.get_int32_param(idx, 0),
+                    Err(asyn_rs::error::AsynError::ParamUndefined(_))
+                ),
                 "{name} must be left to the database, not seeded by the driver"
             );
         }
@@ -425,9 +432,11 @@ mod tests {
             ("AcquireTime", ad.params.acquire_time),
             ("AcquirePeriod", ad.params.acquire_period),
         ] {
-            assert_eq!(
-                ad.port_base.get_float64_param(idx, 0).unwrap(),
-                0.0,
+            assert!(
+                matches!(
+                    ad.port_base.get_float64_param(idx, 0),
+                    Err(asyn_rs::error::AsynError::ParamUndefined(_))
+                ),
                 "{name} must be left to the database, not seeded by the driver"
             );
         }
@@ -615,7 +624,7 @@ mod tests {
         // the detector driver reports the real shutter state.
         assert_eq!(
             ad.port_base
-                .get_int32_param_strict(ad.params.shutter_status, 0)
+                .get_int32_param(ad.params.shutter_status, 0)
                 .ok(),
             Some(0),
             "SHUTTER_STATUS must keep its constructor value through setShutter"

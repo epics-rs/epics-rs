@@ -7,7 +7,8 @@ post and the CA event path are rebuilt to C's shape, and every database
 serves its own local CA links. The breaking changes:
 `IocApplication::register_link_set_installer` becomes
 `register_link_type(key, installer)`, one link set per JSON link type per
-database; `DeviceSupport`'s `WriteCompletion` gives way to `WriteDone`;
+database; `DeviceSupport`'s `WriteCompletion` gives way to `DeviceDone`,
+which also completes the new `read_begin`;
 `CommonFields::time` and `general_time` are a `WallTime`; the process-wide
 `scan_pause`/`scan_run`/`scan_stop` are gone, each database owning its own
 interruptAccept gate; `CaChannel::on_connection_change`,

@@ -16,8 +16,11 @@ pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
 // — `ad-core-rs`, `ad-plugins-rs`, `modbus-rs`, `mqtt-rs` and the example IOCs
 // — spells it `asyn_record::get_port`, and moving the definition is not a
 // reason to break them.
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::registry::register_port;
 pub use crate::registry::{
-    PortEntry, PortRegistry, get_port, open_owner, port_names, register_port, unregister_port,
+    PortClaim, PortEntry, PortRegistry, claim_port, get_port, open_owner, port_names,
+    unregister_port,
 };
 
 use io_intr::{IoIntrBinding, IoIntrSample, IoIntrScan};
@@ -932,7 +935,7 @@ impl Default for ProcessRequest {
 impl CellBody for ProcessJob {
     /// C `asynCallbackProcess`'s `performIO` (asynRecord.c:819-827).
     fn process(&self, port: &mut dyn PortCalls) {
-        let out = run_io_phases(&self.request.lock().plan, port);
+        let out = run_io_phases(&mut self.request.lock().plan, port);
         *self.outcome.lock() = Some(out);
     }
 
@@ -1389,17 +1392,14 @@ impl PhaseList {
 /// Build the write-phase `RequestOp` for an interface. C `performOctetIO`
 /// (asynRecord.c:1528-1546) suppresses the driver's output EOS for a binary
 /// write; `OctetWriteBinary` brackets that save/clear/restore in the actor.
-fn io_write_op(plan: &IoPlan) -> RequestOp {
+fn io_write_op(plan: &mut IoPlan) -> RequestOp {
     match plan.iface {
         InterfaceType::Octet => {
+            let data = std::mem::take(&mut plan.octet_out);
             if plan.ofmt == ASYN_FMT_BINARY {
-                RequestOp::OctetWriteBinary {
-                    data: plan.octet_out.clone(),
-                }
+                RequestOp::OctetWriteBinary { data }
             } else {
-                RequestOp::OctetWrite {
-                    data: plan.octet_out.clone(),
-                }
+                RequestOp::OctetWrite { data }
             }
         }
         InterfaceType::Int32 => RequestOp::Int32Write { value: plan.i32out },
@@ -1437,15 +1437,17 @@ fn io_read_op(plan: &IoPlan) -> RequestOp {
 
 /// The port operation one phase submits — the single owner of phase→`RequestOp`
 /// for [`run_io_phases`].
-fn io_phase_op(plan: &IoPlan, phase: IoPhase) -> RequestOp {
+/// A phase's op. Its bytes are lent from the plan, as C writes from the
+/// record's own buffer; [`return_phase_buffer`] hands them back.
+fn io_phase_op(plan: &mut IoPlan, phase: IoPhase) -> RequestOp {
     match phase {
         IoPhase::Flush => RequestOp::Flush,
         IoPhase::Write => io_write_op(plan),
         IoPhase::Read => io_read_op(plan),
         IoPhase::GpibUniversal(cmd) => RequestOp::GpibUniversalCmd { cmd },
         IoPhase::GpibAddressed => RequestOp::GpibAddressedCmd {
-            data: match &plan.gpib {
-                Some(GpibCycle::Addressed(frame)) => frame.clone(),
+            data: match &mut plan.gpib {
+                Some(GpibCycle::Addressed(frame)) => std::mem::take(frame),
                 // Unreachable by construction: `io_phases` only emits
                 // `GpibAddressed` for `GpibCycle::Addressed`.
                 _ => Vec::new(),
@@ -1928,15 +1930,32 @@ fn record_phase_result(
 /// on a blocking port the actor runs it ([`ProcessJob`]), on any other the
 /// caller does ([`AsynRecord::perform_io`]). A failed phase reports and the
 /// cycle carries on, as in C; a phase that never ran ends it.
-fn run_io_phases(plan: &IoPlan, port: &mut dyn PortCalls) -> IoOutcome {
+fn run_io_phases(plan: &mut IoPlan, port: &mut dyn PortCalls) -> IoOutcome {
     let mut out = IoOutcome::default();
     for phase in io_phases(plan).iter() {
-        let res = port.call(io_phase_op(plan, phase), io_phase_user(plan, phase));
+        let op = io_phase_op(plan, phase);
+        let res = port.call(&op, io_phase_user(plan, phase));
+        return_phase_buffer(plan, op);
         if let PhaseFlow::Aborted = record_phase_result(plan, &mut out, phase, res) {
             break;
         }
     }
     out
+}
+
+/// The bytes [`io_phase_op`] lent `op`, back to `plan` for the next cycle.
+fn return_phase_buffer(plan: &mut IoPlan, op: RequestOp) {
+    match op {
+        RequestOp::OctetWrite { data } | RequestOp::OctetWriteBinary { data } => {
+            plan.octet_out = data;
+        }
+        RequestOp::GpibAddressedCmd { data } => {
+            if let Some(GpibCycle::Addressed(frame)) = &mut plan.gpib {
+                *frame = data;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// C `reportError(pasynRec, status, "I/O request canceled")` for a dequeued
@@ -2205,7 +2224,7 @@ impl SpecialRequest {
                     key: self.key.to_string(),
                     value: self.value.clone(),
                 };
-                let report = match port.call(op, user.user()) {
+                let report = match port.call(&op, user.user()) {
                     Ok(_) => None,
                     Err(e) if e.never_ran() => return SpecialDone::NeverRan(e, QueuedBy::Special),
                     Err(e) => Some(SpecialReport::Errs(
@@ -2239,7 +2258,7 @@ impl SpecialRequest {
                 } else {
                     RequestOp::SetInputEos { eos }
                 };
-                let report = match port.call(op, user.user()) {
+                let report = match port.call(&op, user.user()) {
                     Ok(_) => None,
                     Err(e) if e.never_ran() => return SpecialDone::NeverRan(e, QueuedBy::Special),
                     Err(e) => {
@@ -2265,7 +2284,7 @@ impl SpecialRequest {
                 // `checkPortConnect` refuses it (asynManager.c:1538-1554).
                 let user = || AsynUser::new(0).with_addr(self.user.addr);
                 let connected = port
-                    .call(RequestOp::GetConnected, user())
+                    .call(&RequestOp::GetConnected, user())
                     .map(|r| r.int_val.unwrap_or(0) != 0);
                 let op = match (want, connected) {
                     (true, Ok(false)) => Some(("connect", RequestOp::Connect)),
@@ -2282,7 +2301,7 @@ impl SpecialRequest {
                         );
                     }
                 };
-                let report = match op.map(|(what, op)| (what, port.call(op, user()))) {
+                let report = match op.map(|(what, op)| (what, port.call(&op, user()))) {
                     Some((_, Err(e))) if e.never_ran() => {
                         return SpecialDone::NeverRan(e, QueuedBy::Special);
                     }
@@ -2399,7 +2418,7 @@ fn read_options(
         let op = RequestOp::GetOption {
             key: (*key).to_string(),
         };
-        match port.call(op, user.user()) {
+        match port.call(&op, user.user()) {
             Ok(RequestResult {
                 option_value: Some(val),
                 ..
@@ -2424,7 +2443,7 @@ fn read_options(
 /// readback C queues with no not-connected waiver (`asynQueuePriorityLow`,
 /// :1296), so the gate really does refuse it.
 fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, String), AsynError> {
-    let mut read = |op| match port.call(op, user.user()) {
+    let mut read = |op| match port.call(&op, user.user()) {
         Ok(RequestResult {
             data: Some(bytes), ..
         }) if !bytes.is_empty() => Ok(crate::escape::escaped_from_raw(&bytes, EOS_SIZE)),
@@ -4228,7 +4247,7 @@ impl AsynRecord {
     /// (asynRecord.c:351-352), which runs the queued callback's work on the scan
     /// thread rather than queuing it. The cycle is whatever `plan` says: a
     /// `performIO` transfer, or the GPIB command a UCMD/ACMD put asked for.
-    fn perform_io(&mut self, plan: IoPlan) -> CaResult<()> {
+    fn perform_io(&mut self, mut plan: IoPlan) -> CaResult<()> {
         let mut handle = match self.device_user.device() {
             Some(e) => e.handle.clone(),
             None => {
@@ -4236,7 +4255,7 @@ impl AsynRecord {
                 return Ok(());
             }
         };
-        let out = run_io_phases(&plan, &mut handle);
+        let out = run_io_phases(&mut plan, &mut handle);
         self.apply_io_outcome(out);
         Ok(())
     }
@@ -6091,7 +6110,7 @@ mod tests {
     #[test]
     fn a_shut_down_port_fails_the_asyn_common_lookup() {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct Port(PortDriverBase);
         impl PortDriver for Port {
@@ -6108,7 +6127,7 @@ mod tests {
             destructible: true,
             ..PortFlags::default()
         };
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             Port(PortDriverBase::new(name, 1, flags)),
             RuntimeConfig::default(),
         )
@@ -6209,7 +6228,7 @@ mod tests {
     #[test]
     fn a_noio_process_enters_the_port_queue() {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct Link(PortDriverBase);
         impl PortDriver for Link {
@@ -6225,7 +6244,7 @@ mod tests {
             let mut base = PortDriverBase::new(name, 1, PortFlags::default());
             base.init_connected(connected);
             base.init_auto_connect(false);
-            let (rt, _jh) = create_port_runtime(Link(base), RuntimeConfig::default())
+            let (rt, _jh) = create_port_runtime_unclaimed(Link(base), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
             register_port(
                 name,
@@ -6842,8 +6861,8 @@ mod tests {
         port_name: &str,
         port: GpibSpyPort,
     ) -> (AsynRecord, crate::runtime::PortRuntimeHandle) {
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
-        let (rt, _jh) = create_port_runtime(port, RuntimeConfig::default())
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        let (rt, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
             .expect("the port runtime thread must start");
         register_port(
             port_name,
@@ -6962,7 +6981,7 @@ mod tests {
     #[test]
     fn a_port_without_asyngpib_refuses_ucmd_and_acmd() {
         use crate::interfaces::octet_transport_capabilities;
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
         impl PortDriver for OctetTransport {
@@ -6978,7 +6997,7 @@ mod tests {
         }
 
         let port_name = "r10_55_no_gpib";
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )
@@ -11196,7 +11215,7 @@ A.TMSK 1
         use crate::interfaces::Capability;
         use crate::interpose::eos::EosInterpose;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use epics_base_rs::server::database::PvDatabase;
         use epics_base_rs::server::database::filters::{FilteredMonitorEvent, SubscriptionFilter};
         use epics_base_rs::server::recgbl::EventMask;
@@ -11366,7 +11385,8 @@ A.OEOS
             base.install_octet_interpose(Box::new(EosInterpose::default()));
             base.set_connected(false);
             base.init_auto_connect(false);
-            let (rt, jh) = create_port_runtime(Echo(base), RuntimeConfig::default()).unwrap();
+            let (rt, jh) =
+                create_port_runtime_unclaimed(Echo(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
             register_port(
                 port_name,
@@ -11484,7 +11504,7 @@ A.OEOS
     async fn special_readback_runs_in_the_same_port_callback() {
         use crate::interfaces::Capability;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use epics_base_rs::server::database::PvDatabase;
         use std::sync::mpsc;
         use std::time::Duration;
@@ -11539,7 +11559,7 @@ A.OEOS
             entered: std::sync::Mutex::new(entered_tx),
             proceed: std::sync::Mutex::new(proceed_rx),
         };
-        let (rt, jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let (rt, jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
         let handle = rt.port_handle().clone();
         register_port(port_name, handle.clone(), &crate::registry::open_owner()).unwrap();
@@ -12683,10 +12703,10 @@ A.OEOS
     fn a_gpib_port_reads_back_gpibiv_and_i32iv() {
         use crate::drivers::prologix::DrvAsynPrologixPort;
         use crate::drivers::vxi11::DrvVxi11Port;
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         let vxi_name = "r10_55_vxi11";
-        let (vxi_rt, _vxi_jh) = create_port_runtime(
+        let (vxi_rt, _vxi_jh) = create_port_runtime_unclaimed(
             DrvVxi11Port::configure(vxi_name, "192.0.2.1", 0, "", "gpib0", 0, true).unwrap(),
             RuntimeConfig::default(),
         )
@@ -12707,7 +12727,7 @@ A.OEOS
         assert_eq!(rec.optioniv, 1, "vxi11 registers asynOption (:1777)");
 
         let prologix_name = "r10_55_prologix";
-        let (p_rt, _p_jh) = create_port_runtime(
+        let (p_rt, _p_jh) = create_port_runtime_unclaimed(
             DrvAsynPrologixPort::new(prologix_name, "192.0.2.1:1234", true).unwrap(),
             RuntimeConfig::default(),
         )
@@ -12743,7 +12763,7 @@ A.OEOS
     fn connect_device_reads_the_ports_interface_registry() {
         use crate::interfaces::octet_transport_capabilities;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         // A pure-octet transport: an IP socket, a serial line. asynOctet and
         // asynOption, no register interfaces.
@@ -12761,7 +12781,7 @@ A.OEOS
         }
 
         let port_name = "r9_53_octet_transport";
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )
@@ -12819,7 +12839,7 @@ A.OEOS
     fn an_option_put_reaches_the_driver_with_the_records_tmot() {
         use crate::interfaces::{Capability, octet_transport_capabilities};
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use std::sync::Mutex as StdMutex;
         use std::time::Duration;
 
@@ -12848,7 +12868,7 @@ A.OEOS
         }
 
         let port_name = "r9_55_option_user";
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             OptionSpy(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )
@@ -12884,7 +12904,7 @@ A.OEOS
     fn option_and_eos_are_refused_on_a_port_that_lacks_the_interface() {
         use crate::interfaces::Capability;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         // A GPIB-style octet port: asynOctet only — no asynOption (the Prologix
         // driver's declaration).
@@ -12902,7 +12922,7 @@ A.OEOS
         }
 
         let port_name = "r9_53_no_option";
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             OctetNoOption(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )
@@ -13088,7 +13108,7 @@ A.OEOS
     /// the ordinary case of a port that does not implement a key at all.
     fn register_baud_text_port(port_name: &'static str, baud_text: &'static str) {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct BaudTextPort(PortDriverBase, &'static str);
         impl PortDriver for BaudTextPort {
@@ -13108,7 +13128,7 @@ A.OEOS
             }
         }
 
-        let (rt, jh) = create_port_runtime(
+        let (rt, jh) = create_port_runtime_unclaimed(
             BaudTextPort(
                 PortDriverBase::new(port_name, 1, PortFlags::default()),
                 baud_text,
@@ -13183,7 +13203,7 @@ A.OEOS
     /// asynDrvUser, exactly what drvAsynIPPort / drvAsynSerialPort register).
     fn register_octet_transport(port_name: &'static str) {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetTransport(PortDriverBase);
         impl PortDriver for OctetTransport {
@@ -13198,7 +13218,7 @@ A.OEOS
             }
         }
 
-        let (rt, jh) = create_port_runtime(
+        let (rt, jh) = create_port_runtime_unclaimed(
             OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )
@@ -13218,7 +13238,7 @@ A.OEOS
     fn register_param_port(port_name: &'static str, param: &str) {
         use crate::param::ParamType;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct ParamDriver(PortDriverBase);
         impl PortDriver for ParamDriver {
@@ -13237,7 +13257,7 @@ A.OEOS
             .create_param("FILLER", ParamType::Int32)
             .unwrap();
         base.params.create_param(param, ParamType::Int32).unwrap();
-        let (rt, jh) = create_port_runtime(ParamDriver(base), RuntimeConfig::default())
+        let (rt, jh) = create_port_runtime_unclaimed(ParamDriver(base), RuntimeConfig::default())
             .expect("the port runtime thread must start");
         std::mem::forget(jh);
         register_port(
@@ -13301,7 +13321,7 @@ A.OEOS
     #[test]
     fn connect_device_reads_the_eos_back_from_the_driver() {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct EosPort(PortDriverBase);
         impl PortDriver for EosPort {
@@ -13330,7 +13350,7 @@ A.OEOS
             let mut drv = EosPort(base);
             drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
             drv.set_output_eos(&AsynUser::default(), b"\n").unwrap();
-            let (rt, jh) = create_port_runtime(drv, RuntimeConfig::default())
+            let (rt, jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
                 .expect("the port runtime thread must start");
             std::mem::forget(jh);
             register_port(
@@ -13428,7 +13448,7 @@ A.OEOS
     fn an_eos_put_without_asyn_octet_reads_back_blank() {
         use crate::interfaces::Capability;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct Int32Only(PortDriverBase);
         impl PortDriver for Int32Only {
@@ -13444,7 +13464,8 @@ A.OEOS
         }
         let port_name = "as10_no_octet";
         let base = PortDriverBase::new(port_name, 1, PortFlags::default());
-        let (rt, jh) = create_port_runtime(Int32Only(base), RuntimeConfig::default()).unwrap();
+        let (rt, jh) =
+            create_port_runtime_unclaimed(Int32Only(base), RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
         register_port(
             port_name,
@@ -13475,7 +13496,7 @@ A.OEOS
     #[test]
     fn cnct_reports_the_c_texts() {
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct Refuses(PortDriverBase);
         impl PortDriver for Refuses {
@@ -13502,7 +13523,8 @@ A.OEOS
             let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
             base.set_connected(connected);
             base.init_auto_connect(false);
-            let (rt, jh) = create_port_runtime(Refuses(base), RuntimeConfig::default()).unwrap();
+            let (rt, jh) =
+                create_port_runtime_unclaimed(Refuses(base), RuntimeConfig::default()).unwrap();
             std::mem::forget(jh);
             register_port(
                 port_name,
@@ -13711,10 +13733,10 @@ A.OEOS
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use crate::port::PortFlags;
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             IoIntrDriver {
                 base: PortDriverBase::new(name, 1, PortFlags::default()),
                 reads: reads.clone(),
@@ -14123,7 +14145,7 @@ A.OEOS
         use crate::interfaces::octet_transport_capabilities;
         use crate::param::ParamValue;
         use crate::port::PortFlags;
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         struct OctetOnly(PortDriverBase);
         impl PortDriver for OctetOnly {
@@ -14139,7 +14161,7 @@ A.OEOS
         }
 
         let port_name = "r11_46_no_int32";
-        let (rt, _jh) = create_port_runtime(
+        let (rt, _jh) = create_port_runtime_unclaimed(
             OctetOnly(PortDriverBase::new(port_name, 1, PortFlags::default())),
             RuntimeConfig::default(),
         )

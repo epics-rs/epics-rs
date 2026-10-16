@@ -16,7 +16,7 @@ use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::create_port_runtime;
+use asyn_rs::runtime::port::create_port_runtime_unclaimed;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 
@@ -71,8 +71,9 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0), entry("ON", 1)].into())
         .unwrap();
-    let (runtime, _join) = create_port_runtime(EnumPort { base }, RuntimeConfig::default())
-        .expect("port runtime starts");
+    let (runtime, _join) =
+        create_port_runtime_unclaimed(EnumPort { base }, RuntimeConfig::default())
+            .expect("port runtime starts");
     let handle = runtime.port_handle().clone();
     let owner = Arc::new(PvDatabase::new());
     register_port(

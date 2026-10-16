@@ -18,13 +18,14 @@ async fn main() {
     println!("=== asyn-rs Scope Simulator ===");
     println!("Port of EPICS testAsynPortDriver (digital oscilloscope simulator)\n");
 
-    // 1. Create Notify + Driver
+    // 1. Claim the name, then create Notify + Driver
+    let claim = asyn_rs::asyn_record::claim_port("scopeSim").expect("the port name is free");
     let notify = Arc::new(Notify::new());
     let driver = ScopeSimulator::new("scopeSim", notify.clone());
     let indices = driver.param_indices();
 
     // 2. Create port runtime (driver moves into actor thread)
-    let (runtime_handle, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _jh) = create_port_runtime(&claim, driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
     let port_handle = runtime_handle.port_handle().clone();
 
@@ -42,12 +43,9 @@ async fn main() {
     // construction seeds is delivered rather than missed.
     // The gate is a database's; this program has none, so it owns the port
     // with an open one: registering flushes the construction seeds at once.
-    asyn_rs::asyn_record::register_port(
-        port_handle.port_name(),
-        port_handle.clone(),
-        &asyn_rs::registry::open_owner(),
-    )
-    .expect("the port name is free");
+    claim
+        .publish(port_handle.clone(), &asyn_rs::registry::open_owner())
+        .expect("a fresh port has no owner");
 
     // 5. Spawn background simulation task
     let sim_handle = port_handle.clone();

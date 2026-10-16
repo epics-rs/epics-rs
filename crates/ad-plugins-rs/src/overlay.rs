@@ -708,6 +708,11 @@ impl NDPluginProcess for OverlayProcessor {
         "NDPluginOverlay"
     }
 
+    /// NDPluginOverlay.cpp:440
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(true)
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,

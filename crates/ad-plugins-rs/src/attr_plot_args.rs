@@ -18,6 +18,7 @@
 //! reason this module exists: it is not there to link to in the very
 //! configuration this paragraph is explaining.
 
+use ad_core_rs::plugin::runtime::ArraySource;
 use epics_base_rs::server::iocsh::registry::ArgValue;
 
 /// Parsed `NDAttrPlotConfig` arguments.
@@ -26,7 +27,7 @@ pub struct AttrPlotArgs {
     pub n_attributes: usize,
     pub cache_size: usize,
     pub n_data_blocks: usize,
-    pub in_port: String,
+    pub source: ArraySource,
     pub queue_size: usize,
 }
 
@@ -47,16 +48,20 @@ pub fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
         Some(ArgValue::Int(n)) => (*n).max(0) as usize,
         _ => default,
     };
-    let in_port = match args.get(4) {
+    let port = match args.get(4) {
         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
         _ => String::new(),
+    };
+    let addr = match args.get(5) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
     };
     Ok(AttrPlotArgs {
         port_name,
         n_attributes: usize_arg(1, 8),
         cache_size: usize_arg(2, 1000),
         n_data_blocks: usize_arg(3, 4),
-        in_port,
+        source: ArraySource { port, addr },
         queue_size: usize_arg(6, 20),
     })
 }
@@ -86,7 +91,7 @@ mod tests {
         assert_eq!(p.n_attributes, 10);
         assert_eq!(p.cache_size, 500);
         assert_eq!(p.n_data_blocks, 3);
-        assert_eq!(p.in_port, "DET1");
+        assert_eq!(p.source.port, "DET1");
         assert_eq!(p.queue_size, 50);
     }
 
@@ -113,7 +118,7 @@ mod tests {
             "explicit 0 cache_size honoured (unlimited)"
         );
         assert_eq!(p.n_data_blocks, 4, "absent n_data_blocks -> fallback");
-        assert_eq!(p.in_port, "", "absent in_port -> empty");
+        assert_eq!(p.source.port, "", "absent in_port -> empty");
         assert_eq!(p.queue_size, 20, "absent queue_size -> fallback");
     }
 }

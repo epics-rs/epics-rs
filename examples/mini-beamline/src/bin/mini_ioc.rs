@@ -211,15 +211,14 @@ async fn main() -> CaResult<()> {
                     ("PD_SLIT", DetectorMode::Slit),
                 ];
                 for (port, mode) in &pd_configs {
-                    let rt = point_detector::create_point_detector(port, *mode)
+                    let claim =
+                        asyn_rs::manager::claim_port_driver(port).map_err(|e| e.to_string())?;
+                    let rt = point_detector::create_point_detector(&claim, *mode)
                         .map_err(|e| format!("failed to create PointDetector {port}: {e}"))?;
                     let port_handle = rt.port_handle().clone();
-                    asyn_rs::asyn_record::register_port(
-                        port,
-                        port_handle,
-                        ctx.db().scan_control().interrupt_gate(),
-                    )
-                    .map_err(|e| e.to_string())?;
+                    claim
+                        .publish(port_handle, ctx.db().scan_control().interrupt_gate())
+                        .map_err(|e| e.to_string())?;
                     h.pd_runtimes.lock().unwrap().insert(port.to_string(), rt);
                     println!("  PointDetector '{port}' created");
                 }
@@ -244,9 +243,11 @@ async fn main() -> CaResult<()> {
                     dot_image_config.n_per_i_per_s
                 );
 
+                let dot_claim =
+                    asyn_rs::manager::claim_port_driver("DOT").map_err(|e| e.to_string())?;
                 let dot_output = NDArrayOutput::new();
                 let dot_rt = create_moving_dot_with_config(
-                    "DOT",
+                    &dot_claim,
                     dot_size_x,
                     dot_size_y,
                     dot_max_mem,
@@ -255,12 +256,9 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("failed to create MovingDot: {e}"))?;
                 let dot_handle = dot_rt.port_handle().clone();
-                asyn_rs::asyn_record::register_port(
-                    "DOT",
-                    dot_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                dot_claim
+                    .publish(dot_handle, ctx.db().scan_control().interrupt_gate())
+                    .map_err(|e| e.to_string())?;
 
                 // Connect MovingDot as the data source for the plugin chain
                 // (NDStdArraysConfigure etc. will call connect_downstream on this)

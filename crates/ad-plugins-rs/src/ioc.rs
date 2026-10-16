@@ -9,13 +9,15 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, count_arg, dtyp_from_port, extract_plugin_args, gather_arg_defs,
-    max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
-    threads_arg,
+    PluginManager, attr_arg_defs, count_arg, extract_plugin_args, gather_arg_defs, max_threads_arg,
+    plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands, threads_arg,
 };
-use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
+use ad_core_rs::plugin::runtime::{
+    ArraySource, create_plugin_runtime, create_plugin_runtime_multi_addr,
+};
 use ad_core_rs::plugin::wiring::WiringRegistry;
-use asyn_rs::manager::PortManager;
+use asyn_rs::asyn_record::PortClaim;
+use asyn_rs::manager::{PortManager, claim_port_driver};
 use asyn_rs::services::PortServices;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
@@ -117,8 +119,6 @@ pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 25] = [
 /// The `PluginManager` must have its driver context set (via `set_driver()`)
 /// before any of these commands are invoked from st.cmd.
 pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -> IocApplication {
-    let ts_registry = Arc::new(crate::time_series::TsReceiverRegistry::new());
-
     // --- NDStdArraysConfigure ---
     {
         let m = mgr.clone();
@@ -127,25 +127,27 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDStdArraysConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, _queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
+                let (port_name, _queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _data, _jh) = crate::std_arrays::create_std_arrays_runtime(
-                    &port_name,
+                    &claim,
                     pool,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDStdArraysConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDStdArraysConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
@@ -156,34 +158,34 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     // --- NDStatsConfigure ---
     {
         let m = mgr.clone();
-        let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDStatsConfigure",
             plugin_arg_defs(),
             "NDStatsConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _stats, _stats_params, _jh) = crate::stats::create_stats_runtime(
-                    &port_name,
+                    &claim,
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
-                    &tsr,
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
 
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDStatsConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDStatsConfigure: wiring failed: {e}");
                 }
 
@@ -200,26 +202,28 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDROIConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _roi_params, _jh) = crate::roi::create_roi_runtime(
-                    &port_name,
+                    &claim,
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDROIConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDROIConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
@@ -233,14 +237,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::process::{ProcessConfig, ProcessProcessor};
             create_plugin_runtime(
-                port_name,
+                claim,
                 ProcessProcessor::new(ProcessConfig::default()),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -255,14 +259,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::pos_plugin::{PosMode, PosPluginProcessor};
             create_plugin_runtime(
-                port_name,
+                claim,
                 PosPluginProcessor::new(PosMode::Discard),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -275,14 +279,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::transform::{TransformProcessor, TransformType};
             create_plugin_runtime(
-                port_name,
+                claim,
                 TransformProcessor::new(TransformType::None),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -295,7 +299,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
             use ad_core_rs::color::{NDBayerPattern, NDColorMode};
             let config = ColorConvertConfig {
@@ -304,11 +308,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 false_color: 0,
             };
             create_plugin_runtime(
-                port_name,
+                claim,
                 ColorConvertProcessor::new(config),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -325,33 +329,31 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs_with_count("maxOverlays"),
             "NDOverlayConfigure portName [queueSize] ...".to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
-                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                    println!("NDOverlayConfigure: port={port_name} already configured, skipping");
-                    return Ok(CommandOutcome::Continue);
-                }
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let max_overlays = count_arg(args, 5);
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
-                    &port_name,
+                    &claim,
                     crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
                     max_overlays,
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDOverlayConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDOverlayConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
@@ -365,14 +367,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::fft::FFTProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 FFTProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -385,16 +387,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Fixed(2_000_000),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             create_plugin_runtime(
-                port_name,
+                claim,
                 // queue_size is C `maxBuffers_` (NDCircularBuffConfigure
                 // queueSize); the processor bounds the accepted pre-count by it.
                 CircularBuffProcessor::new(100, 100, TriggerCondition::External, queue_size),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -407,18 +409,18 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::codec::{CodecMode, CodecProcessor};
             use ad_core_rs::codec::CodecName;
             create_plugin_runtime(
-                port_name,
+                claim,
                 CodecProcessor::new(CodecMode::Compress {
                     codec: CodecName::LZ4,
                     quality: 90,
                 }),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -431,14 +433,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::scatter::ScatterProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 ScatterProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -459,16 +461,15 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDGatherConfigure portName [queueSize] [blockingCallbacks] [maxPorts]".to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let (port_name, queue_size, _) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
-                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                    println!("NDGatherConfigure: port={port_name} already configured, skipping");
-                    return Ok(CommandOutcome::Continue);
-                }
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let max_ports = count_arg(args, 3);
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
-                    &port_name,
+                    &claim,
                     crate::gather::GatherProcessor::new(max_ports),
                     pool,
                     queue_size,
@@ -478,10 +479,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     threads_arg(args, 7),
                 );
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDGatherConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
                 Ok(CommandOutcome::Continue)
             },
@@ -533,22 +533,21 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     n_attributes,
                     cache_size,
                     n_data_blocks,
-                    in_port,
+                    source,
                     queue_size,
                 } = parse_attr_plot_args(args)?;
 
-                let dtyp = dtyp_from_port(&port_name);
-                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                    println!("NDAttrPlotConfig: port={port_name} already configured, skipping");
-                    return Ok(CommandOutcome::Continue);
-                }
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 // Addr 0 always exists, so at least one address even for a
                 // degenerate 0/0 request.
                 let max_addr = n_attributes.max(n_data_blocks).max(1);
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
-                    &port_name,
+                    &claim,
                     crate::attr_plot::AttrPlotProcessor::new(
                         n_attributes,
                         cache_size,
@@ -556,18 +555,17 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     ),
                     pool,
                     queue_size,
-                    &in_port,
+                    &source,
                     m.wiring().clone(),
                     max_addr,
                     threads_arg(args, 9),
                 );
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDAttrPlotConfig: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &in_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDAttrPlotConfig: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
@@ -581,14 +579,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_tiff::TiffFileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 TiffFileProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -601,14 +599,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 JpegFileProcessor::new(50),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -621,14 +619,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_hdf5::Hdf5FileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 Hdf5FileProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -641,14 +639,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_netcdf::NetcdfFileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 NetcdfFileProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -661,14 +659,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_magick::MagickFileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 MagickFileProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -678,40 +676,40 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     // --- NDAttrConfigure ---
     {
         let m = mgr.clone();
-        let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDAttrConfigure",
             attr_arg_defs(),
             "NDAttrConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
                 // C arg index 5 is maxAttributes (NDPluginAttribute.cpp:245); a
                 // missing iocsh int arg defaults to 0, which C floors to 1.
                 let max_attributes = match args.get(5) {
                     Some(ArgValue::Int(n)) => *n as i32,
                     _ => 0,
                 };
-                let dtyp = dtyp_from_port(&port_name);
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
 
                 let (handle, _jh) = crate::attribute::create_attribute_runtime(
-                    &port_name,
+                    &claim,
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
-                    &tsr,
                     max_attributes,
                     threads_arg(args, 9),
                 );
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDAttrConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDAttrConfigure: wiring failed: {e}");
                 }
 
@@ -723,34 +721,34 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     // --- NDROIStatConfigure ---
     {
         let m = mgr.clone();
-        let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDROIStatConfigure",
             plugin_arg_defs_with_count("maxROIs"),
             "NDROIStatConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
                 let (handle, _roi_stat_params, _jh) = crate::roi_stat::create_roi_stat_runtime(
-                    &port_name,
+                    &claim,
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
                     count_arg(args, 5),
-                    &tsr,
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDROIStatConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDROIStatConfigure: wiring failed: {e}");
                 }
                 Ok(CommandOutcome::Continue)
@@ -766,14 +764,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         Some(9),
         PluginThreadArgs::Arg(8),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::bad_pixel::BadPixelProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 BadPixelProcessor::new(vec![]),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -787,14 +785,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         plugin_arg_defs(),
         None,
         PluginThreadArgs::Arg(6),
-        |port_name, queue_size, ndarray_port, pool, wiring, threads| {
+        |claim, queue_size, source, pool, wiring, threads| {
             use crate::file_nexus::NexusFileProcessor;
             create_plugin_runtime(
-                port_name,
+                claim,
                 NexusFileProcessor::new(),
                 pool,
                 queue_size,
-                ndarray_port,
+                source,
                 wiring,
                 threads,
             )
@@ -802,87 +800,48 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     );
 
     // --- NDTimeSeriesConfigure ---
-    // Picks up a pending TS receiver from the registry (stored by Stats/ROIStat/Attr)
-    // and creates the TS port.
+    // C NDTimeSeriesConfigure(portName, queueSize, blockingCallbacks,
+    //   NDArrayPort, NDArrayAddr, maxSignals, ...): an NDPluginTimeSeries port.
+    // Stats/Attribute feed it at their address 1; NDArrayAddress selects it.
     {
         let m = mgr.clone();
-        let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDTimeSeriesConfigure",
             plugin_arg_defs(),
             "NDTimeSeriesConfigure portName [queueSize] [blockingCallbacks] NDArrayPort",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
-                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                    println!(
-                        "NDTimeSeriesConfigure: port={port_name} already configured, skipping"
-                    );
-                    return Ok(CommandOutcome::Continue);
-                }
-                // One read for both ports below: C builds the same plugin either way.
-                let threads = threads_arg(args, 9);
-
-                // Look up the pending receiver from the upstream plugin
-                let (ts_rx, channel_names) = match tsr.take(&ndarray_port) {
-                    Some(entry) => entry,
-                    None => {
-                        // No upstream TS receiver registered: the upstream is a raw
-                        // NDArray source, so stand up the standalone
-                        // NDPluginTimeSeries which ingests the arrays directly
-                        // (C NDPluginTimeSeries.cpp). C's NDTimeSeriesConfigure
-                        // takes maxSignals at arg index 5.
-                        let max_signals = match args.get(5) {
-                            Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
-                            _ => 1,
-                        };
-                        let drv = m.driver()?;
-                        let pool = drv.pool();
-                        let (handle, _jh) = create_plugin_runtime_multi_addr(
-                            &port_name,
-                            crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
-                            pool,
-                            queue_size,
-                            &ndarray_port,
-                            m.wiring().clone(),
-                            // C maxAddr = maxSignals + 1 (the 2-D array callback
-                            // address is reserved at addr == maxSignals).
-                            max_signals + 1,
-                            threads,
-                        );
-                        if let Err(e) =
-                            m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
-                        {
-                            eprintln!("NDTimeSeriesConfigure: {e}");
-                            return Ok(CommandOutcome::Continue);
-                        }
-                        if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port)
-                        {
-                            eprintln!("NDTimeSeriesConfigure: wiring failed: {e}");
-                        }
-                        return Ok(CommandOutcome::Continue);
-                    }
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-
-                let channel_name_refs: Vec<&str> =
-                    channel_names.iter().map(|s| s.as_str()).collect();
+                let threads = threads_arg(args, 9);
+                let max_signals = match args.get(5) {
+                    Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
+                    _ => 1,
+                };
                 let drv = m.driver()?;
-                let (ts_runtime, _ts_params, _ts_actor_jh, _ts_data_jh) =
-                    crate::time_series::create_ts_port_runtime(
-                        &port_name,
-                        &channel_name_refs,
-                        2048,
-                        ts_rx,
-                        drv.pool(),
-                        threads,
-                    );
+                let pool = drv.pool();
+                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                    &claim,
+                    crate::time_series_plugin::TimeSeriesProcessor::new(max_signals, pool.clone()),
+                    pool,
+                    queue_size,
+                    source,
+                    m.wiring().clone(),
+                    // C maxAddr = maxSignals + 1 (the 2-D array callback
+                    // address is reserved at addr == maxSignals).
+                    max_signals + 1,
+                    threads,
+                );
                 if let Err(e) =
-                    m.add_port(&dtyp, ts_runtime, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDTimeSeriesConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
+                    eprintln!("NDTimeSeriesConfigure: wiring failed: {e}");
+                }
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -911,12 +870,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDPvaConfigure portName queueSize blockingCallbacks NDArrayPort NDArrayAddr pvName"
                 .to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-                let dtyp = dtyp_from_port(&port_name);
-                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                    println!("NDPvaConfigure: port={port_name} already configured, skipping");
-                    return Ok(CommandOutcome::Continue);
-                }
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let claim = match claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let drv = m.driver()?;
                 let pool = drv.pool();
 
@@ -946,21 +904,20 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 let processor = crate::passthrough::PassthroughProcessor::new("NDPvaConfigure");
 
                 let (handle, _jh) = create_plugin_runtime(
-                    &port_name,
+                    &claim,
                     processor,
                     pool,
                     queue_size,
-                    &ndarray_port,
+                    &source,
                     m.wiring().clone(),
                     threads_arg(args, 9),
                 );
                 if let Err(e) =
-                    m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate())
+                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
                 {
-                    eprintln!("NDPvaConfigure: {e}");
-                    return Ok(CommandOutcome::Continue);
+                    return Ok(ctx.cxx_error(e));
                 }
-                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+                if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                     eprintln!("NDPvaConfigure: wiring failed: {e}");
                 }
                 #[cfg(not(feature = "pva"))]
@@ -1018,9 +975,9 @@ fn register_generic_plugin<F>(
 ) -> IocApplication
 where
     F: Fn(
-            &str,
+            &PortClaim,
             usize,
-            &str,
+            &ArraySource,
             Arc<ad_core_rs::ndarray_pool::NDArrayPool>,
             Arc<WiringRegistry>,
             ad_core_rs::plugin::runtime::PluginThreads,
@@ -1039,14 +996,11 @@ where
         arg_defs,
         format!("{cmd_name} portName [queueSize] ..."),
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
-            let dtyp = dtyp_from_port(&port_name);
-            // Skip if port already exists (allows commonPlugins.cmd to be
-            // loaded multiple times with different PREFIX for alias records).
-            if asyn_rs::asyn_record::get_port(&port_name).is_some() {
-                println!("{cmd_name}: port={port_name} already configured, skipping");
-                return Ok(CommandOutcome::Continue);
-            }
+            let (port_name, queue_size, source) = extract_plugin_args(args)?;
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
             let drv = m.driver()?;
             let pool = drv.pool();
             let threads = match thread_args {
@@ -1056,9 +1010,9 @@ where
                 }
             };
             let (handle, _jh) = factory(
-                &port_name,
+                &claim,
                 queue_size,
-                &ndarray_port,
+                &source,
                 pool,
                 m.wiring().clone(),
                 threads,
@@ -1066,11 +1020,10 @@ where
             if let Some(idx) = max_threads_idx {
                 handle.set_max_threads(max_threads_arg(args, idx));
             }
-            if let Err(e) = m.add_plugin(&dtyp, &handle, ctx.db().scan_control().interrupt_gate()) {
-                eprintln!("{cmd_name}: {e}");
-                return Ok(CommandOutcome::Continue);
+            if let Err(e) = m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate()) {
+                return Ok(ctx.cxx_error(e));
             }
-            if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
+            if let Err(e) = handle.connect_to_array_port(m.wiring()) {
                 eprintln!("{cmd_name}: wiring failed: {e}");
             }
             Ok(CommandOutcome::Continue)

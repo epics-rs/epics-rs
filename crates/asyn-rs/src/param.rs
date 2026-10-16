@@ -2,7 +2,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 
@@ -134,9 +133,9 @@ impl ParamValue {
 
     /// Read this value through the **asynInt32** interface — the single owner
     /// of that interface's read rule, shared by the parameter-store getters
-    /// ([`ParamList::get_int32`]) and the device-support I/O-Intr path, so a
-    /// value delivered to a record cannot be typed differently from the same
-    /// value read by a poll.
+    /// ([`crate::port::PortDriverBase::get_int32_param`]) and the
+    /// device-support I/O-Intr path, so a value delivered to a record cannot
+    /// be typed differently from the same value read by a poll.
     ///
     /// A parameter whose type the interface cannot read is an
     /// [`AsynError::TypeMismatch`], never a coercion: C keeps one interrupt
@@ -242,7 +241,6 @@ struct ParamEntry {
     status: AsynStatus,
     alarm_status: u16,
     alarm_severity: u16,
-    timestamp: Option<SystemTime>,
     /// UInt32Digital: bitmask of bits that changed (for interrupt filtering).
     /// C parity: uInt32CallbackMask in paramVal.
     uint32_interrupt_mask: u32,
@@ -296,7 +294,6 @@ impl ParamEntry {
             status: AsynStatus::Success,
             alarm_status: 0,
             alarm_severity: 0,
-            timestamp: None,
             uint32_interrupt_mask: 0,
             uint32_rising_mask: 0,
             uint32_falling_mask: 0,
@@ -467,25 +464,13 @@ impl ParamList {
 
     // --- Scalar getters/setters ---
 
-    /// Read the cached Int32 value, falling back to the type default
-    /// (`0`) if the parameter has not been set.
-    ///
-    /// Use [`Self::get_int32_strict`] when you need C parity for
-    /// `asynParamUndefined` — the lax variant matches the
-    /// `.unwrap_or(0)` convention used throughout the workspace and
-    /// stays callable on never-set params.
-    pub fn get_int32(&self, index: usize, addr: i32) -> AsynResult<i32> {
-        self.get_entry(index, addr)?.value.as_int32()
-    }
-
-    /// Strict variant of [`Self::get_int32`] — returns
     /// [`AsynError::ParamUndefined`] when the entry has never been set.
     ///
     /// C parity: `paramVal::getInteger` (`paramVal.cpp:147-154`) checks
     /// `WrongType` first then `NotDefined`; the wrapping
     /// `paramList::getInteger` (`asynPortDriver.cpp:301-321`) translates
     /// `ParamValNotDefined` to `asynParamUndefined`.
-    pub fn get_int32_strict(&self, index: usize, addr: i32) -> AsynResult<i32> {
+    pub(crate) fn get_int32(&self, index: usize, addr: i32) -> AsynResult<i32> {
         let entry = self.get_entry(index, addr)?;
         // C order: WrongType first (`as_int32`), then NotDefined.
         let value = entry.value.as_int32()?;
@@ -495,7 +480,7 @@ impl ParamList {
         Ok(value)
     }
 
-    pub fn set_int32(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
+    pub(crate) fn set_int32(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
         let (entry, flags) = self.entry_flags_mut(index, addr)?;
         match entry.value {
             ParamValue::Int32(ref old) => {
@@ -539,17 +524,11 @@ impl ParamList {
         Ok(())
     }
 
-    /// Lax variant — returns `0.0` for an undefined Float64. Use
-    /// [`Self::get_float64_strict`] for C parity.
-    pub fn get_float64(&self, index: usize, addr: i32) -> AsynResult<f64> {
-        self.get_entry(index, addr)?.value.as_float64()
-    }
-
-    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
-    /// entry has never been set. C parity:
+    /// [`AsynError::ParamUndefined`] when the entry has never been set.
+    /// C parity:
     /// `paramVal::getDouble` (`paramVal.cpp:259-266`) +
     /// `paramList::getDouble` (`asynPortDriver.cpp:383-403`).
-    pub fn get_float64_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
+    pub(crate) fn get_float64(&self, index: usize, addr: i32) -> AsynResult<f64> {
         let entry = self.get_entry(index, addr)?;
         let value = entry.value.as_float64()?;
         if !entry.defined {
@@ -558,7 +537,7 @@ impl ParamList {
         Ok(value)
     }
 
-    pub fn set_float64(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
+    pub(crate) fn set_float64(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
         let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Float64(ref old) = entry.value {
             // C parity: paramVal::setDouble (paramVal.cpp:243-253) —
@@ -578,17 +557,11 @@ impl ParamList {
         Ok(())
     }
 
-    /// Lax variant — returns `0` for an undefined Int64. Use
-    /// [`Self::get_int64_strict`] for C parity.
-    pub fn get_int64(&self, index: usize, addr: i32) -> AsynResult<i64> {
-        self.get_entry(index, addr)?.value.as_int64()
-    }
-
-    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
-    /// entry has never been set. C parity: `paramVal::getInteger64`
+    /// [`AsynError::ParamUndefined`] when the entry has never been set.
+    /// C parity: `paramVal::getInteger64`
     /// (`paramVal.cpp:176-183`) + `paramList::getInteger64`
     /// (`asynPortDriver.cpp:328-348`).
-    pub fn get_int64_strict(&self, index: usize, addr: i32) -> AsynResult<i64> {
+    pub(crate) fn get_int64(&self, index: usize, addr: i32) -> AsynResult<i64> {
         let entry = self.get_entry(index, addr)?;
         let value = entry.value.as_int64()?;
         if !entry.defined {
@@ -597,7 +570,7 @@ impl ParamList {
         Ok(value)
     }
 
-    pub fn set_int64(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
+    pub(crate) fn set_int64(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
         let (entry, flags) = self.entry_flags_mut(index, addr)?;
         if let ParamValue::Int64(ref old) = entry.value {
             // C parity: paramVal::setInteger64 (paramVal.cpp:160-170).
@@ -615,17 +588,11 @@ impl ParamList {
         Ok(())
     }
 
-    /// Lax variant — returns no bytes for an undefined Octet.
-    /// Use [`Self::get_string_strict`] for C parity.
-    pub fn get_string(&self, index: usize, addr: i32) -> AsynResult<&[u8]> {
-        self.get_entry(index, addr)?.value.as_octet()
-    }
-
-    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
-    /// entry has never been set. C parity: `paramVal::getString`
+    /// [`AsynError::ParamUndefined`] when the entry has never been set.
+    /// C parity: `paramVal::getString`
     /// (`paramVal.cpp:287-294`) + `paramList::getString`
     /// (`asynPortDriver.cpp:543-565`).
-    pub fn get_string_strict(&self, index: usize, addr: i32) -> AsynResult<&[u8]> {
+    pub(crate) fn get_string(&self, index: usize, addr: i32) -> AsynResult<&[u8]> {
         let entry = self.get_entry(index, addr)?;
         let value = entry.value.as_octet()?;
         if !entry.defined {
@@ -642,7 +609,7 @@ impl ParamList {
     /// buffer, only when they differ — C's `sval != value` then
     /// `sval = value` (paramVal.cpp:271-281). An unchanged value allocates
     /// nothing.
-    pub fn set_string(
+    pub(crate) fn set_string(
         &mut self,
         index: usize,
         addr: i32,
@@ -679,17 +646,11 @@ impl ParamList {
         Ok(())
     }
 
-    /// Lax variant — returns `0` for an undefined UInt32Digital. Use
-    /// [`Self::get_uint32_strict`] for C parity.
-    pub fn get_uint32(&self, index: usize, addr: i32) -> AsynResult<u32> {
-        self.get_entry(index, addr)?.value.as_uint32()
-    }
-
-    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
-    /// entry has never been set. C parity: `paramVal::getUInt32`
+    /// [`AsynError::ParamUndefined`] when the entry has never been set.
+    /// C parity: `paramVal::getUInt32`
     /// (`paramVal.cpp:230-237`) + `paramList::getUInt32`
     /// (`asynPortDriver.cpp:356-376`).
-    pub fn get_uint32_strict(&self, index: usize, addr: i32) -> AsynResult<u32> {
+    pub(crate) fn get_uint32(&self, index: usize, addr: i32) -> AsynResult<u32> {
         let entry = self.get_entry(index, addr)?;
         let value = entry.value.as_uint32()?;
         if !entry.defined {
@@ -698,7 +659,7 @@ impl ParamList {
         Ok(value)
     }
 
-    pub fn set_uint32(
+    pub(crate) fn set_uint32(
         &mut self,
         index: usize,
         addr: i32,
@@ -1143,7 +1104,12 @@ impl ParamList {
     /// `UInt32Digital` is stored with a full write mask and no forced interrupt
     /// bits; use [`Self::set_uint32`] directly for C `setUIntDigitalParam`'s
     /// masked set.
-    pub fn set_value(&mut self, index: usize, addr: i32, value: ParamValue) -> AsynResult<()> {
+    pub(crate) fn set_value(
+        &mut self,
+        index: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
         let type_name = value.type_name();
         match value {
             ParamValue::Int32(v) => self.set_int32(index, addr, v),
@@ -1194,7 +1160,7 @@ impl ParamList {
 
     // --- Status ---
 
-    pub fn set_param_status(
+    pub(crate) fn set_param_status(
         &mut self,
         index: usize,
         addr: i32,
@@ -1233,17 +1199,6 @@ impl ParamList {
     pub fn get_param_status(&self, index: usize, addr: i32) -> AsynResult<(AsynStatus, u16, u16)> {
         let entry = self.get_entry(index, addr)?;
         Ok((entry.status, entry.alarm_status, entry.alarm_severity))
-    }
-
-    // --- Timestamp ---
-
-    pub fn set_timestamp(&mut self, index: usize, addr: i32, ts: SystemTime) -> AsynResult<()> {
-        self.get_entry_mut(index, addr)?.timestamp = Some(ts);
-        Ok(())
-    }
-
-    pub fn get_timestamp(&self, index: usize, addr: i32) -> AsynResult<Option<SystemTime>> {
-        Ok(self.get_entry(index, addr)?.timestamp)
     }
 
     // --- Change tracking ---
@@ -1917,7 +1872,6 @@ mod tests {
     fn test_get_set_int32() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("VAL", ParamType::Int32).unwrap();
-        assert_eq!(pl.get_int32(idx, 0).unwrap(), 0);
         pl.set_int32(idx, 0, 42).unwrap();
         assert_eq!(pl.get_int32(idx, 0).unwrap(), 42);
     }
@@ -2077,22 +2031,6 @@ mod tests {
         assert_eq!(pl.param_name(0), Some("TEMP"));
         assert_eq!(pl.param_type(0), Some(ParamType::Float64));
         assert_eq!(pl.param_name(99), None);
-    }
-
-    #[test]
-    fn test_timestamp_none_by_default() {
-        let mut pl = ParamList::new(1);
-        pl.create_param("V", ParamType::Int32).unwrap();
-        assert_eq!(pl.get_timestamp(0, 0).unwrap(), None);
-    }
-
-    #[test]
-    fn test_timestamp_set_get() {
-        let mut pl = ParamList::new(1);
-        pl.create_param("V", ParamType::Int32).unwrap();
-        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(12345);
-        pl.set_timestamp(0, 0, ts).unwrap();
-        assert_eq!(pl.get_timestamp(0, 0).unwrap(), Some(ts));
     }
 
     #[test]
@@ -2265,7 +2203,6 @@ mod tests {
     fn test_get_set_int64() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("BIG", ParamType::Int64).unwrap();
-        assert_eq!(pl.get_int64(idx, 0).unwrap(), 0);
         pl.set_int64(idx, 0, i64::MAX).unwrap();
         assert_eq!(pl.get_int64(idx, 0).unwrap(), i64::MAX);
     }
@@ -2366,77 +2303,71 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Strict-getter / C-parity tests for asynParamUndefined.
-    // The lax `get_*` variants stay at the type default; the `_strict`
-    // variants surface the C status. The setters now flip `defined` on a
-    // first set even when the value equals the type default
+    // C-parity tests for asynParamUndefined. The setters flip `defined` on
+    // a first set even when the value equals the type default
     // (C `paramVal::setInteger/setDouble/setString/setUInt32`).
     // ------------------------------------------------------------------
 
     #[test]
-    fn get_int32_strict_undefined_returns_param_undefined() {
+    fn get_int32_undefined_returns_param_undefined() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("U", ParamType::Int32).unwrap();
-        // Lax getter still works (returns the type default).
-        assert_eq!(pl.get_int32(idx, 0).unwrap(), 0);
-        // Strict getter surfaces asynParamUndefined.
-        let err = pl.get_int32_strict(idx, 0).unwrap_err();
+        let err = pl.get_int32(idx, 0).unwrap_err();
         assert!(matches!(err, AsynError::ParamUndefined(i) if i == idx));
         pl.set_int32(idx, 0, 7).unwrap();
-        assert_eq!(pl.get_int32_strict(idx, 0).unwrap(), 7);
+        assert_eq!(pl.get_int32(idx, 0).unwrap(), 7);
     }
 
     #[test]
-    fn get_float64_strict_undefined_returns_param_undefined() {
+    fn get_float64_undefined_returns_param_undefined() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("U", ParamType::Float64).unwrap();
-        assert_eq!(pl.get_float64(idx, 0).unwrap(), 0.0);
         assert!(matches!(
-            pl.get_float64_strict(idx, 0).unwrap_err(),
+            pl.get_float64(idx, 0).unwrap_err(),
             AsynError::ParamUndefined(i) if i == idx
         ));
     }
 
     #[test]
-    fn get_int64_strict_undefined_returns_param_undefined() {
+    fn get_int64_undefined_returns_param_undefined() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("U", ParamType::Int64).unwrap();
         assert!(matches!(
-            pl.get_int64_strict(idx, 0).unwrap_err(),
+            pl.get_int64(idx, 0).unwrap_err(),
             AsynError::ParamUndefined(i) if i == idx
         ));
     }
 
     #[test]
-    fn get_uint32_strict_undefined_returns_param_undefined() {
+    fn get_uint32_undefined_returns_param_undefined() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
         assert!(matches!(
-            pl.get_uint32_strict(idx, 0).unwrap_err(),
+            pl.get_uint32(idx, 0).unwrap_err(),
             AsynError::ParamUndefined(i) if i == idx
         ));
     }
 
     #[test]
-    fn get_string_strict_undefined_returns_param_undefined() {
+    fn get_string_undefined_returns_param_undefined() {
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("U", ParamType::Octet).unwrap();
         assert!(matches!(
-            pl.get_string_strict(idx, 0).unwrap_err(),
+            pl.get_string(idx, 0).unwrap_err(),
             AsynError::ParamUndefined(i) if i == idx
         ));
     }
 
     #[test]
-    fn get_strict_checks_type_before_undefined_c_parity() {
+    fn get_checks_type_before_undefined_c_parity() {
         // C parity: paramVal::getInteger throws ParamValWrongType before
         // ParamValNotDefined (paramVal.cpp:147-154). Reading a Float64
-        // param via get_int32_strict on a never-set entry must surface
+        // param via get_int32 on a never-set entry must surface
         // TypeMismatch, not ParamUndefined.
         let mut pl = ParamList::new(1);
         let idx = pl.create_param("F", ParamType::Float64).unwrap();
         assert!(matches!(
-            pl.get_int32_strict(idx, 0).unwrap_err(),
+            pl.get_int32(idx, 0).unwrap_err(),
             AsynError::TypeMismatch {
                 expected: "Int32",
                 ..
@@ -2454,7 +2385,7 @@ mod tests {
         pl.set_int32(idx, 0, 0).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
         assert!(pl.take_changed_single(idx, 0).unwrap());
-        assert_eq!(pl.get_int32_strict(idx, 0).unwrap(), 0);
+        assert_eq!(pl.get_int32(idx, 0).unwrap(), 0);
     }
 
     #[test]
@@ -2463,7 +2394,7 @@ mod tests {
         let idx = pl.create_param("V", ParamType::Float64).unwrap();
         pl.set_float64(idx, 0, 0.0).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
-        assert_eq!(pl.get_float64_strict(idx, 0).unwrap(), 0.0);
+        assert_eq!(pl.get_float64(idx, 0).unwrap(), 0.0);
     }
 
     #[test]
@@ -2477,7 +2408,7 @@ mod tests {
         pl.set_uint32(idx, 0, 0, 0xFFFF, 0).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
         assert!(pl.take_changed_single(idx, 0).unwrap());
-        assert_eq!(pl.get_uint32_strict(idx, 0).unwrap(), 0);
+        assert_eq!(pl.get_uint32(idx, 0).unwrap(), 0);
     }
 
     #[test]
@@ -2486,7 +2417,7 @@ mod tests {
         let idx = pl.create_param("V", ParamType::Octet).unwrap();
         pl.set_string(idx, 0, Vec::new()).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
-        assert_eq!(pl.get_string_strict(idx, 0).unwrap(), b"");
+        assert_eq!(pl.get_string(idx, 0).unwrap(), b"");
     }
 
     #[test]

@@ -15,7 +15,8 @@ use rayon::prelude::*;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle, ProcessResult,
+    ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, PluginRuntimeHandle,
+    ProcessResult,
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
@@ -1766,8 +1767,6 @@ pub struct StatsProcessor {
     params: NDStatsParams,
     /// Shared cell to export params after register_params is called.
     params_out: Arc<Mutex<NDStatsParams>>,
-    /// Optional sender to push time series data to the TS port driver.
-    ts_sender: Option<crate::time_series::TimeSeriesSender>,
 }
 
 impl StatsProcessor {
@@ -1777,7 +1776,6 @@ impl StatsProcessor {
             config: Mutex::new(StatsConfig::default()),
             params: NDStatsParams::default(),
             params_out: Arc::new(Mutex::new(NDStatsParams::default())),
-            ts_sender: None,
         }
     }
 
@@ -1790,11 +1788,6 @@ impl StatsProcessor {
     pub fn params_handle(&self) -> Arc<Mutex<NDStatsParams>> {
         self.params_out.clone()
     }
-
-    /// Set the time series sender for pushing data to the TS port driver.
-    pub fn set_ts_sender(&mut self, sender: crate::time_series::TimeSeriesSender) {
-        self.ts_sender = Some(sender);
-    }
 }
 
 impl Default for StatsProcessor {
@@ -1805,7 +1798,7 @@ impl Default for StatsProcessor {
 
 impl NDPluginProcess for StatsProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
-    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let p = &self.params;
         let info = array.info();
         let cfg = *self.config.lock();
@@ -1959,43 +1952,45 @@ impl NDPluginProcess for StatsProcessor {
             ));
         }
 
-        // Send time series data to TS port driver (if configured)
-        if let Some(ref sender) = self.ts_sender {
-            let ts_data = crate::time_series::TimeSeriesData {
-                values: vec![
-                    result.min,
-                    result.min_x as f64,
-                    result.min_y as f64,
-                    result.max,
-                    result.max_x as f64,
-                    result.max_y as f64,
-                    result.mean,
-                    result.sigma,
-                    result.total,
-                    result.net,
-                    centroid.centroid_total,
-                    centroid.centroid_x,
-                    centroid.centroid_y,
-                    centroid.sigma_x,
-                    centroid.sigma_y,
-                    centroid.sigma_xy,
-                    centroid.skewness_x,
-                    centroid.skewness_y,
-                    centroid.kurtosis_x,
-                    centroid.kurtosis_y,
-                    centroid.eccentricity,
-                    centroid.orientation,
-                    // C `timeSeries[TSTimestamp] = pArray->timeStamp`
-                    // (NDPluginStats.cpp:577) — the standalone double.
-                    array.time_stamp,
-                ],
-            };
-            let _ = sender.try_send(ts_data);
-        }
+        // C posts the time-series point at address 1 every frame
+        // (NDPluginStats.cpp:555-586), whatever ArrayCallbacks says.
+        let ts_point = crate::time_series_plugin::time_series_point(
+            pool,
+            array,
+            &[
+                result.min,
+                result.min_x as f64,
+                result.min_y as f64,
+                result.max,
+                result.max_x as f64,
+                result.max_y as f64,
+                result.mean,
+                result.sigma,
+                result.total,
+                result.net,
+                centroid.centroid_total,
+                centroid.centroid_x,
+                centroid.centroid_y,
+                centroid.sigma_x,
+                centroid.sigma_y,
+                centroid.sigma_xy,
+                centroid.skewness_x,
+                centroid.skewness_y,
+                centroid.kurtosis_x,
+                centroid.kurtosis_y,
+                centroid.eccentricity,
+                centroid.orientation,
+                // C `timeSeries[TSTimestamp] = pArray->timeStamp`
+                // (NDPluginStats.cpp:577) — the standalone double.
+                array.time_stamp,
+            ],
+        );
 
         *self.latest_stats.lock() = result;
         // C++ Stats forwards the input array to downstream plugins
-        ProcessResult::forward(array, updates)
+        let mut out = ProcessResult::forward(array, updates);
+        out.addressed.extend(ts_point.map(|a| (1, a)));
+        out
     }
 
     fn plugin_type(&self) -> &str {
@@ -2125,18 +2120,14 @@ impl NDPluginProcess for StatsProcessor {
     }
 }
 
-/// Create a stats plugin runtime with an integrated time series port.
-///
-/// Returns:
-/// Create a stats plugin runtime. The TS receiver is stored in the registry
-/// for later pickup by `NDTimeSeriesConfigure`.
+/// Create a stats plugin runtime: C's two addresses (NDPluginStats.cpp:777),
+/// address 1 carrying the time-series point an NDPluginTimeSeries port reads.
 pub fn create_stats_runtime(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<WiringRegistry>,
-    ts_registry: &crate::time_series::TsReceiverRegistry,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
     PluginRuntimeHandle,
@@ -2144,31 +2135,16 @@ pub fn create_stats_runtime(
     NDStatsParams,
     std::thread::JoinHandle<()>,
 ) {
-    let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
-
-    let mut processor = StatsProcessor::new();
-    processor.set_ts_sender(ts_tx);
+    let processor = StatsProcessor::new();
     let stats_handle = processor.stats_handle();
     let params_handle = processor.params_handle();
 
-    let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        port_name,
-        processor,
-        pool,
-        queue_size,
-        ndarray_port,
-        wiring,
-        threads,
+    // C maxAddr 2 (NDPluginStats.cpp:777): addr 1 carries the TS point.
+    let (plugin_handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
+        claim, processor, pool, queue_size, source, wiring, 2, threads,
     );
 
     let stats_params = *params_handle.lock();
-
-    // Store the TS receiver for NDTimeSeriesConfigure to pick up
-    let channel_names: Vec<String> = crate::time_series::STATS_TS_CHANNEL_NAMES
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    ts_registry.store(port_name, ts_rx, channel_names);
 
     (plugin_handle, stats_handle, stats_params, data_jh)
 }
@@ -2179,41 +2155,38 @@ mod tests {
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
 
     #[test]
-    fn test_ts_timestamp_channel_is_the_standalone_double() {
-        // R8-66 family: C `timeSeries[TSTimestamp] = pArray->timeStamp`
-        // (NDPluginStats.cpp:577) — the standalone double a driver sets from its
-        // own clock, not a value derived from epicsTS. The port sent
-        // `timestamp.as_f64()`.
-        use crate::time_series::{NUM_STATS_TS_CHANNELS, STATS_TS_CHANNEL_NAMES};
+    fn test_ts_point_is_posted_at_address_1() {
+        // C posts MAX_TIME_SERIES_TYPES doubles at address 1, TSTimestamp last
+        // as `pArray->timeStamp` — the driver's own clock, not epicsTS — with
+        // the frame's uniqueId and epicsTS (NDPluginStats.cpp:555-586).
         use ad_core_rs::ndarray::NDArray;
         use ad_core_rs::ndarray_pool::NDArrayPool;
         use ad_core_rs::plugin::runtime::NDPluginProcess;
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut processor = StatsProcessor::new();
-        processor.set_ts_sender(tx);
-
+        let processor = StatsProcessor::new();
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.data = NDDataBuffer::U8(vec![1, 2, 3, 4]);
+        arr.unique_id = 42;
         arr.timestamp = ad_core_rs::timestamp::EpicsTimestamp {
             sec: 100,
             nsec: 500_000_000,
         };
         arr.time_stamp = 7.25; // hardware clock, unrelated to epicsTS
 
-        processor.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
+        let r = processor.process_array(&Arc::new(arr), &NDArrayPool::new(1_000_000));
 
-        let ts = rx.try_recv().expect("stats pushes a TS sample per frame");
-        assert_eq!(ts.values.len(), NUM_STATS_TS_CHANNELS);
-        let idx = STATS_TS_CHANNEL_NAMES
-            .iter()
-            .position(|n| *n == "TSTimestamp")
-            .unwrap();
-        assert!(
-            (ts.values[idx] - 7.25).abs() < 1e-9,
-            "TSTimestamp carries pArray->timeStamp, got {}",
-            ts.values[idx]
-        );
+        let [(addr, ts)] = r.addressed.as_slice() else {
+            panic!("one TS point per frame, got {}", r.addressed.len());
+        };
+        assert_eq!(*addr, 1);
+        let NDDataBuffer::F64(v) = &ts.data else {
+            panic!("TS point is Float64");
+        };
+        assert_eq!(v.len(), 23);
+        assert_eq!(v[22], 7.25);
+        assert_eq!(ts.unique_id, 42);
+        assert_eq!((ts.timestamp.sec, ts.timestamp.nsec), (100, 500_000_000));
+        assert_eq!(ts.time_stamp, 7.25);
     }
 
     #[test]
@@ -3201,14 +3174,12 @@ mod tests {
     fn test_stats_runtime_end_to_end() {
         let pool = NDArrayPool::new(1_000_000);
         let wiring = Arc::new(WiringRegistry::new());
-        let ts_registry = crate::time_series::TsReceiverRegistry::new();
         let (handle, stats, _params, _jh) = create_stats_runtime(
-            "STATS_RT",
+            &asyn_rs::asyn_record::claim_port("STATS_RT").unwrap(),
             pool,
             10,
             "",
             wiring,
-            &ts_registry,
             ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
         );
 

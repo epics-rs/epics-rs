@@ -2,6 +2,7 @@ pub mod params;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::registry::PortClaim;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::user::AsynUser;
@@ -64,7 +65,7 @@ impl PortDriver for PointDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.base.params.set_float64(reason, user.addr, value)?;
+        self.base.set_float64_param(reason, user.addr, value)?;
 
         // Recompute if an input parameter changed
         if reason == self.params.motor_pos
@@ -81,7 +82,7 @@ impl PortDriver for PointDetector {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.base.params.set_int32(user.reason, user.addr, value)?;
+        self.base.set_int32_param(user.reason, user.addr, value)?;
         self.base.call_param_callback(0, user.reason)?;
         Ok(())
     }
@@ -101,13 +102,14 @@ impl PointDetectorRuntime {
 
 /// Create a PointDetector with actor-based runtime.
 pub fn create_point_detector(
-    port_name: &str,
+    claim: &PortClaim,
     mode: DetectorMode,
 ) -> AsynResult<PointDetectorRuntime> {
+    let port_name = claim.name();
     let det = PointDetector::new(port_name, mode)?;
     let params = det.params;
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
     Ok(PointDetectorRuntime {
         runtime_handle,
@@ -121,7 +123,11 @@ mod tests {
 
     #[test]
     fn test_create_pinhole() {
-        let rt = create_point_detector("PH_TEST", DetectorMode::PinHole).unwrap();
+        let rt = create_point_detector(
+            &asyn_rs::registry::claim_port("PH_TEST").unwrap(),
+            DetectorMode::PinHole,
+        )
+        .unwrap();
         let handle = rt.port_handle();
         let val = handle
             .read_float64_blocking(rt.params.det_value, 0)
@@ -132,7 +138,11 @@ mod tests {
 
     #[test]
     fn test_recompute_on_motor_write() {
-        let rt = create_point_detector("PH_RECOMP", DetectorMode::PinHole).unwrap();
+        let rt = create_point_detector(
+            &asyn_rs::registry::claim_port("PH_RECOMP").unwrap(),
+            DetectorMode::PinHole,
+        )
+        .unwrap();
         let handle = rt.port_handle();
 
         // At center: large value
@@ -159,7 +169,11 @@ mod tests {
 
     #[test]
     fn test_create_edge() {
-        let rt = create_point_detector("EDGE_TEST", DetectorMode::Edge).unwrap();
+        let rt = create_point_detector(
+            &asyn_rs::registry::claim_port("EDGE_TEST").unwrap(),
+            DetectorMode::Edge,
+        )
+        .unwrap();
         let handle = rt.port_handle();
         let val = handle
             .read_float64_blocking(rt.params.det_value, 0)
@@ -169,7 +183,11 @@ mod tests {
 
     #[test]
     fn test_create_slit() {
-        let rt = create_point_detector("SLIT_TEST", DetectorMode::Slit).unwrap();
+        let rt = create_point_detector(
+            &asyn_rs::registry::claim_port("SLIT_TEST").unwrap(),
+            DetectorMode::Slit,
+        )
+        .unwrap();
         let handle = rt.port_handle();
         let val = handle
             .read_float64_blocking(rt.params.det_value, 0)

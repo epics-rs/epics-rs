@@ -84,7 +84,6 @@ pub mod roi_stat;
 pub mod scatter;
 pub mod stats;
 pub mod std_arrays;
-pub mod time_series;
 pub mod time_series_plugin;
 pub mod transform;
 

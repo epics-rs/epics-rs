@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
 use epics_libcom_rs::runtime::task::StackSizeClass;
 
@@ -74,7 +74,7 @@ fn the_port_thread_takes_register_port_s_stack_size() {
             stack_size: raw,
             ..RuntimeConfig::default()
         };
-        let (rt, _jh) = create_port_runtime(device, config).unwrap();
+        let (rt, _jh) = create_port_runtime_unclaimed(device, config).unwrap();
         rt.port_handle().read_int32_blocking(0, 0).unwrap();
         let got = stack.load(Ordering::SeqCst);
         // glibc aligns a byte count down, as for C's own pthread_attr_setstacksize.
@@ -102,7 +102,7 @@ fn a_synchronous_port_s_stack_size_is_not_read() {
         stack_size: 2,
         ..RuntimeConfig::default()
     };
-    let (rt, _jh) = create_port_runtime(device, config).unwrap();
+    let (rt, _jh) = create_port_runtime_unclaimed(device, config).unwrap();
     rt.port_handle().read_int32_blocking(0, 0).unwrap();
     let got = stack.load(Ordering::SeqCst);
     let asked = StackSizeClass::Medium.bytes();

@@ -107,9 +107,11 @@ use std::path::{Path, PathBuf};
 /// one and hands the next branch the same red with less information. Report
 /// the difference and leave the constant alone.
 const SCOPE_GATED: &[(&str, &str)] = &[
+    ("ad-plugins-rs", "tests/configure_duplicate_port.rs"),
     ("ad-plugins-rs", "tests/ioc_asyn_commands.rs"),
     ("ad-plugins-rs", "tests/reference_plugin_asyn_flags.rs"),
     ("ad-plugins-rs", "tests/plugin_configure_max_threads.rs"),
+    ("ad-plugins-rs", "tests/plugin_configure_source.rs"),
     ("ad-plugins-rs", "tests/plugin_configure_stack_size.rs"),
     ("asyn-rs", "tests/process_gate_tests.rs"),
     (

@@ -7,16 +7,14 @@
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot,
-    ProcessResult,
+    ArraySource, NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate,
+    PluginParamSnapshot, ProcessResult,
 };
 use asyn_rs::error::AsynError;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
 use std::sync::Arc;
-
-use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 
 /// Parameter indices for NDPluginAttribute.
 #[derive(Clone, Copy, Default)]
@@ -72,7 +70,6 @@ impl AttrChannel {
 pub struct AttributeProcessor {
     channels: Mutex<Vec<AttrChannel>>,
     params: AttributeParams,
-    ts_sender: Option<TimeSeriesSender>,
 }
 
 impl AttributeProcessor {
@@ -84,12 +81,7 @@ impl AttributeProcessor {
         Self {
             channels: Mutex::new(channels),
             params: AttributeParams::default(),
-            ts_sender: None,
         }
-    }
-
-    pub fn set_ts_sender(&mut self, sender: TimeSeriesSender) {
-        self.ts_sender = Some(sender);
     }
 
     /// Access the registered param indices (populated after register_params).
@@ -128,7 +120,7 @@ impl AttributeProcessor {
 
 impl NDPluginProcess for AttributeProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
-    fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
 
@@ -153,13 +145,14 @@ impl NDPluginProcess for AttributeProcessor {
             }
         }
 
-        // Send to time series
-        if let Some(ref sender) = self.ts_sender {
-            let values: Vec<f64> = channels.iter().map(|ch| ch.value).collect();
-            let _ = sender.try_send(TimeSeriesData { values });
-        }
-
-        ProcessResult::sink(updates)
+        // C doTimeSeriesCallbacks posts every channel's value at address 1
+        // (NDPluginAttribute.cpp:89, :94-110).
+        let values: Vec<f64> = channels.iter().map(|ch| ch.value).collect();
+        let mut out = ProcessResult::sink(updates);
+        out.addressed.extend(
+            crate::time_series_plugin::time_series_point(pool, array, &values).map(|a| (1, a)),
+        );
+        out
     }
 
     fn plugin_type(&self) -> &str {
@@ -168,8 +161,8 @@ impl NDPluginProcess for AttributeProcessor {
 
     /// C `NDPluginAttribute.cpp:203` sets `NDArrayCallbacks = 0`: this plugin
     /// extracts attribute time series and does not deliver arrays downstream.
-    fn does_array_callbacks(&self) -> bool {
-        false
+    fn array_callbacks_seed(&self) -> Option<bool> {
+        Some(false)
     }
 
     fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
@@ -208,30 +201,14 @@ impl NDPluginProcess for AttributeProcessor {
     }
 }
 
-/// Time-series channel names, one per attribute channel. The length is C
-/// `maxAttributes_` (the TS NDArray dim, NDPluginAttribute.cpp:98), so it tracks
-/// the configured channel count rather than a fixed 8.
-pub fn attr_ts_channel_names(num_channels: usize) -> Vec<String> {
-    (0..num_channels.max(1))
-        .map(|i| {
-            if i == 0 {
-                "TSArrayValue".to_string()
-            } else {
-                format!("TSArrayValue{i}")
-            }
-        })
-        .collect()
-}
-
-/// Create an Attribute plugin runtime. The TS receiver is stored in the registry
-/// for later pickup by `NDTimeSeriesConfigure`.
+/// Create an Attribute plugin runtime; address 1 carries the time-series point
+/// an NDPluginTimeSeries port reads.
 pub fn create_attribute_runtime(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     pool: std::sync::Arc<ad_core_rs::ndarray_pool::NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: std::sync::Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
-    ts_registry: &crate::time_series::TsReceiverRegistry,
     max_attributes: i32,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
@@ -244,23 +221,11 @@ pub fn create_attribute_runtime(
     let num_channels = max_attributes.max(1) as usize;
     let num_addr = max_attributes.max(2) as usize;
 
-    let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
-
-    let mut processor = AttributeProcessor::new("", num_channels);
-    processor.set_ts_sender(ts_tx);
+    let processor = AttributeProcessor::new("", num_channels);
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
-        port_name,
-        processor,
-        pool,
-        queue_size,
-        ndarray_port,
-        wiring,
-        num_addr,
-        threads,
+        claim, processor, pool, queue_size, source, wiring, num_addr, threads,
     );
-
-    ts_registry.store(port_name, ts_rx, attr_ts_channel_names(num_channels));
 
     (handle, data_jh)
 }
@@ -269,7 +234,7 @@ pub fn create_attribute_runtime(
 mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-    use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
 
     fn make_array_with_attr(name: &str, value: f64, uid: i32) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -442,9 +407,6 @@ mod tests {
     fn test_channel_count_follows_max_attributes() {
         // C maxAttributes_ sizes the per-frame channel loop and the TS NDArray
         // length (NDPluginAttribute.cpp:55,98,184); neither is fixed at 8.
-        assert_eq!(attr_ts_channel_names(16).len(), 16);
-        assert_eq!(attr_ts_channel_names(2).len(), 2);
-        assert_eq!(attr_ts_channel_names(0).len(), 1); // floored to >=1
 
         let mut proc = AttributeProcessor::new("Temp", 16);
         proc.params.value = 2;
@@ -474,6 +436,16 @@ mod tests {
             )),
             "channel 15 must post with a 16-channel processor"
         );
+        // The TS point at address 1 has one element per channel.
+        let [(addr, ts)] = r.addressed.as_slice() else {
+            panic!("one TS point per frame, got {}", r.addressed.len());
+        };
+        assert_eq!(*addr, 1);
+        let NDDataBuffer::F64(v) = &ts.data else {
+            panic!("TS point is Float64");
+        };
+        assert_eq!(v.len(), 16);
+        assert_eq!((v[0], v[15]), (1.0, 9.0));
     }
 
     #[test]

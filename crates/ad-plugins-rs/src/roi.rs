@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
-    NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
+    ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
@@ -492,6 +492,7 @@ impl NDPluginProcess for ROIProcessor {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
                 scatter: false,
+                addressed: vec![],
             },
             None => ProcessResult::sink(updates),
         }
@@ -607,10 +608,10 @@ impl NDPluginProcess for ROIProcessor {
 
 /// Create an ROI plugin runtime, returning the handle and param reasons.
 pub fn create_roi_runtime(
-    port_name: &str,
+    claim: &asyn_rs::registry::PortClaim,
     pool: Arc<NDArrayPool>,
     queue_size: usize,
-    ndarray_port: &str,
+    source: impl Into<ArraySource>,
     wiring: Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
     threads: ad_core_rs::plugin::runtime::PluginThreads,
 ) -> (
@@ -620,13 +621,7 @@ pub fn create_roi_runtime(
 ) {
     let processor = ROIProcessor::new(ROIConfig::default());
     let (handle, jh) = ad_core_rs::plugin::runtime::create_plugin_runtime(
-        port_name,
-        processor,
-        pool,
-        queue_size,
-        ndarray_port,
-        wiring,
-        threads,
+        claim, processor, pool, queue_size, source, wiring, threads,
     );
     // Recreate param layout on a scratch PortDriverBase to get matching reasons.
     let params = {

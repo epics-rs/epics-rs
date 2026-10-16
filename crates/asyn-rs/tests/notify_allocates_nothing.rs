@@ -152,17 +152,16 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
     );
 
     // Warm: the first flush may size internal tables.
-    base.params.set_string(msg, 0, "warm").unwrap();
-    base.params.set_int32(num, 0, 1).unwrap();
+    base.set_string_param(msg, 0, "warm").unwrap();
+    base.set_int32_param(num, 0, 1).unwrap();
     base.call_param_callbacks(0).unwrap();
 
-    base.params
-        .set_string(msg, 0, "a long enough octet value")
+    base.set_string_param(msg, 0, "a long enough octet value")
         .unwrap();
     base.params
         .set_int32_array(wave, 0, vec![1, 2, 3, 4])
         .unwrap();
-    base.params.set_int32(num, 0, 2).unwrap();
+    base.set_int32_param(num, 0, 2).unwrap();
 
     let (r, allocs, frees) = counted(|| base.call_param_callbacks(0));
     r.unwrap();
@@ -180,25 +179,26 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
 /// type the caller hands in.
 #[test]
 fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() {
-    use asyn_rs::param::{ParamList, ParamType};
+    use asyn_rs::param::ParamType;
+    use asyn_rs::port::{PortDriverBase, PortFlags};
 
-    let mut pl = ParamList::new(1);
+    let mut pl = PortDriverBase::new("ALLOCSET", 1, PortFlags::default());
     let msg = pl.create_param("MSG", ParamType::Octet).unwrap();
-    pl.set_string(msg, 0, "first value").unwrap();
+    pl.set_string_param(msg, 0, "first value").unwrap();
 
     let owned = String::from("second value");
-    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, &owned));
+    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, &owned));
     r.unwrap();
     assert_eq!(allocs, 1, "a new value: the shared buffer, and no Vec");
 
-    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, "second value"));
+    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, "second value"));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged &str");
-    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, &owned));
+    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, &owned));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged String");
     let bytes: &[u8] = b"second value";
-    let (r, allocs, _) = counted(|| pl.set_string(msg, 0, bytes));
+    let (r, allocs, _) = counted(|| pl.set_string_param(msg, 0, bytes));
     r.unwrap();
     assert_eq!(allocs, 0, "an unchanged byte slice");
 }
@@ -208,9 +208,10 @@ fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() 
 /// in an order other than index order allocates nothing.
 #[test]
 fn setting_and_flushing_256_params_allocates_nothing() {
-    use asyn_rs::param::{ParamList, ParamType};
+    use asyn_rs::param::ParamType;
+    use asyn_rs::port::{PortDriverBase, PortFlags};
 
-    let mut pl = ParamList::new(1);
+    let mut pl = PortDriverBase::new("ALLOCSET", 1, PortFlags::default());
     let ids: Vec<usize> = (0..256)
         .map(|i| pl.create_param(&format!("P{i}"), ParamType::Int32).unwrap())
         .collect();
@@ -218,9 +219,9 @@ fn setting_and_flushing_256_params_allocates_nothing() {
     let mut fired = 0usize;
     let (r, allocs, frees) = counted(|| {
         for &i in ids.iter().rev() {
-            pl.set_int32(i, 0, 7).unwrap();
+            pl.set_int32_param(i, 0, 7).unwrap();
         }
-        pl.flush_changed(0, |_, _| {
+        pl.params.flush_changed(0, |_, _| {
             fired += 1;
             Ok(true)
         })
@@ -265,13 +266,12 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
     // Each set builds a fresh buffer, as a driver's write does: the flush
     // then sees the previous one's last reference go.
     let mut flush = |i: i32| {
-        base.params
-            .set_string(msg, 0, format!("message number {i}"))
+        base.set_string_param(msg, 0, format!("message number {i}"))
             .unwrap();
         base.params
             .set_int32_array(wave, 0, (0..64).map(|k| k + i).collect::<Vec<i32>>())
             .unwrap();
-        base.params.set_int32(num, 0, i).unwrap();
+        base.set_int32_param(num, 0, i).unwrap();
         counted(|| base.call_param_callbacks(0))
     };
     for i in 0..2 {
@@ -389,13 +389,12 @@ fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
     let _rx = base.interrupts.subscribe_async(8, 256);
 
     let mut flush = |i: i32| {
-        base.params
-            .set_string(msg, 0, format!("message number {i}"))
+        base.set_string_param(msg, 0, format!("message number {i}"))
             .unwrap();
         base.params
             .set_int32_array(wave, 0, (0..64).map(|k| k + i).collect::<Vec<i32>>())
             .unwrap();
-        base.params.set_int32(num, 0, i).unwrap();
+        base.set_int32_param(num, 0, i).unwrap();
         counted(|| base.call_param_callbacks(0))
     };
     for i in 0..4 {

@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
@@ -277,10 +277,11 @@ pub struct PortHandle {
 
 /// A synchronous port's callback runs on the caller's thread, each call a
 /// blocking round trip — C's `queueRequest` on a port without
-/// `ASYN_CANBLOCK`.
+/// `ASYN_CANBLOCK`. The request is a message to the port's actor, so it owns
+/// a copy of `op`.
 impl PortCalls for PortHandle {
-    fn call(&mut self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
-        self.submit_blocking(op, user)
+    fn call(&mut self, op: &RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.submit_blocking(op.clone(), user)
     }
 }
 
@@ -380,6 +381,11 @@ impl PortHandle {
     /// the actor resolves the addr they carry.
     pub fn dp_addr(&self, addr: i32) -> Option<i32> {
         crate::port::dp_common_key(self.multi_device, addr)
+    }
+
+    /// The parameter list a client at `addr` reads: [`crate::port::param_list`].
+    pub fn param_list(&self, addr: i32) -> i32 {
+        crate::port::param_list(self.multi_device, addr)
     }
 
     /// Maximum sub-device address (exclusive upper bound).
@@ -1051,6 +1057,24 @@ impl PortHandle {
         self.driver_result::<D, R>(result)
     }
 
+    /// C `updateTimeStamp` from a driver's own task: refresh the port's
+    /// timestamp through its source, on the actor, and return it.
+    pub async fn update_time_stamp(&self) -> AsynResult<SystemTime> {
+        let result = Arc::new(Mutex::new(None));
+        let slot = result.clone();
+        let call = DriverCall::new(move |driver| {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(driver.base_mut().update_time_stamp());
+        });
+        self.submit_async(RequestOp::WithDriver(call), AsynUser::default())
+            .await?;
+        let stamp = result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        stamp.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("port {}: the timestamp update did not run", self.port_name),
+        })
+    }
+
     fn driver_call<D, R>(
         &self,
         f: impl FnOnce(&mut D) -> R + Send + 'static,
@@ -1663,7 +1687,7 @@ mod tests {
 
         let (entered_tx, entered) = std_mpsc::sync_channel(1);
         let (release, release_rx) = std_mpsc::channel();
-        let (runtime, _jh) = crate::runtime::create_port_runtime(
+        let (runtime, _jh) = crate::runtime::create_port_runtime_unclaimed(
             Busy {
                 base: PortDriverBase::new(
                     "busy",
@@ -1810,6 +1834,26 @@ mod tests {
         line_up.store(true, Ordering::SeqCst);
         let r = waits.join().unwrap().expect("runs once the port is back");
         assert_eq!(r.int_val, Some(7));
+    }
+
+    /// C `updateTimeStamp` from a task: the source runs on the actor, its
+    /// answer is the port's stamp, and the next read carries it.
+    #[test]
+    fn update_time_stamp_refreshes_the_port_stamp() {
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(4_242_424);
+        let mut drv = TestDriver::new();
+        drv.base.register_timestamp_source(move || fixed);
+        drv.base.set_int32_param(0, 0, 1).unwrap();
+        let handle = make_handle(drv);
+
+        let stamp = epics_libcom_rs::runtime::task::block_on_sync(handle.update_time_stamp())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamp, fixed);
+        let read = handle
+            .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+            .unwrap();
+        assert_eq!(read.timestamp, Some(fixed));
     }
 
     /// `with_driver` hands the closure the driver's concrete type, runs it on
@@ -2695,7 +2739,10 @@ mod tests {
         );
         assert!(
             matches!(
-                handle.read_float64_blocking(1, 0),
+                handle
+                    .read_float64_blocking(1, 0)
+                    .as_ref()
+                    .map_err(AsynError::param_failure),
                 Err(AsynError::ParamUndefined(1))
             ),
             "the failed update stored nothing: the Float64 param is still undefined"

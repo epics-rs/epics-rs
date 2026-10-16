@@ -58,8 +58,8 @@ epicsEnvSet("TYPE",       "Int16")
 < $(ADCORE)/ioc/commonPlugins.cmd
 
 # Also load with ADSIM: prefix for ophyd test compatibility.
-# Configure commands are idempotent (skip if port already exists),
-# so only record templates are created with the new prefix.
+# The Configure lines fail here as in C (the ports exist); only the
+# record templates load with the new prefix.
 epicsEnvSet("PREFIX", "ADSIM:")
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=ADSIM:,R=cam1:,PORT=SIM,ADDR=0,TIMEOUT=1")
 < $(ADCORE)/ioc/commonPlugins.cmd

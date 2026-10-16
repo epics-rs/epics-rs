@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::registry::register_port;
-use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
+use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 
@@ -32,7 +32,7 @@ async fn special_puts_behind_a_blocked_read_are_never_refused() {
         std::thread::sleep(Duration::from_secs(30));
     });
     let driver = DrvAsynIPPort::new("SPQBR", &addr.to_string()).unwrap();
-    let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+    let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default()).unwrap();
     register_port(
         "SPQBR",
         rt.port_handle().clone(),

@@ -221,6 +221,7 @@ dependencies = [
 name = "asyn-rs"
 version = "0.32.0"
 dependencies = [
+ "asyn-rs",
  "bitflags",
  "chrono",
  "criterion",

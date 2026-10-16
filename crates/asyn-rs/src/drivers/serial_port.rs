@@ -2936,14 +2936,14 @@ mod tests {
 
     #[test]
     fn test_pty_runtime_integration() {
-        use crate::runtime::{RuntimeConfig, create_port_runtime};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
         let (master, slave, slave_name) = create_pty_pair();
         unsafe { libc::close(slave) };
         let _guard = PtyGuard { master, slave: -1 };
 
         let drv = DrvAsynSerialPort::new("pty_rt", &slave_name).unwrap();
-        let (runtime_handle, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+        let (runtime_handle, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
             .expect("the port runtime thread must start");
         let ph = runtime_handle.port_handle();
 

@@ -11,8 +11,9 @@ use asyn_rs::runtime::sync::Notify;
 use parking_lot::Mutex;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::param::{EnumEntry, ParamType};
+use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::request::ParamSetValue;
 use asyn_rs::user::AsynUser;
 
 // --- Constants (matching original testAsynPortDriver) ---
@@ -79,15 +80,15 @@ pub struct ScopeSimulator {
     pub p_min_value: usize,
     pub p_max_value: usize,
     pub p_mean_value: usize,
+    /// Fixed at construction, as C `pTimeBase_`.
+    time_base: Vec<f64>,
 }
 
 impl ScopeSimulator {
     pub fn new(port_name: &str, notify: Arc<Notify>) -> Self {
-        let flags = PortFlags {
-            can_block: true,
-            ..PortFlags::default()
-        };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        // testAsynPortDriver registers with ASYN_DESTRUCTIBLE alone: it never
+        // blocks (testAsynPortDriver.cpp:54).
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
 
         let p_run = base.create_param("P_Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("P_MaxPoints", ParamType::Int32).unwrap();
@@ -179,7 +180,13 @@ impl ScopeSimulator {
         base.set_enum_index_param(p_volts_per_div_select, 0, 0)
             .unwrap();
 
-        // Pre-compute initial waveform/time_base so PINI records get real data
+        // A driver array, not a param, so no callback ever posts it
+        // (testAsynPortDriver.cpp:71, served by readFloat64Array :360).
+        let time_base = (0..DEFAULT_MAX_POINTS)
+            .map(|i| i as f64 / (DEFAULT_MAX_POINTS - 1) as f64 * NUM_DIVISIONS)
+            .collect();
+
+        // Pre-compute an initial waveform so PINI records get real data
         {
             let initial_config = SimConfig {
                 run: false,
@@ -196,9 +203,6 @@ impl ScopeSimulator {
             let _ = base
                 .params
                 .set_float64_array(p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(p_mean_value, 0, result.mean_val);
@@ -224,6 +228,7 @@ impl ScopeSimulator {
             p_min_value,
             p_max_value,
             p_mean_value,
+            time_base,
         }
     }
 
@@ -284,7 +289,7 @@ impl PortDriver for ScopeSimulator {
                 .params
                 .set_enum_index(user.reason, user.addr, value as usize)?;
         } else {
-            self.base.params.set_int32(user.reason, user.addr, value)?;
+            self.base.set_int32_param(user.reason, user.addr, value)?;
         }
 
         if user.reason == self.p_run {
@@ -327,9 +332,7 @@ impl PortDriver for ScopeSimulator {
         } else {
             value
         };
-        self.base
-            .params
-            .set_float64(user.reason, user.addr, value)?;
+        self.base.set_float64_param(user.reason, user.addr, value)?;
         if user.reason == self.p_update_time {
             self.notify.notify_one();
         }
@@ -339,6 +342,14 @@ impl PortDriver for ScopeSimulator {
 
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         self.base.check_ready()?;
+        if user.reason == self.p_time_base {
+            let max_points = self.base.get_int32_param(self.p_max_points, 0)?;
+            let n = (max_points.max(0) as usize)
+                .min(buf.len())
+                .min(self.time_base.len());
+            buf[..n].copy_from_slice(&self.time_base[..n]);
+            return Ok(n);
+        }
         let data = self.base.params.get_float64_array(user.reason, user.addr)?;
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
@@ -378,7 +389,6 @@ pub struct SimConfig {
 
 pub struct SimResult {
     pub waveform: Vec<f64>,
-    pub time_base: Vec<f64>,
     pub min_val: f64,
     pub max_val: f64,
     pub mean_val: f64,
@@ -386,31 +396,25 @@ pub struct SimResult {
 
 pub fn read_config(base: &PortDriverBase, idx: &ParamIndices) -> SimConfig {
     SimConfig {
-        run: base.params.get_int32(idx.p_run, 0).unwrap_or(0) != 0,
+        run: base.get_int32_param(idx.p_run, 0).unwrap_or(0) != 0,
         max_points: base
-            .params
-            .get_int32(idx.p_max_points, 0)
+            .get_int32_param(idx.p_max_points, 0)
             .unwrap_or(DEFAULT_MAX_POINTS) as usize,
         time_per_div: base
-            .params
-            .get_float64(idx.p_time_per_div, 0)
+            .get_float64_param(idx.p_time_per_div, 0)
             .unwrap_or(0.001),
         volts_per_div: base
-            .params
-            .get_float64(idx.p_volts_per_div, 0)
+            .get_float64_param(idx.p_volts_per_div, 0)
             .unwrap_or(1.0),
-        volt_offset: base.params.get_float64(idx.p_volt_offset, 0).unwrap_or(0.0),
+        volt_offset: base.get_float64_param(idx.p_volt_offset, 0).unwrap_or(0.0),
         trigger_delay: base
-            .params
-            .get_float64(idx.p_trigger_delay, 0)
+            .get_float64_param(idx.p_trigger_delay, 0)
             .unwrap_or(0.0),
         noise_amplitude: base
-            .params
-            .get_float64(idx.p_noise_amplitude, 0)
+            .get_float64_param(idx.p_noise_amplitude, 0)
             .unwrap_or(0.0),
         update_time: base
-            .params
-            .get_float64(idx.p_update_time, 0)
+            .get_float64_param(idx.p_update_time, 0)
             .unwrap_or(DEFAULT_UPDATE_TIME),
     }
 }
@@ -421,14 +425,12 @@ pub fn compute_waveform(config: &SimConfig, rng: &mut Rng) -> SimResult {
     let dt = time_range / num_points as f64;
 
     let mut waveform = Vec::with_capacity(num_points);
-    let mut time_base = Vec::with_capacity(num_points);
     let mut min_val = f64::MAX;
     let mut max_val = f64::MIN;
     let mut sum = 0.0;
 
     for i in 0..num_points {
         let t = i as f64 * dt + config.trigger_delay;
-        time_base.push(t);
         let y = AMPLITUDE * (2.0 * std::f64::consts::PI * FREQUENCY * t).sin()
             + config.noise_amplitude * rng.next_centered();
         let scaled = NUM_DIVISIONS / 2.0 + (config.volt_offset + y) / config.volts_per_div;
@@ -449,7 +451,6 @@ pub fn compute_waveform(config: &SimConfig, rng: &mut Rng) -> SimResult {
     };
     SimResult {
         waveform,
-        time_base,
         min_val,
         max_val,
         mean_val,
@@ -479,12 +480,10 @@ pub async fn sim_task(port: Arc<Mutex<ScopeSimulator>>, notify: Arc<Notify>, idx
             let _ = base
                 .params
                 .set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(idx.p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
+            base.update_time_stamp();
             let _ = base.call_param_callbacks(0);
         }
 
@@ -525,12 +524,10 @@ pub async fn sim_task_dyn(
             let _ = base
                 .params
                 .set_float64_array(idx.p_waveform, 0, result.waveform);
-            let _ = base
-                .params
-                .set_float64_array(idx.p_time_base, 0, result.time_base);
             let _ = base.set_float64_param(idx.p_min_value, 0, result.min_val);
             let _ = base.set_float64_param(idx.p_max_value, 0, result.max_val);
             let _ = base.set_float64_param(idx.p_mean_value, 0, result.mean_val);
+            base.update_time_stamp();
             let _ = base.call_param_callbacks(0);
         }
 
@@ -562,22 +559,26 @@ pub async fn sim_task_handle(
 
         let result = compute_waveform(&config, &mut rng);
 
+        // C simTask stamps the port (updateTimeStamp, testAsynPortDriver.cpp
+        // :220), sets the statistics, calls callParamCallbacks and posts the
+        // waveform with doCallbacksFloat64Array (:224-230); it never goes
+        // through writeFloat64Array, which the asynPortDriver default refuses.
+        let _ = handle.update_time_stamp().await;
         let _ = handle
-            .write_float64_array(idx.p_waveform, 0, result.waveform)
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::new(idx.p_min_value, 0, ParamValue::Float64(result.min_val)),
+                    ParamSetValue::new(idx.p_max_value, 0, ParamValue::Float64(result.max_val)),
+                    ParamSetValue::new(idx.p_mean_value, 0, ParamValue::Float64(result.mean_val)),
+                    ParamSetValue::new(
+                        idx.p_waveform,
+                        0,
+                        ParamValue::Float64Array(result.waveform.into()),
+                    ),
+                ],
+            )
             .await;
-        let _ = handle
-            .write_float64_array(idx.p_time_base, 0, result.time_base)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_min_value, 0, result.min_val)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_max_value, 0, result.max_val)
-            .await;
-        let _ = handle
-            .write_float64(idx.p_mean_value, 0, result.mean_val)
-            .await;
-        let _ = handle.call_param_callbacks(0).await;
 
         let sleep_dur = std::time::Duration::from_secs_f64(config.update_time);
         asyn_rs::runtime::select! {

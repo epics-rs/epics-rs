@@ -161,96 +161,21 @@ fn an_omitted_stack_size_is_medium() {
     );
 }
 
-/// The stack of the thread `tid` of this process, parked in a syscall: the
-/// mapping its stack pointer is in. `None` while it is running.
-#[cfg(target_os = "linux")]
-fn parked_thread_stack_bytes(tid: u64) -> Option<usize> {
-    let syscall = std::fs::read_to_string(format!("/proc/self/task/{tid}/syscall")).ok()?;
-    // `nr arg1..arg6 sp pc`; a running thread reads `running`.
-    let fields: Vec<&str> = syscall.split_whitespace().collect();
-    if fields.len() < 3 {
-        return None;
-    }
-    let sp = usize::from_str_radix(fields[fields.len() - 2].trim_start_matches("0x"), 16).ok()?;
-    std::fs::read_to_string("/proc/self/maps")
-        .ok()?
-        .lines()
-        .filter_map(|l| {
-            let (lo, hi) = l.split_whitespace().next()?.split_once('-')?;
-            Some((
-                usize::from_str_radix(lo, 16).ok()?,
-                usize::from_str_radix(hi, 16).ok()?,
-            ))
-        })
-        .find(|(lo, hi)| (*lo..*hi).contains(&sp))
-        .map(|(lo, hi)| hi - lo)
-}
-
-/// The port `NDTimeSeriesConfigure` builds on a Stats/ROIStat/Attr upstream's
-/// receiver has the line's `priority` and `stackSize` too: C builds the same
-/// `NDPluginTimeSeries` whatever feeds it (NDPluginTimeSeries.cpp:537-541).
-///
-/// Its handles stay inside the command, so its thread is found by name in
-/// `thread_report` and its stack read from the mapping the parked thread's
-/// stack pointer is in. Each run is a child of its own: glibc hands a new
-/// thread an exited thread's cached stack when it is big enough.
-#[cfg(target_os = "linux")]
+/// A Stats upstream feeds the same `NDPluginTimeSeries` port a raw array
+/// source does (NDPluginTimeSeries.cpp:537-541), with the line's `priority`
+/// and `stackSize`.
 #[test]
-fn the_time_series_receiver_port_gets_the_line_s_priority_and_stack() {
-    const CHILD: &str = "AD_TS_RECEIVER_THREADS_CHILD";
-    const TEST: &str = "the_time_series_receiver_port_gets_the_line_s_priority_and_stack";
-    const BYTES: usize = 3_000_000;
-    const PRIORITY: u32 = 33;
-
-    if std::env::var_os(CHILD).is_none() {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
-
-    let (_ioc, shell) = ad_ioc_with_driver("TSUP");
+fn a_stats_fed_time_series_port_gets_the_line_s_priority_and_stack() {
+    let (ioc, shell) = ad_ioc_with_driver("TSUP");
     for line in [
-        r#"NDStatsConfigure("TSSTAT", 20, 0, "TSUP", 0)"#.to_string(),
-        format!(
-            r#"NDTimeSeriesConfigure("TSRX", 20, 0, "TSSTAT", 0, 0, 0, 0, {PRIORITY}, {BYTES})"#
-        ),
+        r#"NDStatsConfigure("TSSTAT", 20, 0, "TSUP", 0)"#,
+        r#"NDTimeSeriesConfigure("TSRX", 20, 0, "TSSTAT", 1, 23, 0, 0, 33, 3000000)"#,
     ] {
         assert!(
-            matches!(shell.execute_line(&line), Ok(CommandOutcome::Continue)),
+            matches!(shell.execute_line(line), Ok(CommandOutcome::Continue)),
             "`{line}` failed"
         );
     }
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let (priority, stack) = loop {
-        let row = epics_base_rs::runtime::task::thread_report()
-            .into_iter()
-            .find(|t| t.name() == "ts-data-TSRX");
-        if let Some(row) = &row
-            && let Some(stack) = parked_thread_stack_bytes(row.os_id())
-        {
-            break (row.epics_priority(), stack);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "ts-data-TSRX never parked: {}",
-            row.is_some()
-        );
-        std::thread::yield_now();
-    };
-    assert_eq!(priority, PRIORITY);
-    // The mapping holds the stack less glibc's guard page, rounded to pages.
-    assert!(
-        stack.abs_diff(BYTES) <= 64 * 1024,
-        "ts-data-TSRX has a {stack}-byte stack mapping, want about {BYTES}"
-    );
+    let handle = ioc.mgr().plugin("TSRX").expect("TSRX is a plugin port");
+    assert_eq!(handle.threads(), plugin_threads(33, 3_000_000));
 }

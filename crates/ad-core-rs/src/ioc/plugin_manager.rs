@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use asyn_rs::asyn_record::PortClaim;
+use asyn_rs::manager::{PortDriverRegisterFailed, report_port_driver_register_failure};
+
 use crate::plugin::runtime::PluginRuntimeHandle;
 use crate::plugin::wiring::WiringRegistry;
 
@@ -14,7 +17,6 @@ use super::DriverContext;
 pub struct PluginManager {
     driver: parking_lot::Mutex<Option<Arc<dyn DriverContext>>>,
     plugin_handles: parking_lot::Mutex<Vec<PluginRuntimeHandle>>,
-    port_runtimes: parking_lot::Mutex<Vec<asyn_rs::runtime::port::PortRuntimeHandle>>,
     wiring: Arc<WiringRegistry>,
 }
 
@@ -23,7 +25,6 @@ impl PluginManager {
         Arc::new(Self {
             driver: parking_lot::Mutex::new(None),
             plugin_handles: parking_lot::Mutex::new(Vec::new()),
-            port_runtimes: parking_lot::Mutex::new(Vec::new()),
             wiring: Arc::new(WiringRegistry::new()),
         })
     }
@@ -46,29 +47,24 @@ impl PluginManager {
             .ok_or_else(|| "driver must be configured first".into())
     }
 
-    /// Register a plugin. The port is registered in the global asyn port registry
-    /// so the universal asyn device support factory can find it.
+    /// Register a plugin under the name its `*Configure` claimed first
+    /// ([`asyn_rs::manager::claim_port_driver`]), in the global asyn port
+    /// registry the universal asyn device support factory reads.
     ///
     /// `owner` is the gate of the database the plugin's records load into
     /// (the configure command's `ctx.db().scan_control().interrupt_gate()`).
-    ///
-    /// Errors on a duplicate port name (the registry refuses overwrites,
-    /// matching C `asynManager::registerPort`); nothing is stored in that
-    /// case, so the rejected plugin's runtime shuts down when `handle`'s
-    /// last clone drops.
     pub fn add_plugin(
         &self,
-        _dtyp: &str,
+        claim: PortClaim,
         handle: &PluginRuntimeHandle,
         owner: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
-    ) -> asyn_rs::error::AsynResult<()> {
+    ) -> Result<(), PortDriverRegisterFailed> {
         let port_handle = handle.port_runtime().port_handle().clone();
         let port_name = port_handle.port_name().to_string();
-
-        // Claim the port name first: a duplicate must not leave a wiring
-        // output or a parked handle behind for a plugin that was refused.
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)
-            .inspect_err(|_| asyn_rs::manager::report_port_driver_register_failure(&port_name))?;
+        debug_assert_eq!(claim.name(), port_name);
+        claim
+            .publish(port_handle, owner)
+            .map_err(|_| report_port_driver_register_failure(&port_name))?;
 
         // Register this plugin's output in the wiring registry
         self.wiring
@@ -85,25 +81,6 @@ impl PluginManager {
             .iter()
             .find(|h| h.port_runtime().port_handle().port_name() == port_name)
             .cloned()
-    }
-
-    /// Register a raw port (not a plugin runtime) for auxiliary ports like TimeSeries.
-    ///
-    /// The `PortRuntimeHandle` is stored to keep the actor thread alive.
-    /// Errors on a duplicate port name; the rejected runtime is not stored,
-    /// so it shuts down when the caller drops it.
-    pub fn add_port(
-        &self,
-        _dtyp: &str,
-        runtime: asyn_rs::runtime::port::PortRuntimeHandle,
-        owner: &std::sync::Arc<epics_libcom_rs::runtime::interrupt_accept::InterruptGate>,
-    ) -> asyn_rs::error::AsynResult<()> {
-        let port_handle = runtime.port_handle().clone();
-        let port_name = port_handle.port_name().to_string();
-        asyn_rs::asyn_record::register_port(&port_name, port_handle, owner)
-            .inspect_err(|_| asyn_rs::manager::report_port_driver_register_failure(&port_name))?;
-        self.port_runtimes.lock().push(runtime);
-        Ok(())
     }
 
     /// Print a report of registered plugins.

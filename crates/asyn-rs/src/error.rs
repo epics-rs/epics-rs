@@ -11,6 +11,14 @@ pub enum AsynStatus {
     Disabled,
 }
 
+/// The steps of [`crate::request::RequestOp::OctetWriteRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OctetStep {
+    Flush,
+    Write,
+    Read,
+}
+
 /// Error type for asyn-rs operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AsynError {
@@ -99,6 +107,22 @@ pub enum AsynError {
         nbytes: usize,
     },
 
+    /// One step of a multi-step octet request failed, and which one.
+    ///
+    /// C device support runs a command-response as two calls, `writeIt` then
+    /// `readIt` (devAsynOctet.c:853-855), and each prints its own failure
+    /// (:675-678, :706-709), so the step a failure came from is part of the
+    /// outcome. [`crate::request::RequestOp::OctetWriteRead`] runs the steps
+    /// as one atomic request; its executor wraps each step's error here
+    /// (read back with [`AsynError::octet_step`]). Every other question is
+    /// answered through to `source`.
+    #[error("{source}")]
+    OctetStep {
+        step: OctetStep,
+        /// The step's own failure, intact.
+        source: Box<AsynError>,
+    },
+
     /// The request waited in the port queue past the deadline its
     /// `queueRequest` was given, so it was removed and **never ran**.
     ///
@@ -184,6 +208,17 @@ pub enum AsynError {
     #[error("param undefined: index {0}")]
     ParamUndefined(usize),
 
+    /// A param-library failure inside an `asynPortDriver` read/write default,
+    /// carrying the `errorMessage` C's default writes for that function
+    /// (`asynPortDriver.cpp:1983`, `:2506`, `:2621`, ...). Build it with
+    /// [`AsynError::in_param_access`]; [`AsynError::param_failure`] reads the
+    /// wrapped failure back.
+    #[error("{message}")]
+    ParamAccess {
+        source: Box<AsynError>,
+        message: String,
+    },
+
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch {
         expected: &'static str,
@@ -233,9 +268,10 @@ impl AsynError {
     pub fn status(&self) -> AsynStatus {
         match self {
             AsynError::Status { status, .. } | AsynError::QueueRefused { status, .. } => *status,
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.status()
-            }
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. }
+            | AsynError::ParamAccess { source, .. } => source.status(),
             _ => AsynStatus::Error,
         }
     }
@@ -290,9 +326,9 @@ impl AsynError {
     pub fn is_queue_refused(&self) -> bool {
         match self {
             AsynError::QueueRefused { .. } => true,
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.is_queue_refused()
-            }
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. } => source.is_queue_refused(),
             _ => false,
         }
     }
@@ -310,9 +346,9 @@ impl AsynError {
     pub fn is_queue_timeout(&self) -> bool {
         match self {
             AsynError::QueueTimeout { .. } => true,
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.is_queue_timeout()
-            }
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. } => source.is_queue_timeout(),
             _ => false,
         }
     }
@@ -331,9 +367,9 @@ impl AsynError {
     pub fn is_transport_io(&self) -> bool {
         match self {
             AsynError::Io(_) => true,
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.is_transport_io()
-            }
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. } => source.is_transport_io(),
             _ => false,
         }
     }
@@ -364,7 +400,54 @@ impl AsynError {
     pub fn partial_read(&self) -> Option<&crate::interpose::PartialOctetRead> {
         match self {
             AsynError::PartialRead { partial, .. } => Some(partial),
+            AsynError::OctetStep { source, .. } => source.partial_read(),
             _ => None,
+        }
+    }
+
+    /// The step of a multi-step octet request this failure came from — see
+    /// [`AsynError::OctetStep`].
+    pub fn octet_step(&self) -> Option<OctetStep> {
+        match self {
+            AsynError::OctetStep { step, .. } => Some(*step),
+            _ => None,
+        }
+    }
+
+    /// Tag this failure with the octet step it came from.
+    pub fn in_octet_step(self, step: OctetStep) -> Self {
+        AsynError::OctetStep {
+            step,
+            source: Box::new(self),
+        }
+    }
+
+    /// Wrap a param-library failure with C's `errorMessage` for it.
+    pub fn in_param_access(self, message: String) -> Self {
+        AsynError::ParamAccess {
+            source: Box::new(self),
+            message,
+        }
+    }
+
+    /// The param-library failure under [`AsynError::ParamAccess`], or `self`.
+    pub fn param_failure(&self) -> &AsynError {
+        match self {
+            AsynError::ParamAccess { source, .. } => source,
+            other => other,
+        }
+    }
+
+    /// C's `asynStatus` number for a param-library failure — the `status=%d`
+    /// in `asynPortDriver`'s `errorMessage` (asynDriver.h:56-60).
+    pub fn param_status_code(&self) -> i32 {
+        match self {
+            AsynError::ParamAlreadyExists(_) => 6,
+            AsynError::ParamNotFound(_) => 7,
+            AsynError::TypeMismatch { .. } => 8,
+            AsynError::ParamIndexOutOfRange(_) => 9,
+            AsynError::ParamUndefined(_) => 10,
+            other => other.status() as i32,
         }
     }
 
@@ -397,6 +480,7 @@ impl AsynError {
     pub fn partial_write(&self) -> Option<usize> {
         match self {
             AsynError::PartialWrite { nbytes, .. } => Some(*nbytes),
+            AsynError::OctetStep { source, .. } => source.partial_write(),
             _ => None,
         }
     }
@@ -474,9 +558,9 @@ impl fmt::Display for ErrorMessage<'_> {
             AsynError::Status { message, .. } | AsynError::QueueRefused { message, .. } => {
                 f.write_str(message)
             }
-            AsynError::PartialRead { source, .. } | AsynError::PartialWrite { source, .. } => {
-                source.message_display().fmt(f)
-            }
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. } => source.message_display().fmt(f),
             other => fmt::Display::fmt(other, f),
         }
     }

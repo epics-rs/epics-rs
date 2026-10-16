@@ -383,6 +383,14 @@ pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
     (multi_device && addr >= 0).then_some(addr)
 }
 
+/// The parameter list C's `getAddress` (asynPortDriver.cpp:1901-1906) takes
+/// for a user at `addr`: `pasynManager->getAddr` is -1 on a port without
+/// `ASYN_MULTIDEVICE`, whatever the user asked for, and -1 is list 0. A
+/// request and an interrupt client resolve through this one rule.
+pub fn param_list(multi_device: bool, addr: i32) -> i32 {
+    if multi_device && addr != -1 { addr } else { 0 }
+}
+
 use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
@@ -521,6 +529,13 @@ impl QueueGate {
     }
 }
 
+/// Runs on every Int32 store of one reason, before the value lands: what a C
+/// driver overrides the virtual `setIntegerParam` for (asynNDArrayDriver.cpp
+/// :636-663 keeps `ADAcquireBusy` in step with `ADAcquire`). Takes the
+/// parameter list and the value being stored.
+pub type Int32StoreRule =
+    Arc<dyn Fn(&mut PortDriverBase, i32, i32) -> AsynResult<()> + Send + Sync>;
+
 pub struct PortDriverBase {
     pub port_name: Arc<str>,
     pub max_addr: usize,
@@ -628,8 +643,16 @@ pub struct PortDriverBase {
     pub octet_interrupt_process: bool,
     /// Per-address device state for multi-device ports — see [`DeviceTable`].
     device_states: Arc<Mutex<HashMap<i32, DeviceState>>>,
-    /// Timestamp source callback for custom timestamps.
+    /// The source [`Self::update_time_stamp`] asks; `None` is C's
+    /// `defaultTimeStampSource`, the current time.
     pub timestamp_source: Option<Arc<dyn Fn() -> SystemTime + Send + Sync>>,
+    /// C `port.timeStamp` (asynManager.c:227): what every callback and
+    /// parameter read carries. Zero-initialised in C, so the EPICS epoch
+    /// until the driver updates or sets it.
+    time_stamp: SystemTime,
+    /// By reason; empty until a rule is registered, so a port without one
+    /// pays a bounds check per store.
+    int32_rules: Vec<Option<Int32StoreRule>>,
     /// Port-level anchor for the 2s auto-reconnect throttle — the
     /// monotonic instant of the last connect/disconnect transition or
     /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
@@ -742,6 +765,11 @@ impl PortDriverBase {
             octet_interrupt_process: false,
             device_states: Arc::default(),
             timestamp_source: None,
+            time_stamp: SystemTime::UNIX_EPOCH
+                + Duration::from_secs(
+                    epics_libcom_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS,
+                ),
+            int32_rules: Vec::new(),
             last_connect_disconnect: None,
             connect_retry_at: None,
             seconds_between_port_connect: DEFAULT_SECONDS_BETWEEN_PORT_CONNECT,
@@ -889,11 +917,12 @@ impl PortDriverBase {
         }
     }
 
-    /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::write*` prints
-    /// once a value is in the parameter library (asynPortDriver.cpp:2038,
-    /// :2177, :2318, :2565, :2681): `driverName:functionName: function=N,
-    /// name=PARAM, value=V`, through the user's device-level trace config.
-    fn trace_write(&self, user: &AsynUser, function_name: &str, value: std::fmt::Arguments<'_>) {
+    /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::read*` and
+    /// `write*` print on success (asynPortDriver.cpp:1988, :2127, :2267,
+    /// :2516, :2626; :2038, :2177, :2318, :2565, :2681): `driverName:
+    /// functionName: function=N, name=PARAM, value=V`, through the user's
+    /// device-level trace config.
+    fn trace_io(&self, user: &AsynUser, function_name: &str, value: std::fmt::Arguments<'_>) {
         user.print(
             crate::trace::TraceMask::IO_DRIVER,
             file!(),
@@ -913,17 +942,35 @@ impl PortDriverBase {
     /// and the fall-through a driver override takes for a reason it does not
     /// handle itself.
     pub fn write_int32_param(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
-        self.params.set_int32(user.reason, user.addr, value)?;
-        self.call_param_callbacks(user.addr)?;
-        self.trace_write(user, "writeInt32", format_args!("{value}"));
+        let addr = self.parse_user(user)?;
+        let _ = self.set_int32_param(user.reason, addr, value);
+        self.call_param_callbacks(addr).map_err(|e| {
+            param_access_error(
+                &self.params,
+                user,
+                "writeInt32",
+                e,
+                format_args!("value={value}"),
+            )
+        })?;
+        self.trace_io(user, "writeInt32", format_args!("{value}"));
         Ok(())
     }
 
     /// C `asynPortDriver::writeInt64`; see [`Self::write_int32_param`].
     pub fn write_int64_param(&mut self, user: &AsynUser, value: i64) -> AsynResult<()> {
-        self.params.set_int64(user.reason, user.addr, value)?;
-        self.call_param_callbacks(user.addr)?;
-        self.trace_write(user, "writeInt64", format_args!("{value}"));
+        let addr = self.parse_user(user)?;
+        let _ = self.set_int64_param(user.reason, addr, value);
+        self.call_param_callbacks(addr).map_err(|e| {
+            param_access_error(
+                &self.params,
+                user,
+                "writeInt64",
+                e,
+                format_args!("value={value}"),
+            )
+        })?;
+        self.trace_io(user, "writeInt64", format_args!("{value}"));
         Ok(())
     }
 
@@ -936,10 +983,22 @@ impl PortDriverBase {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        self.params
-            .set_uint32(user.reason, user.addr, value, mask, 0)?;
-        self.call_param_callbacks(user.addr)?;
-        self.trace_write(user, "writeUInt32Digital", format_args!("{value}"));
+        let addr = self.parse_user(user)?;
+        let _ = self.set_uint32_param(user.reason, addr, value, mask, 0);
+        self.call_param_callbacks(addr).map_err(|e| {
+            param_access_error(
+                &self.params,
+                user,
+                "writeUInt32Digital",
+                e,
+                format_args!("value={value}, mask={mask}"),
+            )
+        })?;
+        self.trace_io(
+            user,
+            "writeUInt32Digital",
+            format_args!("{}, mask={mask}", value as i32),
+        );
         Ok(())
     }
 
@@ -1574,7 +1633,8 @@ impl PortDriverBase {
         let _ = self.set_addr_enabled(addr, false);
     }
 
-    /// Set a custom timestamp source callback.
+    /// Set the source [`Self::update_time_stamp`] asks — C
+    /// `registerTimeStampSource` (asynManager.c:2681-2696).
     pub fn register_timestamp_source<F>(&mut self, source: F)
     where
         F: Fn() -> SystemTime + Send + Sync + 'static,
@@ -1588,11 +1648,25 @@ impl PortDriverBase {
         self.timestamp_source = None;
     }
 
-    /// Get current timestamp from the registered source, or SystemTime::now().
-    pub fn current_timestamp(&self) -> SystemTime {
-        self.timestamp_source
+    /// C `updateTimeStamp` (asynManager.c:2715-2734): ask the source and keep
+    /// its answer as the port's timestamp, which is returned.
+    pub fn update_time_stamp(&mut self) -> SystemTime {
+        self.time_stamp = self
+            .timestamp_source
             .as_ref()
-            .map_or_else(SystemTime::now, |f| f())
+            .map_or_else(SystemTime::now, |f| f());
+        self.time_stamp
+    }
+
+    /// C `getTimeStamp` (asynManager.c:2736-2751): the last updated or set
+    /// timestamp, never a fresh one.
+    pub fn get_time_stamp(&self) -> SystemTime {
+        self.time_stamp
+    }
+
+    /// C `setTimeStamp` (asynManager.c:2753-2768).
+    pub fn set_time_stamp(&mut self, ts: SystemTime) {
+        self.time_stamp = ts;
     }
 
     pub fn create_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
@@ -1603,47 +1677,224 @@ impl PortDriverBase {
         self.params.find_param(name)
     }
 
+    /// C `asynPortDriver::drvUserCreate` (asynPortDriver.cpp:3555-3580): the
+    /// reason named by `drv_info`. An override that does not recognise a
+    /// drvInfo falls back here, as C subclasses call the base class.
+    pub fn drv_user_create(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let addr = self.get_address(req.addr, 0)?;
+        let Some(reason) = self.params.find_param(&req.drv_info) else {
+            self.print_device(
+                req.addr,
+                crate::trace::TraceMask::ERROR,
+                line!(),
+                format_args!(
+                    "asynPortDriver:drvUserCreate: addr={addr}, cannot find parameter {}",
+                    req.drv_info
+                ),
+            );
+            return Err(AsynError::ParamNotFound(req.drv_info.clone()));
+        };
+        self.print_device(
+            req.addr,
+            crate::trace::TraceMask::FLOW,
+            line!(),
+            format_args!(
+                "asynPortDriver:drvUserCreate: drvInfo={}, index={reason}",
+                req.drv_info
+            ),
+        );
+        Ok(DrvUserInfo::from_reason(reason))
+    }
+
+    /// C `asynPrint(pasynUser, …)` for a user on device `addr` of this port.
+    fn print_device(
+        &self,
+        addr: i32,
+        mask: crate::trace::TraceMask,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        if let Some(trace) = &self.trace
+            && trace.is_enabled_device(&self.port_name, addr, mask)
+        {
+            trace.output_device_with_source(
+                &self.port_name,
+                Some(addr),
+                0,
+                mask,
+                file!(),
+                line,
+                &args.to_string(),
+            );
+        }
+    }
+
+    /// C `asynPortDriver::getAddress` (asynPortDriver.cpp:1901-1914): the
+    /// parameter list `addr` selects ([`param_list`]), printing a refused one
+    /// through the device's trace.
+    pub fn get_address(&self, addr: i32, reason: usize) -> AsynResult<i32> {
+        let address = param_list(self.flags.multi_device, addr);
+        if address >= 0 && (address as usize) < self.max_addr {
+            return Ok(address);
+        }
+        let mask = crate::trace::TraceMask::ERROR;
+        if let Some(trace) = &self.trace
+            && trace.is_enabled_device(&self.port_name, addr, mask)
+        {
+            trace.output_device_with_source(
+                &self.port_name,
+                Some(addr),
+                reason as i32,
+                mask,
+                file!(),
+                line!(),
+                &format!(
+                    "asynPortDriver:getAddress: {} invalid address={address}, must be in range 0 to {}",
+                    self.port_name,
+                    self.max_addr as i64 - 1
+                ),
+            );
+        }
+        Err(AsynError::AddressOutOfRange(address))
+    }
+
+    /// C `asynPortDriver::parseAsynUser` (asynPortDriver.cpp:1924-1933),
+    /// which every default read/write runs first: the address `getAddress`
+    /// resolves, then the reason.
+    pub(crate) fn parse_user(&self, user: &AsynUser) -> AsynResult<i32> {
+        let addr = self.get_address(user.addr, user.reason)?;
+        if self.params.param_name(user.reason).is_none() {
+            return Err(AsynError::ParamIndexOutOfRange(user.reason));
+        }
+        Ok(addr)
+    }
+
     // --- Convenience param accessors ---
 
+    /// C `reportSetParamErrors` (asynPortDriver.cpp:1099-1115), which every
+    /// `set*Param` runs on a refused set; other refusals print nothing.
+    fn report_set_param(&self, function_name: &str, index: usize, addr: i32, e: &AsynError) {
+        let why = match e {
+            AsynError::ParamIndexOutOfRange(_) => "bad index",
+            AsynError::TypeMismatch { .. } => "wrong type",
+            AsynError::AddressOutOfRange(_) => "invalid list",
+            _ => return,
+        };
+        self.trace_print(
+            crate::trace::TraceMask::ERROR,
+            format_args!(
+                "asynPortDriver:{function_name}: port={} error setting parameter {index} in list {addr}, {why}",
+                self.port_name
+            ),
+        );
+    }
+
+    /// C `reportGetParamErrors` (asynPortDriver.cpp:1575-1597): a bad
+    /// index or wrong type at `ASYN_TRACE_ERROR`, an undefined value at
+    /// `ASYN_TRACE_FLOW`; an invalid list prints nothing.
+    fn report_get_param(&self, function_name: &str, index: usize, addr: i32, e: &AsynError) {
+        let (mask, why) = match e {
+            AsynError::ParamIndexOutOfRange(_) => (crate::trace::TraceMask::ERROR, "bad index"),
+            AsynError::TypeMismatch { .. } => (crate::trace::TraceMask::ERROR, "wrong type"),
+            AsynError::ParamUndefined(_) => (crate::trace::TraceMask::FLOW, "value undefined"),
+            _ => return,
+        };
+        // An undefined read is routine; nothing is formatted unless it prints.
+        if !self
+            .trace
+            .as_ref()
+            .is_some_and(|t| t.is_enabled(&self.port_name, mask))
+        {
+            return;
+        }
+        let port = &self.port_name;
+        match self.params.param_name(index) {
+            Some(name) if why != "bad index" => self.trace_print(
+                mask,
+                format_args!(
+                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} {name}, in list {addr}, {why}"
+                ),
+            ),
+            _ => self.trace_print(
+                mask,
+                format_args!(
+                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} in list {addr}, {why}"
+                ),
+            ),
+        }
+    }
+
+    fn reported(
+        &self,
+        function_name: &str,
+        index: usize,
+        addr: i32,
+        result: AsynResult<()>,
+    ) -> AsynResult<()> {
+        if let Err(e) = &result {
+            self.report_set_param(function_name, index, addr, e);
+        }
+        result
+    }
+
+    /// Run `rule` on every Int32 store of `reason`, replacing any rule
+    /// registered for it.
+    pub fn set_int32_rule(&mut self, reason: usize, rule: Int32StoreRule) {
+        if self.int32_rules.len() <= reason {
+            self.int32_rules.resize(reason + 1, None);
+        }
+        self.int32_rules[reason] = Some(rule);
+    }
+
+    /// The one Int32 store: every setter of an Int32 value comes through here,
+    /// so a registered rule cannot be skipped. As in C, the value is stored
+    /// whatever the rule returns.
+    fn store_int32(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
+        let ruled = match self.int32_rules.get(index) {
+            Some(Some(rule)) => rule.clone()(self, addr, value),
+            _ => Ok(()),
+        };
+        let result = self.params.set_int32(index, addr, value);
+        self.reported("setIntegerParam", index, addr, result)?;
+        ruled
+    }
+
     pub fn set_int32_param(&mut self, index: usize, addr: i32, value: i32) -> AsynResult<()> {
-        self.params.set_int32(index, addr, value)
+        self.store_int32(index, addr, value)
     }
 
     pub fn get_int32_param(&self, index: usize, addr: i32) -> AsynResult<i32> {
-        self.params.get_int32(index, addr)
-    }
-
-    /// Strict variant — returns [`AsynError::ParamUndefined`] when the
-    /// cache entry has never been set (C parity for `asynParamUndefined`).
-    /// See [`crate::param::ParamList::get_int32_strict`].
-    pub fn get_int32_param_strict(&self, index: usize, addr: i32) -> AsynResult<i32> {
-        self.params.get_int32_strict(index, addr)
+        let result = self.params.get_int32(index, addr);
+        if let Err(e) = &result {
+            self.report_get_param("getIntegerParam", index, addr, e);
+        }
+        result
     }
 
     pub fn set_int64_param(&mut self, index: usize, addr: i32, value: i64) -> AsynResult<()> {
-        self.params.set_int64(index, addr, value)
+        let result = self.params.set_int64(index, addr, value);
+        self.reported("setInteger64Param", index, addr, result)
     }
 
     pub fn get_int64_param(&self, index: usize, addr: i32) -> AsynResult<i64> {
-        self.params.get_int64(index, addr)
-    }
-
-    /// Strict variant — see [`crate::param::ParamList::get_int64_strict`].
-    pub fn get_int64_param_strict(&self, index: usize, addr: i32) -> AsynResult<i64> {
-        self.params.get_int64_strict(index, addr)
+        let result = self.params.get_int64(index, addr);
+        if let Err(e) = &result {
+            self.report_get_param("getInteger64Param", index, addr, e);
+        }
+        result
     }
 
     pub fn set_float64_param(&mut self, index: usize, addr: i32, value: f64) -> AsynResult<()> {
-        self.params.set_float64(index, addr, value)
+        let result = self.params.set_float64(index, addr, value);
+        self.reported("setDoubleParam", index, addr, result)
     }
 
     pub fn get_float64_param(&self, index: usize, addr: i32) -> AsynResult<f64> {
-        self.params.get_float64(index, addr)
-    }
-
-    /// Strict variant — see [`crate::param::ParamList::get_float64_strict`].
-    pub fn get_float64_param_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
-        self.params.get_float64_strict(index, addr)
+        let result = self.params.get_float64(index, addr);
+        if let Err(e) = &result {
+            self.report_get_param("getDoubleParam", index, addr, e);
+        }
+        result
     }
 
     pub fn set_string_param(
@@ -1652,16 +1903,16 @@ impl PortDriverBase {
         addr: i32,
         value: impl AsRef<[u8]>,
     ) -> AsynResult<()> {
-        self.params.set_string(index, addr, value)
+        let result = self.params.set_string(index, addr, value);
+        self.reported("setStringParam", index, addr, result)
     }
 
     pub fn get_string_param(&self, index: usize, addr: i32) -> AsynResult<&[u8]> {
-        self.params.get_string(index, addr)
-    }
-
-    /// Strict variant — see [`crate::param::ParamList::get_string_strict`].
-    pub fn get_string_param_strict(&self, index: usize, addr: i32) -> AsynResult<&[u8]> {
-        self.params.get_string_strict(index, addr)
+        let result = self.params.get_string(index, addr);
+        if let Err(e) = &result {
+            self.report_get_param("getStringParam", index, addr, e);
+        }
+        result
     }
 
     /// Set a UInt32Digital parameter. `interrupt_mask` mirrors C
@@ -1677,17 +1928,38 @@ impl PortDriverBase {
         mask: u32,
         interrupt_mask: u32,
     ) -> AsynResult<()> {
-        self.params
-            .set_uint32(index, addr, value, mask, interrupt_mask)
+        let result = self
+            .params
+            .set_uint32(index, addr, value, mask, interrupt_mask);
+        self.reported("setUIntDigitalParam", index, addr, result)
+    }
+
+    /// One value of any type, reported under the C `set*Param` that stores
+    /// that type; a type C has no setter for reports nothing.
+    pub fn set_param_value(
+        &mut self,
+        index: usize,
+        addr: i32,
+        value: ParamValue,
+    ) -> AsynResult<()> {
+        let function_name = match &value {
+            ParamValue::Int32(v) => return self.store_int32(index, addr, *v),
+            ParamValue::Int64(_) => "setInteger64Param",
+            ParamValue::Float64(_) => "setDoubleParam",
+            ParamValue::Octet(_) => "setStringParam",
+            ParamValue::UInt32Digital(_) => "setUIntDigitalParam",
+            _ => return self.params.set_value(index, addr, value),
+        };
+        let result = self.params.set_value(index, addr, value);
+        self.reported(function_name, index, addr, result)
     }
 
     pub fn get_uint32_param(&self, index: usize, addr: i32) -> AsynResult<u32> {
-        self.params.get_uint32(index, addr)
-    }
-
-    /// Strict variant — see [`crate::param::ParamList::get_uint32_strict`].
-    pub fn get_uint32_param_strict(&self, index: usize, addr: i32) -> AsynResult<u32> {
-        self.params.get_uint32_strict(index, addr)
+        let result = self.params.get_uint32(index, addr);
+        if let Err(e) = &result {
+            self.report_get_param("getUIntDigitalParam", index, addr, e);
+        }
+        result
     }
 
     pub fn get_enum_param(&self, index: usize, addr: i32) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
@@ -1729,15 +2001,6 @@ impl PortDriverBase {
         self.params.set_generic_pointer(index, addr, value)
     }
 
-    pub fn set_param_timestamp(
-        &mut self,
-        index: usize,
-        addr: i32,
-        ts: SystemTime,
-    ) -> AsynResult<()> {
-        self.params.set_timestamp(index, addr, ts)
-    }
-
     pub fn set_param_status(
         &mut self,
         index: usize,
@@ -1746,8 +2009,10 @@ impl PortDriverBase {
         alarm_status: u16,
         alarm_severity: u16,
     ) -> AsynResult<()> {
-        self.params
-            .set_param_status(index, addr, status, alarm_status, alarm_severity)
+        let result =
+            self.params
+                .set_param_status(index, addr, status, alarm_status, alarm_severity);
+        self.reported("setParamStatus", index, addr, result)
     }
 
     pub fn get_param_status(&self, index: usize, addr: i32) -> AsynResult<(AsynStatus, u16, u16)> {
@@ -1814,7 +2079,8 @@ impl PortDriverBase {
         if !self.interrupts.accepting() {
             return Ok(());
         }
-        let now = self.current_timestamp();
+        // C stamps every callback with getTimeStamp (asynPortDriver.cpp:610-637).
+        let ts = self.time_stamp;
         let interrupts = &self.interrupts;
         // C `callCallbacks` (asynPortDriver.cpp:833-873): every changed flag
         // is walked and cleared at the end; only a bad index returns early,
@@ -1831,7 +2097,6 @@ impl PortDriverBase {
             if !value.is_array() && !params.is_param_defined(reason, addr).unwrap_or(false) {
                 return Ok(false);
             }
-            let ts = params.get_timestamp(reason, addr)?.unwrap_or(now);
             // C parity: read the accumulated callback mask and reset it
             // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
             // uInt32CallbackMask = 0). The flush is the single owner of
@@ -1880,8 +2145,7 @@ impl PortDriverBase {
             if !value.is_array() && !self.params.is_param_defined(reason, addr).unwrap_or(false) {
                 return Ok(());
             }
-            let now = self.current_timestamp();
-            let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
+            let ts = self.time_stamp;
             // C parity: read the accumulated callback mask and reset it
             // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
             // uInt32CallbackMask = 0). The flush is the single owner of
@@ -1953,7 +2217,7 @@ impl PortDriverBase {
         uint32_changed_mask: u32,
         aux_status: AsynStatus,
     ) {
-        let ts = self.current_timestamp();
+        let ts = self.time_stamp;
         self.interrupts.notify(InterruptValue {
             reason,
             addr,
@@ -2151,6 +2415,49 @@ fn illegal_eoslen(port: &str, eoslen: usize) -> AsynError {
     }
 }
 
+/// C `asynPortDriver`'s `errorMessage` for a failed param read/write default,
+/// `"asynPortDriver:<function>: status=%d, function=%d, name=%s, <value>"`. A
+/// bad address or reason fails in `parseAsynUser` before it, where C writes
+/// none, so those pass through unwrapped.
+fn param_access_error(
+    params: &crate::param::ParamList,
+    user: &AsynUser,
+    function: &str,
+    e: AsynError,
+    value: std::fmt::Arguments<'_>,
+) -> AsynError {
+    if matches!(
+        e,
+        AsynError::AddressOutOfRange(_) | AsynError::ParamIndexOutOfRange(_)
+    ) {
+        return e;
+    }
+    let message = format!(
+        "asynPortDriver:{function}: status={}, function={}, name={}, {value}",
+        e.param_status_code(),
+        user.reason,
+        params.param_name(user.reason).unwrap_or(""),
+    );
+    e.in_param_access(message)
+}
+
+/// C's `writeArray` template default (asynPortDriver.cpp:1820-1826): a port
+/// that does not override `writeXxxArray` refuses the put.
+fn write_array_not_implemented() -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: "asynPortDriver:writeArray not implemented".into(),
+    }
+}
+
+/// C's `readArray` template default (asynPortDriver.cpp:1812-1818).
+fn read_array_not_implemented() -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: "asynPortDriver:readArray not implemented".into(),
+    }
+}
+
 pub trait PortDriver: Any + Send + Sync {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
@@ -2164,14 +2471,30 @@ pub trait PortDriver: Any + Send + Sync {
     /// the slot here too — [`PortDriverBase::set_addr_connected`] is the one
     /// owner of that resolution, and a user addressing no device marks the
     /// port's own. A driver that overrides this owns its transport's shape.
+    /// C `asynPortDriver::connect` (asynPortDriver.cpp:3766-3778) refuses an
+    /// address `getAddress` refuses; so do `disconnect` and `drvUserCreate`.
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.base().get_address(user.addr, user.reason)?;
         // Single owner-API: edge-guarded fire is in PortDriverBase::set_connected.
         self.base_mut().set_addr_connected(user.addr, true);
+        user.print(
+            crate::trace::TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("asynPortDriver:connect:, pasynUser={user:p}"),
+        );
         Ok(())
     }
 
     fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.base().get_address(user.addr, user.reason)?;
         self.base_mut().set_addr_connected(user.addr, false);
+        user.print(
+            crate::trace::TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("asynPortDriver:disconnect:, pasynUser={user:p}"),
+        );
         Ok(())
     }
 
@@ -2234,7 +2557,7 @@ pub trait PortDriver: Any + Send + Sync {
             let _ = writeln!(
                 out,
                 "  Timestamp: {}",
-                format_timestamp(base.current_timestamp())
+                format_timestamp(base.get_time_stamp())
             );
             // C prints the EOS pair only when the driver registered `asynOctet`
             // (:3685) — on a port with no octet interface the two terminators are
@@ -2300,27 +2623,44 @@ pub trait PortDriver: Any + Send + Sync {
     // (paramVal.cpp:152,181,235,264,292). devAsyn* then routes that status
     // through asynStatusToEpicsAlarm(READ_ALARM, INVALID_ALARM) instead of
     // updating RVAL/clearing UDF (e.g. devAsynUInt32Digital.c:898-901,
-    // devAsynInt32.c:844-847). The lax get_*_param accessors stay for
-    // internal callers that explicitly want default-zero behavior.
+    // devAsynInt32.c:844-847).
+
+    // A failure past parseAsynUser carries C's errorMessage for the
+    // function, built by param_access_error; the value C prints on a failed
+    // read is the untouched caller buffer, which is 0 / "" here.
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-        self.base().params.get_int32_strict(user.reason, user.addr)
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        let value = base.get_int32_param(user.reason, addr).map_err(|e| {
+            param_access_error(&base.params, user, "readInt32", e, format_args!("value=0"))
+        })?;
+        base.trace_io(user, "readInt32", format_args!("{value}"));
+        Ok(value)
     }
 
     // The default typed writes are C `asynPortDriver::write*`
     // (asynPortDriver.cpp:2016-2040, :2155-2179, :2296-2320, :2544-2568,
     // :2659-2683): set the parameter, run the callbacks, and report the
     // write at `ASYN_TRACEIO_DRIVER` — the line `asynSetTraceMask port -1
-    // 0x2` shows for every value a driver accepted. `writeFloat64` alone
-    // prints its failure at `ASYN_TRACE_ERROR` (:2561-2563); the others put
-    // it in `errorMessage`, which is the `Err` here.
+    // 0x2` shows for every value a driver accepted. Their status is
+    // callParamCallbacks', which overwrites set*Param's: a set the store
+    // refuses (wrong type) is a success, as in C. `writeFloat64` alone keeps
+    // the set status and prints its failure at `ASYN_TRACE_ERROR`
+    // (:2554-2563); the others put it in `errorMessage`, which is the `Err`.
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.base_mut().write_int32_param(user, value)
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
-        self.base().params.get_int64_strict(user.reason, user.addr)
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        let value = base.get_int64_param(user.reason, addr).map_err(|e| {
+            param_access_error(&base.params, user, "readInt64", e, format_args!("value=0"))
+        })?;
+        base.trace_io(user, "readInt64", format_args!("{value}"));
+        Ok(value)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
@@ -2341,17 +2681,27 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
-        self.base()
-            .params
-            .get_float64_strict(user.reason, user.addr)
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        let params = &base.params;
+        let value = base.get_float64_param(user.reason, addr).map_err(|e| {
+            // readFloat64 alone names an undefined value (:2505-2513).
+            let value = if matches!(e, AsynError::ParamUndefined(_)) {
+                format_args!("value is undefined")
+            } else {
+                format_args!("value=0.000000")
+            };
+            param_access_error(params, user, "readFloat64", e, value)
+        })?;
+        base.trace_io(user, "readFloat64", format_args!("{value:.6}"));
+        Ok(value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let status = self
-            .base_mut()
-            .params
-            .set_float64(user.reason, user.addr, value)
-            .and_then(|()| self.base_mut().call_param_callbacks(user.addr));
+        let base = self.base_mut();
+        let addr = base.parse_user(user)?;
+        let status = base.set_float64_param(user.reason, addr, value);
+        let _ = base.call_param_callbacks(addr);
         let base = self.base();
         if let Err(e) = &status {
             user.print(
@@ -2359,8 +2709,8 @@ pub trait PortDriver: Any + Send + Sync {
                 file!(),
                 line!(),
                 format_args!(
-                    "asynPortDriver:writeFloat64: error, status={}, function={}, name={}, value={}",
-                    e.status() as i32,
+                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}",
+                    e.param_status_code(),
                     user.reason,
                     base.params.param_name(user.reason).unwrap_or(""),
                     value
@@ -2368,39 +2718,68 @@ pub trait PortDriver: Any + Send + Sync {
             );
             return status;
         }
-        base.trace_write(user, "writeFloat64", format_args!("{value}"));
+        base.trace_io(user, "writeFloat64", format_args!("{value:.6}"));
         Ok(())
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let bytes = self
-            .base()
-            .params
-            .get_string_strict(user.reason, user.addr)?;
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        let params = &base.params;
+        let bytes = base.get_string_param(user.reason, addr).map_err(|e| {
+            param_access_error(params, user, "readOctet", e, format_args!("value="))
+        })?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
+        base.trace_io(
+            user,
+            "readOctet",
+            format_args!("{}", crate::fixed_text::LossyText(&buf[..n])),
+        );
         Ok(n)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base_mut()
-            .params
-            .set_string(user.reason, user.addr, data)?;
-        self.base_mut().call_param_callbacks(user.addr)?;
-        self.base().trace_write(
+        let base = self.base_mut();
+        let addr = base.parse_user(user)?;
+        let _ = base.set_string_param(user.reason, addr, data);
+        base.call_param_callbacks(addr).map_err(|e| {
+            param_access_error(
+                &base.params,
+                user,
+                "writeOctet",
+                e,
+                format_args!("value={}", crate::fixed_text::LossyText(data)),
+            )
+        })?;
+        self.base().trace_io(
             user,
             "writeOctet",
-            format_args!("{}", String::from_utf8_lossy(data)),
+            format_args!("{}", crate::fixed_text::LossyText(data)),
         );
         Ok(data.len())
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
-        let val = self
-            .base()
-            .params
-            .get_uint32_strict(user.reason, user.addr)?;
-        Ok(val & mask)
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        let params = &base.params;
+        let val = base.get_uint32_param(user.reason, addr).map_err(|e| {
+            param_access_error(
+                params,
+                user,
+                "readUInt32Digital",
+                e,
+                format_args!("value=0 mask={mask}"),
+            )
+        })?;
+        let value = val & mask;
+        base.trace_io(
+            user,
+            "readUInt32Digital",
+            format_args!("{value}, mask={mask}"),
+        );
+        Ok(value)
     }
 
     fn write_uint32_digital(
@@ -2427,9 +2806,10 @@ pub trait PortDriver: Any + Send + Sync {
         mask: u32,
         reason: InterruptReason,
     ) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_uint32_interrupt(user.reason, user.addr, mask, reason)
+        let base = self.base_mut();
+        let addr = base.parse_user(user)?;
+        base.params
+            .set_uint32_interrupt(user.reason, addr, mask, reason)
     }
 
     /// Clear bits from rising AND falling masks. C parity:
@@ -2437,9 +2817,9 @@ pub trait PortDriver: Any + Send + Sync {
     /// (`asynPortDriver.cpp:2392-2415`). Mirrors C — the call does
     /// not take an `interruptReason`; both masks are cleared.
     fn clear_interrupt_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .clear_uint32_interrupt(user.reason, user.addr, mask)
+        let base = self.base_mut();
+        let addr = base.parse_user(user)?;
+        base.params.clear_uint32_interrupt(user.reason, addr, mask)
     }
 
     /// Read the configured rising / falling / combined mask. C
@@ -2450,9 +2830,9 @@ pub trait PortDriver: Any + Send + Sync {
         user: &AsynUser,
         reason: InterruptReason,
     ) -> AsynResult<u32> {
-        self.base()
-            .params
-            .get_uint32_interrupt(user.reason, user.addr, reason)
+        let base = self.base();
+        let addr = base.parse_user(user)?;
+        base.params.get_uint32_interrupt(user.reason, addr, reason)
     }
 
     // --- Enum I/O (cache-based defaults) ---
@@ -2498,72 +2878,54 @@ pub trait PortDriver: Any + Send + Sync {
         self.base_mut().call_param_callbacks(user.addr)
     }
 
-    // --- Array I/O (default: not supported) ---
+    // --- Array I/O (default: not implemented, as in C) ---
 
     fn read_float64_array(&mut self, _user: &AsynUser, _buf: &mut [f64]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynFloat64Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_float64_array(user.reason, user.addr, data)?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_float64_array(&mut self, _user: &AsynUser, _data: &[f64]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     fn read_int32_array(&mut self, _user: &AsynUser, _buf: &mut [i32]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynInt32Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int32_array(user.reason, user.addr, data)?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_int32_array(&mut self, _user: &AsynUser, _data: &[i32]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     fn read_int8_array(&mut self, _user: &AsynUser, _buf: &mut [i8]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynInt8Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_int8_array(&mut self, user: &AsynUser, data: &[i8]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int8_array(user.reason, user.addr, data.to_vec())?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_int8_array(&mut self, _user: &AsynUser, _data: &[i8]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     fn read_int16_array(&mut self, _user: &AsynUser, _buf: &mut [i16]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynInt16Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_int16_array(&mut self, user: &AsynUser, data: &[i16]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int16_array(user.reason, user.addr, data.to_vec())?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_int16_array(&mut self, _user: &AsynUser, _data: &[i16]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     fn read_int64_array(&mut self, _user: &AsynUser, _buf: &mut [i64]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynInt64Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_int64_array(&mut self, user: &AsynUser, data: &[i64]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int64_array(user.reason, user.addr, data.to_vec())?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_int64_array(&mut self, _user: &AsynUser, _data: &[i64]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     fn read_float32_array(&mut self, _user: &AsynUser, _buf: &mut [f32]) -> AsynResult<usize> {
-        Err(AsynError::InterfaceNotSupported("asynFloat32Array".into()))
+        Err(read_array_not_implemented())
     }
 
-    fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_float32_array(user.reason, user.addr, data.to_vec())?;
-        self.base_mut().call_param_callbacks(user.addr)
+    fn write_float32_array(&mut self, _user: &AsynUser, _data: &[f32]) -> AsynResult<()> {
+        Err(write_array_not_implemented())
     }
 
     // --- I/O methods (worker thread calls these) ---
@@ -2817,14 +3179,9 @@ pub trait PortDriver: Any + Send + Sync {
     /// out-of-range address at bind time (C `drvUserCreate` runs `checkOffset`,
     /// drvModbusAsyn.cpp:378-384) instead of alarming on every I/O.
     ///
-    /// Default: look up the shared reason by parameter name; ignore the rest.
+    /// Default: [`PortDriverBase::drv_user_create`].
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
-        let reason = self
-            .base()
-            .params
-            .find_param(&req.drv_info)
-            .ok_or_else(|| AsynError::ParamNotFound(req.drv_info.clone()))?;
-        Ok(DrvUserInfo::from_reason(reason))
+        self.base().drv_user_create(req)
     }
 
     // --- Capabilities ---
@@ -2880,13 +3237,16 @@ impl OctetNext for DriverOctetLink<'_> {
             // consulted (asynOctetBase.c:202-210). `reason` still rides on the
             // value — C leaves `pasynUser->reason` on the callback's user — but
             // it selects nobody.
-            self.driver.base().interrupts.notify_octet(
-                OctetFanOut::ByAddr(user.addr),
+            // Both sides of the addr test are getAddr's (-1 on a single-device
+            // port), resolved through the rule interrupt clients use.
+            let base = self.driver.base();
+            base.interrupts.notify_octet(
+                OctetFanOut::ByAddr(param_list(base.flags.multi_device, user.addr)),
                 InterruptValue {
                     reason: user.reason,
                     addr: user.addr,
                     value: ParamValue::Octet(raw.into()),
-                    timestamp: SystemTime::now(),
+                    timestamp: base.get_time_stamp(),
                     iface: Some(InterfaceType::Octet),
                     ..Default::default()
                 },
@@ -3489,13 +3849,13 @@ mod tests {
     }
 
     #[test]
-    fn test_callback_uses_param_timestamp() {
+    fn test_callback_carries_the_port_time_stamp() {
         let mut drv = TestDriver::new();
         let mut rx = drv.base_mut().interrupts.subscribe_async(256, 4096);
 
         let custom_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         drv.base_mut().set_int32_param(0, 0, 77).unwrap();
-        drv.base_mut().set_param_timestamp(0, 0, custom_ts).unwrap();
+        drv.base_mut().set_time_stamp(custom_ts);
         drv.base_mut().call_param_callbacks(0).unwrap();
 
         let v = rx.try_recv().unwrap();
@@ -4114,10 +4474,26 @@ mod tests {
         let mut base = PortDriverBase::new("ts_test", 1, PortFlags::default());
         base.create_param("V", ParamType::Int32).unwrap();
 
+        // C zero-initialises the port's timeStamp: the EPICS epoch.
+        let epics_epoch = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(631_152_000);
+        assert_eq!(base.get_time_stamp(), epics_epoch);
+
         let fixed_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(999999);
         base.register_timestamp_source(move || fixed_ts);
+        assert_eq!(
+            base.get_time_stamp(),
+            epics_epoch,
+            "registering a source does not update the timestamp"
+        );
+        assert_eq!(base.update_time_stamp(), fixed_ts);
+        assert_eq!(base.get_time_stamp(), fixed_ts);
 
-        assert_eq!(base.current_timestamp(), fixed_ts);
+        base.unregister_timestamp_source();
+        let before = SystemTime::now();
+        assert!(
+            base.update_time_stamp() >= before,
+            "the default source is the current time"
+        );
     }
 
     #[test]
@@ -4128,8 +4504,15 @@ mod tests {
         base.create_param("V", ParamType::Int32).unwrap();
         let mut rx = base.interrupts.subscribe_async(256, 4096);
 
-        let fixed_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123456);
-        base.register_timestamp_source(move || fixed_ts);
+        // A source that answers differently on every call: a callback must
+        // carry the last update's answer, not ask the source itself.
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let source_calls = calls.clone();
+        base.register_timestamp_source(move || {
+            let n = source_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(123456 + n)
+        });
+        let updated = base.update_time_stamp();
 
         struct TsDriver {
             base: PortDriverBase,
@@ -4146,9 +4529,12 @@ mod tests {
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
 
-        let v = rx.try_recv().unwrap();
-        // Should use fixed_ts since no per-param timestamp is set
-        assert_eq!(v.timestamp, fixed_ts);
+        drv.base_mut().set_int32_param(0, 0, 43).unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap().timestamp, updated);
+        assert_eq!(rx.try_recv().unwrap().timestamp, updated);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4738,24 +5124,34 @@ mod tests {
 
         // Unset → every default scalar read is ParamUndefined, NOT Ok(0).
         assert!(matches!(
-            drv.read_int32(&AsynUser::new(i32_idx).with_addr(0)),
+            drv.read_int32(&AsynUser::new(i32_idx).with_addr(0))
+                .as_ref()
+                .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
         ));
         assert!(matches!(
-            drv.read_int64(&AsynUser::new(i64_idx).with_addr(0)),
+            drv.read_int64(&AsynUser::new(i64_idx).with_addr(0))
+                .as_ref()
+                .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
         ));
         assert!(matches!(
-            drv.read_float64(&AsynUser::new(f64_idx).with_addr(0)),
+            drv.read_float64(&AsynUser::new(f64_idx).with_addr(0))
+                .as_ref()
+                .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
         ));
         let mut buf = [0u8; 16];
         assert!(matches!(
-            drv.read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf),
+            drv.read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf)
+                .as_ref()
+                .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
         ));
         assert!(matches!(
-            drv.read_uint32_digital(&AsynUser::new(u32_idx).with_addr(0), 0xFFFF_FFFF),
+            drv.read_uint32_digital(&AsynUser::new(u32_idx).with_addr(0), 0xFFFF_FFFF)
+                .as_ref()
+                .map_err(AsynError::param_failure),
             Err(AsynError::ParamUndefined(_))
         ));
 
@@ -4793,6 +5189,223 @@ mod tests {
                 .unwrap(),
             0x05
         );
+    }
+
+    /// The default read/write paths of a plain asynPortDriver, one param per
+    /// type, for the errorMessage tests below.
+    struct ErrmsgDrv {
+        base: PortDriverBase,
+    }
+    impl PortDriver for ErrmsgDrv {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+    }
+    const I32: usize = 0;
+    const I64: usize = 1;
+    const F64: usize = 2;
+    const OCT: usize = 3;
+    const BITS: usize = 4;
+
+    fn errmsg_drv() -> ErrmsgDrv {
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("errmsg", 1, flags);
+        for (name, t) in [
+            ("I32", ParamType::Int32),
+            ("I64", ParamType::Int64),
+            ("F64", ParamType::Float64),
+            ("SYSTEM_INFO", ParamType::Octet),
+            ("BITS", ParamType::UInt32Digital),
+        ] {
+            base.params.create_param(name, t).unwrap();
+        }
+        ErrmsgDrv { base }
+    }
+
+    fn at(reason: usize) -> AsynUser {
+        AsynUser::new(reason).with_addr(0)
+    }
+
+    fn text(e: AsynError) -> String {
+        e.message_display().to_string()
+    }
+
+    // A failed default read/write carries C asynPortDriver's errorMessage,
+    // which the record trace prints (asynPortDriver.cpp:1983, :2034).
+    #[test]
+    fn int32_param_errors_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        assert_eq!(
+            text(drv.read_int32(&at(I32)).unwrap_err()),
+            "asynPortDriver:readInt32: status=10, function=0, name=I32, value=0"
+        );
+        // A bad reason fails in parseAsynUser, before any errorMessage.
+        assert!(matches!(
+            drv.read_int32(&at(99)),
+            Err(AsynError::ParamIndexOutOfRange(99))
+        ));
+    }
+
+    // asynPortDriver.cpp:2122, :2173.
+    #[test]
+    fn int64_param_errors_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        assert_eq!(
+            text(drv.read_int64(&at(I64)).unwrap_err()),
+            "asynPortDriver:readInt64: status=10, function=1, name=I64, value=0"
+        );
+    }
+
+    // asynPortDriver.cpp:2262 (no comma before mask), :2314.
+    #[test]
+    fn uint32_digital_param_errors_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        assert_eq!(
+            text(drv.read_uint32_digital(&at(BITS), 0xF0).unwrap_err()),
+            "asynPortDriver:readUInt32Digital: status=10, function=4, name=BITS, value=0 mask=240"
+        );
+    }
+
+    // asynPortDriver.cpp:2506 names an undefined value, :2511 prints any
+    // other; writeFloat64 writes no errorMessage (:2561).
+    #[test]
+    fn float64_param_errors_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        assert_eq!(
+            text(drv.read_float64(&at(F64)).unwrap_err()),
+            "asynPortDriver:readFloat64: status=10, function=2, name=F64, value is undefined"
+        );
+        assert_eq!(
+            text(drv.read_float64(&at(I32)).unwrap_err()),
+            "asynPortDriver:readFloat64: status=8, function=0, name=I32, value=0.000000"
+        );
+        assert!(matches!(
+            drv.write_float64(&mut at(I32), 1.5),
+            Err(AsynError::TypeMismatch { .. })
+        ));
+    }
+
+    // asynPortDriver.cpp:2621 (the pixirad SystemInfo read), :2675.
+    #[test]
+    fn octet_param_errors_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        assert_eq!(
+            text(drv.read_octet(&at(OCT), &mut [0u8; 16]).unwrap_err()),
+            "asynPortDriver:readOctet: status=10, function=3, name=SYSTEM_INFO, value="
+        );
+    }
+
+    // C's write* status is callParamCallbacks', not set*Param's
+    // (asynPortDriver.cpp:2028-2031, :2167-2170, :2308-2311, :2672-2675): a
+    // value the store refuses is dropped and the write succeeds. A bad
+    // address or reason still fails in parseAsynUser.
+    fn assert_c_write_outcome(write: impl Fn(&mut ErrmsgDrv, &mut AsynUser) -> AsynResult<()>) {
+        let mut drv = errmsg_drv();
+        write(&mut drv, &mut at(F64)).unwrap();
+        assert!(
+            drv.base()
+                .params
+                .get_float64(F64, 0)
+                .is_err_and(|e| matches!(e, AsynError::ParamUndefined(_))),
+            "the refused value was not stored"
+        );
+        assert!(matches!(
+            write(&mut drv, &mut at(99)),
+            Err(AsynError::ParamIndexOutOfRange(99))
+        ));
+        assert!(matches!(
+            write(&mut drv, &mut AsynUser::new(F64).with_addr(1)),
+            Err(AsynError::AddressOutOfRange(1))
+        ));
+    }
+
+    #[test]
+    fn int32_write_of_a_refused_value_succeeds_as_in_c() {
+        assert_c_write_outcome(|d, u| d.write_int32(u, 5));
+    }
+
+    #[test]
+    fn int64_write_of_a_refused_value_succeeds_as_in_c() {
+        assert_c_write_outcome(|d, u| d.write_int64(u, -3));
+    }
+
+    #[test]
+    fn uint32_digital_write_of_a_refused_value_succeeds_as_in_c() {
+        assert_c_write_outcome(|d, u| d.write_uint32_digital(u, 5, 0xF));
+    }
+
+    #[test]
+    fn octet_write_of_a_refused_value_succeeds_as_in_c() {
+        assert_c_write_outcome(|d, u| d.write_octet(u, b"abc").map(|_| ()));
+    }
+
+    // writeFloat64 returns setDoubleParam's status (:2554-2567).
+    #[test]
+    fn float64_write_of_a_refused_value_fails_as_in_c() {
+        let mut drv = errmsg_drv();
+        assert!(matches!(
+            drv.write_float64(&mut at(I32), 1.5),
+            Err(AsynError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            drv.write_float64(&mut at(99), 1.5),
+            Err(AsynError::ParamIndexOutOfRange(99))
+        ));
+    }
+
+    // The writeArray template default (asynPortDriver.cpp:1824): a port that
+    // does not override writeXxxArray refuses the put and stores nothing.
+    #[test]
+    fn array_writes_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        let arr = drv
+            .base
+            .params
+            .create_param("ARR", ParamType::Float64Array)
+            .unwrap();
+        for e in [
+            drv.write_float64_array(&at(arr), &[1.0]).unwrap_err(),
+            drv.write_int32_array(&at(arr), &[1]).unwrap_err(),
+            drv.write_int8_array(&at(arr), &[1]).unwrap_err(),
+            drv.write_int16_array(&at(arr), &[1]).unwrap_err(),
+            drv.write_int64_array(&at(arr), &[1]).unwrap_err(),
+            drv.write_float32_array(&at(arr), &[1.0]).unwrap_err(),
+        ] {
+            assert_eq!(e.status(), AsynStatus::Error);
+            assert_eq!(text(e), "asynPortDriver:writeArray not implemented");
+        }
+        assert!(
+            drv.base()
+                .params
+                .get_float64_array(arr, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // The readArray template default (asynPortDriver.cpp:1816).
+    #[test]
+    fn array_reads_carry_the_c_error_message() {
+        let mut drv = errmsg_drv();
+        for e in [
+            drv.read_float64_array(&at(F64), &mut [0f64; 2])
+                .unwrap_err(),
+            drv.read_int32_array(&at(I32), &mut [0i32; 2]).unwrap_err(),
+            drv.read_int8_array(&at(I32), &mut [0i8; 2]).unwrap_err(),
+            drv.read_int16_array(&at(I32), &mut [0i16; 2]).unwrap_err(),
+            drv.read_int64_array(&at(I32), &mut [0i64; 2]).unwrap_err(),
+            drv.read_float32_array(&at(I32), &mut [0f32; 2])
+                .unwrap_err(),
+        ] {
+            assert_eq!(e.status(), AsynStatus::Error);
+            assert_eq!(text(e), "asynPortDriver:readArray not implemented");
+        }
     }
 
     /// R16-47: the parameter block is one level *late* no longer.

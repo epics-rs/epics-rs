@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::{PvDatabase, WriteDoneSource};
+use epics_base_rs::server::database::{DeviceDoneSource, PvDatabase};
 use epics_base_rs::server::device_support::{DeviceSupport, WriteStart};
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::{AlarmSeverity, Record};
@@ -32,14 +32,14 @@ impl DeviceSupport for AsyncDevice {
     fn write_begin(
         &mut self,
         _record: &mut dyn Record,
-        done: &WriteDoneSource<'_>,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         let outcome = if self.fails.load(Ordering::SeqCst) {
             Err(CaError::Protocol("asynError".into()))
         } else {
             Ok(())
         };
-        done.write_done()
+        done.device_done()
             .complete(done.priority(), outcome)
             .unwrap();
         Ok(WriteStart::Pending)

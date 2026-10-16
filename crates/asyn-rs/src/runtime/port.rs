@@ -11,6 +11,7 @@ use crate::interrupt::InterruptManager;
 use crate::port::PortDriver;
 use crate::port_actor::PortActor;
 use crate::port_handle::PortHandle;
+use crate::registry::PortClaim;
 use crate::transport::InProcessClient;
 
 use super::config::RuntimeConfig;
@@ -219,10 +220,22 @@ impl Drop for ConnectWaiter {
 ///
 /// `Err` means the port does not exist: see [`create_port_runtime_boxed`].
 pub fn create_port_runtime<D: PortDriver>(
+    claim: &PortClaim,
     driver: D,
     config: RuntimeConfig,
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
-    create_port_runtime_boxed(Box::new(driver), config)
+    create_port_runtime_boxed(claim, Box::new(driver), config)
+}
+
+/// [`create_port_runtime`] under a claim on a private registry, for a fixture
+/// that publishes through `register_port` or not at all.
+#[cfg(any(test, feature = "test-support"))]
+pub fn create_port_runtime_unclaimed<D: PortDriver>(
+    driver: D,
+    config: RuntimeConfig,
+) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
+    let claim = crate::registry::PortRegistry::new().claim(&driver.base().port_name)?;
+    create_port_runtime(&claim, driver, config)
 }
 
 /// Create a port runtime from a boxed driver.
@@ -251,10 +264,25 @@ pub fn create_port_runtime<D: PortDriver>(
 /// without that port. A caller with no error channel — one shaped like a C++
 /// constructor, returning the built port by value — uses
 /// [`port_runtime_unavailable`] instead.
+///
+/// `claim` is the driver's name, held before the driver was built: C's
+/// `asynPortDriver` constructor registers the port ahead of everything else
+/// (asynPortDriver.cpp:4036-4040), so a taken name builds no port thread.
 pub fn create_port_runtime_boxed(
+    claim: &PortClaim,
     mut driver: Box<dyn PortDriver>,
     config: RuntimeConfig,
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
+    if claim.name() != &*driver.base().port_name {
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "port {} built under the claim for {}",
+                driver.base().port_name,
+                claim.name()
+            ),
+        });
+    }
     // The one site that binds a port to its trace configuration and exception
     // list. C does it inside `registerPort` — the sole path into the port list
     // — which calls `dpCommonInit` (asynManager.c:2068) before adding the port
@@ -551,8 +579,9 @@ mod tests {
                 can_block,
                 ..PortFlags::default()
             };
-            let (_handle, _jh) = create_port_runtime(TestPort::with_flags(name, flags), config)
-                .expect("the port runtime thread must start");
+            let (_handle, _jh) =
+                create_port_runtime_unclaimed(TestPort::with_flags(name, flags), config)
+                    .expect("the port runtime thread must start");
             let row = (0..10_000)
                 .find_map(|_| {
                     let row = thread_report().into_iter().find(|t| t.name() == name);
@@ -583,7 +612,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             };
-            match create_port_runtime(TestPort::with_flags("refused_200", flags), config) {
+            match create_port_runtime_unclaimed(TestPort::with_flags("refused_200", flags), config)
+            {
                 Ok(_) => println!("REGISTERED"),
                 Err(_) => println!("FAILED"),
             }
@@ -645,8 +675,9 @@ mod tests {
 
     #[test]
     fn port_runtime_int32_roundtrip() {
-        let (handle, _jh) = create_port_runtime(TestPort::new("rt_test"), RuntimeConfig::default())
-            .expect("the port runtime thread must start");
+        let (handle, _jh) =
+            create_port_runtime_unclaimed(TestPort::new("rt_test"), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
 
         handle.port_handle().write_int32_blocking(0, 0, 42).unwrap();
         assert_eq!(handle.port_handle().read_int32_blocking(0, 0).unwrap(), 42);
@@ -661,7 +692,7 @@ mod tests {
         use crate::transport::RuntimeClient;
 
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_client"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_client"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         let client = handle.client();
@@ -705,7 +736,7 @@ mod tests {
     #[test]
     fn port_runtime_shutdown() {
         let (handle, jh) =
-            create_port_runtime(TestPort::new("rt_shutdown"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_shutdown"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         // Dropping the handle should cause the actor to stop
@@ -716,7 +747,7 @@ mod tests {
 
     #[test]
     fn port_runtime_explicit_shutdown() {
-        let (handle, _jh) = create_port_runtime(
+        let (handle, _jh) = create_port_runtime_unclaimed(
             TestPort::new("rt_explicit_shutdown"),
             RuntimeConfig::default(),
         )
@@ -731,7 +762,7 @@ mod tests {
 
     #[test]
     fn port_runtime_shutdown_while_handles_exist() {
-        let (handle, _jh) = create_port_runtime(
+        let (handle, _jh) = create_port_runtime_unclaimed(
             TestPort::new("rt_shutdown_handles"),
             RuntimeConfig::default(),
         )
@@ -751,7 +782,7 @@ mod tests {
     #[test]
     fn port_runtime_event_subscription() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("rt_events"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("rt_events"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
 
         let mut rx = handle.subscribe_events();
@@ -771,9 +802,29 @@ mod tests {
     #[test]
     fn port_runtime_port_name() {
         let (handle, _jh) =
-            create_port_runtime(TestPort::new("named_port"), RuntimeConfig::default())
+            create_port_runtime_unclaimed(TestPort::new("named_port"), RuntimeConfig::default())
                 .expect("the port runtime thread must start");
         assert_eq!(handle.port_name(), "named_port");
+    }
+
+    /// A claim covers the one name it holds: a driver named anything else
+    /// gets no port thread.
+    #[test]
+    fn a_claim_for_another_name_builds_no_port() {
+        let claim = crate::registry::PortRegistry::new()
+            .claim("claimed_name")
+            .unwrap();
+        let refused = create_port_runtime(
+            &claim,
+            TestPort::new("other_name"),
+            RuntimeConfig::default(),
+        );
+        assert!(matches!(refused, Err(AsynError::Status { .. })));
+        assert!(
+            !epics_libcom_rs::runtime::task::thread_report()
+                .into_iter()
+                .any(|t| t.name() == "other_name")
+        );
     }
 
     /// The boundary this whole change exists for: the OS refuses the port's
@@ -804,7 +855,7 @@ mod tests {
         const PORT: &str = "trace_from_handle";
         let services = crate::services::PortServices::new();
         let trace = services.trace().clone();
-        let (runtime, _actor) = create_port_runtime(
+        let (runtime, _actor) = create_port_runtime_unclaimed(
             TestPort::new(PORT),
             RuntimeConfig {
                 services,
@@ -875,7 +926,7 @@ mod tests {
 
             let manager = crate::manager::PortManager::new();
             let err = manager
-                .register_port(TestPort::new(PORT), &crate::registry::open_owner())
+                .register_port_unclaimed(TestPort::new(PORT), &crate::registry::open_owner())
                 .err()
                 .expect("thread creation is refused, so registration must fail");
             assert!(

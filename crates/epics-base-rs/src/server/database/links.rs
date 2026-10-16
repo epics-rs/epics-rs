@@ -3463,12 +3463,12 @@ impl PvDatabase {
     ///   the link as [`PutAdmission::Refused`](super::PutAdmission::Refused). The caller folds this
     ///   into the owning record's LINK/INVALID (`setLinkAlarm`), same cycle,
     ///   same as before this change.
-    /// * `Ok(())` for [`LinkPutOp::Plain`] — the write is staged. It is
+    /// * `Ok(())` for [`LinkPutOp::Plain`](super::LinkPutOp::Plain) — the write is staged. It is
     ///   **not** yet on the wire. This is the fire-and-forget flavour, C's
     ///   `CA_PUT` / `ca_array_put` (`dbCa.c:1163-1166`), and it is the whole
     ///   point of the queue: record processing no longer suspends on a
     ///   `ca://`/`pva://` round trip inside the record's advisory write gate.
-    /// * `Ok(())` for [`LinkPutOp::Async`] too — the completion flavour, C's
+    /// * `Ok(())` for [`LinkPutOp::Async`](super::LinkPutOp::Async) too — the completion flavour, C's
     ///   `CA_PUT_CALLBACK` / `ca_array_put_callback` whose `putComplete`
     ///   drives the originating record's completion (`dbCa.c:1167-1171`,
     ///   `:994-1012`). `dbCaPutLinkCallback` stores the callback in
@@ -3556,7 +3556,7 @@ impl PvDatabase {
     ///
     /// Returns when every staged write has been handed to its lset and that
     /// lset's `put_value` has returned. The barrier a caller needs when it
-    /// must observe the effect of a [`LinkPutOp::Plain`] write, which by
+    /// must observe the effect of a [`LinkPutOp::Plain`](super::LinkPutOp::Plain) write, which by
     /// construction is no longer complete when `write_external_pv` returns.
     pub async fn sync_external_link_puts(&self) {
         self.inner.link_puts.sync().await;

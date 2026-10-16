@@ -48,7 +48,7 @@ use std::sync::OnceLock;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
-    CommonFields, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
+    CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
     ProcessAction, ProcessContext, ProcessOutcome, Record, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
@@ -248,6 +248,10 @@ pub struct McaRecord {
 
     /// Where each open pass's device half stopped. State, not a field.
     pub resume: cycle::ResumeStack,
+
+    /// This pass reached a C `recGblGetTimeStamp` (`:762`, `:811`). State,
+    /// not a field.
+    pub stamp_asked: bool,
 }
 
 impl Default for McaRecord {
@@ -318,6 +322,7 @@ impl Default for McaRecord {
             roi: std::array::from_fn(|_| Roi::default()),
             status: McaStatus::default(),
             resume: cycle::ResumeStack::default(),
+            stamp_asked: false,
             clock: cycle::StampSource::default(),
         }
     }
@@ -973,11 +978,21 @@ impl Record for McaRecord {
         }
 
         if self.acqg == 0 {
+            self.stamp_asked = true;
             cycle::format_stim(&mut self.stim, self.clock.stamp());
             self.mmap |= cycle::M_STIM;
         }
 
         Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// C stamps only at `:762` and `:811`; every other pass keeps TIME.
+    fn cycle_hooks(&self) -> CycleHooks {
+        CycleHooks::ALL.union(CycleHooks::STAMP_REQUEST)
+    }
+
+    fn take_time_stamp_request(&mut self) -> bool {
+        std::mem::take(&mut self.stamp_asked)
     }
 
     /// C posts VAL only when it was marked, alarm transition or not (`:1013`).

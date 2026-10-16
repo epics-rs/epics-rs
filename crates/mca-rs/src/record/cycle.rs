@@ -310,6 +310,7 @@ impl McaRecord {
         debug_print!(5, "process: initiate read.\n");
         // C records the time the read BEGAN, for clients computing counts per
         // second across it (`:762-764`).
+        self.stamp_asked = true;
         self.rtim = epics_seconds(clock.stamp());
         self.mmap |= M_RTIM;
         let sent = dset.send_read(McaRead::Data);

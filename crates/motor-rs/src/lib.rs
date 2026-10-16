@@ -50,6 +50,7 @@
 )]
 
 pub mod builder;
+pub mod controller_port;
 pub(crate) mod coordinate;
 pub mod device_state;
 pub mod device_support;

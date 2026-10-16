@@ -86,6 +86,37 @@ impl Default for MotorStatus {
     }
 }
 
+/// The status bits a driver's C `poll()` sets on its error label before
+/// `callParamCallbacks`. Every other field keeps its value, as the parameter
+/// library does for fields the failed poll never wrote. A driver that returns
+/// before `callParamCallbacks` raises [`PollFailure::NONE`]: the background
+/// poller then posts nothing, and a forced poll posts the unchanged status,
+/// exactly as for a failure that sets no bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollFailure {
+    pub problem: bool,
+    pub comms_error: bool,
+}
+
+impl PollFailure {
+    pub const NONE: Self = Self {
+        problem: false,
+        comms_error: false,
+    };
+    pub const PROBLEM: Self = Self {
+        problem: true,
+        comms_error: false,
+    };
+    pub const COMMS_ERROR: Self = Self {
+        problem: false,
+        comms_error: true,
+    };
+    pub const PROBLEM_AND_COMMS_ERROR: Self = Self {
+        problem: true,
+        comms_error: true,
+    };
+}
+
 /// Which closed-loop gain a [`AsynMotor::set_pid_gain`] call addresses.
 /// C devMotorAsyn build_trans maps SET_PGAIN/SET_IGAIN/SET_DGAIN onto
 /// the motorPGain/motorIGain/motorDGain float64 parameters.
@@ -240,6 +271,12 @@ pub trait AsynMotor: Send + Sync {
 
     /// Poll the motor for current status.
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
+
+    /// What the C driver's `poll()` posts when it fails, i.e. when
+    /// [`AsynMotor::poll`] returns `Err`. No default: drivers differ (an
+    /// SMC100 raises only `motorStatusProblem_`, an XPS axis also
+    /// `motorStatusCommsError_`), and the bits reach the record as MSTA.
+    fn poll_failure(&self) -> PollFailure;
 
     /// The status fields the write method just called set, in order. The
     /// poller drains this after every write and posts the result when it

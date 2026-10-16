@@ -1,5 +1,5 @@
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use asyn_rs::user::AsynUser;
 use std::time::{Duration, Instant};
 
@@ -425,6 +425,11 @@ impl AsynMotor for SimMotor {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         self.advance_to(Instant::now());
         Ok(self.posted.clone())
+    }
+
+    /// Unreachable: C `motorSimAxis::poll` has no failure path.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
     }
 }
 

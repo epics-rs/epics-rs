@@ -187,6 +187,9 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         moves: Arc<AtomicU32>,
     }
     impl AsynMotor for UndershootMotor {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             Ok(MotorStatus {
                 position: self.position,
@@ -357,6 +360,9 @@ async fn a_put_before_the_first_pulse_moves_at_once() {
         loads: Arc<AtomicU32>,
     }
     impl AsynMotor for SpyMotor {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             Ok(MotorStatus {
                 position: self.position,

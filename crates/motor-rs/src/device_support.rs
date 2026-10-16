@@ -50,6 +50,21 @@ impl MotorAxis {
         &self.user
     }
 
+    /// Queue `command` on the poller for a writer that is no record: C's
+    /// controller port running a base function on the axis.
+    pub(crate) fn send(&self, command: MotorCommand) {
+        let _ = self.motor_cmd_tx.send(CommandBatch {
+            trace: Arc::new(MotorTrace::with_user(self.user.clone())),
+            record: None,
+            commands: vec![command],
+        });
+    }
+
+    /// Poll now and post: C `motorUpdateStatus_`.
+    pub(crate) fn force_poll(&self) {
+        let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll);
+    }
+
     /// Bind one more record: its own mailbox, seeded from the axis' cache,
     /// its own trace, and a place on the subscriber list.
     pub fn attach(&self) -> MotorDeviceSupport {
@@ -241,7 +256,7 @@ impl CommandPort {
             } => {
                 let _ = motor_cmd_tx.send(CommandBatch {
                     trace: self.trace.clone(),
-                    record: *record,
+                    record: Some(*record),
                     commands,
                 });
             }

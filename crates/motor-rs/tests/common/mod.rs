@@ -35,6 +35,9 @@ pub struct ExactMotor {
 }
 
 impl AsynMotor for ExactMotor {
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
     fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
         Ok(MotorStatus {
             position: self.position,

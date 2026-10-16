@@ -7,13 +7,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use asyn_rs::registry::open_owner;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use motor_rs::builder::{AxisSetup, MotorBuilder};
-use motor_rs::devices::{
-    PortDriver, device_support_factory, devices, register_axis, register_port,
-};
+use motor_rs::devices::{device_support_factory, devices, register_axis, register_controller_port};
 use motor_rs::trace::TraceUser;
 
 async fn wait_done(db: &PvDatabase, rec: &str) -> bool {
@@ -28,7 +27,7 @@ async fn wait_done(db: &PvDatabase, rec: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pini_move_completes_before_scan_run() {
-    register_port("PINIM", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "PINIM", 1, ()).unwrap();
     let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
         Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
     let AxisSetup {

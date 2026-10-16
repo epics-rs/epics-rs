@@ -111,7 +111,13 @@ impl RegressionIoc {
             })
             .poll_interval(Duration::from_millis(50))
             .build_axis();
-        motor_rs::devices::register_port(&port, motor_rs::devices::PortDriver::Controller, 1)?;
+        // Registered before the IOC exists, so no interruptAccept gate yet.
+        motor_rs::devices::register_controller_port(
+            &asyn_rs::registry::open_owner(),
+            &port,
+            1,
+            (),
+        )?;
         motor_rs::devices::register_axis(axis)?;
         tokio::spawn(poll_loop.run());
         let (motor_type, motor_record_factory) = motor_rs::motor_record_factory();

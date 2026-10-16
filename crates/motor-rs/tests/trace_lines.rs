@@ -53,6 +53,9 @@ impl AsynMotor for Disconnected {
     fn set_low_limit(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         refused()
     }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
     fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
         refused().map(|()| MotorStatus::default())
     }
@@ -447,24 +450,29 @@ async fn status_callback_and_update_values_print_under_traceio_device() {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use asyn_rs::registry::open_owner;
     use asyn_rs::trace::TraceMask;
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::types::EpicsValue;
     use motor_rs::builder::{AxisSetup, MotorBuilder};
     use motor_rs::devices::{
-        PortDriver, device_support_factory, devices, register_axis, register_port,
+        device_support_factory, devices, register_axis, register_controller_port,
     };
 
     let port = "traceLinesIoDevice";
+    // The controller's own user connects device 0 when the port is created
+    // (asynPortDriver.cpp:4099), so the record's lines take device 0's
+    // trace file: `asynSetTraceFile port 0`, not `-1`.
+    register_controller_port(&open_owner(), port, 1, ()).unwrap();
     PortManager::global()
         .trace_manager()
         .set_trace_mask(Some(port), TraceMask::IO_DEVICE);
     let path = std::env::temp_dir().join(format!("motor-trace-{port}-{}", std::process::id()));
-    PortManager::global().trace_manager().set_trace_file(
-        Some(port),
+    PortManager::global().trace_manager().set_device_trace_file(
+        port,
+        0,
         TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
     );
-    register_port(port, PortDriver::Controller, 1).unwrap();
     let motor: Arc<Mutex<dyn AsynMotor>> =
         Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
     let AxisSetup {

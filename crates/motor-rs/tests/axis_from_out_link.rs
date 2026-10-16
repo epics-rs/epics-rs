@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use asyn_rs::interfaces::motor::MotorStatus;
 use asyn_rs::manager::PortManager;
+use asyn_rs::registry::open_owner;
 use asyn_rs::trace::TraceFile;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -19,8 +20,8 @@ use motor_rs::builder::{AxisSetup, MotorBuilder};
 use motor_rs::device_state::{AxisSubscribers, StampedStatus};
 use motor_rs::device_support::MotorAxis;
 use motor_rs::devices::{
-    PortDriver, device_support_factory, devices, model1_device, register_axis,
-    register_model1_device, register_port,
+    device_support_factory, devices, model1_device, register_axis, register_controller_port,
+    register_drv_motor_asyn_port, register_model1_device,
 };
 use motor_rs::trace::TraceUser;
 use tokio::sync::mpsc;
@@ -128,7 +129,7 @@ async fn errlog_of<F: std::future::Future<Output = Arc<PvDatabase>>>(
 
 #[tokio::test]
 async fn an_asyn_out_reaches_the_axis_at_its_port_and_address() {
-    register_port("OUTA", PortDriver::Controller, 2).unwrap();
+    register_controller_port(&open_owner(), "OUTA", 2, ()).unwrap();
     axis(asyn("OUTA", 0), 10.0);
     axis(asyn("OUTA", 1), 20.0);
     let db = boot(
@@ -290,7 +291,7 @@ record(motor, "G:m") { field(DTYP, "TestModel1") field(OUT, "@asyn(X,0)") }
 /// `asynMotorController` line.
 #[tokio::test]
 async fn an_asyn_record_on_a_live_port_without_its_axis_is_kept() {
-    register_port("HOLE", PortDriver::Controller, 2).unwrap();
+    register_controller_port(&open_owner(), "HOLE", 2, ()).unwrap();
     axis(asyn("HOLE", 0), 5.0);
     let trace = Capture::of("HOLE");
     let db = boot(
@@ -341,7 +342,7 @@ record(motor, "H:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(HOLE,1)") fiel
 /// past `numAxes` fails `drvUserCreate`, so init_record takes `bad:`.
 #[tokio::test]
 async fn an_asyn_record_past_the_ports_axis_count_dies_at_init() {
-    register_port("SHORT", PortDriver::Controller, 2).unwrap();
+    register_controller_port(&open_owner(), "SHORT", 2, ()).unwrap();
     let trace = Capture::of("SHORT");
     let db = boot(
         r##"
@@ -378,7 +379,7 @@ record(motor, "I:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(SHORT,2)") }
 /// drvUserCreate; its reads and writes name the axis they refuse.
 #[tokio::test]
 async fn a_model2_record_on_a_missing_axis_is_kept_with_the_drivers_message() {
-    register_port("DRV2", PortDriver::DrvMotorAsyn, 2).unwrap();
+    register_drv_motor_asyn_port("DRV2", 2).unwrap();
     let trace = Capture::of("DRV2");
     let db = boot(
         r##"
@@ -409,13 +410,13 @@ record(motor, "J:m1") { field(DTYP, "asynMotor") field(OUT, "@asyn(DRV2,4)") }
 fn an_asyn_axis_needs_its_port_registered_and_in_range() {
     let refused = |user: TraceUser| register_axis(unpolled(user, AxisSubscribers::new())).is_err();
     assert!(refused(asyn("UNREGISTERED", 0)));
-    register_port("RANGE", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "RANGE", 1, ()).unwrap();
     assert!(refused(asyn("RANGE", 1)));
     assert!(refused(TraceUser::Model2 {
         port: "RANGE".into(),
         addr: 0
     }));
-    assert!(register_port("RANGE", PortDriver::Controller, 1).is_err());
+    assert!(register_controller_port(&open_owner(), "RANGE", 1, ()).is_err());
 }
 
 /// devMotorAsyn.c:376-387: each record registers its own status callback on
@@ -423,7 +424,7 @@ fn an_asyn_axis_needs_its_port_registered_and_in_range() {
 /// poller. A move one record starts reaches the other's readback.
 #[tokio::test]
 async fn two_asyn_records_on_one_axis_both_follow_its_poller() {
-    register_port("TWIN", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "TWIN", 1, ()).unwrap();
     let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
         Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
     let AxisSetup {
@@ -479,7 +480,7 @@ record(motor, "K:b") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") fiel
 /// its init_record still ends in monitor()'s alarm reset.
 #[tokio::test]
 async fn a_record_on_a_missing_axis_is_initialised_without_a_process() {
-    register_port("NOPASS", PortDriver::DrvMotorAsyn, 2).unwrap();
+    register_drv_motor_asyn_port("NOPASS", 2).unwrap();
     let trace = Capture::of("NOPASS");
     let db = boot(
         r##"
@@ -514,7 +515,7 @@ record(calc, "N:n") { field(CALC, "A+1") field(INPA, "N:n NPP") }
 /// started before the pause still completes on the paused IOC.
 #[tokio::test]
 async fn a_move_completes_while_the_ioc_is_paused() {
-    register_port("PAUSED", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "PAUSED", 1, ()).unwrap();
     let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
         Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
     let AxisSetup {
@@ -559,7 +560,7 @@ record(calc, "P:n") { field(CALC, "A+1") field(INPA, "P:n NPP") }
 /// pending to swallow the ones after `scanRun`.
 #[tokio::test]
 async fn a_put_before_scan_run_completes_its_move() {
-    register_port("EARLY", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "EARLY", 1, ()).unwrap();
     let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
         Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
     let AxisSetup {
@@ -611,7 +612,7 @@ record(motor, "E:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(EARLY,0)") fie
 /// raised it sends the driver nothing.
 #[tokio::test]
 async fn a_record_in_comm_alarm_sends_no_command() {
-    register_port("COMM", PortDriver::Controller, 1).unwrap();
+    register_controller_port(&open_owner(), "COMM", 1, ()).unwrap();
     let subscribers = AxisSubscribers::new();
     subscribers.store(StampedStatus {
         seq: 1,
@@ -661,7 +662,7 @@ record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(COMM,0)") fiel
 #[tokio::test]
 async fn a_move_start_pass_commits_and_resets_the_alarm() {
     for port in ["MVAL0", "MVAL1"] {
-        register_port(port, PortDriver::Controller, 1).unwrap();
+        register_controller_port(&open_owner(), port, 1, ()).unwrap();
         let subscribers = AxisSubscribers::new();
         subscribers.store(StampedStatus {
             seq: 1,

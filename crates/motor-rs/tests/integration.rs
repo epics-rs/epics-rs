@@ -788,6 +788,9 @@ async fn failed_poll_posts_comms_error_status() {
         position: f64,
     }
     impl AsynMotor for FlakyMotor {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             if self.offline.load(Ordering::SeqCst) {
                 return Err(AsynError::Status {
@@ -920,6 +923,195 @@ async fn failed_poll_posts_comms_error_status() {
     let _ = poll_handle.await;
 }
 
+/// A motor whose transport is down from `offline`, failing as `failure`
+/// names (C's per-driver `poll()` error label).
+struct FailingMotor {
+    offline: Arc<std::sync::atomic::AtomicBool>,
+    failure: asyn_rs::interfaces::motor::PollFailure,
+}
+
+impl AsynMotor for FailingMotor {
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        self.failure
+    }
+    fn poll(
+        &mut self,
+        _user: &asyn_rs::user::AsynUser,
+    ) -> asyn_rs::error::AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+        if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(asyn_rs::error::AsynError::Status {
+                status: asyn_rs::error::AsynStatus::Timeout,
+                message: "controller not responding".into(),
+            });
+        }
+        Ok(asyn_rs::interfaces::motor::MotorStatus {
+            position: 3.5,
+            ..Default::default()
+        })
+    }
+    fn move_absolute(
+        &mut self,
+        _: &asyn_rs::user::AsynUser,
+        _: f64,
+        _: f64,
+        _: f64,
+        _: f64,
+    ) -> asyn_rs::error::AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &asyn_rs::user::AsynUser, _: f64) -> asyn_rs::error::AsynResult<()> {
+        Ok(())
+    }
+    fn home(
+        &mut self,
+        _: &asyn_rs::user::AsynUser,
+        _: f64,
+        _: f64,
+        _: f64,
+        _: bool,
+    ) -> asyn_rs::error::AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(
+        &mut self,
+        _: &asyn_rs::user::AsynUser,
+        _: f64,
+    ) -> asyn_rs::error::AsynResult<()> {
+        Ok(())
+    }
+}
+
+/// A poll loop on a [`FailingMotor`], with the switch that cuts its link.
+struct FailingAxis {
+    offline: Arc<std::sync::atomic::AtomicBool>,
+    state: motor_rs::device_state::SharedDeviceState,
+    io_intr: mpsc::Receiver<()>,
+    poll: mpsc::Sender<PollCommand>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FailingAxis {
+    /// The status the record last took, after running every pass the
+    /// poller has pulsed.
+    fn latest(&mut self) -> Option<motor_rs::device_state::StampedStatus> {
+        let mut ds = self.state.lock().unwrap();
+        while self.io_intr.try_recv().is_ok() {
+            ds.begin_callback_pass();
+        }
+        ds.latest_status.clone()
+    }
+
+    async fn shutdown(self) {
+        let _ = self.poll.send(PollCommand::Shutdown).await;
+        let _ = self.task.await;
+    }
+}
+
+fn failing_poll_loop(
+    failure: asyn_rs::interfaces::motor::PollFailure,
+    offline: bool,
+) -> FailingAxis {
+    let switch = Arc::new(std::sync::atomic::AtomicBool::new(offline));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(FailingMotor {
+        offline: switch.clone(),
+        failure,
+    }));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    device_state.lock().unwrap().accept();
+    let (io_intr_tx, io_intr) = mpsc::channel::<()>(1024);
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
+        motor,
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(device_state.clone(), io_intr_tx, Default::default());
+            subscribers
+        },
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        0,
+    );
+    FailingAxis {
+        offline: switch,
+        state: device_state,
+        io_intr,
+        poll: poll_cmd_tx,
+        task: tokio::spawn(poll_loop.run()),
+    }
+}
+
+/// C `SMC100Axis::poll` sets only `motorStatusProblem_` at its `skip` label
+/// (SMC100Driver.cpp), on an `asynMotorAxis::status_` that starts all 0: a
+/// controller down from boot reads MSTA 512, not COMM_ERR|PROBLEM|DONE.
+#[tokio::test]
+async fn a_problem_only_failure_from_boot_raises_problem_on_a_zeroed_status() {
+    use asyn_rs::interfaces::motor::PollFailure;
+    let mut axis = failing_poll_loop(PollFailure::PROBLEM, true);
+    assert!(wait_until(Duration::from_secs(2), || axis.latest().is_some()).await);
+    let status = axis.latest().unwrap().status;
+    assert!(status.problem);
+    assert!(
+        !status.comms_error,
+        "SMC100 never writes motorStatusCommsError_"
+    );
+    assert!(!status.done, "C status_ starts with every bit 0");
+    axis.shutdown().await;
+}
+
+/// The same driver after a healthy poll keeps every field the failure did
+/// not write.
+#[tokio::test]
+async fn a_problem_only_failure_keeps_the_last_status() {
+    use asyn_rs::interfaces::motor::PollFailure;
+    let mut axis = failing_poll_loop(PollFailure::PROBLEM, false);
+    assert!(wait_until(Duration::from_secs(2), || axis.latest().is_some()).await);
+    axis.offline
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            axis.latest().is_some_and(|s| s.status.problem)
+        })
+        .await
+    );
+    let status = axis.latest().unwrap().status;
+    assert!(!status.comms_error);
+    assert_eq!(status.position, 3.5);
+    axis.shutdown().await;
+}
+
+/// A failure raising no bit posts nothing from the background poller; a
+/// forced poll still posts the unchanged status (asynMotorController.cpp
+/// :217-221).
+#[tokio::test]
+async fn a_failure_raising_no_bit_posts_only_when_forced() {
+    use asyn_rs::interfaces::motor::PollFailure;
+    let mut axis = failing_poll_loop(PollFailure::NONE, false);
+    assert!(wait_until(Duration::from_secs(2), || axis.latest().is_some()).await);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let healthy = axis.latest().unwrap();
+    axis.offline
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        axis.latest().unwrap().seq,
+        healthy.seq,
+        "background polls post nothing"
+    );
+    axis.poll.send(PollCommand::ForcePoll).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            axis.latest().is_some_and(|s| s.seq > healthy.seq)
+        })
+        .await
+    );
+    assert_eq!(axis.latest().unwrap().status, healthy.status);
+    axis.shutdown().await;
+}
+
 /// autosave pass0 restore contract. C `reboot_restore` pass0 writes fields
 /// with `dbPut` BEFORE `init_record` runs (`initHookAfterInitDevSup`
 /// precedes `initDatabase` in iocInit), so a restored VAL is a plain field
@@ -942,6 +1134,9 @@ async fn pass0_restored_val_is_not_a_move_command() {
         loads: Arc<AtomicU32>,
     }
     impl AsynMotor for SpyMotor {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             Ok(MotorStatus {
                 position: self.position,
@@ -1052,6 +1247,9 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
         }
     }
     impl AsynMotor for DeadLine {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             self.wire();
             Ok(MotorStatus {
@@ -1155,6 +1353,9 @@ async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
     }
     struct Counting(Arc<Seen>);
     impl AsynMotor for Counting {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             self.0.polls.fetch_add(1, Ordering::SeqCst);
             Ok(MotorStatus {
@@ -1323,6 +1524,9 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
 
     struct Counting(Arc<AtomicUsize>);
     impl AsynMotor for Counting {
+        fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+            asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
         fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(MotorStatus {
@@ -1401,7 +1605,7 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
     motor_cmd_tx
         .send(motor_rs::poll_loop::CommandBatch {
             trace: Arc::new(motor_rs::trace::MotorTrace::new("forcePollFast", 0)),
-            record: 0,
+            record: Some(0),
             commands: vec![MotorCommand::MoveAbsolute {
                 position: 10.0,
                 min_velocity: 0.0,

@@ -7,17 +7,20 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::AsynResult;
+use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::manager::PortManager;
 use crate::port_handle::PortHandle;
 use crate::request::RequestOp;
+use crate::services::PortServices;
+use crate::trace::TraceMask;
 use crate::user::AsynUser;
 
 /// Synchronous I/O handle backed by a [`PortHandle`] (actor model).
 ///
 /// All operations submit requests to the actor and block until completion.
 pub struct SyncIOHandle {
-    handle: PortHandle,
+    /// `None` is C's asynUser whose `connectDevice` failed (`pport == NULL`).
+    handle: Option<PortHandle>,
     addr: i32,
     timeout: Duration,
 }
@@ -26,7 +29,7 @@ impl SyncIOHandle {
     /// Create from a PortHandle.
     pub fn from_handle(handle: PortHandle, addr: i32, timeout: Duration) -> Self {
         Self {
-            handle,
+            handle: Some(handle),
             addr,
             timeout,
         }
@@ -40,18 +43,67 @@ impl SyncIOHandle {
         timeout: Duration,
     ) -> AsynResult<Self> {
         let handle = manager.find_port_handle(port_name)?;
-        Ok(Self {
-            handle,
-            addr,
-            timeout,
+        Ok(Self::from_handle(handle, addr, timeout))
+    }
+
+    /// C `pasynOctetSyncIO->connect` against the global registry: the user
+    /// exists even when `connectDevice` fails (asynOctetSyncIO.c:117-123), so
+    /// a driver that ignores the status keeps a user whose every transfer
+    /// fails in `queueLockPort`.
+    pub fn connect_port(port_name: &str, addr: i32, timeout: Duration) -> (Self, AsynResult<()>) {
+        match crate::registry::get_port(port_name) {
+            Some(entry) => (Self::from_handle(entry.handle, addr, timeout), Ok(())),
+            None => (
+                Self {
+                    handle: None,
+                    addr,
+                    timeout,
+                },
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("asynManager:connectDevice port {port_name} not found"),
+                }),
+            ),
+        }
+    }
+
+    /// The port this user transfers through — for a driver that submits its
+    /// own requests asynchronously — or C `queueLockPort`'s refusal for a user
+    /// whose connect found no port (asynManager.c:1843-1847).
+    pub fn port(&self) -> AsynResult<&PortHandle> {
+        self.handle.as_ref().ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynManager::queueLockPort not connected".into(),
         })
     }
 
+    /// C `asynPrint(pasynUser, mask, ...)` on this user: the port's rung for a
+    /// connected user, and the global trace for one whose connect found no
+    /// port (`findTracePvt`, asynManager.c:548-553). `args` is the line
+    /// without its newline.
+    pub fn print(&self, reason: i32, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        match &self.handle {
+            Some(handle) => handle.trace().print(
+                Some(handle.port_name()),
+                (self.addr >= 0).then_some(self.addr),
+                reason,
+                mask,
+                args,
+            ),
+            None => PortServices::global()
+                .trace()
+                .print(None, None, reason, mask, args),
+        }
+    }
+
     pub(crate) fn user(&self, reason: usize) -> AsynUser {
-        AsynUser::new(reason)
+        let user = AsynUser::new(reason)
             .with_addr(self.addr)
-            .with_timeout(self.timeout)
-            .locking_port(&self.handle)
+            .with_timeout(self.timeout);
+        match &self.handle {
+            Some(handle) => user.locking_port(handle),
+            None => user,
+        }
     }
 
     /// Read the configured per-call timeout. The handle is `&self`-only
@@ -67,7 +119,7 @@ impl SyncIOHandle {
         // Build the user via `self.user` so the configured timeout is
         // honored — the `*_blocking` shortcuts hard-code the 1s default.
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::Int32Read, self.user(reason))?;
         result
             .int_val
@@ -78,14 +130,14 @@ impl SyncIOHandle {
     }
 
     pub fn write_int32(&self, reason: usize, value: i32) -> AsynResult<()> {
-        self.handle
+        self.port()?
             .submit_blocking(RequestOp::Int32Write { value }, self.user(reason))?;
         Ok(())
     }
 
     pub fn read_float64(&self, reason: usize) -> AsynResult<f64> {
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::Float64Read, self.user(reason))?;
         result
             .float_val
@@ -96,7 +148,7 @@ impl SyncIOHandle {
     }
 
     pub fn write_float64(&self, reason: usize, value: f64) -> AsynResult<()> {
-        self.handle
+        self.port()?
             .submit_blocking(RequestOp::Float64Write { value }, self.user(reason))?;
         Ok(())
     }
@@ -104,7 +156,7 @@ impl SyncIOHandle {
     pub fn read_octet(&self, reason: usize, buf_size: usize) -> AsynResult<Vec<u8>> {
         let user = self.user(reason);
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::OctetRead { buf_size }, user)?;
         result.data.ok_or_else(|| crate::error::AsynError::Status {
             status: crate::error::AsynStatus::Error,
@@ -116,7 +168,7 @@ impl SyncIOHandle {
     /// `*nbytesTransferred`).
     pub fn write_octet(&self, reason: usize, data: &[u8]) -> AsynResult<usize> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(
+        let result = self.port()?.submit_blocking(
             RequestOp::OctetWrite {
                 data: data.to_vec(),
             },
@@ -134,7 +186,7 @@ impl SyncIOHandle {
     /// by `read_octet`.
     pub fn write_read(&self, reason: usize, data: &[u8], buf_size: usize) -> AsynResult<Vec<u8>> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(
+        let result = self.port()?.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: data.to_vec(),
                 buf_size,
@@ -151,7 +203,7 @@ impl SyncIOHandle {
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
         let user = self.user(reason);
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::UInt32DigitalRead { mask }, user)?;
         result
             .uint_val
@@ -163,14 +215,14 @@ impl SyncIOHandle {
 
     pub fn write_uint32_digital(&self, reason: usize, value: u32, mask: u32) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle
+        self.port()?
             .submit_blocking(RequestOp::UInt32DigitalWrite { value, mask }, user)?;
         Ok(())
     }
 
     pub fn read_int64(&self, reason: usize) -> AsynResult<i64> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(RequestOp::Int64Read, user)?;
+        let result = self.port()?.submit_blocking(RequestOp::Int64Read, user)?;
         result
             .int64_val
             .ok_or_else(|| crate::error::AsynError::Status {
@@ -181,14 +233,14 @@ impl SyncIOHandle {
 
     pub fn write_int64(&self, reason: usize, value: i64) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle
+        self.port()?
             .submit_blocking(RequestOp::Int64Write { value }, user)?;
         Ok(())
     }
 
     pub fn read_enum(&self, reason: usize) -> AsynResult<usize> {
         let user = self.user(reason);
-        let result = self.handle.submit_blocking(RequestOp::EnumRead, user)?;
+        let result = self.port()?.submit_blocking(RequestOp::EnumRead, user)?;
         result
             .enum_index
             .ok_or_else(|| crate::error::AsynError::Status {
@@ -199,7 +251,7 @@ impl SyncIOHandle {
 
     pub fn write_enum(&self, reason: usize, index: usize) -> AsynResult<()> {
         let user = self.user(reason);
-        self.handle
+        self.port()?
             .submit_blocking(RequestOp::EnumWrite { index }, user)?;
         Ok(())
     }
@@ -216,17 +268,18 @@ impl SyncIOHandle {
         // registered asynDrvUser (`findInterface(asynDrvUserType)`,
         // asynOctetSyncIO.c:143-156); on a port without it the pasynUser keeps
         // reason 0 and the connect succeeds. The interface registry answers that,
-        // not a failed `create`.
-        if !self
-            .handle
-            .has_interface(crate::interfaces::InterfaceType::DrvUser)
-        {
+        // not a failed `create`. A connect that found no port returned before the
+        // drvInfo step (:117-123), leaving reason 0 as well.
+        let Some(handle) = &self.handle else {
+            return Ok(0);
+        };
+        if !handle.has_interface(crate::interfaces::InterfaceType::DrvUser) {
             return Ok(0);
         }
         // Synchronous I/O binds at the port level: no per-record asyn addr (use
         // addr 0, C `getAddr` default) and no record interface behind the bind.
         // Surface only the shared reason.
-        self.handle
+        handle
             .drv_user_create_blocking(&crate::port::DrvUserRequest::new(drv_info, 0))
             .map(|info| info.reason)
     }
@@ -245,7 +298,11 @@ mod tests {
 
     impl TestPort {
         fn new() -> Self {
-            let mut base = PortDriverBase::new("synctest", 1, PortFlags::default());
+            Self::named("synctest")
+        }
+
+        fn named(name: &str) -> Self {
+            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
             base.create_param("INT_VAL", ParamType::Int32).unwrap();
             base.create_param("FLOAT_VAL", ParamType::Float64).unwrap();
             base.create_param("STR_VAL", ParamType::Octet).unwrap();
@@ -410,6 +467,75 @@ mod tests {
         let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);
+    }
+
+    /// C `pasynOctetSyncIO->connect` to a port that does not exist still hands
+    /// back the asynUser (asynOctetSyncIO.c:117-123); every transfer on it then
+    /// fails in `queueLockPort` (asynManager.c:1843-1847).
+    #[test]
+    fn a_user_connected_to_a_missing_port_refuses_every_transfer() {
+        let (sio, status) =
+            SyncIOHandle::connect_port("sync_no_such_port", 0, Duration::from_secs(1));
+        let msg = |e: AsynError| match e {
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message,
+            } => message,
+            other => panic!("not asynError: {other:?}"),
+        };
+        assert_eq!(
+            msg(status.unwrap_err()),
+            "asynManager:connectDevice port sync_no_such_port not found"
+        );
+        let refused = "asynManager::queueLockPort not connected";
+        assert_eq!(msg(sio.read_int32(0).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_int32(0, 1).unwrap_err()), refused);
+        assert_eq!(msg(sio.read_float64(0).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_float64(0, 1.0).unwrap_err()), refused);
+        assert_eq!(msg(sio.read_octet(0, 8).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_octet(0, b"x").unwrap_err()), refused);
+        assert_eq!(msg(sio.write_read(0, b"x", 8).unwrap_err()), refused);
+        assert_eq!(msg(sio.read_uint32_digital(0, 1).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_uint32_digital(0, 1, 1).unwrap_err()), refused);
+        assert_eq!(msg(sio.read_int64(0).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_int64(0, 1).unwrap_err()), refused);
+        assert_eq!(msg(sio.read_enum(0).unwrap_err()), refused);
+        assert_eq!(msg(sio.write_enum(0, 0).unwrap_err()), refused);
+        assert_eq!(sio.drv_user_create("INT_VAL").unwrap(), 0);
+        assert_eq!(msg(sio.port().err().unwrap()), refused);
+
+        // Control: the same call on a published port connects and transfers.
+        let mgr = PortManager::new();
+        mgr.register_port_unclaimed(
+            TestPort::named("sync_connect_port_live"),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let (live, status) =
+            SyncIOHandle::connect_port("sync_connect_port_live", 0, Duration::from_secs(1));
+        status.unwrap();
+        live.write_int32(0, 7).unwrap();
+        assert_eq!(live.read_int32(0).unwrap(), 7);
+    }
+
+    /// C `asynPrint` on a user whose connect found no port prints on the
+    /// global trace (asynManager.c:548-553).
+    #[test]
+    fn a_user_of_a_missing_port_prints_on_the_global_trace() {
+        use crate::trace::TraceFile;
+
+        let path = std::env::temp_dir().join(format!("syncio-global-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = PortServices::global().trace().clone();
+        trace.set_trace_file(None, TraceFile::File(Arc::new(std::sync::Mutex::new(file))));
+
+        let (sio, _) = SyncIOHandle::connect_port("sync_print_no_port", 0, Duration::ZERO);
+        sio.print(0, TraceMask::ERROR, format_args!("unconnected line"));
+        trace.set_trace_file(None, TraceFile::default());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.ends_with("unconnected line\n"), "{text:?}");
     }
 
     /// Reproducer for asyn upstream issue #220: `pasynOctetSyncIO->read`

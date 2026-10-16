@@ -71,6 +71,9 @@ impl AsynMotor for Axis {
     fn set_high_limit(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         self.outcome()
     }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
     fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
         Ok(MotorStatus {
             position: 1.0,
@@ -180,7 +183,7 @@ impl Rig {
         self.commands
             .send(CommandBatch {
                 trace: self.trace.clone(),
-                record: 0,
+                record: Some(0),
                 commands: vec![command],
             })
             .unwrap();
@@ -303,6 +306,42 @@ fn a_model2_driver_field_posts_like_a_controllers() {
     let ratio = MotorCommand::SetEncoderRatio { ratio: 2.0 };
     assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
     assert_eq!(rig.write(ratio), None);
+}
+
+fn model1() -> TraceUser {
+    TraceUser::Model1 {
+        device: "devWritePosts",
+        card: 0,
+        signal: 0,
+    }
+}
+
+/// A model-1 record's move-done pass must not read the done status of the
+/// poll before the move: the record would end the move there and retry it,
+/// or leave a jog running that JOGF 0 then does not stop.
+#[test]
+fn a_model1_move_or_jog_processes_its_record_with_done_off() {
+    let mut rig = rig(model1(), 1.0);
+    for command in [
+        move_to(5.0),
+        MotorCommand::MoveVelocity {
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        },
+    ] {
+        rig.write(command);
+        let read = rig.record.passes();
+        assert_eq!(read.len(), 1);
+        assert!(!read[0].done);
+    }
+}
+
+#[test]
+fn a_failed_model1_move_still_posts_done_off() {
+    let mut rig = rig(model1(), 1.0);
+    rig.fail.store(true, Ordering::Relaxed);
+    assert!(!rig.write(move_to(5.0)).unwrap().done);
 }
 
 #[test]

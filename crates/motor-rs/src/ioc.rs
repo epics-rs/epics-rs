@@ -102,7 +102,12 @@ impl SimMotorHolder {
                     .poll_interval(Duration::from_millis(poll_ms))
                     .build_axis();
 
-                crate::devices::register_port(&port, crate::devices::PortDriver::Controller, 1)?;
+                crate::devices::register_controller_port(
+                    ctx.db().scan_control().interrupt_gate(),
+                    &port,
+                    1,
+                    (),
+                )?;
                 crate::devices::register_axis(axis)?;
 
                 // Spawn poll loop on the tokio runtime (starts idle)

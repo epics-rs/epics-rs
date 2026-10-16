@@ -17,6 +17,10 @@ use epics_base_rs::server::record::{
     DbLinkType, DevSup, Dset, HwLink, ParsedLink, Record, ScanType, parse_link_v2,
 };
 
+use asyn_rs::port_handle::PortHandle;
+use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+
+use crate::controller_port::ControllerParams;
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::MissingAxis;
 use crate::trace::{MotorTrace, TraceUser};
@@ -78,7 +82,7 @@ fn controllers() -> &'static Mutex<HashMap<Controller, Axes>> {
 /// The driver behind an asyn motor port, which decides how it answers for
 /// an axis it does not have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortDriver {
+enum PortDriver {
     /// `asynMotorController` (model 3).
     Controller,
     /// `drvMotorAsyn.c` over a `motorAxisDrvSET_t` (model 2).
@@ -91,17 +95,48 @@ fn ports() -> &'static Mutex<HashMap<String, (PortDriver, i32)>> {
     PORTS.get_or_init(Default::default)
 }
 
-/// Make asyn port `port` reachable from a record's OUT, with axes
-/// `0..num_axes` as its constructor sizes them. The create command calls
-/// this before [`register_axis`] for each axis it creates; a second port of
-/// the same name is refused.
-pub fn register_port(port: &str, driver: PortDriver, num_axes: i32) -> Result<(), String> {
+fn register_port(port: &str, driver: PortDriver, num_axes: i32) -> Result<(), String> {
     let mut ports = lock(ports());
     if ports.contains_key(port) {
         return Err(format!("motor port {port} is already registered"));
     }
     ports.insert(port.to_owned(), (driver, num_axes));
     Ok(())
+}
+
+/// Create `asynMotorController` port `port` with axes `0..num_axes`: the
+/// asyn port its records reach, with C's base parameters and the driver's
+/// `params`, gated on `owner` (the IOC's interruptAccept). The create
+/// command calls this before [`register_axis`] for each axis it creates; a
+/// second port of the same name is refused. The handle is the driver's, to
+/// post the values its poll reads.
+pub fn register_controller_port<P: ControllerParams>(
+    owner: &Arc<InterruptGate>,
+    port: &str,
+    num_axes: i32,
+    params: P,
+) -> Result<PortHandle, String> {
+    if lock(ports()).contains_key(port) {
+        return Err(format!("motor port {port} is already registered"));
+    }
+    let handle = crate::controller_port::publish(owner, port, num_axes, params)?;
+    register_port(port, PortDriver::Controller, num_axes)?;
+    Ok(handle)
+}
+
+/// Make `drvMotorAsyn` port `port` reachable from a record's OUT, with axes
+/// `0..num_axes`; see [`register_controller_port`].
+pub fn register_drv_motor_asyn_port(port: &str, num_axes: i32) -> Result<(), String> {
+    register_port(port, PortDriver::DrvMotorAsyn, num_axes)
+}
+
+/// The axis registered at `addr` of asyn port `port`.
+pub(crate) fn axis_at(port: &str, addr: i32) -> Option<MotorAxis> {
+    let controllers = lock(controllers());
+    let (axis, _) = controllers
+        .get(&Controller::Port(port.to_owned()))?
+        .get(&addr)?;
+    Some(axis.clone())
 }
 
 fn model1_choices() -> &'static Mutex<HashSet<&'static str>> {

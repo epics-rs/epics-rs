@@ -986,7 +986,7 @@ impl PortDriverBase {
                 line!(),
                 format_args!(
                     "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}",
-                    e.param_status_code(),
+                    e.c_status_code(),
                     user.reason,
                     self.params.param_name(user.reason).unwrap_or(""),
                     value
@@ -1789,7 +1789,7 @@ impl PortDriverBase {
         let why = match e {
             AsynError::ParamIndexOutOfRange(_) => "bad index",
             AsynError::TypeMismatch { .. } => "wrong type",
-            AsynError::AddressOutOfRange(_) => "invalid list",
+            AsynError::ParamInvalidList(_) => "invalid list",
             _ => return,
         };
         self.trace_print(
@@ -2524,7 +2524,7 @@ fn param_access_error_by(
     let message = format!(
         "{}:{function}: status={}, function={}, {}={}, {value}",
         writer.driver,
-        e.param_status_code(),
+        e.c_status_code(),
         user.reason,
         writer.name_key,
         params.param_name(user.reason).unwrap_or(""),
@@ -5400,10 +5400,10 @@ mod tests {
             write(&mut drv, &mut at(99)),
             Err(AsynError::ParamIndexOutOfRange(99))
         ));
-        assert!(matches!(
-            write(&mut drv, &mut AsynUser::new(F64).with_addr(1)),
-            Err(AsynError::AddressOutOfRange(1))
-        ));
+        let e = write(&mut drv, &mut AsynUser::new(F64).with_addr(1)).unwrap_err();
+        assert!(matches!(e, AsynError::AddressOutOfRange(1)));
+        // getAddress returns asynError, not the param library's InvalidList.
+        assert_eq!(e.c_status_code(), 3);
     }
 
     #[test]

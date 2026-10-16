@@ -1,5 +1,6 @@
 pub mod ad_driver;
 pub mod ndarray_driver;
+pub mod write_tail;
 
 // Re-exports for backward compatibility
 pub use crate::color::NDColorMode as ColorMode;

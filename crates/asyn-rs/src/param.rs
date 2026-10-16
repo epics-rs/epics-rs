@@ -353,7 +353,7 @@ impl ParamList {
     fn validate_addr(&self, addr: i32) -> AsynResult<usize> {
         let addr = if addr == -1 { 0 } else { addr };
         if addr < 0 || (addr as usize) >= self.max_addr {
-            return Err(AsynError::AddressOutOfRange(addr));
+            return Err(AsynError::ParamInvalidList(addr));
         }
         Ok(addr as usize)
     }
@@ -1951,10 +1951,10 @@ mod tests {
         pl.set_int32(idx, 0, 99).unwrap();
         assert_eq!(pl.get_int32(idx, -1).unwrap(), 99);
         assert_eq!(pl.get_int32(idx, 0).unwrap(), 99);
-        assert!(matches!(
-            pl.get_int32(idx, 5),
-            Err(AsynError::AddressOutOfRange(5))
-        ));
+        let e = pl.get_int32(idx, 5).unwrap_err();
+        assert!(matches!(e, AsynError::ParamInvalidList(5)));
+        // C `getParamList` returns asynParamInvalidList (asynDriver.h:61).
+        assert_eq!(e.c_status_code(), 11);
     }
 
     #[test]

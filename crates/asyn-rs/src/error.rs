@@ -237,6 +237,12 @@ pub enum AsynError {
     #[error("address out of range: {0}")]
     AddressOutOfRange(i32),
 
+    /// C `asynParamInvalidList`: a param-library access to a list the port
+    /// does not have (`asynPortDriver.cpp:997`). [`AsynError::AddressOutOfRange`]
+    /// is `getAddress`'s refusal, which C returns as `asynError`.
+    #[error("invalid param list: {0}")]
+    ParamInvalidList(i32),
+
     #[error("already subscribed")]
     AlreadySubscribed,
 
@@ -463,15 +469,21 @@ impl AsynError {
         }
     }
 
-    /// C's `asynStatus` number for a param-library failure — the `status=%d`
-    /// in `asynPortDriver`'s `errorMessage` (asynDriver.h:56-60).
-    pub fn param_status_code(&self) -> i32 {
+    /// The `asynStatus` number C prints as `status=%d`: [`Self::status`], or
+    /// the param library's own code (asynDriver.h:56-61), which
+    /// [`AsynStatus`] does not carry.
+    pub fn c_status_code(&self) -> i32 {
         match self {
+            AsynError::PartialRead { source, .. }
+            | AsynError::PartialWrite { source, .. }
+            | AsynError::OctetStep { source, .. }
+            | AsynError::ParamAccess { source, .. } => source.c_status_code(),
             AsynError::ParamAlreadyExists(_) => 6,
             AsynError::ParamNotFound(_) => 7,
             AsynError::TypeMismatch { .. } => 8,
             AsynError::ParamIndexOutOfRange(_) => 9,
             AsynError::ParamUndefined(_) => 10,
+            AsynError::ParamInvalidList(_) => 11,
             other => other.status() as i32,
         }
     }

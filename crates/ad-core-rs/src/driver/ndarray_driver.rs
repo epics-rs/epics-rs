@@ -612,7 +612,7 @@ pub(crate) fn trace_write_int32(
             line!(),
             format_args!(
                 "{driver_name}:writeInt32: error, status={} function={}, paramName={name}, value={value}",
-                e.status() as i32,
+                e.c_status_code(),
                 user.reason,
             ),
         ),
@@ -2810,6 +2810,41 @@ pub(crate) mod tests {
                 .get_int32_param(drv.params.attributes_status, 0)
                 .unwrap(),
             ATTR_STATUS_FILE_NOT_FOUND
+        );
+    }
+
+    /// asynNDArrayDriver.cpp:682, :699-702: the line carries setIntegerParam's
+    /// own status, asynParamWrongType (8) for a Float64 parameter.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::user::UserTrace;
+        let port = "NDWRONGTYPE";
+        let mut drv = NDArrayDriverBase::new(port, 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("nd-wrong-type-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = drv.params.timestamp_rbv;
+        let mut user = AsynUser::new(reason);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let pool = NDArrayPool::new(0);
+        assert!(
+            handle_write_int32(&mut drv.port_base, &drv.params, &pool, None, &user, 1).is_err()
+        );
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "asynNDArrayDriver:writeInt32: error, status=8 function={reason}, paramName=TIME_STAMP, value=1"
+            )),
+            "{text}"
         );
     }
 

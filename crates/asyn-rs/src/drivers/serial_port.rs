@@ -979,7 +979,15 @@ pub struct DrvAsynSerialPort {
     /// auto-reconnect.
     termios: platform::termios,
     io: SerialIoState,
-    saved_termios: Option<platform::termios>,
+}
+
+/// C `strerror(errno)`, the text C's serial driver puts in an errorMessage.
+fn strerror(err: &std::io::Error) -> String {
+    let errno = err.raw_os_error().unwrap_or(0);
+    // SAFETY: strerror returns a NUL-terminated static string for any errno.
+    unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Seed the cached termios the way C `drvAsynSerialPortConfigure` does
@@ -1048,14 +1056,11 @@ impl DrvAsynSerialPort {
     /// Close the fd and mark the port disconnected so the actor's
     /// auto-reconnect re-opens it on the next request. C parity:
     /// `drvAsynSerialPort.c::closeConnection` (close, fd=-1,
-    /// `exceptionDisconnect`). Unlike the graceful `disconnect`, a
-    /// fatal-error teardown does not restore termios — the device is gone
-    /// and the fd is being closed.
+    /// `exceptionDisconnect`).
     fn drop_connection(&mut self) {
         if let Some(fd) = self.io.fd.take() {
             unsafe { libc::close(fd) };
         }
-        self.saved_termios = None;
         self.base.set_connected(false);
     }
 
@@ -1087,7 +1092,6 @@ impl DrvAsynSerialPort {
             baud: config.baud,
             termios: seed_termios(&config)?,
             io: SerialIoState::new(),
-            saved_termios: None,
         })
     }
 
@@ -1160,6 +1164,7 @@ impl DrvAsynSerialPort {
         }
     }
 
+    #[cfg(test)]
     fn get_current_termios(&self) -> AsynResult<platform::termios> {
         let fd = self.io.fd_or_err()?;
         let mut t: platform::termios = unsafe { std::mem::zeroed() };
@@ -1174,7 +1179,13 @@ impl DrvAsynSerialPort {
         let fd = self.io.fd_or_err()?;
         let ret = unsafe { platform::tcsetattr(fd, platform::TCSANOW, t) };
         if ret < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "tcsetattr failed: {}",
+                    strerror(&std::io::Error::last_os_error())
+                ),
+            });
         }
         Ok(())
     }
@@ -1217,7 +1228,7 @@ impl PortDriver for DrvAsynSerialPort {
         if self.io.fd.is_some() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("{}: Link already open!", self.base.port_name),
+                message: format!("{}: Link already open!", self.device),
             });
         }
         // 1. Open device
@@ -1234,11 +1245,18 @@ impl PortDriver for DrvAsynSerialPort {
             )
         };
         if fd < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{} Can't open  {}",
+                    self.device,
+                    strerror(&std::io::Error::last_os_error())
+                ),
+            });
         }
         self.io.fd = Some(fd);
 
-        // Steps 2-4 configure the just-opened fd. Any failure here must
+        // Steps 2-3 configure the just-opened fd. Any failure here must
         // close the fd: `base.connected` is still false, so the `Drop`
         // impl would skip `disconnect()` and leak the descriptor.
         let setup = (|| -> AsynResult<()> {
@@ -1247,20 +1265,25 @@ impl PortDriver for DrvAsynSerialPort {
             // (e.g. an iocsh `system` call), which would otherwise hold the
             // device open after this driver closes it.
             if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "Can't set {} close-on-exec flag: {}",
+                        self.device,
+                        strerror(&std::io::Error::last_os_error())
+                    ),
+                });
             }
 
-            // 2. Save original termios
-            let saved = self.get_current_termios()?;
-            self.saved_termios = Some(saved);
-
-            // 3. Configure: push the cached termios — C `connectIt` calls
+            // 2. Configure: push the cached termios — C `connectIt` calls
             // `applyOptions(pasynUser, tty)` (drvAsynSerialPort.c:723), which
             // tcsetattr's `tty->termios` verbatim. The cache carries every
             // option set since configure, including ones set while the port
             // was down, so they take effect on this connect instead of being
             // rebuilt away.
-            self.apply_options()?;
+            // C ignores applyOptions' status here: a refused tcsetattr
+            // still connects.
+            let _ = self.apply_options();
 
             // C parity (drvAsynSerialPort.c:729): discard any bytes that
             // accumulated in the kernel input/output buffers before the port
@@ -1268,7 +1291,7 @@ impl PortDriver for DrvAsynSerialPort {
             // device state.
             unsafe { platform::tcflush(fd, platform::FLUSH_IO) };
 
-            // 4. The fd STAYS non-blocking, for its whole life.
+            // 3. The fd STAYS non-blocking, for its whole life.
             //
             // C turns blocking back on here (drvAsynSerialPort.c:731-739),
             // because its reads are bounded by termios VMIN/VTIME and its
@@ -1294,7 +1317,6 @@ impl PortDriver for DrvAsynSerialPort {
             if let Some(fd) = self.io.fd.take() {
                 unsafe { libc::close(fd) };
             }
-            self.saved_termios = None;
             return Err(e);
         }
 
@@ -1318,16 +1340,10 @@ impl PortDriver for DrvAsynSerialPort {
             "disconnect"
         );
 
-        // Restore original termios if available
-        if let (Some(fd), Some(saved)) = (self.io.fd, &self.saved_termios) {
-            unsafe { platform::tcsetattr(fd, platform::TCSANOW, saved) };
-        }
-
         // Close fd
         if let Some(fd) = self.io.fd.take() {
             unsafe { libc::close(fd) };
         }
-        self.saved_termios = None;
 
         self.base.set_connected(false);
         Ok(())
@@ -2959,10 +2975,12 @@ mod tests {
         assert!(first_fd.is_some());
 
         let err = drv.connect(&user).unwrap_err();
-        assert!(matches!(err, AsynError::Status { .. }));
-        // The original fd (and its saved termios) is left intact.
+        assert!(
+            matches!(&err, AsynError::Status { message, .. } if *message == format!("{slave_name}: Link already open!")),
+            "{err:?}"
+        );
+        // The original fd is left intact.
         assert_eq!(drv.io.fd, first_fd);
-        assert!(drv.saved_termios.is_some());
     }
 
     #[test]
@@ -3008,67 +3026,34 @@ mod tests {
         runtime_handle.shutdown_and_wait();
     }
 
+    /// C `connectIt` (drvAsynSerialPort.c:707-711) refuses with
+    /// "<device> Can't open  <strerror>" when `open` fails.
     #[test]
-    fn test_pty_termios_restored_on_disconnect() {
-        let (master, slave, slave_name) = create_pty_pair();
-        unsafe { libc::close(slave) };
-        let _guard = PtyGuard { master, slave: -1 };
+    fn a_refused_open_fails_the_connect_with_cs_message() {
+        let dir = std::env::temp_dir().join(format!("serial-eacces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tty");
+        std::fs::write(&path, b"").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let device = path.to_str().unwrap().to_owned();
 
-        // Read original termios before the driver touches it
-        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
-        let user = AsynUser::default();
-        drv.connect(&user).unwrap();
-
-        // saved_termios should exist
-        assert!(drv.saved_termios.is_some());
-        let saved = drv.saved_termios.unwrap();
-
-        // cfmakeraw changes key flags; verify they differ now
-        let current = drv.get_current_termios().unwrap();
-        // Raw mode typically clears ECHO, ICANON in c_lflag
-        assert_ne!(
-            current.c_lflag & libc::ECHO,
-            saved.c_lflag & libc::ECHO,
-            "raw mode should have changed ECHO flag"
-        );
-
-        // Re-set saved_termios (disconnect reads from it)
-        drv.saved_termios = Some(saved);
-        drv.disconnect(&user).unwrap();
-        assert!(drv.saved_termios.is_none());
-        assert!(!drv.base().is_connected());
-
-        // Now reopen and verify key flags were restored by reading termios
-        // from the same PTY slave path. Re-open to read the restored state.
-        let c_path = std::ffi::CString::new(slave_name.as_str()).unwrap();
-        let fd2 = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
-            )
-        };
-        if fd2 >= 0 {
-            let mut restored: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(fd2, &mut restored) } == 0 {
-                // Compare key flags (kernel may adjust some bits, so check important ones)
-                assert_eq!(
-                    restored.c_lflag & libc::ECHO,
-                    saved.c_lflag & libc::ECHO,
-                    "ECHO flag should be restored"
-                );
-                assert_eq!(
-                    restored.c_lflag & libc::ICANON,
-                    saved.c_lflag & libc::ICANON,
-                    "ICANON flag should be restored"
-                );
-                assert_eq!(
-                    restored.c_cflag & libc::CSIZE,
-                    saved.c_cflag & libc::CSIZE,
-                    "CSIZE should be restored"
-                );
-            }
-            unsafe { libc::close(fd2) };
+        let mut drv = DrvAsynSerialPort::new("pty_eacces", &device).unwrap();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        // root opens a mode-000 file; nothing to check there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
         }
+        match err {
+            AsynError::Status { status, message } => {
+                assert_eq!(status, AsynStatus::Error);
+                assert_eq!(message, format!("{device} Can't open  Permission denied"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(drv.io.fd.is_none());
+        assert!(!drv.base().is_connected());
     }
 
     /// DRV-32: C (drvAsynSerialPort.c:1080) sets the default input flags to

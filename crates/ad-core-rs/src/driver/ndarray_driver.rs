@@ -5,6 +5,8 @@ use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamValue;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
+use asyn_rs::trace::TraceMask;
+use asyn_rs::user::AsynUser;
 
 use crate::attributes::{
     EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
@@ -514,14 +516,12 @@ pub fn refresh_pool_stats(
     Ok(())
 }
 
-/// Handle a write to a pool-control Int32 parameter, mirroring the pool branch
-/// of C++ `asynNDArrayDriver::writeInt32` (asynNDArrayDriver.cpp:684-694).
+/// The pool branch of C++ `asynNDArrayDriver::writeInt32`
+/// (asynNDArrayDriver.cpp:684-694), run once `param_index` is stored.
 ///
-/// `param_index` is the parameter that was just written; `value` is the value
-/// written. Returns `true` when the parameter was a recognized pool-control
-/// parameter and was handled. `template_array` is used by the
-/// `POOL_PRE_ALLOC_BUFFERS` path (C++ uses `pArrays[0]` — the most recent
-/// array); pass the driver's last array, or `None` if none exists yet.
+/// Returns `true` when `param_index` was one of the three pool controls.
+/// `template_array` is C's `pArrays[0]`, the array `POOL_PRE_ALLOC_BUFFERS`
+/// copies; a failed pre-allocation is printed and, as in C, not returned.
 pub fn handle_pool_write_int32(
     port_base: &mut PortDriverBase,
     params: &NDArrayDriverParams,
@@ -531,32 +531,83 @@ pub fn handle_pool_write_int32(
 ) -> AsynResult<bool> {
     if param_index == params.pool_empty_free_list {
         pool.empty_free_list();
-        refresh_pool_stats(port_base, params, pool)?;
-        Ok(true)
+    } else if param_index == params.pool_pre_alloc {
+        match template_array {
+            None => port_base.trace_print(
+                TraceMask::ERROR,
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first",
+            ),
+            Some(template) => {
+                let count = port_base
+                    .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                if let Err(e) = pool.pre_allocate_buffers(template, count) {
+                    port_base.trace_print(
+                        TraceMask::ERROR,
+                        &format!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}"),
+                    );
+                }
+                refresh_pool_stats(port_base, params, pool)?;
+            }
+        }
+        port_base.set_int32_param(params.pool_pre_alloc, 0, 0)?;
     } else if param_index == params.pool_poll_stats {
         refresh_pool_stats(port_base, params, pool)?;
-        Ok(true)
-    } else if param_index == params.pool_pre_alloc {
-        if let Some(template) = template_array {
-            let count = port_base
-                .get_int32_param(params.pool_num_pre_alloc_buffers, 0)
-                .unwrap_or(0)
-                .max(0) as usize;
-            // C++ preAllocateBuffers ignores allocation errors per-array; here
-            // we surface them so the caller knows the pool limit was hit.
-            pool.pre_allocate_buffers(template, count).map_err(|e| {
-                asyn_rs::error::AsynError::Status {
-                    status: asyn_rs::error::AsynStatus::Error,
-                    message: e.to_string(),
-                }
-            })?;
-            refresh_pool_stats(port_base, params, pool)?;
-        }
-        // C++ resets NDPoolPreAllocBuffers back to 0 after running.
-        port_base.set_int32_param(params.pool_pre_alloc, 0, 0)?;
-        Ok(true)
     } else {
-        Ok(false)
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// C++ `asynNDArrayDriver::writeInt32` (asynNDArrayDriver.cpp:671-708):
+/// store, the pool branch, callbacks, and the closing trace line.
+pub(crate) fn handle_write_int32(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+    template_array: Option<&NDArray>,
+    user: &AsynUser,
+    value: i32,
+) -> AsynResult<()> {
+    let status = port_base.set_int32_param(user.reason, user.addr, value);
+    // C keeps only setIntegerParam's status (:682).
+    let _ = handle_pool_write_int32(port_base, params, pool, user.reason, template_array);
+    let _ = port_base.call_param_callbacks(user.addr);
+    trace_write_int32(port_base, user, "asynNDArrayDriver", &status, value);
+    status
+}
+
+/// The line C's `writeInt32` closes with (asynNDArrayDriver.cpp:699-706,
+/// ADDriver.cpp:107-114), under `driver_name`.
+pub(crate) fn trace_write_int32(
+    port_base: &PortDriverBase,
+    user: &AsynUser,
+    driver_name: &str,
+    status: &AsynResult<()>,
+    value: i32,
+) {
+    let name = port_base.params.param_name(user.reason).unwrap_or("");
+    match status {
+        Err(e) => user.print(
+            TraceMask::ERROR,
+            file!(),
+            line!(),
+            format_args!(
+                "{driver_name}:writeInt32: error, status={} function={}, paramName={name}, value={value}",
+                e.status() as i32,
+                user.reason,
+            ),
+        ),
+        Ok(()) => user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!(
+                "{driver_name}:writeInt32: function={}, paramName={name}, value={value}",
+                user.reason,
+            ),
+        ),
     }
 }
 
@@ -987,15 +1038,14 @@ pub struct NDArrayDriverBase {
 }
 
 impl NDArrayDriverBase {
-    pub fn new(port_name: &str, max_memory: usize) -> AsynResult<Self> {
-        let mut port_base = PortDriverBase::new(
-            port_name,
-            1,
-            PortFlags {
-                can_block: true,
-                ..Default::default()
-            },
-        );
+    pub fn new(
+        port_name: &str,
+        max_addr: usize,
+        max_memory: usize,
+        asyn_flags: PortFlags,
+    ) -> AsynResult<Self> {
+        // C takes `maxAddr` and `asynFlags` from the driver (asynNDArrayDriver.cpp:862-868).
+        let mut port_base = PortDriverBase::new(port_name, max_addr, asyn_flags);
 
         let params = NDArrayDriverParams::create(&mut port_base)?;
         let pool = NDArrayPool::new(max_memory);
@@ -1279,6 +1329,7 @@ impl NDArrayDriverBase {
 pub(crate) mod tests {
     use super::*;
     use crate::plugin::channel::ndarray_channel;
+    use crate::plugin::runtime::ASYN_CANBLOCK;
 
     /// Assert the whole of C++ `asynNDArrayDriver.cpp:954-1005` through the
     /// *strict* getters — the ones a record read goes through
@@ -1384,8 +1435,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn max_addr_comes_from_the_caller() {
+        // asynNDArrayDriver.cpp:862-868 hands maxAddr to asynPortDriver.
+        let drv = NDArrayDriverBase::new("TEST", 3, 1_000_000, ASYN_CANBLOCK).unwrap();
+        assert_eq!(drv.port_base.max_addr, 3);
+    }
+
+    #[test]
     fn test_constructor_seeds_the_c_read_only_block() {
-        let drv = NDArrayDriverBase::new("TEST", 4_194_304).unwrap();
+        let drv = NDArrayDriverBase::new("TEST", 1, 4_194_304, ASYN_CANBLOCK).unwrap();
         assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
         // C `:1002-1003` leaves both memory figures at 0 and fills MaxMemory
         // from the pool later (asynNDArrayDriver.cpp:690). The port has the
@@ -1400,7 +1458,7 @@ pub(crate) mod tests {
         // touching NDAttributesStatus, so an IOC that never loads one reads
         // "File not found" — including after the PINI="YES" write that
         // NDArrayBase.template:793 performs at iocInit.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.read_nd_attributes_file().unwrap();
         assert_eq!(drv.attributes().len(), 0);
         assert_eq!(
@@ -1413,7 +1471,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_new_sets_callbacks_enabled() {
-        let drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.array_callbacks, 0)
@@ -1424,7 +1482,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_prepare_array() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let arr = drv
             .pool
             .alloc(
@@ -1446,7 +1504,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_prepare_updates_size_info() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let arr = drv
             .pool
             .alloc(
@@ -1476,7 +1534,7 @@ pub(crate) mod tests {
     fn test_create_file_name_empty_template_yields_empty() {
         // C parity (B9): an empty FILE_TEMPLATE is passed through epicsSnprintf
         // verbatim, producing an empty string — no fabricated default.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
@@ -1496,7 +1554,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_create_file_name_standard_template() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
@@ -1526,7 +1584,7 @@ pub(crate) mod tests {
         // seeded with set_string_param, bypassing writeOctet) is normalized
         // before the template runs. Without it the "%s%s_%3.3d.dat" default
         // produces "/tmpimg_042.dat".
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let tmp = std::env::temp_dir();
         let no_sep = tmp
             .to_string_lossy()
@@ -1573,7 +1631,7 @@ pub(crate) mod tests {
     fn test_r6_64_check_path_empty_path_touches_nothing() {
         // C checkPath() returns early for an empty FilePath (:104), leaving both
         // FilePath and FilePathExists alone.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_int32_param(drv.params.file_path_exists, 0, 1)
             .unwrap();
@@ -1635,7 +1693,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_check_path_exists() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         // The platform temp dir exists on every OS; a hard-coded `/tmp`
         // does not exist on Windows, so `check_path`'s `is_dir()` reported
         // it missing and the assertion failed there. Mirrors the
@@ -1649,7 +1707,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_check_path_not_exists() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz")
             .unwrap();
@@ -1660,7 +1718,7 @@ pub(crate) mod tests {
     fn test_prepare_array_publishes_dims_type_timestamps() {
         // G7: prepare_array must publish N_DIMENSIONS, ARRAY_DIMENSIONS,
         // DATA_TYPE, COLOR_MODE, TIME_STAMP, EPICS_TS_SEC/NSEC.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let mut arr = drv
             .pool
             .alloc(
@@ -1723,7 +1781,7 @@ pub(crate) mod tests {
         // G5/G6: prepare_array publishes CODEC, COMPRESSED_SIZE, BAYER_PATTERN.
         use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let mut arr = drv
             .pool
             .alloc(
@@ -1768,7 +1826,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_connect_downstream() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let (sender, mut receiver) = ndarray_channel("DOWNSTREAM", 10);
         drv.connect_downstream(sender);
         assert_eq!(drv.num_plugins(), 1);
@@ -1819,7 +1877,7 @@ pub(crate) mod tests {
     #[test]
     fn test_read_nd_attributes_file_inline_xml() {
         // G9: readNDAttributesFile parses inline XML (NDAttributesFile schema).
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Gain" type="param" source="GAIN" description="detector gain"/>
             <Attribute name="Comment" type="const" source="hello"/>
@@ -1852,7 +1910,7 @@ pub(crate) mod tests {
     }
 
     fn load_with_macros(xml: &str, macros: &str) -> NDArrayDriverBase {
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(drv.params.attributes_macros, 0, macros)
             .unwrap();
@@ -1941,7 +1999,7 @@ pub(crate) mod tests {
         // An EPICS_PV attribute evaluates Undefined for the life of the IOC
         // (no CA feeder exists), so NDAttributesStatus must not read
         // "Attributes file OK" — that is what made the gap invisible.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(
                 drv.params.attributes_file,
@@ -1987,7 +2045,7 @@ pub(crate) mod tests {
         // C returns asynError on any dbrtype outside its nine names
         // (asynNDArrayDriver.cpp:421-436); the port must not accept a typo and
         // publish the attribute as the native type instead.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(
                 drv.params.attributes_file,
@@ -2048,7 +2106,7 @@ pub(crate) mod tests {
         // G10: a PARAM attribute loaded from NDAttributesFile XML must
         // re-evaluate from the driver's asyn parameter library on
         // update_attributes(), not stay frozen at its Undefined load value.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
             <Attribute name="Maker" type="PARAM" source="MANUFACTURER" datatype="STRING"/>
@@ -2090,7 +2148,7 @@ pub(crate) mod tests {
         // the attribute, so it stays NDAttrUndefined. (The port previously
         // derived the type from the param's runtime type and published an
         // Int32 value.)
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER"/>
         </Attributes>"#;
@@ -2117,7 +2175,7 @@ pub(crate) mod tests {
         // an Int32 param — so the attribute is not refreshed (stays Undefined)
         // rather than coercing the Int32 into a Float64. With the matching
         // datatype="INT" the same param publishes Int32(value).
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let xml = r#"<Attributes>
             <Attribute name="AsDouble" type="PARAM" source="ARRAY_COUNTER" datatype="DOUBLE"/>
             <Attribute name="AsInt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
@@ -2143,7 +2201,7 @@ pub(crate) mod tests {
     fn test_function_attribute_reevaluates_from_registry() {
         // G10: a FUNCTION attribute loaded from XML must call its registered
         // function on update_attributes().
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         // Register a function whose return value changes on each call.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let c = counter.clone();
@@ -2184,7 +2242,7 @@ pub(crate) mod tests {
     fn test_function_attribute_missing_function_is_undefined() {
         // G10: a FUNCTION attribute naming an unregistered function evaluates
         // to Undefined (C++ functAttribute::updateValue returns asynError).
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Missing" type="FUNCTION" source="no_such_fn"/>
         </Attributes>"#;
@@ -2201,7 +2259,7 @@ pub(crate) mod tests {
         // G9: an empty ND_ATTRIBUTES_FILE clears the attribute list. The
         // status it leaves behind is asserted by
         // `test_empty_attributes_file_keeps_the_constructor_status`.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.attributes.list.add(NDAttribute::new_static(
             "Gone",
             "",
@@ -2215,7 +2273,7 @@ pub(crate) mod tests {
     #[test]
     fn test_read_nd_attributes_file_missing_file() {
         // G9: a non-existent file path yields FILE_NOT_FOUND status.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         drv.port_base
             .set_string_param(drv.params.attributes_file, 0, "/nonexistent_attrs_xyz.xml")
             .unwrap();
@@ -2231,7 +2289,7 @@ pub(crate) mod tests {
     #[test]
     fn test_write_octet_file_path_creates_dir() {
         // G9: writeOctet on FILE_PATH runs checkPath then createFilePath.
-        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
         let base = std::env::temp_dir().join(format!(
             "ad_core_rs_wo_{}",
             std::time::SystemTime::now()

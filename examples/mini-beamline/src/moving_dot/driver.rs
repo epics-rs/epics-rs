@@ -14,6 +14,7 @@ use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::{
     ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
 };
+use ad_core_rs::plugin::runtime::ASYN_NONE;
 use ad_core_rs::runtime as rt;
 
 use crate::physics::MovingDotImageConfig;
@@ -39,7 +40,9 @@ impl MovingDotDetector {
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        // ASYN_CANBLOCK=0: no C driver; acquisition runs on its own thread like simDetector.
+        let mut ad =
+            ADDriverBase::new(port_name, 1, max_size_x, max_size_y, max_memory, ASYN_NONE)?;
         let dot_params = MovingDotParams::create(&mut ad.port_base)?;
 
         // Set defaults

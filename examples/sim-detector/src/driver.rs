@@ -14,6 +14,7 @@ use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::{
     ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
 };
+use ad_core_rs::plugin::runtime::ASYN_NONE;
 use ad_core_rs::runtime as rt;
 
 use crate::params::SimDetectorParams;
@@ -36,7 +37,9 @@ impl SimDetector {
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        // maxAddr 1, ASYN_CANBLOCK=0: simDetector.cpp:1031-1036.
+        let mut ad =
+            ADDriverBase::new(port_name, 1, max_size_x, max_size_y, max_memory, ASYN_NONE)?;
         let sim_params = SimDetectorParams::create(&mut ad.port_base)?;
 
         // Set default values matching C++ constructor

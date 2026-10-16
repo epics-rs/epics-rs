@@ -26,6 +26,7 @@ use ad_core_rs::attributes::{NDAttrValue, NDAttributeSource};
 use ad_core_rs::driver::ndarray_driver::{
     ATTR_STATUS_OK, ATTR_STATUS_XML_SYNTAX_ERROR, NDArrayDriverBase,
 };
+use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use epics_base_rs::server::records::ai::AiRecord;
 #[cfg(tokio_backend)]
 use epics_ca_rs::client::CaClient;
@@ -67,7 +68,8 @@ fn status(drv: &NDArrayDriverBase) -> i32 {
 /// rather than reporting the file as loaded.
 #[test]
 fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
-    let mut drv = NDArrayDriverBase::new("ADATTR_NOCLIENT", 1 << 20).expect("driver");
+    let mut drv =
+        NDArrayDriverBase::new("ADATTR_NOCLIENT", 1, 1 << 20, ASYN_CANBLOCK).expect("driver");
 
     assert!(
         load_attributes(&mut drv, &attributes_xml()).is_err(),
@@ -99,7 +101,7 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     }
     let client = Arc::new(CaClient::new().await.expect("CA client"));
 
-    let mut drv = NDArrayDriverBase::new("ADATTR_FED", 1 << 20).expect("driver");
+    let mut drv = NDArrayDriverBase::new("ADATTR_FED", 1, 1 << 20, ASYN_CANBLOCK).expect("driver");
     drv.set_ca_client(client, tokio::runtime::Handle::current());
 
     load_attributes(&mut drv, &attributes_xml()).expect("a fed EPICS_PV attribute loads clean");

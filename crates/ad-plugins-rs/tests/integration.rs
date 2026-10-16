@@ -14,6 +14,7 @@ use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::driver::ad_driver::ADDriverBase;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, PluginRuntimeHandle};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use ad_plugins_rs::stats::create_stats_runtime;
@@ -61,7 +62,7 @@ fn test_driver_to_stats_pipeline() {
         .unwrap();
     params_applied(&stats_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 64, 64, 10_000_000).unwrap();
+    let mut driver = ADDriverBase::new("SIM1", 1, 64, 64, 10_000_000, ASYN_CANBLOCK).unwrap();
     driver.connect_downstream(stats_handle.array_sender().clone());
 
     let mut arr = driver
@@ -114,7 +115,7 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
     params_applied(&image_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 32, 32, 10_000_000).unwrap();
+    let mut driver = ADDriverBase::new("SIM1", 1, 32, 32, 10_000_000, ASYN_CANBLOCK).unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let arr = driver
@@ -800,8 +801,15 @@ fn test_process_and_publish_writes_array_size_params() {
     params_applied(&image_handle);
 
     // Connect and send a 64x48 array
-    let mut driver =
-        ad_core_rs::driver::ad_driver::ADDriverBase::new("DRV1", 64, 48, 1_000_000).unwrap();
+    let mut driver = ad_core_rs::driver::ad_driver::ADDriverBase::new(
+        "DRV1",
+        1,
+        64,
+        48,
+        1_000_000,
+        ASYN_CANBLOCK,
+    )
+    .unwrap();
     driver.connect_downstream(image_handle.array_sender().clone());
 
     let mut arr = NDArray::new(

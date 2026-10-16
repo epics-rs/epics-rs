@@ -18,6 +18,7 @@ use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::{
     ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
 };
+use ad_core_rs::plugin::runtime::ASYN_NONE;
 use ad_core_rs::runtime as rt;
 
 use crate::beamline_sim::{MotorPositions, SimConfig};
@@ -44,7 +45,8 @@ impl XrtDetector {
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, size_x, size_y, max_memory)?;
+        // ASYN_CANBLOCK=0: no C driver; acquisition runs on its own thread like simDetector.
+        let mut ad = ADDriverBase::new(port_name, 1, size_x, size_y, max_memory, ASYN_NONE)?;
         let xrt_params = XrtDetectorParams::create(&mut ad.port_base)?;
         let motor_param_set = xrt_params.motor_params();
 

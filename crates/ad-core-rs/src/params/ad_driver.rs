@@ -8,6 +8,9 @@ use super::ndarray_driver::NDArrayDriverParams;
 #[derive(Clone, Copy)]
 pub struct ADDriverParams {
     pub base: NDArrayDriverParams,
+    /// C `FIRST_AD_PARAM` (ADDriver.h:148): every index below it is an
+    /// `asynNDArrayDriver` parameter.
+    pub first_ad_param: usize,
 
     // Image size
     pub max_size_x: usize,
@@ -60,9 +63,11 @@ pub struct ADDriverParams {
 impl ADDriverParams {
     pub fn create(port_base: &mut PortDriverBase) -> AsynResult<Self> {
         let base = NDArrayDriverParams::create(port_base)?;
+        let first_ad_param = port_base.params.len();
 
         Ok(Self {
             base,
+            first_ad_param,
 
             // Image size
             max_size_x: port_base.create_param("MAX_SIZE_X", ParamType::Int32)?,

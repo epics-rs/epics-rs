@@ -16,6 +16,7 @@ use rumqttc::{
 };
 use socket2::{Domain, Socket, Type};
 use tokio::sync::{Notify, mpsc};
+use tokio::time::Instant;
 
 use crate::address::{PayloadFormat, TopicAddress, ValueType};
 use crate::config::MqttConfig;
@@ -165,7 +166,7 @@ pub async fn mqtt_event_loop(
     // to flip it back). Any inbound packet (`Publish`, `PingResp`) is direct
     // proof the session is alive, so we use it as a fallback recovery signal.
     let mut session = Session::Booting;
-    let mut backoff = Backoff::default();
+    let mut backoff = Backoff::new(Instant::now());
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Incoming::Publish(publish))) => {
@@ -243,13 +244,10 @@ pub async fn mqtt_event_loop(
                     tracing::info!("MQTT event loop exiting while disconnected: {e}");
                     break;
                 }
-                // `onDisconnectCb`'s `reconnect()` retries a lost session at
-                // once; every failed attempt waits out paho's backoff.
-                let wait = if session == Session::Up {
-                    backoff.lost();
-                    None
+                let retry_at = if session == Session::Up {
+                    backoff.lost(Instant::now())
                 } else {
-                    Some(backoff.failed())
+                    backoff.failed(Instant::now())
                 };
                 // C reports the loss of a live session from `onDisconnectCb`
                 // (drvMqtt.cpp:219-220) and a failed attempt of the initHook
@@ -284,15 +282,13 @@ pub async fn mqtt_event_loop(
                         vec![ParamSetValue::new(connected_param, 0, ParamValue::Int32(0))],
                     )
                     .await;
-                if let Some(wait) = wait {
-                    // `poll()` is not running, so this `select!` drops nothing
-                    // half-done; a shutdown cannot wait out a 72 s retry.
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = abort.notified() => {
-                            tracing::info!("MQTT event loop exiting while disconnected");
-                            break;
-                        }
+                // `poll()` is not running, so this `select!` drops nothing
+                // half-done; a shutdown cannot wait out a 72 s retry.
+                tokio::select! {
+                    _ = tokio::time::sleep_until(retry_at) => {}
+                    _ = abort.notified() => {
+                        tracing::info!("MQTT event loop exiting while disconnected");
+                        break;
                     }
                 }
             }
@@ -477,37 +473,57 @@ fn connect_pending(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock
 }
 
-/// paho's `automaticReconnect` retry interval with the v5 connect-option
-/// defaults C builds (`minRetryInterval` 1 s, `maxRetryInterval` 60 s,
-/// MQTTAsync.h:1394).
-#[derive(Default)]
+/// paho's `automaticReconnect` retry with the v5 connect-option defaults C
+/// builds (`minRetryInterval` 1 s, `maxRetryInterval` 60 s, MQTTAsync.h:1394).
+///
+/// paho retries only from `MQTTAsync_checkTimeouts`, which runs at most once
+/// per 3 s (MQTTAsyncUtils.c:1734-1736) on the send thread `MQTTAsync_connect`
+/// starts (MQTTAsync.c:670), so a retry lands on that 3 s grid.
 struct Backoff {
     /// `currentIntervalBase` in seconds; `None` while not `retrying`.
     base: Option<u32>,
+    /// The initHook connect, where the grid starts.
+    ticks_from: Instant,
 }
 
 const RETRY_MIN_SECS: u32 = 1;
 const RETRY_MAX_SECS: u32 = 60;
+const RETRY_TICK_SECS: u64 = 3;
 
 impl Backoff {
-    /// `MQTTAsync_startConnectRetry` (MQTTAsyncUtils.c:951-967) after a failed
-    /// attempt: the base doubles up to the maximum, and the wait is a whole
-    /// second drawn around it.
-    fn failed(&mut self) -> Duration {
+    fn new(ticks_from: Instant) -> Self {
+        Self {
+            base: None,
+            ticks_from,
+        }
+    }
+
+    /// `MQTTAsync_startConnectRetry` (MQTTAsyncUtils.c:951-967) after an
+    /// attempt failed at `now`: the base doubles up to the maximum, the
+    /// interval is a whole second drawn around it, and the retry is the first
+    /// tick past it (`elapsed > currentInterval`, :1761).
+    fn failed(&mut self, now: Instant) -> Instant {
         let base = self
             .base
             .map_or(RETRY_MIN_SECS, |b| (b * 2).min(RETRY_MAX_SECS));
         self.base = Some(base);
         let draw =
             std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), base);
-        Duration::from_secs(u64::from(jitter_secs(base, draw)))
+        self.tick_after(now + Duration::from_secs(u64::from(jitter_secs(base, draw))))
     }
 
-    /// The loss of a live session: `onDisconnectCb`'s `reconnect()` resets the
-    /// base to the minimum (MQTTAsync.c:956-964) and paho's own
-    /// `startConnectRetry` then doubles it (MQTTAsyncUtils.c:1714-1719).
-    fn lost(&mut self) {
+    /// The loss of a live session at `now`: `onDisconnectCb`'s `reconnect()`
+    /// resets the base to the minimum and sets `reconnectNow`
+    /// (MQTTAsync.c:956-964), paho's own `startConnectRetry` then doubles the
+    /// base (MQTTAsyncUtils.c:1714-1719), and the retry is the next tick.
+    fn lost(&mut self, now: Instant) -> Instant {
         self.base = Some(RETRY_MIN_SECS * 2);
+        self.tick_after(now)
+    }
+
+    fn tick_after(&self, t: Instant) -> Instant {
+        let secs = t.saturating_duration_since(self.ticks_from).as_secs();
+        self.ticks_from + Duration::from_secs((secs / RETRY_TICK_SECS + 1) * RETRY_TICK_SECS)
     }
 
     /// A ConnAck clears `retrying` (MQTTAsyncUtils.c:2014).
@@ -1290,7 +1306,8 @@ mod tests {
 
         // The first failed attempt is reported, the retries are not.
         wait_for(&path, "onFailCb: MQTT Operation error: 'Error: ").await;
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // Past the retry on the 3 s tick.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
 
         // First session, then the broker goes away entirely.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -1304,8 +1321,8 @@ mod tests {
         drop(listener);
         drop(sock);
         wait_for(&path, "onDisconnectCb: Connection lost. Reconnecting...").await;
-        // The first retry after a loss is immediate and refused.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // The retry on the next 3 s tick is refused.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
 
         // The broker is back.
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -1493,7 +1510,8 @@ mod tests {
     }
 
     /// A shutdown that lands while the loop waits out a retry interval (here
-    /// the third, 3-4 s) releases the driver at once, not after the wait.
+    /// the third, at least 3 s) releases the driver at once, not after the
+    /// wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shutdown_during_a_retry_wait_releases_the_driver() {
         // Every attempt is accepted and dropped before a CONNACK.
@@ -1963,11 +1981,12 @@ mod tests {
     /// ConnAck clears it.
     #[test]
     fn backoff_follows_paho_start_connect_retry() {
-        let mut b = Backoff::default();
+        let t0 = Instant::now();
+        let mut b = Backoff::new(t0);
         let bases = |b: &mut Backoff, n| {
             (0..n)
                 .map(|_| {
-                    b.failed();
+                    b.failed(t0);
                     b.base.unwrap()
                 })
                 .collect::<Vec<_>>()
@@ -1975,10 +1994,28 @@ mod tests {
         assert_eq!(bases(&mut b, 8), [1, 2, 4, 8, 16, 32, 60, 60]);
         b.connected();
         assert_eq!(b.base, None);
-        b.lost();
+        b.lost(t0);
         assert_eq!(bases(&mut b, 2), [4, 8]);
-        let wait = b.failed();
-        assert!((13..=19).contains(&wait.as_secs()), "{wait:?}");
+        // Base 16: an interval of 13-19 s, so the tick at 15 or 18 s, or the
+        // one at 21 s for a 19 s draw.
+        let wait = b.failed(t0) - t0;
+        assert!([15, 18, 21].contains(&wait.as_secs()), "{wait:?}");
+    }
+
+    /// paho retries on its 3 s `checkTimeouts` grid: a loss at the next tick,
+    /// a failure at the first tick strictly past its interval.
+    #[test]
+    fn retries_land_on_paho_s_three_second_tick() {
+        let t0 = Instant::now();
+        let mut b = Backoff::new(t0);
+        let s = Duration::from_secs;
+        assert_eq!(b.lost(t0 + Duration::from_millis(100)), t0 + s(3));
+        assert_eq!(b.lost(t0 + s(3)), t0 + s(6));
+        // Base 4 after the loss: an interval of 3 or 4 s.
+        let at = b.failed(t0 + Duration::from_millis(3500)) - t0;
+        assert!(at == s(9), "{at:?}");
+        assert_eq!(b.tick_after(t0), t0 + s(3));
+        assert_eq!(b.tick_after(t0 + Duration::from_millis(2999)), t0 + s(3));
     }
 
     /// Each PUBLISH prints from its own ack, whatever order the acks come in.

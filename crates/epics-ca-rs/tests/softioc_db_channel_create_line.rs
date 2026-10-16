@@ -62,7 +62,6 @@ impl Ioc {
             .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
             .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
             .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
             .stdin(Stdio::piped())
             .stdout(out_w.try_clone().expect("clone pipe"))
             .stderr(out_w)

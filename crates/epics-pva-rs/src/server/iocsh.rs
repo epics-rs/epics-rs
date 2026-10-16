@@ -27,7 +27,7 @@
 //! [`register_pvxs_commands`] is that registrar for an
 //! [`epics_base_rs::server::ioc_app::IocApplication`]; the native server
 //! publishes what the command reads through [`publish_pvxs_report`] the
-//! instant its listeners bind. `PvaServer::run_with_shell` and
+//! instant it starts serving. `PvaServer::run_with_shell` and
 //! `run_with_source_and_shell` still register the same command on the
 //! interactive shell, which is the half a registrar at the head cannot
 //! reach for a caller that has no `IocApplication` at all.
@@ -39,10 +39,10 @@ use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
-use crate::server_native::ServerReportHandle;
+use crate::server_native::{BoundPvaServer, PvaServerConfig, ServerReportHandle};
 
 /// pvxs's `server()` singleton as this port can spell it: `None` until the
-/// native server's listeners bind, which is the state `pvxsr` is registered
+/// native server starts, which is the state `pvxsr` is registered
 /// in and must answer from.
 fn report_cell() -> &'static RwLock<Option<ServerReportHandle>> {
     static CELL: OnceLock<RwLock<Option<ServerReportHandle>>> = OnceLock::new();
@@ -51,8 +51,8 @@ fn report_cell() -> &'static RwLock<Option<ServerReportHandle>> {
 
 /// The single writer — pvxs `initialisePvxsServer` filling the singleton the
 /// already-registered `pvxsr` reads. Called from the one place that has the
-/// handle and knows the listeners are up
-/// (`server_native::runtime::run_pva_server_reporting`'s bind callback).
+/// handle and knows the server is serving
+/// (`server_native::runtime::serve_reporting`'s start callback).
 /// Last write wins: a process that stands up a second PVA server has
 /// replaced the first, which is the only state pvxs can be in at all.
 pub fn publish_pvxs_report(handle: ServerReportHandle) {
@@ -62,7 +62,7 @@ pub fn publish_pvxs_report(handle: ServerReportHandle) {
 /// The singleton's only reader — pvxs's `if (auto srv = server())`, which
 /// guards every hook that needs the running server (`pvxsr`
 /// (`iochooks.cpp:188`), `qReport` and `qStats`
-/// (`singlesourcehooks.cpp:76`, `:88`)). `None` until the listeners bind.
+/// (`singlesourcehooks.cpp:76`, `:88`)). `None` until the server starts.
 ///
 /// Returns the handle by clone so no caller holds the lock across its report.
 pub fn pvxs_report() -> Option<ServerReportHandle> {
@@ -89,6 +89,60 @@ pub fn register_pvxs_commands(app: IocApplication) -> IocApplication {
         .register_shell_command(pvxsr_command())
 }
 
+/// The name [`pvxs_base_registrar`] hands its server to the runner under.
+pub const PVXS_SERVER: &str = "pvxs";
+
+/// What `pvxsBaseRegistrar` left in pvxs's `server()` singleton: the server it
+/// bound, or nothing when the bind threw and the IOC runs without pvAccess.
+/// The runner takes it from [`IocRunConfig::servers`](epics_base_rs::server::ioc_app::IocRunConfig::servers)
+/// through `PvaServer::bound_at_registrar`.
+pub struct PvxsServer(pub(crate) Option<BoundPvaServer>);
+
+/// pvxs `pvxsBaseRegistrar` (`ioc/iochooks.cpp:461-511`): the commands, then
+/// `initialisePvxsServer`, which binds the server from the environment and
+/// publishes its TCP port before the startup script runs. pvxs starts it at
+/// `initHookAfterIocRunning` (`:374-379`), which here is the runner. A bind
+/// that fails prints pvxs's catch line and leaves the IOC without pvAccess.
+///
+/// Must be called on the IOC's runtime, which the bound sockets register with.
+pub fn pvxs_base_registrar(app: IocApplication) -> IocApplication {
+    let app = register_pvxs_commands(app);
+    let bound = match crate::server_native::PvaServer::bind(PvaServerConfig::default().with_env()) {
+        Ok(bound) => {
+            publish_server_port(bound.bound_tcp_port());
+            Some(bound)
+        }
+        Err(e) => {
+            eprintln!("Error in pvxsBaseRegistrar : {}", pvxs_what(&e));
+            None
+        }
+    };
+    app.register_server_init(PVXS_SERVER, move |_| async move {
+        Ok::<_, epics_base_rs::error::CaError>(PvxsServer(bound))
+    })
+}
+
+/// pvxs's `e.what()` for a failed server: a bind throws `std::system_error`,
+/// whose text is `strerror` alone, without Rust's ` (os error N)`.
+pub(crate) fn pvxs_what(e: &crate::error::PvaError) -> String {
+    match e {
+        crate::error::PvaError::Io(e) => epics_base_rs::net::sock_err_string(e),
+        e => e.to_string(),
+    }
+}
+
+/// pvxs `initialisePvxsServer` publishing the effective TCP port: recsync and
+/// any later `$(PVAS_SERVER_PORT)` expansion in `st.cmd` read it from there.
+/// The bound port, because an ephemeral or fallen-back bind is exactly when a
+/// reader cannot derive it. The second name is pvAccessCPP's, which pvxs sets
+/// too so either stack answers.
+pub(crate) fn publish_server_port(port: u16) {
+    let portstr = port.to_string();
+    for name in ["PVXS_SERVER_PORT", "PVAS_SERVER_PORT"] {
+        epics_base_rs::runtime::env::set(name, &portstr);
+    }
+}
+
 /// `pvxsr [<detail>]` — report the running pvAccess server.
 ///
 /// Detail thresholds track pvxs `operator<<(Server)`
@@ -99,7 +153,7 @@ pub fn register_pvxs_commands(app: IocApplication) -> IocApplication {
 /// and each channel's tx/rx bytes.
 ///
 /// The handle is read through [`publish_pvxs_report`], filled the moment the
-/// listeners bind. Before that — which is the whole startup script, since
+/// server starts. Before that — which is the whole startup script, since
 /// the protocol runner is Phase 3 — the command reports the server as not
 /// yet started. pvxs prints nothing at all there; the line is kept because
 /// an operator who typed `pvxsr` is better served by being told why the

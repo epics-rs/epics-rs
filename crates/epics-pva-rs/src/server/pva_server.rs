@@ -94,6 +94,7 @@ impl PvaServerBuilder {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager: None,
+            registrar: std::sync::Mutex::new(None),
         })
     }
 }
@@ -125,6 +126,9 @@ pub struct PvaServer {
     acl_version: Arc<std::sync::atomic::AtomicU64>,
     autosave_config: Option<(autosave::SaveSetConfig, autosave::SaveStrategy)>,
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
+    /// What [`super::iocsh::pvxs_base_registrar`] bound, taken by the first
+    /// run; `None` binds at the run, as a server with no registrar must.
+    registrar: std::sync::Mutex<Option<super::iocsh::PvxsServer>>,
 }
 
 impl PvaServer {
@@ -155,7 +159,21 @@ impl PvaServer {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
+            registrar: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Serve on the server [`super::iocsh::pvxs_base_registrar`] bound before
+    /// the startup script, as pvxs starts the registrar's server at
+    /// `initHookAfterIocRunning` (`ioc/iochooks.cpp:374-379`). A registrar
+    /// whose bind failed leaves no server, and this one then serves nothing.
+    pub fn bound_at_registrar(
+        self,
+        servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    ) -> Self {
+        *self.registrar.lock().unwrap() =
+            servers.take::<super::iocsh::PvxsServer>(super::iocsh::PVXS_SERVER);
+        self
     }
 
     /// Reload the Access Security policy from a `.acf` file. Mirrors
@@ -217,7 +235,7 @@ impl PvaServer {
     }
 
     /// As [`Self::run`], but publishes a [`ServerReportHandle`] into
-    /// `report_tx` the instant the native server binds.
+    /// `report_tx` the instant the native server starts.
     ///
     /// The iocsh `pvxsr` command does NOT ride on this channel: it is
     /// registered by a registrar before any server exists, so it reads
@@ -254,7 +272,7 @@ impl PvaServer {
 
     /// As [`Self::run_with_source`], but publishes a
     /// [`ServerReportHandle`] into `report_tx` the instant the native
-    /// server binds its listeners (so the actually-bound ports are known).
+    /// server starts (so the actually-bound ports are known).
     /// Only a caller that needs the handle itself passes `Some`; the iocsh
     /// `pvxsr` command reads `iocsh::publish_pvxs_report`, which this fills
     /// on every path.
@@ -267,6 +285,7 @@ impl PvaServer {
         // explicit port overrides the TCP port alone. The search port is
         // `EPICS_PVAS_BROADCAST_PORT`, then `EPICS_PVA_BROADCAST_PORT`, then
         // 5076 (pvxs `config.cpp:410-415`), whatever the TCP port is.
+        let registrar = self.registrar.lock().unwrap().take();
         let mut config = PvaServerConfig::default().with_env();
         if let Some(port) = self.port {
             config.tcp_port = port;
@@ -302,27 +321,28 @@ impl PvaServer {
             None
         };
 
-        let result = crate::server_native::runtime::run_pva_server_reporting(
-            source,
-            config,
-            move |handle| {
+        let started = match registrar {
+            Some(super::iocsh::PvxsServer(Some(bound))) => bound.start(source),
+            // pvxs's `initHookAfterIocRunning` with no `server()`: nothing to
+            // start, so `iocRun` is not held for it, and the autosave task
+            // above lives until the runner ends.
+            Some(super::iocsh::PvxsServer(None)) => {
+                epics_base_rs::server::db_server::announce_serving();
+                std::future::pending().await
+            }
+            None => crate::server_native::PvaServer::bind(config).and_then(|bound| {
+                super::iocsh::publish_server_port(bound.bound_tcp_port());
+                bound.start(source)
+            }),
+        };
+        let served = async move {
+            crate::server_native::runtime::serve_reporting(started?, move |handle| {
                 // pvxs `initialisePvxsServer` filling the `server()`
                 // singleton its already-registered `pvxsr` reads. Every
                 // caller publishes, shell or not, because the command may
                 // have been registered by `iocsh::register_pvxs_commands`
                 // at an application head this server knows nothing about.
                 super::iocsh::publish_pvxs_report(handle.clone());
-                // The same function publishes the effective TCP port into the
-                // environment, as pvxs `initialisePvxsServer` does: recsync and
-                // any later `$(PVAS_SERVER_PORT)` expansion in `st.cmd` read it
-                // from there. It has to be the bound port and not the requested
-                // one, because an ephemeral (`0`) or EADDRINUSE-fallen-back bind
-                // is exactly when a reader cannot derive it. The second name is
-                // pvAccessCPP's, which pvxs sets too so either stack answers.
-                let portstr = handle.bound_tcp_port().to_string();
-                for name in ["PVXS_SERVER_PORT", "PVAS_SERVER_PORT"] {
-                    epics_base_rs::runtime::env::set(name, &portstr);
-                }
                 if let Some(tx) = report_tx {
                     // Best-effort: a dropped receiver (no shell) just
                     // means nobody is watching the report.
@@ -335,10 +355,12 @@ impl PvaServer {
                 // is the one place the layer can say it, and `BuiltIoc::run`
                 // holds the startup script's `iocInit` line until it has.
                 epics_base_rs::server::db_server::announce_serving();
-            },
-        )
-        .await
-        .map_err(|e| CaError::InvalidValue(e.to_string()));
+            })
+            .await
+        };
+        let result = served
+            .await
+            .map_err(|e| CaError::InvalidValue(e.to_string()));
 
         if let Some(h) = autosave_handle {
             h.abort();

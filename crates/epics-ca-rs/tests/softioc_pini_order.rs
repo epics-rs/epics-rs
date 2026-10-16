@@ -72,7 +72,6 @@ fn pini_passes_bracket_every_run_and_pause_line_as_in_soft_ioc() {
         .args(["--port", "0", "-d"])
         .arg(&db)
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
         .stdin(Stdio::piped())
         .stdout(writer.try_clone().expect("clone the pipe"))
         .stderr(writer)

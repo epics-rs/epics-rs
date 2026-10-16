@@ -182,10 +182,12 @@ pub fn serving_generation() -> u64 {
 ///
 /// **The single owner is each protocol server's serve entry** — the one
 /// function that starts accepting, `CaServer::run` and the PVA server's
-/// `run_with_source_inner` bind callback. Announcing there and nowhere else is
+/// `run_with_source_inner` start callback. Announcing there and nowhere else is
 /// what keeps "a layer is serving" and "the generation moved" from coming
 /// apart: a caller cannot start a server by another route, because there is no
-/// other route to accepting a client.
+/// other route to accepting a client. The one other announcement is that same
+/// entry's when pvxs's registrar bound no server: the layer's `iocRun` work is
+/// then done with nothing to serve, as pvxs's start hook returns.
 pub fn announce_serving() {
     serving()
         .0

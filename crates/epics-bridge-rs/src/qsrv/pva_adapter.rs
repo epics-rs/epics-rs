@@ -1522,7 +1522,9 @@ pub async fn run_ca_pva_qsrv_ioc_app(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::error::CaResult<()> {
     let app = epics_ca_rs::server::iocsh::register_rsrv_commands(app);
-    let app = epics_pva_rs::server::iocsh::register_pvxs_commands(app);
+    // pvxsBaseRegistrar decides QSRV2 (`enable2`) before it binds the server.
+    qsrv2_decision();
+    let app = epics_pva_rs::server::iocsh::pvxs_base_registrar(app);
     // No `group_files`: this IOC's `dbLoadGroup` requests sit on the base
     // startup queue, put there by the iocsh command during st.cmd.
     run_qsrv_ioc_app(app, Vec::new(), serve_ca_pva_qsrv).await
@@ -1678,7 +1680,8 @@ async fn serve_ca_pva_qsrv(
         config.acf,
         config.autosave_config,
         config.autosave_manager,
-    );
+    )
+    .bound_at_registrar(&mut config.servers);
 
     pva_server
         .run_with_source_and_shell(composite, move |shell| {

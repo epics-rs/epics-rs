@@ -24,14 +24,15 @@ use epics_base_rs::server::ioc_app::IocRunConfig;
 /// Stand `app` up on pvAccess — [`run_pva_ioc`] with pvxs's
 /// `pvxsBaseRegistrar` already run.
 ///
-/// pvxs registers `pvxsr` from an `epicsExportRegistrar`
-/// (`ioc/iochooks.cpp:461-476`), so it answers on the first `st.cmd` line.
-/// This port has no link-time registrar, so the pairing here is what keeps a
-/// head from getting the runner without it; `IocApplication::run(run_pva_ioc)`
-/// still reaches the interactive shell's copy.
+/// pvxs registers `pvxsr` and binds its server from an `epicsExportRegistrar`
+/// (`ioc/iochooks.cpp:461-511`), so the command answers on the first `st.cmd`
+/// line and a held port is reported before it. This port has no link-time
+/// registrar, so the pairing here is what keeps a head from getting the
+/// runner without it; `IocApplication::run(run_pva_ioc)` still reaches the
+/// interactive shell's copy and binds at the runner.
 #[cfg(tokio_backend)]
 pub async fn run_pva_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
-    iocsh::register_pvxs_commands(app).run(run_pva_ioc).await
+    iocsh::pvxs_base_registrar(app).run(run_pva_ioc).await
 }
 
 /// Run an IOC with the pvAccess protocol.
@@ -57,14 +58,15 @@ pub async fn run_pva_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication
 /// `EPICS_PVA_SERVER_PORT`, then 5075, `config.cpp:402-408`), not
 /// `IocRunConfig::port`, which is the CA server port.
 #[cfg(tokio_backend)]
-pub async fn run_pva_ioc(config: IocRunConfig) -> CaResult<()> {
+pub async fn run_pva_ioc(mut config: IocRunConfig) -> CaResult<()> {
     let server = PvaServer::from_parts(
         config.db,
         None,
         config.acf,
         config.autosave_config,
         config.autosave_manager,
-    );
+    )
+    .bound_at_registrar(&mut config.servers);
     server
         .run_with_shell(move |shell| {
             for cmd in config.shell_commands {

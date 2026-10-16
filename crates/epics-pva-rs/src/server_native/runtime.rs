@@ -56,7 +56,15 @@ where
     S: ChannelSource + 'static,
     F: FnOnce(ServerReportHandle),
 {
-    let server = PvaServer::start(source, config)?;
+    serve_reporting(PvaServer::start(source, config)?, on_started).await
+}
+
+/// [`run_pva_server_reporting`] for a server already started, as from
+/// [`BoundPvaServer::start`].
+pub async fn serve_reporting<F>(server: PvaServer, on_started: F) -> PvaResult<()>
+where
+    F: FnOnce(ServerReportHandle),
+{
     on_started(server.report_handle());
     server.wait().await
 }
@@ -211,6 +219,14 @@ impl PvaServer {
     where
         S: ChannelSource + 'static,
     {
+        Self::bind(config)?.start(source)
+    }
+
+    /// Bind the search socket(s) and the TCP listener(s) without serving on
+    /// them: pvxs's `Server` between its constructor (`server.cpp:385-500`,
+    /// listeners disabled) and `start()`. The ports are final here, ephemeral
+    /// and fallen-back ones included, and a held search port fails here.
+    pub fn bind(config: PvaServerConfig) -> PvaResult<BoundPvaServer> {
         // `?` and not a fallback: a host with no entropy source must fail to
         // start rather than advertise a guessable identity — see `random_guid`
         // for why every consumer of a GUID collision degrades silently, which
@@ -237,32 +253,6 @@ impl PvaServer {
         if let Some(msg) = config.ignore_addr_error.take() {
             return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
         }
-        // The live per-peer registry is created up-front so the
-        // built-in server-info source can report connection counts.
-        let peers = crate::server_native::peers::PeerRegistry::new();
-
-        // The reserved `__server` composition — the same one
-        // `BlockingPvaServer::bind` performs. Written once in
-        // `server_info::compose_with_server_info`, because two copies of a
-        // composition rule is how the blocking driver came to have no
-        // server meta-channel at all.
-        let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
-        let dyn_source: DynSource = super::server_info::compose_with_server_info(user_source)
-            .map_err(|e| PvaError::Protocol(format!("PvaServer::start: {e}")))?;
-
-        // One server-wide channel-invalidation fan-out. A source that can
-        // invalidate a channel out of band (the PVA gateway, on an operator
-        // `<prefix>:drop` / `:flush`) publishes the affected PV name(s) here;
-        // every per-connection task holds a receiver and force-disconnects any
-        // channel it currently serves under those names with a server-initiated
-        // DESTROY_CHANNEL — the downstream effect of pva2pva's cache-entry
-        // `channel->destroy()` fanout. Lossless by construction (per-connection
-        // unbounded queues + one batch per removal command, see
-        // [`ChannelInvalidator`]); per-connection receivers are minted at
-        // accept from this clone.
-        let channel_invalidator = ChannelInvalidator::new();
-        dyn_source.set_channel_invalidator(channel_invalidator.clone());
-
         // `EPICS_PVAS_INTF_ADDR_LIST` expanded once, for TCP, UDP and beacons.
         let interfaces = ServerInterfaces::resolve(
             &config.interfaces,
@@ -350,16 +340,6 @@ impl PvaServer {
             config.tls_port = bound_tls_port;
         }
 
-        let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-        // The port advertised for `protocol` in SEARCH replies / beacons.
-        // pvxs returns `tls_port` for a protoTLS reply and `tcp_port`
-        // otherwise (src/server.cpp:849-857); on a TLS server clients are
-        // therefore steered to the dedicated TLS listener bound above.
-        let advertised_tcp_port = if config.tls.is_some() {
-            bound_tls_port
-        } else {
-            bound_tcp_port
-        };
         // Bind the search socket synchronously here, for the same reason the
         // TCP listener is bound above rather than inside its task: with
         // `udp_port = 0` the kernel picks the number, and a bind performed
@@ -370,98 +350,20 @@ impl PvaServer {
         // `src/server.cpp:426`).
         // The v6 companion's socket is bound here as well, on the same
         // number, so a start that cannot hold both families fails here.
-        let bound = crate::server_native::udp::bind_udp(
+        let udp = crate::server_native::udp::bind_udp(
             config.udp_port,
             &interfaces,
             config.enable_ipv6_udp,
         )?;
-        config.udp_port = bound.port;
-        let udp_handle = tokio::spawn(run_udp_responder_on_socket(
-            bound.v4,
-            bound.collector,
-            bound.port,
-            dyn_source.clone(),
-            advertised_tcp_port,
+        config.udp_port = udp.port;
+        Ok(BoundPvaServer {
+            config,
             guid,
-            protocol,
-            config.beacon_period,
-            config.beacon_period_long,
-            config.beacon_burst_count,
-            config.beacon_destinations.clone(),
-            config.auto_beacon,
-            config.ignore_addrs.clone(),
-            config.enable_ipv6_udp,
-            interfaces.v4(),
-        ));
-        // PR #205 IPv6 Stage 2: optional companion responder bound
-        // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
-        // the GUID + TCP port + protocol of the v4 path so a peer
-        // sees one consistent PVA identity across both families.
-        // Default-off via `enable_ipv6_udp = false`.
-        let udp_v6_handle = bound.v6.map(|socket| {
-            tokio::spawn(run_udp_responder_v6(
-                dyn_source.clone(),
-                socket,
-                advertised_tcp_port,
-                guid,
-                protocol,
-                config.ignore_addrs.clone(),
-            ))
-        });
-        // One accept loop per bound interface, supervised by a single
-        // task so the `PvaServer` keeps its single-handle shape (Drop /
-        // run / wait / report / stop are unchanged). The supervisor owns
-        // the per-listener `run_tcp_server_on_listener` futures in a
-        // JoinSet: the first listener to return Err ends the service and
-        // dropping the supervisor future (PvaServer::stop →
-        // `tcp_abort.abort()`) aborts every accept loop together. With
-        // the default empty interface list this is exactly one listener,
-        // identical to the previous single-bind behaviour.
-        let tcp_source = dyn_source;
-        let tcp_config = config.clone();
-        let tcp_peers = peers.clone();
-        let tcp_invalidator = channel_invalidator;
-        let tcp_handle = tokio::spawn(async move {
-            let mut set: tokio::task::JoinSet<PvaResult<()>> = tokio::task::JoinSet::new();
-            for listener in tcp_listeners {
-                set.spawn(crate::server_native::tcp::run_tcp_server_on_listener(
-                    tcp_source.clone(),
-                    listener,
-                    tcp_config.clone(),
-                    tcp_peers.clone(),
-                    tcp_invalidator.clone(),
-                ));
-            }
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) if e.is_cancelled() => return Ok(()),
-                    Err(e) => {
-                        return Err(crate::error::PvaError::Protocol(format!(
-                            "tcp listener task panic: {e}"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        });
-
-        let udp_abort = udp_handle.abort_handle();
-        let udp_v6_abort = udp_v6_handle.as_ref().map(|h| h.abort_handle());
-        let tcp_abort = tcp_handle.abort_handle();
-        Ok(Self {
-            udp_handle: Some(udp_handle),
-            udp_v6_handle,
-            tcp_handle: Some(tcp_handle),
-            udp_abort,
-            udp_v6_abort,
-            tcp_abort,
-            effective_config: config,
+            interfaces,
+            tcp_listeners,
             bound_tcp_port,
             bound_tls_port,
-            interrupt: Arc::new(tokio::sync::Notify::new()),
-            peers,
+            udp,
         })
     }
 
@@ -682,6 +584,165 @@ impl PvaServer {
                 }
             },
         }
+    }
+}
+
+/// A [`PvaServer`] bound by [`PvaServer::bind`] that serves nothing yet. Its
+/// listeners queue connections and its search socket queues searches until
+/// [`Self::start`], as pvxs's do until `Server::Pvt::start` (`server.cpp:555`).
+pub struct BoundPvaServer {
+    config: PvaServerConfig,
+    guid: [u8; 12],
+    interfaces: ServerInterfaces,
+    tcp_listeners: Vec<tokio::net::TcpListener>,
+    bound_tcp_port: u16,
+    bound_tls_port: u16,
+    udp: crate::server_native::udp::UdpBind,
+}
+
+impl BoundPvaServer {
+    /// The TCP port the listeners hold — the requested one, or the fallback.
+    pub fn bound_tcp_port(&self) -> u16 {
+        self.bound_tcp_port
+    }
+
+    /// Serve `source` on the bound sockets; see [`PvaServer::start`].
+    pub fn start<S>(self, source: Arc<S>) -> PvaResult<PvaServer>
+    where
+        S: ChannelSource + 'static,
+    {
+        let BoundPvaServer {
+            config,
+            guid,
+            interfaces,
+            tcp_listeners,
+            bound_tcp_port,
+            bound_tls_port,
+            udp,
+        } = self;
+        // The live per-peer registry is created up-front so the
+        // built-in server-info source can report connection counts.
+        let peers = crate::server_native::peers::PeerRegistry::new();
+
+        // The reserved `__server` composition — the same one
+        // `BlockingPvaServer::bind` performs. Written once in
+        // `server_info::compose_with_server_info`, because two copies of a
+        // composition rule is how the blocking driver came to have no
+        // server meta-channel at all.
+        let user_source: DynSource = source as Arc<dyn ChannelSourceObj>;
+        let dyn_source: DynSource = super::server_info::compose_with_server_info(user_source)
+            .map_err(|e| PvaError::Protocol(format!("PvaServer::start: {e}")))?;
+
+        // One server-wide channel-invalidation fan-out. A source that can
+        // invalidate a channel out of band (the PVA gateway, on an operator
+        // `<prefix>:drop` / `:flush`) publishes the affected PV name(s) here;
+        // every per-connection task holds a receiver and force-disconnects any
+        // channel it currently serves under those names with a server-initiated
+        // DESTROY_CHANNEL — the downstream effect of pva2pva's cache-entry
+        // `channel->destroy()` fanout. Lossless by construction (per-connection
+        // unbounded queues + one batch per removal command, see
+        // [`ChannelInvalidator`]); per-connection receivers are minted at
+        // accept from this clone.
+        let channel_invalidator = ChannelInvalidator::new();
+        dyn_source.set_channel_invalidator(channel_invalidator.clone());
+
+        let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
+        // The port advertised for `protocol` in SEARCH replies / beacons.
+        // pvxs returns `tls_port` for a protoTLS reply and `tcp_port`
+        // otherwise (src/server.cpp:849-857); on a TLS server clients are
+        // therefore steered to the dedicated TLS listener bound above.
+        let advertised_tcp_port = if config.tls.is_some() {
+            bound_tls_port
+        } else {
+            bound_tcp_port
+        };
+        let udp_handle = tokio::spawn(run_udp_responder_on_socket(
+            udp.v4,
+            udp.collector,
+            udp.port,
+            dyn_source.clone(),
+            advertised_tcp_port,
+            guid,
+            protocol,
+            config.beacon_period,
+            config.beacon_period_long,
+            config.beacon_burst_count,
+            config.beacon_destinations.clone(),
+            config.auto_beacon,
+            config.ignore_addrs.clone(),
+            config.enable_ipv6_udp,
+            interfaces.v4(),
+        ));
+        // PR #205 IPv6 Stage 2: optional companion responder bound
+        // to `[::]:udp_port` that answers v6 SEARCH packets. Shares
+        // the GUID + TCP port + protocol of the v4 path so a peer
+        // sees one consistent PVA identity across both families.
+        // Default-off via `enable_ipv6_udp = false`.
+        let udp_v6_handle = udp.v6.map(|socket| {
+            tokio::spawn(run_udp_responder_v6(
+                dyn_source.clone(),
+                socket,
+                advertised_tcp_port,
+                guid,
+                protocol,
+                config.ignore_addrs.clone(),
+            ))
+        });
+        // One accept loop per bound interface, supervised by a single
+        // task so the `PvaServer` keeps its single-handle shape (Drop /
+        // run / wait / report / stop are unchanged). The supervisor owns
+        // the per-listener `run_tcp_server_on_listener` futures in a
+        // JoinSet: the first listener to return Err ends the service and
+        // dropping the supervisor future (PvaServer::stop →
+        // `tcp_abort.abort()`) aborts every accept loop together. With
+        // the default empty interface list this is exactly one listener,
+        // identical to the previous single-bind behaviour.
+        let tcp_source = dyn_source;
+        let tcp_config = config.clone();
+        let tcp_peers = peers.clone();
+        let tcp_invalidator = channel_invalidator;
+        let tcp_handle = tokio::spawn(async move {
+            let mut set: tokio::task::JoinSet<PvaResult<()>> = tokio::task::JoinSet::new();
+            for listener in tcp_listeners {
+                set.spawn(crate::server_native::tcp::run_tcp_server_on_listener(
+                    tcp_source.clone(),
+                    listener,
+                    tcp_config.clone(),
+                    tcp_peers.clone(),
+                    tcp_invalidator.clone(),
+                ));
+            }
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) if e.is_cancelled() => return Ok(()),
+                    Err(e) => {
+                        return Err(crate::error::PvaError::Protocol(format!(
+                            "tcp listener task panic: {e}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        let udp_abort = udp_handle.abort_handle();
+        let udp_v6_abort = udp_v6_handle.as_ref().map(|h| h.abort_handle());
+        let tcp_abort = tcp_handle.abort_handle();
+        Ok(PvaServer {
+            udp_handle: Some(udp_handle),
+            udp_v6_handle,
+            tcp_handle: Some(tcp_handle),
+            udp_abort,
+            udp_v6_abort,
+            tcp_abort,
+            effective_config: config,
+            bound_tcp_port,
+            bound_tls_port,
+            interrupt: Arc::new(tokio::sync::Notify::new()),
+            peers,
+        })
     }
 }
 

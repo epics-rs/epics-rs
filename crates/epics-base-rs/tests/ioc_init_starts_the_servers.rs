@@ -111,7 +111,7 @@ async fn a_script_line_after_ioc_init_reaches_the_running_server() {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind the test server");
             runner_bound.publish(listener.local_addr().unwrap());
             // What a real protocol server's serve entry does at this point —
-            // `CaServer::run` and the PVA bind callback both announce here.
+            // `CaServer::run` and the PVA start callback both announce here.
             // Without it `iocInit` would have nothing to return on and would
             // wait for this runner to FINISH, which is a deadlock: the accept
             // below is served by the script line that cannot run yet.

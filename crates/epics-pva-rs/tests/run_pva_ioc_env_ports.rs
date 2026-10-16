@@ -187,7 +187,7 @@ fn a_held_search_port_is_printed_and_the_shell_survives() {
     drop(held);
     assert!(alive, "the IOC left before `exit`\n{stderr}");
     assert!(
-        stderr.contains("Error in pvxsBaseRegistrar"),
+        stderr.contains("Error in pvxsBaseRegistrar : Address already in use\n"),
         "a search port that could not be bound was not reported\n{stderr}"
     );
     assert!(

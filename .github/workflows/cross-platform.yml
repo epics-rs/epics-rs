@@ -144,5 +144,9 @@ jobs:
       # The reference_trees suite is excluded the same way and for the same
       # reason, via profile.ci's default-filter in .config/nextest.toml — it
       # reads epics-base sources directly and this job provisions none.
+      # Below the job timeout, so a hang fails this step and the job log is
+      # kept; `--status-level slow` is what prints the SLOW line naming a
+      # stuck test (profile.ci stops at `retry`). The slowest cell takes ~15 min.
       - name: Test (nextest)
-        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci
+        timeout-minutes: 30
+        run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci --status-level slow

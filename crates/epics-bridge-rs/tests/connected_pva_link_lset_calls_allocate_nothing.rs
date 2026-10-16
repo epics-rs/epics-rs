@@ -99,26 +99,13 @@ const CONNECTED_CALLS: &[(&str, fn(&dyn LinkSet, &[u8]))] = &[
 
 #[test]
 fn connected_pva_link_lset_calls_allocate_nothing() {
-    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: the one test in this binary, before any runtime exists, so no
-    // other thread reads the environment.
-    unsafe {
-        std::env::set_var("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{port}"));
-        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-    }
-
     // The target IOC runs on its own runtime, off the counted thread.
     let server_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
-    let _server = server_rt.block_on(async move {
+    let server = server_rt.block_on(async move {
         let (remote, _) = IocBuilder::new()
             .db_string(
                 r#"
@@ -133,13 +120,17 @@ fn connected_pva_link_lset_calls_allocate_nothing() {
             .unwrap();
         PvaServer::start(
             Arc::new(PvDatabaseSource::new(remote)),
-            PvaServerConfig {
-                tcp_port: port,
-                ..PvaServerConfig::isolated()
-            },
+            PvaServerConfig::isolated(),
         )
         .expect("target PVA server starts")
     });
+    // SAFETY: before the PVA client exists; the server's threads read the
+    // environment only through `std::env`.
+    unsafe {
+        std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
+        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+    }
 
     let worker = MandatoryThread::new("scan-1", ThreadPriority::ScanLow, StackSizeClass::Big)
         .spawn(|| {

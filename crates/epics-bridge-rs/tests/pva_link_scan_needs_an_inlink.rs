@@ -50,18 +50,6 @@ async fn wait_for(db: &PvDatabase, name: &str, want: f64) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn only_an_input_pvalink_scans_on_update() {
-    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: the one test in this binary, before the PVA client exists.
-    unsafe {
-        std::env::set_var("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{port}"));
-        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-    }
-
     let (remote, _) = IocBuilder::new()
         .db_string(
             r#"
@@ -76,14 +64,18 @@ async fn only_an_input_pvalink_scans_on_update() {
         .build()
         .await
         .unwrap();
-    let _server = PvaServer::start(
+    let server = PvaServer::start(
         Arc::new(PvDatabaseSource::new(remote.clone())),
-        PvaServerConfig {
-            tcp_port: port,
-            ..PvaServerConfig::isolated()
-        },
+        PvaServerConfig::isolated(),
     )
     .expect("target PVA server starts");
+    // SAFETY: before the PVA client exists; the server's threads read the
+    // environment only through `std::env`.
+    unsafe {
+        std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
+        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+    }
 
     let (db, _) = IocBuilder::new()
         .register_link_type("pva", |db| async move {

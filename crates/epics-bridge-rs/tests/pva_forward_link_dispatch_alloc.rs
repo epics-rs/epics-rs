@@ -120,37 +120,28 @@ async fn connect(local: &PvDatabase, remote: &PvDatabase, rec: &str, target: &st
 
 #[test]
 fn a_connected_pva_forward_allocates_nothing_on_the_processing_thread() {
-    let port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    // SAFETY: the one test in this binary, before any runtime exists, so no
-    // other thread reads the environment.
-    unsafe {
-        std::env::set_var("EPICS_PVA_NAME_SERVERS", format!("127.0.0.1:{port}"));
-        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-    }
-
     // The target IOC runs on its own runtime, off the counted thread.
     let server_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
-    let (remote, _server) = server_rt.block_on(async {
+    let (remote, server) = server_rt.block_on(async {
         let remote = db(TARGETS).await;
         let server = PvaServer::start(
             Arc::new(PvDatabaseSource::new(remote.clone())),
-            PvaServerConfig {
-                tcp_port: port,
-                ..PvaServerConfig::isolated()
-            },
+            PvaServerConfig::isolated(),
         )
         .expect("target PVA server starts");
         (remote, server)
     });
+    // SAFETY: before the PVA client exists; the server's threads read the
+    // environment only through `std::env`.
+    unsafe {
+        std::env::set_var("EPICS_PVA_NAME_SERVERS", server.tcp_addr().to_string());
+        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
+        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

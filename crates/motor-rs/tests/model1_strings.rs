@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -172,11 +172,71 @@ fn with_previous(
         .collect()
 }
 
+/// A move's strings; an empty `post` is a move POST did not arm.
 fn strings(prem: &str, post: &str) -> MotorCommand {
     MotorCommand::MoveStrings {
         prem: prem.into(),
-        post: post.into(),
+        post: (!post.is_empty()).then(|| {
+            let message = PostMessage::default();
+            message.set(post.as_bytes());
+            message
+        }),
     }
+}
+
+/// The POST a move was armed with, as the device would read it now.
+fn armed_post(commands: &[MotorCommand]) -> Option<PostMessage> {
+    commands.iter().find_map(|c| match c {
+        MotorCommand::MoveStrings { post, .. } => post.clone(),
+        _ => None,
+    })
+}
+
+/// C arms a move with `&mr->post` (devIM483PL.cc:203-204) and the driver
+/// copies it out when the move is done (drvIM483PL.cc:361-366): a POST put
+/// during the move is what the device sends, an emptied one sends nothing,
+/// and a POST set after an unarmed move's build is not sent for it.
+#[tokio::test]
+async fn post_is_read_when_the_move_is_done() {
+    let mut rx = axis(47);
+    let db = boot(
+        r##"
+record(motor, "S:post") { field(DTYP, "TestStrings") field(OUT, "#C47 S0 @") field(MRES, "1") field(VELO, "1") field(POST, "MF") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    settle(&mut rx).await;
+    let put = |field: &'static str, value: EpicsValue| {
+        let db = db.clone();
+        async move {
+            db.put_record_field_from_ca("S:post", field, value)
+                .await
+                .unwrap()
+        }
+    };
+
+    put("VAL", EpicsValue::Double(5.0)).await;
+    let post = armed_post(&settle(&mut rx).await).expect("POST arms the move");
+    put("POST", EpicsValue::String(" XY".into())).await;
+    assert_eq!(post.get(), b" XY", "the field, not the text at the build");
+    put("POST", EpicsValue::String("".into())).await;
+    assert!(post.is_empty(), "emptied during the move: nothing to send");
+
+    put("VAL", EpicsValue::Double(6.0)).await;
+    let commands = settle(&mut rx).await;
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{commands:?}"
+    );
+    assert_eq!(armed_post(&commands), None, "{commands:?}");
+    put("POST", EpicsValue::String("MF".into())).await;
+    assert_eq!(
+        db.get_pv("S:post.POST").unwrap(),
+        EpicsValue::String("MF".into())
+    );
 }
 
 #[tokio::test]
@@ -292,8 +352,17 @@ impl AsynMotor for Hooks {
     fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         Ok(())
     }
-    fn set_move_strings(&mut self, _: &AsynUser, prem: &[u8], post: &[u8]) -> AsynResult<()> {
-        let (prem, post) = (String::from_utf8_lossy(prem), String::from_utf8_lossy(post));
+    fn set_move_strings(
+        &mut self,
+        _: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        let post = post.map(|p| p.get()).unwrap_or_default();
+        let (prem, post) = (
+            String::from_utf8_lossy(prem),
+            String::from_utf8_lossy(&post),
+        );
         self.seen
             .lock()
             .unwrap()

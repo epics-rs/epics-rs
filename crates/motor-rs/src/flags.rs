@@ -1,7 +1,7 @@
 use bitflags::bitflags;
 use epics_base_rs::types::PvString;
 
-pub use asyn_rs::interfaces::motor::PidGainKind;
+pub use asyn_rs::interfaces::motor::{PidGainKind, PostMessage};
 
 bitflags! {
     /// MIP (Motion In Progress) flags — exposed as a PV field.
@@ -384,10 +384,11 @@ pub enum MotorCommand {
         init: PvString,
     },
     /// The record's PREM and POST, ahead of the move they belong to: C
-    /// `build_trans` reads both from the record at each move it builds.
+    /// `build_trans` reads PREM at each move it builds, and arms the move
+    /// with the POST field itself when it is set then.
     MoveStrings {
         prem: PvString,
-        post: PvString,
+        post: Option<PostMessage>,
     },
     ProfileInitialize {
         max_points: usize,

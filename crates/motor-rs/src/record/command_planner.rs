@@ -2147,9 +2147,12 @@ impl MotorRecord {
         //   SPMG=Pause/Stop, waiting for the Go pass to dispatch — C
         //   keeps DMOV low across the pause ("not done": a move is
         //   pending).
+        // - The LS-error update (1367-1378) of a load on a limit: pp is
+        //   armed and the GET_INFO pass must run postProcess.
         let put_owned = self.last_write.is_some()
             || matches!(self.pending_event, Some(MotorEvent::UserWrite(_)));
         if !put_owned
+            && !self.internal.pp
             && !self.stat.dmov
             && self.stat.phase == MotionPhase::Idle
             && self.stat.mip.is_empty()

@@ -144,7 +144,9 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "RINP" => Some(EpicsValue::String(rec.links.rinp.clone())),
         "INIT" => Some(EpicsValue::String(rec.links.init.clone())),
         "PREM" => Some(EpicsValue::String(rec.links.prem.clone())),
-        "POST" => Some(EpicsValue::String(rec.links.post.clone())),
+        "POST" => Some(EpicsValue::String(PvString::from_bytes(
+            rec.links.post.get(),
+        ))),
         "OMSL" => Some(EpicsValue::Short(rec.links.omsl)),
         // Alarm-limit / operator-range surface.
         "HIHI" => Some(EpicsValue::Double(rec.alarm.hihi)),
@@ -1462,7 +1464,13 @@ pub(crate) fn motor_put_field(
         // Read only by a model-1 device at init (motordevCom.cc:310).
         "INIT" => put_link_string(value, &mut rec.links.init, name),
         "PREM" => put_link_string(value, &mut rec.links.prem, name),
-        "POST" => put_link_string(value, &mut rec.links.post, name),
+        "POST" => match value {
+            EpicsValue::String(v) => {
+                rec.links.post.set(v.as_bytes());
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // menuOmsl: 0 = supervisory, 1 = closed_loop.
         "OMSL" => match value {
             EpicsValue::Short(v) => {

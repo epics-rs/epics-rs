@@ -107,7 +107,9 @@ fn a_move_refused_by_a_disconnected_port_prints_the_controller_then_the_device_l
         tails,
         [
             "asynMotorController:writeFloat64 error, status=4 axis=0, function=1, value=5.000000",
-            "devMotorAsyn::asynCallback: XPS:m1 pasyn{Float64,Int32}->write returned port XPS_M not connected",
+            // The driver's "port XPS_M not connected" is not the record's
+            // errorMessage; C nPoint LC400 prints this line with an empty tail.
+            "devMotorAsyn::asynCallback: XPS:m1 pasyn{Float64,Int32}->write returned ",
         ]
     );
 }
@@ -280,9 +282,8 @@ fn a_refused_runtime_encoder_ratio_prints_the_async_callback_line() {
     );
     assert_eq!(lines.len(), 2, "{lines:#?}");
     assert!(
-        lines[1].ends_with(
-            "devMotorAsyn::asynCallback: XPS:m1 pasyn{Float64,Int32}->write returned port XPS_M not connected"
-        ),
+        lines[1]
+            .ends_with("devMotorAsyn::asynCallback: XPS:m1 pasyn{Float64,Int32}->write returned "),
         "{lines:#?}"
     );
 }
@@ -429,7 +430,7 @@ fn a_model2_axis_prints_drv_motor_asyn_write_lines_and_no_controller_line() {
         lines[0]
     );
     assert!(lines[0].contains(" pAxis=0x"), "{}", lines[0]);
-    let refused = "devMotorAsyn::asynCallback: MM4000:m1 pasyn{Float64,Int32}->write returned port XPS_M not connected";
+    let refused = "devMotorAsyn::asynCallback: MM4000:m1 pasyn{Float64,Int32}->write returned ";
     assert_eq!(
         lines[1..],
         [

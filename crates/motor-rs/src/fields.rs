@@ -1,3 +1,4 @@
+use asyn_rs::interfaces::motor::PostMessage;
 use epics_base_rs::types::PvString;
 
 use crate::flags::*;
@@ -363,7 +364,9 @@ pub struct LinkFields {
     pub rinp: PvString,
     pub init: PvString,
     pub prem: PvString,
-    pub post: PvString,
+    /// Shared with the device a move armed with it, which reads it when
+    /// that move is done.
+    pub post: PostMessage,
     pub omsl: i16,
 }
 

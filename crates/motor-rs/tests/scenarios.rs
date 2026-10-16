@@ -770,6 +770,102 @@ fn set_mode_load_pos_collapses_through_live_path() {
     assert!(rec.stat.dmov, "DMOV returns TRUE");
 }
 
+/// Helper: an idle done status at dial `pos` resting on the low limit switch.
+fn on_low_limit_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
+    let mut s = idle_status_at(seq, pos);
+    s.status.low_limit = true;
+    s
+}
+
+/// A SET+FOFF=Frozen VAL redefinition of an axis resting on its low limit
+/// after a reverse move, on a controller that ignores the load (the nf874x
+/// `DH`). `cdir` is the boundary: C 1367 takes the LS-error update only for
+/// the limit in the commanded direction.
+fn frozen_load_on_low_limit(
+    cdir: bool,
+) -> (MotorRecord, motor_rs::device_state::SharedDeviceState) {
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(1, -5.0));
+    let mut rec = make_record();
+    rec.conv.foff = FreezeOffset::Frozen;
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+    rec.stat.cdir = cdir;
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    rec.put_field("VAL", EpicsValue::Double(-6.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == -6000.0))
+    );
+
+    // The GET_INFO callback: the controller kept its position.
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(2, -5.0));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.is_empty(), "LOAD_P collapses");
+    (rec, state)
+}
+
+#[test]
+fn a_load_on_the_commanded_limit_resyncs_val_from_the_readback() {
+    // C 1367-1378 then postProcess 827-849: nf874x SET VAL=2 FOFF=Frozen
+    // after HOMR ends VAL=3 DVAL=-5000 on softIoc, the readback it rests at.
+    let (mut rec, state) = frozen_load_on_low_limit(false);
+    assert!(!rec.stat.dmov, "the LS-error update keeps DMOV FALSE");
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(actions.force_poll, "GET_INFO");
+
+    state.lock().unwrap().latest_status = Some(on_low_limit_at(3, -5.0));
+    rec.process().unwrap();
+    assert!(rec.stat.dmov);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-5.0, -5.0));
+    assert_eq!(rec.pos.rval, -5000);
+    let reload = state
+        .lock()
+        .unwrap()
+        .pending_actions
+        .take()
+        .is_some_and(|a| {
+            a.commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
+        });
+    assert!(!reload, "the synced lasts leave nothing for a second load");
+}
+
+#[test]
+fn a_moving_report_on_the_limit_is_a_stopped_callback() {
+    // The nf874x answers `MD?` with 0 after a DH it ignored: MSTA carries
+    // MOVING and no DONE on the minus limit, so movn = 0 (C 3741-3748) and
+    // C 1345 takes the stopped branch, whose postProcess resyncs VAL.
+    let (mut rec, state) = frozen_load_on_low_limit(false);
+    state.lock().unwrap().pending_actions.take();
+    let mut moving = on_low_limit_at(3, -5.0);
+    moving.status.done = false;
+    moving.status.moving = true;
+    state.lock().unwrap().latest_status = Some(moving);
+    rec.process().unwrap();
+    assert!(!rec.stat.movn);
+    assert!(!rec.stat.msta.contains(MstaFlags::DONE));
+    assert!(rec.stat.dmov);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-5.0, -5.0));
+}
+
+#[test]
+fn a_load_on_the_opposite_limit_keeps_the_redefined_val() {
+    let (rec, _) = frozen_load_on_low_limit(true);
+    assert!(rec.stat.dmov);
+    assert_eq!((rec.pos.val, rec.pos.dval), (-6.0, -6.0));
+}
+
 #[test]
 fn load_pos_leaves_rbv_in_old_frame_until_get_info_callback() {
     // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF but

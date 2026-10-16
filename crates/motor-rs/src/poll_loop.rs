@@ -658,7 +658,7 @@ pub fn execute_commands(
             MotorCommand::OutParm { ref parm } => motor.set_out_parm(&user, parm.as_bytes()),
             MotorCommand::Primitive { ref init } => motor.primitive(&user, init.as_bytes()),
             MotorCommand::MoveStrings { ref prem, ref post } => {
-                motor.set_move_strings(&user, prem.as_bytes(), post.as_bytes())
+                motor.set_move_strings(&user, prem.as_bytes(), post.clone())
             }
             MotorCommand::Poll => Ok(()),
         };
@@ -756,7 +756,9 @@ pub fn execute_commands(
             }
             continue;
         }
-        let failure = result.as_ref().err().map(|e| e.message_display());
+        // C axis methods get no record asynUser, so a failure leaves its
+        // errorMessage as createAsynUser made it: empty.
+        let failure = result.as_ref().err().map(|_| "");
         dev_motor_asyn_reply(
             trace,
             cmd,

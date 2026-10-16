@@ -259,8 +259,11 @@ impl MotorRecord {
     /// either is set. A record's process and `special()` puts both send
     /// through it.
     pub(crate) fn transaction(&self, commands: Vec<MotorCommand>) -> Vec<MotorCommand> {
-        let (prem, post) = (&self.links.prem, &self.links.post);
-        if prem.is_empty() && post.is_empty() {
+        let prem = &self.links.prem;
+        // C `if (strlen(mr->post) != 0) postmsgptr = &mr->post`: the field,
+        // not its text, so the device sends what POST holds when it is done.
+        let post = (!self.links.post.is_empty()).then(|| self.links.post.clone());
+        if prem.is_empty() && post.is_none() {
             return commands;
         }
         let mut out = Vec::with_capacity(commands.len() + 1);

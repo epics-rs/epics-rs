@@ -392,6 +392,11 @@ impl MotorRecord {
                 // truncate the delay on the first poll tick.
             }
             MotionPhase::Idle => {
+                // Every branch here is C's stopped callback (1345), keyed
+                // on MOVN alone, which the early return above already
+                // tested: a driver reporting MOVING on its limit switch
+                // has movn = 0 (3741-3748) and no RA_DONE.
+                //
                 // C process (1405-1409, postProcess 851-852): the
                 // GET_INFO callback after a LOAD_POS collapses MIP_LOAD_P
                 // to MIP_DONE and DMOV returns TRUE — no DLY, no retry
@@ -404,12 +409,19 @@ impl MotorRecord {
                 // MIP_LOAD_P skip in load_pos's set test). The pp and
                 // EXTERNAL blocks below self-gate: load_pos arms
                 // neither, and MIP is empty after the collapse.
-                if self.stat.mip.contains(MipFlags::LOAD_P)
-                    && self.stat.msta.contains(MstaFlags::DONE)
-                    && !self.stat.movn
-                {
+                if self.stat.mip.contains(MipFlags::LOAD_P) {
                     self.stat.mip = MipFlags::empty();
                     self.mark(m::MIP);
+                    // C 1367-1378 sees `mip == MIP_LOAD_P`, not MIP_DONE, so a
+                    // load on an axis resting on its limit in the commanded
+                    // direction takes the LS-error update: DMOV stays FALSE,
+                    // pp is armed and a GET_INFO sent, and the pp branch below
+                    // resyncs the drive fields from that fresh readback.
+                    if self.limit_stopped() {
+                        self.internal.pp = true;
+                        effects.request_poll = true;
+                        return effects;
+                    }
                     self.set_dmov(true);
                 }
                 // C process (1382-1402): a done status callback with pp
@@ -419,8 +431,10 @@ impl MotorRecord {
                 // (do_work 1981-1987: pp = TRUE + GET_INFO) completes
                 // here, re-deriving VAL/DVAL/RVAL at the new
                 // resolution.
-                if self.internal.pp && self.stat.msta.contains(MstaFlags::DONE) && !self.stat.movn {
+                if self.internal.pp {
                     self.internal.pp = false;
+                    // C 1351: a stopped callback returns DMOV to TRUE first.
+                    self.set_dmov(true);
                     self.postprocess_sync();
                     // This early-return quiesces the axis without finalize_motion
                     // and dispatches nothing, deferring a held button to a later
@@ -433,10 +447,7 @@ impl MotorRecord {
                 // move (MIP_EXTERNAL set during process_motor_info), close
                 // the loop once the driver reports done. Reseed VAL/DVAL/RVAL
                 // from the readback and clear MIP.
-                if self.stat.mip.contains(MipFlags::EXTERNAL)
-                    && self.stat.msta.contains(MstaFlags::DONE)
-                    && !self.stat.movn
-                {
+                if self.stat.mip.contains(MipFlags::EXTERNAL) {
                     self.postprocess_sync();
                     self.finalize_motion(&mut effects);
                 }
@@ -706,17 +717,23 @@ impl MotorRecord {
     /// positional moves), so a close-enough or rtry-disabled completion is
     /// still not synced. Do not extend the sync to those branches.
     fn sync_if_limit_stopped(&mut self) -> bool {
+        let ls_stopped = self.limit_stopped();
+        if ls_stopped {
+            self.postprocess_sync();
+        }
+        ls_stopped
+    }
+
+    /// C 1367: `(rhls && cdir) || (rlls && !cdir)` — the axis rests on the
+    /// limit switch in its commanded direction.
+    fn limit_stopped(&self) -> bool {
         let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
         let user_cdir = if same_polarity {
             self.stat.cdir
         } else {
             !self.stat.cdir
         };
-        let ls_stopped = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
-        if ls_stopped {
-            self.postprocess_sync();
-        }
-        ls_stopped
+        (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir)
     }
 
     /// The C `maybeRetry` port (motorRecord.cc:1042-1104) — the single

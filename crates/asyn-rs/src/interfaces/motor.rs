@@ -1,7 +1,40 @@
 //! Motor interface definitions.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use crate::error::AsynResult;
 use crate::user::AsynUser;
+
+/// A model-1 record's POST field, shared with the device: C arms a move with
+/// `postmsgptr = &mr->post` and the driver copies it out when the move is
+/// done, so a POST put during the move is the one sent. A clone is the same
+/// field.
+#[derive(Debug, Clone, Default)]
+pub struct PostMessage(Arc<Mutex<Vec<u8>>>);
+
+impl PostMessage {
+    pub fn get(&self) -> Vec<u8> {
+        self.0.lock().clone()
+    }
+
+    pub fn set(&self, bytes: &[u8]) {
+        let mut post = self.0.lock();
+        post.clear();
+        post.extend_from_slice(bytes);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+}
+
+impl PartialEq for PostMessage {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0.lock() == *other.0.lock()
+    }
+}
 
 /// Motor axis status.
 /// Fields match the C asynMotorController MotorStatus structure.
@@ -286,9 +319,16 @@ pub trait AsynMotor: Send + Sync {
     /// A model-1 record's PREM and POST for the move called next, which C
     /// `build_trans` reads at every MOVE_ABS, MOVE_REL, HOME and JOG
     /// (devIM483PL.cc:191-205): the device puts PREM ahead of that move its
-    /// own way, and sends POST once the move is done (drvIM483PL.cc:361-366).
-    /// Called only when either is set, so they belong to that one move.
-    fn set_move_strings(&mut self, _user: &AsynUser, _prem: &[u8], _post: &[u8]) -> AsynResult<()> {
+    /// own way. `post` is given when POST was set at that build, and the
+    /// device sends what it holds once the move is done
+    /// (drvIM483PL.cc:361-366). Called only when either is set, so they
+    /// belong to that one move.
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        _prem: &[u8],
+        _post: Option<PostMessage>,
+    ) -> AsynResult<()> {
         Ok(())
     }
 

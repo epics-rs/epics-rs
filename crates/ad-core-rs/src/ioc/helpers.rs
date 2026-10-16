@@ -218,35 +218,20 @@ pub fn dtyp_from_port(port_name: &str) -> String {
 /// `create_monitor_set`, `create_triggered_set`) are no longer registered here.
 /// They are handled by `AutosaveStartupConfig::register_startup_commands()`.
 pub fn register_noop_commands(mut app: IocApplication) -> IocApplication {
-    for cmd in &["startPVAServer", "callbackSetQueueSize"] {
-        let name = *cmd;
-        app = app.register_startup_command(CommandDef::new(
-            name,
-            vec![
-                ArgDesc {
-                    name: "arg1",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "arg2",
-                    arg_type: ArgType::String,
-                },
-            ],
-            format!("{name} [args...] - no-op (not implemented)"),
-            move |_args: &[ArgValue], _ctx: &CommandContext| {
-                // B16: callbackSetQueueSize sizes the asyn callback queue in C.
-                // The Rust plugin model uses a per-plugin bounded channel sized
-                // at plugin construction, so this is a genuine no-op — warn so
-                // a cmd file tuning it is not silently ineffective.
-                if name == "callbackSetQueueSize" {
-                    eprintln!(
-                        "warning: callbackSetQueueSize is a no-op in epics-rs; \
-                         plugin queue size is set per-plugin at construction"
-                    );
-                }
-                Ok(CommandOutcome::Continue)
+    app = app.register_startup_command(CommandDef::new(
+        "startPVAServer",
+        vec![
+            ArgDesc {
+                name: "arg1",
+                arg_type: ArgType::String,
             },
-        ));
-    }
+            ArgDesc {
+                name: "arg2",
+                arg_type: ArgType::String,
+            },
+        ],
+        "startPVAServer [args...] - no-op (not implemented)",
+        |_args: &[ArgValue], _ctx: &CommandContext| Ok(CommandOutcome::Continue),
+    ));
     app
 }

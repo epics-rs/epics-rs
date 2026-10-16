@@ -3,6 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use asyn_rs::param::ParamValue;
@@ -92,9 +93,12 @@ pub async fn mqtt_event_loop(
     // left half-advanced if the future is dropped mid-poll), so we must never
     // drive it inside a `tokio::select!`. Instead, outbound publishes are
     // forwarded on a dedicated task, and the main loop only awaits `poll()`.
+    let (acks, ack_rx) = mpsc::unbounded_channel();
+    tokio::spawn(ack_task(ack_rx, port_handle.clone()));
     tokio::spawn(publish_task(
         client.clone(),
         publish_rx,
+        acks.clone(),
         port_handle.clone(),
     ));
 
@@ -223,7 +227,7 @@ pub async fn mqtt_event_loop(
                     &port_handle.interrupts().subscribed_bindings(),
                 );
                 for topic in sub_topics {
-                    subscribe(&client, &port_handle, topic, config.qos.into());
+                    subscribe(&client, &acks, &port_handle, topic, config.qos.into());
                 }
             }
             Ok(Event::Incoming(Incoming::PingResp)) => {
@@ -240,6 +244,9 @@ pub async fn mqtt_event_loop(
                 break;
             }
             Err(e) => {
+                // rumqttc ends the connection on every error. paho fails what
+                // the session owed before `connectionLost` reports the loss.
+                end_session(&acks).await;
                 // A shutdown with the session already down: C sends nothing at
                 // all (`if (client_.is_connected())`, mqttClient.cpp:52), so
                 // exit without reconnecting rather than sleeping and retrying.
@@ -305,6 +312,7 @@ pub async fn mqtt_event_loop(
     // release the `Drop` that is blocked waiting for it. Dropping `done` would
     // release it too; sending first is what lets the far side tell a loop that
     // ended from a task that died.
+    end_session(&acks).await;
     let _ = done.send(());
 }
 
@@ -312,16 +320,14 @@ pub async fn mqtt_event_loop(
 /// on the PUBACK/PUBCOMP, or on the write for QoS 0 (MQTTAsyncUtils.c:1474-1500,
 /// :3157-3209); `onFailure5` on a refusal, a SUBACK for the one filter C
 /// subscribes at a time or a PUBACK/PUBREC/PUBCOMP whose reason is 0x80 or
-/// above (:2234-2248, :3199-3209), with the session left up.
+/// above (:2234-2248, :3199-3209), with the session left up, and when the
+/// request dies with its session (:1902-1938).
 #[derive(Debug, PartialEq, Eq)]
 enum AckLine {
     Succeeded,
-    /// `onFailCb`'s text: empty for a broker refusal, since paho hands
-    /// `onFailure5` no message.
+    /// `onFailCb`'s text: empty where paho hands `onFailure5` no message, a
+    /// broker refusal or a request its session took with it.
     Failed(String),
-    /// The request died with its session or with the event loop. Neither
-    /// callback is printed.
-    Dropped,
 }
 
 fn subscribe_line(result: &Result<SubAck, SubscribeNoticeError>) -> AckLine {
@@ -334,8 +340,9 @@ fn subscribe_line(result: &Result<SubAck, SubscribeNoticeError>) -> AckLine {
         {
             AckLine::Succeeded
         }
-        Ok(_) => AckLine::Failed(String::new()),
-        Err(SubscribeNoticeError::SessionReset | SubscribeNoticeError::Recv) => AckLine::Dropped,
+        Ok(_) | Err(SubscribeNoticeError::SessionReset | SubscribeNoticeError::Recv) => {
+            AckLine::Failed(String::new())
+        }
         Err(e) => AckLine::Failed(e.to_string()),
     }
 }
@@ -349,9 +356,7 @@ fn publish_line(result: &Result<PublishResult, PublishNoticeError>) -> AckLine {
         ),
         Ok(PublishResult::Qos2PubRecRejected(_)) => true,
         Ok(PublishResult::Qos2Completed(ack)) => ack.reason != PubCompReason::Success,
-        Err(PublishNoticeError::SessionReset | PublishNoticeError::Recv) => {
-            return AckLine::Dropped;
-        }
+        Err(PublishNoticeError::SessionReset | PublishNoticeError::Recv) => true,
         Err(e) => return AckLine::Failed(e.to_string()),
     };
     if refused {
@@ -361,12 +366,77 @@ fn publish_line(result: &Result<PublishResult, PublishNoticeError>) -> AckLine {
     }
 }
 
-/// Print `line`; `success` is the operation's `onSuccess` text.
-fn print_ack(port_handle: &PortHandle, line: AckLine, success: std::fmt::Arguments<'_>) {
+/// A SUBSCRIBE or PUBLISH rumqttc took: the ack that ends it and its
+/// `onSuccess` text.
+struct Owed {
+    ack: std::pin::Pin<Box<dyn std::future::Future<Output = AckLine> + Send>>,
+    success: String,
+}
+
+enum AckRequest {
+    Owe(Owed),
+    /// The session ended; answered once every owed request has its line.
+    SessionEnded(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The one owner of every SUBSCRIBE and PUBLISH line: paho's `responses`
+/// list. A request prints its ack's line, or fails with its session, since
+/// `MQTTAsync_closeSession` fails every request still owed an ack (v5
+/// sessionExpiry is 0) on a loss and on the exit disconnect alike
+/// (MQTTAsyncUtils.c:979, :1687, :1902-1938, :2491-2498). An ack that came in
+/// before the end keeps its own line.
+async fn ack_task(mut requests: mpsc::UnboundedReceiver<AckRequest>, port_handle: PortHandle) {
+    let mut owed: Vec<Owed> = Vec::new();
+    let mut closed = false;
+    std::future::poll_fn(|cx| {
+        while !closed {
+            match requests.poll_recv(cx) {
+                Poll::Ready(Some(AckRequest::Owe(o))) => owed.push(o),
+                Poll::Ready(Some(AckRequest::SessionEnded(ended))) => {
+                    for mut o in owed.drain(..) {
+                        let line = match o.ack.as_mut().poll(cx) {
+                            Poll::Ready(line) => line,
+                            Poll::Pending => AckLine::Failed(String::new()),
+                        };
+                        print_ack(&port_handle, line, &o.success);
+                    }
+                    let _ = ended.send(());
+                }
+                Poll::Ready(None) => closed = true,
+                Poll::Pending => break,
+            }
+        }
+        owed.retain_mut(|o| match o.ack.as_mut().poll(cx) {
+            Poll::Ready(line) => {
+                print_ack(&port_handle, line, &o.success);
+                false
+            }
+            Poll::Pending => true,
+        });
+        if closed && owed.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// End the session for [`ack_task`] and wait until it has printed what the
+/// session owed, so those lines come before the loss is reported.
+async fn end_session(acks: &mpsc::UnboundedSender<AckRequest>) {
+    let (ended, printed) = tokio::sync::oneshot::channel();
+    if acks.send(AckRequest::SessionEnded(ended)).is_ok() {
+        let _ = printed.await;
+    }
+}
+
+fn print_ack(port_handle: &PortHandle, line: AckLine, success: &str) {
     match line {
-        AckLine::Succeeded => asyn_print(port_handle, TraceMask::IO_DRIVER, success),
+        AckLine::Succeeded => {
+            asyn_print(port_handle, TraceMask::IO_DRIVER, format_args!("{success}"))
+        }
         AckLine::Failed(e) => print_fail(port_handle, &e),
-        AckLine::Dropped => {}
     }
 }
 
@@ -378,21 +448,22 @@ fn print_fail(port_handle: &PortHandle, e: &str) {
     );
 }
 
-/// Queue one SUBSCRIBE and print its outcome when rumqttc resolves its notice.
+/// Queue one SUBSCRIBE and hand its notice to [`ack_task`].
 /// `try_`: this runs on the task that drives `poll()`, which is what drains
 /// the request channel.
-fn subscribe(client: &AsyncClient, port_handle: &PortHandle, topic: String, qos: rumqttc::QoS) {
+fn subscribe(
+    client: &AsyncClient,
+    acks: &mpsc::UnboundedSender<AckRequest>,
+    port_handle: &PortHandle,
+    topic: String,
+    qos: rumqttc::QoS,
+) {
     match client.try_subscribe_tracked(topic.as_str(), qos) {
         Ok(notice) => {
-            let port_handle = port_handle.clone();
-            tokio::spawn(async move {
-                let line = subscribe_line(&notice.wait_async().await);
-                print_ack(
-                    &port_handle,
-                    line,
-                    format_args!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
-                );
-            });
+            let _ = acks.send(AckRequest::Owe(Owed {
+                ack: Box::pin(async move { subscribe_line(&notice.wait_async().await) }),
+                success: format!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
+            }));
         }
         Err(e) => {
             let e = match e {
@@ -567,6 +638,7 @@ async fn mark_connected(port_handle: &PortHandle, connected_param: usize, connec
 async fn publish_task(
     client: AsyncClient,
     mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
+    acks: mpsc::UnboundedSender<AckRequest>,
     port_handle: PortHandle,
 ) {
     while let Some(req) = publish_rx.recv().await {
@@ -585,15 +657,10 @@ async fn publish_task(
             .await
         {
             Ok(notice) => {
-                let port_handle = port_handle.clone();
-                tokio::spawn(async move {
-                    let line = publish_line(&notice.wait_async().await);
-                    print_ack(
-                        &port_handle,
-                        line,
-                        format_args!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
-                    );
-                });
+                let _ = acks.send(AckRequest::Owe(Owed {
+                    ack: Box::pin(async move { publish_line(&notice.wait_async().await) }),
+                    success: format!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
+                }));
             }
             Err(e) => print_fail(&port_handle, &e.to_string()),
         }
@@ -1844,6 +1911,174 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// paho fails every SUBSCRIBE and QoS 1/2 PUBLISH still owed an ack when
+    /// its session closes, on a loss before `onDisconnectCb` and on the exit
+    /// disconnect (MQTTAsyncUtils.c:979, :1902-1938, :2491-2498); one acked
+    /// before the loss keeps its `onPublishCb` line, and the new session
+    /// fails nothing twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requests_owed_an_ack_fail_with_their_session() {
+        use asyn_rs::interrupt::InterruptFilter;
+        use asyn_rs::port::PortDriver;
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+        use tokio::io::AsyncWriteExt;
+
+        const CONNACK: [u8; 5] = [0x20, 0x03, 0x00, 0x00, 0x00];
+        const FAIL: &str = "MqttDriver::onFailCb: MQTT Operation error: 'Error: '";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = MqttConfig {
+            broker_host: "127.0.0.1".into(),
+            broker_port: addr.port(),
+            client_id: "owed-acks".into(),
+            keep_alive_secs: 3600,
+            ..MqttConfig::default()
+        };
+        let (publish_tx, publish_rx) = mpsc::unbounded_channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let mut driver = crate::driver::MqttDriver::new(
+            "MQOWED",
+            &config,
+            Vec::new(),
+            publish_tx.clone(),
+            connected.clone(),
+        );
+        let reason = driver
+            .drv_user_create(&asyn_rs::port::DrvUserRequest::new("FLAT:INT dev/t", 0))
+            .unwrap()
+            .reason;
+        let topic_map = driver.topic_map();
+        let connected_param = driver.connected_param;
+        let shutdown = driver.shutdown_signal();
+        let teardown_done = driver.teardown_ack();
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+            driver,
+            asyn_rs::runtime::config::RuntimeConfig {
+                services,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("mqowed-{}.log", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("MQOWED"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("MQOWED"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let _binding = runtime.port_handle().interrupts().register_sync_callback(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                ..Default::default()
+            },
+            |_| {},
+        );
+
+        let port_handle = runtime.port_handle().clone();
+        let start = Arc::new(Notify::new());
+        let loop_start = start.clone();
+        let ev = tokio::spawn(async move {
+            mqtt_event_loop(
+                config,
+                topic_map,
+                port_handle,
+                publish_rx,
+                connected_param,
+                connected,
+                Lifecycle {
+                    start: loop_start,
+                    shutdown,
+                    done: teardown_done,
+                },
+            )
+            .await;
+        });
+        start.notify_one();
+        let publish = |topic: &str| {
+            publish_tx
+                .send(PublishRequest {
+                    topic: topic.into(),
+                    payload: b"1".to_vec(),
+                    qos: crate::config::QoS::AtLeastOnce,
+                    retained: false,
+                })
+                .unwrap();
+        };
+        let log = || std::fs::read_to_string(&path).unwrap();
+        let wait_for = |needle: &'static str, n: usize| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while log().matches(needle).count() < n {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("fewer than {n} '{needle}' in:\n{}", log()));
+        };
+
+        // First session: the SUBSCRIBE and one PUBLISH stay unacked, the
+        // PUBLISH after it is acked.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(8), "SUBSCRIBE");
+        publish("dev/owed");
+        assert_eq!(read_packet_type(&mut sock).await, Some(3), "PUBLISH");
+        publish("dev/acked");
+        let (kind, body) = read_packet(&mut sock).await.unwrap();
+        assert_eq!(kind, 3, "PUBLISH");
+        let at = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
+        sock.write_all(&[0x40, 0x03, body[at], body[at + 1], 0x00])
+            .await
+            .unwrap();
+        wait_for("Published to topic 'dev/acked'", 1).await;
+        drop(sock);
+        wait_for("onDisconnectCb: Connection lost", 1).await;
+        let lost = log();
+        assert_eq!(lost.matches(FAIL).count(), 2, "{lost}");
+        assert!(
+            lost.rfind(FAIL) < lost.find("Connection lost"),
+            "the failures come before the loss:\n{lost}"
+        );
+
+        // The broker is back: the new session fails nothing again.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        assert_eq!(read_packet_type(&mut sock).await, Some(1), "CONNECT");
+        sock.write_all(&CONNACK).await.unwrap();
+        let (kind, body) = read_packet(&mut sock).await.unwrap();
+        assert_eq!(kind, 8, "SUBSCRIBE");
+        sock.write_all(&[0x90, 0x04, body[0], body[1], 0x00, 0x00])
+            .await
+            .unwrap();
+        wait_for("Subscribed to topic 'dev/t'", 1).await;
+        assert_eq!(log().matches(FAIL).count(), 2, "{}", log());
+
+        // A PUBLISH in flight at the exit fails with the exit disconnect.
+        publish("dev/exit");
+        assert_eq!(read_packet_type(&mut sock).await, Some(3), "PUBLISH");
+        runtime.shutdown();
+        assert_eq!(read_packet_type(&mut sock).await, Some(14), "DISCONNECT");
+        tokio::time::timeout(Duration::from_secs(10), ev)
+            .await
+            .expect("event loop did not exit")
+            .unwrap();
+        assert_eq!(log().matches(FAIL).count(), 3, "{}", log());
+        assert!(
+            !log().contains("Published to topic 'dev/owed'"),
+            "{}",
+            log()
+        );
+        assert!(
+            !log().contains("Published to topic 'dev/exit'"),
+            "{}",
+            log()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A refused PUBREC ends that QoS 2 flow and frees its slot, as paho's
     /// `onFailure5` path frees the message (MQTTAsyncUtils.c:3199-3209): with
     /// Receive Maximum 2, five refused publishes all reach the broker.
@@ -2308,7 +2543,7 @@ mod tests {
             );
             assert_eq!(
                 subscribe_line(&Err(SubscribeNoticeError::SessionReset)),
-                AckLine::Dropped
+                refused()
             );
         }
 
@@ -2349,13 +2584,13 @@ mod tests {
             );
         }
 
-        /// A new session fails what the old one still owed; neither callback
-        /// is printed for it.
+        /// A publish its session took with it fails without a message, as
+        /// `MQTTAsync_freeResponses` fails it (MQTTAsyncUtils.c:1902-1938).
         #[test]
-        fn a_publish_lost_with_its_session_prints_nothing() {
+        fn a_publish_lost_with_its_session_fails() {
             assert_eq!(
                 publish_line(&Err(PublishNoticeError::SessionReset)),
-                AckLine::Dropped
+                refused()
             );
             assert_eq!(
                 publish_line(&Err(PublishNoticeError::Qos0NotFlushed)),

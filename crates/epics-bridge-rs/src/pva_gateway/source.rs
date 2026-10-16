@@ -812,28 +812,14 @@ impl GatewayChannelSource {
                 return None;
             }
         };
-        // subscribe before snapshot to avoid losing events in the
-        // gap, but the same gap can deliver event E to both the broadcast
-        // receiver (created here) and snapshot_raw() (read below).
-        // Dedup the first broadcast event by Bytes ptr when it matches.
-        let mut bcast = entry.subscribe_raw();
         // Single-seed: the connect-time value is returned as the
         // SubscriptionSeed seed (a decoded `PvField`, since the server
         // encodes the START frame through the regular path even on the
         // raw path) and emitted by the server — NOT replayed into this
         // raw stream. pva2pva moncache.cpp:285-311 delivers `lastelem`
-        // once on start(); we deliver it once via the seed. `initial_raw`
-        // is still read to dedup the first broadcast event by `Bytes`
-        // pointer (the snapshot/broadcast race below).
-        let initial_decoded = entry.snapshot();
-        let initial_raw = entry.snapshot_raw();
-        // capture the Bytes pointer of the initial snapshot so the
-        // broadcast loop can skip the duplicate if the same event landed in
-        // both the snapshot cache and the broadcast queue (the race window
-        // between subscribe_raw() and snapshot_raw() above).
-        // bytes::Bytes::clone() is a refcount clone; same allocation ⟹ same
-        // as_ptr(). Take the Option once so only a single event is skipped.
-        let dedup_body: Option<bytes::Bytes> = initial_raw.as_ref().map(|e| e.body.clone());
+        // once on start(); `subscribe_raw` takes the seed and the receiver
+        // together, so no event is in both.
+        let (initial_decoded, initial_order, mut bcast) = entry.subscribe_raw();
         // Descriptor snapshot for bridge-local overrun marking on lag. A
         // type-change event terminates this forwarder (see the `type_changed`
         // return below), so the descriptor is stable for the forwarder's whole
@@ -841,10 +827,7 @@ impl GatewayChannelSource {
         // first upstream event, so introspection is populated; `None` only on
         // the degenerate not-yet-decoded case, where we forward unmarked.
         let desc = entry.introspection();
-        let initial_order = initial_raw
-            .as_ref()
-            .map(|e| e.byte_order)
-            .unwrap_or(epics_pva_rs::proto::ByteOrder::Little);
+        let initial_order = initial_order.unwrap_or(epics_pva_rs::proto::ByteOrder::Little);
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
@@ -857,10 +840,7 @@ impl GatewayChannelSource {
             }
             let _guard = CounterGuard(counter);
             // updates-only: the cached snapshot is delivered once via the
-            // SubscriptionSeed seed, not replayed here. `dedup` still
-            // skips the first broadcast event that duplicates that
-            // snapshot (the subscribe_raw()/snapshot_raw() race window).
-            let mut dedup = dedup_body;
+            // SubscriptionSeed seed, not replayed here.
             // The byte order the re-frame after a lag is encoded in: the one
             // the upstream is speaking. Seeded from the cached snapshot and
             // refreshed on every event, so a synthesized frame never
@@ -869,11 +849,6 @@ impl GatewayChannelSource {
             loop {
                 match bcast.recv().await {
                     Ok(ev) => {
-                        if let Some(d) = dedup.take() {
-                            if ev.body.as_ptr() == d.as_ptr() {
-                                continue;
-                            }
-                        }
                         let type_changed = ev.type_changed;
                         order = ev.byte_order;
                         let out = epics_pva_rs::server_native::RawMonitorEvent {
@@ -959,8 +934,7 @@ impl GatewayChannelSource {
                 return None;
             }
         };
-        let mut bcast_rx = entry.subscribe();
-        let initial = entry.snapshot();
+        let (initial, mut bcast_rx) = entry.subscribe();
         let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
         cache.reactor().spawn(async move {

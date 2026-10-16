@@ -92,7 +92,7 @@ async fn run_do(db: &PvDatabase, name: &str, save: bool, req: &str) {
         if get(db, "DO", "VALA") == Some(EpicsValue::Long(0)) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(10)).await;
     }
     panic!("the completion never re-processed DO");
 }

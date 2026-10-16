@@ -10,10 +10,6 @@ use std::sync::{Arc, Mutex};
 use bitflags::bitflags;
 
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
-use crate::fixed_text::FixedText;
-
-/// The longest line [`TraceManager::print`] writes, its newline aside.
-pub const PRINT_LINE_SIZE: usize = 512;
 
 bitflags! {
     /// What to trace — control message categories.
@@ -285,6 +281,67 @@ impl TraceFile {
                 }
             }
         }
+    }
+
+    /// Stream one line, `body` then a newline, into the sink under its lock,
+    /// as C's `vfprintf(fp, ...)` writes a trace line of any length. Staged
+    /// in a stack buffer that spills when full, so nothing is allocated.
+    fn write_streamed(&self, body: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result) {
+        fn stream(
+            out: &mut dyn std::io::Write,
+            body: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result,
+        ) {
+            let mut spill = Spill {
+                out,
+                buf: [0; 512],
+                len: 0,
+            };
+            if body(&mut spill).is_ok() {
+                let _ = std::fmt::Write::write_str(&mut spill, "\n");
+            }
+            let _ = spill.flush();
+        }
+        match self {
+            TraceFile::Stderr | TraceFile::Errlog => stream(&mut std::io::stderr().lock(), body),
+            TraceFile::Stdout => stream(&mut std::io::stdout().lock(), body),
+            TraceFile::File(f) => {
+                if let Ok(mut f) = f.lock() {
+                    stream(&mut *f, body);
+                }
+            }
+        }
+    }
+}
+
+/// A [`std::fmt::Write`] over an [`std::io::Write`] staged through a fixed
+/// buffer.
+struct Spill<'a> {
+    out: &'a mut dyn std::io::Write,
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl Spill<'_> {
+    fn flush(&mut self) -> std::fmt::Result {
+        let n = std::mem::take(&mut self.len);
+        self.out
+            .write_all(&self.buf[..n])
+            .map_err(|_| std::fmt::Error)
+    }
+}
+
+impl std::fmt::Write for Spill<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let s = s.as_bytes();
+        if self.len + s.len() > self.buf.len() {
+            self.flush()?;
+        }
+        if s.len() > self.buf.len() {
+            return self.out.write_all(s).map_err(|_| std::fmt::Error);
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s);
+        self.len += s.len();
+        Ok(())
     }
 }
 
@@ -708,11 +765,10 @@ impl TraceManager {
 
     /// C `asynPrint` of one line on the rung C's `findTracePvt` picks — `port:
     /// None` is a user on no port, which prints on the global rung
-    /// (asynManager.c:548-553). Formatted into a bounded buffer on the stack:
-    /// C's `traceVprintSource` `fprintf`s into the trace file
-    /// (asynManager.c:3090-3115) and allocates nothing, so a caller holding a
-    /// record's lock does not either. A line past [`PRINT_LINE_SIZE`] bytes is
-    /// cut, keeping its newline.
+    /// (asynManager.c:548-553). C's `traceVprintSource` `fprintf`s straight
+    /// into the trace file (asynManager.c:3090-3115) and allocates nothing, so
+    /// a caller holding a record's lock does not either; see
+    /// [`TraceFile::write_streamed`].
     pub fn print(
         &self,
         port: Option<&str>,
@@ -725,15 +781,10 @@ impl TraceManager {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
-            let mut line = FixedText::<PRINT_LINE_SIZE>::EMPTY;
-            // `Err` is the cut, which ends the text.
-            let _ = write_prefix(&mut line, port, addr, reason, ("", 0), cfg)
-                .and_then(|()| std::fmt::Write::write_fmt(&mut line, args));
-            let mut bytes = [0u8; PRINT_LINE_SIZE + 1];
-            let n = line.len();
-            bytes[..n].copy_from_slice(line.as_bytes());
-            bytes[n] = b'\n';
-            cfg.file.write_bytes(&bytes[..=n]);
+            cfg.file.write_streamed(|mut out| {
+                write_prefix(&mut out, port, addr, reason, ("", 0), cfg)?;
+                out.write_fmt(args)
+            });
         };
         match port {
             Some(port) => {
@@ -1424,6 +1475,43 @@ macro_rules! asyn_trace_device_io {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `vfprintf`s a trace line into the file whole (asynManager.c:3106):
+    /// a line far past the stack buffer, written both as one long piece and
+    /// as many short ones, lands uncut with one newline.
+    #[test]
+    fn print_writes_a_long_line_uncut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = TraceManager::new();
+        trace.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        trace.set_trace_mask(None, TraceMask::ERROR);
+        trace.set_trace_info_mask(None, TraceInfoMask::empty());
+
+        let long = "x".repeat(1500);
+        let short: Vec<String> = (0..400).map(|i| format!("{i},")).collect();
+        trace.print(None, None, 0, TraceMask::ERROR, format_args!("a{long}b"));
+        trace.print(
+            None,
+            None,
+            0,
+            TraceMask::ERROR,
+            format_args!("{}", Join(&short)),
+        );
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, format!("a{long}b\n{}\n", short.concat()));
+    }
+
+    /// Displays its pieces with one `write_str` each.
+    struct Join<'a>(&'a [String]);
+
+    impl std::fmt::Display for Join<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.iter().try_for_each(|p| f.write_str(p))
+        }
+    }
 
     /// C parity: `tracePvtInit` (asynManager.c:456) sets every port's
     /// default mask to `ASYN_TRACE_ERROR` only — WARNING is OFF until a

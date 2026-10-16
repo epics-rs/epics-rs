@@ -8,22 +8,52 @@
 //! through — so this record type, like every other, has exactly one declaration
 //! and it is the `.dbd`.
 
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// C `mcaRecordDebug` (`mcaRecord.c:117-118`), the iocsh variable
+/// `mcaSupport.dbd` declares: the record's trace level.
+static MCA_RECORD_DEBUG: AtomicI32 = AtomicI32::new(0);
+
+/// C `if (mcaRecordDebug > level) errlogPrintf(...)`.
+macro_rules! debug_print {
+    ($level:expr, $($arg:tt)*) => {
+        if $crate::record::debug_level() > $level {
+            epics_base_rs::runtime::log::errlog_vprintf(format_args!($($arg)*));
+        }
+    };
+}
+
+pub(crate) fn debug_level() -> i32 {
+    MCA_RECORD_DEBUG.load(Ordering::Relaxed)
+}
+
+/// The `var mcaRecordDebug` entry.
+pub(crate) fn debug_var() -> epics_base_rs::server::iocsh::vars::VarDef {
+    use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
+    VarDef {
+        name: "mcaRecordDebug",
+        access: VarAccess::Int {
+            get: || i64::from(debug_level()),
+            set: |value| MCA_RECORD_DEBUG.store(value as i32, Ordering::Relaxed),
+        },
+    }
+}
+
 pub mod cycle;
 pub mod dbd_generated;
 mod roi;
 
 use std::any::Any;
 use std::sync::OnceLock;
-use std::time::SystemTime;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     CommonFields, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
-    ProcessAction, ProcessOutcome, Record, uniform_post_table,
+    ProcessAction, ProcessContext, ProcessOutcome, Record, uniform_post_table,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
-pub use cycle::{McaCommand, McaStatus};
+pub use cycle::{McaCommand, McaDset, McaRead, McaStart, McaStatus, Nack, Sent, StampSource};
 
 /// C `mcaRecord.c:197` `#define NUM_ROI 32`.
 pub const NUM_ROI: usize = 32;
@@ -160,7 +190,7 @@ pub struct McaRecord {
     /// HIHI/HIGH/LOW/LOLO are compared against THIS, not against VAL
     /// (`mcaRecord.c:962-1003`).
     pub idtim: f64,
-    /// `STIM` — the time acquisition stopped, rendered to millisecond precision.
+    /// `STIM` — the time acquisition stopped, rendered by `cycle::format_stim`.
     pub stim: PvString,
     /// `RTIM` — the time the last spectrum read began, as seconds past the EPICS
     /// epoch.
@@ -207,10 +237,17 @@ pub struct McaRecord {
     /// field.
     ///
     /// The record keeps it because `process()` must commit `ACQG` from the SAME
-    /// status the read was decided on ([`McaRecord::apply_status`] must
+    /// status the read was decided on (`McaRecord::apply_status` must
     /// not commit it early, or a client sees acquisition stop before the final
     /// spectrum is posted — C `mcaRecord.c:735-742`).
     pub status: McaStatus,
+
+    /// C's `recGblGetTimeStamp` inputs for STIM (`:811`), from this cycle's
+    /// process context. State, not a field.
+    pub clock: cycle::StampSource,
+
+    /// Where each open pass's device half stopped. State, not a field.
+    pub resume: cycle::ResumeStack,
 }
 
 impl Default for McaRecord {
@@ -280,37 +317,40 @@ impl Default for McaRecord {
             newr: 0,
             roi: std::array::from_fn(|_| Roi::default()),
             status: McaStatus::default(),
+            resume: cycle::ResumeStack::default(),
+            clock: cycle::StampSource::default(),
         }
     }
 }
 
 /// Everything a cycle may post, in C `monitor()`'s order (`mcaRecord.c:1013-
-/// 1037`): VAL, the MMAP fields, each region's sum and net, ACQG last. RDNG,
-/// which C marks only on a read callback the port has no path for, is absent.
-const PROCESS_POSTED: [&str; 80] = [
-    "VAL", "BG", "NACK", "READ", "ERTM", "ELTM", "ACT", "STRT", "STOP", "STIM", "RTIM", "DWEL",
-    "DTIM", "IDTIM", "NORD", "R0", "R0N", "R1", "R1N", "R2", "R2N", "R3", "R3N", "R4", "R4N", "R5",
-    "R5N", "R6", "R6N", "R7", "R7N", "R8", "R8N", "R9", "R9N", "R10", "R10N", "R11", "R11N", "R12",
-    "R12N", "R13", "R13N", "R14", "R14N", "R15", "R15N", "R16", "R16N", "R17", "R17N", "R18",
-    "R18N", "R19", "R19N", "R20", "R20N", "R21", "R21N", "R22", "R22N", "R23", "R23N", "R24",
-    "R24N", "R25", "R25N", "R26", "R26N", "R27", "R27N", "R28", "R28N", "R29", "R29N", "R30",
-    "R30N", "R31", "R31N", "ACQG",
+/// 1037`): VAL, the MMAP fields, each region's sum and net, ACQG last. RDNS,
+/// which C marks but never posts, is absent.
+const PROCESS_POSTED: [&str; 81] = [
+    "VAL", "BG", "NACK", "READ", "RDNG", "ERTM", "ELTM", "ACT", "STRT", "STOP", "STIM", "RTIM",
+    "DWEL", "DTIM", "IDTIM", "NORD", "R0", "R0N", "R1", "R1N", "R2", "R2N", "R3", "R3N", "R4",
+    "R4N", "R5", "R5N", "R6", "R6N", "R7", "R7N", "R8", "R8N", "R9", "R9N", "R10", "R10N", "R11",
+    "R11N", "R12", "R12N", "R13", "R13N", "R14", "R14N", "R15", "R15N", "R16", "R16N", "R17",
+    "R17N", "R18", "R18N", "R19", "R19N", "R20", "R20N", "R21", "R21N", "R22", "R22N", "R23",
+    "R23N", "R24", "R24N", "R25", "R25N", "R26", "R26N", "R27", "R27N", "R28", "R28N", "R29",
+    "R29N", "R30", "R30N", "R31", "R31N", "ACQG",
 ];
 /// `PROCESS_POSTED` past VAL, each a mark; VAL goes through
 /// `monitor_value_changed`.
-static MONITOR_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 79] =
+static MONITOR_POSTS: [(epics_base_rs::server::record::FieldIx, CyclePostMask); 80] =
     uniform_post_table(
         dbd_generated::MCA_FIELDS,
         PROCESS_POSTED.split_at(1).1,
         CyclePostMask::MonitorValueLog,
     );
-static PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx; 80] =
+static PROCESS_POSTED_SET: [epics_base_rs::server::record::FieldIx; 81] =
     epics_base_rs::server::record::declared_set(dbd_generated::MCA_FIELDS, PROCESS_POSTED);
 /// The MMAP bit of each `MONITOR_POSTS` entry ahead of the regions.
-const MONITOR_BITS: [u32; 14] = [
+const MONITOR_BITS: [u32; 15] = [
     cycle::M_BG,
     cycle::M_NACK,
     cycle::M_READ,
+    cycle::M_RDNG,
     cycle::M_ERTM,
     cycle::M_ELTM,
     cycle::M_ACT,
@@ -409,27 +449,7 @@ impl McaRecord {
     /// 8. The port has no such table: the buffer is a typed `EpicsValue`, so a
     /// channel count is a channel count for every element type.
     fn zero_spectrum(&mut self, n: usize) {
-        macro_rules! clear {
-            ($v:expr, $zero:expr) => {{
-                let end = n.min($v.len());
-                $v.make_mut()[..end].fill($zero);
-            }};
-        }
-        match &mut self.val {
-            EpicsValue::CharArray(v) => clear!(v, 0),
-            EpicsValue::UCharArray(v) => clear!(v, 0),
-            EpicsValue::ShortArray(v) => clear!(v, 0),
-            EpicsValue::UShortArray(v) => clear!(v, 0),
-            EpicsValue::LongArray(v) => clear!(v, 0),
-            EpicsValue::ULongArray(v) => clear!(v, 0),
-            EpicsValue::Int64Array(v) => clear!(v, 0),
-            EpicsValue::UInt64Array(v) => clear!(v, 0),
-            EpicsValue::FloatArray(v) => clear!(v, 0.0),
-            EpicsValue::DoubleArray(v) => clear!(v, 0.0),
-            EpicsValue::EnumArray(v) => clear!(v, 0),
-            EpicsValue::StringArray(v) => clear!(v, PvString::new()),
-            _ => {}
-        }
+        zero_channels(&mut self.val, n);
     }
 
     /// Land a written array in one of the two `special(SPC_DBADDR)` buffers and
@@ -833,6 +853,11 @@ impl Record for McaRecord {
             if self.nmax <= 0 {
                 self.nmax = 1;
             }
+            // `if (pmca->ftvl > DBF_DOUBLE) pmca->ftvl=2` (`:429`): ENUM is the
+            // one menuFtype past DOUBLE, and 2 is UCHAR.
+            if self.ftvl == Ftype::Enum {
+                self.ftvl = Ftype::UChar;
+            }
             self.val = self.zeroed_buffer();
             self.bg = self.zeroed_buffer();
             self.nord = 0;
@@ -918,10 +943,8 @@ impl Record for McaRecord {
         Ok(())
     }
 
-    /// C `process` `:793-841` — the tail of the cycle, after device support has
-    /// sent the commands ([`McaRecord::take_device_requests`]), read the status
-    /// ([`McaRecord::apply_status`]) and landed any new spectrum
-    /// ([`McaRecord::land_spectrum_read`]).
+    /// C `process` `:793-841` — the tail of the cycle, after device support's
+    /// `read()` has run [`McaRecord::finish_device_cycle`].
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut actions = Vec::new();
 
@@ -929,6 +952,7 @@ impl Record for McaRecord {
         // which region is visited: `sum_ROIs` recomputes all 32 and clears the
         // whole map.
         if self.newr != 0 && self.sum_rois().preset_reached {
+            debug_print!(5, "process: stop acquisition.\n");
             // C sends the stop straight from `process` (`:797-800`). The port's
             // records hold no driver handle, so it goes out as the framework's
             // device command — executed after `process()` returns, which is where
@@ -949,7 +973,7 @@ impl Record for McaRecord {
         }
 
         if self.acqg == 0 {
-            self.stim = PvString::from(cycle::format_stim(SystemTime::now()).as_str());
+            cycle::format_stim(&mut self.stim, self.clock.stamp());
             self.mmap |= cycle::M_STIM;
         }
 
@@ -992,6 +1016,10 @@ impl Record for McaRecord {
 
     fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
         Some(&PROCESS_POSTED_SET)
+    }
+
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.clock = ctx.into();
     }
 
     /// C `mcaAlarm` (`:962-1003`) — the analog ladder runs on `IDTIM`, the
@@ -1051,6 +1079,32 @@ pub mod commands {
     /// C `mcaStopAcquire`, sent from `process()` when an armed ROI preset is
     /// reached.
     pub const STOP_ACQUIRE: &str = "mcaStopAcquire";
+}
+
+/// Zero the first `n` elements of a spectrum buffer in place, as C's `memset`
+/// on `bptr`/`pbg` does; the buffer keeps its width.
+pub(crate) fn zero_channels(buf: &mut EpicsValue, n: usize) {
+    macro_rules! clear {
+        ($v:expr, $zero:expr) => {{
+            let end = n.min($v.len());
+            $v.make_mut()[..end].fill($zero);
+        }};
+    }
+    match buf {
+        EpicsValue::CharArray(v) => clear!(v, 0),
+        EpicsValue::UCharArray(v) => clear!(v, 0),
+        EpicsValue::ShortArray(v) => clear!(v, 0),
+        EpicsValue::UShortArray(v) => clear!(v, 0),
+        EpicsValue::LongArray(v) => clear!(v, 0),
+        EpicsValue::ULongArray(v) => clear!(v, 0),
+        EpicsValue::Int64Array(v) => clear!(v, 0),
+        EpicsValue::UInt64Array(v) => clear!(v, 0),
+        EpicsValue::FloatArray(v) => clear!(v, 0.0),
+        EpicsValue::DoubleArray(v) => clear!(v, 0.0),
+        EpicsValue::EnumArray(v) => clear!(v, 0),
+        EpicsValue::StringArray(v) => clear!(v, PvString::new()),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1167,11 +1221,200 @@ mod tests {
         common
     }
 
-    fn status(acquiring: bool) -> McaStatus {
-        McaStatus {
+    fn status(acquiring: bool) -> Result<McaStatus, cycle::Nack> {
+        Ok(McaStatus {
             acquiring,
             ..Default::default()
+        })
+    }
+
+    /// A dset that records every message, and answers each with `Nack` when
+    /// `fail` is set.
+    #[derive(Default)]
+    struct Probe {
+        sent: Vec<McaCommand>,
+        fail: bool,
+    }
+
+    impl Probe {
+        fn answer(&self) -> Result<(), cycle::Nack> {
+            if self.fail { Err(cycle::Nack) } else { Ok(()) }
         }
+    }
+
+    impl cycle::McaDset for Probe {
+        fn send_msg(&mut self, command: McaCommand) -> Result<(), cycle::Nack> {
+            self.sent.push(command);
+            self.answer()
+        }
+        fn read_status(&mut self, _: &McaRecord) -> Result<McaStatus, cycle::Nack> {
+            self.answer().map(|()| McaStatus::default())
+        }
+        fn read_array(&mut self, _: &mut McaRecord) -> Result<(), cycle::Nack> {
+            self.answer()
+        }
+    }
+
+    /// A dset whose reads answer with a scripted [`cycle::Sent`], logging
+    /// every call the record makes.
+    #[derive(Default)]
+    struct Trips {
+        status: Option<cycle::Sent>,
+        data: Option<cycle::Sent>,
+        log: Vec<&'static str>,
+    }
+
+    impl cycle::McaDset for Trips {
+        fn send_msg(&mut self, _: McaCommand) -> Result<(), cycle::Nack> {
+            self.log.push("send_msg");
+            Ok(())
+        }
+        fn send_read(&mut self, read: cycle::McaRead) -> Result<cycle::Sent, cycle::Nack> {
+            let (name, sent) = match read {
+                cycle::McaRead::Status => ("send_status", self.status),
+                cycle::McaRead::Data => ("send_data", self.data),
+            };
+            self.log.push(name);
+            sent.ok_or(cycle::Nack)
+        }
+        fn read_status(&mut self, _: &McaRecord) -> Result<McaStatus, cycle::Nack> {
+            self.log.push("read_status");
+            Ok(McaStatus {
+                elapsed_real: 2.0,
+                ..Default::default()
+            })
+        }
+        fn read_array(&mut self, _: &mut McaRecord) -> Result<(), cycle::Nack> {
+            self.log.push("read_array");
+            Ok(())
+        }
+    }
+
+    /// One pass's device half, as the framework runs it for an answer that
+    /// is not `Pending`: `read_begin`, then `read()`.
+    fn pass(rec: &mut McaRecord, dset: &mut Trips) -> cycle::McaStart {
+        let start = rec.begin_device_cycle(dset, StampSource::default());
+        if start == cycle::McaStart::Synchronous {
+            rec.finish_device_cycle(dset, StampSource::default());
+        }
+        start
+    }
+
+    /// A read completed inside its send: one pass, status then data.
+    #[test]
+    fn a_read_done_in_the_send_completes_in_one_pass() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.read = 1;
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Done),
+            data: Some(cycle::Sent::Done),
+            ..Default::default()
+        };
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(
+            dset.log,
+            ["send_status", "read_status", "send_data", "read_array"]
+        );
+        assert_eq!((rec.rdns, rec.rdng, rec.read), (0, 0, 0));
+        assert_eq!(rec.ertm, 2.0);
+    }
+
+    /// C `:678-682`, `:777-781`: a queued read ends the pass; its callback
+    /// pass enters at `read_status:` / `read_data:` (`:523-524`) without
+    /// re-sending the setup, and clears NACK on the way in (`:510-514`).
+    #[test]
+    fn a_queued_read_ends_the_pass_and_its_callback_pass_lands_it() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.read = 1;
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Queued),
+            data: Some(cycle::Sent::Queued),
+            ..Default::default()
+        };
+        let pending = rec.begin_device_cycle(&mut dset, StampSource::default());
+        assert_eq!(pending, cycle::McaStart::Pending);
+        assert_eq!(dset.log, ["send_status"]);
+        assert_eq!((rec.rdns, rec.ertm), (1, 0.0), "the status is not in yet");
+        assert_ne!(rec.mmap & cycle::M_RDNS, 0);
+
+        rec.nack = 1;
+        rec.mmap = 0;
+        dset.log.clear();
+        let pending = rec.begin_device_cycle(&mut dset, StampSource::default());
+        assert_eq!(pending, cycle::McaStart::Pending);
+        assert_eq!(dset.log, ["read_status", "send_data"]);
+        assert_eq!((rec.rdns, rec.rdng, rec.read, rec.ertm), (0, 1, 0, 2.0));
+        assert_eq!(rec.nack, 0);
+        assert_ne!(rec.mmap & cycle::M_NACK, 0);
+        assert_ne!(rec.mmap & cycle::M_RDNG, 0);
+
+        rec.mmap = 0;
+        dset.log.clear();
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(dset.log, ["read_array"]);
+        assert_eq!(rec.rdng, 0);
+        assert_ne!(rec.mmap & cycle::M_RDNG, 0);
+        // C posts RDNG (`:1017`) and never RDNS.
+        let rdng = MONITOR_BITS.iter().position(|&b| b == cycle::M_RDNG);
+        assert_eq!(PROCESS_POSTED[1 + rdng.unwrap()], "RDNG");
+        assert!(!MONITOR_BITS.contains(&cycle::M_RDNS));
+        assert_ne!(rec.mmap & cycle::M_VAL, 0);
+    }
+
+    /// A refused read is C's `status != 0`: NACK, the status read's ACQG
+    /// zeroing (`:667-670`), and a data read that still reads (`:767-788`).
+    #[test]
+    fn a_refused_read_is_a_nack_and_the_pass_goes_on() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.read = 1;
+        rec.acqg = 1;
+        let mut dset = Trips::default();
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(dset.log, ["send_status", "send_data", "read_array"]);
+        assert_eq!((rec.nack, rec.acqg, rec.rdns, rec.rdng), (1, 0, 0, 0));
+    }
+
+    /// C `queueRequest` on a port without `ASYN_CANBLOCK` runs each callback,
+    /// and the `process` it calls, inside `send_msg`: three nested passes.
+    /// Each outer pass then goes on from its `send_msg` (`:678`, `:777`) —
+    /// the status pass reuses `pstatus`, the data pass reads the data again
+    /// — and `READ` is still 1 in the innermost pass.
+    #[test]
+    fn a_read_run_inline_nests_the_passes_and_resumes_each_innermost_first() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.read = 1;
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Ran),
+            data: Some(cycle::Sent::Ran),
+            ..Default::default()
+        };
+        let clock = StampSource::default();
+        let reentered = cycle::McaStart::Reentered;
+        assert_eq!(rec.begin_device_cycle(&mut dset, clock), reentered);
+        assert_eq!(rec.begin_device_cycle(&mut dset, clock), reentered);
+        assert_eq!(
+            rec.begin_device_cycle(&mut dset, clock),
+            cycle::McaStart::Synchronous
+        );
+        assert_eq!(rec.read, 1, "the innermost pass runs before READ clears");
+        assert_eq!(
+            dset.log,
+            ["send_status", "read_status", "send_data", "read_array"]
+        );
+        dset.log.clear();
+        for _ in 0..3 {
+            rec.finish_device_cycle(&mut dset, clock);
+        }
+        assert_eq!(dset.log, ["read_array"], "only the data pass reads again");
+        assert_eq!((rec.rdns, rec.rdng, rec.read, rec.ertm), (0, 0, 0, 2.0));
+        assert_eq!(rec.resume, cycle::ResumeStack::default());
+    }
+
+    /// What C `:509-659` sends this cycle.
+    fn sent(rec: &mut McaRecord) -> Vec<McaCommand> {
+        let mut probe = Probe::default();
+        rec.send_device_requests(&mut probe);
+        probe.sent
     }
 
     // ---- the acquisition state machine (C `process`) ----
@@ -1186,12 +1429,13 @@ mod tests {
     fn start_forces_acqg_before_the_first_status_is_read() {
         let mut rec = loaded(8, &[0; 8]);
         rec.strt = 1;
-        let cmds = rec.take_device_requests();
+        let cmds = sent(&mut rec);
         assert_eq!(cmds, vec![McaCommand::StartAcquire]);
         assert_eq!(rec.acqg, 1);
 
         // The device was faster than the poll: it is already done.
-        assert!(rec.apply_status(status(false)), "the final read is forced");
+        rec.apply_status(status(false));
+        assert_eq!(rec.read, 1, "the final read is forced");
         assert_eq!(rec.acqg, 1, "not committed until the spectrum is in");
         rec.process().unwrap();
         assert_eq!(rec.acqg, 0);
@@ -1204,7 +1448,7 @@ mod tests {
     fn a_read_is_forced_only_on_the_acquiring_edge() {
         let mut rec = loaded(8, &[0; 8]);
         assert_eq!(rec.acqg, 0);
-        assert!(!rec.apply_status(status(false)));
+        rec.apply_status(status(false));
         assert_eq!(rec.read, 0);
     }
 
@@ -1215,15 +1459,14 @@ mod tests {
     fn acqg_is_committed_after_the_data_not_with_the_status() {
         let mut rec = loaded(8, &[0; 8]);
         rec.strt = 1;
-        rec.take_device_requests();
+        sent(&mut rec);
         rec.apply_status(status(true));
         rec.process().unwrap();
         assert_eq!(rec.acqg, 1);
 
         rec.apply_status(status(false));
         assert_eq!(rec.acqg, 1, "still 1 — the spectrum has not landed yet");
-        rec.land_spectrum_read(EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7, 8].into()))
-            .unwrap();
+        rec.read_data(&mut Probe::default(), StampSource::default());
         assert_eq!(rec.acqg, 1);
         rec.process().unwrap();
         assert_eq!(rec.acqg, 0, "and only now");
@@ -1235,7 +1478,7 @@ mod tests {
     fn the_forward_link_fires_only_when_acquisition_is_over() {
         let mut rec = loaded(8, &[0; 8]);
         rec.strt = 1;
-        rec.take_device_requests();
+        sent(&mut rec);
         rec.apply_status(status(true));
         rec.process().unwrap();
         assert!(!rec.should_fire_forward_link());
@@ -1252,12 +1495,223 @@ mod tests {
         let mut rec = loaded(8, &[0; 8]);
         rec.put_field("DWEL", EpicsValue::Double(0.25)).unwrap();
         rec.special("DWEL", true).unwrap();
-        assert_eq!(
-            rec.take_device_requests(),
-            vec![McaCommand::DwellTime(0.25)]
-        );
+        assert_eq!(sent(&mut rec), vec![McaCommand::DwellTime(0.25)]);
         assert_eq!(rec.newv, 0);
-        assert!(rec.take_device_requests().is_empty());
+        assert!(sent(&mut rec).is_empty());
+    }
+
+    /// NACK at C's checked sites: a setup send (`:530`), an erase (`:607`) and
+    /// a MODE send (`:631`) raise it on failure and not on success.
+    #[test]
+    fn a_failed_setup_send_raises_nack() {
+        for fail in [false, true] {
+            for field in ["DWEL", "ERAS", "MODE"] {
+                let mut rec = loaded(8, &[0; 8]);
+                rec.special(field, true).unwrap();
+                rec.send_device_requests(&mut Probe {
+                    fail,
+                    ..Default::default()
+                });
+                assert_eq!(rec.nack, i16::from(fail), "{field} fail={fail}");
+                assert_eq!(rec.mmap & cycle::M_NACK != 0, fail, "{field} fail={fail}");
+            }
+        }
+    }
+
+    /// C ignores the start and stop sends' status (`:639`, `:657`).
+    #[test]
+    fn a_failed_start_or_stop_send_raises_no_nack() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.strt = 1;
+        rec.stop = 1;
+        rec.send_device_requests(&mut Probe {
+            fail: true,
+            ..Default::default()
+        });
+        assert_eq!(rec.nack, 0);
+        assert_eq!(rec.acqg, 1, "the start still forces ACQG");
+    }
+
+    /// The next cycle clears NACK before it sends anything (`:510-514`).
+    #[test]
+    fn nack_is_cleared_by_the_next_cycle() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.nack = 1;
+        rec.run_device_cycle(&mut Probe::default(), StampSource::default());
+        assert_eq!(rec.nack, 0);
+        assert_ne!(rec.mmap & cycle::M_NACK, 0, "and the clear is posted");
+    }
+
+    /// C compares ACT, an int32, against the double count (`:702`): an integral
+    /// repeat leaves it unmarked, a fractional one marks it every pass.
+    #[test]
+    fn act_is_compared_as_a_double() {
+        let mut rec = loaded(8, &[0; 8]);
+        for (counts, marked) in [(10.0, true), (10.0, false), (10.5, true), (10.5, true)] {
+            rec.mmap = 0;
+            rec.apply_status(Ok(McaStatus {
+                total_counts: counts,
+                ..Default::default()
+            }));
+            assert_eq!(rec.act, 10, "{counts}");
+            assert_eq!(rec.mmap & cycle::M_ACT != 0, marked, "{counts}");
+        }
+    }
+
+    /// `:703` stores the count with C's `(epicsInt32)` conversion: an
+    /// out-of-range or NaN count is INT_MIN, not a saturated value.
+    #[test]
+    fn act_takes_the_c_conversion_of_the_count() {
+        let mut rec = loaded(8, &[0; 8]);
+        for (counts, act) in [
+            (3e9, i32::MIN),
+            (-3e9, i32::MIN),
+            (f64::NAN, i32::MIN),
+            (7.9, 7),
+        ] {
+            rec.apply_status(Ok(McaStatus {
+                total_counts: counts,
+                ..Default::default()
+            }));
+            assert_eq!(rec.act, act, "{counts}");
+        }
+    }
+
+    /// A failed status read raises NACK and zeroes ACQG unmarked, and the cycle
+    /// goes on with the status read before it (`:670-674`).
+    #[test]
+    fn a_failed_status_read_raises_nack_and_keeps_the_previous_status() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.strt = 1;
+        sent(&mut rec);
+        rec.apply_status(Ok(McaStatus {
+            acquiring: true,
+            elapsed_real: 2.0,
+            ..Default::default()
+        }));
+        rec.mmap = 0;
+
+        rec.apply_status(Err(cycle::Nack));
+        assert_eq!(rec.nack, 1);
+        assert_eq!(rec.acqg, 0);
+        assert_eq!(rec.mmap & cycle::M_ACQG, 0, "ACQG is zeroed unmarked");
+        assert_eq!(rec.ertm, 2.0);
+        assert_eq!(rec.read, 0, "the held status still says acquiring");
+        rec.process().unwrap();
+        assert_eq!(rec.acqg, 1, "and process commits it back");
+    }
+
+    /// A failed `mcaData` send raises NACK and the data are still read
+    /// (`:767-783`); a failed `read_array` raises NACK and leaves VAL unmarked
+    /// (`:784-788`).
+    #[test]
+    fn a_failed_data_read_raises_nack() {
+        for fail in [false, true] {
+            let mut rec = loaded(8, &[0; 8]);
+            rec.read = 1;
+            let mut probe = Probe {
+                fail,
+                ..Default::default()
+            };
+            rec.read_data(&mut probe, StampSource::default());
+            assert_eq!(probe.sent, vec![McaCommand::Data]);
+            assert_eq!(rec.nack, i16::from(fail), "fail={fail}");
+            assert_eq!(rec.mmap & cycle::M_VAL == 0, fail, "fail={fail}");
+            assert_eq!(rec.read, 0);
+            assert_eq!(rec.newr, cycle::NEWR_ALL);
+        }
+    }
+
+    /// RTIM and STIM are C's `recGblGetTimeStamp` (`:762`, `:811`): TSE -2
+    /// takes the record's TIME as it stands, TSE 0 the current time.
+    #[test]
+    fn rtim_and_stim_follow_tse() {
+        use epics_base_rs::types::WallTime;
+        // 2000-01-01T00:00:00.25Z, 315532800.25 s past the EPICS epoch.
+        let time = WallTime::from_unix(946_684_800, 250_000_000);
+        let run = |tse: i16| {
+            let clock = StampSource { tse, time };
+            let mut rec = loaded(8, &[0; 8]);
+            rec.read = 1;
+            rec.read_data(&mut Probe::default(), clock);
+            rec.clock = clock;
+            rec.process().unwrap();
+            (rec.rtim, rec.stim.clone())
+        };
+        let mut stim = PvString::new();
+        cycle::format_stim(&mut stim, time);
+        assert_eq!(run(-2), (315_532_800.25, stim.clone()));
+        let (rtim, now) = run(0);
+        assert!(rtim > 315_532_800.25 + 1.0e8, "{rtim}");
+        assert_ne!(now, stim);
+
+        // C's unset `{0, 0}` TIME under TSE -2.
+        let mut rec = loaded(8, &[0; 8]);
+        rec.read = 1;
+        rec.read_data(
+            &mut Probe::default(),
+            StampSource {
+                tse: -2,
+                time: WallTime::UNIX_EPOCH,
+            },
+        );
+        assert_eq!(rec.rtim, 0.0);
+    }
+
+    /// `var mcaRecordDebug` is registered with the record type, and each trace
+    /// line prints only above its C level: `> 5` for the start (`:638`).
+    #[test]
+    fn mca_record_debug_gates_cs_trace_lines() {
+        use epics_base_rs::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+        use epics_base_rs::server::iocsh::vars::{VarAccess, variable_names};
+        use std::sync::{Arc, Mutex};
+
+        let _ = crate::mca_record_factory();
+        assert!(variable_names().contains(&"mcaRecordDebug"));
+        let VarAccess::Int { get, set } = debug_var().access else {
+            panic!("mcaRecordDebug is an int");
+        };
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_string()));
+        let traced = |level: i64| {
+            set(level);
+            assert_eq!(get(), level);
+            let mut rec = loaded(8, &[0; 8]);
+            rec.strt = 1;
+            rec.run_device_cycle(&mut Probe::default(), StampSource::default());
+            errlog_flush();
+            set(0);
+            std::mem::take(&mut *lines.lock().unwrap())
+        };
+        let at5 = traced(5);
+        let at6 = traced(6);
+        errlog_remove_listener(id);
+
+        let start = "process: start acquisition.\n".to_string();
+        assert!(at5.contains(&"process: entry, rdng=0, rdns=0, read=0\n".to_string()));
+        assert!(!at5.contains(&start), "{at5:?}");
+        assert!(at6.contains(&start), "{at6:?}");
+    }
+
+    /// C `:630` sends the MODE index as the command code, one case per
+    /// `menu(mcaMODE)` choice.
+    #[test]
+    fn a_mode_put_sends_the_mode_index_as_the_command() {
+        for (mode, cmd) in [
+            (0, McaCommand::Data),
+            (1, McaCommand::StartAcquire),
+            (2, McaCommand::StopAcquire),
+        ] {
+            let mut rec = loaded(8, &[0; 8]);
+            rec.put_field("MODE", EpicsValue::Enum(mode)).unwrap();
+            rec.special("MODE", true).unwrap();
+            assert_eq!(sent(&mut rec), vec![cmd], "MODE {mode}");
+            assert_eq!(rec.acqg, 0, "MODE {mode} does not force ACQG");
+        }
     }
 
     /// C `:636` — "Turn acquisition on or off. Do this before reading device
@@ -1273,7 +1727,7 @@ mod tests {
         rec.special("ERST", true).unwrap();
 
         assert_eq!(
-            rec.take_device_requests(),
+            sent(&mut rec),
             vec![
                 McaCommand::PresetRealTime(10.0),
                 McaCommand::Erase,
@@ -1290,7 +1744,7 @@ mod tests {
         rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
         rec.put_field("ERAS", EpicsValue::Enum(1)).unwrap();
         rec.special("ERAS", true).unwrap();
-        rec.take_device_requests();
+        sent(&mut rec);
 
         assert_eq!(rec.nord, 0, "NORD is reset — the data are gone");
         assert_eq!(rec.eras, 0);
@@ -1320,35 +1774,45 @@ mod tests {
 
     // ---- dead time (C `:710-732`) ----
 
-    /// The deviation this port makes from C, at the boundary that exposes it: a
-    /// detector so dead that its live-time clock has stopped. Real time advances
-    /// by 1 s, live time by 0 — the instantaneous dead time is 100%.
-    ///
-    /// C reports 0%, because its `eltp` ("previous live time") is a local that is
-    /// only assigned in the branch where ELTM CHANGED, so on this cycle it is
-    /// still its initialiser, 0. See [`cycle`]'s `update_dead_time`.
-    #[test]
-    fn instantaneous_dead_time_reports_a_fully_dead_detector() {
+    /// IDTIM while acquiring, from a first read of (1 s real, 1 s live) to
+    /// `second`. C takes a previous value only for a field that changed
+    /// (`:692-701`) and 0 otherwise (`:498`).
+    fn idtim_after(second: (f64, f64)) -> f64 {
         let mut rec = loaded(8, &[0; 8]);
         rec.strt = 1;
-        rec.take_device_requests();
-        rec.apply_status(McaStatus {
-            acquiring: true,
-            elapsed_real: 1.0,
-            elapsed_live: 1.0,
-            ..Default::default()
-        });
-        assert_eq!(rec.idtim, 0.0);
+        sent(&mut rec);
+        let read = |rec: &mut McaRecord, (elapsed_real, elapsed_live)| {
+            rec.apply_status(Ok(McaStatus {
+                acquiring: true,
+                elapsed_real,
+                elapsed_live,
+                ..Default::default()
+            }));
+        };
+        read(&mut rec, (1.0, 1.0));
+        read(&mut rec, second);
+        rec.idtim
+    }
 
-        // Second poll: 1 s of real time, no live time at all.
-        rec.apply_status(McaStatus {
-            acquiring: true,
-            elapsed_real: 2.0,
-            elapsed_live: 1.0,
-            ..Default::default()
-        });
-        assert_eq!(rec.idtim, 100.0);
-        assert_eq!(rec.dtim, 50.0, "and the AVERAGE is 50%");
+    /// Both elapsed times moved: the interval is the true interval.
+    #[test]
+    fn instantaneous_dead_time_with_eltm_changed() {
+        assert_eq!(idtim_after((2.0, 1.5)), 50.0);
+    }
+
+    /// ELTM unchanged: C's `eltp` is 0, so `100*(1 - 1)/1` = 0 rather than the
+    /// 100% the detector actually spent dead.
+    #[test]
+    fn instantaneous_dead_time_with_eltm_unchanged() {
+        assert_eq!(idtim_after((2.0, 1.0)), 0.0);
+    }
+
+    /// ERTM unchanged: `ertp` is 0, so the interval is the whole ERTM and the
+    /// live-time step is clamped against it.
+    #[test]
+    fn instantaneous_dead_time_with_ertm_unchanged() {
+        // drt = 1 - 0, dlt = 0.5 - 1: 100*(1 + 0.5)/1, clamped to 100.
+        assert_eq!(idtim_after((1.0, 0.5)), 100.0);
     }
 
     /// C `:727-729`: with acquisition off there is no interval to be
@@ -1356,12 +1820,12 @@ mod tests {
     #[test]
     fn instantaneous_dead_time_falls_back_to_the_average_when_idle() {
         let mut rec = loaded(8, &[0; 8]);
-        rec.apply_status(McaStatus {
+        rec.apply_status(Ok(McaStatus {
             acquiring: false,
             elapsed_real: 4.0,
             elapsed_live: 3.0,
             ..Default::default()
-        });
+        }));
         assert_eq!(rec.dtim, 25.0);
         assert_eq!(rec.idtim, 25.0);
     }
@@ -1470,6 +1934,91 @@ mod tests {
         assert_eq!(rec.roi[0].net, 7.0);
     }
 
+    /// C's `MAX`/`MIN` macros (`:177-178`) keep a NaN that `f64::max` drops:
+    /// a NaN dead time clamps to 100 (`:717`, `:723`), and a NaN channel
+    /// read last becomes the end-marker height (`:361`).
+    #[test]
+    fn a_nan_goes_through_the_c_max_and_min() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.acqg = 1;
+        rec.apply_status(Ok(McaStatus {
+            acquiring: true,
+            elapsed_real: 1.0,
+            elapsed_live: f64::NAN,
+            ..Default::default()
+        }));
+        assert_eq!(rec.dtim, 100.0);
+        assert_eq!(rec.idtim, 100.0);
+
+        let mut rec = McaRecord {
+            nmax: 4,
+            nuse: 4,
+            ftvl: Ftype::Float,
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        rec.put_field(
+            "VAL",
+            EpicsValue::FloatArray(vec![5.0, 1.0, f32::NAN, 0.0].into()),
+        )
+        .unwrap();
+        rec.roi[0] = Roi {
+            lo: 0,
+            hi: 1,
+            nbg: -1,
+            ..Default::default()
+        };
+        rec.newr = cycle::NEWR_ALL;
+        rec.process().unwrap();
+        let EpicsValue::FloatArray(bg) = &rec.bg else {
+            panic!("FLOAT BG");
+        };
+        assert!(bg[0].is_nan() && bg[1].is_nan(), "{bg:?}");
+    }
+
+    /// C subtracts the background in the element type (`:393`): under ULONG a
+    /// background above the count wraps, under FLOAT the difference rounds
+    /// to float.
+    #[test]
+    fn the_net_is_taken_in_the_spectrum_element_type() {
+        let typed = |ftvl: Ftype, val: EpicsValue| {
+            let mut rec = McaRecord {
+                nmax: 4,
+                nuse: 4,
+                ftvl,
+                ..Default::default()
+            };
+            rec.init_record(0).unwrap();
+            rec.init_record(1).unwrap();
+            rec.put_field("VAL", val).unwrap();
+            rec.roi[0] = Roi {
+                lo: 1,
+                hi: 1,
+                nbg: 1,
+                ..Default::default()
+            };
+            rec.newr = cycle::NEWR_ALL;
+            rec.process().unwrap();
+            rec.roi[0].net
+        };
+
+        // Background (7 + 5 + 7) / 3 stored as 6; C's 5u - 6u.
+        let net = typed(
+            Ftype::ULong,
+            EpicsValue::ULongArray(vec![7, 5, 7, 0].into()),
+        );
+        assert_eq!(net, f64::from(u32::MAX));
+
+        let b = ((f64::from(1e8f32) + 3.0) / 3.0) as f32;
+        assert_ne!(f64::from(1e8f32 - b), f64::from(1e8f32) - f64::from(b));
+        let net = typed(
+            Ftype::Float,
+            EpicsValue::FloatArray(vec![0.0, 1e8, 3.0, 0.0].into()),
+        );
+        assert_eq!(net, f64::from(1e8f32 - b));
+    }
+
     /// The whole ROI machinery against the C IOC built for this port (record +
     /// `devMCA_soft`, EPICS base R7.0.10.1-DEV). The numbers below are read off
     /// that IOC, not derived here:
@@ -1510,6 +2059,103 @@ mod tests {
                 vec![0, 0, 30, 13, 16, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].into()
             ))
         );
+    }
+
+    /// C `init_record` pass 0 turns an FTVL past DOUBLE into UCHAR (`:429`).
+    #[test]
+    fn init_record_turns_an_enum_ftvl_into_uchar() {
+        for (ftvl, expect) in [
+            (Ftype::Enum, Ftype::UChar),
+            (Ftype::Double, Ftype::Double),
+            (Ftype::String, Ftype::String),
+        ] {
+            let mut rec = McaRecord {
+                nmax: 4,
+                ftvl,
+                ..Default::default()
+            };
+            rec.init_record(0).unwrap();
+            assert_eq!(rec.ftvl, expect, "{ftvl:?}");
+            assert_eq!(rec.val, rec.zeroed_buffer(), "{ftvl:?}");
+        }
+    }
+
+    /// C memsets `pbg` in place on every `sum_ROIs` (`:1143`): a region that no
+    /// longer has a background leaves zeros, in the same buffer.
+    #[test]
+    fn sum_rois_zeroes_bg_in_place() {
+        let mut rec = loaded(16, &[0, 0, 10, 20, 30, 20, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        rec.roi[0] = Roi {
+            lo: 2,
+            hi: 5,
+            nbg: 1,
+            ..Default::default()
+        };
+        rec.sum_rois();
+        let bg_ptr = |rec: &McaRecord| match &rec.bg {
+            EpicsValue::LongArray(v) => v.as_ptr(),
+            other => panic!("BG is {other:?}"),
+        };
+        let before = bg_ptr(&rec);
+        rec.roi[0].lo = -1;
+        rec.sum_rois();
+        assert_eq!(bg_ptr(&rec), before);
+        assert_eq!(rec.bg, EpicsValue::LongArray(vec![0; 16].into()));
+    }
+
+    /// C sums regions for SHORT..DOUBLE only (`:1147-1178`): a CHAR, UCHAR or
+    /// INT64 spectrum leaves the sums and NEWR as they were.
+    #[test]
+    fn only_the_switch_s_element_types_are_summed() {
+        let summed = |ftvl: Ftype| {
+            let mut rec = McaRecord {
+                nmax: 4,
+                nuse: 4,
+                ftvl,
+                ..Default::default()
+            };
+            rec.init_record(0).unwrap();
+            rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4].into()))
+                .unwrap();
+            rec.roi[0] = Roi {
+                lo: 0,
+                hi: 3,
+                nbg: -1,
+                ..Default::default()
+            };
+            rec.newr = cycle::NEWR_ALL;
+            rec.process().unwrap();
+            (rec.roi[0].sum, rec.newr, rec.rmap)
+        };
+        for ftvl in [Ftype::Char, Ftype::UChar, Ftype::Int64] {
+            assert_eq!(summed(ftvl), (0.0, cycle::NEWR_ALL, 0), "{ftvl:?}");
+        }
+        for ftvl in [Ftype::Short, Ftype::Long, Ftype::Double] {
+            assert_eq!(summed(ftvl), (10.0, 0, 1), "{ftvl:?}");
+        }
+    }
+
+    /// The end-marker height scans channels `0..NORD-1` exclusive of the last
+    /// (C `:361`): a peak in channel `NORD-2` sets it, one in `NORD-1` does not.
+    #[test]
+    fn the_end_markers_take_the_peak_short_of_the_last_channel() {
+        let marker = |spectrum: &[i32]| {
+            let mut rec = loaded(4, spectrum);
+            rec.roi[0] = Roi {
+                lo: 0,
+                hi: 1,
+                nbg: -1,
+                ..Default::default()
+            };
+            rec.newr = cycle::NEWR_ALL;
+            rec.process().unwrap();
+            match rec.get_field("BG") {
+                Some(EpicsValue::LongArray(v)) => v[0],
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(marker(&[1, 0, 9, 0]), 9, "peak in channel max-1");
+        assert_eq!(marker(&[1, 0, 0, 9]), 1, "peak in channel max");
     }
 
     /// C `:398` — `net >= preset` fires, and the record stops acquisition. The
@@ -1680,18 +2326,21 @@ mod tests {
         assert!(rec.field_metadata_override("ERTM").is_none());
     }
 
-    /// C renders STIM with a 25-byte bound for a 26-byte rendering, so the field
-    /// a client reads back ends `.**` — measured on the C IOC. The port emits the
-    /// milliseconds the format string asks for.
+    /// C's 25-byte `epicsTimeToStrftime` has no room for the milliseconds
+    /// (`:812`): STIM ends in two stars, as measured on the C IOC.
     #[test]
-    fn the_stop_time_carries_the_milliseconds_it_promises() {
-        let mut rec = loaded(8, &[0; 8]);
-        rec.process().unwrap();
-        let stim = rec.stim.to_string();
-        assert!(!stim.contains('*'), "{stim}");
-        let millis = stim.rsplit('.').next().unwrap();
-        assert_eq!(millis.len(), 3, "{stim}");
-        assert!(millis.chars().all(|c| c.is_ascii_digit()), "{stim}");
+    fn the_stop_time_is_cs_truncated_rendering() {
+        use chrono::TimeZone;
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 7, 14, 19, 28, 45)
+            .unwrap();
+        let t = epics_base_rs::types::WallTime::from(std::time::SystemTime::from(local));
+        let mut stim = PvString::from("a longer previous value, 40 bytes wide..");
+        cycle::format_stim(&mut stim, t);
+        assert_eq!(stim, "Jul 14, 2026 19:28:45.**");
+
+        cycle::format_stim(&mut stim, epics_base_rs::types::WallTime::UNIX_EPOCH);
+        assert_eq!(stim, "<undefined>");
     }
 
     /// `R`-prefixed scalars are not regions: the suffix set is closed.

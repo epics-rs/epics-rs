@@ -2,10 +2,11 @@
 //! expands (`:358-412`).
 //!
 //! C writes this once per element type by macro, over a `DATA_TYPE *` cast of
-//! the spectrum buffer, dispatched by a `switch (pmca->ftvl)` whose
-//! `DBF_CHAR`/`DBF_UCHAR` arm is a bare `break` — so a char spectrum computes NO
-//! region sums at all, silently. Here the arithmetic is written once, in
-//! doubles, and every element type reaches it.
+//! the spectrum buffer, dispatched by a `switch (pmca->ftvl)`. Here the
+//! arithmetic is written once, in doubles, for the element types that switch
+//! sums.
+
+use epics_base_rs::server::record::Ftype;
 
 use super::{McaRecord, NUM_ROI, Roi};
 
@@ -109,6 +110,19 @@ impl McaRecord {
         acc / (2 * n + 1) as f64
     }
 
+    /// C's `*p - *pb` (`:393`), taken in the element type: ULONG wraps
+    /// unsigned, LONG wraps as x86 int and FLOAT rounds to float. SHORT and
+    /// USHORT promote to int, where the f64 difference is exact.
+    fn net_term(&self, c: usize) -> f64 {
+        let (y, b) = (self.channel(c), self.background(c));
+        match self.ftvl {
+            Ftype::Long => f64::from((y as i32).wrapping_sub(b as i32)),
+            Ftype::ULong => f64::from((y as u32).wrapping_sub(b as u32)),
+            Ftype::Float => f64::from(y as f32 - b as f32),
+            _ => y - b,
+        }
+    }
+
     /// C `sum_ROIs` (`mcaRecord.c:1135-1180`).
     ///
     /// Recomputes EVERY region — C's `newr` bitmap gates whether `sum_ROIs` runs
@@ -116,27 +130,36 @@ impl McaRecord {
     /// and clears each one's bit (`:401`). So the port's caller gates on
     /// `newr != 0` and this clears `newr` whole.
     pub(crate) fn sum_rois(&mut self) -> RoiPass {
+        debug_print!(5, "sum_ROIs: entry\n");
         let max = self.nord - 1;
-        self.bg = self.zeroed_buffer();
-
-        // The peak of the spectrum, used only to plant the two end markers of
-        // each region on the background curve (`:404-411`).
-        //
-        // C's loop is `for (i=0; i<max; i++)` with `max = nord-1`, so it stops
-        // one channel SHORT of the spectrum and a peak in the last channel is
-        // never seen. The marker's whole purpose is to reach the top of the
-        // data, so the port includes the last channel.
-        let mut ymax: f64 = 0.0;
-        for i in 0..=max.max(-1) {
-            if i < 0 {
-                break;
-            }
-            ymax = ymax.max(self.channel(i as usize));
-        }
-
+        // C memsets `pbg` in place (`:1143`).
+        let cap = self.capacity();
+        super::zero_channels(&mut self.bg, cap);
         let mut pass = RoiPass {
             preset_reached: false,
         };
+        // C's switch sums these six; CHAR, UCHAR, STRING and the 64-bit types
+        // take its `default: break` (`:1147-1151`), which leaves the sums,
+        // their marks and NEWR as they were.
+        if !matches!(
+            self.ftvl,
+            Ftype::Short
+                | Ftype::UShort
+                | Ftype::Long
+                | Ftype::ULong
+                | Ftype::Float
+                | Ftype::Double
+        ) {
+            return pass;
+        }
+
+        // The height of the region end markers on the background curve
+        // (`:404-411`). C's `for (i=0; i<max; i++)` with `max = nord-1`
+        // (`:361`) never looks at the last channel read.
+        let mut ymax: f64 = 0.0;
+        for i in 0..max.max(0) {
+            ymax = super::cycle::c_max(ymax, self.channel(i as usize));
+        }
 
         for i in 0..NUM_ROI {
             let Roi { lo, hi, nbg, .. } = self.roi[i];
@@ -172,7 +195,7 @@ impl McaRecord {
                     // Read the background back: under an integer spectrum the
                     // store above truncated it, and C's `net += *p - *pb` reads
                     // the truncated value.
-                    net += y - self.background(c);
+                    net += self.net_term(c);
                 }
             }
 

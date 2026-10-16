@@ -168,7 +168,7 @@ async fn mca_posts_what_its_cycle_marked_as_the_oracle_does() {
     let (name, factory) = mca_rs::mca_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
-        .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca))
+        .register_device_support("mca", &SOFT_MCA, || Box::new(mca_rs::SoftMca::default()))
         .db_string(DB, &HashMap::new())
         .unwrap()
         .build()

@@ -43,17 +43,16 @@ Each one is a C shape that cannot be reproduced without reproducing its defect:
   must match the `.dbd` order exactly, where one mis-ordered field silently
   mis-reads every region. Here a region is one `Roi`, and the `.dbd` order is
   the generated table's business alone.
-- **Every element type computes its sums.** C writes the ROI arithmetic once
-  per element type by macro, dispatched on `FTVL`, and the `DBF_CHAR`/`DBF_UCHAR`
-  arm is a bare `break` — a char spectrum gets no region sums at all, silently.
-  Here the arithmetic is written once in doubles and every element type reaches
-  it.
+- **The ROI arithmetic is written once.** C writes it once per element type
+  by macro, dispatched on `FTVL`; here it is written once in doubles, for the
+  same six types (`SHORT` through `DOUBLE`). `CHAR`, `UCHAR` and the rest take
+  C's bare `default: break` and get no region sums, as in C.
 - **The cycle is the record's, the device calls are the driver's.** C calls
   `pdset->send_msg()` from the middle of `process()`. A port record cannot call
-  its device support, so the cycle is split in two: the record applies its own
-  state and hands over what it wants sent (`take_device_requests`), the driver
-  sends it and reads status and spectrum back, and the record lands the result.
-  C's order is load-bearing and is kept — `ACQG` is forced to 1 when the start
+  its device support from `process()`, so the driver's `read()` runs the
+  device half (`run_device_cycle`) against an `McaDset`: the record sends each
+  message at C's site and decides what each answer and each failure (`NACK`)
+  means. C's order is load-bearing and is kept — `ACQG` is forced to 1 when the start
   command goes out, so a device that finishes before the first status read still
   shows the 1 → 0 transition that triggers the spectrum read.
 

@@ -53,6 +53,7 @@ pub mod builder;
 pub(crate) mod coordinate;
 pub mod device_state;
 pub mod device_support;
+pub mod devices;
 pub(crate) mod fields;
 pub mod flags;
 pub mod ioc;

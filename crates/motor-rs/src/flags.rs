@@ -220,7 +220,6 @@ pub enum MotorEvent {
     UserWrite(CommandSource),
     DeviceUpdate(asyn_rs::interfaces::motor::MotorStatus),
     DelayExpired,
-    Startup,
 }
 
 /// Which field triggered the command.
@@ -340,6 +339,22 @@ pub enum MotorCommand {
     SetLowLimit {
         position: f64,
     },
+}
+
+impl MotorCommand {
+    /// devMotorAsyn's `commandIsMove` (devMotorAsyn.c:686-691): a command
+    /// whose completion processes the record, counted in
+    /// `moveRequestPending` from `build_trans` on.
+    pub fn is_move(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveAbsolute { .. }
+                | Self::MoveRelative { .. }
+                | Self::MoveVelocity { .. }
+                | Self::Home { .. }
+                | Self::SetPosition { .. }
+        )
+    }
 }
 
 /// Effects returned by process logic.

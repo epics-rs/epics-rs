@@ -193,31 +193,22 @@ async fn stdio_printf_routes_to_dev_write_and_prints_to_errlog() {
     );
 }
 
-/// C registers a stdio dset only for `lso`/`printf`/`stringout`; a `stringin`
-/// with `DTYP="stdio"` has no matching support. The Rust device's record-type
-/// gate Errs in `init()`, so `wire_device_to_record` flags the record INVALID
-/// at build time — proving the stdio device attached and gated, rather than
-/// being silently accepted as a soft channel.
+/// C registers a stdio dset only for `lso`/`printf`/`stringout`, so
+/// `stringin`'s device menu has no `stdio` and the `.db` does not load:
+/// `Can't set 'SI_STDIO.DTYP' to 'stdio' no such device support for
+/// 'stringin' record type : Illegal choice` (softIoc R7.0.10).
 #[epics_macros_rs::epics_test]
-async fn stdio_wrong_record_type_is_invalid() {
+async fn stdio_wrong_record_type_is_refused_at_load() {
     let db_content = r#"
 record(stringin, "SI_STDIO") {
     field(DTYP, "stdio")
     field(INP, "@stdout")
 }
 "#;
-    let (db, _) = IocBuilder::new()
+    let built = IocBuilder::new()
         .db_string(db_content, &HashMap::new())
         .unwrap()
         .build()
-        .await
-        .unwrap();
-
-    let rec = db.get_record("SI_STDIO").expect("record exists");
-    let inst = rec.read();
-    assert_eq!(
-        inst.common.sevr,
-        AlarmSeverity::Invalid,
-        "stringin with DTYP=stdio must be INVALID (no stdio device support for stringin)"
-    );
+        .await;
+    assert!(built.is_err(), "stringin has no stdio device support");
 }

@@ -3,12 +3,6 @@ use super::*;
 impl MotorRecord {
     /// Plan and start a motion from a user write.
     pub fn plan_motion(&mut self, src: CommandSource) -> ProcessEffects {
-        // Reset DMOV notification flag so the upcoming DMOV 1→0 transition
-        // fires AsyncPendingNotify. Without this, back-to-back motions
-        // (previous done + new write in same process cycle) would skip
-        // the notification because dmov_notified was still true from the
-        // previous motion.
-        self.internal.dmov_notified = false;
         let mut effects = ProcessEffects::default();
 
         // C mmap marks live exactly one process pass (monitor() clears
@@ -369,7 +363,6 @@ impl MotorRecord {
                             effects.commands.push(MotorCommand::Stop {
                                 acceleration: self.move_accel_egu(),
                             });
-                            effects.request_poll = true;
                             return effects;
                         }
                         RetargetAction::ExtendMove => {
@@ -632,8 +625,8 @@ impl MotorRecord {
                 // Rust-side deviation from C (deliberate, ophyd/bluesky):
                 // a sub-step request pulses DMOV 1→0→1 so clients watching
                 // DMOV see the "move" complete; a pending completion runs
-                // the same flow to restore DMOV=1. dmov=false flushes
-                // DMOV=0 via AsyncPendingNotify; the immediate re-process
+                // the same flow to restore DMOV=1. dmov=false posts
+                // DMOV=0 on this pass; the immediate re-process
                 // (no pending event) finalizes with DMOV=1. An SPDB
                 // suppress with DMOV already 1 stays quiet, like C's
                 // dmov==FALSE gate (2333).
@@ -775,8 +768,6 @@ impl MotorRecord {
         // visible through the next move until its evaluation lands
         // close enough.
 
-        // tdir reflects the actual first-command direction
-        self.stat.tdir = move_target > self.pos.drbv;
         // C 2526: cdir = (rdif < 0) ? 0 : 1 — the INTEGER raw error
         // posted at the move-block entry, so a sub-half-step negative
         // error (rdif rounds to 0) and a zero error under MRES < 0 both
@@ -857,7 +848,6 @@ impl MotorRecord {
                 self.backlash_accel_egu(),
             );
         }
-        effects.request_poll = true;
     }
 
     /// Handle STOP command.
@@ -952,7 +942,6 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::Stop {
                 acceleration: self.move_accel_egu(),
             });
-            effects.request_poll = true;
             return true;
         }
 
@@ -1034,7 +1023,6 @@ impl MotorRecord {
             velocity: self.vel.jvel,
             acceleration: self.jog_accel_egu(),
         });
-        effects.request_poll = true;
     }
 
     /// Stop jogging.
@@ -1270,7 +1258,6 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::Stop {
                 acceleration: self.move_accel_egu(),
             });
-            effects.request_poll = true;
             return;
         }
 
@@ -1318,7 +1305,6 @@ impl MotorRecord {
             velocity: self.vel.hvel,
             acceleration: self.home_accel_egu(),
         });
-        effects.request_poll = true;
     }
 
     /// Handle tweak (TWF/TWR).
@@ -1737,6 +1723,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::SetPosition {
             position: self.pos.dval,
         });
+        // C sends GET_INFO after LOAD_POS (motorRecord.cc:3814-3816).
         effects.request_poll = true;
     }
 
@@ -1775,6 +1762,7 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::SetEncoderRatio {
                 ratio: (m / eres) / (m / mres),
             });
+            self.internal.drv_eres = Some(eres);
         }
         if self.conv.set && !self.conv.igset {
             self.internal.pp = true;
@@ -2072,37 +2060,9 @@ impl MotorRecord {
             self.stat.stup = if stup_fired { 2 } else { 0 };
             self.mark(m::STUP);
         }
-        let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
-        // Driver commands queued by put handlers (C sends these from
-        // special() — pidcof 3003-3026, set_user/dial_*limit 4076-4328 —
-        // which runs before the pp pass enters do_work). Spliced in
-        // FRONT of the pass's own commands to preserve C's wire order.
-        let mut special_cmds = std::mem::take(&mut self.internal.special_cmds);
         let mut effects = self.do_process_inner();
-        if !special_cmds.is_empty() {
-            special_cmds.append(&mut effects.commands);
-            effects.commands = special_cmds;
-        }
         if stup_fired {
             effects.status_refresh = true;
-        }
-        // C special() motorRecordJVEL (motorRecord.cc:3059-3072): a JVEL
-        // write landing on an active jog retunes it in place — C sends
-        // SET_ACCEL + JOG_VELOCITY immediately from special(). Every put
-        // is followed by a process pass here, so the JVEL put arm parks a
-        // one-shot request and this pass re-emits the jog command with
-        // the new JVEL/JAR. Direction comes from the active MIP jog bit,
-        // folded to the dial frame exactly as emit_jog does.
-        if jvel_retune && self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
-            let forward = self.stat.mip.contains(MipFlags::JOGF);
-            let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
-            effects.commands.push(MotorCommand::MoveVelocity {
-                direction: dial_forward,
-                min_velocity: self.effective_vbas(),
-                velocity: self.vel.jvel,
-                acceleration: self.jog_accel_egu(),
-            });
-            effects.request_poll = true;
         }
         effects
     }
@@ -2118,46 +2078,6 @@ impl MotorRecord {
         // the pass below, the mark drops unconsumed (the readback was
         // already applied; C would have run two passes).
         let idle_status_pass = std::mem::take(&mut self.internal.idle_status_pass);
-
-        // C iocInit parity: init_record runs before any dbProcess pass can
-        // exist, so the anchor outranks every command source. The Startup
-        // pass is handled before the put/res-reanchor/latent gates below —
-        // determine_event anchors on the first status pulse even when a
-        // write is parked (the pass-1-restore / init→first-poll put
-        // window), so Startup and a parked last_write CAN co-occur on this
-        // pass. The anchor runs; the parked write stays armed and replays
-        // on the pass the anchor's forced refresh queues (initial_readback
-        // sets request_poll whenever a write is parked).
-        if matches!(self.pending_event, Some(MotorEvent::Startup)) {
-            self.pending_event = None;
-            self.initialized = true;
-            // C init_record (motorRecord.cc:690-733): the first device
-            // readback runs process_motor_info(initcall), the RSTM
-            // restore decision (devMotorAsyn.c init_controller), and
-            // the OMSL-gated drive-triplet sync. determine_event()
-            // consumed the seq but left the status in the shared slot.
-            let status = self.device_state.as_ref().and_then(|state| {
-                state
-                    .lock()
-                    .ok()
-                    .and_then(|ds| ds.latest_status.as_ref().map(|s| s.status.clone()))
-            });
-            return match status {
-                Some(status) => self.initial_readback(&status),
-                None => ProcessEffects::default(),
-            };
-        }
-        // A mailbox-wired record that has not anchored yet may not consume
-        // or dispatch any command: a parked put, a res-reanchor mark, or a
-        // latched button waits for the anchor and replays afterwards. In C
-        // this pass cannot exist (no dbProcess before init_record); running
-        // it here dispatched real moves against an unanchored baseline, and
-        // the following Startup then synced the mid-flight readback into
-        // VAL/DVAL. Records without a device-state mailbox never see a
-        // Startup, so the anchor concept does not apply to them.
-        if !self.initialized && self.device_state.is_some() {
-            return ProcessEffects::default();
-        }
 
         // C do_work resolution block (1936-1991) on the pass a
         // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
@@ -2219,7 +2139,7 @@ impl MotorRecord {
         // the pass its io_intr pulse triggers, so a coalesced device
         // update keeps its completion pipeline and a coalesced
         // DelayExpired keeps the settle watchdog (a dropped expiry has
-        // no second timer; with the poll loop idled by ScheduleDelay it
+        // no second timer; with the poll loop idled by the delay it
         // wedged DMOV low for good). determine_event defers the mailbox
         // consume while a put is pending, so the two cannot co-occur on
         // the live path; not taking the event here keeps the invariant
@@ -2229,11 +2149,6 @@ impl MotorRecord {
         }
 
         match self.pending_event.take() {
-            Some(MotorEvent::Startup) => {
-                // Consumed by the anchor-first block at the top of this
-                // pass — a Startup can no longer reach the event match.
-                ProcessEffects::default()
-            }
             Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {
                 self.process_motor_info(&status);

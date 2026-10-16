@@ -635,8 +635,8 @@ fn create_put_link_channel(
 ) {
     use crate::server::record::{LinkProcessPolicy, ParsedLink};
     let parsed = link
-        .map(PreparedLink::parsed)
-        .or(common.map(PreparedCommonLink::parsed));
+        .map(PreparedLink::as_parsed)
+        .or(common.map(PreparedCommonLink::as_parsed));
     if let Some(ParsedLink::Db(target)) = parsed
         && !matches!(
             target.policy,

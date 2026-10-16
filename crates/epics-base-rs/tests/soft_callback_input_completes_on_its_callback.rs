@@ -5,6 +5,8 @@
 //! names when the read lands. The re-entry used to run inside the task that
 //! waited for the notify, on the band read at the first pass.
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +19,7 @@ use epics_base_rs::server::device_support::{
 };
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::EpicsValue;
 
 type Pending = Arc<Mutex<Option<(DeviceDone, CallbackPriority)>>>;
@@ -65,11 +67,17 @@ async fn an_async_soft_input_completes_on_the_band_its_prio_names_now() {
     let pending: Pending = Arc::default();
     let passes = Arc::new(Mutex::new(Vec::new()));
     let (p, s) = (Arc::clone(&pending), Arc::clone(&passes));
+    let devices = [(
+        "ao",
+        declared_rows::rows(&["Submits", "Sink"], DbLinkType::Constant),
+    )];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| match ctx.dtyp {
-            "Submits" => Some(Box::new(Submits(Arc::clone(&p))) as Box<dyn DeviceSupport>),
-            "Sink" => Some(Box::new(Sink(Arc::clone(&s))) as Box<dyn DeviceSupport>),
-            _ => None,
+        .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
+            match ctx.dtyp {
+                "Submits" => Some(Box::new(Submits(Arc::clone(&p))) as Box<dyn DeviceSupport>),
+                "Sink" => Some(Box::new(Sink(Arc::clone(&s))) as Box<dyn DeviceSupport>),
+                _ => None,
+            }
         })
         .db_string(
             r#"

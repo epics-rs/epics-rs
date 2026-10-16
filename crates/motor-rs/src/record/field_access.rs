@@ -927,9 +927,18 @@ pub(crate) fn motor_put_field(
                     // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
                     range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
                     // C motorRecord.cc:3059-3072: a JVEL write landing on an
-                    // active jog retunes it in place. The retune command is
-                    // emitted by the process pass that follows this put.
-                    rec.jog_retune_pending = true;
+                    // active jog retunes it in place. Direction comes from
+                    // the JOGR field, not the MIP bit (3064), folded to the
+                    // dial frame as emit_jog does.
+                    if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
+                        let forward = !rec.ctrl.jogr;
+                        rec.send_special(vec![MotorCommand::MoveVelocity {
+                            direction: forward != (rec.conv.dir == MotorDir::Neg),
+                            min_velocity: rec.effective_vbas(),
+                            velocity: rec.vel.jvel,
+                            acceleration: rec.jog_accel_egu(),
+                        }]);
+                    }
                 }
                 Ok(())
             }
@@ -1820,9 +1829,9 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
 /// - C runs the switch only under `if (pdset->base.init_record)`
 ///   (`motorRecord.cc:645`) and forces -1 when that dset init fails (`:650`).
 ///   Qualified because the bullet above ends on `dbStaticLib.c`, where those
-///   two numbers land in `dbCopyEntry`/`dbCopyEntryContents`. This port has
-///   no dset-less motor record and no dset-init failure at this point, so the
-///   switch runs unconditionally.
+///   two numbers land in `dbCopyEntry`/`dbCopyEntryContents`. Here the dset
+///   init runs after this pass, so the switch runs unconditionally and a
+///   failed dset init overwrites it ([`motor_failed_dset_init`]).
 pub(crate) fn motor_derive_card(rec: &mut MotorRecord) {
     use epics_base_rs::server::record::{HwLink, ParsedLink, parse_link_v2};
 
@@ -1837,6 +1846,19 @@ pub(crate) fn motor_derive_card(rec: &mut MotorRecord) {
         // `default:` arm.
         _ => -1,
     };
+}
+
+/// A dset `init_record` that returned a status (`motorRecord.cc:648-651`):
+/// `pmr->card = -1`. `readback` is `motor_init_record_com`'s reset for a
+/// refused card or signal (motordevCom.cc:250-256): MSTA is RA_PROBLEM alone
+/// and the raw positions are 0.
+pub(crate) fn motor_failed_dset_init(rec: &mut MotorRecord, readback: bool) {
+    if readback {
+        rec.stat.msta = MstaFlags::PROBLEM;
+        rec.pos.rmp = 0;
+        rec.pos.rep = 0;
+    }
+    rec.links.card = -1;
 }
 
 /// Establish the limit invariant at IOC init — the load-time counterpart of
@@ -1919,10 +1941,9 @@ enum DialLimit {
     Low,
 }
 
-/// Queue the driver forward for a soft-limit put (C set_dial_highlimit
+/// Send the driver forward for a soft-limit put (C set_dial_highlimit
 /// 4236-4277 / set_dial_lowlimit 4287-4328 send SET_HIGH/LOW_LIMIT from
-/// special() before the pp pass runs do_work; `do_process` drains the
-/// buffer in front of the pass's own commands). Init-gated like the raw
+/// special() before the pp pass runs do_work). Init-gated like the raw
 /// helpers: during dbLoadRecords C applies field() as raw struct writes
 /// and special never runs, so a load must not emit. The boundary speaks
 /// dial-frame EGU (like `MotorCommand::SetPosition`) — C's raw-steps
@@ -1933,20 +1954,18 @@ fn queue_limit_forward(rec: &mut MotorRecord, side: DialLimit, dial: f64) {
     if !rec.internal.init_invariants_synced {
         return;
     }
-    rec.internal.special_cmds.push(match side {
+    rec.send_special(vec![match side {
         DialLimit::High => MotorCommand::SetHighLimit { position: dial },
         DialLimit::Low => MotorCommand::SetLowLimit { position: dial },
-    });
+    }]);
 }
 
-/// Queue the driver forward for a PID-coefficient put (C special pidcof,
+/// Send the driver forward for a PID-coefficient put (C special pidcof,
 /// motorRecord.cc 3003-3026: build_trans SET_PGAIN/SET_IGAIN/SET_DGAIN
 /// at put time). Callers gate on GAIN_SUPPORT and clamp to 0.0–1.0
 /// first, matching C's order (gate 3003, clamp 3005-3014, send 3017).
 fn queue_pid_gain_forward(rec: &mut MotorRecord, kind: PidGainKind, gain: f64) {
-    rec.internal
-        .special_cmds
-        .push(MotorCommand::SetPidGain { kind, gain });
+    rec.send_special(vec![MotorCommand::SetPidGain { kind, gain }]);
 }
 
 /// C set_dial_highlimit (motorRecord.cc:4243-4275, fd808eb2 PR #206):

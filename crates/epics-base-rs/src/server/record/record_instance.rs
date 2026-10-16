@@ -1459,6 +1459,8 @@ mod link_cache {
         ftype: LinkFieldType,
         pub(super) text: PvString,
         pub(super) parsed: Arc<ParsedLink>,
+        /// `dbParseLink`'s answer, which [`Self::relink`] leaves alone.
+        as_parsed: Arc<ParsedLink>,
         /// The new dset of a device-link put, prepared before the hold by
         /// [`Self::ask_add_record`].
         pub(super) device: Option<PreparedDevice>,
@@ -1518,18 +1520,22 @@ mod link_cache {
             .into_iter()
             .find(|(f, _)| f.eq_ignore_ascii_case(field))?;
             let text = text.clone();
+            let parsed = parse(text.as_bytes(), ftype);
             Some(PreparedCommonLink {
                 field,
                 ftype,
-                parsed: parse(text.as_bytes(), ftype),
+                as_parsed: Arc::clone(&parsed),
+                parsed,
                 text,
                 device: None,
                 add_record_refusal: None,
             })
         }
 
-        pub(crate) fn parsed(&self) -> &ParsedLink {
-            &self.parsed
+        /// The parse before [`Self::relink`]: what C `dbPutFieldLink`
+        /// creates its channel from, ahead of `dbAddLink`.
+        pub(crate) fn as_parsed(&self) -> &ParsedLink {
+            &self.as_parsed
         }
 
         /// C `dbAddLink`'s view of the parse: `relink` answers what the link
@@ -1764,6 +1770,8 @@ mod link_cache {
         field: &'static str,
         ftype: LinkFieldType,
         parsed: Arc<ParsedLink>,
+        /// [`PreparedCommonLink`]'s.
+        as_parsed: Arc<ParsedLink>,
         #[cfg(debug_assertions)]
         text: PvString,
     }
@@ -1786,10 +1794,12 @@ mod link_cache {
             // is one the record holds and has a slot ([`LinkSlots::of`]).
             let desc = super::field_desc_in(fields, field)?;
             let ftype = slot_type(desc)?;
+            let parsed = parse(text.as_bytes(), ftype);
             Some(PreparedLink {
                 field: desc.name,
                 ftype,
-                parsed: parse(text.as_bytes(), ftype),
+                as_parsed: Arc::clone(&parsed),
+                parsed,
                 #[cfg(debug_assertions)]
                 text: text.clone(),
             })
@@ -1799,8 +1809,10 @@ mod link_cache {
             self.field
         }
 
-        pub(crate) fn parsed(&self) -> &ParsedLink {
-            &self.parsed
+        /// The parse before [`Self::relink`]: what C `dbPutFieldLink`
+        /// creates its channel from, ahead of `dbAddLink`.
+        pub(crate) fn as_parsed(&self) -> &ParsedLink {
+            &self.as_parsed
         }
 
         /// [`PreparedCommonLink::relink`].
@@ -9920,11 +9932,28 @@ impl RecordInstance {
             "DTYP" => match value {
                 EpicsValue::String(s) => {
                     let text = s.as_str_lossy();
-                    match super::device_menu_choices(self.record.record_type())
-                        .find(|choice| *choice == text)
-                    {
+                    let rtype = self.record.record_type();
+                    let index = || {
+                        use crate::types::c_parse::{NumericField, parse_auto_base_units_null};
+                        match parse_auto_base_units_null(NumericField::UShort, &text) {
+                            Some(EpicsValue::UShort(i)) => Some(usize::from(i)),
+                            _ => None,
+                        }
+                    };
+                    match super::device_menu_choices(rtype).find(|choice| *choice == text) {
                         Some(choice) => self.common.dtyp.set_menu_name(choice),
-                        None => self.common.dtyp.set_name(text),
+                        // `dbPutStringNum` stores an index the menu bounds
+                        // check let through (`dbStaticRun.c:505-510`): C reads
+                        // a choice back, or "" on a type without a menu.
+                        None => {
+                            match index().map(|i| (i, super::device_menu_choices(rtype).nth(i))) {
+                                Some((_, Some(choice))) => self.common.dtyp.set_menu_name(choice),
+                                Some(_) if super::device_menu_choices(rtype).next().is_none() => {
+                                    self.common.dtyp.set_name("")
+                                }
+                                _ => self.common.dtyp.set_name(text),
+                            }
+                        }
                     }
                 }
                 EpicsValue::Enum(i) => {

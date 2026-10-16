@@ -871,6 +871,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// Called after init() with the record name and scan type.
     fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 
+    /// The callback band the record's `PRIO` selects, handed over just
+    /// before [`Self::init`]: C device and record support read `prec->prio`
+    /// in `init_record` for the callbacks they set up there
+    /// (motorRecord.cc:634). Default: ignore.
+    fn set_callback_priority(&mut self, _prio: crate::runtime::task::CallbackPriority) {}
+
     /// Forward parsed `info("key", "value")` directives from the .db
     /// file to the device support. Default is a no-op; drivers that
     /// react to specific tags (asyn `asyn:READBACK`, EtherCAT terminal
@@ -884,6 +890,16 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// It does not choose the port's gate — a port reads its owner's alone.
     /// Default: ignore.
     fn bind_interrupt_gate(
+        &mut self,
+        _gate: &std::sync::Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    ) {
+    }
+
+    /// Tell the device which database's `finishDevSup` gate it is under,
+    /// before [`io_intr_receiver`](Self::io_intr_receiver) is asked: the
+    /// stand-in for a dset `init(after)` that latches the second pass.
+    /// Default: ignore.
+    fn bind_dev_sup_gate(
         &mut self,
         _gate: &std::sync::Arc<crate::runtime::interrupt_accept::InterruptGate>,
     ) {
@@ -943,6 +959,15 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// gated on the record's current `SCAN` being `"I/O Intr"`, matching C
     /// `scanIoRequest`, which honors scan-list membership.
     fn io_intr_scan_independent(&self) -> bool {
+        false
+    }
+
+    /// Whether a pulse stands for the device's own `dbProcess` rather than
+    /// `scanIoRequest`: devMotorAsyn's `statusCallback` gates on the
+    /// `dbScanLockOK` it latched at `interruptAccept` (devMotorAsyn.c:159-162,
+    /// 756), so an `iocPause`, which only stops `scanIoRequest`
+    /// (`dbScan.c:621`), still lets it process. Default: `false`.
+    fn io_intr_processes_directly(&self) -> bool {
         false
     }
 
@@ -1133,6 +1158,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         return;
     };
     dev.bind_database(instance.device_done.database());
+    dev.set_callback_priority(instance.common.callback_priority());
     let status = match dev.init(&mut *instance.record) {
         Ok(DeviceInitOutcome::Ok(udf)) => {
             apply_init_udf(instance, udf);
@@ -1201,6 +1227,8 @@ mod tests {
         record_info_before_init: bool,
         /// Whether `set_record_info` had run by the time `init` ran.
         init_ran: bool,
+        /// The band `set_callback_priority` handed over before `init`.
+        prio_at_init: Option<crate::runtime::task::CallbackPriority>,
     }
 
     /// What the probe's `init` returns — the three C shapes.
@@ -1220,6 +1248,7 @@ mod tests {
         obs: Arc<Mutex<WireObservation>>,
         info: HashMap<String, String>,
         record_info_set: bool,
+        prio: Option<crate::runtime::task::CallbackPriority>,
         verdict: InitVerdict,
     }
     impl DeviceSupport for ProbeDev {
@@ -1235,9 +1264,13 @@ mod tests {
         fn apply_record_info(&mut self, info: &HashMap<String, String>) {
             self.info = info.clone();
         }
+        fn set_callback_priority(&mut self, prio: crate::runtime::task::CallbackPriority) {
+            self.prio = Some(prio);
+        }
         fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             let mut o = self.obs.lock().unwrap();
             o.init_ran = true;
+            o.prio_at_init = self.prio;
             o.record_info_before_init = self.record_info_set;
             o.info_at_init = self.info.keys().cloned().collect();
             match self.verdict {
@@ -1258,10 +1291,39 @@ mod tests {
                 obs: Arc::new(Mutex::new(WireObservation::default())),
                 info: HashMap::new(),
                 record_info_set: false,
+                prio: None,
                 verdict,
             }),
         );
         instance
+    }
+
+    /// Device support reads the record's `PRIO` band in `init_record`, as C's
+    /// motor record does for its delay callback (motorRecord.cc:634).
+    #[test]
+    fn init_sees_the_band_of_the_record_s_prio() {
+        use crate::runtime::task::CallbackPriority;
+        for (prio, band) in [
+            (0, CallbackPriority::Low),
+            (1, CallbackPriority::Medium),
+            (2, CallbackPriority::High),
+        ] {
+            let obs = Arc::new(Mutex::new(WireObservation::default()));
+            let mut instance = RecordInstance::new("TEST:PRIO", AiRecord::new(0.0));
+            instance.common.dtyp = "ProbeDev".into();
+            instance.common.prio = prio;
+            wire_device_to_record(
+                &mut instance,
+                Box::new(ProbeDev {
+                    obs: obs.clone(),
+                    info: HashMap::new(),
+                    record_info_set: false,
+                    prio: None,
+                    verdict: InitVerdict::Live,
+                }),
+            );
+            assert_eq!(obs.lock().unwrap().prio_at_init, Some(band), "PRIO {prio}");
+        }
     }
 
     /// C's `bad:` arm sets `pr->pact = 1` and nothing ever clears it, so
@@ -1345,6 +1407,7 @@ mod tests {
             obs: obs.clone(),
             info: HashMap::new(),
             record_info_set: false,
+            prio: None,
             verdict: InitVerdict::Live,
         });
 

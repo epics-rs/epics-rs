@@ -554,33 +554,48 @@ fn startup_moving_starts_polling() {
     assert!(rec.stat.mip.contains(MipFlags::EXTERNAL));
 }
 
-#[test]
-fn startup_event_runs_initial_readback_through_live_path() {
-    // C init_record (motorRecord.cc:690-733) + devMotorAsyn.c
-    // init_controller: the FIRST device status must flow through
-    // initial_readback — readback adoption and the RSTM restore — not
-    // just flip `initialized`. Drives the real process() path: shared
-    // mailbox → determine_event(Startup) → do_process.
+/// `rec`'s device init on an axis whose cached status is `status`: the
+/// commands it queued for the poller.
+fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> {
+    use epics_base_rs::server::device_support::DeviceSupport;
     use motor_rs::device_state::{StampedStatus, new_shared_state};
+    use motor_rs::device_support::MotorDeviceSupport;
 
     let state = new_shared_state();
-    {
-        let mut ds = state.lock().unwrap();
-        ds.latest_status = Some(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                position: 25.0,
-                encoder_position: 25.0,
-                done: true,
-                moving: false,
-                ..Default::default()
-            },
-        });
+    state.lock().unwrap().latest_status = Some(StampedStatus { seq: 1, status });
+    let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut dev = MotorDeviceSupport::new(
+        Default::default(),
+        Duration::from_secs(1),
+        poll_cmd_tx,
+        motor_cmd_tx,
+        state,
+    );
+    dev.init(rec as &mut dyn Record).unwrap();
+    let mut commands = Vec::new();
+    while let Ok(batch) = motor_cmd_rx.try_recv() {
+        commands.extend(batch.commands.into_iter().map(|q| q.command));
     }
+    commands
+}
 
+#[test]
+fn device_init_runs_initial_readback() {
+    // C init_record (motorRecord.cc:690-733) + devMotorAsyn.c
+    // init_controller: the device init adopts the cached status, before
+    // any process.
     let mut rec = make_record();
-    rec.set_device_state(state.clone());
-    rec.process().unwrap();
+    device_init(
+        &mut rec,
+        MotorStatus {
+            position: 25.0,
+            encoder_position: 25.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        },
+    );
 
     assert_eq!(rec.pos.rbv, 25.0);
     assert_eq!(rec.pos.val, 25.0, "boot VAL adopted from the readback");
@@ -589,42 +604,36 @@ fn startup_event_runs_initial_readback_through_live_path() {
 }
 
 #[test]
-fn startup_event_applies_rstm_restore_through_live_path() {
-    // The RSTM near-zero restore (devMotorAsyn.c init_controller) must
-    // reach the driver via the live mailbox: the InitPosition command
-    // lands in pending_actions for DeviceSupport.write().
-    use motor_rs::device_state::{StampedStatus, new_shared_state};
-
-    let state = new_shared_state();
-    {
-        let mut ds = state.lock().unwrap();
-        ds.latest_status = Some(StampedStatus {
-            seq: 1,
-            status: MotorStatus {
-                position: 0.0, // controller lost its position
-                encoder_position: 0.0,
-                done: true,
-                moving: false,
-                ..Default::default()
-            },
-        });
-    }
-
+fn device_init_queues_the_rstm_restore_before_the_limits() {
+    // init_controller's position load (devMotorAsyn.c:216-231) precedes
+    // the record's limit writes (motorRecord.cc:717-718).
     let mut rec = make_record();
     rec.conv.rstm = RestoreMode::NearZero;
     rec.retry.rdbd = 0.05;
     rec.pos.dval = 5.0; // autosave-restored target
-    rec.set_device_state(state.clone());
-    rec.process().unwrap();
+    let commands = device_init(
+        &mut rec,
+        MotorStatus {
+            position: 0.0, // controller lost its position
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        },
+    );
 
     assert_eq!(rec.pos.dval, 5.0, "autosaved DVAL kept, not overwritten");
-    let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(&c.command, MotorCommand::InitPosition { position, .. } if *position == 5.0)),
-        "restore pushes the autosaved position to the driver"
+        matches!(
+            commands.as_slice(),
+            [
+                MotorCommand::InitEncoderRatio { .. },
+                MotorCommand::InitPosition { position },
+                MotorCommand::SetHighLimit { .. },
+                MotorCommand::SetLowLimit { .. },
+            ] if *position == 5.0
+        ),
+        "{commands:?}"
     );
 }
 
@@ -997,14 +1006,12 @@ fn move_start_notify_posts_diff_and_rdif() {
 
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let outcome = rec.process().unwrap();
-    let fields = match outcome.result {
-        RecordProcessResult::AsyncPendingNotify(fields) => fields,
-        other => panic!("expected move-start AsyncPendingNotify, got {other:?}"),
-    };
-    // The notify names its fields; the record holds what they post.
-    let fields: Vec<(&str, EpicsValue)> = fields
-        .into_iter()
-        .map(|ix| {
+    assert_eq!(outcome.result, RecordProcessResult::Complete);
+    assert!(!rec.stat.dmov);
+    // The pass's monitor() names its fields; the record holds what they post.
+    let fields: Vec<(&str, EpicsValue)> = rec
+        .take_cycle_posted_fields()
+        .map(|(ix, _)| {
             let name = epics_base_rs::server::record::field_at(
                 motor_rs::record::dbd_generated::MOTOR_FIELDS,
                 ix,
@@ -1031,9 +1038,9 @@ fn move_start_notify_posts_diff_and_rdif() {
 
 #[test]
 fn coalesced_put_and_delay_expiry_keeps_watchdog() {
-    // The settle-delay timer is one-shot (poll_loop::spawn_delay): an
-    // expiry consumed by a put-owned pass has no second chance, and
-    // ScheduleDelay idled the poll loop — the record would wedge with
+    // The settle-delay timer is one-shot (MotorDeviceSupport::schedule_delay):
+    // an expiry consumed by a put-owned pass has no second chance, and the
+    // delay idled the record's polling — the record would wedge with
     // DMOV low. The expiry must survive the put pass and run its own.
     use motor_rs::device_state::new_shared_state;
 
@@ -1178,11 +1185,15 @@ fn sim_motor_end_to_end() {
             .unwrap();
     }
 
-    // Wait for completion
-    std::thread::sleep(Duration::from_millis(10));
-
-    // Poll and update
-    let status = motor.poll(&user).unwrap();
+    // Wait for completion: the ACCL ramp bounds the time, not VELO.
+    let mut status = motor.poll(&user).unwrap();
+    for _ in 0..150 {
+        std::thread::sleep(Duration::from_millis(20));
+        status = motor.poll(&user).unwrap();
+        if status.done {
+            break;
+        }
+    }
     assert!(status.done);
     assert_eq!(status.position, 10.0);
 
@@ -1555,9 +1566,11 @@ fn sim_motor_homing() {
     }
     assert!(rec.stat.dmov, "First move to 5.0 should complete");
 
-    // Home forward
-    rec.ctrl.homf = true;
-    let effects = rec.plan_motion(CommandSource::Homf);
+    // Home toward the switch at 0: motorSim overshoots it and routes back.
+    // Away from it the sim runs into the hard limit first, which completes
+    // the record there as in C (motorRecord.cc:1367-1380).
+    rec.ctrl.homr = true;
+    let effects = rec.plan_motion(CommandSource::Homr);
     assert!(!rec.stat.dmov);
     assert!(
         effects
@@ -1582,7 +1595,7 @@ fn sim_motor_homing() {
     }
 
     // Wait for homing to complete
-    for _ in 0..100 {
+    for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(20));
         let status = motor.poll(&user).unwrap();
         rec.process_motor_info(&status);
@@ -1828,4 +1841,31 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
         "SPMG=Go resumes the held jog, got {:?}",
         effects.commands
     );
+}
+
+/// motorSim ignores the encoder ratio (asynMotorAxis::setEncoderRatio is a
+/// no-op), so its encoder counts motor steps: REP is 3000 at 3.0 EGU with
+/// MRES 0.001 whatever ERES says, and an ERES put on an axis without an
+/// encoder, which downloads no ratio, leaves it there.
+#[test]
+fn sim_motor_rep_counts_motor_steps_whatever_eres() {
+    for eres in [0.001, 0.002] {
+        let user = AsynUser::new(0);
+        let mut motor = SimMotor::new().with_position(3.0);
+        let mut rec = make_record();
+        rec.conv.eres = eres;
+        let effects = rec.initial_readback(&motor.poll(&user).unwrap());
+        for cmd in &effects.commands {
+            if let MotorCommand::InitEncoderRatio { ratio } = cmd {
+                motor.set_encoder_ratio(&user, *ratio).unwrap();
+            }
+        }
+        rec.process_motor_info(&motor.poll(&user).unwrap());
+        assert_eq!(rec.pos.rep, 3000, "ERES {eres}");
+
+        rec.put_field("ERES", EpicsValue::Double(eres * 2.0))
+            .unwrap();
+        rec.process_motor_info(&motor.poll(&user).unwrap());
+        assert_eq!(rec.pos.rep, 3000, "ERES {eres} then {}", eres * 2.0);
+    }
 }

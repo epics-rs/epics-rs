@@ -37,7 +37,10 @@ async fn main() -> CaResult<()> {
     epics_base_rs::runtime::env::set_default("MOTOR", motor_rs::MOTOR_IOC_DIR);
     let motor_holder = SimMotorHolder::new();
     ioc.register_startup_command(motor_holder.sim_motor_create_command());
-    ioc.register_dynamic_device_support(motor_holder.device_support_factory());
+    ioc.register_dynamic_device_support(
+        &motor_rs::devices::devices(),
+        motor_rs::devices::device_support_factory(),
+    );
 
     ioc.run_from_args_with_pva().await
 }

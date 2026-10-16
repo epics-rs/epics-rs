@@ -4,6 +4,26 @@ use epics_base_rs::types::EpicsValue;
 use motor_rs::MotorRecord;
 use motor_rs::flags::*;
 
+/// The port `rec`'s special() puts send through from now on.
+fn capture(
+    rec: &mut MotorRecord,
+) -> tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch> {
+    let (port, rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port);
+    rx
+}
+
+/// What the port sent since the last read.
+fn sent(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+) -> Vec<MotorCommand> {
+    let mut commands = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        commands.extend(batch.commands.into_iter().map(|q| q.command));
+    }
+    commands
+}
+
 /// Anchor a mailbox-wired record with a first idle status pulse (Startup
 /// pass). C's init_record precedes any dbProcess pass, so tests that drive
 /// put/scan passes must run them against an anchored record — an unanchored
@@ -358,7 +378,9 @@ fn test_absolute_move_sets_dmov_false() {
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert_eq!(effects.commands.len(), 1);
-    assert!(effects.request_poll);
+    // C sends GO alone: its completion processes the record and the driver
+    // wakes its poller, so no status refresh follows.
+    assert!(!effects.request_poll);
     assert!(matches!(
         effects.commands[0],
         MotorCommand::MoveAbsolute { .. }
@@ -3920,8 +3942,8 @@ fn test_move_to_home_defaults_to_move_absolute() {
     // move_to_home's default impl delegates to move_absolute(position=3.0).
     sim.move_to_home(&user, 3.0, 0.0, 1.0, 0.5).unwrap();
     let status = sim.poll(&user).unwrap();
-    // The sim must now be moving toward 3.0 from its start at 0.0.
-    assert!(status.moving, "move_to_home should start a move");
+    // The move cleared Done at once; Moving waits for the sim's next step.
+    assert!(!status.done, "move_to_home should start a move");
 }
 
 // Position-compare output (PCO) tests were removed with the framework PCO
@@ -7965,16 +7987,16 @@ fn test_pid_gain_raw_store_without_gain_support() {
 fn test_pid_gain_put_forwards_driver_command() {
     // C special pidcof (3003-3026): with GAIN_SUPPORT each coefficient
     // put builds SET_PGAIN/SET_IGAIN/SET_DGAIN with the CLAMPED value
-    // and sends it from special(); the pp pass that follows carries it.
+    // and sends it from special(), with no process.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
     rec.put_field("ICOF", EpicsValue::Double(0.3)).unwrap();
     rec.put_field("DCOF", EpicsValue::Double(-0.5)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        &effects.commands[..3],
-        &[
+        sent(&mut rx),
+        [
             MotorCommand::SetPidGain {
                 kind: PidGainKind::Proportional,
                 gain: 1.0,
@@ -7996,16 +8018,10 @@ fn test_pid_gain_put_forwards_driver_command() {
 fn test_pid_gain_put_no_forward_without_gain_support() {
     // C: no GAIN_SUPPORT — no build_trans, the put is a raw store.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE;
     rec.put_field("PCOF", EpicsValue::Double(0.5)).unwrap();
-    let effects = rec.do_process();
-    assert!(
-        !effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPidGain { .. })),
-        "no SET_PGAIN without GAIN_SUPPORT"
-    );
+    assert_eq!(sent(&mut rx), [], "no SET_PGAIN without GAIN_SUPPORT");
 }
 
 #[test]
@@ -8015,22 +8031,21 @@ fn test_dial_limit_put_forwards_one_sided() {
     // dial-frame EGU (like SetPosition), so DHLM maps to SetHighLimit
     // unswapped — C's MRES-sign register swap lives in the raw pair.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.internal.init_invariants_synced = true;
 
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        effects.commands,
-        vec![MotorCommand::SetHighLimit { position: 10.0 }]
+        sent(&mut rx),
+        [MotorCommand::SetHighLimit { position: 10.0 }]
     );
 
     rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        effects.commands,
-        vec![MotorCommand::SetLowLimit { position: -10.0 }]
+        sent(&mut rx),
+        [MotorCommand::SetLowLimit { position: -10.0 }]
     );
 }
 
@@ -8040,23 +8055,22 @@ fn test_user_limit_put_folds_dir_into_forwarded_side() {
     // limit lands on the dial LOW side, so the driver forward is the
     // LOW limit (C folds `dir_positive`); DIR=Pos forwards HIGH.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.internal.init_invariants_synced = true;
 
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        effects.commands,
-        vec![MotorCommand::SetHighLimit { position: 10.0 }]
+        sent(&mut rx),
+        [MotorCommand::SetHighLimit { position: 10.0 }]
     );
 
     rec.conv.dir = MotorDir::Neg;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        effects.commands,
-        vec![MotorCommand::SetLowLimit { position: -10.0 }],
+        sent(&mut rx),
+        [MotorCommand::SetLowLimit { position: -10.0 }],
         "user high under DIR=Neg is the dial low limit"
     );
 }
@@ -8064,31 +8078,29 @@ fn test_user_limit_put_folds_dir_into_forwarded_side() {
 #[test]
 fn test_limit_put_during_load_does_not_forward() {
     // C: dbLoadRecords applies field() as raw struct writes — special()
-    // never runs, so a loaded limit emits no driver command. The queue
+    // never runs, so a loaded limit emits no driver command. The send
     // helper is init-gated like the raw-pair helpers.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     assert!(!rec.internal.init_invariants_synced);
 
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
-    rec.internal.init_invariants_synced = true;
-    let effects = rec.do_process();
-    assert!(
-        !effects.commands.iter().any(|c| matches!(
-            c,
-            MotorCommand::SetHighLimit { .. } | MotorCommand::SetLowLimit { .. }
-        )),
+    assert_eq!(
+        sent(&mut rx),
+        [],
         "load-time limit put must not reach the driver"
     );
 }
 
 #[test]
-fn test_special_cmds_drain_in_front_of_pass_commands() {
-    // C wire order: special() sends fire when the put lands, BEFORE the
-    // pp pass enters do_work — a coefficient put followed by a VAL move
-    // in the same pass puts SET_PGAIN ahead of the move on the wire.
+fn test_special_sends_at_put_time_not_on_the_pass() {
+    // C special() sends when the put lands, before any pass: a
+    // coefficient put is on the wire before a later VAL put's pass, and
+    // that pass does not repeat it.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
@@ -8098,21 +8110,22 @@ fn test_special_cmds_drain_in_front_of_pass_commands() {
     rec.internal.init_invariants_synced = true;
 
     rec.put_field("PCOF", EpicsValue::Double(0.5)).unwrap();
-    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
-    let effects = rec.do_process();
     assert_eq!(
-        effects.commands[0],
-        MotorCommand::SetPidGain {
+        sent(&mut rx),
+        [MotorCommand::SetPidGain {
             kind: PidGainKind::Proportional,
             gain: 0.5,
-        }
+        }]
     );
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
     assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
-        "the pass's own move follows the special() send"
+        matches!(
+            effects.commands.as_slice(),
+            [MotorCommand::MoveAbsolute { .. }]
+        ),
+        "{:?}",
+        effects.commands
     );
 }
 
@@ -8606,19 +8619,19 @@ mod jvel_live_retune {
     #[test]
     fn jvel_write_during_active_jog_reemits_move_velocity() {
         let mut rec = jogging_after_init(true);
+        let mut rx = capture(&mut rec);
         rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
-        let effects = rec.do_process();
+        let commands = sent(&mut rx);
         assert!(
-            effects.commands.iter().any(|c| matches!(
-                c,
-                MotorCommand::MoveVelocity {
+            matches!(
+                commands.as_slice(),
+                [MotorCommand::MoveVelocity {
                     direction: true,
                     velocity,
                     ..
-                } if *velocity == 2.5
-            )),
-            "retune re-emits the jog at the new JVEL: {:?}",
-            effects.commands
+                }] if *velocity == 2.5
+            ),
+            "retune re-emits the jog at the new JVEL: {commands:?}"
         );
     }
 
@@ -8626,18 +8639,40 @@ mod jvel_live_retune {
     #[test]
     fn jvel_retune_keeps_reverse_direction() {
         let mut rec = jogging_after_init(false);
+        let mut rx = capture(&mut rec);
         rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
-        let effects = rec.do_process();
+        let commands = sent(&mut rx);
         assert!(
-            effects.commands.iter().any(|c| matches!(
-                c,
-                MotorCommand::MoveVelocity {
+            matches!(
+                commands.as_slice(),
+                [MotorCommand::MoveVelocity {
                     direction: false,
                     ..
-                }
-            )),
-            "reverse jog retunes in the reverse direction: {:?}",
-            effects.commands
+                }]
+            ),
+            "reverse jog retunes in the reverse direction: {commands:?}"
+        );
+    }
+
+    // C 3064: the retune reads JOGR, not the MIP bit — a reverse jog
+    // whose JOGR is already released retunes forward.
+    #[test]
+    fn jvel_retune_reads_jogr_not_the_mip_bit() {
+        let mut rec = jogging_after_init(false);
+        rec.ctrl.jogr = false;
+        assert!(rec.stat.mip.contains(MipFlags::JOGR));
+        let mut rx = capture(&mut rec);
+        rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
+        let commands = sent(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [MotorCommand::MoveVelocity {
+                    direction: true,
+                    ..
+                }]
+            ),
+            "JOGR 0 retunes forward: {commands:?}"
         );
     }
 
@@ -8646,17 +8681,10 @@ mod jvel_live_retune {
     #[test]
     fn jvel_write_when_idle_emits_nothing() {
         let mut rec = MotorRecord::new();
+        let mut rx = capture(&mut rec);
         rec.init_record(1).unwrap();
         rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
-        let effects = rec.do_process();
-        assert!(
-            !effects
-                .commands
-                .iter()
-                .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
-            "no jog active, no retune: {:?}",
-            effects.commands
-        );
+        assert_eq!(sent(&mut rx), [], "no jog active, no retune");
     }
 
     // C 3074-3078: a non-positive JAR put is replaced by JVEL / 0.1 at

@@ -5,6 +5,8 @@
 //! each with its own monitor and FLNK — so a READ cycle reads twice and links
 //! three times (mcaRecord.c:770-790).
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +18,7 @@ use epics_base_rs::server::device_support::{
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::DbFieldType;
 use epics_base_rs::types::EpicsValue;
 
@@ -80,15 +82,21 @@ impl DeviceSupport for Sink {
 async fn an_inline_completion_runs_its_pass_nested() {
     let log: Log = Arc::default();
     let l = Arc::clone(&log);
+    let devices = [
+        ("ai", declared_rows::rows(&["Inline"], DbLinkType::Constant)),
+        ("ao", declared_rows::rows(&["Sink"], DbLinkType::Constant)),
+    ];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| match ctx.dtyp {
-            "Inline" => Some(Box::new(Inline {
-                log: Arc::clone(&l),
-                begins: 0,
-                reads: 0.0,
-            }) as Box<dyn DeviceSupport>),
-            "Sink" => Some(Box::new(Sink(Arc::clone(&l))) as Box<dyn DeviceSupport>),
-            _ => None,
+        .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
+            match ctx.dtyp {
+                "Inline" => Some(Box::new(Inline {
+                    log: Arc::clone(&l),
+                    begins: 0,
+                    reads: 0.0,
+                }) as Box<dyn DeviceSupport>),
+                "Sink" => Some(Box::new(Sink(Arc::clone(&l))) as Box<dyn DeviceSupport>),
+                _ => None,
+            }
         })
         .db_string(
             r#"

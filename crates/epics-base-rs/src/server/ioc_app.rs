@@ -1305,6 +1305,7 @@ pub(crate) async fn build_without_application(db: &Arc<PvDatabase>) -> bool {
         return false;
     };
     db.ioc_init().await;
+    db.scan_control().finish_dev_sup();
     initial_process(db);
     build.finish();
     true
@@ -1608,6 +1609,7 @@ impl IocBuild {
         // no-op when the script already spelled `iocInit` out.
         db.ioc_init().await;
         announce!(InitHookState::AfterInitDatabase);
+        db.scan_control().finish_dev_sup();
         announce!(InitHookState::AfterFinishDevSup);
 
         // C `iocBuild_2` (`iocInit.c:186-191`): `scanInit()`, then `asInit()`,
@@ -1919,10 +1921,20 @@ impl IocApplication {
     /// and returns `Some(device_support)` if it can handle that DTYP.
     ///
     /// Multiple calls are chained: new factory is tried first, then existing.
-    pub fn register_dynamic_device_support<F>(mut self, factory: F) -> Self
+    ///
+    /// `devices` are the `device()` lines the factory serves, added to the
+    /// device menus now: a `.db` may name only a menu choice.
+    pub fn register_dynamic_device_support<F>(
+        mut self,
+        devices: &[(&str, &'static [crate::server::record::DevSup])],
+        factory: F,
+    ) -> Self
     where
         F: Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync + 'static,
     {
+        for (record_type, rows) in devices {
+            crate::server::record::register_device_menu(record_type, rows);
+        }
         if let Some(existing) = self.dynamic_device_factory.take() {
             self.dynamic_device_factory = Some(Box::new(move |ctx: &DeviceSupportContext| {
                 factory(ctx).or_else(|| existing(ctx))
@@ -2987,6 +2999,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             continue;
         };
         dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
+        dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
         if let Some(mut intr_rx) = dev.io_intr_receiver() {
             let db_clone = db.clone();
             let rec_name = name.clone();
@@ -2998,13 +3011,15 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             // pump is per record, so the record's own band is the list it
             // would be on.
             let prio = inst.common.callback_priority();
+            let direct = dev.io_intr_processes_directly();
             crate::runtime::task::spawn_background(prio, async move {
                 while intr_rx.recv().await.is_some() {
                     // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr
                     // callback queues nothing while the scan facility is
                     // not running, which is what `interruptAccept` buys a
-                    // building or paused IOC.
-                    if !db_clone.scan_control().is_running() {
+                    // building or paused IOC. A device's own `dbProcess`
+                    // passes no such gate.
+                    if !direct && !db_clone.scan_control().is_running() {
                         continue;
                     }
                     // Process if the device drives SCAN-independently,
@@ -3501,6 +3516,13 @@ mod tests {
     /// `info()` tag the driver depends on (e.g. asyn `asyn:READBACK`).
     #[epics_macros_rs::epics_test]
     async fn wire_device_support_forwards_info_tags_to_driver() {
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devTest",
+            choice: "TestRecording",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
         use crate::server::records::ai::AiRecord;
@@ -3589,6 +3611,13 @@ mod tests {
     /// stable across runs of the same binary.
     #[epics_macros_rs::epics_test]
     async fn wire_device_support_binds_in_database_load_order() {
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devTest",
+            choice: "SeqDev",
+            link_type: crate::server::record::DbLinkType::InstIo,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::records::ai::AiRecord;
         use std::sync::{Arc as StdArc, Mutex as StdMutex};

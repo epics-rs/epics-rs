@@ -274,9 +274,13 @@ pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
     #[cfg(feature = "scaler")]
     let builder = {
         let (scaler_type, scaler_factory) = scaler_rs::scaler_record_factory();
+        let devices = [(
+            "scaler",
+            std::slice::from_ref(&scaler_rs::device_support::scaler_asyn::ASYN_SCALER_DEVICE),
+        )];
         builder
             .register_record_type(scaler_type, scaler_factory)
-            .register_dynamic_device_support(|ctx| {
+            .register_dynamic_device_support(&devices, |ctx| {
                 // C `scalerSupport.dbd`: `device(scaler,INST_IO,devScalerAsyn,
                 // "Asyn Scaler")`, whose `init_record` parses OUT's `@asyn(port
                 // ..)` and connects to that port.

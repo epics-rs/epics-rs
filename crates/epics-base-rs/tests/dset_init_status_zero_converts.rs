@@ -4,6 +4,8 @@
 //! `init_record`, and the soft channel dsets (which return 2) leave VAL and
 //! UDF alone.
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,7 +16,7 @@ use epics_base_rs::server::device_support::{
 };
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::EpicsValue;
 
 /// Leaves RVAL = 20 and returns `outcome`; `None` is a dset without an
@@ -65,8 +67,12 @@ async fn ioc(rtype: &str, fields: &str) -> Arc<PvDatabase> {
             format!("record({rtype}, \"{rtype}:{i}\") {{ field(DTYP, \"{dtyp}\") {fields} }}\n")
         })
         .collect();
+    let devices = [(
+        rtype,
+        declared_rows::rows(&DTYPS[..4], DbLinkType::Constant),
+    )];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        .register_dynamic_device_support(&devices, |ctx: &DeviceSupportContext| {
             let outcome = match ctx.dtyp {
                 "probeOk" => Some(DeviceInitOutcome::ok()),
                 "probeNoConvert" => Some(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched)),
@@ -164,10 +170,14 @@ async fn the_default_init_is_status_zero() {
 record(bo, "inherit:bo") { field(DTYP, "inherit") }
 record(mbbiDirect, "inherit:mbbid") { field(DTYP, "inherit") field(VAL, "5") }
 "#;
+    let inherit = declared_rows::rows(&["inherit"], DbLinkType::Constant);
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-            (ctx.dtyp == "inherit").then(|| Box::new(Inherit) as Box<dyn DeviceSupport>)
-        })
+        .register_dynamic_device_support(
+            &[("bo", inherit), ("mbbiDirect", inherit)],
+            |ctx: &DeviceSupportContext| {
+                (ctx.dtyp == "inherit").then(|| Box::new(Inherit) as Box<dyn DeviceSupport>)
+            },
+        )
         .db_string(db, &HashMap::new())
         .unwrap()
         .build()

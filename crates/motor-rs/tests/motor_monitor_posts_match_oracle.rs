@@ -398,16 +398,17 @@ async fn a_dly_wait_posts_mip_from_c_s_marks_only_as_the_oracle_does() {
 }
 
 impl MotorFixture {
-    /// The poll loop firing the last armed DLY watchdog, and the pass it wakes.
+    /// The armed DLY watchdog firing on the callback pool, and the pass it
+    /// wakes.
     async fn expire_delay(&mut self) {
-        use motor_rs::poll_loop::PollCommand;
-        let mut id = None;
-        while let Ok(cmd) = self._poll_cmd_rx.try_recv() {
-            if let PollCommand::ScheduleDelay(d, _) = cmd {
-                id = Some(d);
+        let fired = || self.state.lock().unwrap().expired_delay_id.is_some();
+        for _ in 0..500 {
+            if fired() {
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        self.state.lock().unwrap().expired_delay_id = Some(id.expect("no delay armed"));
+        assert!(fired(), "no delay armed");
         self.db
             .process_record_readback("M1", &mut ProcStack::new())
             .await
@@ -706,4 +707,77 @@ async fn an_alarm_move_with_nothing_marked_posts_to_msta_and_stops() {
     assert_eq!(sevr(&mut msta), [2], "MSTA");
     assert_eq!(sevr(&mut velo), Vec::<u16>::new(), "VELO");
     assert_eq!(sevr(&mut rllm), Vec::<u16>::new(), "RLLM");
+}
+
+/// The posts one client on `fields` sees for a `caput M1 1` move: the put and
+/// its start pass, a pass reporting the driver moving forward, and the pass
+/// reporting it done.
+async fn move_phases(fields: &[(&str, DbFieldType)]) -> [Vec<String>; 3] {
+    let mut fx = MotorFixture::new(|rec| rec.vel.velo = 1.0).await;
+    let user = EventUser::new();
+    let _readers: Vec<_> = fields
+        .iter()
+        .enumerate()
+        .map(|(sid, &(field, ty))| {
+            subscribe_on(
+                &fx,
+                &user,
+                field,
+                sid as u32,
+                ty,
+                EventMask::VALUE | EventMask::LOG,
+            )
+        })
+        .collect();
+    let _ = drain_user(&user);
+    let posts = |user: &EventUser| {
+        drain_user(user)
+            .into_iter()
+            .map(|(sid, value)| format!("{} {value:?}", fields[sid as usize].0))
+            .collect::<Vec<_>>()
+    };
+    fx.start_move(1.0).await;
+    let start = posts(&user);
+    fx.poll_pass(|m| {
+        m.moving = true;
+        m.direction = true;
+        m.position = 0.5;
+    })
+    .await;
+    let moving = posts(&user);
+    fx.poll_pass(|m| {
+        m.moving = false;
+        m.direction = false;
+        m.position = 1.0;
+    })
+    .await;
+    [start, moving, posts(&user)]
+}
+
+/// oracleMotorIoc `camonitor M1.TDIR` over `caput M1 1`: TDIR follows the
+/// driver's direction bit (motorRecord.cc:3722-3724) and nothing else, so the
+/// move's start posts none.
+#[tokio::test]
+async fn tdir_posts_the_driver_direction_only_as_the_oracle_does() {
+    let [start, moving, done] = move_phases(&[("TDIR", DbFieldType::Short)]).await;
+    assert_eq!(start, Vec::<String>::new());
+    assert_eq!(moving, ["TDIR Short(1)"]);
+    assert_eq!(done, ["TDIR Short(0)"]);
+}
+
+/// oracleMotorIoc `camonitor M1.CDIR` over `caput M1 1` sees no post: C
+/// writes CDIR, LVAL, LDVL, LRVL, LRLV and PP during a move but posts none of
+/// them, from `monitor()` or anywhere else.
+#[tokio::test]
+async fn the_fields_c_never_posts_stay_silent_through_a_move() {
+    let phases = move_phases(&[
+        ("CDIR", DbFieldType::Short),
+        ("LVAL", DbFieldType::Double),
+        ("LDVL", DbFieldType::Double),
+        ("LRVL", DbFieldType::Long),
+        ("LRLV", DbFieldType::Double),
+        ("PP", DbFieldType::Short),
+    ])
+    .await;
+    assert!(phases.iter().all(Vec::is_empty), "{phases:?}");
 }

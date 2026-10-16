@@ -4533,8 +4533,7 @@ pub fn universal_asyn_factory(
 pub fn register_asyn_device_support(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::server::ioc_app::IocApplication {
-    register_asyn_device_menus();
-    let app = app.register_dynamic_device_support(universal_asyn_factory);
+    let app = app.register_dynamic_device_support(&asyn_devices(), universal_asyn_factory);
     crate::iocsh::register_asyn_commands(app, crate::manager::PortManager::global())
 }
 
@@ -4559,6 +4558,15 @@ pub fn register_asyn_device_menus() {
             epics_base_rs::server::record::register_device_menu(record_type, rows);
         }
     }
+}
+
+/// Every record type's [`asyn_device_menu`] rows, the `device()` lines
+/// [`universal_asyn_factory`] serves.
+fn asyn_devices() -> Vec<(&'static str, &'static [DevSup])> {
+    ASYN_DEVICE_MENU_RECORD_TYPES
+        .iter()
+        .filter_map(|&record_type| Some((record_type, asyn_device_menu(record_type)?)))
+        .collect()
 }
 
 /// The record types [`asyn_device_menu`] answers for: the generated table plus
@@ -4611,8 +4619,7 @@ static BUSY_DEVICES: &[DevSup] = &[DevSup {
 pub fn register_asyn_device_support_for_builder(
     builder: epics_base_rs::server::ioc_builder::IocBuilder,
 ) -> epics_base_rs::server::ioc_builder::IocBuilder {
-    register_asyn_device_menus();
-    builder.register_dynamic_device_support(universal_asyn_factory)
+    builder.register_dynamic_device_support(&asyn_devices(), universal_asyn_factory)
 }
 
 #[cfg(test)]

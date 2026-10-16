@@ -351,8 +351,8 @@ pub struct LinkFields {
     /// `field(CARD,DBF_SHORT)` (motorRecord.dbd:239-243), the one field that is
     /// a pure function of [`Self::out`]: `init_record` switches on the OUT link
     /// TYPE and stores the card number, -1, or 0 (`motorRecord.cc:653-670`).
-    /// It lives beside the link it is derived from; `motor_derive_card` is the
-    /// only writer.
+    /// It lives beside the link it is derived from; `motor_derive_card`
+    /// writes it, and `motor_failed_dset_init` forces C's -1 after it.
     pub card: i16,
     pub rdbl: PvString,
     pub dol: PvString,
@@ -485,6 +485,13 @@ pub struct InternalFields {
     /// The cycle that set this ran `process()`, so the next take of the
     /// post marks is its `monitor()`; any other take is a put's.
     pub monitor_due: bool,
+    /// The last pass committed STAT = COMM_ALARM: what C `build_trans`
+    /// reads during the next pass's `do_work`, ahead of its `alarm_sub`.
+    pub comm_alarm: bool,
+    /// ERES of the last encoder-ratio download: the driver's encoder EGU
+    /// carries the scale it was told, so REP converts with this one, not a
+    /// later ERES put the driver never heard of (C REP is the raw count).
+    pub drv_eres: Option<f64>,
     /// `monitor()` found a mark below its short circuit this cycle
     /// (motorRecord.cc:3550-3551), so an alarm move posts that group too.
     pub monitor_lower_marked: bool,
@@ -517,9 +524,6 @@ pub struct InternalFields {
     pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
-    /// True after the initial DMOV 1→0 notification has been sent.
-    /// Reset when DMOV returns to 1.
-    pub dmov_notified: bool,
     /// Set when a same-direction retarget (ExtendMove) occurred during a
     /// motion. On completion, evaluate_position_error verifies that the
     /// driver actually followed the retarget and, if not, replans once
@@ -569,11 +573,4 @@ pub struct InternalFields {
     /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
     /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
-    /// Driver commands a put queued at special() time (C sends them
-    /// from special() before the pp pass runs do_work: pidcof
-    /// 3003-3026, set_user/dial_*limit 4076-4328). Every motor put is
-    /// followed by a process pass; `do_process` drains this buffer in
-    /// front of the pass's own commands, preserving C's emission
-    /// order.
-    pub special_cmds: Vec<crate::flags::MotorCommand>,
 }

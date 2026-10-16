@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, StatusWrite};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::runtime::task::{
-    CallbackPriority, StackSizeClass, ThreadPriority, block_on_sync, sleep_background,
-    spawn_background, spawn_dedicated_thread,
+    StackSizeClass, ThreadPriority, block_on_sync, sleep_background, spawn_dedicated_thread,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -18,7 +17,17 @@ use crate::trace::MotorTrace;
 ///
 /// Unbounded like the asyn request queue C `devMotorAsyn::build_trans` feeds,
 /// so a record pass never waits on the driver.
-pub type MotorCommandSender = mpsc::UnboundedSender<Vec<QueuedCommand>>;
+pub type MotorCommandSender = mpsc::UnboundedSender<CommandBatch>;
+
+/// One record pass's commands, with the record's trace: C's asynUser that
+/// `build_trans` queued them on, which `asynCallback` prints through and
+/// whose record a finished move processes.
+#[derive(Debug)]
+pub struct CommandBatch {
+    pub trace: Arc<MotorTrace>,
+    pub record: RecordId,
+    pub commands: Vec<QueuedCommand>,
+}
 
 /// A driver command with the MRES of the record pass that queued it. The
 /// driver takes dial EGU; C's asyn layer carries steps, the command over MRES,
@@ -29,23 +38,25 @@ pub struct QueuedCommand {
     pub mres: f64,
 }
 
-/// Commands sent to the poll loop.
+/// Commands sent to the poll loop. The axis polls while any bound record
+/// wants it, so one record settling cannot starve another of posts.
 #[derive(Debug)]
 pub enum PollCommand {
-    StartPolling,
-    StopPolling,
-    ScheduleDelay(u64, Duration),
+    /// Poll now, posting even when nothing changed: C `motorUpdateStatus_`
+    /// (asynMotorController.cpp:217-222). The timed polls never stop: C's
+    /// `asynMotorPoller` has no request that halts them (:615-696).
+    ForcePoll,
     Shutdown,
 }
 
 /// The poller's two queues: poll control, and the driver commands a record
-/// pass queued (drained first, so a StartPolling sees their effect).
+/// pass queued (drained first, so a ForcePoll sees their effect).
 pub struct PollerInbox {
     pub poll: mpsc::Receiver<PollCommand>,
-    pub commands: mpsc::UnboundedReceiver<Vec<QueuedCommand>>,
+    pub commands: mpsc::UnboundedReceiver<CommandBatch>,
 }
 
-/// Motor poll loop — one per record, stays alive for the record's lifetime.
+/// Motor poll loop — one per axis, posting to every record bound to it.
 ///
 /// It is the only caller of the driver after `init`: polls and the record's
 /// commands both run on its own `motorPoller` OS thread (see [`Self::run`]),
@@ -53,11 +64,9 @@ pub struct PollerInbox {
 /// dead serial line or TCP peer never stalls the IOC's async executor.
 pub struct MotorPollLoop {
     cmd_rx: mpsc::Receiver<PollCommand>,
-    motor_cmd_rx: mpsc::UnboundedReceiver<Vec<QueuedCommand>>,
-    io_intr_tx: mpsc::Sender<()>,
+    motor_cmd_rx: mpsc::UnboundedReceiver<CommandBatch>,
     motor: Arc<Mutex<dyn AsynMotor>>,
-    trace: Arc<MotorTrace>,
-    device_state: SharedDeviceState,
+    subscribers: AxisSubscribers,
     moving_poll_interval: Duration,
     idle_poll_interval: Duration,
     forced_fast_polls_config: u32,
@@ -69,9 +78,16 @@ pub struct MotorPollLoop {
     /// this — the analogue of C `asynMotorAxis::callParamCallbacks` firing the
     /// status callback only when `statusChanged_` is set (asynMotorAxis.cpp:
     /// 316-322), so a stationary axis does not re-post DIFF/RDIF every idle
-    /// period. A forced poll (StartPolling, i.e. request_poll/status_refresh)
+    /// period. A forced poll (ForcePoll, i.e. request_poll/status_refresh)
     /// bypasses this and always notifies.
     last_status: Option<MotorStatus>,
+    /// A model-2 driver's parameter library, by drvMotorAsyn reason: what
+    /// the axis's `setDouble` / `setInteger` stored last.
+    params: std::collections::HashMap<i32, CValue>,
+    /// The io_intr pulses owed for processes the callbacks queued.
+    pulses: Pulses,
+    /// A move ran: C `wakeupPoller`.
+    woken: bool,
 }
 
 /// C `epicsThreadCreate`'s report of a refused `pthread_create`
@@ -91,9 +107,8 @@ fn thread_create_refused(e: &std::io::Error) {
 impl MotorPollLoop {
     pub fn new(
         inbox: PollerInbox,
-        io_intr_tx: mpsc::Sender<()>,
         motor: Arc<Mutex<dyn AsynMotor>>,
-        device_state: SharedDeviceState,
+        subscribers: AxisSubscribers,
         moving_poll_interval: Duration,
         idle_poll_interval: Duration,
         forced_fast_polls: u32,
@@ -101,10 +116,8 @@ impl MotorPollLoop {
         Self {
             cmd_rx: inbox.poll,
             motor_cmd_rx: inbox.commands,
-            io_intr_tx,
             motor,
-            trace: Default::default(),
-            device_state,
+            subscribers,
             moving_poll_interval,
             idle_poll_interval,
             forced_fast_polls_config: forced_fast_polls,
@@ -112,28 +125,93 @@ impl MotorPollLoop {
             last_moving: false,
             status_seq: 1, // starts at 1 (init already wrote seq=1)
             last_status: None,
+            params: Default::default(),
+            pulses: Pulses::new(),
+            woken: false,
         }
-    }
-
-    /// Share the device support's trace user, so command failures print as
-    /// the record's.
-    pub fn with_trace(mut self, trace: Arc<MotorTrace>) -> Self {
-        self.trace = trace;
-        self
     }
 
     /// Run the commands queued so far on the calling thread: for a harness
     /// standing in for the poller thread. The IOC path is [`Self::run`].
     pub fn run_queued_commands(&mut self) {
-        while let Ok(commands) = self.motor_cmd_rx.try_recv() {
-            self.execute(&commands);
+        while let Ok(batch) = self.motor_cmd_rx.try_recv() {
+            self.execute(&batch);
+        }
+        for io_intr in self.pulses.drain(..) {
+            let _ = io_intr.try_send(());
         }
     }
 
-    fn execute(&self, commands: &[QueuedCommand]) {
-        if let Ok(mut motor) = self.motor.lock() {
-            execute_commands(&mut *motor, &self.trace, commands);
+    /// Send the owed pulses, waiting on a full queue as C's callback waits
+    /// in `dbProcess`.
+    async fn send_pulses(&mut self) {
+        for io_intr in std::mem::take(&mut self.pulses) {
+            let _ = io_intr.send(()).await;
         }
+    }
+
+    /// Run a record's commands, posting each write's status change; a
+    /// finished move then processes the record (C `asynCallback`), and a
+    /// move wakes the poller (asynMotorController.cpp:303, :320, :336,
+    /// :355).
+    fn execute(&mut self, batch: &CommandBatch) {
+        let motor = self.motor.clone();
+        let Ok(mut motor) = motor.lock() else {
+            return;
+        };
+        for queued in &batch.commands {
+            let mut write = AxisWrite::default();
+            execute_commands(
+                &mut *motor,
+                &batch.trace,
+                std::slice::from_ref(queued),
+                &mut |w| write = w,
+            );
+            self.post_writes(write);
+            let command = &queued.command;
+            if !command.is_move() {
+                continue;
+            }
+            self.pulses
+                .extend(self.subscribers.move_done(batch.record, command));
+            if !matches!(command, MotorCommand::SetPosition { .. }) {
+                self.woken = true;
+            }
+        }
+    }
+
+    /// C `asynMotorAxis::callParamCallbacks` after a write (asynMotorAxis.cpp:
+    /// 316-322): `write.fields` land on the last posted status, which is
+    /// posted only if they changed it (`statusChanged_`). A model-2 parameter
+    /// posts the status when it changed the parameter: paramLib flags only a
+    /// new type or value (paramLib.c:112-118, 141-147), and `callCallback`
+    /// then posts to every record on the axis (drvMotorAsyn.c `intCallback`).
+    fn post_writes(&mut self, write: AxisWrite) {
+        let param_changed = write
+            .param
+            .is_some_and(|(reason, value)| self.params.insert(reason, value) != Some(value));
+        if write.fields.is_empty() && !param_changed {
+            return;
+        }
+        let mut status = self.last_status.clone().unwrap_or_default();
+        for field in write.fields {
+            field.apply(&mut status);
+        }
+        if param_changed || self.last_status.as_ref() != Some(&status) {
+            self.publish(status);
+        }
+    }
+
+    /// Post `status` to every bound record's `statusCallback` under a new
+    /// sequence number.
+    fn publish(&mut self, status: MotorStatus) {
+        self.last_status = Some(status.clone());
+        self.status_seq += 1;
+        let pulses = self.subscribers.post(StampedStatus {
+            seq: self.status_seq,
+            status,
+        });
+        self.pulses.extend(pulses);
     }
 
     /// Poll the motor and write stamped status to shared state.
@@ -173,14 +251,12 @@ impl MotorPollLoop {
 
     /// C asynMotorPoller's "Force on poll at startup": fills the cache
     /// `MotorDeviceSupport::init` reads, as readGenericPointer reads the
-    /// parameter library. No record is listening yet, so nothing is posted.
+    /// parameter library. No record is woken.
     /// [`Self::run`] does this first; a harness calls it before init.
     pub fn prime_cache(&mut self) {
         let status = self.poll_status();
         self.last_status = Some(status.clone());
-        if let Ok(mut ds) = self.device_state.lock() {
-            ds.latest_status = Some(StampedStatus { seq: 1, status });
-        }
+        self.subscribers.store(StampedStatus { seq: 1, status });
     }
 
     fn poll_status(&mut self) -> MotorStatus {
@@ -203,7 +279,7 @@ impl MotorPollLoop {
         }
     }
 
-    async fn poll_and_notify(&mut self, force: bool) {
+    fn poll_and_notify(&mut self, force: bool) {
         let status = self.poll_status();
         // The poll rate decision (moving vs idle) always tracks the latest
         // poll, independent of whether the record is notified. On a failed
@@ -223,39 +299,14 @@ impl MotorPollLoop {
             // flips the flag — always differs from the last status and posts.
             return;
         }
-        self.last_status = Some(status.clone());
-        self.status_seq += 1;
-        {
-            let Ok(mut ds) = self.device_state.lock() else {
-                return;
-            };
-            ds.latest_status = Some(StampedStatus {
-                seq: self.status_seq,
-                status,
-            });
-        }
-        let _ = self.io_intr_tx.send(()).await;
+        self.publish(status);
     }
 
-    /// Spawn a settle-delay timer as an independent task so the `select!`
-    /// loop keeps servicing commands (Shutdown/Stop/Start) while the delay
-    /// runs. On expiry it records `expired_delay_id` and pulses io_intr.
-    ///
-    /// C `callbackRequestDelayed` (motorRecord.cc:1437): the timer runs on the
-    /// callback pool, not on the poller thread, so a driver call blocked there
-    /// cannot hold the settle delay past expiry. LOW is the record's default
-    /// `PRIO`; the poll loop does not carry the record's own.
-    fn spawn_delay(&self, delay_id: u64, dur: Duration) {
-        let device_state = self.device_state.clone();
-        let io_intr_tx = self.io_intr_tx.clone();
-        spawn_background(CallbackPriority::Low, async move {
-            sleep_background(dur).await;
-            match device_state.lock() {
-                Ok(mut ds) => ds.expired_delay_id = Some(delay_id),
-                Err(_) => return,
-            }
-            let _ = io_intr_tx.send(()).await;
-        });
+    /// A record's poll request (request_poll / status_refresh): fast polls
+    /// restart and the post is forced.
+    fn start_polling(&mut self) {
+        self.forced_fast_polls_remaining = self.forced_fast_polls_config;
+        self.poll_and_notify(true);
     }
 
     fn effective_poll_interval(&mut self) -> Duration {
@@ -295,76 +346,31 @@ impl MotorPollLoop {
 
     async fn serve(mut self) {
         self.prime_cache();
-        // Then idle until the record asks for polling.
-        let mut active = false;
-
         loop {
-            if active {
-                // Poll mode: check for commands or poll on interval
-                let interval = self.effective_poll_interval();
-                tokio::select! {
-                    biased;
-                    Some(commands) = self.motor_cmd_rx.recv() => self.execute(&commands),
-                    cmd = self.cmd_rx.recv() => {
-                        match cmd {
-                            Some(PollCommand::StartPolling) => {
-                                active = true;
-                                self.forced_fast_polls_remaining = self.forced_fast_polls_config;
-                                // Command-triggered (request_poll/status_refresh
-                                // /keep-alive resume): force the post.
-                                self.poll_and_notify(true).await;
-                            }
-                            Some(PollCommand::StopPolling) => {
-                                active = false;
-                            }
-                            Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
-                                active = false;
-                                self.spawn_delay(delay_id, dur);
-                            }
-                            Some(PollCommand::Shutdown) => {
-                                return;
-                            }
-                            None => {
-                                return;
-                            }
-                        }
-                    }
-                    // C asynMotorController.cpp:633-634: idlePollPeriod_ == 0
-                    // blocks on the event (no timed poll). A zero effective
-                    // interval disables this timed arm so the loop is
-                    // event-driven only, never busy-spinning on sleep(0).
-                    _ = sleep_background(interval), if !interval.is_zero() => {
-                        // Autonomous timed poll: notify only on a real change
-                        // (C statusChanged_ gate).
-                        self.poll_and_notify(false).await;
+            self.send_pulses().await;
+            // C asynMotorController.cpp:633-634: idlePollPeriod_ == 0 blocks
+            // on the event (no timed poll), so a zero interval disables the
+            // timed arm rather than spinning on sleep(0).
+            let interval = self.effective_poll_interval();
+            tokio::select! {
+                biased;
+                Some(batch) = self.motor_cmd_rx.recv() => {
+                    self.execute(&batch);
+                    if std::mem::take(&mut self.woken) {
+                        // C's poller wakes from its event: fast polls
+                        // restart and it polls at once, posting on change.
+                        self.forced_fast_polls_remaining = self.forced_fast_polls_config;
+                        self.poll_and_notify(false);
                     }
                 }
-            } else {
-                // Idle mode: wait for commands only
-                let cmd = tokio::select! {
-                    biased;
-                    Some(commands) = self.motor_cmd_rx.recv() => {
-                        self.execute(&commands);
-                        continue;
-                    }
-                    cmd = self.cmd_rx.recv() => cmd,
-                };
-                match cmd {
-                    Some(PollCommand::StartPolling) => {
-                        active = true;
-                        self.forced_fast_polls_remaining = self.forced_fast_polls_config;
-                        // Command-triggered: force the post (see active arm).
-                        self.poll_and_notify(true).await;
-                    }
-                    Some(PollCommand::StopPolling) => {
-                        active = false;
-                    }
-                    Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
-                        self.spawn_delay(delay_id, dur);
-                    }
-                    Some(PollCommand::Shutdown) | None => {
-                        return;
-                    }
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(PollCommand::ForcePoll) => self.start_polling(),
+                    Some(PollCommand::Shutdown) | None => return,
+                },
+                _ = sleep_background(interval), if !interval.is_zero() => {
+                    // Autonomous timed poll: notify only on a real change
+                    // (C statusChanged_ gate).
+                    self.poll_and_notify(false);
                 }
             }
         }
@@ -372,15 +378,11 @@ impl MotorPollLoop {
 }
 
 /// The value C `asynMotorController::writeFloat64` / `writeInt32` receives.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum CValue {
     Float64(f64),
     Int32(i32),
 }
-
-/// C asynMotorController's `motorStatus_` index: the reason devMotorAsyn's
-/// init-time user carries (devMotorAsyn.c:405).
-pub(crate) const MOTOR_STATUS_REASON: i32 = 26;
 
 /// C `asynMotorController`'s parameter index for `cmd` (createParam order,
 /// asynMotorController.cpp:57-129) and the value written to it.
@@ -432,6 +434,66 @@ fn c_write(cmd: &MotorCommand, mres: f64) -> Option<(i32, CValue)> {
     })
 }
 
+/// drvMotorAsyn's `motorCommand` for `cmd` (drvMotorAsyn.c:76-104), the
+/// reason a model-2 write carries. Profiles have no drvMotorAsyn command.
+fn drv_motor_asyn_reason(cmd: &MotorCommand, mres: f64) -> Option<i32> {
+    Some(match *cmd {
+        MotorCommand::SetPosition { .. } | MotorCommand::InitPosition { .. } => 0,
+        MotorCommand::SetEncoderRatio { .. } | MotorCommand::InitEncoderRatio { .. } => 2,
+        // set_dial_highlimit / set_dial_lowlimit swap the pair for a
+        // negative MRES (motorRecord.cc:4245-4249, 4296-4300).
+        MotorCommand::SetLowLimit { .. } => {
+            if mres < 0.0 {
+                4
+            } else {
+                3
+            }
+        }
+        MotorCommand::SetHighLimit { .. } => {
+            if mres < 0.0 {
+                3
+            } else {
+                4
+            }
+        }
+        MotorCommand::SetPidGain { kind, .. } => match kind {
+            PidGainKind::Proportional => 5,
+            PidGainKind::Integral => 6,
+            PidGainKind::Derivative => 7,
+        },
+        MotorCommand::SetClosedLoop { .. } => 8,
+        MotorCommand::DeferMoves { .. } => 26,
+        MotorCommand::MoveToHome { .. } => 27,
+        MotorCommand::MoveRelative { .. } => 103,
+        MotorCommand::MoveAbsolute { .. } => 104,
+        MotorCommand::MoveVelocity { .. } => 105,
+        MotorCommand::Home { .. } => 106,
+        MotorCommand::Stop { .. } => 107,
+        MotorCommand::Poll => 109,
+        MotorCommand::ProfileInitialize { .. }
+        | MotorCommand::ProfileBuild
+        | MotorCommand::ProfileExecute
+        | MotorCommand::ProfileAbort
+        | MotorCommand::ProfileReadback => return None,
+    })
+}
+
+/// Whether drvMotorAsyn hands `reason` to the driver's `setDouble` /
+/// `setInteger` (drvMotorAsyn.c:613-623, 735-745), which store it as a
+/// parameter. Position is a status field, posted through it.
+fn is_driver_param(reason: i32) -> bool {
+    (1..100).contains(&reason)
+}
+
+/// What one command wrote on the axis.
+#[derive(Debug, Default)]
+pub struct AxisWrite {
+    /// The status fields it set.
+    pub fields: Vec<StatusWrite>,
+    /// The model-2 parameter it stored, by drvMotorAsyn reason.
+    param: Option<(i32, CValue)>,
+}
+
 /// Whether a failed `cmd` prints C `devMotorAsyn::asynCallback`'s write line
 /// (devMotorAsyn.c:661-713). Deferred moves, move-to-home and profiles reach
 /// the C driver through other records; `GET_INFO` has no failure print.
@@ -454,21 +516,59 @@ fn sent_by_dev_motor_asyn(cmd: &MotorCommand) -> bool {
 /// Run `commands` against the driver in order. Only the poller thread calls
 /// this outside tests, so a blocking driver stalls nothing but that thread.
 ///
-/// Each command prints what C's `asynMotorController::writeFloat64` /
-/// `writeInt32` (asynMotorController.cpp:181-427) and then devMotorAsyn's
-/// `asynCallback` print for it, on the record's asyn user.
-pub fn execute_commands(motor: &mut dyn AsynMotor, trace: &MotorTrace, commands: &[QueuedCommand]) {
+/// Each command prints what C's driver layer prints for it — on a model-3
+/// axis `asynMotorController::writeFloat64` / `writeInt32`
+/// (asynMotorController.cpp:181-427), on a model-2 axis drvMotorAsyn's
+/// (drvMotorAsyn.c:575-735) — and then devMotorAsyn's `asynCallback` print,
+/// on the record's asyn user.
+///
+/// After each command `on_write` gets the status fields that write set: on
+/// an `asynMotorController` axis the position SET_POSITION stores before
+/// `setPosition` (asynMotorController.cpp:289) and the DONE=0 every move
+/// sets after it (:301, :318, :334, :353), around whatever the driver set
+/// itself ([`AsynMotor::take_status_writes`]). A model-2 driver sets the
+/// position and DONE=0 only once the write succeeded, after its own
+/// fields (drvMM4000Asyn.c:388, :485, :518; drvEnsembleAsyn.cc:539), and
+/// the parameter the write stored.
+pub fn execute_commands(
+    motor: &mut dyn AsynMotor,
+    trace: &MotorTrace,
+    commands: &[QueuedCommand],
+    on_write: &mut dyn FnMut(AxisWrite),
+) {
     let user = AsynUser::new(0);
     let port = trace.port();
     let axis = trace.addr();
+    let model2 = trace.is_model2();
+    let controller = trace.is_controller();
     for QueuedCommand { command, mres } in commands {
         let (cmd, mres) = (command, *mres);
         // C's wire units: positions in signed steps, speeds in steps/s.
         let steps = |egu: f64| egu / mres;
         let rate = |egu: f64| egu / mres.abs();
-        let c = c_write(cmd, mres);
+        let c = if model2 {
+            c_write(cmd, mres)
+                .and_then(|(_, value)| Some((drv_motor_asyn_reason(cmd, mres)?, value)))
+        } else {
+            c_write(cmd, mres)
+        };
         let function = c.map_or(0, |(function, _)| function);
-        let flow = |args: std::fmt::Arguments<'_>| trace.print(TraceMask::FLOW, function, args);
+        // asynMotorController's own flow lines; drvMotorAsyn has none of them.
+        let flow = |args: std::fmt::Arguments<'_>| {
+            if !model2 {
+                trace.print(TraceMask::FLOW, function, args)
+            }
+        };
+        if let (true, Some((_, CValue::Float64(_)))) = (model2, c) {
+            trace.print(
+                TraceMask::FLOW,
+                function,
+                format_args!(
+                    "drvMotorAsyn::writeFloat64, reason={function}, pasynUser={:p} pAxis={:p}",
+                    &user, motor as *const dyn AsynMotor as *const (),
+                ),
+            );
+        }
         let mut write_status = None;
         let result = match *cmd {
             MotorCommand::MoveAbsolute {
@@ -602,8 +702,54 @@ pub fn execute_commands(motor: &mut dyn AsynMotor, trace: &MotorTrace, commands:
             }
             MotorCommand::Poll => Ok(()),
         };
+        let position = match *cmd {
+            MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {
+                Some(StatusWrite::Position(position))
+            }
+            _ => None,
+        };
+        let moved = matches!(
+            cmd,
+            MotorCommand::MoveAbsolute { .. }
+                | MotorCommand::MoveRelative { .. }
+                | MotorCommand::MoveVelocity { .. }
+                | MotorCommand::Home { .. }
+        )
+        .then_some(StatusWrite::Done(false));
+        let mut writes = Vec::new();
+        if controller {
+            writes.extend(position);
+            writes.extend(motor.take_status_writes());
+            writes.extend(moved);
+        } else {
+            writes.extend(motor.take_status_writes());
+            if model2 && result.is_ok() {
+                writes.extend(position.or(moved));
+            }
+        }
+        // A model-2 driver stores a parameter only once the write succeeded
+        // (drvMotorSim.c:364-368, 424-428).
+        let param = c.filter(|&(reason, _)| model2 && result.is_ok() && is_driver_param(reason));
+        on_write(AxisWrite {
+            fields: writes,
+            param,
+        });
 
-        if let Some((_, value)) = c {
+        if let (true, Some((_, value))) = (model2, c) {
+            // drvMotorAsyn prints the write whatever its status.
+            match value {
+                CValue::Float64(v) => trace.print(
+                    TraceMask::IO_DRIVER,
+                    function,
+                    format_args!("drvMotorAsyn::writeFloat64, reason={function}, value={v:.6}"),
+                ),
+                CValue::Int32(v) => trace.print(
+                    TraceMask::IO_DRIVER,
+                    function,
+                    format_args!("drvMotorAsyn::writeInt32, reason={function}, value={v}"),
+                ),
+            }
+        } else if let Some((_, value)) = c {
             let status = write_status.unwrap_or_else(|| match &result {
                 Ok(()) => 0,
                 Err(e) => e.status() as i32,
@@ -633,65 +779,112 @@ pub fn execute_commands(motor: &mut dyn AsynMotor, trace: &MotorTrace, commands:
             }
         }
 
-        if let MotorCommand::InitEncoderRatio { ratio } = *cmd {
-            let record = trace.record();
-            match result {
-                Ok(()) => trace.print(
-                    TraceMask::FLOW,
-                    MOTOR_STATUS_REASON,
-                    format_args!(
-                        "devMotorAsyn::init_controller, {record} set encoder ratio to {ratio:.6}"
-                    ),
-                ),
-                Err(_) => trace.print(
+        if let (Err(_), MotorCommand::MoveToHome { .. }) = (&result, cmd) {
+            if !model2 {
+                trace.print_self(
                     TraceMask::ERROR,
-                    MOTOR_STATUS_REASON,
                     format_args!(
-                        "devMotorAsyn::init_controller, {record} failed to set encoder ratio to {ratio:.6}"
+                        "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={axis}"
                     ),
-                ),
+                );
             }
             continue;
         }
-        if let MotorCommand::InitPosition { position } = *cmd {
-            let steps = steps(position);
-            let record = trace.record();
-            match result {
-                Ok(()) => trace.print(
-                    TraceMask::FLOW,
-                    MOTOR_STATUS_REASON,
-                    format_args!(
-                        "devMotorAsyn::init_controller, {record} set position to {steps:.6}"
-                    ),
-                ),
-                Err(_) => trace.print(
-                    TraceMask::ERROR,
-                    MOTOR_STATUS_REASON,
-                    format_args!(
-                        "devMotorAsyn::init_controller, {record} failed to set position to {steps:.6}"
-                    ),
-                ),
+        let failure = result.as_ref().err().map(|e| e.message_display());
+        dev_motor_asyn_reply(
+            trace,
+            cmd,
+            mres,
+            function,
+            failure.as_ref().map(|e| e as &dyn std::fmt::Display),
+        );
+    }
+}
+
+/// An axis the port answers for but never created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingAxis {
+    /// `asynMotorController::getAxis` is NULL: `asynError` with the
+    /// `errorMessage` left empty (asynMotorController.cpp:505-513, 552-556).
+    Controller,
+    /// drvMotorAsyn's refusal (drvMotorAsyn.c:584-597, 683-695, 762-775):
+    /// an axis number past `numAxes`, or a slot whose `open` never succeeded.
+    DrvMotorAsyn { invalid: bool },
+}
+
+impl MissingAxis {
+    /// The `errorMessage` `method` leaves for axis `addr`.
+    pub fn message(self, method: &str, addr: i32) -> String {
+        match self {
+            MissingAxis::Controller => String::new(),
+            MissingAxis::DrvMotorAsyn { invalid } => {
+                let what = if invalid { "Invalid" } else { "Uninitialised" };
+                format!("drvMotorAsyn::{method} {what} axis {addr}")
             }
-            continue;
         }
-        let Err(e) = result else { continue };
-        if matches!(cmd, MotorCommand::MoveToHome { .. }) {
-            trace.print_self(
-                TraceMask::ERROR,
-                format_args!(
-                    "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={axis}"
-                ),
-            );
-        } else if sent_by_dev_motor_asyn(cmd) {
-            trace.print(
-                TraceMask::ERROR,
-                function,
-                format_args!(
-                    "devMotorAsyn::asynCallback: {} pasyn{{Float64,Int32}}->write returned {}",
-                    trace.record(),
-                    e.message_display()
-                ),
-            );
+    }
+}
+
+/// [`execute_commands`] for a [`MissingAxis`]: every write fails before the
+/// driver prints anything, and devMotorAsyn reports it as for any failure.
+pub fn refuse_commands(trace: &MotorTrace, missing: MissingAxis, commands: &[QueuedCommand]) {
+    let model2 = trace.is_model2();
+    for QueuedCommand { command, mres } in commands {
+        let c = c_write(command, *mres);
+        let function = if model2 {
+            drv_motor_asyn_reason(command, *mres)
+        } else {
+            c.map(|(function, _)| function)
+        };
+        let method = match c {
+            Some((_, CValue::Int32(_))) => "writeInt32",
+            _ => "writeFloat64",
+        };
+        let message = missing.message(method, trace.addr());
+        dev_motor_asyn_reply(trace, command, *mres, function.unwrap_or(0), Some(&message));
+    }
+}
+
+/// devMotorAsyn's own line for a finished `cmd`: `init_controller`'s report
+/// of its two synchronous writes (devMotorAsyn.c:187-235), or `asynCallback`'s
+/// write failure (:700-707) carrying the driver's `errorMessage`.
+fn dev_motor_asyn_reply(
+    trace: &MotorTrace,
+    cmd: &MotorCommand,
+    mres: f64,
+    function: i32,
+    failure: Option<&dyn std::fmt::Display>,
+) {
+    let record = trace.record();
+    let (what, value) = match *cmd {
+        MotorCommand::InitEncoderRatio { ratio } => ("encoder ratio", ratio),
+        MotorCommand::InitPosition { position } => ("position", position / mres),
+        _ => {
+            if let Some(e) = failure.filter(|_| sent_by_dev_motor_asyn(cmd)) {
+                trace.print(
+                    TraceMask::ERROR,
+                    function,
+                    format_args!(
+                        "devMotorAsyn::asynCallback: {record} pasyn{{Float64,Int32}}->write returned {e}"
+                    ),
+                );
+            }
+            return;
         }
+    };
+    let reason = trace.status_reason();
+    match failure {
+        None => trace.print(
+            TraceMask::FLOW,
+            reason,
+            format_args!("devMotorAsyn::init_controller, {record} set {what} to {value:.6}"),
+        ),
+        Some(_) => trace.print(
+            TraceMask::ERROR,
+            reason,
+            format_args!(
+                "devMotorAsyn::init_controller, {record} failed to set {what} to {value:.6}"
+            ),
+        ),
     }
 }

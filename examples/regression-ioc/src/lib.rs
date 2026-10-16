@@ -26,15 +26,13 @@ use std::time::Duration;
 
 use asyn_rs::interfaces::motor::AsynMotor;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::device_support::DeviceSupport;
-use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::server::PvDatabaseSource;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
-use motor_rs::builder::{MotorBuilder, MotorSetup};
+use motor_rs::builder::{AxisSetup, MotorBuilder};
 use motor_rs::poll_loop::PollCommand;
 use motor_rs::sim_motor::SimMotor;
 use tokio::sync::mpsc;
@@ -43,9 +41,9 @@ use tokio::sync::mpsc;
 /// `regression-ioc` binary serve byte-identical records.
 pub const REGRESSION_DB: &str = include_str!("../db/regression.db");
 
-/// DTYP that the standard motor record (`REG:D:MTR`) carries; the harness
-/// supplies the matching sim device support under this name.
-const MOTOR_DTYP: &str = "simMotor";
+/// Boots in one process each get their own motor port: the axis registry is
+/// process-wide, as C's asyn port list is.
+static MOTOR_PORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A booted regression IOC: a shared database served by live CA + PVA servers.
 ///
@@ -89,33 +87,32 @@ impl RegressionIoc {
             std::env::set_var("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1");
         }
 
-        let macros = std::collections::HashMap::new();
-
-        // Motor device support: a sim driver + poll loop, handed to the db's
-        // motor record (DTYP `simMotor`) through a take-once dynamic factory.
+        // Motor device support: a sim driver + poll loop at axis 0 of
+        // `$(MPORT)`, which the db's motor record (DTYP `asynMotor`) names
+        // in its OUT.
+        let port = format!(
+            "REG_MTR{}",
+            MOTOR_PORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let macros = std::collections::HashMap::from([("MPORT".to_string(), port.clone())]);
         // io_intr_scan_independent drives the record on every readback even
         // though SCAN=Passive, which is exactly the v0.20.0 path under test.
         let motor: Arc<Mutex<dyn AsynMotor>> =
             Arc::new(Mutex::new(SimMotor::new().with_limits(-100.0, 100.0)));
-        let MotorSetup {
-            record: _,
-            device_support,
+        let AxisSetup {
+            axis,
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
+            .trace_user(motor_rs::trace::TraceUser::Asyn {
+                port: port.clone(),
+                addr: 0,
+            })
             .poll_interval(Duration::from_millis(50))
-            .build();
-        let device_support = device_support.with_dtyp_name(MOTOR_DTYP.to_string());
+            .build_axis();
+        motor_rs::devices::register_port(&port, motor_rs::devices::PortDriver::Controller, 1)?;
+        motor_rs::devices::register_axis(axis)?;
         tokio::spawn(poll_loop.run());
-        let motor_slot: Arc<Mutex<Option<Box<dyn DeviceSupport>>>> =
-            Arc::new(Mutex::new(Some(Box::new(device_support))));
-        let motor_factory = move |ctx: &DeviceSupportContext| -> Option<Box<dyn DeviceSupport>> {
-            if ctx.dtyp == MOTOR_DTYP {
-                motor_slot.lock().unwrap().take()
-            } else {
-                None
-            }
-        };
         let (motor_type, motor_record_factory) = motor_rs::motor_record_factory();
 
         // dbCa, which every C IOC links.
@@ -126,13 +123,16 @@ impl RegressionIoc {
                 epics_ca_rs::calink::calink_link_set_install(db, reactor)
             })
             .register_record_type(motor_type, motor_record_factory)
-            .register_dynamic_device_support(motor_factory)
+            .register_dynamic_device_support(
+                &motor_rs::devices::devices(),
+                motor_rs::devices::device_support_factory(),
+            )
             .db_string(db_text, &macros)?
             .build_served()
             .await?;
 
         // Arm motor polling after iocInit (C arms the poller post-PINI).
-        let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
+        let _ = poll_cmd_tx.try_send(PollCommand::ForcePoll);
 
         // Scanning is core-owned (C iocInit), not the servers': the scan
         // owner runs the PINI pass and the periodic scan-%g threads for

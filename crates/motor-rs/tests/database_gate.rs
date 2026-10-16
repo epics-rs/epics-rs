@@ -125,15 +125,11 @@ async fn user_limit_put_processes_with_implicit_get_info() {
 }
 
 #[tokio::test]
-async fn pid_gain_put_rides_its_pass_to_the_driver() {
-    // PCOF is NOT pp(TRUE) in C (special() forwards SET_PGAIN with no
-    // process pass), but motor-rs has no put-time driver channel: the
-    // SetPidGain command rides the process pass that follows the put.
-    // The motor pp entry therefore keeps PCOF as a special()-transport
-    // extension — this pins that the forward still reaches the device
-    // mailbox under the modeled gate.
-    let state = motor_rs::device_state::new_shared_state();
-    let mut rec = make_record(state.clone());
+async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
+    // PCOF is not pp(TRUE): C special() sends SET_PGAIN at put time.
+    let mut rec = make_record(motor_rs::device_state::new_shared_state());
+    let (port, mut sent) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     let db = PvDatabase::new();
     db.add_record("M1", Box::new(rec)).await.unwrap();
@@ -142,32 +138,25 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
         .await
         .unwrap();
 
-    let actions = state
-        .lock()
-        .unwrap()
-        .pending_actions
-        .take()
-        .expect("the transport pass writes the device mailbox");
-    assert!(
-        actions
-            .commands
-            .iter()
-            .any(|c| matches!(&c.command, MotorCommand::SetPidGain { .. })),
-        "SetPidGain forwarded through the put's process pass"
-    );
+    let batch = sent.try_recv().unwrap();
+    assert!(matches!(
+        batch.commands.as_slice(),
+        [q] if matches!(q.command, MotorCommand::SetPidGain { .. })
+    ));
 }
 
 /// Stands in for the poller thread: runs the driver commands the record
 /// passes queued.
 fn run_queued(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::poll_loop::QueuedCommand>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
     motor: &std::sync::Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>,
 ) {
-    while let Ok(commands) = rx.try_recv() {
+    while let Ok(batch) = rx.try_recv() {
         motor_rs::poll_loop::execute_commands(
             &mut *motor.lock().unwrap(),
-            &Default::default(),
-            &commands,
+            &batch.trace,
+            &batch.commands,
+            &mut |_| {},
         );
     }
 }
@@ -341,15 +330,11 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     );
 }
 
-/// A write parked before the first status pulse (autosave pass-1 restore,
-/// or a CA put in the init→first-poll window) must not turn that pulse
-/// into a command pass: the pulse anchors (Startup), the anchor leaves the
-/// parked target untouched, and the write replays as a real move on the
-/// pass the anchor's forced refresh queues. Pre-fix, the pulse was consumed
-/// as a put pass against an unanchored baseline and the following Startup
-/// synced the mid-flight readback into VAL/DVAL.
+/// The device init anchors the record (C init_record), so a put before
+/// the first status pulse is an ordinary put pass: C has no pre-anchor
+/// window, as init_record precedes any dbPutField.
 #[tokio::test]
-async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
+async fn a_put_before_the_first_pulse_moves_at_once() {
     use asyn_rs::error::AsynError;
     use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
     use asyn_rs::user::AsynUser;
@@ -459,34 +444,15 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         inst.device = Some(Box::new(dev));
     }
 
-    // Put BEFORE any status pulse processed: init() cleared the pass0
-    // latch, so this parks a fresh last_write — the pass-1/early-CA-put
-    // window. The put's own process pass consumes the init-seeded status
-    // (seq 1) as the ANCHOR, not as a put pass.
     db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
     run_queued(&mut motor_cmd_rx, &motor);
-
-    assert_eq!(
-        moves.load(Ordering::SeqCst),
-        0,
-        "the anchor pass must not dispatch the parked put"
-    );
+    assert_eq!(moves.load(Ordering::SeqCst), 1, "the put moves at once");
     assert_eq!(
         loads.load(Ordering::SeqCst),
         0,
-        "the anchor must not redefine the controller position"
-    );
-    assert_eq!(
-        db.get_pv("M1.VAL").unwrap(),
-        EpicsValue::Double(1.0),
-        "the anchor must not sync the parked target away"
-    );
-    assert_eq!(
-        db.get_pv("M1.DVAL").unwrap(),
-        EpicsValue::Double(1.0),
-        "the anchor must not sync the parked dial target away"
+        "the anchor kept the controller position"
     );
 
     let stamp = |seq: u64| {
@@ -494,22 +460,8 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
 
-    // The anchor's forced refresh queues the replay pass: the parked put
-    // now dispatches as an ordinary post-init move.
-    stamp(2);
-    let mut visited = epics_base_rs::server::database::ProcStack::new();
-    db.process_record_readback("M1", &mut visited)
-        .await
-        .unwrap();
-    run_queued(&mut motor_cmd_rx, &motor);
-    assert_eq!(
-        moves.load(Ordering::SeqCst),
-        1,
-        "the parked put replays as a real move after the anchor"
-    );
-
     // Completion pass: the axis landed on target.
-    stamp(3);
+    stamp(2);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await

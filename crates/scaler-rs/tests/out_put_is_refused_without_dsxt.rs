@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
-use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport;
 use scaler_rs::device_support::scaler_soft::SoftScalerDriver;
 
@@ -57,17 +57,19 @@ fn an_out_put_is_refused_silently_as_in_oracle_scaler_ioc() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (name, factory) = scaler_rs::scaler_record_factory();
-    register_device_row("scaler", &ASYN_SCALER);
     let (db, bridge) = rt.block_on(async {
         let (db, _) = IocBuilder::new()
             .register_record_type(name, factory)
-            .register_dynamic_device_support(|ctx| {
-                (ctx.dtyp == "Asyn Scaler").then(|| {
-                    Box::new(ScalerAsynDeviceSupport::new(Box::new(
-                        SoftScalerDriver::new(8),
-                    ))) as Box<dyn DeviceSupport>
-                })
-            })
+            .register_dynamic_device_support(
+                &[("scaler", std::slice::from_ref(&ASYN_SCALER))],
+                |ctx| {
+                    (ctx.dtyp == "Asyn Scaler").then(|| {
+                        Box::new(ScalerAsynDeviceSupport::new(Box::new(
+                            SoftScalerDriver::new(8),
+                        ))) as Box<dyn DeviceSupport>
+                    })
+                },
+            )
             .db_string(DB, &HashMap::new())
             .unwrap()
             .build()

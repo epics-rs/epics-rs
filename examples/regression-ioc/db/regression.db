@@ -254,11 +254,11 @@ record(ai, "REG:Q:AI") {
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a
 # Passive motor VAL actually drives the move; RBV converges, DMOV cycles".
-# Device support (sim driver + poll loop) is supplied by the harness, keyed on
-# DTYP "simMotor".
+# The harness creates the sim axis at port $(MPORT), address 0.
 record(motor, "REG:D:MTR") {
     field(DESC, "sim motor move-on-caput")
-    field(DTYP, "simMotor")
+    field(DTYP, "asynMotor")
+    field(OUT, "@asyn($(MPORT=REG_MTR),0)")
     field(SCAN, "Passive")
     field(VELO, "20.0")
     field(ACCL, "0.2")

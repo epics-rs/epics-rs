@@ -270,6 +270,8 @@ async fn test_poll_loop_lifecycle() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
     let device_state = motor_rs::device_state::new_shared_state();
+    // Past finishDevSup: each post is a pulse.
+    device_state.lock().unwrap().accept();
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
@@ -277,9 +279,12 @@ async fn test_poll_loop_lifecycle() {
             poll: poll_cmd_rx,
             commands: mpsc::unbounded_channel().1,
         },
-        io_intr_tx,
         motor,
-        device_state.clone(),
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers
+        },
         Duration::from_millis(5),
         Duration::from_millis(5),
         0,
@@ -288,7 +293,7 @@ async fn test_poll_loop_lifecycle() {
     let poll_handle = tokio::spawn(poll_loop.run());
 
     // Start polling
-    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
 
     // Wait for at least one io_intr notification
     let got_notification =
@@ -300,23 +305,10 @@ async fn test_poll_loop_lifecycle() {
 
     // Verify status was written
     {
-        let ds = device_state.lock().unwrap();
+        let mut ds = device_state.lock().unwrap();
+        ds.begin_callback_pass();
         assert!(ds.latest_status.is_some(), "status should be populated");
     }
-
-    // Stop polling
-    poll_cmd_tx.send(PollCommand::StopPolling).await.unwrap();
-
-    // Drain any in-flight notifications
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    while io_intr_rx.try_recv().is_ok() {}
-
-    // Verify no more notifications arrive
-    let no_notification = tokio::time::timeout(Duration::from_millis(50), io_intr_rx.recv()).await;
-    assert!(
-        no_notification.is_err(),
-        "should not receive notifications after StopPolling"
-    );
 
     // Shutdown
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
@@ -328,7 +320,7 @@ async fn test_poll_loop_lifecycle() {
 /// C `asynMotorController::asynMotorPoller` (asynMotorController.cpp:633-634)
 /// treats `idlePollPeriod_ == 0` as "block on the event, no timed poll". The
 /// Rust loop guards the `sleep(interval)` select arm on `!interval.is_zero()`,
-/// so with a settled (done, not-moving) motor StartPolling triggers exactly
+/// so with a settled (done, not-moving) motor ForcePoll triggers exactly
 /// one poll and the loop then blocks on the command channel. Without the guard
 /// `sleep(Duration::ZERO)` would fire immediately on every iteration, spinning
 /// the CPU and flooding io_intr.
@@ -345,9 +337,12 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
             poll: poll_cmd_rx,
             commands: mpsc::unbounded_channel().1,
         },
-        io_intr_tx,
         motor,
-        device_state.clone(),
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers
+        },
         Duration::from_millis(5),
         Duration::ZERO,
         0,
@@ -359,12 +354,12 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
     // channel and masks itself.
     tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
 
-    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
 
     // Give any erroneous busy-spin a 100ms window to accumulate polls.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // seq starts at 1 (init), +1 for the single StartPolling poll → 2.
+    // seq starts at 1 (init), +1 for the single ForcePoll poll → 2.
     // A busy-spin would drive it into the hundreds/thousands.
     let seq = device_state
         .lock()
@@ -375,7 +370,7 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
         .unwrap_or(0);
     assert_eq!(
         seq, 2,
-        "zero idle interval must poll once on StartPolling then block (event-only), got seq {seq}"
+        "zero idle interval must poll once on ForcePoll then block (event-only), got seq {seq}"
     );
 
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
@@ -386,7 +381,7 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
 /// must not re-post on every poll. C `asynMotorAxis::callParamCallbacks`
 /// (asynMotorAxis.cpp:316-322) fires the status callback — which drives the
 /// record's process() — only when `statusChanged_` is set; on an unchanging
-/// idle poll C posts nothing. A *forced* poll (StartPolling, the analogue of
+/// idle poll C posts nothing. A *forced* poll (ForcePoll, the analogue of
 /// C `motorUpdateStatus_` forcing `statusChanged_=1`) still posts even when the
 /// status is identical, so STUP/GET_INFO acks and readback refreshes are never
 /// stranded.
@@ -403,9 +398,12 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
             poll: poll_cmd_rx,
             commands: mpsc::unbounded_channel().1,
         },
-        io_intr_tx,
         motor,
-        device_state.clone(),
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers
+        },
         Duration::from_millis(5),
         Duration::from_millis(5),
         0,
@@ -425,8 +423,8 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
             .unwrap_or(0)
     };
 
-    // StartPolling forces one post → seq 1→2.
-    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    // ForcePoll forces one post → seq 1→2.
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         seq(&device_state),
@@ -434,9 +432,9 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
         "a stationary axis must not re-post on every idle poll (change-gated)"
     );
 
-    // A second StartPolling is a FORCED poll → re-posts even though the status
+    // A second ForcePoll is a FORCED poll → re-posts even though the status
     // is byte-identical → seq 2→3.
-    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
         seq(&device_state),
@@ -474,6 +472,9 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
         .device_support
         .io_intr_receiver()
         .expect("device support owns the io_intr receiver until iocInit wiring");
+    setup
+        .device_support
+        .bind_dev_sup_gate(&epics_base_rs::runtime::interrupt_accept::InterruptGate::opened());
     let poll_handle = tokio::spawn(setup.poll_loop.run());
 
     // Startup pass.
@@ -507,6 +508,7 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(100), io_intr_rx.recv()).await {
             Ok(Some(())) => {
+                setup.device_support.arm_readback_callback();
                 setup.record.process().unwrap();
                 if setup.record.stat.dmov && setup.record.stat.phase == MotionPhase::Idle {
                     completed = true;
@@ -535,6 +537,7 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), io_intr_rx.recv()).await {
             Ok(Some(())) => {
+                setup.device_support.arm_readback_callback();
                 setup.record.process().unwrap();
                 setup.device_support.write(&mut setup.record).unwrap();
                 if setup.record.stat.phase == MotionPhase::Jog {
@@ -834,6 +837,7 @@ async fn failed_poll_posts_comms_error_status() {
     }));
     let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
     let device_state = motor_rs::device_state::new_shared_state();
+    device_state.lock().unwrap().accept();
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
@@ -841,9 +845,12 @@ async fn failed_poll_posts_comms_error_status() {
             poll: poll_cmd_rx,
             commands: mpsc::unbounded_channel().1,
         },
-        io_intr_tx,
         motor,
-        device_state.clone(),
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers
+        },
         Duration::from_millis(5),
         Duration::from_millis(5),
         0,
@@ -853,7 +860,7 @@ async fn failed_poll_posts_comms_error_status() {
     // A healthy poll first, so the failure has a last-known status to carry
     // forward (C's parameter library keeps every field the failed poll never
     // wrote).
-    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(500), io_intr_rx.recv())
             .await
@@ -861,7 +868,8 @@ async fn failed_poll_posts_comms_error_status() {
         "the healthy poll must notify"
     );
     let (healthy_seq, healthy) = {
-        let ds = device_state.lock().unwrap();
+        let mut ds = device_state.lock().unwrap();
+        ds.begin_callback_pass();
         let s = ds.latest_status.clone().expect("status populated");
         (s.seq, s.status)
     };
@@ -872,10 +880,11 @@ async fn failed_poll_posts_comms_error_status() {
     offline.store(true, Ordering::SeqCst);
 
     let posted = wait_until(Duration::from_secs(2), || {
-        device_state
-            .lock()
-            .unwrap()
-            .latest_status
+        let mut ds = device_state.lock().unwrap();
+        while io_intr_rx.try_recv().is_ok() {
+            ds.begin_callback_pass();
+        }
+        ds.latest_status
             .as_ref()
             .is_some_and(|s| s.status.comms_error)
     })
@@ -1093,7 +1102,7 @@ async fn blocked_driver_does_not_stall_the_ioc_runtime() {
     // keeps serving its other tasks.
     setup
         .poll_cmd_tx
-        .send(PollCommand::StartPolling)
+        .send(PollCommand::ForcePoll)
         .await
         .unwrap();
     let start = Instant::now();
@@ -1203,7 +1212,7 @@ async fn bridge_spawned_poller_serves_moves_and_timed_polls() {
     setup.device_support.write(&mut setup.record).unwrap();
     setup
         .poll_cmd_tx
-        .send(PollCommand::StartPolling)
+        .send(PollCommand::ForcePoll)
         .await
         .unwrap();
 
@@ -1257,4 +1266,43 @@ async fn sim_motor_msta_at_rest_matches_motor_sim_driver() {
         let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
         let _ = poll_handle.await;
     }
+}
+
+/// C `asynMotorPoller` polls on its period from start-up and nothing a
+/// record does stops it (asynMotorController.cpp:615-696): with no request
+/// ever sent, a move only the driver knows of still reaches the record.
+#[tokio::test]
+async fn the_axis_polls_with_no_record_request() {
+    use motor_rs::device_state::{AxisSubscribers, new_shared_state};
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let subscribers = AxisSubscribers::new();
+    let state = new_shared_state();
+    state.lock().unwrap().accept();
+    let (io_intr_tx, mut io_intr) = mpsc::channel::<()>(64);
+    subscribers.attach(state.clone(), io_intr_tx);
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
+        motor.clone(),
+        subscribers,
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    while io_intr.try_recv().is_ok() {}
+
+    motor
+        .lock()
+        .unwrap()
+        .move_absolute(&asyn_rs::user::AsynUser::new(0), 0.2, 0.0, 100.0, 100.0)
+        .unwrap();
+    let posted = tokio::time::timeout(Duration::from_millis(500), io_intr.recv()).await;
+    assert!(posted.is_ok(), "a timed poll saw the move");
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
 }

@@ -11279,6 +11279,13 @@ BO_REC
     #[test]
     fn db_load_records_dtyp_macro_leaves_literal_dtyp_alone() {
         use std::io::Write;
+        static ROW: crate::server::record::DevSup = crate::server::record::DevSup {
+            name: "devScalerRs",
+            choice: "Scaler-rs",
+            link_type: crate::server::record::DbLinkType::Constant,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        };
+        crate::server::record::register_device_row("ai", &ROW);
 
         let (db, ctx) = make_ctx();
 

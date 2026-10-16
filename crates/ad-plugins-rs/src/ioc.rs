@@ -1194,9 +1194,13 @@ impl AdIoc {
         self.app = Some(app.register_device_support(record_type, devsup, factory));
     }
 
-    /// Register a dynamic device support factory (dispatches by context).
-    pub fn register_dynamic_device_support<F>(&mut self, factory: F)
-    where
+    /// Register a dynamic device support factory (dispatches by context) and
+    /// the `device()` lines it serves.
+    pub fn register_dynamic_device_support<F>(
+        &mut self,
+        devices: &[(&str, &'static [epics_base_rs::server::record::DevSup])],
+        factory: F,
+    ) where
         F: Fn(
                 &epics_ca_rs::server::ioc_app::DeviceSupportContext,
             ) -> Option<Box<dyn epics_base_rs::server::device_support::DeviceSupport>>
@@ -1205,7 +1209,7 @@ impl AdIoc {
             + 'static,
     {
         let app = self.app.take().unwrap();
-        self.app = Some(app.register_dynamic_device_support(factory));
+        self.app = Some(app.register_dynamic_device_support(devices, factory));
     }
 
     /// Keep a resource alive for the IOC's lifetime.

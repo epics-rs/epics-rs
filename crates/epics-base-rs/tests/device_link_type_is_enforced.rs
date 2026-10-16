@@ -291,18 +291,18 @@ async fn the_verdict_does_not_depend_on_the_order_the_db_spells_the_fields() {
     assert_eq!(link_text(&db, "INP"), "@");
 }
 
-/// The declaration is the `.dbd`'s, and where there is no `.dbd` there is no
-/// declaration to enforce. A DTYP registered at runtime by a downstream crate
-/// (`asynInt32` on an `ai`) appears in no vendored `device()` line, so the port
-/// has no `link_type` for it and invents none — it must not touch the link on a
-/// rule it cannot state.
+/// Every DTYP a `.db` can name has a `device()` line and so a link type: one
+/// no loaded line declares (`asynInt32` on an IOC without asyn) is refused
+/// before any link rule could apply.
 #[epics_macros_rs::epics_test]
-async fn a_dtyp_no_vendored_dbd_declares_carries_no_rule() {
-    let db = loads("    field(DTYP, \"asynInt32\")\n    field(INP, \"@asyn(PORT,0)VALUE\")")
-        .await
-        .expect("no vendored device() declares asynInt32, so there is no link type to enforce");
+async fn a_dtyp_no_device_line_declares_does_not_load() {
+    let built =
+        loads("    field(DTYP, \"asynInt32\")\n    field(INP, \"@asyn(PORT,0)VALUE\")").await;
+    assert!(
+        built.is_err(),
+        "no loaded device() declares asynInt32, so `dbPutString` refuses the DTYP"
+    );
     assert_eq!(refusal("asynInt32", "INP", "@asyn(PORT,0)VALUE"), None);
-    assert_eq!(link_text(&db, "INP"), "@asyn(PORT,0)VALUE");
 }
 
 /// The pass rewrites link text, so it owns re-deriving whatever a record

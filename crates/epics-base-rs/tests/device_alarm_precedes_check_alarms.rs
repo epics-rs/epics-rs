@@ -13,6 +13,7 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset};
 use epics_base_rs::types::EpicsValue;
 
 struct AlarmingDevice;
@@ -42,8 +43,14 @@ impl DeviceSupport for AlarmingDevice {
 
 #[epics_macros_rs::epics_test]
 async fn the_device_alarm_wins_an_equal_severity_tie() {
+    static ROW: DevSup = DevSup {
+        name: "devAlarmingRead",
+        choice: "alarmingRead",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[3], false),
+    };
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        .register_dynamic_device_support(&[("ai", std::slice::from_ref(&ROW))], |ctx: &DeviceSupportContext| {
             (ctx.dtyp == "alarmingRead").then(|| Box::new(AlarmingDevice) as Box<dyn DeviceSupport>)
         })
         .db_string(

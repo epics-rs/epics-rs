@@ -174,6 +174,9 @@ pub struct ScanControl {
     /// This database's `interruptAccept`, written only by `run`/`pause`/`stop`
     /// and the one source of "running": open ⟺ [`ScanCtl::Run`].
     gate: Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    /// Open from C `finishDevSup` on: when a dset's `init(after=1)` ran.
+    /// Never closes, and opens before `gate` can.
+    dev_sup: Arc<crate::runtime::interrupt_accept::InterruptGate>,
 }
 
 const SCAN_CTL_PAUSE: u8 = 2;
@@ -185,7 +188,19 @@ impl ScanControl {
             stopped_as: std::sync::atomic::AtomicU8::new(SCAN_CTL_PAUSE),
             claimed: std::sync::atomic::AtomicBool::new(false),
             gate: crate::runtime::interrupt_accept::InterruptGate::new(),
+            dev_sup: crate::runtime::interrupt_accept::InterruptGate::new(),
         }
+    }
+
+    /// The gate C's `finishDevSup` opens, for a device whose dset `init`
+    /// latches the `after` pass (devMotorAsyn's `dbScanLockOK`).
+    pub fn dev_sup_gate(&self) -> &Arc<crate::runtime::interrupt_accept::InterruptGate> {
+        &self.dev_sup
+    }
+
+    /// C `finishDevSup` (`iocInit.c:464`): every dset's `init(1)`.
+    pub fn finish_dev_sup(&self) {
+        self.dev_sup.set(true);
     }
 
     /// The `interruptAccept` of the database this cell belongs to; what a
@@ -239,6 +254,8 @@ impl ScanControl {
         // records that registered during iocInit.
         self.stopped_as
             .store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
+        // `iocBuild` runs `finishDevSup` before any `scanRun`.
+        self.finish_dev_sup();
         self.gate.set(true);
     }
 

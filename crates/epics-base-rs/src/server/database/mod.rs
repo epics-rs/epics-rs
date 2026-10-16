@@ -2404,7 +2404,16 @@ impl PvDatabase {
         // C `dbInitLink` adds a local CA link with `DBCA_CALLBACK_INIT_START`
         // (`dbLink.c:127-129`), which `dbCaRun` waits for. Registered as the
         // open is queued, so nothing the open does can report it first.
-        let local_ca = scheme == "ca" && self.has_name_no_resolve(body);
+        //
+        // Deviation: C's `dbChannelTest` passes a local name whose filter
+        // chain `dbChannelCreate` refuses, and `dbCaRun` then waits forever
+        // for a channel that never connects (C bug: iocInit hangs). Such a
+        // link is not waited for.
+        let local_ca = scheme == "ca"
+            && self.has_name_no_resolve(body)
+            && filters::split_channel_name(body)
+                .json_suffix
+                .is_none_or(|json| filters::try_parse_filter_chain(&json).is_ok());
         let staged = self.inner.link_puts.stage_open(
             link_put_queue::Channel {
                 scheme,

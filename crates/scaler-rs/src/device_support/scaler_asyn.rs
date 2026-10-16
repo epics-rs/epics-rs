@@ -9,6 +9,17 @@ use epics_base_rs::server::record::Record;
 
 use crate::records::scaler::{MAX_SCALER_CHANNELS, ScalerRecord};
 
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`:
+/// the menu row an IOC serving [`ScalerAsynDeviceSupport`] registers, so a
+/// `.db` may name it.
+pub static ASYN_SCALER_DEVICE: epics_base_rs::server::record::DevSup =
+    epics_base_rs::server::record::DevSup {
+        name: "devScalerAsyn",
+        choice: "Asyn Scaler",
+        link_type: epics_base_rs::server::record::DbLinkType::InstIo,
+        dset: epics_base_rs::server::record::Dset::new(7, &[2, 4, 5, 6], false),
+    };
+
 /// Asyn command strings for scaler drivers.
 pub const SCALER_RESET_COMMAND: &str = "SCALER_RESET";
 pub const SCALER_CHANNELS_COMMAND: &str = "SCALER_CHANNELS";

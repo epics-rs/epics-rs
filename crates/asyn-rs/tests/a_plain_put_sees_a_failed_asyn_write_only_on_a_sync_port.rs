@@ -6,6 +6,7 @@
 //! completing pass's -1 reaches nobody.
 #![cfg(feature = "epics")]
 
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
@@ -21,7 +22,23 @@ use epics_base_rs::server::record::ScanType;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 
-struct Failing(PortDriverBase);
+/// Holds a port's writes until opened, so a test can look at the record
+/// while its write is still queued.
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Gate {
+    fn open(&self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+    fn pass(&self) {
+        let (open, cv) = &*self.0;
+        let _open = cv.wait_while(open.lock().unwrap(), |o| !*o).unwrap();
+    }
+}
+
+struct Failing(PortDriverBase, Gate);
 
 impl PortDriver for Failing {
     fn base(&self) -> &PortDriverBase {
@@ -31,6 +48,7 @@ impl PortDriver for Failing {
         &mut self.0
     }
     fn write_float64(&mut self, _: &mut AsynUser, _: f64) -> AsynResult<()> {
+        self.1.pass();
         Err(AsynError::Status {
             status: AsynStatus::Error,
             message: "refused".into(),
@@ -38,8 +56,9 @@ impl PortDriver for Failing {
     }
 }
 
-/// An ao on a port whose every write fails, bound as `asynFloat64`.
-async fn ioc(port: &str, can_block: bool) -> PvDatabase {
+/// An ao on a port whose every write fails once `gate` opens, bound as
+/// `asynFloat64`.
+async fn ioc_gated(port: &str, can_block: bool, gate: Gate) -> PvDatabase {
     let mut base = PortDriverBase::new(
         port,
         1,
@@ -50,7 +69,7 @@ async fn ioc(port: &str, can_block: bool) -> PvDatabase {
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) =
-        create_port_runtime_unclaimed(Failing(base), RuntimeConfig::default()).unwrap();
+        create_port_runtime_unclaimed(Failing(base, gate), RuntimeConfig::default()).unwrap();
     let mut rec = AoRecord::new(0.0);
     let mut ads = AsynDeviceSupport::from_handle(
         runtime.port_handle().clone(),
@@ -76,6 +95,12 @@ async fn ioc(port: &str, can_block: bool) -> PvDatabase {
     db
 }
 
+async fn ioc(port: &str, can_block: bool) -> PvDatabase {
+    let gate = Gate::default();
+    gate.open();
+    ioc_gated(port, can_block, gate).await
+}
+
 #[epics_macros_rs::epics_test]
 async fn a_failed_write_on_a_sync_port_fails_the_plain_put() {
     let db = ioc("PSTAT_SYNC", false).await;
@@ -90,15 +115,27 @@ async fn a_failed_write_on_a_sync_port_fails_the_plain_put() {
 
 #[epics_macros_rs::epics_test]
 async fn a_failed_write_on_a_blocking_port_returns_zero_at_put_time() {
-    let db = ioc("PSTAT_BLOCK", true).await;
+    // Held, or the port thread may complete the record before it is read.
+    let gate = Gate::default();
+    let db = ioc_gated("PSTAT_BLOCK", true, gate.clone()).await;
     let put = db
         .put_record_field_from_ca_no_notify("A:AO", "VAL", EpicsValue::Double(1.0))
         .await;
     assert!(put.is_ok(), "the record went PACT: status 0, got {put:?}");
+    let processing = || db.get_record("A:AO").unwrap().read().is_processing();
     assert!(
-        db.get_record("A:AO").unwrap().read().is_processing(),
+        processing(),
         "the write is still queued when the put returns"
     );
+    gate.open();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while processing() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write never completed"
+        );
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 /// `dbNotify` never reads the status, sync port or not.

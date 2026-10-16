@@ -12,15 +12,7 @@ impl MotorRecord {
         // mailbox untouched — no status consume, no STUP ack, no delay
         // take. The io_intr pulse that announced a pending status or
         // delay expiry is already queued and triggers its own pass.
-        //
-        // The deferral applies only once the record is anchored: in C,
-        // init_record precedes any dbPutField pass (iocInit), so no put
-        // can exist before the anchor. A write parked before the first
-        // status pulse (an autosave pass-1 restore, or a CA put landing
-        // in the init→first-poll window) must NOT turn that pulse into a
-        // put pass — the pulse anchors (Startup) and the parked write
-        // replays on the pass the anchor's forced refresh queues.
-        if (self.last_write.is_some() || self.internal.res_reanchor) && self.initialized {
+        if self.last_write.is_some() || self.internal.res_reanchor {
             return None;
         }
         // Extract data from shared state, then drop the lock before mutating self
@@ -59,10 +51,6 @@ impl MotorRecord {
                 self.mark(m::STUP);
                 self.internal.stup_ack = true;
             }
-            if !self.initialized {
-                self.initialized = true;
-                return Some(MotorEvent::Startup);
-            }
             // Always apply readback even in Idle
             if self.stat.phase == MotionPhase::Idle {
                 self.process_motor_info(&status);
@@ -82,39 +70,13 @@ impl MotorRecord {
 
     /// Convert ProcessEffects to DeviceActions for the shared mailbox.
     pub(crate) fn effects_to_actions(&mut self, effects: &ProcessEffects) -> DeviceActions {
-        let poll = if effects.request_poll {
-            // An explicit poll request (move dispatch, LOAD_POS readback,
-            // retarget) wants a fresh status post — Refresh forces it through
-            // even if the polled status is unchanged.
-            PollDirective::Refresh
-        } else if effects.status_refresh {
-            // STUP / implicit GET_INFO / DELAY_ACK settle-resume. C's
-            // motorUpdateStatus_ forces statusChanged_=1 (asynMotorController
-            // .cpp:217-222) so the ack callback always fires and clears
-            // STUP=BUSY; Refresh is the analogue. A plain Start would dedup
-            // against the already-running poller and leave STUP stranded on a
-            // stationary axis whose status never changes.
-            PollDirective::Refresh
-        } else if effects.commands.is_empty() && effects.schedule_delay.is_none() && self.stat.dmov
-        {
-            // C asynMotorController::asynMotorPoller (asynMotorController.cpp:
-            // 615-696) is a while(1) that NEVER stops idle polling — it polls
-            // every idlePollPeriod_ when !anyMoving, so an external move / limit
-            // trip / encoder drift while the record is idle is still detected.
-            // The MIP_EXTERNAL detector (status_update.rs:239) and the idle-poll
-            // button resume (the Idle-arm dispatch_latent_collection) both
-            // depend on this poll. Keep the poller alive at the idle rate
-            // (effective_poll_interval returns idle_poll_interval once the
-            // completing poll cleared last_moving) instead of stopping it; Start
-            // is idempotent via the polling_active dedup while already polling,
-            // and resumes the poller after a settle delay (ScheduleDelay reset
-            // polling_active). The record intentionally never emits Stop — C has
-            // no record-driven poller stop; idle_poll_interval == 0 gives C's
-            // event-only idle mode (idlePollPeriod_ == 0) at the loop's timed arm.
-            PollDirective::Start
-        } else {
-            PollDirective::None
-        };
+        // An explicit poll request (move dispatch, LOAD_POS readback,
+        // retarget) or a status refresh (STUP / implicit GET_INFO /
+        // DELAY_ACK settle-resume) forces a post of even an unchanged
+        // status, as C's motorUpdateStatus_ does (asynMotorController.cpp:
+        // 217-222), so STUP=BUSY clears on a stationary axis. Nothing a
+        // record does stops the timed polls.
+        let force_poll = effects.request_poll || effects.status_refresh;
 
         let schedule_delay = effects.schedule_delay.map(|dur| {
             let id = self.next_delay_id;
@@ -131,7 +93,7 @@ impl MotorRecord {
                     mres: self.conv.mres,
                 })
                 .collect(),
-            poll,
+            force_poll,
             schedule_delay,
             status_refresh: effects.status_refresh,
         }
@@ -152,11 +114,8 @@ impl MotorRecord {
     /// init flag explicitly; the URIP RDBL scaling is gated `else if
     /// (urip==Yes && initcall==false)` (3682), so the init readback seeds RRBV
     /// from the motor position rather than the external link. The init path
-    /// (`device_support::init` + `initial_readback`) therefore calls
-    /// `process_motor_info_initcall(.., true)`. (An earlier Rust version gated
-    /// URIP on `self.initialized`, but `determine_event` flips that true
-    /// *before* dispatching the Startup readback, so the gate never skipped
-    /// the call that actually seeds DVAL/VAL.)
+    /// (`initial_readback`) therefore calls
+    /// `process_motor_info_initcall(.., true)`.
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
         self.process_motor_info_initcall(status, false);
     }
@@ -197,18 +156,18 @@ impl MotorRecord {
         // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
         // independent of UEIP (C rounds the count the asyn layer already
         // reports raw; the Rust EGU convention converts at the boundary,
-        // so the encoder scale is ERES whether or not the readback uses
-        // it). MRES is only a fallback for an invalid runtime ERES.
-        let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
-        if eres_valid {
-            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
-                (status.encoder_position / self.conv.eres + 0.5).floor(),
-            );
-        } else {
-            self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
-                (status.encoder_position / self.conv.mres + 0.5).floor(),
-            );
-        }
+        // with the ERES the driver was last given). MRES is only a fallback
+        // for an invalid ERES.
+        let valid = |res: f64| res.is_finite() && res != 0.0;
+        let eres_valid = valid(self.conv.eres);
+        let scale = match self.internal.drv_eres {
+            Some(eres) if valid(eres) => eres,
+            _ if eres_valid => self.conv.eres,
+            _ => self.conv.mres,
+        };
+        self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
+            (status.encoder_position / scale + 0.5).floor(),
+        );
 
         // RRBV depends on UEIP
         self.pos.rrbv = if self.conv.ueip {
@@ -458,7 +417,11 @@ impl MotorRecord {
         }
     }
 
-    /// Initial readback and position sync at startup.
+    /// C `init_record`'s device half (motorRecord.cc:646-733 with
+    /// devMotorAsyn.c `init_controller`), run from the device init and never
+    /// on a process pass: C processes a record only from its callbacks, and
+    /// a record on a missing axis never gets one. The commands it returns
+    /// are init_controller's writes.
     ///
     /// On entry `self.pos.dval` holds the autosave-restored target (or 0 if
     /// none). C: `devMotorAsyn.c::init_controller` consults RSTM to decide
@@ -469,6 +432,10 @@ impl MotorRecord {
         status: &asyn_rs::interfaces::motor::MotorStatus,
     ) -> ProcessEffects {
         let mut effects = ProcessEffects::default();
+        // No put precedes init_record in C: a pass-0 restore is a plain
+        // field write, not a move.
+        self.last_write = None;
+        self.finish_init();
 
         // Capture the autosaved target before the driver readback overwrites it.
         let autosaved_dval = self.pos.dval;
@@ -506,25 +473,14 @@ impl MotorRecord {
         } else {
             self.conv.mres / self.conv.eres
         };
+        self.internal.drv_eres = Some(if self.conv.eres == 0.0 {
+            self.conv.mres
+        } else {
+            self.conv.eres
+        });
         effects
             .commands
             .push(MotorCommand::InitEncoderRatio { ratio });
-
-        // A write parked before this anchor (an autosave pass-1 restore or
-        // a CA put in the init→first-poll window — a window C cannot have,
-        // since init_record precedes any dbPutField pass) means the drive
-        // triplet already carries that write's target, not saved state.
-        // Anchor the readback only: no RSTM decision (its DVAL input is
-        // gone, and a SetPosition to the parked target would redefine the
-        // axis to where the put asks it to MOVE), no drive-field sync (it
-        // would destroy the target), and no lasts anchoring (C anchors
-        // them to the pre-put values, which is what they still hold — an
-        // anchored-to-target lval would swallow the replay's val != lval
-        // change detection). The forced refresh queues the replay pass.
-        if self.last_write.is_some() {
-            effects.request_poll = true;
-            return effects;
-        }
 
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
@@ -579,7 +535,7 @@ impl MotorRecord {
         } else {
             self.trace().print(
                 asyn_rs::trace::TraceMask::FLOW,
-                crate::poll_loop::MOTOR_STATUS_REASON,
+                self.trace().status_reason(),
                 format_args!(
                     "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={autosaved_dval:.6}, rdbd={rdbd:.6}",
                     self.trace().record(),

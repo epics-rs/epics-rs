@@ -405,12 +405,8 @@ fn suggest_field(record_type: &str, name: &str, value: &str) -> Option<&'static 
 /// external static is not in it — which is why the name is an `Option`:
 /// validation does not need it, only the refusal wording does.
 ///
-/// `DBF_DEVICE` is deliberately not answered here. C's device menu is the
-/// record type's `device()` lines, so every DTYP a `.db` may name is in it; the
-/// port has a second channel — `IocBuilder::register_device_support` and
-/// `register_dynamic_device_support` — whose factories never reach
-/// `merged_device_menu`, so a valid `field(DTYP,"asynInt32")` is absent from
-/// the menu that would judge it.
+/// `DBF_DEVICE` is not answered here: its menu is `merged_device_menu`, judged
+/// by `device_arm` with C's own wording.
 ///
 /// `menuScan` is why the menu's NAME is looked up rather than carried on the
 /// declaration: its choices are the site's, resolved at run time, so the
@@ -418,8 +414,7 @@ fn suggest_field(record_type: &str, name: &str, value: &str) -> Option<&'static 
 fn load_menu_of(desc: &FieldDesc) -> Option<(Option<&'static str>, &'static [&'static str])> {
     use crate::server::record::shared_menu_choices;
 
-    // `DBF_DEVICE` stays out even when it carries a table: its channel is
-    // the device menu, and its C refusal is worded differently (see above).
+    // `DBF_DEVICE` stays out even when it carries a table (see above).
     if desc.declared_dbf != DbfCode::Menu
         && (desc.menu.is_none() || desc.declared_dbf == DbfCode::Device)
     {
@@ -556,18 +551,9 @@ pub(crate) fn field_name_refusal(
 /// field falls to the numeric arms. A menu whose NAME did not resolve — an
 /// externally-registered record type's own table — still validates against
 /// its choices; only the refusal wording loses the name C would print.
-/// DTYP is deliberately NOT judged here, and the omission is a decision
-/// rather than an oversight. C refuses a bad `field(DTYP,…)` during the
-/// `.db` parse, through `dbPutStringNum`'s own `DBF_DEVICE` branch
-/// (`dbStaticRun.c:499-501`), and words it its own way — `no such device
-/// support for '<record type>' record type`, NOT the menu wording this
-/// function builds. The port instead warns at `iocInit` from
-/// `wire_device_support` and lets the load succeed. Closing that gap needs a
-/// decision about when the device menu is considered CLOSED: C loads every
-/// `.dbd` before any `.db`, so `dbDeviceMenu` is complete at put time,
-/// whereas the port's `contributed_device_menu` is filled by downstream
-/// crates (asyn) AFTER the load — refusing here would fail a
-/// `field(DTYP,"asynInt32")` that works today.
+/// DTYP is judged against the record type's device menu
+/// ([`device_arm`]), which every device-support registration extends before
+/// a `.db` is read, as C loads every `.dbd` first.
 pub(crate) fn menu_value_refusal(
     record_type: &str,
     record_name: &str,
@@ -647,6 +633,7 @@ pub(crate) fn menu_value_refusal(
     }
     let probe = db_put_string_probe(value);
     let (writes, status, suggestion) = match load_menu_of(desc) {
+        _ if desc.declared_dbf == DbfCode::Device => device_arm(record_type, probe, value)?,
         Some((menu_name, choices)) => menu_arm(desc, field, menu_name, choices, probe, value)?,
         // Not a menu — or one that resolves no choice table. Either way the
         // numeric arms of the same C function decide it.
@@ -733,6 +720,36 @@ fn menu_arm(
     // (`dbStaticLib.c:2669-2708`), which is why the numeric refusals below
     // carry no suggestion.
     Some((writes, status, suggest_choice(choices, value)))
+}
+
+/// The `DBF_DEVICE` arm of `dbPutStringNum` (`dbStaticRun.c:484-512`): a
+/// choice of `record_type`'s device menu, or an index C bounds by
+/// `value > nChoice && nChoice > 0`, so `nChoice` itself and any index on a
+/// type without device support load.
+fn device_arm(
+    record_type: &str,
+    probe: &str,
+    value: &str,
+) -> Option<(Option<String>, &'static str, Option<String>)> {
+    use crate::types::c_parse::{self, NumericField};
+
+    let choices = crate::server::record::merged_device_menu(record_type);
+    if choices.contains(&probe) {
+        return None;
+    }
+    match c_parse::parse_auto_base_units_null(NumericField::UShort, probe) {
+        Some(EpicsValue::UShort(index)) => {
+            (!choices.is_empty() && usize::from(index) > choices.len() && index < u16::MAX)
+                .then_some((None, "Bad Field value", None))
+        }
+        _ => Some((
+            Some(format!(
+                "no such device support for '{record_type}' record type"
+            )),
+            "Illegal choice",
+            suggest_choice(&choices, value),
+        )),
+    }
 }
 
 /// The `errSymLookup` text of the `S_stdlib_*` statuses (`epicsStdlib.h:43-51`)
@@ -6489,6 +6506,66 @@ mod menu_refusal_tests {
         menu_value_refusal(rt, "R", field, value).and_then(|r| r.suggestion)
     }
 
+    /// C `dbPutStringNum`'s `DBF_DEVICE` arm (`dbStaticRun.c:484-512`), each
+    /// case measured on softIoc R7.0.10 (ai has five `device()` lines, calc
+    /// none).
+    #[test]
+    fn a_dtyp_is_judged_by_the_device_menu() {
+        let no_such = |rt: &str, rec: &str, value: &str| {
+            Some(format!(
+                "{ERL_ERROR}: Can't set '{rec}.DTYP' to '{value}' no such device support \
+                 for '{rt}' record type : Illegal choice"
+            ))
+        };
+        let bad_index = |rec: &str, value: &str| {
+            Some(format!(
+                "{ERL_ERROR}: Can't set '{rec}.DTYP' to '{value}'  : Bad Field value"
+            ))
+        };
+        for (rt, rec, value, expect) in [
+            (
+                "longin",
+                "li:x",
+                "EtherIP",
+                no_such("longin", "li:x", "EtherIP"),
+            ),
+            (
+                "ai",
+                "a1",
+                "Soft Chanel",
+                no_such("ai", "a1", "Soft Chanel"),
+            ),
+            (
+                "calc",
+                "c1",
+                "Soft Channel",
+                no_such("calc", "c1", "Soft Channel"),
+            ),
+            ("ai", "a3", "7", bad_index("a3", "7")),
+            ("ai", "a5", "1000", bad_index("a5", "1000")),
+            // `value > nChoice` refuses, so `nChoice` itself loads, and so
+            // does any index on a type with no menu, and `USHRT_MAX`.
+            ("ai", "a2", "2", None),
+            ("ai", "a7", "5", None),
+            ("ai", "a6", "65535", None),
+            ("calc", "c2", "0", None),
+            ("calc", "c3", "5", None),
+            ("ai", "a4", "", None),
+            ("ai", "a8", "Async Soft Channel", None),
+        ] {
+            assert_eq!(line(rt, rec, "DTYP", value), expect, "{rt} {rec} {value:?}");
+        }
+        assert_eq!(
+            hint("longin", "DTYP", "EtherIP").as_deref(),
+            Some("    Did you mean \"General Time\"?")
+        );
+        assert_eq!(
+            hint("ai", "DTYP", "Soft Chanel").as_deref(),
+            Some("    Did you mean \"Soft Channel\"?")
+        );
+        assert_eq!(hint("calc", "DTYP", "Soft Channel"), None);
+    }
+
     /// C `dbPutString` refuses ANY value still carrying a macro before it
     /// reaches the field-type switch (`dbStaticLib.c:2579-2585`), and
     /// `dbIsMacroOk` is `return(FALSE)` in the only definition base has
@@ -6758,9 +6835,14 @@ mod menu_refusal_tests {
         assert_eq!(hint("ai", "PREC", "not a number"), None);
         // `DBF_STRING` has a length check, not a parse.
         assert_eq!(line("ai", "R", "DESC", "anything at all"), None);
-        // `DBF_DEVICE`: the port's builder-registered device support never
-        // reaches the device menu, so the menu cannot judge a DTYP.
-        assert_eq!(line("ai", "R", "DTYP", "Soft Chanel"), None);
+        // `DBF_DEVICE` has its own wording (`dbStaticRun.c:499-501`).
+        assert_eq!(
+            line("ai", "R", "DTYP", "Soft Chanel"),
+            Some(format!(
+                "{ERL_ERROR}: Can't set 'R.DTYP' to 'Soft Chanel' no such device support \
+                 for 'ai' record type : Illegal choice"
+            ))
+        );
     }
 
     /// C `dbPutStringSuggest` (`dbStaticLib.c:2665-2708`), measured on the

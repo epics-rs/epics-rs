@@ -1,14 +1,15 @@
 mod command_planner;
 pub mod dbd_generated;
 mod field_access;
+pub(crate) use field_access::motor_failed_dset_init;
 mod state_machine;
 mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDesc, FieldIx, MonitorValueClasses, MonitorValueGate,
-    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, RecordProcessResult,
-    ResolvedInputLinks, parse_link_v2,
+    ParsedLink, ProcessAction, ProcessActions, ProcessOutcome, Record, ResolvedInputLinks,
+    parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -43,15 +44,14 @@ pub struct MotorRecord {
     trace: std::sync::Arc<crate::trace::MotorTrace>,
     /// Track which field was last written (for process)
     last_write: Option<CommandSource>,
-    /// One-shot request from a runtime JVEL put: re-emit the jog command
-    /// with the new JVEL/JAR if a jog is active when the put's process
-    /// pass runs (C special() motorRecordJVEL, motorRecord.cc:3059-3072).
-    jog_retune_pending: bool,
+    /// Where `special()`'s driver commands go, from the device init on.
+    port: Option<crate::device_support::CommandPort>,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
     /// Last seen status sequence number
     last_seen_seq: u64,
-    /// Whether initial readback has been performed
+    /// Whether `init_record`'s device half ran, which in C ends in
+    /// `monitor()` and its alarm reset.
     initialized: bool,
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
@@ -138,37 +138,26 @@ static MONITOR_FIELDS: [&str; 44] = [
     "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM", "CNEN",
 ];
 
-/// Each [`MONITOR_FIELDS`] entry's `monitor_mask` row in [`MONITOR_POSTS`] —
-/// the mark bit it posts from — so a pass posts its marks in C's order.
-static MONITOR_ORDER: [u8; 44] = {
-    const fn same(a: &str, b: &str) -> bool {
-        let (a, b) = (a.as_bytes(), b.as_bytes());
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut i = 0;
-        while i < a.len() {
-            if a[i] != b[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-    let mut order = [0; 44];
-    let mut i = 0;
-    while i < MONITOR_FIELDS.len() {
-        let mut row = 0;
-        while !(matches!(MONITOR_POSTS_NAMED[row].1, CyclePostMask::MonitorValueLog)
-            && same(MONITOR_POSTS_NAMED[row].0, MONITOR_FIELDS[i]))
-        {
-            row += 1;
-        }
-        order[i] = row as u8;
-        i += 1;
-    }
-    order
-};
+/// The fields C posts outside `monitor()`: devMotorAsyn's RMP/REP/RVEL
+/// (devMotorAsyn.c:456-473), `range_check` and the PID clamp
+/// (motorRecord.cc:4377, 3025), and the literal posts of `special()` and
+/// `process()`. C posts no other field from a process.
+const CHANGE_POSTED: [&str; 25] = [
+    "ACCL", "ACCS", "BACC", "BVEL", "DCOF", "FOFF", "FRAC", "HVEL", "ICOF", "JVEL", "NTMF", "PCOF",
+    "RDBD", "REP", "RMP", "RVEL", "S", "SBAK", "SET", "SMAX", "SYNC", "TWF", "TWR", "URIP", "VMAX",
+];
+
+/// [`MONITOR_FIELDS`] in their post order, then every other motor field but
+/// RBV, the deadband field, and [`CHANGE_POSTED`]: CDIR, LVAL and the other
+/// fields C never posts stay silent however a process changes them.
+static POSTED_ONLY_WHEN_MARKED: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let never = dbd_generated::MOTOR_FIELDS.iter().map(|field| field.name);
+        let never = never.filter(|name| {
+            *name != "RBV" && !CHANGE_POSTED.contains(name) && !MONITOR_FIELDS.contains(name)
+        });
+        MONITOR_FIELDS.iter().copied().chain(never).collect()
+    });
 
 impl Default for MotorRecord {
     fn default() -> Self {
@@ -189,7 +178,7 @@ impl Default for MotorRecord {
             pending_event: None,
             trace: Default::default(),
             last_write: None,
-            jog_retune_pending: false,
+            port: None,
             device_state: None,
             last_seen_seq: 0,
             initialized: false,
@@ -255,16 +244,33 @@ impl MotorRecord {
     }
 
     /// Set a pending event for the next process() call.
-    pub fn set_event(&mut self, event: MotorEvent) {
-        self.pending_event = Some(event);
+    /// The port `special()` sends through from now on.
+    pub fn set_command_port(&mut self, port: crate::device_support::CommandPort) {
+        self.port = Some(port);
     }
 
-    /// Clear any pending write command source.
-    ///
-    /// Called by device support init() so that pass0-restored field values
-    /// are not interpreted as move commands during PINI processing.
-    pub fn clear_last_write(&mut self) {
-        self.last_write = None;
+    /// C `special()`'s `SEND_MSG`: queued at put time, with no process. A
+    /// record with no device support has nowhere to send.
+    pub(crate) fn send_special(&self, commands: Vec<MotorCommand>) {
+        if let Some(port) = &self.port {
+            let mres = self.conv.mres;
+            port.send(
+                commands
+                    .into_iter()
+                    .map(|command| crate::poll_loop::QueuedCommand { command, mres })
+                    .collect(),
+            );
+        }
+    }
+
+    /// C `init_record` ran to its closing `monitor()`: devMotorAsyn's
+    /// `bad:` arm returns 0, so a record it parks still gets there.
+    pub(crate) fn finish_init(&mut self) {
+        self.initialized = true;
+    }
+
+    pub fn set_event(&mut self, event: MotorEvent) {
+        self.pending_event = Some(event);
     }
 
     /// C do_work collection gate (motorRecord.cc:1994): `omsl ==
@@ -279,10 +285,8 @@ impl MotorRecord {
     /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
     /// pass0 — i.e. autosave restored a saved position.
     ///
-    /// Device support `init()` uses this to decide whether to reseed the
-    /// controller with the restored DVAL. It MUST be queried before
-    /// [`clear_last_write`](Self::clear_last_write), which device support
-    /// calls later in `init()`.
+    /// It reads true only before [`initial_readback`](Self::initial_readback),
+    /// which drops the write.
     ///
     /// This is the correct "was a position restored" signal: a genuine
     /// restored position of exactly `0.0` is indistinguishable from the
@@ -366,37 +370,13 @@ impl MotorRecord {
         bits
     }
 
-    /// The move-start pass's posts: what its `monitor()` would post from the
-    /// marks, RBV through the deadband when marked.
-    /// `process_motor_info`'s UEIP precedes `monitor()`, whose RBV block
-    /// precedes the rest.
-    fn monitor_notify_fields(&mut self) -> Vec<FieldIx> {
-        let rbv = self.internal.mmap & m::RBV != 0;
-        let bits = self.take_monitor_marks() & (m::MONITOR | m::CNEN);
-        let mut fields = Vec::new();
-        let mut post = |row: usize| fields.push(MONITOR_POSTS[row].0);
-        if bits & m::UEIP_POSTED != 0 {
-            post(m::UEIP_POSTED.trailing_zeros() as usize);
-        }
-        if rbv {
-            self.internal.mmap |= m::RBV;
-            post(m::RBV.trailing_zeros() as usize);
-        }
-        for &row in &MONITOR_ORDER {
-            if bits & 1 << row != 0 {
-                post(usize::from(row));
-            }
-        }
-        fields
-    }
-
     /// Fire the readback output link (RLNK) with the current RBV.
     ///
     /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
     /// unconditionally just before `process_exit` on every process pass, so a
     /// record wired through RLNK re-processes whenever the motor record does.
     /// We mirror that by emitting a `WriteDbLink` on every process cycle,
-    /// including the move-start `AsyncPendingNotify` (DMOV 1→0) pass: C fires
+    /// including the move-start (DMOV 1→0) pass: C fires
     /// `dbPutLink` before `monitor()` (motorRecord.cc:1507) and before the
     /// `recGblFwdLink` gate (motorRecord.cc:1509), so it runs even while the
     /// move is still pending. A `dbPutLink` processes a PP readback target even
@@ -459,9 +439,6 @@ impl Record for MotorRecord {
         }
 
         let effects = self.do_process();
-        // DMOV=0 means a move started (or sub-step pulse).
-        // Flush DMOV=0 even if no commands were emitted (sub-step case).
-        let move_started = !self.stat.dmov;
 
         // Write effects to shared mailbox for DeviceSupport.write() to consume.
         // If a previous batch has not been consumed yet (two process() cycles
@@ -470,6 +447,7 @@ impl Record for MotorRecord {
         if let Some(state) = self.device_state.clone() {
             let actions = self.effects_to_actions(&effects);
             if let Ok(mut ds) = state.lock() {
+                ds.set_comm_alarm(self.internal.comm_alarm);
                 match ds.pending_actions.take() {
                     Some(mut prev) => {
                         prev.merge_newer(actions);
@@ -480,39 +458,14 @@ impl Record for MotorRecord {
             }
         }
 
-        if move_started && !self.internal.dmov_notified {
-            // First DMOV 1→0 transition: flush immediately so monitors see
-            // the transition before the move completes.
-            self.internal.dmov_notified = true;
-            // The pass's `monitor()` (motorRecord.cc:1507), from its marks.
-            let fields = self.monitor_notify_fields();
-            // C fires `dbPutLink(&rlnk, ...)` (motorRecord.cc:1495) on this
-            // move-start pass too — before `monitor()` and the `recGblFwdLink`
-            // gate — so the RLNK readback target still re-processes while the
-            // move is pending.
-            let mut actions = Vec::new();
-            self.push_readback_link_write(&mut actions);
-            Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(fields),
-                actions,
-                device_did_compute: false,
-                // DMOV stays a `process()` store: C reads it back at
-                // `motorRecord.cc:1509-1510` to gate `recGblFwdLink`, so it is
-                // an input to a later decision in the same cycle, not a
-                // completion flag published after the writes.
-                post_write_fields: Vec::new(),
-                status: Ok(()),
-            })
-        } else {
-            // Ongoing motion or idle: the cycle's monitor() posts the marks.
-            if !move_started {
-                self.internal.dmov_notified = false;
-            }
-            self.internal.monitor_due = true;
-            let mut outcome = ProcessOutcome::complete();
-            self.push_readback_link_write(&mut outcome.actions);
-            Ok(outcome)
-        }
+        // Every pass, the move-start one included, ends in C process_exit
+        // (motorRecord.cc:1503-1510): alarm_sub and monitor()'s
+        // recGblResetAlarms run whatever DMOV is; only recGblFwdLink, and with
+        // it put-notify completion, waits for DMOV (should_fire_forward_link).
+        self.internal.monitor_due = true;
+        let mut outcome = ProcessOutcome::complete();
+        self.push_readback_link_write(&mut outcome.actions);
+        Ok(outcome)
     }
 
     /// C process_exit (motorRecord.cc:1509-1510): `if (dmov != 0)
@@ -752,7 +705,7 @@ impl Record for MotorRecord {
 
     /// C `monitor()` posts from `mmap`/`nmap`, never on a value change.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
-        &MONITOR_FIELDS
+        &POSTED_ONLY_WHEN_MARKED
     }
 
     /// The cycle's `monitor()` drains the marks; a put drains the literal
@@ -833,10 +786,26 @@ impl Record for MotorRecord {
         false
     }
 
+    /// C `init_record` ends in `monitor()`, whose `recGblResetAlarms`
+    /// (motorRecord.cc:3466) leaves `NO_ALARM`.
+    fn init_resets_alarms(&self) -> bool {
+        self.initialized
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
     fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        self.alarm_sub(common);
+        // No later alarm displaces an INVALID one: a COMM_ALARM nsta here
+        // is the stat this pass commits.
+        self.internal.comm_alarm =
+            common.nsta == epics_base_rs::server::recgbl::alarm_status::COMM_ALARM;
+    }
+}
+
+impl MotorRecord {
+    fn alarm_sub(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
         use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
         use epics_base_rs::server::record::AlarmSeverity;
 
@@ -900,6 +869,18 @@ mod tests {
     use epics_base_rs::server::record::{FieldDeclaration, field_at};
 
     use super::*;
+
+    /// A put processes the record exactly where motorRecord.dbd says
+    /// pp(TRUE): PCOF/ICOF/DCOF/JVEL send from special() without one.
+    #[test]
+    fn the_puts_that_process_are_the_dbd_pp_set() {
+        let dbd: Vec<&str> = dbd_generated::MOTOR_FIELDS
+            .iter()
+            .filter(|f| f.pp)
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(MotorRecord::new().process_passive_fields(), dbd);
+    }
 
     #[test]
     fn test_set_mode_updates_offset() {
@@ -977,21 +958,15 @@ mod tests {
     // C motorRecord.cc:1495 fires `dbPutLink(&rlnk, ...)` on the move-start
     // pass too — before `monitor()` (motorRecord.cc:1507) and the
     // `recGblFwdLink` gate (motorRecord.cc:1509) — so the RLNK readback
-    // target re-processes even while the move is still pending. The framework
-    // executes the emitted WriteDbLink on the AsyncPendingNotify branch.
+    // target re-processes even while the move is still pending.
     #[test]
-    fn rlnk_readback_link_fired_on_move_start_async_pending() {
+    fn rlnk_readback_link_fired_on_move_start() {
         let mut rec = MotorRecord::new();
         rec.links.rlnk = "readback_sink.PROC".into();
-        // Enter a move: DMOV goes true→false. The first process() of a fresh
-        // move returns the intermediate DMOV=0 notification.
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
         let outcome = rec.process().unwrap();
-        assert!(
-            matches!(outcome.result, RecordProcessResult::AsyncPendingNotify(_)),
-            "first process() of a fresh move must be the move-start notification"
-        );
+        assert!(!rec.stat.dmov, "the pass started the move");
         let rbv = rec.pos.rbv;
         assert!(
             outcome.actions.iter().any(|a| matches!(
@@ -1001,7 +976,7 @@ mod tests {
                     value: EpicsValue::Double(v),
                 } if *v == rbv
             )),
-            "the move-start AsyncPendingNotify cycle must still emit the RLNK readback write"
+            "the move-start cycle must still emit the RLNK readback write"
         );
     }
 
@@ -1031,13 +1006,11 @@ mod tests {
         rec.retry.rcnt = 2;
         rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
         rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
-        let outcome = rec.process().unwrap();
-        let RecordProcessResult::AsyncPendingNotify(fields) = outcome.result else {
-            panic!("first process() of a fresh move must be the move-start notification");
-        };
-        let fields: Vec<(&str, EpicsValue)> = fields
-            .into_iter()
-            .map(|ix| {
+        rec.process().unwrap();
+        assert!(!rec.stat.dmov, "the pass started the move");
+        let fields: Vec<(&str, EpicsValue)> = rec
+            .take_cycle_posted_fields()
+            .map(|(ix, _)| {
                 let name = field_at(dbd_generated::MOTOR_FIELDS, ix).unwrap().name;
                 (name, rec.get_field(name).unwrap())
             })
@@ -1201,49 +1174,32 @@ mod tests {
         );
     }
 
-    // R61: a settled-idle record keeps the poller alive (Start), never Stop.
-    // C asynMotorController::asynMotorPoller (asynMotorController.cpp:615-696)
-    // is a while(1) that never stops idle polling, so the MIP_EXTERNAL detector
-    // and the idle-poll button resume keep firing. Pre-R61 the settled pass
-    // emitted PollDirective::Stop, stranding both end-to-end.
-    #[test]
-    fn settled_idle_keeps_poller_alive_not_stopped() {
-        let mut rec = MotorRecord::new();
-        rec.stat.dmov = true;
-        // No commands, no schedule_delay, no request_poll / status_refresh.
-        let effects = ProcessEffects::default();
-        let actions = rec.effects_to_actions(&effects);
-        assert_eq!(
-            actions.poll,
-            PollDirective::Start,
-            "a settled idle record must keep the poller alive, not stop it"
-        );
-    }
-
     // An explicit refresh request (request_poll / status_refresh — STUP,
-    // implicit GET_INFO, settle-resume) must emit PollDirective::Refresh, the
-    // forced-post directive (C motorUpdateStatus_ forces statusChanged_=1), not
-    // the deduped keep-alive Start — otherwise STUP=BUSY strands on a stationary
-    // axis whose status never changes.
+    // implicit GET_INFO, settle-resume) forces the post (C motorUpdateStatus_
+    // forces statusChanged_=1); otherwise STUP=BUSY strands on a stationary
+    // axis whose status never changes. A settled pass asks for nothing.
     #[test]
     fn refresh_request_forces_poll_directive() {
         let mut rec = MotorRecord::new();
+        rec.stat.dmov = true;
+        assert!(
+            !rec.effects_to_actions(&ProcessEffects::default())
+                .force_poll
+        );
         let status_refresh = ProcessEffects {
             status_refresh: true,
             ..Default::default()
         };
-        assert_eq!(
-            rec.effects_to_actions(&status_refresh).poll,
-            PollDirective::Refresh,
+        assert!(
+            rec.effects_to_actions(&status_refresh).force_poll,
             "status_refresh must force a poll"
         );
         let request_poll = ProcessEffects {
             request_poll: true,
             ..Default::default()
         };
-        assert_eq!(
-            rec.effects_to_actions(&request_poll).poll,
-            PollDirective::Refresh,
+        assert!(
+            rec.effects_to_actions(&request_poll).force_poll,
             "request_poll must force a poll"
         );
     }

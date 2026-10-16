@@ -4,16 +4,24 @@ use std::time::Duration;
 use asyn_rs::interfaces::motor::AsynMotor;
 use tokio::sync::mpsc;
 
-use crate::device_state::{self, SharedDeviceState};
-use crate::device_support::MotorDeviceSupport;
+use crate::device_state::AxisSubscribers;
+use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::{MotorPollLoop, PollCommand, PollerInbox};
 use crate::record::MotorRecord;
-use crate::trace::{MotorTrace, TraceUser};
+use crate::trace::TraceUser;
 
 /// Assembled motor components ready for use.
 pub struct MotorSetup {
     pub record: MotorRecord,
     pub device_support: MotorDeviceSupport,
+    pub poll_loop: MotorPollLoop,
+    pub poll_cmd_tx: mpsc::Sender<PollCommand>,
+}
+
+/// An axis and its poller, for a create command to register; records bind
+/// it at init through [`MotorAxis::attach`].
+pub struct AxisSetup {
+    pub axis: MotorAxis,
     pub poll_loop: MotorPollLoop,
     pub poll_cmd_tx: mpsc::Sender<PollCommand>,
 }
@@ -48,7 +56,8 @@ impl MotorBuilder {
     }
 
     /// The asyn user the axis's trace lines print on: C's `pasynUser`
-    /// `(port, addr)`, or [`TraceUser::Model1`] for a model-1 driver.
+    /// `(port, addr)` on a model-3 or model-2 driver, or
+    /// [`TraceUser::Model1`] for a model-1 one.
     pub fn trace_user(mut self, user: TraceUser) -> Self {
         self.user = user;
         self
@@ -90,40 +99,51 @@ impl MotorBuilder {
         self
     }
 
-    pub fn build(self) -> MotorSetup {
-        let device_state: SharedDeviceState = device_state::new_shared_state();
+    /// The axis and its poller, with no record bound.
+    pub fn build_axis(mut self) -> AxisSetup {
+        self.configure_record = None;
         let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(self.poll_channel_capacity);
-
-        let mut record = MotorRecord::new().with_device_state(device_state.clone());
-        if let Some(configure) = self.configure_record {
-            configure(&mut record);
-        }
-
         let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
-        let trace = Arc::new(MotorTrace::with_user(self.user));
-        let device_support = MotorDeviceSupport::new(
-            trace.clone(),
+        let subscribers = AxisSubscribers::new();
+        let axis = MotorAxis::new(
+            self.user,
             self.timeout,
             poll_cmd_tx.clone(),
             motor_cmd_tx,
-            device_state.clone(),
+            subscribers.clone(),
         );
-
-        let io_intr_tx = device_support.io_intr_sender();
         let poll_loop = MotorPollLoop::new(
             PollerInbox {
                 poll: poll_cmd_rx,
                 commands: motor_cmd_rx,
             },
-            io_intr_tx,
             self.motor,
-            device_state,
+            subscribers,
             self.moving_poll_interval,
             self.idle_poll_interval,
             self.forced_fast_polls,
-        )
-        .with_trace(trace);
+        );
+        AxisSetup {
+            axis,
+            poll_loop,
+            poll_cmd_tx,
+        }
+    }
 
+    /// One record bound to a fresh axis.
+    pub fn build(mut self) -> MotorSetup {
+        let configure_record = self.configure_record.take();
+        let AxisSetup {
+            axis,
+            poll_loop,
+            poll_cmd_tx,
+        } = self.build_axis();
+        let device_support = axis.attach();
+        let mut record =
+            MotorRecord::new().with_device_state(device_support.device_state().clone());
+        if let Some(configure) = configure_record {
+            configure(&mut record);
+        }
         MotorSetup {
             record,
             device_support,

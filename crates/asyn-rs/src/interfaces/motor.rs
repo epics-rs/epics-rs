@@ -96,6 +96,36 @@ pub enum PidGainKind {
     Derivative,
 }
 
+/// A [`MotorStatus`] field a write method set, C `asynMotorAxis::
+/// setDoubleParam` / `setIntegerParam` on a `status_` member
+/// (asynMotorAxis.cpp:250-300) or a model-2 driver's `motorParam->set*`,
+/// for the poller to post after the write.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatusWrite {
+    Position(f64),
+    EncoderPosition(f64),
+    Done(bool),
+    PowerOn(bool),
+    Problem(bool),
+    /// `motorAxisDirection`, which model-2 moves set before they post
+    /// (drvEnsembleAsyn.cc:537, drvANC150Asyn.cc:453).
+    Direction(bool),
+}
+
+impl StatusWrite {
+    /// Write the field into `status`.
+    pub fn apply(self, status: &mut MotorStatus) {
+        match self {
+            StatusWrite::Position(v) => status.position = v,
+            StatusWrite::EncoderPosition(v) => status.encoder_position = v,
+            StatusWrite::Done(v) => status.done = v,
+            StatusWrite::PowerOn(v) => status.powered = v,
+            StatusWrite::Problem(v) => status.problem = v,
+            StatusWrite::Direction(v) => status.direction = v,
+        }
+    }
+}
+
 /// Motor interface trait.
 ///
 /// Provides motor axis control for motor-capable drivers.
@@ -216,6 +246,14 @@ pub trait AsynMotor: Send + Sync {
 
     /// Poll the motor for current status.
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
+
+    /// The status fields the write method just called set, in order. The
+    /// poller drains this after every write and posts the result when it
+    /// changed the status, as `callParamCallbacks` ends every C
+    /// `asynMotorController` write. None by default.
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        Vec::new()
+    }
 
     /// Initialize profile move with maximum number of points.
     fn initialize_profile(&mut self, _user: &AsynUser, _max_points: usize) -> AsynResult<()> {

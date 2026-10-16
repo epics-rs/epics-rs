@@ -4,6 +4,8 @@
 //! applied before the output stage, so it was the previous write's, and an
 //! INVALID one vetoed the write under IVOA "Don't drive outputs".
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +15,7 @@ use epics_base_rs::server::device_support::{DeviceAlarm, DeviceReadOutcome, Devi
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::EpicsValue;
 
 /// Each write leaves the alarm of that write: WRITE at the written VAL as
@@ -54,8 +56,12 @@ impl DeviceSupport for AlarmingWrite {
 async fn an_output_raises_the_alarm_of_this_cycles_write() {
     let writes = Arc::new(AtomicUsize::new(0));
     let w = Arc::clone(&writes);
+    let devices = [(
+        "ao",
+        declared_rows::rows(&["alarmingWrite"], DbLinkType::Constant),
+    )];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
+        .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
             (ctx.dtyp == "alarmingWrite").then(|| {
                 Box::new(AlarmingWrite {
                     writes: Arc::clone(&w),

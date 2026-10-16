@@ -3,6 +3,8 @@
 //! derives them after the constant DOL load. softIoc reads the bits below.
 //! A runtime Bx put folds into VAL from mbboDirect's after-put special.
 
+mod probe_rows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,16 +45,19 @@ impl DeviceSupport for Probe {
 
 async fn ioc(db: &str) -> Arc<PvDatabase> {
     IocBuilder::new()
-        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-            let (outcome, raw) = match ctx.dtyp {
-                "probeLive" => (Some(DeviceInitOutcome::ok()), None),
-                "probeDead" => (Some(DeviceInitOutcome::dead()), None),
-                "probeErr" => (None, None),
-                "probeRaw" => (Some(DeviceInitOutcome::ok()), Some(58 & 60)),
-                _ => return None,
-            };
-            Some(Box::new(Probe(outcome, raw)) as Box<dyn DeviceSupport>)
-        })
+        .register_dynamic_device_support(
+            &probe_rows::devices(&["mbbiDirect", "mbboDirect"]),
+            |ctx: &DeviceSupportContext| {
+                let (outcome, raw) = match ctx.dtyp {
+                    "probeLive" => (Some(DeviceInitOutcome::ok()), None),
+                    "probeDead" => (Some(DeviceInitOutcome::dead()), None),
+                    "probeErr" => (None, None),
+                    "probeRaw" => (Some(DeviceInitOutcome::ok()), Some(58 & 60)),
+                    _ => return None,
+                };
+                Some(Box::new(Probe(outcome, raw)) as Box<dyn DeviceSupport>)
+            },
+        )
         .db_string(db, &HashMap::new())
         .unwrap()
         .build()

@@ -13,8 +13,8 @@
 //!     `devBiSoftRaw.c:44`) vs the per-cycle link read (masked).
 //!   - output dset per record type: ao/bo (raw word, unmasked) and
 //!     mbbo/mbboDirect (`rval & mask`).
-//!   - record type with NO SoftRaw dset in C (longin/longout): the DTYP must
-//!     fall back to the VAL-direct soft path, not drop the value.
+//!   - record type with NO SoftRaw dset in C (longin/longout): the DTYP is
+//!     not in its device menu, so the `.db` is refused.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -56,7 +56,6 @@ record(longout, "DST:BO")   { field(VAL, "0") }
 record(longout, "DST:MBBO") { field(VAL, "0") }
 record(longout, "DST:MBBO:SHFT") { field(VAL, "0") }
 record(longout, "DST:MBBOD"){ field(VAL, "0") }
-record(longout, "DST:LO")   { field(VAL, "0") }
 
 record(ao, "RAO") {
     field(DTYP, "Raw Soft Channel")
@@ -84,14 +83,6 @@ record(mbboDirect, "RMBOD") {
     field(OUT, "DST:MBBOD")
 }
 
-record(longin, "RLI") {
-    field(DTYP, "Raw Soft Channel")
-    field(INP, "SRC")
-}
-record(longout, "RLO") {
-    field(DTYP, "Raw Soft Channel")
-    field(OUT, "DST:LO")
-}
 "#;
 
 async fn ioc() -> Arc<PvDatabase> {
@@ -280,18 +271,21 @@ async fn mbbo_direct_raw_soft_channel_nobt_zero_passes_whole_raw_word() {
 
 // ---- the dset table is the source of truth ----
 
-/// C ships NO `devLonginSoftRaw` / `devLongoutSoftRaw`. `Record::raw_soft_input`
-/// / `Record::raw_soft_output_value` return `None` for those record types — the
-/// dset table has no SoftRaw column for them — so `DTYP="Raw Soft Channel"`
-/// keeps the plain VAL-direct soft path instead of routing the value into an
-/// RVAL that does not exist. (C rejects that DTYP at init; the port reads soft
-/// DTYPs leniently, and leniency must not turn the write into a silent no-op.)
+/// C ships NO `devLonginSoftRaw` / `devLongoutSoftRaw`, so `longin`'s and
+/// `longout`'s device menus have no `Raw Soft Channel` and the `.db` does not
+/// load: `Can't set 'RLI.DTYP' to 'Raw Soft Channel' no such device support
+/// for 'longin' record type : Illegal choice` (softIoc R7.0.10).
 #[epics_macros_rs::epics_test]
-async fn record_without_a_softraw_dset_falls_back_to_val_direct() {
-    let db = ioc().await;
-    process(&db, "RLI").await;
-    put_val(&db, "RLO", EpicsValue::Long(9)).await;
-
-    assert_eq!(field(&db, "RLI", "VAL").await, EpicsValue::Long(37));
-    assert_eq!(field(&db, "DST:LO", "VAL").await, EpicsValue::Long(9));
+async fn record_without_a_softraw_dset_is_refused_at_load() {
+    for db in [
+        r#"record(longin, "RLI") { field(DTYP, "Raw Soft Channel") }"#,
+        r#"record(longout, "RLO") { field(DTYP, "Raw Soft Channel") }"#,
+    ] {
+        let built = IocBuilder::new()
+            .db_string(db, &HashMap::new())
+            .unwrap()
+            .build()
+            .await;
+        assert!(built.is_err(), "{db}");
+    }
 }

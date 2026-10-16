@@ -4972,7 +4972,9 @@ impl PvDatabase {
         let crate::server::record::ParsedLink::Db(db) = parsed else {
             return None;
         };
-        if self.has_db_link_target(db.target().record.as_bytes(), db.field_as_written()) {
+        if self.has_db_link_target(db.target().record.as_bytes(), db.field_as_written())
+            && Self::db_link_filter_refusal(db).is_none()
+        {
             return None;
         }
         Some(crate::server::record::ParsedLink::Ca(
@@ -4987,6 +4989,18 @@ impl PvDatabase {
                 policy: db.policy,
             },
         ))
+    }
+
+    /// Why `dbDbInitLink`/`dbDbAddLink`'s `dbChannelCreate` refuses a local
+    /// DB link's filter chain, sending it on to `dbCaAddLink`
+    /// (`dbDbLink.c:89-102`, `dbLink.c:118-130`).
+    fn db_link_filter_refusal(
+        db: &crate::server::record::DbLink,
+    ) -> Option<crate::server::database::filters::ChannelCreateError> {
+        let suffix = db.target().json_suffix.as_deref()?;
+        crate::server::database::filters::try_parse_filter_chain(suffix)
+            .err()
+            .map(crate::server::database::filters::ChannelCreateError::Filter)
     }
 
     /// C `dbAddLink` (`dbLink.c:146-191`) for a link put: [`Self::relink`],
@@ -5156,6 +5170,14 @@ impl PvDatabase {
                 let unserviceable = parsed.required_link_set_scheme();
                 let was_db = matches!(parsed, ParsedLink::Db(_));
                 let json = matches!(parsed, ParsedLink::PvaJson(_));
+                // `dbDbInitLink`'s `dbChannelCreate` line; a put printed its
+                // own in `dbPutFieldLink`, which `dbAddLink` reuses.
+                if let ParsedLink::Db(db) = &parsed
+                    && self.has_db_link_target(db.target().record.as_bytes(), db.field_as_written())
+                    && let Some(refusal) = Self::db_link_filter_refusal(db)
+                {
+                    refusal.report();
+                }
                 let next = self.db_init_link_locality(parsed, ftype);
                 if let ParsedLink::Ca(ca) = &next
                     && ftype == LinkFieldType::Fwd

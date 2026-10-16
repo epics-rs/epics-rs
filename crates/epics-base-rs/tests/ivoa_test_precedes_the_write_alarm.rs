@@ -6,6 +6,8 @@
 //! used to raise both alarms ahead of the test, so under IVOA "Set output to
 //! IVOV" a device's INVALID turned VAL into IVOV.
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +18,7 @@ use epics_base_rs::server::device_support::{DeviceAlarm, DeviceSupport, WriteSta
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::EpicsValue;
 
 type Writes = Arc<Mutex<HashMap<String, Vec<f64>>>>;
@@ -129,8 +131,9 @@ async fn the_ivoa_test_reads_the_alarm_before_the_write() {
         }
     }
     let w = Arc::clone(&writes);
+    let devices = [("ao", declared_rows::rows(&["ivoaDev"], DbLinkType::InstIo))];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
+        .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
             (ctx.dtyp == "ivoaDev").then(|| {
                 let (pending, invalid) = ctx.out.trim_start_matches('@').split_once(' ').unwrap();
                 Box::new(Dev {

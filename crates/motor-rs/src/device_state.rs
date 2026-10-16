@@ -9,26 +9,6 @@ pub struct StampedStatus {
     pub status: MotorStatus,
 }
 
-/// Poll loop directive — exclusive enum, not booleans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PollDirective {
-    #[default]
-    None,
-    /// Keep the autonomous idle poller alive (the settled-idle keep-alive,
-    /// deduped against an already-running poller). Does NOT force a status
-    /// post — idle polls are change-gated in the poll loop.
-    Start,
-    /// Force a one-shot poll + status post now, even if the polled status is
-    /// unchanged, and (re)start the poller. The analogue of C
-    /// `motorUpdateStatus_` forcing `statusChanged_ = 1`
-    /// (asynMotorController.cpp:217-222): emitted for `request_poll` /
-    /// `status_refresh` (STUP / implicit GET_INFO / settle-resume / startup
-    /// readback) so the record's STUP=BUSY ack clears even on a stationary axis
-    /// whose status did not change.
-    Refresh,
-    Stop,
-}
-
 /// Delay request with unique ID for stale timer prevention.
 #[derive(Debug, Clone)]
 pub struct DelayRequest {
@@ -40,7 +20,11 @@ pub struct DelayRequest {
 #[derive(Debug, Default)]
 pub struct DeviceActions {
     pub commands: Vec<crate::poll_loop::QueuedCommand>,
-    pub poll: PollDirective,
+    /// Poll now and post even an unchanged status: C `motorUpdateStatus_`
+    /// forcing `statusChanged_ = 1` (asynMotorController.cpp:217-222), for
+    /// `request_poll` / `status_refresh`, so STUP=BUSY clears on a
+    /// stationary axis.
+    pub force_poll: bool,
     pub schedule_delay: Option<DelayRequest>,
     pub status_refresh: bool,
 }
@@ -48,24 +32,12 @@ pub struct DeviceActions {
 impl DeviceActions {
     /// Fold a newer batch into `self` when a previous batch has not yet been
     /// consumed by DeviceSupport.write(). Commands are appended (FIFO order
-    /// preserved); the poll directive takes the newer value unless it is
-    /// `None` ("no change"); schedule_delay and status_refresh take the newer
-    /// value if present. Prevents a dropped move command when two process()
+    /// preserved); a forced poll from either survives; schedule_delay and
+    /// status_refresh take the newer value if present. Prevents a dropped move command when two process()
     /// cycles run without an intervening write().
     pub fn merge_newer(&mut self, newer: DeviceActions) {
         self.commands.extend(newer.commands);
-        if newer.poll != PollDirective::None {
-            // A pending `Refresh` (forced status post — the STUP/GET_INFO ack
-            // depends on it reaching the poll loop) must not be downgraded to a
-            // plain keep-alive `Start` by a later batch. Every other
-            // combination takes the newer directive.
-            self.poll = if self.poll == PollDirective::Refresh && newer.poll == PollDirective::Start
-            {
-                PollDirective::Refresh
-            } else {
-                newer.poll
-            };
-        }
+        self.force_poll |= newer.force_poll;
         if newer.schedule_delay.is_some() {
             self.schedule_delay = newer.schedule_delay;
         }
@@ -76,25 +48,149 @@ impl DeviceActions {
 /// Shared mailbox between MotorRecord, MotorDeviceSupport, and PollLoop.
 ///
 /// Data flow:
-///   PollLoop → latest_status, expired_delay_id → Record.process() reads
+///   PollLoop → [`Callbacks`] → latest_status, expired_delay_id on the pass
+///   io_intr runs → Record.process() reads
 ///   Record.process() → pending_actions → DeviceSupport.write() consumes
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MotorDeviceState {
-    // PollLoop → Record
+    /// C `pPvt->status` as the record's pass sees it; a new `seq` is
+    /// `needUpdate` (devMotorAsyn.c:446).
     pub latest_status: Option<StampedStatus>,
     pub expired_delay_id: Option<u64>,
 
     // Record → DeviceSupport
     pub pending_actions: Option<DeviceActions>,
+
+    pub callbacks: Callbacks,
 }
 
-impl Default for MotorDeviceState {
-    fn default() -> Self {
-        Self {
-            latest_status: None,
-            expired_delay_id: None,
-            pending_actions: None,
+/// One process a callback asked for, with what that pass reads.
+#[derive(Debug, Clone, PartialEq)]
+enum Callback {
+    /// `statusCallback` or a finished move: `needUpdate` with this status.
+    Status(MotorStatus),
+    /// The settle delay's `callbackFunc` (motorRecord.cc:460-480).
+    Delay(u64),
+}
+
+/// devMotorAsyn's per-record callback state (`motorAsynPvt`): the single
+/// owner that turns a driver post, a finished move or the settle delay into
+/// a record process.
+///
+/// C calls `dbProcess` from the callback itself, so that pass reads the
+/// status the callback copied. Here the pass runs later on the record's
+/// io_intr task, so each asked-for process is queued with what it reads and
+/// paired with exactly one io_intr pulse; [`MotorDeviceState::begin_callback_pass`]
+/// takes one per pass.
+#[derive(Debug, Default)]
+pub struct Callbacks {
+    /// `pPvt->status`: the last status posted.
+    status: MotorStatus,
+    /// `pPvt->moveRequestPending`.
+    move_request_pending: u32,
+    /// devMotorAsyn's `dbScanLockOK`, here its database's `finishDevSup` gate.
+    accepting: bool,
+    /// `pmr->stat == COMM_ALARM` as the record's last pass committed it.
+    comm_alarm: bool,
+    queued: std::collections::VecDeque<Callback>,
+}
+
+impl MotorDeviceState {
+    /// C `statusCallback` (devMotorAsyn.c:743-770): copy the post, and ask
+    /// for a process unless a move is pending. Before the gate opens it only
+    /// copies, with `needUpdate`. True when the caller must pulse io_intr.
+    pub fn status_callback(&mut self, status: &MotorStatus) -> bool {
+        self.callbacks.status = status.clone();
+        if !self.callbacks.accepting {
+            self.need_update(status.clone());
+            return false;
         }
+        if self.callbacks.move_request_pending > 0 {
+            return false;
+        }
+        self.queue(Callback::Status(status.clone()));
+        true
+    }
+
+    /// C `build_trans` queuing a move-class command (devMotorAsyn.c:547,
+    /// :565, :582).
+    pub fn move_queued(&mut self) {
+        self.callbacks.move_request_pending += 1;
+    }
+
+    /// C `asynCallback`'s tail for a move-class command, whatever the write
+    /// returned (devMotorAsyn.c:717-728): the last move to finish processes
+    /// the record with the last status posted. Before the gate a
+    /// SET_POSITION clears the count instead. True when the caller must
+    /// pulse io_intr.
+    pub fn move_done(&mut self, command: &crate::flags::MotorCommand) -> bool {
+        let callbacks = &mut self.callbacks;
+        if !callbacks.accepting {
+            if matches!(command, crate::flags::MotorCommand::SetPosition { .. }) {
+                callbacks.move_request_pending = 0;
+            }
+            return false;
+        }
+        callbacks.move_request_pending = callbacks.move_request_pending.saturating_sub(1);
+        if callbacks.move_request_pending > 0 {
+            return false;
+        }
+        let status = callbacks.status.clone();
+        self.queue(Callback::Status(status));
+        true
+    }
+
+    /// The settle delay expired. True when the caller must pulse io_intr;
+    /// before the gate the expiry only waits for the next pass.
+    pub fn delay_expired(&mut self, id: u64) -> bool {
+        if !self.callbacks.accepting {
+            self.expired_delay_id = Some(id);
+            return false;
+        }
+        self.queue(Callback::Delay(id));
+        true
+    }
+
+    /// The record's `stat` as its passes before this batch committed it;
+    /// COMM_ALARM or not is all `build_trans` reads of it.
+    pub fn set_comm_alarm(&mut self, comm_alarm: bool) {
+        self.callbacks.comm_alarm = comm_alarm;
+    }
+
+    /// C `build_trans` (devMotorAsyn.c:529-532): a record in COMM_ALARM
+    /// queues nothing, so counts no move pending either.
+    pub(crate) fn comm_alarm(&self) -> bool {
+        self.callbacks.comm_alarm
+    }
+
+    /// `finishDevSup` ran: callbacks process the record from now on.
+    pub fn accept(&mut self) {
+        self.callbacks.accepting = true;
+    }
+
+    /// The pass one io_intr pulse runs: hand it the oldest asked-for
+    /// process.
+    pub fn begin_callback_pass(&mut self) {
+        match self.callbacks.queued.pop_front() {
+            Some(Callback::Status(status)) => self.need_update(status),
+            Some(Callback::Delay(id)) => self.expired_delay_id = Some(id),
+            None => {}
+        }
+    }
+
+    /// The axis' cached status, as `readGenericPointer` returns it at bind.
+    fn seed(&mut self, status: &StampedStatus) {
+        self.latest_status = Some(status.clone());
+        self.callbacks.status = status.status.clone();
+    }
+
+    fn need_update(&mut self, status: MotorStatus) {
+        let seq = self.latest_status.as_ref().map_or(1, |s| s.seq + 1);
+        self.latest_status = Some(StampedStatus { seq, status });
+    }
+
+    fn queue(&mut self, callback: Callback) {
+        self.callbacks.queued.push_back(callback);
     }
 }
 
@@ -104,6 +200,100 @@ pub fn new_shared_state() -> SharedDeviceState {
     Arc::new(Mutex::new(MotorDeviceState::default()))
 }
 
+/// A record bound to an axis, by the order it attached.
+pub type RecordId = usize;
+
+/// The records bound to one axis, C's `registerInterruptUser` list on its
+/// `motorStatus` parameter: every status the poller posts reaches each of
+/// them (devMotorAsyn.c:376-387, asynMotorAxis.cpp:316-322).
+#[derive(Clone, Default)]
+pub struct AxisSubscribers(Arc<Mutex<Subscribed>>);
+
+#[derive(Default)]
+struct Subscribed {
+    /// The axis' parameter cache: what `readGenericPointer` returns to a
+    /// record that binds after the poller primed it.
+    latest: Option<StampedStatus>,
+    records: Vec<(SharedDeviceState, tokio::sync::mpsc::Sender<()>)>,
+}
+
+/// The io_intr pulses a post or a finished move owes, one per process.
+pub type Pulses = Vec<tokio::sync::mpsc::Sender<()>>;
+
+impl AxisSubscribers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Subscribed> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Bind a record: its mailbox starts from the axis' cache, and every
+    /// later post reaches its [`Callbacks`].
+    pub fn attach(
+        &self,
+        device_state: SharedDeviceState,
+        io_intr: tokio::sync::mpsc::Sender<()>,
+    ) -> RecordId {
+        let mut subscribed = self.lock();
+        if let (Some(latest), Ok(mut ds)) = (&subscribed.latest, device_state.lock()) {
+            ds.seed(latest);
+        }
+        subscribed.records.push((device_state, io_intr));
+        subscribed.records.len() - 1
+    }
+
+    /// How many records are bound; their ids are `0..len`.
+    pub fn len(&self) -> usize {
+        self.lock().records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Fill the cache and every bound mailbox without a callback: the
+    /// poller's startup poll.
+    pub fn store(&self, status: StampedStatus) {
+        let mut subscribed = self.lock();
+        for (device_state, _) in &subscribed.records {
+            if let Ok(mut ds) = device_state.lock() {
+                ds.seed(&status);
+            }
+        }
+        subscribed.latest = Some(status);
+    }
+
+    /// Fill the cache and run every bound record's `statusCallback`; the
+    /// pulses the processes it asked for are owed.
+    pub fn post(&self, status: StampedStatus) -> Pulses {
+        let mut subscribed = self.lock();
+        let mut pulses = Pulses::new();
+        for (device_state, io_intr) in &subscribed.records {
+            if let Ok(mut ds) = device_state.lock() {
+                if ds.status_callback(&status.status) {
+                    pulses.push(io_intr.clone());
+                }
+            }
+        }
+        subscribed.latest = Some(status);
+        pulses
+    }
+
+    /// `record`'s move-class command finished ([`MotorDeviceState::move_done`]).
+    pub fn move_done(
+        &self,
+        record: RecordId,
+        command: &crate::flags::MotorCommand,
+    ) -> Option<tokio::sync::mpsc::Sender<()>> {
+        let subscribed = self.lock();
+        let (device_state, io_intr) = subscribed.records.get(record)?;
+        let mut ds = device_state.lock().ok()?;
+        ds.move_done(command).then(|| io_intr.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +301,166 @@ mod tests {
 
     fn queued(command: MotorCommand) -> crate::poll_loop::QueuedCommand {
         crate::poll_loop::QueuedCommand { command, mres: 1.0 }
+    }
+
+    fn stamped(seq: u64, position: f64) -> StampedStatus {
+        StampedStatus {
+            seq,
+            status: MotorStatus {
+                position,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn seq_of(state: &SharedDeviceState) -> Option<u64> {
+        state.lock().unwrap().latest_status.as_ref().map(|s| s.seq)
+    }
+
+    fn accepting() -> SharedDeviceState {
+        let state = new_shared_state();
+        state.lock().unwrap().accept();
+        state
+    }
+
+    fn at(position: f64) -> MotorStatus {
+        MotorStatus {
+            position,
+            ..Default::default()
+        }
+    }
+
+    /// The position the next io_intr pass reads, if it reads a status.
+    fn pass(state: &SharedDeviceState) -> Option<f64> {
+        let mut ds = state.lock().unwrap();
+        let before = ds.latest_status.as_ref().map(|s| s.seq);
+        ds.begin_callback_pass();
+        let after = ds.latest_status.as_ref().unwrap();
+        (Some(after.seq) != before).then_some(after.status.position)
+    }
+
+    fn move_to() -> MotorCommand {
+        MotorCommand::MoveAbsolute {
+            position: 1.0,
+            min_velocity: 0.0,
+            velocity: 1.0,
+            acceleration: 1.0,
+        }
+    }
+
+    #[test]
+    fn an_axis_with_no_record_keeps_its_post_for_the_first_to_bind() {
+        let axis = AxisSubscribers::new();
+        assert!(axis.post(stamped(4, 1.5)).is_empty());
+        let state = accepting();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert_eq!(axis.attach(state.clone(), tx), 0);
+        assert_eq!(seq_of(&state), Some(4));
+        assert!(
+            rx.try_recv().is_err(),
+            "binding does not process the record"
+        );
+    }
+
+    #[test]
+    fn store_fills_the_mailbox_without_a_callback() {
+        let axis = AxisSubscribers::new();
+        let state = accepting();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        axis.attach(state.clone(), tx);
+        axis.store(stamped(2, 0.0));
+        assert_eq!(seq_of(&state), Some(2));
+        assert_eq!(pass(&state), None);
+    }
+
+    #[test]
+    fn every_record_on_the_axis_gets_one_process_per_post() {
+        let axis = AxisSubscribers::new();
+        let (a, b) = (accepting(), accepting());
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        assert_eq!(axis.attach(a.clone(), tx_a), 0);
+        assert_eq!(axis.attach(b.clone(), tx_b), 1);
+        assert_eq!(axis.post(stamped(2, 1.0)).len(), 2);
+        assert_eq!(axis.post(stamped(3, 2.0)).len(), 2);
+        for state in [&a, &b] {
+            assert_eq!(pass(state), Some(1.0));
+            assert_eq!(pass(state), Some(2.0));
+            assert_eq!(pass(state), None);
+        }
+    }
+
+    #[test]
+    fn a_post_before_the_gate_copies_with_need_update_and_asks_no_process() {
+        let state = new_shared_state();
+        let mut ds = state.lock().unwrap();
+        assert!(!ds.status_callback(&at(3.0)));
+        assert_eq!(ds.latest_status.as_ref().unwrap().status.position, 3.0);
+        assert!(ds.callbacks.queued.is_empty());
+    }
+
+    #[test]
+    fn each_pass_reads_its_own_post_in_order() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        assert!(ds.status_callback(&at(1.0)));
+        assert!(ds.status_callback(&at(2.0)));
+        drop(ds);
+        assert_eq!(pass(&state), Some(1.0));
+        assert_eq!(pass(&state), Some(2.0));
+    }
+
+    #[test]
+    fn a_post_while_one_move_is_pending_waits_for_its_completion() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        ds.move_queued();
+        assert!(!ds.status_callback(&at(1.0)));
+        assert!(!ds.status_callback(&at(2.0)));
+        assert!(ds.move_done(&move_to()));
+        drop(ds);
+        assert_eq!(pass(&state), Some(2.0));
+        assert_eq!(pass(&state), None);
+    }
+
+    #[test]
+    fn only_the_last_of_two_pending_moves_processes() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        ds.move_queued();
+        ds.move_queued();
+        assert!(!ds.move_done(&move_to()));
+        assert!(!ds.status_callback(&at(5.0)));
+        assert!(ds.move_done(&move_to()));
+        assert!(ds.status_callback(&at(6.0)), "nothing pending");
+        drop(ds);
+        assert_eq!(pass(&state), Some(5.0));
+        assert_eq!(pass(&state), Some(6.0));
+    }
+
+    #[test]
+    fn before_the_gate_only_a_set_position_clears_the_pending_count() {
+        let state = new_shared_state();
+        let mut ds = state.lock().unwrap();
+        ds.move_queued();
+        ds.move_queued();
+        assert!(!ds.move_done(&move_to()));
+        assert_eq!(ds.callbacks.move_request_pending, 2);
+        assert!(!ds.move_done(&MotorCommand::SetPosition { position: 0.0 }));
+        assert_eq!(ds.callbacks.move_request_pending, 0);
+    }
+
+    #[test]
+    fn a_delay_expiry_takes_its_turn_behind_the_posts_before_it() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        assert!(ds.status_callback(&at(1.0)));
+        ds.delay_expired(7);
+        drop(ds);
+        assert_eq!(pass(&state), Some(1.0));
+        assert_eq!(state.lock().unwrap().expired_delay_id, None);
+        assert_eq!(pass(&state), None);
+        assert_eq!(state.lock().unwrap().expired_delay_id, Some(7));
     }
 
     #[test]
@@ -131,59 +481,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_newer_poll_none_keeps_previous() {
-        let mut a = DeviceActions {
-            poll: PollDirective::Start,
-            ..Default::default()
-        };
-        let b = DeviceActions {
-            poll: PollDirective::None,
-            ..Default::default()
-        };
-        a.merge_newer(b);
-        assert_eq!(a.poll, PollDirective::Start);
-    }
-
-    #[test]
-    fn merge_newer_poll_explicit_overrides() {
-        let mut a = DeviceActions {
-            poll: PollDirective::Start,
-            ..Default::default()
-        };
-        let b = DeviceActions {
-            poll: PollDirective::Stop,
-            ..Default::default()
-        };
-        a.merge_newer(b);
-        assert_eq!(a.poll, PollDirective::Stop);
-    }
-
-    #[test]
-    fn merge_newer_refresh_not_downgraded_to_start() {
-        // A pending forced Refresh must survive a later keep-alive Start so the
-        // STUP/GET_INFO ack still reaches the poll loop.
-        let mut a = DeviceActions {
-            poll: PollDirective::Refresh,
-            ..Default::default()
-        };
-        let b = DeviceActions {
-            poll: PollDirective::Start,
-            ..Default::default()
-        };
-        a.merge_newer(b);
-        assert_eq!(a.poll, PollDirective::Refresh);
-
-        // The reverse — a newer Refresh over an older Start — upgrades.
-        let mut c = DeviceActions {
-            poll: PollDirective::Start,
-            ..Default::default()
-        };
-        let d = DeviceActions {
-            poll: PollDirective::Refresh,
-            ..Default::default()
-        };
-        c.merge_newer(d);
-        assert_eq!(c.poll, PollDirective::Refresh);
+    fn merge_newer_keeps_a_forced_poll_from_either_batch() {
+        for (older, newer) in [(true, false), (false, true)] {
+            let mut a = DeviceActions {
+                force_poll: older,
+                ..Default::default()
+            };
+            a.merge_newer(DeviceActions {
+                force_poll: newer,
+                ..Default::default()
+            });
+            assert!(a.force_poll);
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@
 //! `prec->mlst = prec->val`; `mbbiRecord.c:133-137` keeps the status and seeds
 //! anyway. Both shapes of a port failure (`Err`, `Dead`) are a nonzero status.
 
+mod probe_rows;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -61,8 +63,24 @@ async fn probe_ioc_of(rtype: &str, fields: &str) -> Arc<PvDatabase> {
 }
 
 async fn probe_ioc(db: &str) -> Arc<PvDatabase> {
+    let devices = probe_rows::devices(&[
+        "ai",
+        "ao",
+        "bi",
+        "bo",
+        "longin",
+        "longout",
+        "mbbi",
+        "mbbo",
+        "mbbiDirect",
+        "mbboDirect",
+        "stringin",
+        "stringout",
+        "lsi",
+        "lso",
+    ]);
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        .register_dynamic_device_support(&devices, |ctx: &DeviceSupportContext| {
             let outcome = match ctx.dtyp {
                 "probeLive" => Some(DeviceInitOutcome::ok()),
                 "probeDead" => Some(DeviceInitOutcome::dead()),

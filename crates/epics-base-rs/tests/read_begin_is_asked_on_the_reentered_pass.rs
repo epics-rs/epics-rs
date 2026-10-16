@@ -4,6 +4,8 @@
 //! (devMcaAsyn.c:284-289, mcaRecord.c:770-775). The re-entered pass used to
 //! skip `read_begin`, so its `read()` could only block under the hold.
 
+mod declared_rows;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +18,7 @@ use epics_base_rs::server::device_support::{
 };
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, Record};
 use epics_base_rs::types::EpicsValue;
 
 type Pending = Arc<Mutex<Option<(DeviceDone, CallbackPriority)>>>;
@@ -95,15 +97,24 @@ async fn a_reentered_pass_may_queue_a_second_read() {
         Arc::clone(&reads),
         Arc::clone(&flnks),
     );
+    let devices = [
+        (
+            "ai",
+            declared_rows::rows(&["TwoTrips"], DbLinkType::Constant),
+        ),
+        ("ao", declared_rows::rows(&["Sink"], DbLinkType::Constant)),
+    ];
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| match ctx.dtyp {
-            "TwoTrips" => Some(Box::new(TwoTrips {
-                pending: Arc::clone(&p),
-                begins: Arc::clone(&b),
-                reads: Arc::clone(&r),
-            }) as Box<dyn DeviceSupport>),
-            "Sink" => Some(Box::new(Sink(Arc::clone(&f))) as Box<dyn DeviceSupport>),
-            _ => None,
+        .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
+            match ctx.dtyp {
+                "TwoTrips" => Some(Box::new(TwoTrips {
+                    pending: Arc::clone(&p),
+                    begins: Arc::clone(&b),
+                    reads: Arc::clone(&r),
+                }) as Box<dyn DeviceSupport>),
+                "Sink" => Some(Box::new(Sink(Arc::clone(&f))) as Box<dyn DeviceSupport>),
+                _ => None,
+            }
         })
         .db_string(
             r#"

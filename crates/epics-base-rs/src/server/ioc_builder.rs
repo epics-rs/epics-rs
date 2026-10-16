@@ -260,13 +260,23 @@ impl IocBuilder {
     /// so universal drivers (asyn `universal_asyn_factory`,
     /// areaDetector plugin dispatch) attach correctly in both build
     /// paths.
-    pub fn register_dynamic_device_support<F>(mut self, factory: F) -> Self
+    ///
+    /// `devices` are the `device()` lines the factory serves, added to the
+    /// device menus now: a `.db` may name only a menu choice.
+    pub fn register_dynamic_device_support<F>(
+        mut self,
+        devices: &[(&str, &'static [crate::server::record::DevSup])],
+        factory: F,
+    ) -> Self
     where
         F: Fn(&DeviceSupportContext) -> Option<Box<dyn device_support::DeviceSupport>>
             + Send
             + Sync
             + 'static,
     {
+        for (record_type, rows) in devices {
+            crate::server::record::register_device_menu(record_type, rows);
+        }
         if let Some(existing) = self.dynamic_device_factory.take() {
             self.dynamic_device_factory = Some(Box::new(move |ctx: &DeviceSupportContext| {
                 factory(ctx).or_else(|| existing(ctx))
@@ -537,6 +547,7 @@ impl IocBuilder {
         // classifications queued during the load. Link status is FINAL when
         // `build` returns, as it is when C's `iocInit` returns.
         db.ioc_init().await;
+        db.scan_control().finish_dev_sup();
 
         Ok((db, self.autosave_config, begun))
     }
@@ -1095,6 +1106,12 @@ record(ai, "AI:BPT") {
     /// startup-script path, never the pure-Rust IocBuilder path.
     #[epics_macros_rs::epics_test]
     async fn dynamic_device_factory_attaches_when_static_missing() {
+        static ROW: [crate::server::record::DevSup; 1] = [crate::server::record::DevSup {
+            name: "devTest",
+            choice: "asynInt32",
+            link_type: crate::server::record::DbLinkType::InstIo,
+            dset: crate::server::record::Dset::new(6, &[3], false),
+        }];
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
 
@@ -1120,7 +1137,7 @@ record(ai, "AI:DYN") {
 "#;
         let (db, _) = IocBuilder::new()
             .register_record_type("ai", ai_factory)
-            .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+            .register_dynamic_device_support(&[("ai", &ROW)], |ctx: &DeviceSupportContext| {
                 if ctx.dtyp.starts_with("asyn") {
                     Some(Box::new(UniversalDev))
                 } else {
@@ -1147,6 +1164,20 @@ record(ai, "AI:DYN") {
     /// `IocApplication::register_dynamic_device_support` chaining.
     #[epics_macros_rs::epics_test]
     async fn dynamic_factories_chain_lifo_with_fallthrough() {
+        static ROWS: [crate::server::record::DevSup; 2] = [
+            crate::server::record::DevSup {
+                name: "devA",
+                choice: "DTA",
+                link_type: crate::server::record::DbLinkType::Constant,
+                dset: crate::server::record::Dset::new(6, &[3], false),
+            },
+            crate::server::record::DevSup {
+                name: "devB",
+                choice: "DTB",
+                link_type: crate::server::record::DbLinkType::Constant,
+                dset: crate::server::record::Dset::new(6, &[3], false),
+            },
+        ];
         use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
         use crate::server::record::ScanType;
 
@@ -1183,14 +1214,14 @@ record(ai, "REC:B") { field(DTYP, "DTB") }
 "#;
         let (db, _) = IocBuilder::new()
             .register_record_type("ai", ai_factory)
-            .register_dynamic_device_support(|ctx| {
+            .register_dynamic_device_support(&[("ai", &ROWS[..1])], |ctx| {
                 if ctx.dtyp == "DTA" {
                     Some(Box::new(DevA))
                 } else {
                     None
                 }
             })
-            .register_dynamic_device_support(|ctx| {
+            .register_dynamic_device_support(&[("ai", &ROWS[1..])], |ctx| {
                 if ctx.dtyp == "DTB" {
                     Some(Box::new(DevB))
                 } else {

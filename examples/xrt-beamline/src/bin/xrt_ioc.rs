@@ -191,7 +191,10 @@ async fn main() -> CaResult<()> {
 
     let motor_holder = SimMotorHolder::new();
     app = app.register_startup_command(motor_holder.sim_motor_create_command());
-    app = app.register_dynamic_device_support(motor_holder.device_support_factory());
+    app = app.register_dynamic_device_support(
+        &motor_rs::devices::devices(),
+        motor_rs::devices::device_support_factory(),
+    );
 
     let motor_h = motor_holder.clone();
     app = app.register_after_init(move || {

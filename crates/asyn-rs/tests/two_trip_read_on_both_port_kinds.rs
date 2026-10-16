@@ -28,7 +28,7 @@ use epics_base_rs::server::device_support::{
 };
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::EpicsValue;
 
 /// Counts its reads.
@@ -158,22 +158,36 @@ async fn cycle(can_block: bool) -> (Arc<PvDatabase>, Vec<String>) {
     let handle = runtime.port_handle().clone();
     let log: Log = Arc::default();
     let l = Arc::clone(&log);
+    // The `device()` lines a C IOC's `.dbd` would carry.
+    static AI: [DevSup; 1] = [row("TwoTrips")];
+    static AO: [DevSup; 1] = [row("Sink")];
+    const fn row(choice: &'static str) -> DevSup {
+        DevSup {
+            name: "devTest",
+            choice,
+            link_type: DbLinkType::Constant,
+            dset: Dset::new(6, &[3], false),
+        }
+    }
     let (db, _) = IocBuilder::new()
-        .register_dynamic_device_support(move |ctx: &DeviceSupportContext| match ctx.dtyp {
-            "TwoTrips" => {
-                let body = Arc::new(Trip::default());
-                let cell = handle.new_cell(body.clone());
-                Some(Box::new(TwoTrips {
-                    handle: handle.clone(),
-                    body,
-                    cell,
-                    trips: 0,
-                    log: Arc::clone(&l),
-                }) as Box<dyn DeviceSupport>)
-            }
-            "Sink" => Some(Box::new(Sink(Arc::clone(&l))) as Box<dyn DeviceSupport>),
-            _ => None,
-        })
+        .register_dynamic_device_support(
+            &[("ai", &AI), ("ao", &AO)],
+            move |ctx: &DeviceSupportContext| match ctx.dtyp {
+                "TwoTrips" => {
+                    let body = Arc::new(Trip::default());
+                    let cell = handle.new_cell(body.clone());
+                    Some(Box::new(TwoTrips {
+                        handle: handle.clone(),
+                        body,
+                        cell,
+                        trips: 0,
+                        log: Arc::clone(&l),
+                    }) as Box<dyn DeviceSupport>)
+                }
+                "Sink" => Some(Box::new(Sink(Arc::clone(&l))) as Box<dyn DeviceSupport>),
+                _ => None,
+            },
+        )
         .db_string(
             r#"
             record(ai, "AI") { field(DTYP, "TwoTrips") field(FLNK, "SINK") }

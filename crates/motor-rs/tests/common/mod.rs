@@ -3,7 +3,7 @@
 //!
 //! The two halves of a move are separate calls because what these tests
 //! measure happens BETWEEN them: the put drives the move-start
-//! `AsyncPendingNotify` pass (DMOV 1→0), and the readback pass drives the
+//! pass (DMOV 1→0), and the readback pass drives the
 //! completion (DMOV 0→1).
 
 use std::sync::{Arc, Mutex};
@@ -97,7 +97,7 @@ pub struct MotorFixture {
     pub(crate) _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
     /// The driver commands the record queued for the poller thread, which
     /// this fixture stands in for.
-    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::poll_loop::QueuedCommand>>,
+    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
 }
 
 impl MotorFixture {
@@ -174,8 +174,7 @@ impl MotorFixture {
         }
     }
 
-    /// The put pass: dispatches the move and posts DMOV 1→0
-    /// (`AsyncPendingNotify`).
+    /// The put pass: dispatches the move and posts DMOV 1→0.
     pub async fn start_move(&self, target: f64) {
         self.db
             .put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(target))
@@ -200,8 +199,13 @@ impl MotorFixture {
         let user = AsynUser::new(0);
         let status = {
             let mut motor = self.motor.lock().unwrap();
-            while let Ok(commands) = self.motor_cmd_rx.try_recv() {
-                motor_rs::poll_loop::execute_commands(&mut *motor, &Default::default(), &commands);
+            while let Ok(batch) = self.motor_cmd_rx.try_recv() {
+                motor_rs::poll_loop::execute_commands(
+                    &mut *motor,
+                    &batch.trace,
+                    &batch.commands,
+                    &mut |_| {},
+                );
             }
             edit(&mut motor);
             motor.poll(&user).unwrap()

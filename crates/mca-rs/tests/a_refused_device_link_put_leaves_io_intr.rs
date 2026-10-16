@@ -28,31 +28,30 @@ use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::server::device_support::DeviceSupport;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::iocsh::IocShell;
-use epics_base_rs::server::record::{
-    DbLinkType, DevSup, Dset, Record, ScanType, register_device_row,
-};
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
-static MCA_PROBE: DevSup = DevSup {
+static MCA_PROBE: [DevSup; 1] = [DevSup {
     name: "devMcaIntrProbe",
     choice: "Intr Probe",
     link_type: DbLinkType::Constant,
     dset: Dset::new(6, &[1, 2, 3, 4, 5], true),
-};
+}];
 
-static AI_PROBE: DevSup = DevSup {
-    name: "devAiIntrProbe",
-    choice: "Intr Probe",
-    link_type: DbLinkType::Constant,
-    dset: Dset::new(6, &[1, 2, 3, 4], true),
-};
-
-static AI_NO_DSXT: DevSup = DevSup {
-    name: "devAiIntrNoDsxt",
-    choice: "Intr NoDsxt",
-    link_type: DbLinkType::InstIo,
-    dset: Dset::new(6, &[1, 2, 3, 4], false),
-};
+static AI_PROBES: [DevSup; 2] = [
+    DevSup {
+        name: "devAiIntrProbe",
+        choice: "Intr Probe",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(6, &[1, 2, 3, 4], true),
+    },
+    DevSup {
+        name: "devAiIntrNoDsxt",
+        choice: "Intr NoDsxt",
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(6, &[1, 2, 3, 4], false),
+    },
+];
 
 /// `add_record` calls on an mca probe: C's NOMOD put never reaches one.
 static MCA_ADDS: AtomicUsize = AtomicUsize::new(0);
@@ -128,14 +127,11 @@ fn run(shell: &IocShell, line: &str) -> String {
 fn a_refused_device_link_put_leaves_the_record_passive() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (name, factory) = mca_rs::mca_record_factory();
-    register_device_row("mca", &MCA_PROBE);
-    register_device_row("ai", &AI_PROBE);
-    register_device_row("ai", &AI_NO_DSXT);
     let (db, bridge) = rt.block_on(async {
         let (db, _) = IocBuilder::new()
             .register_record_type(name, factory)
             // Keyed by record type too: C's `device()` rows are.
-            .register_dynamic_device_support(|ctx| {
+            .register_dynamic_device_support(&[("mca", &MCA_PROBE), ("ai", &AI_PROBES)], |ctx| {
                 let dtyp = match (ctx.record_type, ctx.dtyp) {
                     ("mca" | "ai", "Intr Probe") => "Intr Probe",
                     ("ai", "Intr NoDsxt") => "Intr NoDsxt",

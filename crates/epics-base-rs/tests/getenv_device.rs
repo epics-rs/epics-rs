@@ -72,13 +72,11 @@ record(stringin, "GETENV_SI") {
     );
 }
 
-/// C registers a getenv dset only for `stringin`/`lsi`; the device's
-/// record-type gate Errs in `init()`, so `wire_device_to_record` flags an
-/// `ai` with `DTYP="getenv"` INVALID at build time — proving the device
-/// attached and gated rather than being silently accepted.
+/// C registers a getenv dset only for `stringin`/`lsi`, so `ai`'s device
+/// menu has no `getenv` and the `.db` does not load (`dbStaticRun.c:499`).
 #[epics_macros_rs::epics_test]
-async fn getenv_wrong_record_type_is_invalid() {
-    let (db, _) = IocBuilder::new()
+async fn getenv_wrong_record_type_is_refused_at_load() {
+    let built = IocBuilder::new()
         .db_string(
             r#"
 record(ai, "GETENV_AI") {
@@ -90,16 +88,8 @@ record(ai, "GETENV_AI") {
         )
         .unwrap()
         .build()
-        .await
-        .unwrap();
-
-    let ai = db.get_record("GETENV_AI").expect("ai exists");
-    let inst = ai.read();
-    assert_eq!(
-        inst.common.sevr,
-        AlarmSeverity::Invalid,
-        "ai with DTYP=getenv must be INVALID (no getenv device support for ai)"
-    );
+        .await;
+    assert!(built.is_err(), "ai has no getenv device support");
 }
 
 /// An unset env var: C raises UDF_ALARM at UDFS (default INVALID) and clears

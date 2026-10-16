@@ -88,7 +88,7 @@ fn traced_at(port: &str, mres: f64, commands: &[MotorCommand]) -> Vec<String> {
     traced_by(port, || {
         let trace = MotorTrace::new(port, 0);
         trace.set_record("XPS:m1");
-        execute_commands(&mut Disconnected, &trace, &queued);
+        execute_commands(&mut Disconnected, &trace, &queued, &mut |_| {});
     })
 }
 
@@ -348,6 +348,7 @@ fn stop_traced(user: TraceUser) -> Vec<String> {
                 command: MotorCommand::Stop { acceleration: 1.0 },
                 mres: 1.0,
             }],
+            &mut |_| {},
         );
     });
     lines.extend(
@@ -369,5 +370,88 @@ fn a_model1_axis_prints_nothing_for_a_refused_command() {
         })
         .is_empty()
     );
-    assert!(stop_traced(TraceUser::Model1).is_empty());
+    assert!(
+        stop_traced(TraceUser::Model1 {
+            device: "traceLinesModel1",
+            card: 0,
+            signal: 0,
+        })
+        .is_empty()
+    );
+}
+
+/// `user`'s lines, under ERROR|FLOW|IO_DRIVER, for a refused move then stop.
+fn move_and_stop_traced(port: &str, user: TraceUser) -> Vec<String> {
+    use asyn_rs::trace::TraceMask;
+
+    PortManager::global().trace_manager().set_trace_mask(
+        Some(port),
+        TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER,
+    );
+    let lines = traced_by(port, || {
+        let trace = MotorTrace::with_user(user);
+        trace.set_record("MM4000:m1");
+        let queued = [
+            MotorCommand::MoveAbsolute {
+                position: 5.0,
+                min_velocity: 0.1,
+                velocity: 1.0,
+                acceleration: 0.2,
+            },
+            MotorCommand::Stop { acceleration: 1.0 },
+        ]
+        .map(|command| QueuedCommand { command, mres: 1.0 });
+        execute_commands(&mut Disconnected, &trace, &queued, &mut |_| {});
+    });
+    lines
+        .iter()
+        .map(|l| {
+            let at = ["drvMotorAsyn", "asynMotorController", "devMotorAsyn"]
+                .iter()
+                .filter_map(|w| l.find(w))
+                .min()
+                .unwrap();
+            l[at..].to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn a_model2_axis_prints_drv_motor_asyn_write_lines_and_no_controller_line() {
+    let model3 = move_and_stop_traced(
+        "traceLinesModel3",
+        TraceUser::Asyn {
+            port: "traceLinesModel3".into(),
+            addr: 0,
+        },
+    );
+    assert!(
+        model3.iter().any(|l| l.starts_with("asynMotorController")),
+        "{model3:#?}"
+    );
+
+    let lines = move_and_stop_traced(
+        "traceLinesModel2",
+        TraceUser::Model2 {
+            port: "traceLinesModel2".into(),
+            addr: 0,
+        },
+    );
+    assert_eq!(lines.len(), 5, "{lines:#?}");
+    assert!(
+        lines[0].starts_with("drvMotorAsyn::writeFloat64, reason=104, pasynUser=0x"),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains(" pAxis=0x"), "{}", lines[0]);
+    let refused = "devMotorAsyn::asynCallback: MM4000:m1 pasyn{Float64,Int32}->write returned port XPS_M not connected";
+    assert_eq!(
+        lines[1..],
+        [
+            "drvMotorAsyn::writeFloat64, reason=104, value=5.000000",
+            refused,
+            "drvMotorAsyn::writeInt32, reason=107, value=0",
+            refused,
+        ]
+    );
 }

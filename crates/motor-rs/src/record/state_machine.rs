@@ -202,7 +202,6 @@ impl MotorRecord {
                         self.emit_jog(forward, &mut effects);
                     }
                 }
-                effects.request_poll = true;
                 return effects;
             }
             // Plain stop. C discriminates by pp (motorRecord.cc:1382-1402):
@@ -526,7 +525,7 @@ impl MotorRecord {
     /// it. The poll loop now notifies the record only on a changed status (the C
     /// `statusChanged_` gate, asynMotorAxis.cpp:316-322), so a now-stationary
     /// axis would never deliver that pass and the held button would strand.
-    /// Request one forced poll (→ `PollDirective::Refresh`) so the deferred
+    /// Request one forced poll (→ `DeviceActions::force_poll`) so the deferred
     /// level-triggered action gets its pass. C strands this case (`special()`
     /// arms MIP_JOG_REQ only at mip==MIP_DONE, motorRecord.cc:3045, so a button
     /// pressed during a move is never armed); preserving the resume is a
@@ -860,7 +859,6 @@ impl MotorRecord {
                 acceleration: self.backlash_accel_egu(),
             });
         }
-        effects.request_poll = true;
     }
 
     /// Start jog backlash correction (phase 1: move to pretarget at slew velocity).
@@ -905,7 +903,6 @@ impl MotorRecord {
                 acceleration: self.move_accel_egu(),
             });
         }
-        effects.request_poll = true;
     }
 
     /// Start jog backlash phase 2 (final approach at backlash velocity).
@@ -944,6 +941,5 @@ impl MotorRecord {
                 acceleration: self.backlash_accel_egu(),
             });
         }
-        effects.request_poll = true;
     }
 }

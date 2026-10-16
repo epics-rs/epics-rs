@@ -13,6 +13,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, register_device_row};
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
 use optics_rs::snl::kohzu_ctl_soft::{self, KohzuSoftConfig};
@@ -50,6 +51,15 @@ async fn boot_with(rbv: [f64; 3], presets: &[(&str, f64)]) -> Arc<PvDatabase> {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
+    // devSoftMotor.dbd's line, which kohzuSeq_soft.db's motors name. The port
+    // has no devMotorSoft, so these motors have no device support.
+    static SOFT_MOTOR: DevSup = DevSup {
+        name: "devMotorSoft",
+        choice: "Soft Channel",
+        link_type: DbLinkType::Constant,
+        dset: Dset::new(8, &[1, 2, 4, 5, 6, 7], false),
+    };
+    register_device_row("motor", &SOFT_MOTOR);
     let ioc = IocBuilder::new()
         .register_record_type("busy", || Box::new(BusyRecord::default()))
         .register_record_type("motor", || Box::new(motor_rs::MotorRecord::new()))

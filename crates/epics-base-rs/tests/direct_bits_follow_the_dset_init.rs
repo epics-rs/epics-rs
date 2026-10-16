@@ -15,8 +15,8 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 
-/// The init outcome, and the raw word a read hands `apply_raw_readback` the
-/// way asyn's `processMbbiDirect` does.
+/// The init outcome, and the RVAL a read hands `apply_raw_readback` the way
+/// asyn's `processMbbiDirect` does, already ANDed with MASK.
 struct Probe(Option<DeviceInitOutcome>, Option<i32>);
 
 impl DeviceSupport for Probe {
@@ -48,7 +48,7 @@ async fn ioc(db: &str) -> Arc<PvDatabase> {
                 "probeLive" => (Some(DeviceInitOutcome::ok()), None),
                 "probeDead" => (Some(DeviceInitOutcome::dead()), None),
                 "probeErr" => (None, None),
-                "probeRaw" => (Some(DeviceInitOutcome::ok()), Some(58)),
+                "probeRaw" => (Some(DeviceInitOutcome::ok()), Some(58 & 60)),
                 _ => return None,
             };
             Some(Box::new(Probe(outcome, raw)) as Box<dyn DeviceSupport>)

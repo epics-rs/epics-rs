@@ -198,13 +198,9 @@ impl Record for BiRecord {
     /// `devBiSoft` `read_bi` returns 2). Routing the device raw here instead of
     /// through `set_val` keeps `set_val` single-meaning (a Soft Channel `bi`
     /// linked to a non-binary source still passes its value through as C does).
-    /// Input twin of `bo::apply_raw_readback` (same `mask != 0` split).
+    /// Input twin of `bo::apply_raw_readback`.
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        self.rval = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
+        self.rval = raw as u32;
         self.val = if self.rval != 0 { 1 } else { 0 };
         true
     }

@@ -839,23 +839,18 @@ impl Record for MbbiRecord {
     /// BOTH ifaces (devAsynInt32.c:1270 with the record's NOBT-derived mask /
     /// devAsynUInt32Digital.c:903 with the `@asynMask`), and mbbiRecord's
     /// convert (mbbiRecord.c:172-190) then shifts `rval >> SHFT` and resolves
-    /// the state index. The hook performs the (identical) mask + shift +
-    /// lookup inline and returns `true` so the framework skips the forward
-    /// convert.
+    /// the state index. The hook performs the (identical) shift + lookup
+    /// inline and returns `true` so the framework skips the forward convert.
     ///
     /// This is the *device-distinct* entry, separate from the Soft Channel
     /// `set_val` pass-through above — routing the device raw here is what lets
-    /// `set_val` stay single-meaning. Input twin of `mbbo::apply_raw_readback`,
-    /// with an **unconditional** `& mask` (unlike `bi`, whose asynInt32 dset
-    /// leaves mask 0 and reads the value unmasked — `processMbbi` masks on both
-    /// ifaces). The `& mask` here is the masking the prior `set_val` omitted.
+    /// `set_val` stay single-meaning. Input twin of `mbbo::apply_raw_readback`.
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        let masked = (raw as u32) & self.mask;
-        self.rval = masked;
+        self.rval = raw as u32;
         let shifted = if self.shft > 0 {
-            masked.checked_shr(self.shft as u32).unwrap_or(0)
+            self.rval.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            masked
+            self.rval
         };
         self.val = self.raw_to_val(shifted);
         true

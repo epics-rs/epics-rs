@@ -873,17 +873,16 @@ impl Record for MbboRecord {
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL through the state table, mirroring C
     /// `processMbbo`/`initMbbo` (devAsynInt32.c:1311-1330,1296 /
-    /// devAsynUInt32Digital.c:945-963,930). `RVAL` keeps the masked-but-
-    /// unshifted raw; VAL is the state index of the shifted raw. Returns
+    /// devAsynUInt32Digital.c:945-963,930). `RVAL` is the unshifted value the
+    /// dset stores; VAL is the state index of the shifted raw. Returns
     /// `true` so the store reports `computed` and the framework skips the
     /// forward convert (via `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        let masked = (raw as u32) & self.mask;
-        self.rval = masked;
+        self.rval = raw as u32;
         let shifted = if self.shft > 0 {
-            masked.checked_shr(self.shft as u32).unwrap_or(0)
+            self.rval.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            masked
+            self.rval
         };
         self.val = self.raw_to_val(shifted);
         true

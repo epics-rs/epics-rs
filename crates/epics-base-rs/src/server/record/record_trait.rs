@@ -4085,6 +4085,9 @@ pub trait Record: Send + Sync + 'static {
     /// already `raw → eng` (`ai`) or that need no conversion (`longout`,
     /// `mbbo`, whose `set_val` re-derives from the raw value) keep the legacy
     /// raw → `RVAL` / direct-`VAL` path.
+    ///
+    /// `raw` is the `RVAL` the dset stores. A MASK is the dset's to apply, as
+    /// asyn's `processBo`/`processMbbi` do, never the record's.
     fn apply_raw_readback(&mut self, _raw: i32) -> bool {
         false
     }

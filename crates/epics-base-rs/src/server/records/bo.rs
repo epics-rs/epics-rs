@@ -431,18 +431,11 @@ impl Record for BoRecord {
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and resolve VAL to 0/1, mirroring C `processBo`/`initBo`
     /// (devAsynInt32.c:1202-1203,1187 / devAsynUInt32Digital.c:731-732,716).
-    /// When MASK is set (the digital `asynUInt32Digital` config) RVAL keeps the
-    /// masked raw and VAL is `(masked != 0)`; when MASK is 0 (the typical
-    /// `asynInt32` `bo`, whose `initBo`/`processBo` do not mask) RVAL is the raw
-    /// and VAL is `(raw != 0)` — the `mask != 0` split reproduces both device
-    /// supports exactly. Returns `true` so the store reports `computed` and the
+    /// RVAL is the value the dset stores (masked or not, per the dset) and VAL
+    /// is `(RVAL != 0)`. Returns `true` so the store reports `computed` and the
     /// framework skips the forward convert (via `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        self.rval = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
+        self.rval = raw as u32;
         self.val = if self.rval != 0 { 1 } else { 0 };
         true
     }

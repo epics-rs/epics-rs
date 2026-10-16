@@ -249,23 +249,18 @@ impl Record for MbboDirectRecord {
     /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
     /// the raw and set VAL to the shifted masked value, mirroring C
     /// `processMbboDirect`/`initMbboDirect` (devAsynUInt32Digital.c:1084-1090,
-    /// 1058-1065). RVAL keeps the masked-but-unshifted raw; VAL is the shifted
+    /// 1058-1065). RVAL is the unshifted value the dset stores; VAL is the shifted
     /// value (no state table — Direct is the raw value). B0..B1F are derived
     /// by C's own `bitsFromVAL` sites, `init_record_tail` and
     /// `monitor_value_changed`. Returns `true` so the store reports
     /// `computed` and the framework skips the forward convert (via
     /// `set_device_did_compute`).
     fn apply_raw_readback(&mut self, raw: i32) -> bool {
-        let masked = if self.mask != 0 {
-            (raw as u32) & self.mask
-        } else {
-            raw as u32
-        };
-        self.rval = masked;
+        self.rval = raw as u32;
         self.val = if self.shft > 0 {
-            masked.checked_shr(self.shft as u32).unwrap_or(0)
+            self.rval.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            masked
+            self.rval
         };
         true
     }

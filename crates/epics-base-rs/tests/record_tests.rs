@@ -265,15 +265,14 @@ fn test_mbbo_readback_unknown_state_is_65535() {
 #[test]
 fn test_bo_readback_maps_raw_to_binary_both_mask_modes() {
     use epics_base_rs::server::records::bo::BoRecord;
-    // mask != 0 (digital): rval = raw & mask, val = (rval != 0).
+    // The MASK is the dset's to apply (asyn `processBo`), not the record's:
+    // C Int32 `initBo` stores the read raw whatever MASK holds.
     let mut rec = BoRecord::new(0);
     rec.mask = 0x04;
-    assert!(rec.apply_raw_readback(0x04));
-    assert_eq!(rec.rval, 0x04);
-    assert_eq!(rec.val, 1);
-    // Out-of-mask bits only → masked 0 → val 0.
     assert!(rec.apply_raw_readback(0x02));
-    assert_eq!(rec.rval, 0);
+    assert_eq!(rec.rval, 0x02);
+    assert_eq!(rec.val, 1);
+    assert!(rec.apply_raw_readback(0));
     assert_eq!(rec.val, 0);
     // mask == 0 (asynInt32 bo): rval = raw (unmasked), val = (raw != 0).
     let mut rec2 = BoRecord::new(0);
@@ -359,19 +358,12 @@ fn test_bi_readback_maps_raw_to_binary_both_mask_modes() {
     assert_eq!(rec.val, 1, "VAL is 0/1, not the raw count");
     assert!(rec.apply_raw_readback(0));
     assert_eq!(rec.val, 0);
-    // asynUInt32Digital bi (mask != 0): rval = raw & mask, val = (rval != 0).
+    // The MASK is the dset's to apply (asyn `processBi`), not the record's.
     let mut rec2 = BiRecord::new(0);
     rec2.mask = 0x80;
-    assert!(rec2.apply_raw_readback(0x80));
-    assert_eq!(rec2.rval, 0x80);
-    assert_eq!(
-        rec2.val, 1,
-        "high-bit mask hit → val 1 (C gives 1, not 128)"
-    );
-    // A raw whose set bits are all outside the mask → masked 0 → val 0.
-    assert!(rec2.apply_raw_readback(0x01));
-    assert_eq!(rec2.rval, 0);
-    assert_eq!(rec2.val, 0, "bits outside MASK do not set VAL");
+    assert!(rec2.apply_raw_readback(0x81));
+    assert_eq!(rec2.rval, 0x81);
+    assert_eq!(rec2.val, 1, "a set RVAL is 1 (C gives 1, not 129)");
 }
 
 // INPUT twin of the mbboDirect readback (asynUInt32Digital only). C
@@ -404,10 +396,6 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     assert_eq!(rec.bits[0], 1);
     assert_eq!(rec.bits[3], 1);
     assert_eq!(rec.bits[4], 0);
-    // Bits outside MASK are dropped: raw 0xC0 (bits 6-7) & 0x3C = 0 → val 0.
-    assert!(rec.apply_raw_readback(0xC0));
-    assert_eq!(rec.rval, 0);
-    assert_eq!(rec.val, 0, "out-of-mask bits do not reach VAL");
 }
 
 // Family boundary: longin's VAL *is* the raw (C processLi sets pr->val, no
@@ -441,14 +429,8 @@ fn test_mbbi_readback_masks_shifts_and_maps_state() {
         rec.apply_raw_readback(0x08),
         "mbbi claims the device readback"
     );
-    assert_eq!(rec.rval, 0x08, "RVAL = raw & mask (C processMbbi)");
+    assert_eq!(rec.rval, 0x08, "RVAL is the dset's (C processMbbi masks)");
     assert_eq!(rec.val, 2, "shifted raw 2 -> state index 2 (TWVL)");
-    // Mask gating: an out-of-mask 0x80 bit is stripped, NOT leaked. Before the
-    // fix set_val left rval unmasked, so 0x88 would have shifted to 0x22 and
-    // missed the state table (val 65535).
-    assert!(rec.apply_raw_readback(0x88));
-    assert_eq!(rec.rval, 0x08, "out-of-mask 0x80 bit masked away");
-    assert_eq!(rec.val, 2, "still resolves to TWVL, not an unknown state");
 }
 
 // mbbi Soft Channel set_val is now a pass-through (C devMbbiSoft read_mbbi

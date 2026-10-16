@@ -25,11 +25,12 @@ pub enum AsynException {
     Shutdown,
 }
 
-/// An exception event delivered to registered callbacks.
+/// An exception event delivered to registered callbacks. It borrows the
+/// port's name, so an announce allocates nothing, as C's does not.
 #[derive(Debug, Clone)]
-pub struct ExceptionEvent {
+pub struct ExceptionEvent<'a> {
     /// Name of the port that generated this exception.
-    pub port_name: String,
+    pub port_name: &'a str,
     /// The type of exception.
     pub exception: AsynException,
     /// Sub-address (-1 for port-level events).
@@ -41,8 +42,9 @@ pub struct ExceptionEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExceptionCallbackId(u64);
 
-type CallbackFn = Arc<dyn Fn(&ExceptionEvent) + Send + Sync>;
+type CallbackFn = Arc<dyn Fn(&ExceptionEvent<'_>) + Send + Sync>;
 
+#[derive(Clone)]
 struct CallbackEntry {
     id: ExceptionCallbackId,
     callback: CallbackFn,
@@ -53,14 +55,16 @@ struct CallbackEntry {
 /// Owned by [`crate::manager::PortManager`]. Ports announce state changes
 /// through this manager, and all registered callbacks receive the events.
 pub struct ExceptionManager {
-    callbacks: Mutex<Vec<CallbackEntry>>,
+    /// An announce takes the list with one reference count and allocates
+    /// nothing; an edit copies it only while an announce still holds it.
+    callbacks: Mutex<Arc<Vec<CallbackEntry>>>,
     next_id: AtomicU64,
 }
 
 impl ExceptionManager {
     pub fn new() -> Self {
         Self {
-            callbacks: Mutex::new(Vec::new()),
+            callbacks: Mutex::new(Arc::default()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -68,19 +72,20 @@ impl ExceptionManager {
     /// Register an exception callback. Returns an ID for later removal.
     pub fn add_callback<F>(&self, callback: F) -> ExceptionCallbackId
     where
-        F: Fn(&ExceptionEvent) + Send + Sync + 'static,
+        F: Fn(&ExceptionEvent<'_>) + Send + Sync + 'static,
     {
         let id = ExceptionCallbackId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.callbacks.lock().push(CallbackEntry {
+        let entry = CallbackEntry {
             id,
             callback: Arc::new(callback),
-        });
+        };
+        Arc::make_mut(&mut self.callbacks.lock()).push(entry);
         id
     }
 
     /// Remove a previously registered callback.
     pub fn remove_callback(&self, id: ExceptionCallbackId) {
-        self.callbacks.lock().retain(|e| e.id != id);
+        Arc::make_mut(&mut self.callbacks.lock()).retain(|e| e.id != id);
     }
 
     /// How many callbacks are registered — C's `exceptionUsers`, the count
@@ -92,17 +97,14 @@ impl ExceptionManager {
 
     /// Announce an exception event to all registered callbacks.
     ///
-    /// The callback list is snapshotted under the lock and the lock is
-    /// released before any callback runs, so a callback may freely call
-    /// [`Self::add_callback`] / [`Self::remove_callback`] (or re-enter
-    /// `announce`) without deadlocking on the non-reentrant mutex.
-    pub fn announce(&self, event: &ExceptionEvent) {
-        let snapshot: Vec<CallbackFn> = {
-            let cbs = self.callbacks.lock();
-            cbs.iter().map(|e| e.callback.clone()).collect()
-        };
-        for callback in &snapshot {
-            callback(event);
+    /// The list is taken under the lock and the lock is released before any
+    /// callback runs, so a callback may freely call [`Self::add_callback`] /
+    /// [`Self::remove_callback`] (or re-enter `announce`) without deadlocking
+    /// on the non-reentrant mutex.
+    pub fn announce(&self, event: &ExceptionEvent<'_>) {
+        let snapshot = Arc::clone(&self.callbacks.lock());
+        for entry in snapshot.iter() {
+            (entry.callback)(event);
         }
     }
 }
@@ -130,7 +132,7 @@ mod tests {
         });
 
         let event = ExceptionEvent {
-            port_name: "test".into(),
+            port_name: "test",
             exception: AsynException::Connect,
             addr: -1,
         };
@@ -150,7 +152,7 @@ mod tests {
         });
 
         let event = ExceptionEvent {
-            port_name: "p".into(),
+            port_name: "p",
             exception: AsynException::Enable,
             addr: -1,
         };
@@ -178,7 +180,7 @@ mod tests {
         });
 
         let event = ExceptionEvent {
-            port_name: "p".into(),
+            port_name: "p",
             exception: AsynException::AutoConnect,
             addr: 0,
         };
@@ -194,11 +196,11 @@ mod tests {
         let captured2 = captured.clone();
 
         mgr.add_callback(move |event| {
-            *captured2.lock() = event.port_name.clone();
+            *captured2.lock() = event.port_name.to_string();
         });
 
         mgr.announce(&ExceptionEvent {
-            port_name: "myport".into(),
+            port_name: "myport",
             exception: AsynException::Connect,
             addr: -1,
         });

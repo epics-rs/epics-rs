@@ -12615,6 +12615,13 @@ A.OEOS
 
         rec.enbl = 0;
         rec.special("ENBL", true).unwrap();
+        // One round trip: the actor drains what it owes before it serves this.
+        let _ = rec
+            .device_user
+            .device()
+            .unwrap()
+            .handle
+            .call_param_callbacks_blocking(0);
         assert!(!rec.status_dirty.load(Ordering::Acquire), "actor setter");
         rec.enbl = 1;
         rec.special("ENBL", true).unwrap();

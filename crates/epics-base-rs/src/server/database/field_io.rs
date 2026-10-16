@@ -2273,7 +2273,8 @@ impl PvDatabase {
     /// read wants, which drops the error's text unread. One frame from the
     /// address to the field's accessor, so the value is built once and
     /// handed up, not repacked through a `Result` on the way.
-    #[inline(always)]
+    // Off the debug FLNK frame; see `process_cycle`.
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub(crate) fn read_field_at(
         &self,
         instance: &crate::server::record::RecordInstance,

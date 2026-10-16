@@ -1444,6 +1444,22 @@ fn seeded_record_attributes() -> RecordAttributes {
         .collect()
 }
 
+/// Raised before the first breakpoint table or TPRO lands in any database,
+/// never lowered: the process frame's one test for both debug hooks, so a
+/// process nobody debugs pays a single relaxed load per record.
+static DEBUG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`DEBUG_ARMED`]'s one writer, called before a breakpoint table or a TPRO
+/// is written.
+pub(crate) fn arm_debugging() {
+    DEBUG_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn debug_armed() -> bool {
+    DEBUG_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl PvDatabase {
     /// Acquire L46, `registration_mutex` — the ONE acquisition site.
     ///
@@ -1867,7 +1883,8 @@ impl PvDatabase {
         self.inner.breakpoints.load_full()
     }
 
-    /// [`Self::breakpoints`] for the two hooks in the process frame: C's
+    /// [`Self::breakpoints`] for the two hooks in the process frame, behind
+    /// [`debug_armed`]: C's
     /// `if (lset_stack_count)` first, and the table only if it answers yes.
     /// See [`PvDatabaseInner::debugging`].
     pub(crate) fn breakpoints_if_debugging(&self) -> Option<Arc<breakpoint::BreakpointTable>> {
@@ -1893,6 +1910,7 @@ impl PvDatabase {
             return existing;
         }
         // Raised before the table lands — see [`PvDatabaseInner::debugging`].
+        arm_debugging();
         self.inner
             .debugging
             .store(true, std::sync::atomic::Ordering::Relaxed);

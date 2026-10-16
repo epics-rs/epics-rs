@@ -147,8 +147,8 @@ impl BackgroundHandle {
     }
 
     /// Enqueue a one-shot record-process tail — C `scanOnce` (`dbScan.c:660`).
-    pub fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
-        self.scan_once.scan_once(cb)
+    pub fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
+        self.scan_once.scan_once(name, cb)
     }
 
     /// The callback-submission handle alone.
@@ -187,7 +187,7 @@ mod tests {
         )
         .unwrap();
         let tx_once = tx.clone();
-        h.scan_once(Box::new(move || tx_once.send("once").unwrap()))
+        h.scan_once("REC", Box::new(move || tx_once.send("once").unwrap()))
             .unwrap();
         h.callback_delayed(
             Duration::from_millis(20),

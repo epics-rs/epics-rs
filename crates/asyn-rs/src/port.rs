@@ -86,8 +86,6 @@ pub struct DeviceState {
     /// mirrors C's zero-initialised timestamp: the first attempt is
     /// always permitted.
     pub last_connect_disconnect: Option<Instant>,
-    /// This device's announces owed — see [`OwedAnnounces`].
-    owed: OwedAnnounces,
 }
 
 impl Default for DeviceState {
@@ -95,7 +93,6 @@ impl Default for DeviceState {
         Self {
             cells: DpCells::new(true, true, true),
             last_connect_disconnect: None,
-            owed: OwedAnnounces::default(),
         }
     }
 }
@@ -142,7 +139,6 @@ fn locate_device(
         DeviceState {
             cells: DpCells::new(port.connected(), port.enabled(), port.auto_connect()),
             last_connect_disconnect: None,
-            owed: OwedAnnounces::default(),
         }
     })
 }
@@ -153,18 +149,15 @@ fn locate_device(
 /// user — or C `enable` / `autoConnect`, the other manager calls asynRecord
 /// makes under the record's lock — is a short lock on the calling thread and
 /// never a request to the actor. The lock is never held across a driver call or
-/// an exception announce.
+/// an exception announce; `enable` and `autoConnect` announce after it, on the
+/// caller's thread, as C's do after `asynManagerLock` (asynManager.c:2247-2249).
 #[derive(Clone)]
 pub(crate) struct DeviceTable {
     multi_device: bool,
     port: DpCells,
     devices: Arc<Mutex<HashMap<i32, DeviceState>>>,
-    /// C `dpCommon.defunct`; written only under the `devices` lock, in
-    /// [`PortDriverBase::shutdown_lifecycle`], so [`Self::enable`]'s check and
-    /// store cannot straddle a shutdown.
-    defunct: Arc<AtomicBool>,
-    owed: Arc<Mutex<PortOwed>>,
-    lock_port_timeout: Arc<LockPortTimeout>,
+    shared: Arc<PortShared>,
+    announcer: Arc<ExceptionAnnouncer>,
 }
 
 impl DeviceTable {
@@ -175,9 +168,8 @@ impl DeviceTable {
             multi_device: false,
             port: DpCells::new(true, true, true),
             devices: Arc::default(),
-            defunct: Arc::default(),
-            owed: Arc::default(),
-            lock_port_timeout: Arc::default(),
+            shared: Arc::default(),
+            announcer: Arc::new(ExceptionAnnouncer::new("detached")),
         }
     }
 
@@ -199,145 +191,99 @@ impl DeviceTable {
     /// C `pport->dpc.defunct`, read without the actor as C's `findInterface`
     /// reads it under `asynManagerLock` (asynManager.c:1487).
     pub(crate) fn is_defunct(&self) -> bool {
-        self.defunct.load(Ordering::Acquire)
+        self.shared.defunct.load(Ordering::Acquire)
     }
 
     /// C `port.queueLockPortTimeout`, the queue deadline every SyncIO call on
     /// the port gets at least — see [`crate::user::AsynUser::locking_port`].
     pub(crate) fn queue_lock_port_timeout(&self) -> Duration {
-        Duration::from_nanos(self.lock_port_timeout.0.load(Ordering::Relaxed))
+        Duration::from_nanos(self.shared.lock_port_timeout.load(Ordering::Relaxed))
     }
 
     /// C `setQueueLockPortTimeout` (asynManager.c:2393-2406).
     pub(crate) fn set_queue_lock_port_timeout(&self, timeout: Duration) {
         let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        self.lock_port_timeout.0.store(nanos, Ordering::Relaxed);
+        self.shared
+            .lock_port_timeout
+            .store(nanos, Ordering::Relaxed);
     }
 
-    /// C `enable`'s locked half (asynManager.c:2236-2247): refuse a shut-down
-    /// port, else store `enabled` on the `dpCommon` `addr` resolves to and owe
-    /// its `asynExceptionEnable` (:2249) — see [`PortDriverBase::drain_announces`].
+    /// C `enable` (asynManager.c:2236-2249): refuse a shut-down port, else
+    /// store `enabled` on the `dpCommon` `addr` resolves to and, unlocked,
+    /// announce its `asynExceptionEnable` on this thread.
     pub(crate) fn enable(&self, addr: i32, yes: bool) -> AsynResult<()> {
-        let mut devices = self.devices.lock();
-        if self.defunct.load(Ordering::Acquire) {
-            return Err(PortDriverBase::shut_down_error());
-        }
-        let mut owed = self.owed.lock();
-        let stamp = owed.stamp();
-        match dp_common_key(self.multi_device, addr) {
-            Some(addr) => {
-                let dev = locate_device(&mut devices, addr, || self.port.clone());
-                dev.put_enabled(yes);
-                dev.owed.enable = stamp;
+        let dp = dp_common_key(self.multi_device, addr);
+        {
+            let mut devices = self.devices.lock();
+            if self.shared.defunct.load(Ordering::Acquire) {
+                return Err(PortDriverBase::shut_down_error());
             }
-            None => {
-                self.port.enabled.store(yes, Ordering::Release);
-                owed.port.enable = stamp;
+            match dp {
+                Some(addr) => {
+                    locate_device(&mut devices, addr, || self.port.clone()).put_enabled(yes)
+                }
+                None => self.port.enabled.store(yes, Ordering::Release),
             }
         }
+        self.announcer
+            .announce(AsynException::Enable, dp.unwrap_or(-1));
         Ok(())
     }
 
-    /// C `autoConnectAsyn`'s store (asynManager.c:2318-2323), owing its connect
-    /// timer and `asynExceptionAutoConnect` — see
-    /// [`PortDriverBase::drain_announces`].
+    /// C `autoConnectAsyn` (asynManager.c:2318-2326): store, owe the port's
+    /// connect timer to the actor when a disconnected dpCommon turns it on,
+    /// then announce `asynExceptionAutoConnect` on this thread.
     pub(crate) fn auto_connect(&self, addr: i32, yes: bool) {
-        let mut devices = self.devices.lock();
-        let mut owed = self.owed.lock();
-        let stamp = owed.stamp();
+        let dp = dp_common_key(self.multi_device, addr);
         // C checks the dpCommon `findDpCommon` resolved — on a device, the
         // DEVICE's — while the timer it starts is the port's.
-        let (slot, connected) = match dp_common_key(self.multi_device, addr) {
+        let connected = match dp {
             Some(addr) => {
+                let mut devices = self.devices.lock();
                 let dev = locate_device(&mut devices, addr, || self.port.clone());
                 dev.put_auto_connect(yes);
-                (&mut dev.owed, dev.cells.connected())
+                dev.cells.connected()
             }
             None => {
                 self.port.auto_connect.store(yes, Ordering::Release);
-                (&mut owed.port, self.port.connected())
+                self.port.connected()
             }
         };
-        slot.auto_connect = stamp;
         if yes && !connected {
-            owed.start_timer = true;
+            self.shared
+                .connect_timer_owed
+                .store(true, Ordering::Release);
         }
-    }
-
-    /// The oldest announce owed on any dpCommon, taken off it: its stamp
-    /// cleared, and for an AutoConnect the timer start owed with it.
-    fn take_oldest_owed(&self) -> Option<(AsynException, i32, bool)> {
-        let mut devices = self.devices.lock();
-        let mut owed = self.owed.lock();
-        if !owed.any {
-            return None;
-        }
-        let port = &mut owed.port;
-        let mut oldest: Option<(u64, AsynException, i32, &mut u64)> = None;
-        let slots = std::iter::once((-1, port))
-            .chain(devices.iter_mut().map(|(addr, d)| (*addr, &mut d.owed)));
-        for (addr, slot) in slots {
-            for (kind, stamp) in [
-                (AsynException::Enable, &mut slot.enable),
-                (AsynException::AutoConnect, &mut slot.auto_connect),
-            ] {
-                if *stamp != 0 && oldest.as_ref().is_none_or(|o| *stamp < o.0) {
-                    oldest = Some((*stamp, kind, addr, stamp));
-                }
-            }
-        }
-        let Some((_, kind, addr, stamp)) = oldest else {
-            owed.any = false;
-            return None;
-        };
-        *stamp = 0;
-        let start_timer =
-            kind == AsynException::AutoConnect && std::mem::take(&mut owed.start_timer);
-        Some((kind, addr, start_timer))
+        self.announcer
+            .announce(AsynException::AutoConnect, dp.unwrap_or(-1));
     }
 }
 
-/// A port's `queueLockPortTimeout` in nanoseconds, C's default until set.
-struct LockPortTimeout(AtomicU64);
+/// The port-wide words the actor and every [`DeviceTable`] share, behind one
+/// `Arc` so a [`crate::port_handle::PortHandle`] clone pays one refcount for
+/// them.
+struct PortShared {
+    /// C `dpCommon.defunct`; written only under the `devices` lock, in
+    /// [`PortDriverBase::shutdown_lifecycle`], so [`DeviceTable::enable`]'s
+    /// check and store cannot straddle a shutdown.
+    defunct: AtomicBool,
+    /// The `connectTimer` start C `autoConnectAsyn` makes (:2320-2322), owed
+    /// to the actor, whose deadline it is — see
+    /// [`PortDriverBase::start_owed_connect_timer`].
+    connect_timer_owed: AtomicBool,
+    /// C `port.queueLockPortTimeout` in nanoseconds, C's default until set.
+    lock_port_timeout: AtomicU64,
+}
 
-impl Default for LockPortTimeout {
+impl Default for PortShared {
     fn default() -> Self {
-        Self(AtomicU64::new(
-            crate::user::QUEUE_LOCK_PORT_TIMEOUT.as_nanos() as u64,
-        ))
-    }
-}
-
-/// The announces C `enable` and `autoConnectAsyn` raise inline on one
-/// dpCommon (asynManager.c:2249, :2323-2326), owed to the port's actor: the
-/// port stamp of the latest call of each kind, 0 for none. Owed in place, so a
-/// call under a record's hold allocates nothing and is never refused; repeated
-/// calls of one kind on one dpCommon coalesce into one announce at the latest
-/// call's place, which the one consumer (asynRecord's exception callback,
-/// re-reading the state as C `exceptCallback` does) cannot tell apart.
-#[derive(Debug, Clone, Copy, Default)]
-struct OwedAnnounces {
-    enable: u64,
-    auto_connect: u64,
-}
-
-/// The port's half of the owed announces, under the lock taken after the
-/// device list's: the port dpCommon's own, the stamp counter and the
-/// AutoConnect timer start.
-#[derive(Default)]
-struct PortOwed {
-    port: OwedAnnounces,
-    seq: u64,
-    start_timer: bool,
-    /// Some dpCommon may owe an announce.
-    any: bool,
-}
-
-impl PortOwed {
-    fn stamp(&mut self) -> u64 {
-        self.seq += 1;
-        self.any = true;
-        self.seq
+        Self {
+            defunct: AtomicBool::new(false),
+            connect_timer_owed: AtomicBool::new(false),
+            lock_port_timeout: AtomicU64::new(
+                crate::user::QUEUE_LOCK_PORT_TIMEOUT.as_nanos() as u64
+            ),
+        }
     }
 }
 
@@ -601,19 +547,17 @@ pub struct PortDriverBase {
     /// The field is private so [`Self::shutdown_lifecycle`] is the only way to
     /// set it, which is what makes the invariant hold by construction: nothing can
     /// build a port that is defunct but still enabled, so no gate needs to ask
-    /// about defunct to refuse it (R15-50).
-    defunct: Arc<AtomicBool>,
-    /// The announces [`DeviceTable`] owes — see [`Self::drain_announces`].
-    owed: Arc<Mutex<PortOwed>>,
-    /// C `port.queueLockPortTimeout` — see [`DeviceTable::queue_lock_port_timeout`].
-    lock_port_timeout: Arc<LockPortTimeout>,
+    /// about defunct to refuse it (R15-50). It lives in `shared`, with the
+    /// connect timer start [`DeviceTable`] owes and C
+    /// `port.queueLockPortTimeout`.
+    shared: Arc<PortShared>,
     /// This port's announcement channel — C `dpCommon.exceptionUserList` plus
     /// the `notifyPortThread` signal that `announceExceptionOccurred` ends with
     /// (asynManager.c:613-639). Detachable ([`Self::exception_announcer`]) so a
     /// worker thread the driver owns — the IP-server accept loop — announces
     /// through the same counter and the same list as the actor does, instead of
     /// reaching around them.
-    pub(crate) announcer: ExceptionAnnouncer,
+    pub(crate) announcer: Arc<ExceptionAnnouncer>,
     pub options: HashMap<String, String>,
     /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
     /// is created per `asynInterposeEosConfig(portName, addr, ...)`
@@ -695,7 +639,8 @@ pub struct PortDriverBase {
 /// ([`PortDriverBase::exceptions_announced`]).
 #[derive(Clone)]
 pub struct ExceptionAnnouncer {
-    port_name: String,
+    /// Shared, so a [`DeviceTable`] in every handle clone allocates nothing.
+    port_name: Arc<str>,
     /// Set once by [`crate::services::PortServices::bind`] at port creation, so
     /// every clone taken afterwards carries the IOC's exception list.
     sink: Option<Arc<ExceptionManager>>,
@@ -706,7 +651,7 @@ pub struct ExceptionAnnouncer {
 impl ExceptionAnnouncer {
     fn new(port_name: &str) -> Self {
         Self {
-            port_name: port_name.to_string(),
+            port_name: Arc::from(port_name),
             sink: None,
             announced: Arc::new(AtomicU64::new(0)),
         }
@@ -719,7 +664,7 @@ impl ExceptionAnnouncer {
         self.announced.fetch_add(1, Ordering::Release);
         if let Some(ref sink) = self.sink {
             sink.announce(&ExceptionEvent {
-                port_name: self.port_name.clone(),
+                port_name: &self.port_name,
                 exception,
                 addr,
             });
@@ -755,10 +700,8 @@ impl PortDriverBase {
             last_announced: true,
             enabled: Arc::new(AtomicBool::new(true)),
             auto_connect: Arc::new(AtomicBool::new(true)),
-            defunct: Arc::default(),
-            owed: Arc::default(),
-            lock_port_timeout: Arc::default(),
-            announcer: ExceptionAnnouncer::new(port_name),
+            shared: Arc::default(),
+            announcer: Arc::new(ExceptionAnnouncer::new(port_name)),
             options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
@@ -837,14 +780,14 @@ impl PortDriverBase {
     /// A clone of this port's announcement capability, for a worker thread the
     /// driver owns. See [`ExceptionAnnouncer`].
     pub fn exception_announcer(&self) -> ExceptionAnnouncer {
-        self.announcer.clone()
+        ExceptionAnnouncer::clone(&self.announcer)
     }
 
     /// Bind the IOC's exception list. [`crate::services::PortServices::bind`] is
     /// the production caller; tests that drive a driver without a runtime use it
     /// to stand in for that binding.
     pub(crate) fn bind_exception_sink(&mut self, sink: Arc<ExceptionManager>) {
-        self.announcer.sink = Some(sink);
+        Arc::make_mut(&mut self.announcer).sink = Some(sink);
     }
 
     /// How many exceptions this port has announced. Monotonic; the actor compares
@@ -1250,9 +1193,7 @@ impl PortDriverBase {
         // C `enable` writes `findDpCommon(puserPvt)->enabled` (asynManager.c:2245),
         // so an addr that resolves to the port's own slot is the port's enable —
         // not a device entry no reader would ever resolve to.
-        self.device_table().enable(addr, enabled)?;
-        self.drain_announces();
-        Ok(())
+        self.device_table().enable(addr, enabled)
     }
 
     /// Query whether auto-connect is enabled.
@@ -1279,20 +1220,12 @@ impl PortDriverBase {
         self.set_auto_connect_addr(-1, yes);
     }
 
-    /// What C `enable` and `autoConnectAsyn` do after their store
-    /// (asynManager.c:2249, :2323-2326) — start the port's connect timer and
-    /// raise the exception on the dpCommon it was made on — for every store
-    /// [`DeviceTable`] recorded, on this thread or a handle's, oldest first.
-    pub(crate) fn drain_announces(&mut self) {
-        if !self.owed.lock().any {
-            return;
-        }
-        let table = self.device_table();
-        while let Some((kind, addr, start_timer)) = table.take_oldest_owed() {
-            if start_timer {
-                self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
-            }
-            self.announce_exception(kind, addr);
+    /// Start the connect timer C `autoConnectAsyn` starts (asynManager.c:
+    /// 2320-2322), if a [`DeviceTable::auto_connect`] owes it.
+    pub(crate) fn start_owed_connect_timer(&mut self) {
+        let owed = &self.shared.connect_timer_owed;
+        if owed.load(Ordering::Acquire) && owed.swap(false, Ordering::AcqRel) {
+            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
         }
     }
 
@@ -1304,14 +1237,14 @@ impl PortDriverBase {
         // Same `findDpCommon` split as [`Self::set_addr_enabled`]
         // (asynManager.c:2316).
         self.device_table().auto_connect(addr, yes);
-        self.drain_announces();
+        self.start_owed_connect_timer();
     }
 
     /// Query whether the port has been marked defunct via
     /// [`Self::shutdown_lifecycle`] — once true the port is gone for
     /// good, mirroring C asynManager.c:2268-2271.
     pub fn is_defunct(&self) -> bool {
-        self.defunct.load(Ordering::Acquire)
+        self.shared.defunct.load(Ordering::Acquire)
     }
 
     /// The one place a shut-down port is named in an error message, and the
@@ -1376,12 +1309,10 @@ impl PortDriverBase {
         self.queue_gate().check(connect)?;
         if !self.flags.can_block && connect != ConnectCheck::SynchronousLock {
             // C :1563-1569 — the device-enabled refusal in the synchronous block
-            // is *not* conditioned on `checkPortConnect`; only the connected one
-            // below is (:1570).
+            // is *not* conditioned on `checkPortConnect`. The connected one
+            // (:1570-1577) needs an auto-connect first, so it is the actor's
+            // (`PortActor::synchronous_gate`).
             self.check_device_enabled(addr)?;
-            if connect == ConnectCheck::Required {
-                self.check_device_connected(addr)?;
-            }
         }
         Ok(())
     }
@@ -1506,7 +1437,7 @@ impl PortDriverBase {
         for ds in devices.values() {
             ds.put_enabled(false);
         }
-        self.defunct.store(true, Ordering::Release);
+        self.shared.defunct.store(true, Ordering::Release);
         drop(devices);
         self.announce_exception(AsynException::Shutdown, -1);
         Ok(())
@@ -1574,9 +1505,8 @@ impl PortDriverBase {
             multi_device: self.flags.multi_device,
             port: self.port_cells(),
             devices: Arc::clone(&self.device_states),
-            defunct: Arc::clone(&self.defunct),
-            owed: Arc::clone(&self.owed),
-            lock_port_timeout: Arc::clone(&self.lock_port_timeout),
+            shared: Arc::clone(&self.shared),
+            announcer: Arc::clone(&self.announcer),
         }
     }
 

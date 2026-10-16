@@ -1013,6 +1013,12 @@ pub enum RequestOp {
     /// A preallocated request the port thread runs — C `queueRequest` of a
     /// user that carries its own callbacks; see [`RequestCell`].
     Cell(Arc<RequestCell>),
+    /// The same cell on a port without `ASYN_CANBLOCK`: C `queueRequest`'s
+    /// synchronous branch, its refusals and then `processUser` under
+    /// `synchronousLock` (asynManager.c:1555-1584), as one step of the actor,
+    /// whose serial ownership of the driver is that lock. A waiter, not a
+    /// queue entry. Built by [`crate::port_handle::PortHandle::queue_request`].
+    CellInline(Arc<RequestCell>),
     /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
     /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
     /// interpose layer reads, so asynRecord IEOS writes survive a

@@ -569,8 +569,7 @@ impl PvaLinkResolver {
     ) {
         self.spawn_notify_forwarder(MonitorKey::from_config(cfg), link);
         if holder.scans_on_update(cfg) && link.is_connected() && self.is_attached(holder, id) {
-            self.scan_attached_record(&holder.record, cfg.scan_on_passive)
-                .await;
+            self.scan_attached_record(&holder.record, cfg.scan_on_passive);
         }
     }
 
@@ -625,24 +624,20 @@ impl PvaLinkResolver {
         ));
     }
 
-    /// Fire one immediate scan of a single newly-attached scan target —
-    /// the attach-time scan pvxs runs when the shared channel is already
-    /// connected at link-open (`pvxs/ioc/pvalink_lset.cpp:148-167`). Applies the
-    /// same CPP passive gate + PACT pre-check as the steady-state
-    /// forwarder, then processes the one record through the
-    /// gate-acquiring entry. There is no atomic group and no epoch is
-    /// held at attach time, so the link's `atomic` flag does not change
-    /// the entry here — it governs only the multi-record group locking
-    /// inside [`scan_once`].
-    async fn scan_attached_record(&self, record: &[u8], passive_only: bool) {
+    /// The attach-time scan pvxs runs when the shared channel is already
+    /// connected at link-open (`pvxs/ioc/pvalink_lset.cpp:148-167`): the
+    /// CPP passive gate, then C `scanOnce`. Unlike the steady-state
+    /// [`scan_target_should_process`] there is no PACT pre-check; the
+    /// queued `dbProcess` meets a busy record as C's does.
+    fn scan_attached_record(&self, record: &[u8], passive_only: bool) {
         let Some(db_handle) = self.db.read().clone() else {
             return;
         };
-        if scan_target_should_process(&db_handle, record, passive_only) {
-            let mut visited = epics_base_rs::server::database::ProcStack::new();
-            let _ = db_handle
-                .process_record_with_links(record, &mut visited)
-                .await;
+        let passive = db_handle.get_record(record).is_some_and(|rec| {
+            rec.read().common.scan == epics_base_rs::server::record::ScanType::Passive
+        });
+        if passive || !passive_only {
+            db_handle.scan_once(record);
         }
     }
 
@@ -1042,9 +1037,8 @@ async fn run_notify_forwarder(
 ///     stream onto a stuck async target drives it to SCAN_ALARM/INVALID
 ///     after MAX_LOCK consecutive busy attempts.
 ///
-/// This is the single owner of the scan-time `rpro` set, shared by the
-/// steady-state forwarder ([`scan_once`]) and the attach-time scan
-/// ([`PvaLinkResolver::scan_attached_record`]). The write guard is
+/// This is the single owner of the scan-time `rpro` set, used by the
+/// steady-state forwarder ([`scan_once`]). The write guard is
 /// released before returning so the caller's process call can take its
 /// own locks. A missing record returns `false`.
 fn scan_target_should_process(db_handle: &PvDatabase, record: &[u8], passive_only: bool) -> bool {
@@ -2747,6 +2741,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Queued, as C `scanOnce`.
+        for _ in 0..200 {
+            if count.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -2792,6 +2793,8 @@ mod tests {
             .await
             .unwrap();
 
+        // Long enough for a queued scan to have run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             count.load(std::sync::atomic::Ordering::SeqCst),
             0,

@@ -158,8 +158,9 @@ impl Inner {
         wake.wake();
     }
 
-    /// Port of `scanOnceCallback` (`dbScan.c:670-694`).
-    fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
+    /// Port of `scanOnceCallback` (`dbScan.c:670-694`); `name` is the
+    /// record's, for the overflow line C prints from `precord->name`.
+    fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         let mut st = self.state.lock();
         if st.shutdown {
             // Worker stopped: C drops late scanOnce requests during shutdown
@@ -173,14 +174,10 @@ impl Inner {
             );
             return Ok(());
         }
+        let mut report = false;
         let result = if st.queue.len() >= self.capacity {
             // dbScan.c:682-687 — ring full: log once per episode, then count.
-            if st.new_overflow {
-                tracing::warn!(
-                    target: "epics_base_rs::runtime::scan_once",
-                    "WARNING scanOnce: Ring buffer overflow"
-                );
-            }
+            report = st.new_overflow;
             st.new_overflow = false; // dbScan.c:686
             st.overflows += 1; // dbScan.c:687
             Err(ScanOnceOverflow)
@@ -192,6 +189,12 @@ impl Inner {
         };
         let wake = Arc::clone(&st.wake);
         drop(st);
+        if report {
+            crate::runtime::log::errlog_vprintf(format_args!(
+                "{name} : {} scanOnce: Ring buffer overflow\n",
+                crate::runtime::log::erl_warning()
+            ));
+        }
         // dbScan.c:691 — `epicsEventSignal(onceSem)` is issued unconditionally,
         // outside the push success/failure branch.
         wake.signal();
@@ -299,12 +302,12 @@ pub struct ScanOnceHandle {
 }
 
 impl ScanOnceHandle {
-    /// Enqueue `cb` for one-shot processing and return immediately. `Err` on a
-    /// full ring (the request is dropped, as in C). Port of `scanOnce`
-    /// (`dbScan.c:660`).
-    pub fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
+    /// Enqueue `cb` for one-shot processing of record `name` and return
+    /// immediately. `Err` on a full ring (the request is dropped, as in C).
+    /// Port of `scanOnce` (`dbScan.c:660`).
+    pub fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         self.inner.ensure_worker();
-        self.inner.scan_once(cb)
+        self.inner.scan_once(name, cb)
     }
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:67`).
@@ -398,9 +401,9 @@ impl ScanOnceQueue {
 
     /// Enqueue `cb` for one-shot processing — convenience wrapper over
     /// [`ScanOnceHandle::scan_once`].
-    pub fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
+    pub fn scan_once(&self, name: &str, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         self.inner.ensure_worker();
-        self.inner.scan_once(cb)
+        self.inner.scan_once(name, cb)
     }
 
     /// Lifetime overflow count — C `onceQOverruns` (`dbScan.c:67`).
@@ -491,7 +494,8 @@ mod tests {
     fn scan_once_puts_nothing_on_the_mutex_list() {
         let q = ScanOnceQueue::new();
         let (tx, rx) = mpsc::channel();
-        q.scan_once(Box::new(move || tx.send(()).unwrap())).unwrap();
+        q.scan_once("REC", Box::new(move || tx.send(()).unwrap()))
+            .unwrap();
         rx.recv_timeout(T).unwrap();
         let listed: Vec<_> = crate::runtime::sync::mutex_report(false)
             .shown
@@ -507,11 +511,11 @@ mod tests {
     #[test]
     fn a_panicking_tail_does_not_stop_the_worker() {
         let q = ScanOnceQueue::new();
-        q.scan_once(Box::new(|| panic!("a scanOnce tail panicked")))
+        q.scan_once("REC", Box::new(|| panic!("a scanOnce tail panicked")))
             .expect("enqueue the panicking tail");
 
         let (tx, rx) = mpsc::channel();
-        q.scan_once(Box::new(move || tx.send(7u32).unwrap()))
+        q.scan_once("REC", Box::new(move || tx.send(7u32).unwrap()))
             .expect("enqueue the next tail");
         assert_eq!(
             rx.recv_timeout(T).unwrap(),
@@ -525,7 +529,7 @@ mod tests {
         let q = ScanOnceQueue::new();
         let (tx, rx) = mpsc::channel();
         // Non-blocking by construction: this returns before the worker runs.
-        q.scan_once(Box::new(move || tx.send(7u32).unwrap()))
+        q.scan_once("REC", Box::new(move || tx.send(7u32).unwrap()))
             .unwrap();
         assert_eq!(rx.recv_timeout(T).unwrap(), 7);
     }
@@ -539,19 +543,38 @@ mod tests {
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
 
         // Worker picks this up and blocks inside it; ring is empty again.
-        q.scan_once(Box::new(move || {
-            started_tx.send(()).unwrap();
-            gate_rx.recv().unwrap();
-        }))
+        q.scan_once(
+            "REC",
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
         .unwrap();
         started_rx.recv_timeout(T).unwrap();
 
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let listener = crate::runtime::log::errlog_add_listener(move |m| {
+            if m.contains("scanOnce") {
+                sink.lock().unwrap().push(m.to_string());
+            }
+        });
+
         // Fill the single ring slot (worker is busy).
-        q.scan_once(Box::new(|| {})).unwrap();
+        q.scan_once("REC", Box::new(|| {})).unwrap();
         // Ring full → overflow, request dropped.
-        assert_eq!(q.scan_once(Box::new(|| {})), Err(ScanOnceOverflow));
-        assert_eq!(q.scan_once(Box::new(|| {})), Err(ScanOnceOverflow));
+        assert_eq!(q.scan_once("OVF1", Box::new(|| {})), Err(ScanOnceOverflow));
+        assert_eq!(q.scan_once("OVF2", Box::new(|| {})), Err(ScanOnceOverflow));
         assert_eq!(q.overflow_count(), 2);
+
+        // dbScan.c:688: the first overflow of the episode only, by name.
+        crate::runtime::log::errlog_flush();
+        crate::runtime::log::errlog_remove_listener(listener);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            ["OVF1 : WARNING scanOnce: Ring buffer overflow\n"]
+        );
 
         gate_tx.send(()).unwrap(); // release the worker so it can drain.
     }
@@ -563,11 +586,11 @@ mod tests {
     fn stop_runs_the_queued_tails_joins_and_the_next_request_restarts() {
         let q = ScanOnceQueue::new();
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
-        q.scan_once(Box::new(move || gate_rx.recv().unwrap()))
+        q.scan_once("REC", Box::new(move || gate_rx.recv().unwrap()))
             .unwrap();
         let ran = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&ran);
-        q.scan_once(Box::new(move || r.store(true, Ordering::SeqCst)))
+        q.scan_once("REC", Box::new(move || r.store(true, Ordering::SeqCst)))
             .unwrap();
         gate_tx.send(()).unwrap();
         q.stop();
@@ -578,7 +601,7 @@ mod tests {
         assert!(q.inner.worker.lock().is_none(), "the worker was not joined");
 
         let (tx, rx) = mpsc::channel();
-        q.scan_once(Box::new(move || tx.send(7u32).unwrap()))
+        q.scan_once("REC", Box::new(move || tx.send(7u32).unwrap()))
             .unwrap();
         assert_eq!(rx.recv_timeout(T).unwrap(), 7);
     }
@@ -590,10 +613,13 @@ mod tests {
         let q = Arc::new(ScanOnceQueue::new());
         let (tx, rx) = mpsc::channel();
         let me = Arc::clone(&q);
-        q.scan_once(Box::new(move || {
-            me.stop();
-            tx.send(()).unwrap();
-        }))
+        q.scan_once(
+            "REC",
+            Box::new(move || {
+                me.stop();
+                tx.send(()).unwrap();
+            }),
+        )
         .unwrap();
         rx.recv_timeout(T).expect("stop on the worker returned");
     }
@@ -608,7 +634,7 @@ mod tests {
 
         let ran = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&ran);
-        let res = h.scan_once(Box::new(move || r.store(true, Ordering::SeqCst)));
+        let res = h.scan_once("REC", Box::new(move || r.store(true, Ordering::SeqCst)));
         assert_eq!(res, Ok(())); // silent no-op, not Err(ScanOnceOverflow).
         assert!(
             !ran.load(Ordering::SeqCst),
@@ -631,14 +657,17 @@ mod tests {
         let q = ScanOnceQueue::with_capacity(8);
         let (started_tx, started_rx) = mpsc::channel();
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
-        q.scan_once(Box::new(move || {
-            started_tx.send(()).unwrap();
-            gate_rx.recv().unwrap();
-        }))
+        q.scan_once(
+            "REC",
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                gate_rx.recv().unwrap();
+            }),
+        )
         .unwrap();
         started_rx.recv_timeout(T).unwrap();
         for _ in 0..5 {
-            q.scan_once(Box::new(|| {})).unwrap();
+            q.scan_once("REC", Box::new(|| {})).unwrap();
         }
         let st = q.stats(true);
         assert_eq!(

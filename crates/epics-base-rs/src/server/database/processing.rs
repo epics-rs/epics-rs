@@ -109,7 +109,7 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
-use super::{FrameGate, InFrame, PvDatabase};
+use super::{FrameGate, InFrame, PvDatabase, debug_armed};
 
 /// C `sCalcoutRecord.c` `STRING_SIZE` (:198) — the 40-byte buffer behind every
 /// string field a string-input link writes into. The text therefore carries at
@@ -352,6 +352,7 @@ impl DeviceDone {
                 generation,
                 epoch: AtomicU64::new(0),
                 owed: std::sync::Mutex::new(Owed::default()),
+                pending: std::sync::atomic::AtomicUsize::new(0),
             },
         ))
     }
@@ -409,17 +410,31 @@ impl DeviceDone {
     }
 
     /// One pass per request, in order, as C's asyn callback processes the
-    /// record once per callback (devMcaAsyn.c:357-382): the band may take
-    /// this request into a run already queued, the pass it owes is not.
+    /// record once per callback (devMcaAsyn.c:357-382). Only the first pass
+    /// owed to an idle cell requests a run, and that run drains every pass
+    /// owed until none is: one at a time on one worker, as C runs them on
+    /// the port thread, however many workers the band has.
     fn owe(
         &self,
         priority: crate::runtime::task::CallbackPriority,
         completion: Completion,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        if !self.0.body().owed.lock().unwrap().push(completion) {
-            return Err(crate::runtime::background::CallbackError::QueueFull);
+        let body = self.0.body();
+        let first = {
+            let mut owed = body.owed.lock().unwrap();
+            owed.push(completion);
+            body.pending.fetch_add(1, Ordering::AcqRel) == 0
+        };
+        if !first {
+            return Ok(());
         }
-        crate::runtime::task::request_cell(priority, &self.0)
+        crate::runtime::task::request_cell(priority, &self.0).inspect_err(|_| {
+            // No run will drain them: lost, as C loses a refused
+            // `callbackRequest`, so the next pass owed requests afresh.
+            let mut owed = body.owed.lock().unwrap();
+            *owed = Owed::default();
+            body.pending.store(0, Ordering::Release);
+        })
     }
 
     /// [`Self::reprocess`] at the record's band for the re-entry `epoch`
@@ -433,38 +448,29 @@ impl DeviceDone {
     }
 }
 
-/// The passes a [`DeviceDone`] owes, oldest first, in place: four deep,
-/// deeper than any device keeps requests in flight (devMcaAsyn queues a
-/// status and then a data read), and a request past it is refused as a full
-/// band is. The oldest sits apart, so the one-pass run takes it as a single
-/// slot; `next.is_none()` implies `behind` is empty.
+/// The passes a [`DeviceDone`] owes, oldest first, never refused: C's asyn
+/// callback processes the record once per completion however many are
+/// outstanding. The oldest sits apart, so the one-pass run takes it as a
+/// single slot and `behind` allocates only when two are owed at once;
+/// `next.is_none()` implies `behind` is empty.
 #[derive(Default)]
 struct Owed {
     next: Option<Completion>,
-    behind: [Option<Completion>; 3],
-    behind_len: usize,
+    behind: std::collections::VecDeque<Completion>,
 }
 
 impl Owed {
-    fn push(&mut self, completion: Completion) -> bool {
+    fn push(&mut self, completion: Completion) {
         if self.next.is_none() {
             self.next = Some(completion);
-        } else if self.behind_len < self.behind.len() {
-            self.behind[self.behind_len] = Some(completion);
-            self.behind_len += 1;
         } else {
-            return false;
+            self.behind.push_back(completion);
         }
-        true
     }
 
     fn pop(&mut self) -> Option<Completion> {
         let completion = self.next.take()?;
-        if self.behind_len != 0 {
-            self.next = self.behind[0].take();
-            self.behind.rotate_left(1);
-            self.behind_len -= 1;
-        }
+        self.next = self.behind.pop_front();
         Some(completion)
     }
 }
@@ -566,6 +572,9 @@ struct DeviceReentry {
     generation: Arc<AtomicU64>,
     epoch: AtomicU64,
     owed: std::sync::Mutex<Owed>,
+    /// Passes owed and not yet run to their end, counted under `owed` after
+    /// the push: nonzero is the one run that drains them.
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 impl crate::runtime::background::CallbackBody for DeviceReentry {
@@ -575,31 +584,24 @@ impl crate::runtime::background::CallbackBody for DeviceReentry {
         };
         let db = PvDatabase { inner };
         loop {
-            let mut owed = self.owed.lock().unwrap();
-            let Some(completion) = owed.pop() else {
-                return;
-            };
-            // The cell went idle before this run, so a pass owed after the
-            // last was taken queues a run of its own.
-            let more = owed.next.is_some();
-            // Down while the pass runs: the pass may owe the next one.
-            drop(owed);
+            // Counted after it was pushed, so the run owed a pass finds it.
+            let completion = self.owed.lock().unwrap().pop().expect("a pass owed");
             match completion {
                 Completion::Write(outcome) => {
                     let _ = db.complete_async_write(&self.name, outcome.map_err(|e| *e));
                 }
                 Completion::Read => {
-                    let Some(rec) = db.get_record_no_resolve(&self.name) else {
-                        continue;
-                    };
-                    let _ = db.reenter_if_current(
-                        ProcessTarget::Resolved(&self.name, &rec),
-                        &self.generation,
-                        self.epoch.load(Ordering::Acquire),
-                    );
+                    if let Some(rec) = db.get_record_no_resolve(&self.name) {
+                        let _ = db.reenter_if_current(
+                            ProcessTarget::Resolved(&self.name, &rec),
+                            &self.generation,
+                            self.epoch.load(Ordering::Acquire),
+                        );
+                    }
                 }
             }
-            if !more {
+            // A pass owed while this one ran requested no run: it is ours.
+            if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
                 return;
             }
         }
@@ -2297,6 +2299,8 @@ struct CycleCtx<'c, 'a> {
     rec: InFrame<'a>,
     is_continuation: bool,
     device_callback: bool,
+    /// The set's TPRO trace is on and this pass is a `dbProcess`, so it prints.
+    traced: bool,
     plan: &'c crate::server::record::record_instance::ProcessPlan,
     facts: crate::server::record::record_instance::CycleFacts,
     input_link_texts: &'c InputLinkTexts,
@@ -2932,15 +2936,27 @@ impl PvDatabase {
         // parks is never a runtime worker: the hook hands foreign processing
         // to the lock set's own continuation thread and returns `Skip`, and
         // only that thread reaches the parking arm.
-        let breakpoints = self.breakpoints_if_debugging();
-        if let Some(table) = breakpoints.as_ref() {
-            if table.before_process(self, name) == crate::server::database::breakpoint::Before::Skip
-            {
-                // C's `goto all_done`, which unwinds the same way the normal
-                // path does. `visited` was inserted by the prelude above and
-                // this frame owns it, so it comes out here as it would below.
-                visited.release(rec);
-                return Ok(());
+        //
+        // The TPRO trace shares the gate (`dbAccess.c:519-526`, `:620-621`):
+        // a TPRO record turns its set's trace on until it returns, FLNK chain
+        // included. A continuation is C's `prset->process`: it neither turns
+        // the trace on nor prints.
+        let mut traced = false;
+        if debug_armed() {
+            if let Some(table) = self.breakpoints_if_debugging() {
+                if table.before_process(self, name)
+                    == crate::server::database::breakpoint::Before::Skip
+                {
+                    // C's `goto all_done`, which unwinds the same way the normal
+                    // path does. `visited` was inserted by the prelude above and
+                    // this frame owns it, so it comes out here as it would below.
+                    visited.release(rec);
+                    return Ok(());
+                }
+            }
+            if !is_continuation {
+                let frame = record_gate.frame(rec);
+                traced = frame.trace_enter(frame.read().common.tpro != 0);
             }
         }
 
@@ -2952,6 +2968,7 @@ impl PvDatabase {
             visited,
             is_continuation,
             device_callback,
+            traced,
         );
         record_gate.frame(rec).publish_hints();
 
@@ -2959,8 +2976,11 @@ impl PvDatabase {
         // support, under the same `lset_stack_count` guard. Reloaded rather
         // than reusing the handle above: a `dbd` during this record's own
         // processing can have retired the observer, and C re-tests the count.
-        if let Some(table) = self.breakpoints_if_debugging() {
-            table.after_process(self, name);
+        if debug_armed() {
+            if let Some(table) = self.breakpoints_if_debugging() {
+                table.after_process(self, name);
+            }
+            record_gate.frame(rec).trace_exit();
         }
 
         // The unwind. C `dbDbLink.c:521-526`, `if (claim_dst)
@@ -3297,18 +3317,18 @@ impl PvDatabase {
             instance.record.check_alarms(&mut instance.common);
             instance.evaluate_alarms();
         }
-        self.post_value_put_tail(rec);
+        self.post_value_put_tail(rec, visited);
     }
 
     /// [`Record::take_value_put_tail`](crate::server::record::Record::take_value_put_tail)
     /// for its two owners, [`Self::value_put_in`] and the cycle's hand drain:
     /// the STS post (`:592`), `recGblGetTimeStamp` (`:602`), then the reset
     /// and the SENT post.
-    fn post_value_put_tail(&self, rec: InFrame<'_>) {
+    fn post_value_put_tail(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
         let (head, reset) = rec.write().record.take_value_put_tail().split_at_reset();
         super::field_io::post_cycle_marks(&mut rec.write(), head);
         if !reset.is_empty() {
-            self.rec_gbl_get_time_stamp_in(rec);
+            self.rec_gbl_get_time_stamp_in(rec, visited);
             super::field_io::post_cycle_marks(&mut rec.write(), reset);
         }
     }
@@ -3391,7 +3411,10 @@ impl PvDatabase {
                 // Between the two guards, like every other stamp point: the
                 // TSEL read takes its own locks.
                 let tsel = match db.db() {
-                    Some(db) => db.with_frame(&rec, |frame| db.read_tsel(frame)),
+                    // A tick is a chain of its own, as C's `wdogCallback` is.
+                    Some(db) => {
+                        db.with_frame(&rec, |frame| db.read_tsel(frame, &mut ProcStack::new()))
+                    }
                     None => super::TselStamp::None,
                 };
                 let mut instance = rec.write();
@@ -3898,7 +3921,11 @@ impl PvDatabase {
     /// not an aSub in READ mode (the common case), so the caller pays only a
     /// single brief read lock. Run BEFORE the process write lock so the SUBL
     /// link read cannot deadlock against this record.
-    fn resolve_asub_dynamic_subroutine(&self, rec: InFrame<'_>) -> Option<AsubDynamicSub> {
+    fn resolve_asub_dynamic_subroutine(
+        &self,
+        rec: InFrame<'_>,
+        visited: &mut ProcStack,
+    ) -> Option<AsubDynamicSub> {
         let (subl, onam, snam) = {
             let inst = rec.read();
             if inst.record.record_type() != "aSub" {
@@ -3931,7 +3958,7 @@ impl PvDatabase {
         // (`aSubRecord.c:126`) loaded at init — which is also what a `caput
         // REC.SNAM other` leaves in place.
         use crate::server::recgbl::simm::LinkFetch;
-        let name: Option<String> = match self.db_get_link_in(rec, "SUBL", &subl) {
+        let name: Option<String> = match self.db_get_link_in(rec, "SUBL", &subl, visited) {
             LinkFetch::Value(v) => Some(match v {
                 EpicsValue::String(s) => s.as_str_lossy().into_owned(),
                 o => o.to_f64().map(|f| f.to_string()).unwrap_or_default(),
@@ -4089,8 +4116,9 @@ impl PvDatabase {
     fn count_refused_active_entry(&self, rec: InFrame<'_>) {
         let mut instance = rec.write();
 
-        // C `dbAccess.c:539-541`, printed before the bail decision.
-        if instance.common.tpro != 0 {
+        // C `dbAccess.c:539-541`, printed before the bail decision; a TPRO
+        // record re-entered on the stack has its set's trace on already.
+        if debug_armed() && rec.set().tracing() {
             trace_dbprocess(format_args!(
                 "dbProcess of Active '{}' with RPRO={}",
                 instance.name, instance.common.rpro,
@@ -4275,6 +4303,7 @@ impl PvDatabase {
         &self,
         rec: InFrame<'_>,
         siol: &crate::server::record::ParsedLink,
+        visited: &mut ProcStack,
     ) -> (super::TselStamp, SiolStamp) {
         if Self::cycle_stamp_withheld_in(rec) {
             return (super::TselStamp::Withheld, SiolStamp::Keep);
@@ -4285,7 +4314,7 @@ impl PvDatabase {
         };
         let tsel = match link {
             None => super::TselStamp::None,
-            Some(link) => self.read_tsel_link(rec, link),
+            Some(link) => self.read_tsel_link(rec, link, visited),
         };
         let tse = match tsel {
             super::TselStamp::Time(..) => return (tsel, SiolStamp::Keep),
@@ -4355,10 +4384,10 @@ impl PvDatabase {
     /// The link read takes its own locks (a failed `dbGetLink` writes
     /// `LINK_ALARM` into this record), so it must not run under the caller's
     /// data guard — which is the whole reason C's single function is two here.
-    fn read_tsel(&self, rec: InFrame<'_>) -> super::TselStamp {
+    fn read_tsel(&self, rec: InFrame<'_>, visited: &mut ProcStack) -> super::TselStamp {
         match Self::tsel_link(&rec.read()) {
             None => super::TselStamp::None,
-            Some(link) => self.read_tsel_link(rec, link),
+            Some(link) => self.read_tsel_link(rec, link, visited),
         }
     }
 
@@ -4367,17 +4396,21 @@ impl PvDatabase {
     /// [`TselStamp::Withheld`](super::TselStamp::Withheld), so no stamp site
     /// of the cycle stores TIME for it.
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn cycle_tsel(&self, rec: InFrame<'_>) -> super::TselStamp {
+    fn cycle_tsel(&self, rec: InFrame<'_>, visited: &mut ProcStack) -> super::TselStamp {
         if Self::cycle_stamp_withheld_in(rec) {
             return super::TselStamp::Withheld;
         }
-        self.read_tsel(rec)
+        self.read_tsel(rec, visited)
     }
 
     #[cold]
     #[inline(never)]
-    fn cycle_tsel_out_of_line(&self, rec: InFrame<'_>) -> super::TselStamp {
-        self.cycle_tsel(rec)
+    fn cycle_tsel_out_of_line(
+        &self,
+        rec: InFrame<'_>,
+        visited: &mut ProcStack,
+    ) -> super::TselStamp {
+        self.cycle_tsel(rec, visited)
     }
 
     /// Whether this pass's cycle stamp is withheld: always for an own-stamp
@@ -4411,6 +4444,7 @@ impl PvDatabase {
         &self,
         rec: InFrame<'_>,
         tsel_link: Arc<crate::server::record::ParsedLink>,
+        visited: &mut ProcStack,
     ) -> super::TselStamp {
         // A TSEL link pointing at a `.TIME` field copies that record's
         // timestamp+utag into `time`/`utag`, and the TSE→TIME half does not
@@ -4478,7 +4512,7 @@ impl PvDatabase {
             // never reaches here (`tsel_link`). The coercion is C's, chosen by
             // the SOURCE type. A failed read is `TselStamp::Failed`, whose
             // LINK alarm the stamp raises where C's read sits.
-            match self.db_try_get_link(rec, &tsel_link) {
+            match self.db_try_get_link(rec, &tsel_link, visited) {
                 LinkFetch::Value(val) => super::TselStamp::Tse(val.to_dbf_i16().unwrap_or(0)),
                 LinkFetch::Failed => super::TselStamp::Failed,
                 LinkFetch::NoData => super::TselStamp::None,
@@ -4493,8 +4527,8 @@ impl PvDatabase {
     /// open; this is the entry for the callers that do not — `seq`, whose C
     /// `process` calls `recGblGetTimeStamp` once per link group
     /// (`seqRecord.c:261`).
-    pub(crate) fn rec_gbl_get_time_stamp_in(&self, rec: InFrame<'_>) {
-        let tsel = self.read_tsel(rec);
+    pub(crate) fn rec_gbl_get_time_stamp_in(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
+        let tsel = self.read_tsel(rec, visited);
         let mut instance = rec.write();
         let inst = &mut *instance;
         tsel.stamp(&inst.name, &mut inst.common, || false);
@@ -4517,6 +4551,7 @@ impl PvDatabase {
     /// link that needs the guard released (a PP source, a self-link, a target
     /// found by name, a remote timestamp to adopt), which takes the general
     /// path.
+    // Off the debug FLNK frame; see `process_cycle`.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn soft_db_inp_stage(
         &self,
@@ -4692,6 +4727,7 @@ impl PvDatabase {
     /// that cycle used to walk the whole stage to learn it: the empty INP read
     /// through three classifiers, twelve slots asked for a text that was
     /// never set. It now gets [`InputStage::none`] from inside that guard.
+    // Off the debug FLNK frame; see `process_cycle`.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn fetch_input_stage(
         &self,
@@ -5089,7 +5125,7 @@ impl PvDatabase {
                     .input_link_request("DOL")
                     .renders_at_source();
                 let (fetch, render) =
-                    self.db_get_input_link_in(rec, "DOL", dol_parsed, render, visited);
+                    self.db_get_link_rendered_in(rec, "DOL", dol_parsed, render, visited);
                 self.convert_link_fetch(rec, "DOL", dol_parsed, fetch, render)
                     .0
             });
@@ -5119,7 +5155,8 @@ impl PvDatabase {
         } else {
             match sel_nvl_link {
                 Some(parsed) => {
-                    let (fetch, _) = self.db_get_input_link_in(rec, "NVL", &parsed, false, visited);
+                    let (fetch, _) =
+                        self.db_get_link_rendered_in(rec, "NVL", &parsed, false, visited);
                     // C `dbGetLink(&nvl, DBR_USHORT, &seln, 0, 0)`: the source
                     // is converted at DBR_USHORT (an array contributes element
                     // 0), so a value outside 0..65535 wraps as C's GET table
@@ -5326,7 +5363,7 @@ impl PvDatabase {
         // this record (C `aSubRecord.c::fetch_values`). `None` for everything
         // that is not an aSub in READ mode.
         let asub_dynamic = if plan.resolves_subroutine_from_link {
-            self.resolve_asub_dynamic_subroutine(rec)
+            self.resolve_asub_dynamic_subroutine(rec, visited)
         } else {
             None
         };
@@ -5363,7 +5400,7 @@ impl PvDatabase {
     #[cold]
     #[inline(never)]
     fn run_reentered_pass(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
-        let _ = self.process_record_with_links_body(name, rec, visited, true, false);
+        let _ = self.process_record_with_links_body(name, rec, visited, true, false, false);
     }
 
     /// The record process cycle itself — C `dbProcess`'s body
@@ -5389,6 +5426,7 @@ impl PvDatabase {
         visited: &mut ProcStack,
         is_continuation: bool,
         device_callback: bool,
+        traced: bool,
     ) -> CaResult<()> {
         let mut cycle_end = CycleEndGuard::new(self, name, rec);
         let mut guard = DataGuard::new(rec);
@@ -5457,6 +5495,7 @@ impl PvDatabase {
             rec,
             is_continuation,
             device_callback,
+            traced,
             plan,
             facts,
             input_link_texts,
@@ -5477,6 +5516,11 @@ impl PvDatabase {
     /// The cycle past the prologue, once per [`CyclePlan`](crate::server::record::record_instance::CyclePlan) arm. `PLAIN` is a
     /// compile-time fact: the arm's gates are folded away, so it is the one
     /// source of the cycle and not a second copy that could drift from it.
+    ///
+    /// Inlined, like the input fetches it calls, only when optimized: an
+    /// unoptimized build shares no stack slot between inlined callees, so the
+    /// recursive FLNK frame carried all three arms and their fetches (~120 KB
+    /// a hop) and a C-sized chain overflowed a 2 MiB callback stack.
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn process_cycle<const PLAIN: bool, const DB_INP: bool>(
         &self,
@@ -5493,6 +5537,7 @@ impl PvDatabase {
             rec,
             is_continuation,
             device_callback,
+            traced,
             plan,
             facts,
             input_link_texts,
@@ -5558,7 +5603,7 @@ impl PvDatabase {
             let disa = match sdis_link {
                 Some(sdis_link) => {
                     guard.release();
-                    let fetch = self.db_get_link_in(rec, "SDIS", &sdis_link);
+                    let fetch = self.db_get_link_in(rec, "SDIS", &sdis_link, visited);
                     if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
                         sdis_status = Err(DbStatus::FAILED);
                     }
@@ -5579,7 +5624,7 @@ impl PvDatabase {
                 let notify = {
                     let instance = guard.hold();
                     // C `dbAccess.c:570-571`.
-                    if instance.common.tpro != 0 {
+                    if traced {
                         trace_dbprocess(format_args!("dbProcess of Disabled '{}'", instance.name));
                     }
                     // C `dbAccess.c:575-577` — clear rpro/putf and arm
@@ -5746,7 +5791,9 @@ impl PvDatabase {
         // put-notify parked on that window is replayed there (C
         // `dbNotifyCompletion`) instead of being stranded.
         let (sim_outcome, sim_pact_exit) = match plan.simm {
-            Some(simm) if !facts.not_simulating => self.check_simulation_mode(guard, rec, &simm),
+            Some(simm) if !facts.not_simulating => {
+                self.check_simulation_mode(guard, rec, &simm, visited)
+            }
             _ => (SimOutcome::NotSimulated, no_sim_pact_exit),
         };
         // Every exit below this line owes C's `recGblFwdLink` tail. The guard
@@ -5784,8 +5831,8 @@ impl PvDatabase {
                     // forward link — C `process()` runs `checkAlarms`,
                     // `monitor()` and `recGblFwdLink()` regardless of the -1.
                     let (tsel, siol_stamp) = match &siol {
-                        Some(siol) => self.read_sim_stamp(rec, siol),
-                        None => (self.cycle_tsel(rec), SiolStamp::Keep),
+                        Some(siol) => self.read_sim_stamp(rec, siol, visited),
+                        None => (self.cycle_tsel(rec, visited), SiolStamp::Keep),
                     };
                     {
                         let mut instance = rec.write();
@@ -6238,7 +6285,7 @@ impl PvDatabase {
                             // at `:778`.
                             if Self::stamp_requested(instance) {
                                 guard.release();
-                                self.rec_gbl_get_time_stamp_in(guard.rec);
+                                self.rec_gbl_get_time_stamp_in(guard.rec, visited);
                                 guard.rec.write().hand_cycle_stamp();
                             }
                             self.apply_pact_exit(name, cycle_end.take());
@@ -6406,7 +6453,7 @@ impl PvDatabase {
                 }
 
                 // C `dbAccess.c:608-609`.
-                if instance.common.tpro != 0 {
+                if traced {
                     // `as_str`: the record's address, which `process_and_drain`'s
                     // hooked path takes, is then not computed for this branch
                     // ahead of the test.
@@ -6546,7 +6593,7 @@ impl PvDatabase {
                     && Self::stamp_requested(guard.hold());
                 guard.release();
                 if stamps {
-                    self.rec_gbl_get_time_stamp_in(rec);
+                    self.rec_gbl_get_time_stamp_in(rec, visited);
                     rec.write().hand_cycle_stamp();
                 }
 
@@ -6599,7 +6646,7 @@ impl PvDatabase {
                 // snapshot. The data guard is released before the link-write /
                 // notify awaits below (parking_lot guards are `!Send`).
                 guard.release();
-                let tsel = self.cycle_tsel(rec);
+                let tsel = self.cycle_tsel(rec, visited);
                 let snapshot = {
                     let mut instance = rec.write();
                     if !is_soft {
@@ -6709,7 +6756,7 @@ impl PvDatabase {
             // every record whose C reads SELL elsewhere.
             if plan.reads_sell {
                 guard.release();
-                self.read_sell_into_seln(rec, super::links::SellPhase::BeforeAlarms);
+                self.read_sell_into_seln(rec, super::links::SellPhase::BeforeAlarms, visited);
             }
 
             // The TSEL half of this cycle's `recGblGetTimeStampSimm`, read here
@@ -6723,7 +6770,7 @@ impl PvDatabase {
             // the no-TSEL arm reaches Segment C with its guard and constant.
             let tsel = if plan.hooks.withholds_cycle_stamp() {
                 guard.release();
-                let tsel = self.cycle_tsel_out_of_line(rec);
+                let tsel = self.cycle_tsel_out_of_line(rec, visited);
                 guard.hold();
                 tsel
             } else {
@@ -6731,7 +6778,7 @@ impl PvDatabase {
                     None => super::TselStamp::None,
                     Some(link) => {
                         guard.release();
-                        let tsel = self.read_tsel_link(rec, link);
+                        let tsel = self.read_tsel_link(rec, link, visited);
                         guard.hold();
                         tsel
                     }
@@ -7139,7 +7186,7 @@ impl PvDatabase {
                     // keeps what it holds, as in C where a swait DOL that is not a PV
                     // name never registers a recDynLink and so never delivers.
                     let parsed = crate::server::record::parse_link_v2(&link);
-                    if let Some(value) = self.db_try_get_link(rec, &parsed).value() {
+                    if let Some(value) = self.read_link_unprocessed(rec, &parsed, false).0.value() {
                         out_time_fetched
                             .get_or_insert_with(Vec::new)
                             .push((value_field, value));
@@ -7610,7 +7657,7 @@ impl PvDatabase {
             // `.TIME` TSEL adopts whatever the forward-link chain just did to
             // its source.
             guard.release();
-            self.rec_gbl_get_time_stamp_in(rec);
+            self.rec_gbl_get_time_stamp_in(rec, visited);
         }
 
         // 8. Execute the deferred ProcessActions after the FLNK tail:
@@ -7808,21 +7855,8 @@ impl PvDatabase {
                 }
             };
             if needs_rpro {
-                let db = self.clone();
-                let rpro_name = RecordName::from(name);
-                // Middle band, not the record's PRIO: C `recGblFwdLink` hands
-                // RPRO to `scanOnce` (`recGbl.c`), whose single "scanOnce"
-                // thread runs at `epicsThreadPriorityScanLow + nPeriodic`
-                // (`dbScan.c:770-779`) and is not a callback band at all.
-                crate::runtime::task::spawn_background(
-                    crate::runtime::task::CallbackPriority::Medium,
-                    async move {
-                        let mut fresh_visited = ProcStack::new();
-                        let _ = db
-                            .process_record_with_links(&rpro_name, &mut fresh_visited)
-                            .await;
-                    },
-                );
+                // C `recGblFwdLink` (`recGbl.c:297-300`).
+                self.scan_once(name);
             }
         }
     }
@@ -8118,7 +8152,7 @@ impl PvDatabase {
         if rec.process_plan().hooks.stamps_at_own_reset() {
             let flnk = rec.read().forward_target();
             self.scan_forward_target(rec, &flnk, visited);
-            self.post_value_put_tail(rec);
+            self.post_value_put_tail(rec, visited);
         }
     }
 
@@ -8444,18 +8478,7 @@ impl PvDatabase {
                         // the process lands after the putting thread leaves
                         // `dbPutField` and releases the record gate this call is
                         // still holding.
-                        let db = self.clone();
-                        let name = RecordName::from(record_name);
-                        // Middle band, not the record's PRIO: `scanOnce` is a
-                        // dedicated thread in C (`dbScan.c:770-779`), not one
-                        // of the three callback queues.
-                        crate::runtime::task::spawn_background(
-                            crate::runtime::task::CallbackPriority::Medium,
-                            async move {
-                                let mut visited = ProcStack::new();
-                                let _ = db.process_record_with_links(&name, &mut visited).await;
-                            },
-                        );
+                        self.scan_once(record_name);
                     }
                 }
                 ProcessAction::WriteDbLinkNotify { link_field, value } => {
@@ -8638,7 +8661,7 @@ impl PvDatabase {
 
         // This pass IS C's `process()` re-entry, so it runs the whole
         // `recGblGetTimeStampSimm` again — TSEL read included, before the guard.
-        let tsel = self.cycle_tsel(rec);
+        let tsel = self.cycle_tsel(rec, visited);
 
         let (flnk_name, pact_exit) = {
             // Phase 1 — first write guard, confined to this scope so the
@@ -8907,21 +8930,8 @@ impl PvDatabase {
                 }
             };
             if needs_rpro {
-                let db = self.clone();
-                let rpro_name = RecordName::from(name);
-                // Middle band, not the record's PRIO: C `recGblFwdLink` hands
-                // RPRO to `scanOnce` (`recGbl.c`), whose single "scanOnce"
-                // thread runs at `epicsThreadPriorityScanLow + nPeriodic`
-                // (`dbScan.c:770-779`) and is not a callback band at all.
-                crate::runtime::task::spawn_background(
-                    crate::runtime::task::CallbackPriority::Medium,
-                    async move {
-                        let mut fresh_visited = ProcStack::new();
-                        let _ = db
-                            .process_record_with_links(&rpro_name, &mut fresh_visited)
-                            .await;
-                    },
-                );
+                // C `recGblFwdLink` (`recGbl.c:297-300`).
+                self.scan_once(name);
             }
         }
 
@@ -9159,17 +9169,46 @@ impl PvDatabase {
     /// (`recGbl.c:316-321` calls `dbGetTimeStampTag`, not `dbGetLink`) — and
     /// that branch does not come through here. EVERY other TSEL form falls
     /// through to `dbGetLink` at `recGbl.c:322`, so it does.
+    ///
+    /// A `PP` DB link processes its source first, as `dbDbGetValue` does for
+    /// every caller (`dbDbLink.c:174-179`), and a failed process is the read's
+    /// failure.
     pub(crate) fn db_try_get_link(
         &self,
         reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
+        visited: &mut ProcStack,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        self.db_try_get_link_rendered(reader, link, false).0
+        self.db_try_get_link_rendered(reader, link, false, visited)
+            .0
     }
 
     /// [`Self::db_try_get_link`] with the source's `DBR_STRING` part when
     /// `render` asks for it.
     fn db_try_get_link_rendered(
+        &self,
+        reader: InFrame<'_>,
+        link: &crate::server::record::ParsedLink,
+        render: bool,
+        visited: &mut ProcStack,
+    ) -> (
+        crate::server::recgbl::simm::LinkFetch,
+        Option<crate::server::record::record_instance::SourceRender>,
+    ) {
+        if let crate::server::record::ParsedLink::Db(db) = link
+            && self
+                .process_passive_db_source(Some(reader.unframed()), db, visited)
+                .is_err()
+        {
+            return (crate::server::recgbl::simm::LinkFetch::Failed, None);
+        }
+        self.read_link_unprocessed(reader, link, render)
+    }
+
+    /// [`Self::db_try_get_link_rendered`] without the `PP` step, for swait's
+    /// `recDynLinkGet` (`swaitRecord.c:767`), a CA-style read that never
+    /// processes its source.
+    fn read_link_unprocessed(
         &self,
         reader: InFrame<'_>,
         link: &crate::server::record::ParsedLink,
@@ -9217,17 +9256,17 @@ impl PvDatabase {
     /// field name, a [`ParsedLink`](crate::server::record::ParsedLink) does not, so
     /// the caller spells it.
     ///
-    /// Use [`Self::db_try_get_link`] for the reads whose C is NOT `dbGetLink` —
-    /// `recGblGetSimm`'s SIML read (`dbTryGetLink`, which bypasses `setLinkAlarm`
-    /// and writes `nsta` itself, `recGbl.c:453-454`) and swait's output-time DOL
-    /// (`recDynLinkGet`, `swaitRecord.c:767`).
+    /// Use [`Self::db_try_get_link`] for `recGblGetSimm`'s SIML read
+    /// (`dbTryGetLink`, which bypasses `setLinkAlarm` and writes `nsta` itself,
+    /// `recGbl.c:453-454`).
     pub(crate) fn db_get_link_in(
         &self,
         reader: InFrame<'_>,
         link_field: &'static str,
         link: &crate::server::record::ParsedLink,
+        visited: &mut ProcStack,
     ) -> crate::server::recgbl::simm::LinkFetch {
-        self.db_get_link_rendered_in(reader, link_field, link, false)
+        self.db_get_link_rendered_in(reader, link_field, link, false, visited)
             .0
     }
 
@@ -9239,11 +9278,12 @@ impl PvDatabase {
         link_field: &'static str,
         link: &crate::server::record::ParsedLink,
         render: bool,
+        visited: &mut ProcStack,
     ) -> (
         crate::server::recgbl::simm::LinkFetch,
         Option<crate::server::record::record_instance::SourceRender>,
     ) {
-        let (fetch, render) = self.db_try_get_link_rendered(reader, link, render);
+        let (fetch, render) = self.db_try_get_link_rendered(reader, link, render, visited);
         if matches!(fetch, crate::server::recgbl::simm::LinkFetch::Failed) {
             self.db_get_link_failed(reader, link_field, link);
         }
@@ -9260,34 +9300,6 @@ impl PvDatabase {
     ) {
         let mut instance = rec.write();
         self.get_link_failed(&mut instance.common, link, link_field);
-    }
-
-    /// [`Self::db_get_link_in`] for an INPUT link — same classification, same
-    /// `setLinkAlarm`, but the PP rule applies first: C `dbGetLink` on a
-    /// `ProcessPassive` DB link processes the passive source before reading it.
-    /// Used by sel's NVL→SELN read and the closed-loop DOL read.
-    #[inline]
-    pub(crate) fn db_get_input_link_in(
-        &self,
-        reader: InFrame<'_>,
-        link_field: &'static str,
-        link: &crate::server::record::ParsedLink,
-        render: bool,
-        visited: &mut ProcStack,
-    ) -> (
-        crate::server::recgbl::simm::LinkFetch,
-        Option<crate::server::record::record_instance::SourceRender>,
-    ) {
-        // C `dbDbGetValue` returns `dbScanPassive`'s status unread.
-        if let crate::server::record::ParsedLink::Db(db) = link
-            && self
-                .process_passive_db_source(Some(reader.unframed()), db, visited)
-                .is_err()
-        {
-            self.db_get_link_failed(reader, link_field, link);
-            return (crate::server::recgbl::simm::LinkFetch::Failed, None);
-        }
-        self.db_get_link_rendered_in(reader, link_field, link, render)
     }
 
     /// [`Self::execute_process_actions_in`] for a caller holding no frame
@@ -9634,6 +9646,7 @@ impl PvDatabase {
         &self,
         rec: InFrame<'_>,
         siml: &crate::server::record::ParsedLink,
+        visited: &mut ProcStack,
     ) -> bool {
         use crate::server::recgbl::simm::LinkFetch;
         // `recGblSaveSimm(*psscn, poldsimm, *psimm)` — latch the outgoing mode
@@ -9649,7 +9662,7 @@ impl PvDatabase {
         // YES; re-reading the constant every cycle (the pre-fix behaviour of
         // `read_link_value_no_process`) would stomp the operator's put back to
         // the constant on the very next process.
-        let fetch = self.db_try_get_link(rec, siml);
+        let fetch = self.db_try_get_link(rec, siml, visited);
         let failed = matches!(fetch, LinkFetch::Failed);
         match fetch {
             LinkFetch::Value(v) => {
@@ -10076,6 +10089,7 @@ impl PvDatabase {
         guard: &mut DataGuard<'_>,
         rec: InFrame<'_>,
         simm: &crate::server::record::record_instance::SimmBlock,
+        visited: &mut ProcStack,
     ) -> (SimOutcome, crate::server::record::PactExit) {
         // The steady cycle: SIMM is NO, SIML is no link that must be read
         // (constant, or PACT held), and no SSCN swap is owed — one cell read
@@ -10096,7 +10110,7 @@ impl PvDatabase {
                 );
             }
         }
-        self.simulate_or_resolve(guard, rec, simm)
+        self.simulate_or_resolve(guard, rec, simm, visited)
     }
 
     #[inline(never)]
@@ -10105,6 +10119,7 @@ impl PvDatabase {
         guard: &mut DataGuard<'_>,
         rec: InFrame<'_>,
         simm: &crate::server::record::record_instance::SimmBlock,
+        visited: &mut ProcStack,
     ) -> (SimOutcome, crate::server::record::PactExit) {
         // Read SIML, SIMS, SDLY from the record. SIOL is parsed further down,
         // on the paths that read or write it.
@@ -10235,7 +10250,7 @@ impl PvDatabase {
         // (`rec_gbl_get_simm`, C `recGblGetSimm`), which is the ONLY site that
         // writes SIMM.
         if let Some(siml_link) = &siml_link {
-            let siml_read_failed = self.rec_gbl_get_simm(rec, siml_link);
+            let siml_read_failed = self.rec_gbl_get_simm(rec, siml_link, visited);
             // W10-E5. `busyRecord.c:399-401` returns from `writeValue` on a
             // failed SIML read — BEFORE `write_busy` and before the SIOL
             // `dbPutLink`. So C never reaches the `switch (prec->simm)` below:
@@ -10391,7 +10406,7 @@ impl PvDatabase {
             // first WINS the tie here and swait publishes
             // STAT=LINK/AMSG="field SIOL", where a longin publishes STAT=SIMM.
             // Compiled C confirms both.
-            let fetch = self.db_get_link_in(rec, "SIOL", &siol_link);
+            let fetch = self.db_get_link_in(rec, "SIOL", &siol_link, visited);
             let mut instance = rec.write();
             // C `:417-420` — `if (status == 0) { val = sval; udf = FALSE; }`.
             // A CONSTANT (or unset) SIOL is `status == 0` with SVAL untouched
@@ -10513,7 +10528,8 @@ impl PvDatabase {
                 .record
                 .input_link_request("SIOL")
                 .renders_at_source();
-            let (fetch, render) = self.db_get_link_rendered_in(rec, "SIOL", &siol_link, render);
+            let (fetch, render) =
+                self.db_get_link_rendered_in(rec, "SIOL", &siol_link, render, visited);
             let (fetch, _raw) = self.convert_link_fetch(rec, "SIOL", &siol_link, fetch, render);
             // The read itself raised C's `setLinkAlarm` (dbLink.c:321 ->
             // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field SIOL")`) on a
@@ -10525,7 +10541,7 @@ impl PvDatabase {
             // The tail's `recGblGetTimeStampSimm` owes its TSEL read here, after
             // the SIOL read that stands in for the device read and before the
             // guard the store runs under.
-            let (tsel, siol_stamp) = self.read_sim_stamp(rec, &siol_link);
+            let (tsel, siol_stamp) = self.read_sim_stamp(rec, &siol_link, visited);
             let mut instance = rec.write();
 
             // The other order (`mcaRecord.c:1118` then `:1129`): the read has
@@ -11540,47 +11556,41 @@ mod owed_tests {
     #[test]
     fn a_single_pass_leaves_nothing_behind_it() {
         let mut owed = Owed::default();
-        assert!(owed.push(Completion::Read));
+        owed.push(Completion::Read);
         assert!(owed.pop().is_some());
         assert!(owed.next.is_none());
         assert!(owed.pop().is_none());
     }
 
     #[test]
-    fn four_passes_are_owed_in_order_and_a_fifth_is_refused() {
+    fn every_pass_is_owed_in_order_however_many_are_outstanding() {
         let mut owed = Owed::default();
-        for n in 1..=4 {
-            assert!(owed.push(tag(n)));
+        for n in 1..=64 {
+            owed.push(tag(n));
         }
-        assert!(!owed.push(tag(5)));
-        assert_eq!(
-            drain(&mut owed),
-            [
-                "protocol error: 1",
-                "protocol error: 2",
-                "protocol error: 3",
-                "protocol error: 4"
-            ]
-        );
+        let want: Vec<String> = (1..=64).map(|n| format!("protocol error: {n}")).collect();
+        assert_eq!(drain(&mut owed), want);
     }
 
     #[test]
     fn a_pass_owed_after_a_pop_runs_after_the_ones_before_it() {
         let mut owed = Owed::default();
-        assert!(owed.push(tag(1)));
-        assert!(owed.push(Completion::Read));
-        assert!(owed.push(tag(2)));
+        owed.push(tag(1));
+        owed.push(Completion::Read);
+        owed.push(tag(2));
         assert!(owed.pop().is_some());
-        assert!(owed.push(tag(3)));
-        assert!(owed.push(tag(4)));
-        assert!(!owed.push(tag(5)));
+        for n in 3..=6 {
+            owed.push(tag(n));
+        }
         assert_eq!(
             drain(&mut owed),
             [
                 "read",
                 "protocol error: 2",
                 "protocol error: 3",
-                "protocol error: 4"
+                "protocol error: 4",
+                "protocol error: 5",
+                "protocol error: 6"
             ]
         );
     }

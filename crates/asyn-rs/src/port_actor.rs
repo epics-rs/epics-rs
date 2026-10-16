@@ -860,7 +860,7 @@ impl PortActor {
     }
 
     fn drain_channel(&mut self) {
-        self.driver.base_mut().drain_announces();
+        self.driver.base_mut().start_owed_connect_timer();
         while let Ok(msg) = self.rx.try_recv() {
             self.enqueue_message(msg);
         }
@@ -1162,8 +1162,10 @@ impl PortActor {
             | RequestOp::LockPort(_) => CDispatch::Direct,
 
             // The caller's own callback, queued at the band it names.
-            RequestOp::Cell(cell) if cell.connect_queue() => CDispatch::ConnectQueue,
-            RequestOp::Cell(_) => CDispatch::Queued,
+            RequestOp::Cell(cell) | RequestOp::CellInline(cell) if cell.connect_queue() => {
+                CDispatch::ConnectQueue
+            }
+            RequestOp::Cell(_) | RequestOp::CellInline(_) => CDispatch::Queued,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
             // queued at Connect priority (asynRecord's CNCT put,
@@ -1326,73 +1328,80 @@ impl PortActor {
 
         let multi_device = self.driver.base().flags.multi_device;
         if let Some(connect) = queue_gate(&msg.op, &msg.user, multi_device) {
-            // C drains the Connect queue *before* `autoConnectDevice`
-            // (asynManager.c:813-857): a waived request runs on the dead line
-            // with no connect attempt in front of it. The attempt C makes
-            // *after* that drain (:858-863) is the actor loop's.
-            if connect == ConnectCheck::Required {
-                self.auto_connect_device(msg.user.addr, msg.user.reason);
-            }
-            // Every queued request passed the port-level half of `queueRequest`
-            // on its caller's thread. A port disabled or down since then is the
-            // port thread's to answer, and it answers by leaving the request
-            // queued until the state changes back or its timer fires (:808-810,
-            // :858-863).
-            if self.driver.base().queue_gate().check(connect).is_err() {
-                self.parked.push(msg);
-                return;
-            }
-            if let Err(e) = self.driver.base().check_queue(msg.user.addr, connect) {
-                msg.refuse(e);
-                return;
-            }
-            // C `portThread`'s per-request DEVICE checks (asynManager.c:877-888):
-            // the half of the device state `check_queue` deliberately leaves to
-            // the thread on a CANBLOCK port, because C answers them here in a way
-            // `queueRequest` cannot — by *not answering*.
-            //
-            // The scope is the requests C leaves in the lower-priority loop: the
-            // Connect-priority queue is drained above it with no device checks at
-            // all (:813-857), and every waived request C queues rides that queue
-            // (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
-            // `Queued` dispatch and a `Required` connect check — the same
-            // requests, asked the same way.
-            if connect == ConnectCheck::Required
-                && self.driver.base().flags.can_block
-                && Self::c_dispatch(&msg.op) == CDispatch::Queued
-            {
-                // :877 `if(!pdpCommon->enabled) continue;` — the request keeps
-                // its place in the queue. It runs when the device is re-enabled,
-                // and its queue timer still expires under it if it never is.
-                if self
-                    .driver
-                    .base()
-                    .check_device_enabled(msg.user.addr)
-                    .is_err()
-                {
+            if !self.driver.base().flags.can_block {
+                if let Err(e) = self.synchronous_gate(&msg, connect) {
+                    msg.refuse(e);
+                    return;
+                }
+            } else {
+                // C drains the Connect queue *before* `autoConnectDevice`
+                // (asynManager.c:813-857): a waived request runs on the dead line
+                // with no connect attempt in front of it. The attempt C makes
+                // *after* that drain (:858-863) is the actor loop's.
+                if connect == ConnectCheck::Required {
+                    self.auto_connect_device(msg.user.addr, msg.user.reason);
+                }
+                // Every queued request passed the port-level half of `queueRequest`
+                // on its caller's thread. A port disabled or down since then is the
+                // port thread's to answer, and it answers by leaving the request
+                // queued until the state changes back or its timer fires (:808-810,
+                // :858-863).
+                if self.driver.base().queue_gate().check(connect).is_err() {
                     self.parked.push(msg);
                     return;
                 }
-                // :879-888 — auto-connect has already run above (C calls it at
-                // :879); a device still down diverts the request to its
-                // *timeout* callback rather than `processUser`, but only when
-                // one was registered (`:886` guards on `timeoutUser != 0`;
-                // `createAsynUser`'s second argument is optional —
-                // asynRecord.c:307-308 passes one, devAsynInt32.c:212 passes
-                // 0). A request that asked for a timeout always has one:
-                // `queueRequest` refuses `timeout > 0.0` without it
-                // (:1592-1597). Here the reply channel *is* that callback, so
-                // the request reports the same queue timeout its own timer
-                // would.
-                if msg.timeout_user()
-                    && self
+                if let Err(e) = self.driver.base().check_queue(msg.user.addr, connect) {
+                    msg.refuse(e);
+                    return;
+                }
+                // C `portThread`'s per-request DEVICE checks (asynManager.c:877-888):
+                // the half of the device state `check_queue` deliberately leaves to
+                // the thread on a CANBLOCK port, because C answers them here in a way
+                // `queueRequest` cannot — by *not answering*.
+                //
+                // The scope is the requests C leaves in the lower-priority loop: the
+                // Connect-priority queue is drained above it with no device checks at
+                // all (:813-857), and every waived request C queues rides that queue
+                // (asynShellCommands.c:127,174,245,296; asynRecord.c:562-571). Hence
+                // `Queued` dispatch and a `Required` connect check — the same
+                // requests, asked the same way.
+                if connect == ConnectCheck::Required
+                    && self.driver.base().flags.can_block
+                    && Self::c_dispatch(&msg.op) == CDispatch::Queued
+                {
+                    // :877 `if(!pdpCommon->enabled) continue;` — the request keeps
+                    // its place in the queue. It runs when the device is re-enabled,
+                    // and its queue timer still expires under it if it never is.
+                    if self
                         .driver
                         .base()
-                        .check_device_connected(msg.user.addr)
+                        .check_device_enabled(msg.user.addr)
                         .is_err()
-                {
-                    msg.time_out(self.driver.base().port_name.to_string());
-                    return;
+                    {
+                        self.parked.push(msg);
+                        return;
+                    }
+                    // :879-888 — auto-connect has already run above (C calls it at
+                    // :879); a device still down diverts the request to its
+                    // *timeout* callback rather than `processUser`, but only when
+                    // one was registered (`:886` guards on `timeoutUser != 0`;
+                    // `createAsynUser`'s second argument is optional —
+                    // asynRecord.c:307-308 passes one, devAsynInt32.c:212 passes
+                    // 0). A request that asked for a timeout always has one:
+                    // `queueRequest` refuses `timeout > 0.0` without it
+                    // (:1592-1597). Here the reply channel *is* that callback, so
+                    // the request reports the same queue timeout its own timer
+                    // would.
+                    if msg.timeout_user()
+                        && self
+                            .driver
+                            .base()
+                            .check_device_connected(msg.user.addr)
+                            .is_err()
+                    {
+                        msg.time_out(self.driver.base().port_name.to_string());
+                        return;
+                    }
                 }
             }
         }
@@ -1539,6 +1548,29 @@ impl PortActor {
                 .stamp_auto_connect_attempt(-1, Instant::now());
         }
         self.driver.base().is_connected()
+    }
+
+    /// C `queueRequest`'s synchronous branch (asynManager.c:1543-1577), the
+    /// whole answer on a port without `ASYN_CANBLOCK`: it has no queue, so a
+    /// request it does not refuse runs now, and one it refuses is never parked.
+    /// A down device is auto-connected and refused only below Connect priority
+    /// and without `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (:1570-1577) —
+    /// a Connect-priority request is how such a device comes up.
+    fn synchronous_gate(&mut self, msg: &ActorMessage, connect: ConnectCheck) -> AsynResult<()> {
+        let addr = msg.user.addr;
+        self.driver.base().check_queue(addr, connect)?;
+        if connect != ConnectCheck::SynchronousLock
+            && msg.priority < QueuePriority::Connect
+            && msg.user.reason != crate::user::ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED
+            && !self.auto_connect_device(addr, msg.user.reason)
+        {
+            return self
+                .driver
+                .base()
+                .check_device_connected(addr)
+                .map_err(AsynError::into_queue_refusal);
+        }
+        Ok(())
     }
 
     /// C `autoConnectDevice` (asynManager.c:706-741) — the single owner of
@@ -2239,6 +2271,10 @@ impl PortActor {
             }
             RequestOp::Cell(cell) => {
                 cell.run(&mut ActorCalls(self));
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::CellInline(cell) => {
+                cell.run_inline(&mut ActorCalls(self));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::WithDriver(call) => match call.take() {
@@ -3201,6 +3237,9 @@ mod tests {
     #[test]
     fn actor_auto_connect() {
         let mut drv = TestDriver::new();
+        // A request's auto-connect is `portThread`'s (asynManager.c:858-863):
+        // a synchronous port's `queueRequest` refuses a down port (:1549).
+        drv.base.flags.can_block = true;
         drv.base.init_connected(false);
         drv.base.init_auto_connect(true);
         // Seed VAL so the read probe returns a value: the default read now
@@ -3243,7 +3282,11 @@ mod tests {
         }
 
         let connect_calls = Arc::new(AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("throttle_test", 1, PortFlags::default());
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("throttle_test", 1, flags);
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
         base.init_auto_connect(true);
@@ -3259,8 +3302,12 @@ mod tests {
         let replies: Vec<_> = (0..3)
             .map(|_| send(&tx, RequestOp::Int32Read, AsynUser::new(0)))
             .collect();
-        // Not a CANBLOCK port, so FIFO: its reply means the reads were dequeued.
-        send_and_wait(&tx, RequestOp::GetAutoConnect, AsynUser::new(0)).unwrap();
+        let start = Instant::now();
+        while connect_calls.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no attempt");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
 
         // Only the first attempt fired; every later one fell inside the 2s
         // throttle window (C autoConnectDevice 2.0s gate, asynManager.c:714-715).
@@ -3472,7 +3519,11 @@ mod tests {
             }
         }
 
-        let mut base = PortDriverBase::new("addr_ac", 1, PortFlags::default());
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("addr_ac", 1, flags);
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
         base.init_connected(false);
@@ -3540,6 +3591,7 @@ mod tests {
                 4,
                 PortFlags {
                     multi_device: true,
+                    can_block: true,
                     ..PortFlags::default()
                 },
             );

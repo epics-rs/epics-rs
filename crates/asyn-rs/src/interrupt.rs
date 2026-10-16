@@ -254,6 +254,7 @@ fn setenums_string_len(s: &str) -> usize {
 /// record: at most [`MAX_ENUM_STATES`] choices, each string cut as above.
 /// A ring slot stores exactly this, so a table compared on the receiver
 /// must be clamped by the same function to be equal when nothing changed.
+#[cfg(any(feature = "epics", test))]
 pub(crate) fn clamp_enum_table(
     entries: &[crate::param::EnumEntry],
 ) -> Arc<[crate::param::EnumEntry]> {

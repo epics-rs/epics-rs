@@ -57,6 +57,10 @@ pub struct PrintfRecord {
     links_generation: u64,
     /// The cycle ran to `printfRecord.c:399-401`, which posts LEN unchanged.
     len_posted: bool,
+    /// `prec->pact` as this pass entered `process()`.
+    pact: bool,
+    /// This pass reached the `recGblGetTimeStamp` at `printfRecord.c:382`.
+    stamp_asked: bool,
 }
 
 impl Default for PrintfRecord {
@@ -79,6 +83,8 @@ impl Default for PrintfRecord {
             links_generation: 0,
             fmt_buf: Vec::new(),
             len_posted: false,
+            pact: false,
+            stamp_asked: false,
         }
     }
 }
@@ -892,8 +898,24 @@ impl Record for PrintfRecord {
         false
     }
 
+    /// C stamps only inside `if (!pact)` (`printfRecord.c:378-383`), so the
+    /// pass an asynchronous `write_string` completes keeps TIME.
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
         crate::server::record::CycleHooks::INPUT_FETCH
+            .union(crate::server::record::CycleHooks::CONTINUATION)
+            .union(crate::server::record::CycleHooks::STAMP_REQUEST)
+    }
+
+    fn set_process_continuation(
+        &mut self,
+        _continuation: bool,
+        pact: crate::server::record::Pact<'_>,
+    ) {
+        self.pact = pact.held();
+    }
+
+    fn take_time_stamp_request(&mut self) -> bool {
+        std::mem::take(&mut self.stamp_asked)
     }
 
     fn record_type(&self) -> &'static str {
@@ -944,13 +966,16 @@ impl Record for PrintfRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        let mut out = std::mem::take(&mut self.fmt_buf);
-        out.clear();
-        self.apply_fmt(&mut out);
-        // C `printfRecord.c:321-322`: `*pval++ = 0; prec->len = pval - prec->val`
-        // — LEN counts the formatted bytes plus the terminating NUL.
-        self.val.set_text(&out);
-        self.fmt_buf = out;
+        if !self.pact {
+            let mut out = std::mem::take(&mut self.fmt_buf);
+            out.clear();
+            self.apply_fmt(&mut out);
+            // C `printfRecord.c:321-322`: `*pval++ = 0; prec->len = pval - prec->val`
+            // — LEN counts the formatted bytes plus the terminating NUL.
+            self.val.set_text(&out);
+            self.fmt_buf = out;
+            self.stamp_asked = true;
+        }
         self.len_posted = true;
         Ok(ProcessOutcome::complete())
     }

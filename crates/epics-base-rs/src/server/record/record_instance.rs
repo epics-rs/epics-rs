@@ -9882,6 +9882,9 @@ impl RecordInstance {
             }
             "TPRO" => {
                 if let EpicsValue::Char(v) = value {
+                    if v != 0 {
+                        crate::server::database::arm_debugging();
+                    }
                     self.common.tpro = v;
                 }
             }

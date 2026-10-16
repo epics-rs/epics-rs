@@ -118,7 +118,7 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::WithDriver(_) => Self::WithDriver,
             RequestOp::LockPort(_) => Self::LockPort,
-            RequestOp::Cell(cell) => Self::Callback {
+            RequestOp::Cell(cell) | RequestOp::CellInline(cell) => Self::Callback {
                 connect_queue: cell.connect_queue(),
             },
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },

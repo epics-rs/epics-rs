@@ -572,7 +572,7 @@ impl TraceManager {
         };
         if let Some(sink) = sink {
             sink.announce(&ExceptionEvent {
-                port_name: port.unwrap_or("").to_string(),
+                port_name: port.unwrap_or(""),
                 exception,
                 addr: -1,
             });
@@ -685,7 +685,7 @@ impl TraceManager {
         if let Some(sink) = sink {
             for a in announced {
                 sink.announce(&ExceptionEvent {
-                    port_name: port.to_string(),
+                    port_name: port,
                     exception,
                     addr: a,
                 });
@@ -736,7 +736,7 @@ impl TraceManager {
         let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
         if let Some(sink) = sink {
             sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
+                port_name: port,
                 exception,
                 addr: a,
             });

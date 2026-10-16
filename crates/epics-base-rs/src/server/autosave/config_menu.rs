@@ -243,7 +243,7 @@ impl Completion {
                 let _ = rec.write().record.put_field("D", EpicsValue::Long(status));
             }
         }
-        self.db.scan_once(&self.record);
+        self.db.scan_once(self.record.as_bytes());
     }
 }
 

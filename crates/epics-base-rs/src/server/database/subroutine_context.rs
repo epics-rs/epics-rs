@@ -53,15 +53,66 @@ impl PvDatabase {
     /// C `scanOnce(prec)`: process `name` once, after the caller lets go of
     /// it. Unlike [`crate::server::record::ProcessAction::ScanOnce`] there is
     /// no Passive gate, because no put of the caller's processes the record.
-    pub(crate) fn scan_once(&self, name: &str) {
+    ///
+    /// Queued on the libcom `scanOnce` ring and processed on its one thread,
+    /// so a full ring drops the request with C's overflow line.
+    pub fn scan_once(&self, name: &[u8]) {
         let db = self.clone();
-        let name = RecordName::from(name);
-        crate::runtime::task::spawn_background(
-            crate::runtime::task::CallbackPriority::Medium,
-            async move {
-                let mut visited = ProcStack::new();
-                let _ = db.process_record_with_links(&name, &mut visited).await;
-            },
+        let record = RecordName::from(name);
+        let _ = crate::runtime::task::background_scan_once(
+            &String::from_utf8_lossy(name),
+            Box::new(move || {
+                crate::runtime::task::poll_here_then_background(
+                    crate::runtime::task::CallbackPriority::Medium,
+                    async move {
+                        let mut visited = ProcStack::new();
+                        let _ = db.process_record_with_links(&record, &mut visited).await;
+                    },
+                );
+            }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::server::ioc_builder::IocBuilder;
+
+    static RAN_ON: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// C `onceTask` processes the record on the `scanOnce` thread
+    /// (`dbScan.c:715-717`), not on a callback band.
+    #[epics_macros_rs::epics_test]
+    async fn scan_once_processes_on_the_scan_once_thread() {
+        let db = IocBuilder::new()
+            .register_context_subroutine(
+                "whereAmI",
+                Box::new(|_rec, _ctx| {
+                    let name = std::thread::current().name().unwrap_or("").to_string();
+                    RAN_ON.lock().unwrap().push(name);
+                    Ok(0)
+                }),
+            )
+            .db_string(
+                r#"record(aSub, "ONCE") { field(SNAM, "whereAmI") }"#,
+                &HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .0;
+        db.scan_once(b"ONCE");
+        for _ in 0..200 {
+            if !RAN_ON.lock().unwrap().is_empty() {
+                break;
+            }
+            crate::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*RAN_ON.lock().unwrap(), ["scanOnce"]);
     }
 }

@@ -2842,7 +2842,7 @@ mod tests {
             seen_cb
                 .lock()
                 .unwrap()
-                .push((ev.port_name.clone(), ev.exception, ev.addr));
+                .push((ev.port_name.to_string(), ev.exception, ev.addr));
         });
 
         let cmds = build_asyn_commands(mgr.clone());

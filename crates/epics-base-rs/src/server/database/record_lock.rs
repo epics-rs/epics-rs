@@ -371,13 +371,17 @@ use crate::types::RecordName;
 /// is here instead, so releasing never takes the registry lock: doing that
 /// while holding the set would close a cycle against [`Registry::real_set_of`],
 /// which takes the registry lock and then the set.
+///
+/// `repr(C)` in the order the compiler had chosen, with [`Self::trace`] last:
+/// the scan walk prefetches only the fields before it, which a cycle reads.
+#[repr(C)]
 struct LockSet {
-    /// C's `lockSet::id` (`dbLockPvt.h:33`). Assigned once by
+    /// C's `lockSet::lock` (`dbLockPvt.h:32`) — the mutex `dbScanLock` takes.
+    lock: PriorityInheritanceMutex<()>,
+    /// C's `lockSet::id` (`:33`). Assigned once by
     /// [`Registry::make_set`] and kept for the cell's whole life, free-list
     /// round trips included, exactly as C's is.
     id: u64,
-    /// C's `lockSet::lock` (`:32`) — the mutex `dbScanLock` takes.
-    lock: PriorityInheritanceMutex<()>,
     /// The address the process mutex list lists `lock` under, so
     /// [`mutex_rows_by_addr`] can hand back the row `epicsMutexShow` prints
     /// for this set and no other.
@@ -400,6 +404,10 @@ struct LockSet {
     /// C's `dbScanUnlock` from inside `dbBkpt` (`dbBkpt.c:795`). Touched only
     /// by the thread named in `owner`, under the mutex itself.
     held: std::cell::UnsafeCell<Option<PriorityInheritanceMutexGuard<'static, ()>>>,
+    /// C's `lockSet::trace` (`dbLockPvt.h`): the record whose TPRO
+    /// `dbProcess` is running under this set, as [`InFrame::trace_enter`]'s
+    /// token, or 0. Written only under `lock`.
+    trace: AtomicUsize,
 }
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
@@ -460,7 +468,11 @@ impl LockRecord {
     #[inline(always)]
     pub(crate) fn prefetch_targets(&self) {
         let set = self.plock_set.load(Ordering::Relaxed);
-        crate::server::record::prefetch_val(set.cast_const());
+        crate::server::record::prefetch_span(
+            set.cast_const().cast(),
+            std::mem::offset_of!(LockSet, trace),
+            align_of::<LockSet>(),
+        );
         let h = &self.hints;
         h.body.prefetch();
         h.out[0].prefetch();
@@ -591,6 +603,7 @@ fn new_set(id: u64) -> Set {
         depth: AtomicUsize::new(0),
         many_holds: AtomicUsize::new(0),
         held: std::cell::UnsafeCell::new(None),
+        trace: AtomicUsize::new(0),
     }))
 }
 
@@ -871,6 +884,12 @@ impl SetGuard {
     #[inline(always)]
     fn on_bootstrap(&self) -> bool {
         self.set.id == 0
+    }
+
+    /// C `*dbLockSetAddrTrace(precord)`.
+    #[inline]
+    pub(crate) fn tracing(&self) -> bool {
+        self.set.trace.load(Ordering::Relaxed) != 0
     }
 
     /// Whether `record` is in the set this guard holds — C `dbLockGetLockId`
@@ -1929,6 +1948,25 @@ impl<'a> InFrame<'a> {
     /// The set the frame holds, which a link target merged into it is read
     /// under without taking it again.
     #[inline(always)]
+    /// C `dbProcess`'s trace prologue (`dbAccess.c:519-526`): a TPRO record
+    /// turns its set's trace on, unless it is on already, until its
+    /// [`Self::trace_exit`]. Whether this pass prints.
+    pub(crate) fn trace_enter(&self, tpro: bool) -> bool {
+        let trace = &self.set.set.trace;
+        if tpro && trace.load(Ordering::Relaxed) == 0 {
+            trace.store(Arc::as_ptr(self.cell) as usize, Ordering::Relaxed);
+        }
+        trace.load(Ordering::Relaxed) != 0
+    }
+
+    /// C `dbProcess`'s `if (set_trace) *ptrace = 0;` (`dbAccess.c:620-621`).
+    pub(crate) fn trace_exit(&self) {
+        let trace = &self.set.set.trace;
+        if trace.load(Ordering::Relaxed) == Arc::as_ptr(self.cell) as usize {
+            trace.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn set(&self) -> &'a SetGuard {
         self.set
     }

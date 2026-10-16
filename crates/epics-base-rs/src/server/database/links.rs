@@ -1118,7 +1118,8 @@ impl PvDatabase {
     /// value needs, taken under this same hold.
     ///
     /// [`SourceRender`]: crate::server::record::record_instance::SourceRender
-    #[inline(always)]
+    // Off the debug FLNK frame; see `process_cycle`.
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn read_db_at(
         &self,
         held: Option<&crate::server::database::SetGuard>,
@@ -1966,7 +1967,8 @@ impl PvDatabase {
     /// the source's alarm only for a read and conversion that both
     /// succeeded (`dbDbLink.c:228`), as [`Self::read_link_value_as_with_alarm`]
     /// gates the general path. `None` with no alarm for a non-DB `link`.
-    #[inline(always)]
+    // Off the debug FLNK frame; see `process_cycle`.
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub(crate) fn read_db_link_as_at(
         &self,
         held: &crate::server::database::SetGuard,
@@ -1997,7 +1999,8 @@ impl PvDatabase {
     /// `dbGetLink`'s success (`dbDbLink.c:228`), and a failed conversion is a
     /// failed status. An unfiltered `VAL` the record serves as `DBF_DOUBLE`
     /// is read straight off its slot, the `dbGetLink` of C's `dbAddr`.
-    #[inline(always)]
+    // Off the debug FLNK frame; see `process_cycle`.
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub(crate) fn read_db_link_f64_at(
         &self,
         held: &crate::server::database::SetGuard,
@@ -4259,7 +4262,12 @@ impl PvDatabase {
     ///
     /// `sseq` reads its own SELL→SELN in `SseqRecord::pre_input_link_actions`
     /// (the async machine owns the whole cycle), so it is not handled here.
-    pub(crate) fn read_sell_into_seln(&self, rec: InFrame<'_>, phase: SellPhase) {
+    pub(crate) fn read_sell_into_seln(
+        &self,
+        rec: InFrame<'_>,
+        phase: SellPhase,
+        visited: &mut ProcStack,
+    ) {
         let parsed = {
             let instance = rec.read();
             let record_type = instance.record.record_type();
@@ -4292,7 +4300,7 @@ impl PvDatabase {
         // (`fanoutRecord.c:88`, `dfanoutRecord.c:102`, `seqRecord.c:121`
         // `recGblInitConstantLink(&sell, DBF_USHORT, &seln)`), so a
         // `caput REC.SELN` STAYS put.
-        if let Some(val) = self.db_get_link_in(rec, "SELL", &parsed).value() {
+        if let Some(val) = self.db_get_link_in(rec, "SELL", &parsed, visited).value() {
             // The conversion routine is chosen by the SOURCE type — an integer
             // source wraps mod 2^16, a float source is UB. `dbr_ushort_cast`
             // owns that split. SELN is a `DBF_USHORT` (u16) field either way,
@@ -4351,7 +4359,7 @@ impl PvDatabase {
             field: "",
         };
 
-        self.read_sell_into_seln(rec, SellPhase::OutputDispatch);
+        self.read_sell_into_seln(rec, SellPhase::OutputDispatch, visited);
 
         let dispatch_info: Option<(SelmResult, MultiOut, Option<EpicsValue>)> = {
             let instance = rec.read();
@@ -4709,7 +4717,7 @@ impl PvDatabase {
         // DOLn raises `setLinkAlarm` (LINK/INVALID, AMSG `field DOL0`) on the
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
-            self.db_get_input_link_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, false, visited)
+            self.db_get_link_rendered_in(rec, DOL_LINK_FIELDS[idx], &grp.dol, false, visited)
                 .0
                 .value()
                 .and_then(|v| v.to_f64())
@@ -4724,7 +4732,7 @@ impl PvDatabase {
         // nothing at all; the only other call is `asyncFinish`'s (`:224`),
         // which lands the last hop's time on the record. Through the owner,
         // so TSEL is re-resolved per group exactly as C's re-entry does.
-        self.rec_gbl_get_time_stamp_in(rec);
+        self.rec_gbl_get_time_stamp_in(rec, visited);
         // C `seqRecord.c:264` drives LNKn via `dbPutLink` (`DBR_DOUBLE,
         // &dov`), whose `DBF_OUTLINK` target is processed by `dbDbPutValue`
         // (`dbDbLink.c:388`) only when the link carries an explicit `PP`

@@ -8635,7 +8635,10 @@ pub(crate) mod tests {
                 .union(CycleHooks::CONTEXT)
                 .union(CycleHooks::PUT_REPORT)
                 .union(CycleHooks::INPUT_FETCH),
-            "calc" | "sel" | "printf" => CycleHooks::INPUT_FETCH,
+            "printf" => CycleHooks::INPUT_FETCH
+                .union(CycleHooks::CONTINUATION)
+                .union(CycleHooks::STAMP_REQUEST),
+            "calc" | "sel" => CycleHooks::INPUT_FETCH,
             "aSub" => CycleHooks::MONITOR_SETS,
             "longout" => CycleHooks::OUTPUT_HOOKS,
             "sseq" => CycleHooks::ALL,

@@ -122,3 +122,108 @@ record(ai, "SC") { field(SCAN, "1 second") field(TPRO, "1") }
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1500)).await;
     drop(owner);
 }
+
+/// The trace is the lock set's (`dbAccess.c:519-526`, `:620-621`): a TPRO
+/// record's FLNK chain prints while it runs, and the same chain processed
+/// later without it does not. softIoc, `dbpf A.PROC 1` then `dbpf B.PROC 1`:
+///
+/// ```text
+/// _main_: dbProcess of 'A'
+/// _main_: dbProcess of 'B'
+/// _main_: dbProcess of 'C'
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_tpro_record_traces_its_forward_link_chain() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("a_tpro_record_traces_its_forward_link_chain");
+        assert_eq!(
+            trace.iter().map(|l| uncontexted(l)).collect::<Vec<_>>(),
+            ["dbProcess of 'A'", "dbProcess of 'B'", "dbProcess of 'C'"]
+        );
+        return;
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(calc, "A") { field(TPRO, "1") field(FLNK, "B") }
+record(calc, "B") { field(FLNK, "C") }
+record(calc, "C") { }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for r in ["A", "B"] {
+        db.put_record_field_from_ca(r, "PROC", EpicsValue::Char(1))
+            .await
+            .unwrap();
+    }
+}
+
+/// A continuation is `prset->process` (`callback.c` `ProcessCallback`), not
+/// `dbProcess`: a TPRO calcout's ODLY end neither prints nor traces its
+/// FLNK target.
+#[epics_macros_rs::epics_test]
+async fn a_tpro_continuation_does_not_trace() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("a_tpro_continuation_does_not_trace");
+        assert_eq!(
+            trace.iter().map(|l| uncontexted(l)).collect::<Vec<_>>(),
+            ["dbProcess of 'D'"]
+        );
+        return;
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(calcout, "D") { field(TPRO, "1") field(CALC, "1") field(ODLY, "0.05") field(FLNK, "E") }
+record(calc, "E") { }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("D", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+/// TPRO first set by a put, after the database loaded with none, traces the
+/// record's next `dbProcess` as one set at load does.
+#[epics_macros_rs::epics_test]
+async fn a_tpro_put_at_run_time_traces_the_next_process() {
+    if std::env::var_os(CHILD).is_none() {
+        let trace = trace_of("a_tpro_put_at_run_time_traces_the_next_process");
+        assert_eq!(
+            trace.iter().map(|l| uncontexted(l)).collect::<Vec<_>>(),
+            ["dbProcess of 'R'", "dbProcess of 'S'"]
+        );
+        return;
+    }
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(calc, "R") { field(FLNK, "S") }
+record(calc, "S") { }
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("R", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("R", "TPRO", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("R", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+}

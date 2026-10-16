@@ -137,3 +137,46 @@ async fn ao_converts_rval_only_on_status_zero() {
         [(10.0, 0), (0.0, 1), (0.0, 0), (0.0, 1), (0.0, 1)]
     );
 }
+
+/// A device that keeps the trait's default `init`: C's `init_record` that
+/// returns 0 having touched nothing.
+struct Inherit;
+
+impl DeviceSupport for Inherit {
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        Ok(DeviceReadOutcome::ok())
+    }
+
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    fn dtyp(&self) -> &str {
+        "inherit"
+    }
+}
+
+/// The default `init` is status 0: `bo` converts RVAL 0 and is defined, and
+/// `mbbiDirect` derives B0-B1F from VAL (`mbbiDirectRecord.c:115-125`).
+#[epics_macros_rs::epics_test]
+async fn the_default_init_is_status_zero() {
+    let db = r#"
+record(bo, "inherit:bo") { field(DTYP, "inherit") }
+record(mbbiDirect, "inherit:mbbid") { field(DTYP, "inherit") field(VAL, "5") }
+"#;
+    let (db, _) = IocBuilder::new()
+        .register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+            (ctx.dtyp == "inherit").then(|| Box::new(Inherit) as Box<dyn DeviceSupport>)
+        })
+        .db_string(db, &HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let bo = db.get_record("inherit:bo").unwrap();
+    assert_eq!(bo.read().common.udf, 0);
+    let rec = db.get_record("inherit:mbbid").unwrap();
+    let rec = rec.read();
+    let bit = |f: &str| rec.record.get_field(f).and_then(|v| v.to_f64()).unwrap();
+    assert_eq!([bit("B0"), bit("B1"), bit("B2")], [1.0, 0.0, 1.0]);
+}

@@ -755,10 +755,11 @@ pub struct DeviceAlarm<'a> {
 pub trait DeviceSupport: Send + Sync + 'static {
     /// C `init_record`. See [`DeviceInitOutcome`] for the two failure shapes:
     /// `Err` flags the record but leaves it processing, `Ok(Dead)` is C's
-    /// `pr->pact = 1` and stops it for good. The default does nothing, so
-    /// there is nothing for the record to convert.
+    /// `pr->pact = 1` and stops it for good. The default is an `init_record`
+    /// that returns 0, so the record's status-0 arm runs; a dset with no
+    /// `init_record` says so through [`Self::has_init_record`].
     fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// Whether the C dset this ports has an `init_record` entry. `aiRecord.c`

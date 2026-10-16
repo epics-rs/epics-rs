@@ -893,6 +893,17 @@ impl PortDriverBase {
         );
     }
 
+    /// C `asynPortDriver::writeInt32`: store the value, run the callbacks for
+    /// `user.addr`, trace the write. The [`PortDriver::write_int32`] default,
+    /// and the fall-through a driver override takes for a reason it does not
+    /// handle itself.
+    pub fn write_int32_param(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
+        self.params.set_int32(user.reason, user.addr, value)?;
+        self.call_param_callbacks(user.addr)?;
+        self.trace_write(user, "writeInt32", format_args!("{value}"));
+        Ok(())
+    }
+
     /// Single owner-API for the port-level `connected` transition.
     ///
     /// C parity: `exceptionConnect` (asynManager.c:2153-2162) and
@@ -2266,13 +2277,7 @@ pub trait PortDriver: Any + Send + Sync {
     // it in `errorMessage`, which is the `Err` here.
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int32(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)?;
-        self.base()
-            .trace_write(user, "writeInt32", format_args!("{value}"));
-        Ok(())
+        self.base_mut().write_int32_param(user, value)
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {

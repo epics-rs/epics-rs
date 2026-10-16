@@ -768,7 +768,7 @@ impl TraceManager {
     /// (asynManager.c:548-553). C's `traceVprintSource` `fprintf`s straight
     /// into the trace file (asynManager.c:3090-3115) and allocates nothing, so
     /// a caller holding a record's lock does not either; see
-    /// [`TraceFile::write_streamed`].
+    /// `TraceFile::write_streamed`.
     pub fn print(
         &self,
         port: Option<&str>,

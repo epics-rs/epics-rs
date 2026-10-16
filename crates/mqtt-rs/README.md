@@ -228,7 +228,7 @@ subscriber, as the `mqtt-ioc` example does.
 
 ## Dependencies
 
-- [rumqttc](https://crates.io/crates/rumqttc) — async MQTT client
+- [rumqttc-v5-next](https://crates.io/crates/rumqttc-v5-next) — async MQTT v5 client
 - [serde_json](https://crates.io/crates/serde_json) — JSON parsing
 - [asyn-rs](../asyn-rs/) — PortDriver framework
 - epics-base-rs, epics-ca-rs — the record and iocsh side, `ioc` feature only

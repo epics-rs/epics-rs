@@ -1287,7 +1287,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1394,6 +1394,17 @@ name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
+]
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -1817,7 +1828,7 @@ dependencies = [
  "hyper",
  "libc",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2053,7 +2064,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2212,7 +2223,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "328f4e1041f7cfeb3affccb814ddbe2f004856a2ce769c8bf22080d74c5204c6"
 dependencies = [
  "fastrand",
- "flume",
+ "flume 0.11.1",
  "if-addrs",
  "mio",
  "socket2 0.5.10",
@@ -2375,11 +2386,21 @@ dependencies = [
  "asyn-rs",
  "epics-base-rs",
  "epics-ca-rs",
- "rumqttc",
+ "rumqttc-v5-next",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mqttbytes-core-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366b6ba2b4209ca4bc5ac731ccddf570d09831981eed07e5fbd63564cf0cf1aa"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2467,7 +2488,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3289,19 +3310,30 @@ name = "rtems-exec-gate"
 version = "0.0.0"
 
 [[package]]
-name = "rumqttc"
-version = "0.25.1"
+name = "rumqttc-core-next"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
+checksum = "249896ab27ed630590971738264baa8f722f18965d2e387c706c40a3c2a572cc"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "rumqttc-v5-next"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3dfa6ddcc7a7dd5688f9bf78d8f81cb94f367bce56c055d8d94cf81ecb0518bf"
 dependencies = [
  "bytes",
  "fixedbitset",
- "flume",
+ "flume 0.12.0",
  "futures-util",
  "log",
+ "mqttbytes-core-next",
+ "rumqttc-core-next",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-util",
 ]
 
@@ -3374,7 +3406,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3886,7 +3918,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4559,7 +4591,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

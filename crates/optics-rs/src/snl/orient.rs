@@ -315,6 +315,9 @@ pub enum OrientEvent {
 pub struct OrientActions {
     /// Motor targets to write (tth, th, chi, phi). `None` if no motor move needed.
     pub drive_motors: Option<[f64; 4]>,
+    /// `drive_motors` is the motPut command: every motor is written, not
+    /// only those that differ (orient_st.st:888-897 vs :1101-1124).
+    pub mot_put: bool,
     /// Updated HKL to write back.
     pub write_hkl: Option<[f64; 3]>,
     /// Updated trial angles to write back.
@@ -333,6 +336,15 @@ pub struct OrientActions {
     pub write_ref1: Option<Reflection>,
     /// Ref2 was updated from current values.
     pub write_ref2: Option<Reflection>,
+    /// Write motPut_Auto to manual: C does on every bad OMTX
+    /// (orient_st.st:557, :651, :958).
+    pub mot_put_auto_off: bool,
+    /// Reset the OMTX_Calc command once the calculation ran
+    /// (orient_st.st:540, :643).
+    pub clear_omtx_calc: bool,
+    /// The step ends in C's putAll, which clears Busy and the *_busy
+    /// records when no motor is left moving (orient_st.st:1132-1141).
+    pub put_all: bool,
 }
 
 /// Synchronise energy and wavelength.
@@ -345,6 +357,37 @@ fn sync_energy_lambda(energy: &mut f64, lambda: &mut f64) {
 }
 
 impl OrientController {
+    /// C's bad-OMTX exit: drive switch to manual so a bad matrix does not
+    /// drive the motors (orient_st.st:555-560, :649-653, :957-959).
+    fn bad_omtx(&mut self, actions: &mut OrientActions) {
+        self.mot_put_auto = false;
+        actions.mot_put_auto_off = true;
+        actions.message = Some("Bad OMTX calc; motPut_Auto set to Manual".into());
+    }
+
+    /// The init state's OMTX calculation (orient_st.st:514-561): skipped
+    /// unless A0 is good, published only when both reflections are nonzero.
+    pub fn init_omtx(&mut self) -> OrientActions {
+        let mut actions = OrientActions::default();
+        if self.a0_state != CalcState::Succeeded {
+            return actions;
+        }
+        let refs_set = self.ref1.hkl() != [0.0; 3] && self.ref2.hkl() != [0.0; 3];
+        actions.clear_omtx_calc = refs_set;
+        if self.recalc_omtx() {
+            actions.write_omtx = Some(self.omtx);
+            actions.message = Some("Successful OMTX calc".into());
+        } else {
+            if refs_set {
+                actions.write_omtx = Some(self.omtx);
+            }
+            if self.mot_put_auto {
+                self.bad_omtx(&mut actions);
+            }
+        }
+        actions
+    }
+
     /// Recalculate the A0 matrix from current lattice params and wavelength.
     pub fn recalc_a0(&mut self) -> bool {
         sync_energy_lambda(&mut self.energy, &mut self.lambda);
@@ -485,6 +528,26 @@ impl OrientController {
     /// Process a single event, returning actions the caller should take.
     pub fn step(&mut self, event: OrientEvent) -> OrientActions {
         let mut actions = OrientActions::default();
+        // newMotors always ends in putAll; newHKL and newAngles do only with
+        // good matrices (orient_st.st:970-1066).
+        let via_new_motors = matches!(
+            event,
+            OrientEvent::MotorsChanged { .. }
+                | OrientEvent::MotorsDone { .. }
+                | OrientEvent::MotGet
+        );
+        let via_new_hkl = matches!(
+            event,
+            OrientEvent::EnergyChanged(_)
+                | OrientEvent::LambdaChanged(_)
+                | OrientEvent::LatticeChanged(_)
+                | OrientEvent::HKLChanged { .. }
+                | OrientEvent::AnglesChanged { .. }
+                | OrientEvent::CalcOMTX
+                | OrientEvent::ModeChanged(_)
+                | OrientEvent::A0MatrixChanged(_)
+                | OrientEvent::OMTXMatrixChanged(_)
+        );
 
         match event {
             OrientEvent::EnergyChanged(e) => {
@@ -556,8 +619,6 @@ impl OrientController {
                     actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
                     if self.mot_put_auto {
                         actions.drive_motors = Some([self.tth, self.th, self.chi, self.phi]);
-                        self.busy = true;
-                        actions.busy_changed = Some(true);
                     }
                 } else {
                     actions.message = Some("HKL to angles calculation failed".into());
@@ -578,8 +639,6 @@ impl OrientController {
                     actions.write_hkl = Some([self.h, self.k, self.l]);
                     if self.mot_put_auto {
                         actions.drive_motors = Some([self.tth, self.th, self.chi, self.phi]);
-                        self.busy = true;
-                        actions.busy_changed = Some(true);
                     }
                 } else {
                     actions.message = Some("Angles to HKL calculation failed".into());
@@ -640,19 +699,20 @@ impl OrientController {
                     return actions;
                 }
                 let ok = self.recalc_omtx();
+                actions.clear_omtx_calc = true;
                 // C `newOMTX` (orient_st.st:637-642) pvPuts OMTX_11..OMTX_33
                 // unconditionally after calc_OMTX — identity on a singular result,
                 // the real matrix otherwise — before deciding success/failure.
                 actions.write_omtx = Some(self.omtx);
                 if ok {
-                    actions.message = Some("Successful OMTX calc".into());
+                    // Only init's calculation reports success (orient_st.st:554
+                    // vs :646-648).
                     // Recompute angles from current HKL
                     if self.hkl_to_trial_angles() {
                         actions.write_angles = Some([self.tth, self.th, self.chi, self.phi]);
                     }
                 } else {
-                    actions.message = Some("Bad OMTX calc; motPut_Auto set to Manual".into());
-                    self.mot_put_auto = false;
+                    self.bad_omtx(&mut actions);
                 }
             }
 
@@ -670,10 +730,10 @@ impl OrientController {
             }
 
             OrientEvent::MotPut => {
+                // The db's putBusy sets Busy, not the sequencer
+                // (orient_st.st:888-897).
                 actions.drive_motors = Some([self.tth, self.th, self.chi, self.phi]);
-                self.waiting_for_motors = true;
-                self.busy = true;
-                actions.busy_changed = Some(true);
+                actions.mot_put = true;
             }
 
             OrientEvent::MotGet => {
@@ -758,25 +818,38 @@ impl OrientController {
                             Some(e) => {
                                 self.err_angle = e;
                                 self.omtx_state = CalcState::Failed;
-                                actions.message = Some("User OMTX fails check".into());
                             }
                             None => {
                                 self.omtx_state = CalcState::Failed;
-                                actions.message = Some("OMTX check failed".into());
                             }
                         }
                     } else {
-                        actions.message = Some("Cannot check OMTX: no valid A0".into());
                         self.omtx_state = CalcState::Failed;
                     }
                 } else {
                     self.omtx_state = CalcState::Failed;
-                    actions.message = Some("Could not invert OMTX matrix".into());
+                }
+                // newOMTX (orient_st.st:954-961) follows every failure here.
+                if self.omtx_state != CalcState::Succeeded {
+                    self.bad_omtx(&mut actions);
                 }
             }
         }
 
+        actions.put_all = via_new_motors
+            || via_new_hkl
+                && self.a0_state == CalcState::Succeeded
+                && self.omtx_state == CalcState::Succeeded;
         actions
+    }
+}
+
+/// Clear each set *_busy record (orient_st.st:868-874, :1134-1140).
+async fn clear_flag_busy(monitor: &mut DbMultiMonitor, pvs: &[String; 7], chs: &[DbChannel; 7]) {
+    for (pv, ch) in pvs.iter().zip(chs) {
+        if monitor.var(pv) as i16 != 0 {
+            let _ = ch.put_i16_process(0).await;
+        }
     }
 }
 
@@ -797,10 +870,35 @@ pub async fn run(
     let p = &config.prefix;
 
     // Connect motor channels
-    let ch_mot_tth = DbChannel::with_origin(&db, &config.motor_tth, my_origin);
-    let ch_mot_th = DbChannel::with_origin(&db, &config.motor_th, my_origin);
-    let ch_mot_chi = DbChannel::with_origin(&db, &config.motor_chi, my_origin);
-    let ch_mot_phi = DbChannel::with_origin(&db, &config.motor_phi, my_origin);
+    let pv_mots = [
+        config.motor_tth.clone(),
+        config.motor_th.clone(),
+        config.motor_chi.clone(),
+        config.motor_phi.clone(),
+    ];
+    let ch_mots = pv_mots
+        .each_ref()
+        .map(|pv| DbChannel::with_origin(&db, pv, my_origin));
+    let [ch_mot_tth, ch_mot_th, ch_mot_chi, ch_mot_phi] = &ch_mots;
+    // DMOV's return to 1 stands in for pvPutComplete(motX) and, like C's
+    // completion callback, raises the motor's flag (orient_st.st:776-800).
+    let pv_dmovs = pv_mots.each_ref().map(|pv| {
+        let base = pv.split('.').next().unwrap_or(pv);
+        format!("{base}.DMOV")
+    });
+    let ch_dmovs = pv_dmovs
+        .each_ref()
+        .map(|pv| DbChannel::with_origin(&db, pv, my_origin));
+    // C's state PVs (orient_st.st:314-331).
+    let axes = ["TTH", "TH", "CHI", "PHI"];
+    let ch_waiting4 =
+        axes.map(|a| DbChannel::with_origin(&db, &format!("{p}waiting4mot{a}"), my_origin));
+    let ch_we_wrote =
+        axes.map(|a| DbChannel::with_origin(&db, &format!("{p}weWrote_mot{a}"), my_origin));
+    let ch_waiting4_mot = DbChannel::with_origin(&db, &format!("{p}waiting4Mot"), my_origin);
+    let ch_load_mot_put = DbChannel::with_origin(&db, &format!("{p}load_motPut"), my_origin);
+    let mut waiting4 = [false; 4];
+    let mut we_wrote = [false; 4];
 
     // Motor readback channels
     let ch_mot_tth_rbv = DbChannel::with_origin(&db, &config.motor_tth_rbv(), my_origin);
@@ -808,23 +906,19 @@ pub async fn run(
     let ch_mot_chi_rbv = DbChannel::with_origin(&db, &config.motor_chi_rbv(), my_origin);
     let ch_mot_phi_rbv = DbChannel::with_origin(&db, &config.motor_phi_rbv(), my_origin);
 
-    // HKL channels
-    let ch_h = DbChannel::with_origin(&db, &format!("{p}H"), my_origin);
-    let ch_k = DbChannel::with_origin(&db, &format!("{p}K"), my_origin);
-    let ch_l = DbChannel::with_origin(&db, &format!("{p}L"), my_origin);
+    // C writes HKL and the trial angles through the load records, whose
+    // PACT disables the *_event records (orient_st.st:1083-1094).
+    let ch_h = DbChannel::with_origin(&db, &format!("{p}loadH"), my_origin);
+    let ch_k = DbChannel::with_origin(&db, &format!("{p}loadK"), my_origin);
+    let ch_l = DbChannel::with_origin(&db, &format!("{p}loadL"), my_origin);
     let ch_h_rbv = DbChannel::with_origin(&db, &format!("{p}H_RBV"), my_origin);
     let ch_k_rbv = DbChannel::with_origin(&db, &format!("{p}K_RBV"), my_origin);
     let ch_l_rbv = DbChannel::with_origin(&db, &format!("{p}L_RBV"), my_origin);
 
-    // Trial angle channels
-    let ch_tth = DbChannel::with_origin(&db, &format!("{p}TTH"), my_origin);
-    let ch_th = DbChannel::with_origin(&db, &format!("{p}TH"), my_origin);
-    let ch_chi = DbChannel::with_origin(&db, &format!("{p}CHI"), my_origin);
-    let ch_phi = DbChannel::with_origin(&db, &format!("{p}PHI"), my_origin);
-
-    // Energy / lambda
-    let ch_energy = DbChannel::with_origin(&db, &format!("{p}energy"), my_origin);
-    let _ch_lambda = DbChannel::with_origin(&db, &format!("{p}lambda"), my_origin);
+    let ch_tth = DbChannel::with_origin(&db, &format!("{p}loadTTH"), my_origin);
+    let ch_th = DbChannel::with_origin(&db, &format!("{p}loadTH"), my_origin);
+    let ch_chi = DbChannel::with_origin(&db, &format!("{p}loadCHI"), my_origin);
+    let ch_phi = DbChannel::with_origin(&db, &format!("{p}loadPHI"), my_origin);
 
     // Crystal params
     let ch_a = DbChannel::with_origin(&db, &format!("{p}a"), my_origin);
@@ -856,36 +950,110 @@ pub async fn run(
     let ch_msg = DbChannel::with_origin(&db, &format!("{p}Msg"), my_origin);
     let _ch_mot_put = DbChannel::with_origin(&db, &format!("{p}motPut"), my_origin);
     let _ch_mot_get = DbChannel::with_origin(&db, &format!("{p}motGet"), my_origin);
+    let ch_mot_put_auto = DbChannel::with_origin(&db, &format!("{p}motPut_Auto"), my_origin);
+    let ch_omtx_calc = DbChannel::with_origin(&db, &format!("{p}OMTX_Calc"), my_origin);
 
     // Build multi-monitor
-    let monitored_pvs: Vec<String> = vec![
-        format!("{p}energy"),
-        format!("{p}lambda"),
-        format!("{p}H"),
-        format!("{p}K"),
-        format!("{p}L"),
-        format!("{p}TTH"),
-        format!("{p}TH"),
-        format!("{p}CHI"),
-        format!("{p}PHI"),
-        config.motor_tth.clone(),
-        config.motor_th.clone(),
-        config.motor_chi.clone(),
-        config.motor_phi.clone(),
+    // C's event flags sync to the *_event records; the values behind them
+    // are plain ASSIGN_MONITOR (orient_st.st:177-256).
+    let names = ["H", "K", "L", "TTH", "TH", "CHI", "PHI", "energy", "lambda"];
+    let [
+        ev_h,
+        ev_k,
+        ev_l,
+        ev_tth,
+        ev_th,
+        ev_chi,
+        ev_phi,
+        ev_energy,
+        ev_lambda,
+    ] = names.map(|f| format!("{p}{f}_event"));
+    let values = names.map(|f| format!("{p}{f}"));
+    let mut monitored_pvs: Vec<String> = vec![
+        ev_energy.clone(),
+        ev_lambda.clone(),
+        ev_h.clone(),
+        ev_k.clone(),
+        ev_l.clone(),
+        ev_tth.clone(),
+        ev_th.clone(),
+        ev_chi.clone(),
+        ev_phi.clone(),
+    ];
+    monitored_pvs.extend(pv_mots.iter().cloned());
+    monitored_pvs.extend(pv_dmovs.iter().cloned());
+    monitored_pvs.extend([
         config.motor_tth_rbv(),
         format!("{p}Mode"),
         format!("{p}motPut"),
         format!("{p}motGet"),
-    ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+        format!("{p}OMTX_Calc"),
+    ]);
+    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
     // C `ASSIGN_MONITOR` syncs no event flag (orient_st.st:70-72, :126, :136)
     // and only action code reads them (:557, :993, :1024, :1053), so they are
     // written on arrival and wake nothing.
     let pv_mot_put_auto = format!("{p}motPut_Auto");
     let pv_mot_get_auto = format!("{p}motGet_Auto");
+    let pv_busy = format!("{p}Busy");
     monitor
-        .add_vars(&db, &[pv_mot_put_auto.clone(), pv_mot_get_auto.clone()])
+        .add_vars(
+            &db,
+            &[
+                pv_mot_put_auto.clone(),
+                pv_mot_get_auto.clone(),
+                pv_busy.clone(),
+            ],
+        )
         .await;
+    // The reflections and errAngleThresh are plain ASSIGN_MONITOR too
+    // (orient_st.st:222-240, :295), read only by the OMTX calculation.
+    let pv_ref = |n: u8| ["H", "K", "L", "TTH", "TH", "CHI", "PHI"].map(|f| format!("{p}{f}{n}"));
+    let (pv_ref1, pv_ref2) = (pv_ref(1), pv_ref(2));
+    let pv_err_angle_thresh = format!("{p}errAngleThresh");
+    monitor.add_vars(&db, &values).await;
+    let [
+        pv_h,
+        pv_k,
+        pv_l,
+        pv_tth,
+        pv_th,
+        pv_chi,
+        pv_phi,
+        pv_energy,
+        pv_lambda,
+    ] = values;
+    // The *_busy records the *_event records set (orient_st.st:179-216).
+    let pv_flag_busy = ["H", "K", "L", "TTH", "TH", "CHI", "PHI"].map(|f| format!("{p}{f}_busy"));
+    monitor.add_vars(&db, &pv_flag_busy).await;
+    let ch_flag_busy = pv_flag_busy
+        .each_ref()
+        .map(|pv| DbChannel::with_origin(&db, pv, my_origin));
+    monitor.add_vars(&db, &pv_ref1).await;
+    monitor.add_vars(&db, &pv_ref2).await;
+    monitor
+        .add_vars(&db, std::slice::from_ref(&pv_err_angle_thresh))
+        .await;
+    let load_vars = |monitor: &mut DbMultiMonitor, ctrl: &mut OrientController| {
+        ctrl.mot_put_auto = monitor.var(&pv_mot_put_auto) as i16 != 0;
+        ctrl.mot_get_auto = monitor.var(&pv_mot_get_auto) as i16 != 0;
+        ctrl.busy = monitor.var(&pv_busy) as i16 != 0;
+        let mut reflection = |pvs: &[String; 7]| {
+            let [h, k, l, tth, th, chi, phi] = pvs.each_ref().map(|pv| monitor.var(pv));
+            Reflection {
+                h,
+                k,
+                l,
+                tth,
+                th,
+                chi,
+                phi,
+            }
+        };
+        ctrl.ref1 = reflection(&pv_ref1);
+        ctrl.ref2 = reflection(&pv_ref2);
+        ctrl.err_angle_thresh = monitor.var(&pv_err_angle_thresh);
+    };
     println!(
         "orient: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -896,7 +1064,7 @@ pub async fn run(
     let mut ctrl = OrientController::default();
 
     // Read initial values
-    ctrl.energy = ch_energy.get_f64().await;
+    ctrl.energy = monitor.var(&pv_energy);
     ctrl.lambda = if ctrl.energy > SMALL {
         HC / ctrl.energy
     } else {
@@ -927,154 +1095,210 @@ pub async fn run(
 
     // Initial A0 + OMTX
     ctrl.recalc_a0();
-    ctrl.recalc_omtx();
+    load_vars(&mut monitor, &mut ctrl);
+    let mut init_actions = Some(ctrl.init_omtx());
 
     let _ = ch_msg.put_string_process("Orient initialized").await;
     tracing::info!("orient state machine running for {p}");
 
     // PV name constants
-    let pv_energy = format!("{p}energy");
-    let pv_lambda = format!("{p}lambda");
-    let pv_h = format!("{p}H");
-    let pv_k = format!("{p}K");
-    let pv_l = format!("{p}L");
-    let pv_tth = format!("{p}TTH");
-    let pv_th = format!("{p}TH");
-    let pv_chi = format!("{p}CHI");
-    let pv_phi = format!("{p}PHI");
-    let pv_mot_tth = config.motor_tth.clone();
-    let pv_mot_th = config.motor_th.clone();
-    let pv_mot_chi = config.motor_chi.clone();
-    let pv_mot_phi = config.motor_phi.clone();
     let pv_mot_tth_rbv = config.motor_tth_rbv();
     let pv_mode = format!("{p}Mode");
     let pv_mot_put = format!("{p}motPut");
     let pv_mot_get = format!("{p}motGet");
+    let pv_omtx_calc = format!("{p}OMTX_Calc");
 
     // Main event loop
     loop {
-        let (changed_pv, new_val) = monitor.wait_change().await;
-
-        let event: Option<OrientEvent> = if changed_pv == pv_energy {
-            Some(OrientEvent::EnergyChanged(new_val))
-        } else if changed_pv == pv_lambda {
-            Some(OrientEvent::LambdaChanged(new_val))
-        } else if changed_pv == pv_h {
-            sleep(Duration::from_millis(20)).await;
-            let h = new_val;
-            let k = ch_k.get_f64().await;
-            let l = ch_l.get_f64().await;
-            Some(OrientEvent::HKLChanged { h, k, l })
-        } else if changed_pv == pv_k {
-            sleep(Duration::from_millis(20)).await;
-            let h = ch_h.get_f64().await;
-            let k = new_val;
-            let l = ch_l.get_f64().await;
-            Some(OrientEvent::HKLChanged { h, k, l })
-        } else if changed_pv == pv_l {
-            sleep(Duration::from_millis(20)).await;
-            let h = ch_h.get_f64().await;
-            let k = ch_k.get_f64().await;
-            let l = new_val;
-            Some(OrientEvent::HKLChanged { h, k, l })
-        } else if changed_pv == pv_tth
-            || changed_pv == pv_th
-            || changed_pv == pv_chi
-            || changed_pv == pv_phi
-        {
-            sleep(Duration::from_millis(20)).await;
-            let tth = ch_tth.get_f64().await;
-            let th = ch_th.get_f64().await;
-            let chi = ch_chi.get_f64().await;
-            let phi = ch_phi.get_f64().await;
-            Some(OrientEvent::AnglesChanged { tth, th, chi, phi })
-        } else if changed_pv == pv_mot_tth
-            || changed_pv == pv_mot_th
-            || changed_pv == pv_mot_chi
-            || changed_pv == pv_mot_phi
-        {
-            let tth = ch_mot_tth.get_f64().await;
-            let th = ch_mot_th.get_f64().await;
-            let chi = ch_mot_chi.get_f64().await;
-            let phi = ch_mot_phi.get_f64().await;
-            Some(OrientEvent::MotorsChanged { tth, th, chi, phi })
-        } else if changed_pv == pv_mot_tth_rbv {
-            let tth = ch_mot_tth_rbv.get_f64().await;
-            let th = ch_mot_th_rbv.get_f64().await;
-            let chi = ch_mot_chi_rbv.get_f64().await;
-            let phi = ch_mot_phi_rbv.get_f64().await;
-            Some(OrientEvent::MotorRBVChanged { tth, th, chi, phi })
-        } else if changed_pv == pv_mode {
-            let constraint = constraint_from_mode(new_val as i32);
-            Some(OrientEvent::ModeChanged(constraint))
-        } else if changed_pv == pv_mot_put {
-            if new_val as i32 != 0 {
-                Some(OrientEvent::MotPut)
-            } else {
-                None
-            }
-        } else if changed_pv == pv_mot_get {
-            if new_val as i32 != 0 {
-                Some(OrientEvent::MotGet)
-            } else {
-                None
-            }
+        let actions = if let Some(actions) = init_actions.take() {
+            actions
         } else {
-            None
+            let (changed_pv, new_val) = monitor.wait_change().await;
+
+            let event: Option<OrientEvent> = if changed_pv == ev_energy {
+                Some(OrientEvent::EnergyChanged(monitor.var(&pv_energy)))
+            } else if changed_pv == ev_lambda {
+                Some(OrientEvent::LambdaChanged(monitor.var(&pv_lambda)))
+            } else if [&ev_h, &ev_k, &ev_l].contains(&&changed_pv) {
+                if monitor.var(&pv_busy) as i16 == 0 {
+                    let _ = ch_busy.put_i16_process(1).await;
+                }
+                // newHKL's SYNC_WAIT_SECS takes the rest of a vector write
+                // and clears its flags (orient_st.st:978-981).
+                sleep(Duration::from_millis(20)).await;
+                for ev in [&ev_h, &ev_k, &ev_l] {
+                    monitor.clear(ev);
+                }
+                let [h, k, l] = [&pv_h, &pv_k, &pv_l].map(|pv| monitor.var(pv));
+                Some(OrientEvent::HKLChanged { h, k, l })
+            } else if [&ev_tth, &ev_th, &ev_chi, &ev_phi].contains(&&changed_pv) {
+                if monitor.var(&pv_busy) as i16 == 0 {
+                    let _ = ch_busy.put_i16_process(1).await;
+                }
+                // newAngles, orient_st.st:1013-1017.
+                sleep(Duration::from_millis(20)).await;
+                for ev in [&ev_tth, &ev_th, &ev_chi, &ev_phi] {
+                    monitor.clear(ev);
+                }
+                let [tth, th, chi, phi] =
+                    [&pv_tth, &pv_th, &pv_chi, &pv_phi].map(|pv| monitor.var(pv));
+                Some(OrientEvent::AnglesChanged { tth, th, chi, phi })
+            } else if let Some((i, dmov_wake)) = pv_mots
+                .iter()
+                .position(|pv| *pv == changed_pv)
+                .map(|i| (i, false))
+                .or_else(|| {
+                    pv_dmovs
+                        .iter()
+                        .position(|pv| *pv == changed_pv)
+                        .map(|i| (i, true))
+                })
+            {
+                // The motor arms of monitor_all (orient_st.st:801-861).
+                let new_motors = if waiting4[i] && ch_dmovs[i].get_i16().await != 0 {
+                    waiting4[i] = false;
+                    let _ = ch_waiting4[i].put_i16_process(0).await;
+                    if we_wrote[i] {
+                        we_wrote[i] = false;
+                        let _ = ch_we_wrote[i].put_i16_process(0).await;
+                    }
+                    // checkDone (orient_st.st:1030-1046).
+                    let done = monitor.var(&pv_busy) as i16 != 0
+                        && ctrl.waiting_for_motors
+                        && !waiting4.iter().any(|&w| w);
+                    if done {
+                        ctrl.waiting_for_motors = false;
+                        let _ = ch_waiting4_mot.put_i16_process(0).await;
+                        let _ = ch_busy.put_i16_process(0).await;
+                        clear_flag_busy(&mut monitor, &pv_flag_busy, &ch_flag_busy).await;
+                    }
+                    done
+                } else if dmov_wake {
+                    // DMOV leaving 1 is no C event.
+                    false
+                } else if we_wrote[i] {
+                    we_wrote[i] = false;
+                    let _ = ch_we_wrote[i].put_i16_process(0).await;
+                    false
+                } else {
+                    true
+                };
+                if new_motors {
+                    let tth = ch_mot_tth.get_f64().await;
+                    let th = ch_mot_th.get_f64().await;
+                    let chi = ch_mot_chi.get_f64().await;
+                    let phi = ch_mot_phi.get_f64().await;
+                    Some(OrientEvent::MotorsChanged { tth, th, chi, phi })
+                } else {
+                    None
+                }
+            } else if changed_pv == pv_mot_tth_rbv {
+                let tth = ch_mot_tth_rbv.get_f64().await;
+                let th = ch_mot_th_rbv.get_f64().await;
+                let chi = ch_mot_chi_rbv.get_f64().await;
+                let phi = ch_mot_phi_rbv.get_f64().await;
+                Some(OrientEvent::MotorRBVChanged { tth, th, chi, phi })
+            } else if changed_pv == pv_mode {
+                let constraint = constraint_from_mode(new_val as i32);
+                Some(OrientEvent::ModeChanged(constraint))
+            } else if changed_pv == pv_mot_put {
+                if new_val as i32 != 0 {
+                    Some(OrientEvent::MotPut)
+                } else {
+                    None
+                }
+            } else if changed_pv == pv_mot_get {
+                if new_val as i32 != 0 {
+                    Some(OrientEvent::MotGet)
+                } else {
+                    None
+                }
+            } else if changed_pv == pv_omtx_calc {
+                (new_val as i16 != 0).then_some(OrientEvent::CalcOMTX)
+            } else {
+                None
+            };
+
+            let Some(ev) = event else { continue };
+            load_vars(&mut monitor, &mut ctrl);
+            ctrl.step(ev)
         };
 
-        if let Some(ev) = event {
-            ctrl.mot_put_auto = monitor.var(&pv_mot_put_auto) as i16 != 0;
-            ctrl.mot_get_auto = monitor.var(&pv_mot_get_auto) as i16 != 0;
-            let actions = ctrl.step(ev);
-
-            // Apply actions
-            if let Some(msg) = &actions.message {
-                let _ = ch_msg.put_string_process(msg.as_str()).await;
-            }
-            if let Some(a0) = actions.write_a0 {
-                // C: A0[i][j] -> {P}A0_ij, pvPut each (orient_st.st:497-503,
-                // 671-679). NOT into {P}a, which is a user lattice-param input.
-                for (i, row) in ch_a0.iter().enumerate() {
-                    for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_process(a0[i][j]).await;
-                    }
+        // Apply actions
+        if let Some(msg) = &actions.message {
+            let _ = ch_msg.put_string_process(msg.as_str()).await;
+        }
+        if let Some(a0) = actions.write_a0 {
+            // C: A0[i][j] -> {P}A0_ij, pvPut each (orient_st.st:497-503,
+            // 671-679). NOT into {P}a, which is a user lattice-param input.
+            for (i, row) in ch_a0.iter().enumerate() {
+                for (j, ch) in row.iter().enumerate() {
+                    let _ = ch.put_f64_process(a0[i][j]).await;
                 }
             }
-            if let Some(omtx) = actions.write_omtx {
-                // C: OMTX[i][j] -> {P}OMTX_ij, pvPut each (orient_st.st:534-539).
-                for (i, row) in ch_omtx.iter().enumerate() {
-                    for (j, ch) in row.iter().enumerate() {
-                        let _ = ch.put_f64_process(omtx[i][j]).await;
-                    }
+        }
+        if let Some(omtx) = actions.write_omtx {
+            // C: OMTX[i][j] -> {P}OMTX_ij, pvPut each (orient_st.st:534-539).
+            for (i, row) in ch_omtx.iter().enumerate() {
+                for (j, ch) in row.iter().enumerate() {
+                    let _ = ch.put_f64_process(omtx[i][j]).await;
                 }
             }
-            if let Some(hkl) = actions.write_hkl {
-                let _ = ch_h.put_f64_process(hkl[0]).await;
-                let _ = ch_k.put_f64_process(hkl[1]).await;
-                let _ = ch_l.put_f64_process(hkl[2]).await;
+        }
+        if let Some(hkl) = actions.write_hkl {
+            let _ = ch_h.put_f64_process(hkl[0]).await;
+            let _ = ch_k.put_f64_process(hkl[1]).await;
+            let _ = ch_l.put_f64_process(hkl[2]).await;
+        }
+        if let Some(ang) = actions.write_angles {
+            let _ = ch_tth.put_f64_process(ang[0]).await;
+            let _ = ch_th.put_f64_process(ang[1]).await;
+            let _ = ch_chi.put_f64_process(ang[2]).await;
+            let _ = ch_phi.put_f64_process(ang[3]).await;
+        }
+        if let Some(motors) = actions.drive_motors {
+            // putAll writes only the motors that differ; motPut writes
+            // all four (orient_st.st:1097-1129, :888-897).
+            for (i, ch) in ch_mots.iter().enumerate() {
+                if !actions.mot_put && (ch.get_f64().await - motors[i]).abs() <= SMALL {
+                    continue;
+                }
+                we_wrote[i] = true;
+                let _ = ch_we_wrote[i].put_i16_process(1).await;
+                waiting4[i] = true;
+                let _ = ch_waiting4[i].put_i16_process(1).await;
+                let _ = ch.put_f64_process(motors[i]).await;
             }
-            if let Some(ang) = actions.write_angles {
-                let _ = ch_tth.put_f64_process(ang[0]).await;
-                let _ = ch_th.put_f64_process(ang[1]).await;
-                let _ = ch_chi.put_f64_process(ang[2]).await;
-                let _ = ch_phi.put_f64_process(ang[3]).await;
+            if actions.mot_put {
+                let _ = ch_load_mot_put.put_i16_process(0).await;
             }
-            if let Some(motors) = actions.drive_motors {
-                let _ = ch_mot_tth.put_f64_process(motors[0]).await;
-                let _ = ch_mot_th.put_f64_process(motors[1]).await;
-                let _ = ch_mot_chi.put_f64_process(motors[2]).await;
-                let _ = ch_mot_phi.put_f64_process(motors[3]).await;
+            if actions.mot_put || waiting4.iter().any(|&w| w) {
                 ctrl.waiting_for_motors = true;
+                let _ = ch_waiting4_mot.put_i16_process(1).await;
+                if !actions.mot_put && monitor.var(&pv_busy) as i16 == 0 {
+                    let _ = ch_busy.put_i16_process(1).await;
+                }
             }
-            if let Some(b) = actions.busy_changed {
-                let _ = ch_busy.put_i16_process(if b { 1 } else { 0 }).await;
+        }
+        if actions.put_all && !ctrl.waiting_for_motors {
+            if monitor.var(&pv_busy) as i16 != 0 {
+                let _ = ch_busy.put_i16_process(0).await;
             }
-            if let Some(rbv) = actions.write_hkl_rbv {
-                let _ = ch_h_rbv.put_f64_process(rbv[0]).await;
-                let _ = ch_k_rbv.put_f64_process(rbv[1]).await;
-                let _ = ch_l_rbv.put_f64_process(rbv[2]).await;
-            }
+            clear_flag_busy(&mut monitor, &pv_flag_busy, &ch_flag_busy).await;
+        }
+        if let Some(b) = actions.busy_changed {
+            let _ = ch_busy.put_i16_process(if b { 1 } else { 0 }).await;
+        }
+        if let Some(rbv) = actions.write_hkl_rbv {
+            let _ = ch_h_rbv.put_f64_process(rbv[0]).await;
+            let _ = ch_k_rbv.put_f64_process(rbv[1]).await;
+            let _ = ch_l_rbv.put_f64_process(rbv[2]).await;
+        }
+        if actions.clear_omtx_calc {
+            let _ = ch_omtx_calc.put_i16_process(0).await;
+        }
+        if actions.mot_put_auto_off {
+            let _ = ch_mot_put_auto.put_i16_process(0).await;
         }
     }
 }
@@ -1301,8 +1525,7 @@ mod tests {
         let actions = ctrl.step(OrientEvent::MotPut);
         let motors = actions.drive_motors.expect("should drive motors");
         assert_eq!(motors[0], 24.0);
-        assert!(ctrl.busy);
-        assert!(ctrl.waiting_for_motors);
+        assert!(actions.mot_put);
     }
 
     #[test]
@@ -1425,6 +1648,29 @@ mod tests {
         let rbv = [24.3414, 12.1707, 0.0, 0.0];
         let hkl = ctrl.motor_rbv_to_hkl(&rbv).unwrap();
         assert!((hkl[0] - 4.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_init_bad_omtx_turns_mot_put_auto_off() {
+        // orient_st.st:555-560: only a set motPut_Auto is written.
+        let mut ctrl = make_controller();
+        let actions = ctrl.init_omtx();
+        assert!(!actions.mot_put_auto_off);
+        assert!(actions.write_omtx.is_none());
+        ctrl.mot_put_auto = true;
+        let actions = ctrl.init_omtx();
+        assert!(actions.mot_put_auto_off);
+        assert!(!ctrl.mot_put_auto);
+    }
+
+    #[test]
+    fn test_user_omtx_failing_the_check_turns_mot_put_auto_off() {
+        // newOMTX (orient_st.st:957-959) after the OMTX_mon arm.
+        let mut ctrl = make_controller();
+        ctrl.mot_put_auto = true;
+        let actions = ctrl.step(OrientEvent::OMTXMatrixChanged([[0.0; 3]; 3]));
+        assert_eq!(ctrl.omtx_state, CalcState::Failed);
+        assert!(actions.mot_put_auto_off);
     }
 
     #[test]

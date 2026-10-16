@@ -339,7 +339,7 @@ pub async fn run(
         pv_gainidx.clone(),
         pv_debug.clone(),
     ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored, origin).await;
+    let mut monitor = DbMultiMonitor::new(&db, &monitored).await;
     if monitor.sub_count() != monitored.len() {
         return Err(format!(
             "femto: {} of the {} PVs it assigns are not in the database ({})",
@@ -375,6 +375,17 @@ pub async fn run(
             }
             if let Some(gain) = puts.gain {
                 let _ = ch_gain.put_f64_process(gain).await;
+            }
+            // `init` (`femto.st:82-87`) and the applying `changeGain` arm
+            // (`:283-287`) efClear the flags their own puts just raised; the
+            // reverting arms and `updateGain` do not, and take their own post.
+            if previous == FemtoState::Init || puts.bits.is_some() {
+                for pv in [&pv_t0, &pv_t1, &pv_t2, &pv_tx, &pv_gainidx] {
+                    monitor.clear(pv);
+                }
+                if previous == FemtoState::Init {
+                    monitor.clear(&pv_debug);
+                }
             }
             if state != previous {
                 debug_print(debug_flag, 2, &format!("{previous:?} -> {state:?}"));

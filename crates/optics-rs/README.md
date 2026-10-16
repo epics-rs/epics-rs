@@ -74,10 +74,10 @@ seqStart("ml_monoCtl", "P=BL1:,M_THETA=ml:theta,M_Y=ml:y,M_Z=ml:z")
 seqStart("orient", "P=BL1:,PM=BL1:,mTTH=tth,mTH=th,mCHI=chi,mPHI=phi")
 
 # Automatic filter selection (8 filters)
-seqStart("filterDrive", "P=BL1:,R=filter:,N=8")
+seqStart("filterDrive", "NAME=filters,P=BL1:,R=filter:,NUM_FILTERS=8")
 
 # XIA PF4 dual filter bank
-seqStart("pf4", "P=BL1:,H=pf4:,B=A")
+seqStart("pf4", "name=pf4_1,P=BL1:,H=pf4:,B=A,M=BL1:userTranpf4.I,B1=BL1:userTranpf4.A,B2=BL1:userTranpf4.B,B3=BL1:userTranpf4.C,B4=BL1:userTranpf4.D")
 
 # Ion chamber intensity
 seqStart("Io", "P=BL1:,MONO=BL1:mono:,VSC=BL1:scaler:")
@@ -154,10 +154,10 @@ simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
 | `kohzuCtl` | P, M_THETA, M_Y, M_Z | GEOM |
 | `kohzuCtl_soft` | P, M_THETA, M_Y, M_Z | MONO, GEOM |
 | `hrCtl` | P, M_PHI1, M_PHI2 | N |
-| `ml_monoCtl` | P, M_THETA | M_THETA2, M_Y, M_Z, Y_OFFSET, GEOM |
+| `ml_monoCtl` | P, M_THETA | M_THETA2, M_Y, M_Z, Y_OFF, GEOM |
 | `orient` | P, PM, mTTH, mTH, mCHI, mPHI | |
-| `filterDrive` | P, R | N |
-| `pf4` | P, B | H |
+| `filterDrive` | P, R, NUM_FILTERS | NAME |
+| `pf4` | P, B | H, M, BP, B1..B4, name |
 | `Io` | P | MONO, VSC |
 | `flexCombinedMotion` | P, M, FM, CM | CAP |
 

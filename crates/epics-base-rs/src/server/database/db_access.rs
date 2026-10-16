@@ -1098,19 +1098,14 @@ pub struct DbMultiMonitor {
 }
 
 impl DbMultiMonitor {
-    /// Create subscriptions for all given PV names. PVs that don't exist are skipped.
+    /// Create subscriptions for all given PV names. The sequencer's own puts
+    /// reach them, as its `pvPut` monitors raise its flags in C. A refused PV
+    /// is skipped without a line: C's sequencer monitors through a CA circuit,
+    /// where a refusal is OOM-only and reaches CA's default exception handler.
     pub async fn new(db: &PvDatabase, pv_names: &[String]) -> Self {
-        Self::new_filtered(db, pv_names, 0).await
-    }
-
-    /// Create subscriptions with origin filtering. Events from `ignore_origin`
-    /// are silently skipped in `wait_change`. A refused PV is skipped without a
-    /// line: C's sequencer monitors through a CA circuit, where a refusal is
-    /// OOM-only and reaches CA's default exception handler.
-    pub async fn new_filtered(db: &PvDatabase, pv_names: &[String], ignore_origin: u64) -> Self {
         let mut subs = Vec::new();
         for name in pv_names {
-            if let Ok(sub) = DbSubscription::subscribe_filtered(db, name, ignore_origin).await {
+            if let Ok(sub) = Self::subscribe(db, name).await {
                 subs.push((name.clone(), sub));
             }
         }
@@ -1123,17 +1118,23 @@ impl DbMultiMonitor {
     /// Monitor `names` as SNL `monitor` variables that no event flag is
     /// `sync`ed to: C writes such a variable as each monitor arrives, so it
     /// raises no [`Self::wait_change`] and [`Self::var`] reads its last post.
-    /// Not origin-filtered, as the sequencer's own `pvPut` monitors reach it
-    /// too. Returns how many of `names` were subscribed.
+    /// Returns how many of `names` were subscribed.
     pub async fn add_vars(&mut self, db: &PvDatabase, names: &[String]) -> usize {
         let before = self.vars.len();
         for name in names {
-            if let Ok(sub) = DbSubscription::subscribe(db, name).await {
+            if let Ok(sub) = Self::subscribe(db, name).await {
                 let seed = db.get_pv(name).ok().and_then(|v| v.to_f64());
                 self.vars.push((name.clone(), sub, seed.unwrap_or(0.0)));
             }
         }
         self.vars.len() - before
+    }
+
+    /// The sequencer's monitor: `DBE_VALUE | DBE_ALARM` (`pv.c:133`), so an
+    /// alarm-only post raises the flag as a value change does.
+    async fn subscribe(db: &PvDatabase, name: &str) -> Result<DbSubscription, SubscribeRefused> {
+        let mask = (EventMask::VALUE | EventMask::ALARM).bits();
+        DbSubscription::subscribe_with_mask(db, name, 0, mask).await
     }
 
     /// The last value posted to the variable `name` added by
@@ -1174,8 +1175,7 @@ impl DbMultiMonitor {
     /// Wait for any subscribed PV to change. Returns (pv_name, new_value)
     /// with the newest value queued for that PV: one SNL sync'd event flag
     /// stands for every monitor since it was last cleared, and its variable
-    /// holds the last of them. Silently skips events matching the
-    /// subscription's `ignore_origin`.
+    /// holds the last of them.
     pub async fn wait_change(&mut self) -> (String, f64) {
         loop {
             for (name, sub) in &mut self.subs {
@@ -1298,18 +1298,41 @@ mod multi_monitor_tests {
         assert_eq!(monitor.var("M"), 2.0);
     }
 
-    /// The sequencer's own puts reach its vars, as its pvPut monitors do in
-    /// C, while its flagged channels still skip them.
+    /// The sequencer's own puts reach both its vars and its flagged channels,
+    /// as its pvPut monitors do in C.
     #[epics_macros_rs::epics_test]
-    async fn a_var_takes_the_ignored_origins_posts() {
+    async fn the_writers_own_puts_reach_its_vars_and_flags() {
         let db = db_with(&[("M", 0.0), ("X", 0.0)]).await;
-        let mut monitor = DbMultiMonitor::new_filtered(&db, &["X".to_string()], 7).await;
+        let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
         monitor.add_vars(&db, &["M".to_string()]).await;
         DbChannel::with_origin(&db, "M", 7)
             .put_f64_process(4.0)
             .await
             .unwrap();
         assert_eq!(monitor.var("M"), 4.0);
+        DbChannel::with_origin(&db, "X", 7)
+            .put_f64_process(5.0)
+            .await
+            .unwrap();
+        assert_eq!(monitor.wait_change().await, ("X".to_string(), 5.0));
+    }
+
+    /// The first put of an unchanged value clears UDF, an alarm-only post,
+    /// which the sequencer's `DBE_VALUE | DBE_ALARM` monitor (`pv.c:133`)
+    /// delivers.
+    #[epics_macros_rs::epics_test]
+    async fn an_alarm_only_post_raises_a_change() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "X",
+            Box::new(crate::server::records::mbbo::MbboRecord::new(0)),
+        )
+        .await
+        .unwrap();
+        let mut monitor = DbMultiMonitor::new(&db, &["X".to_string()]).await;
+        DbChannel::new(&db, "X").put_i16_process(0).await.unwrap();
+        let change = crate::runtime::task::timeout(Duration::from_secs(1), monitor.wait_change());
+        assert_eq!(change.await.ok(), Some(("X".to_string(), 0.0)));
     }
 }
 

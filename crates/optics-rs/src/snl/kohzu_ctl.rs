@@ -552,9 +552,6 @@ async fn kohzu_ctl(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("kohzuCtl: starting for prefix={}", config.prefix);
 
-    // Allocate a unique origin ID for this controller instance.
-    // All put_f64_post calls use this origin, and the monitor filters
-    // out events with the same origin to prevent self-feedback loops.
     let my_origin = alloc_origin();
 
     // -- Create channels for all PVs (direct database access, available immediately) --
@@ -717,12 +714,20 @@ async fn kohzu_ctl(
         config.pv("BraggThetaIncBO"),
         config.pv("BraggThetaDecBO"),
     ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
     // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
     // waitForCmnd `when` tests them (kohzuCtl.st:78-85, :673-810): they are
-    // written on arrival and only read.
+    // written on arrival and only read. kohzuMoving's variable takes every
+    // monitor, the sequencer's own included, unlike its kMbusy wake above.
     monitor
-        .add_vars(&db, &[config.pv("KohzuModeBO"), config.pv("KohzuMode2MO")])
+        .add_vars(
+            &db,
+            &[
+                config.pv("KohzuModeBO"),
+                config.pv("KohzuMode2MO"),
+                config.pv("KohzuMoving"),
+            ],
+        )
         .await;
     println!(
         "kohzuCtl: subscribed to {} PVs, {} active",
@@ -863,7 +868,9 @@ async fn kohzu_ctl(
         // C waitForCmndEnter (kohzuCtl.st:607-671), which only acts once
         // initSeqDone.
         if std::mem::take(&mut enter_wait) && init_seq_done {
-            // The events C's efClears drop here (kohzuCtl.st:610-617).
+            // The events C's efClears drop 0.1 s in, own posts included
+            // (kohzuCtl.st:608-617).
+            tokio::time::sleep(Duration::from_millis(100)).await;
             for pv in [
                 &pv_h, &pv_k, &pv_l, &pv_a, &pv_e, &pv_moving, &pv_lambda, &pv_theta,
             ] {
@@ -914,7 +921,7 @@ async fn kohzu_ctl(
                 let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
             }
             let _ = ch_oper_ack.put_i16_process(0).await;
-            if kohzu_done && ch_moving.get_i16().await != 0 {
+            if kohzu_done && monitor.var(&pv_moving) != 0.0 {
                 kohzu_done = false;
                 let _ = ch_moving.put_i16_process(0).await;
             }
@@ -927,7 +934,11 @@ async fn kohzu_ctl(
 
         let mut next = Next::Wait;
         let (changed_pv, new_val) = match steps.pop_front() {
-            Some(Step::Event(pv, val)) => (pv, val),
+            Some(Step::Event(pv, val)) => {
+                // One C flag with the live monitors queued behind it.
+                monitor.clear(&pv);
+                (pv, val)
+            }
             Some(Step::ThChanged) => {
                 next = Next::ThChanged;
                 (String::new(), 0.0)

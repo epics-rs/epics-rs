@@ -283,6 +283,139 @@ pub fn calc_readback(
     }
 }
 
+/// Drive limits C's `phiLimits` state derives from the motor soft limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhiLimits {
+    pub theta1_hi: f64,
+    pub theta1_lo: f64,
+    pub theta2_hi: f64,
+    pub theta2_lo: f64,
+    pub lambda_hi: f64,
+    pub lambda_lo: f64,
+    pub e_hi: f64,
+    pub e_lo: f64,
+    /// The seqMsg2 clip messages, in C's put order.
+    pub msgs: Vec<String>,
+}
+
+/// C `phiLimits` with `!useSetMode` (hrCtl.st:843-904). `mot_lims` is the
+/// phi1 HLM, phi1 LLM, phi2 HLM, phi2 LLM in micro-radians.
+#[allow(clippy::too_many_arguments)]
+pub fn calc_phi_limits(
+    mot_lims: [f64; 4],
+    phi1_off: f64,
+    phi2_off: f64,
+    world_off: f64,
+    theta_min: f64,
+    theta_max: f64,
+    d1: f64,
+    d2: f64,
+    geom: HrGeometry,
+) -> PhiLimits {
+    let [phi1_mot_hi, phi1_mot_lo, phi2_mot_hi, phi2_mot_lo] = mot_lims;
+    let world_off_deg = world_off * UR2D;
+    let mut msgs = Vec::new();
+
+    let phi1_hi = motor_to_phi(phi1_mot_hi, phi1_off, world_off_deg);
+    let phi1_lo = motor_to_phi(phi1_mot_lo, phi1_off, world_off_deg);
+    let (mut theta1_hi, mut theta1_lo) = (phi1_hi, phi1_lo);
+    if theta1_hi > theta_max {
+        theta1_hi = theta_max;
+        msgs.push(format!("Theta1HiLim clipped at {theta_max:.3}"));
+    }
+    if theta1_lo < theta_min {
+        theta1_lo = theta_min;
+        msgs.push(format!("Theta1LoLim clipped at {theta_min:.3}"));
+    }
+
+    let (mut theta2_hi, mut theta2_lo) = match geom {
+        HrGeometry::Nested => {
+            let phi2_hi = motor_to_phi(phi2_mot_hi, phi2_off, world_off_deg);
+            let phi2_lo = motor_to_phi(phi2_mot_lo, phi2_off, world_off_deg);
+            (phi2_hi - phi1_lo - theta1_lo, phi2_lo - phi1_hi - theta1_hi)
+        }
+        HrGeometry::Symmetric => (
+            motor_to_phi2_symmetric(phi2_mot_hi, phi2_off, world_off_deg),
+            motor_to_phi2_symmetric(phi2_mot_lo, phi2_off, world_off_deg),
+        ),
+    };
+    if theta2_hi > theta_max {
+        theta2_hi = theta_max;
+        msgs.push(format!("Theta2HiLim clipped at {theta_max:.3}"));
+    }
+    if theta2_lo < theta_min {
+        theta2_lo = theta_min;
+        msgs.push(format!("Theta2LoLim clipped at {theta_min:.3}"));
+    }
+
+    let lambda_hi = (d1 * (theta1_hi * D2R).sin()).min(d2 * (theta2_hi * D2R).sin());
+    let lambda_lo = (d1 * (theta1_lo * D2R).sin()).max(d2 * (theta2_lo * D2R).sin());
+    PhiLimits {
+        theta1_hi,
+        theta1_lo,
+        theta2_hi,
+        theta2_lo,
+        lambda_hi,
+        lambda_lo,
+        e_hi: HC / lambda_lo,
+        e_lo: HC / lambda_hi,
+        msgs,
+    }
+}
+
+/// The twelve drive-limit fields `phiLimits` and the UseSet arm write.
+struct LimitChannels {
+    e_hi: DbChannel,
+    e_lo: DbChannel,
+    lambda_hi: DbChannel,
+    lambda_lo: DbChannel,
+    theta1_hi: DbChannel,
+    theta1_lo: DbChannel,
+    phi1_hi: DbChannel,
+    phi1_lo: DbChannel,
+    theta2_hi: DbChannel,
+    theta2_lo: DbChannel,
+    phi2_hi: DbChannel,
+    phi2_lo: DbChannel,
+}
+
+impl LimitChannels {
+    /// C puts no phi1/phi2 limit here (hrCtl.st:843-904).
+    async fn put(&self, lim: &PhiLimits, msg2: &DbChannel) {
+        for m in &lim.msgs {
+            let _ = msg2.put_string_process(m).await;
+        }
+        let _ = self.theta1_hi.put_f64_process(lim.theta1_hi).await;
+        let _ = self.theta1_lo.put_f64_process(lim.theta1_lo).await;
+        let _ = self.theta2_hi.put_f64_process(lim.theta2_hi).await;
+        let _ = self.theta2_lo.put_f64_process(lim.theta2_lo).await;
+        let _ = self.lambda_hi.put_f64_process(lim.lambda_hi).await;
+        let _ = self.lambda_lo.put_f64_process(lim.lambda_lo).await;
+        let _ = self.e_hi.put_f64_process(lim.e_hi).await;
+        let _ = self.e_lo.put_f64_process(lim.e_lo).await;
+    }
+
+    /// Limits ignored entirely during Use/Set setup (hrCtl.st:765-779, :906-918).
+    async fn zero(&self) {
+        for ch in [
+            &self.e_hi,
+            &self.e_lo,
+            &self.lambda_hi,
+            &self.lambda_lo,
+            &self.theta1_hi,
+            &self.theta1_lo,
+            &self.phi1_hi,
+            &self.phi1_lo,
+            &self.theta2_hi,
+            &self.theta2_lo,
+            &self.phi2_hi,
+            &self.phi2_lo,
+        ] {
+            let _ = ch.put_f64_process(0.0).await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -358,37 +491,37 @@ pub async fn run(
 
     // Energy / lambda
     let ch_e = DbChannel::with_origin(&db, &config.pv("EAO"), my_origin);
-    let _ch_e_hi = DbChannel::with_origin(&db, &config.pv("EAO.DRVH"), my_origin);
-    let _ch_e_lo = DbChannel::with_origin(&db, &config.pv("EAO.DRVL"), my_origin);
+    let ch_e_hi = DbChannel::with_origin(&db, &config.pv("EAO.DRVH"), my_origin);
+    let ch_e_lo = DbChannel::with_origin(&db, &config.pv("EAO.DRVL"), my_origin);
     let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbkAO"), my_origin);
 
     let ch_lambda = DbChannel::with_origin(&db, &config.pv("LambdaAO"), my_origin);
-    let _ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVH"), my_origin);
-    let _ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVL"), my_origin);
+    let ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVH"), my_origin);
+    let ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("LambdaAO.DRVL"), my_origin);
     let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbkAO"), my_origin);
 
     // Theta 1/2
     let ch_theta1 = DbChannel::with_origin(&db, &config.pv("Theta1AO"), my_origin);
-    let _ch_theta1_hi = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVH"), my_origin);
-    let _ch_theta1_lo = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVL"), my_origin);
+    let ch_theta1_hi = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVH"), my_origin);
+    let ch_theta1_lo = DbChannel::with_origin(&db, &config.pv("Theta1AO.DRVL"), my_origin);
     let ch_theta1_rdbk = DbChannel::with_origin(&db, &config.pv("Theta1RdbkAO"), my_origin);
 
     let ch_theta2 = DbChannel::with_origin(&db, &config.pv("Theta2AO"), my_origin);
-    let _ch_theta2_hi = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVH"), my_origin);
-    let _ch_theta2_lo = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVL"), my_origin);
+    let ch_theta2_hi = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVH"), my_origin);
+    let ch_theta2_lo = DbChannel::with_origin(&db, &config.pv("Theta2AO.DRVL"), my_origin);
     let ch_theta2_rdbk = DbChannel::with_origin(&db, &config.pv("Theta2RdbkAO"), my_origin);
 
     // Phi 1/2
     let ch_phi1 = DbChannel::with_origin(&db, &config.pv("phi1AO"), my_origin);
     let ch_phi1_off = DbChannel::with_origin(&db, &config.pv("phi1OffAO"), my_origin);
-    let _ch_phi1_hi = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVH"), my_origin);
-    let _ch_phi1_lo = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVL"), my_origin);
+    let ch_phi1_hi = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVH"), my_origin);
+    let ch_phi1_lo = DbChannel::with_origin(&db, &config.pv("phi1AO.DRVL"), my_origin);
     let ch_phi1_rdbk = DbChannel::with_origin(&db, &config.pv("phi1RdbkAO"), my_origin);
 
     let ch_phi2 = DbChannel::with_origin(&db, &config.pv("phi2AO"), my_origin);
     let ch_phi2_off = DbChannel::with_origin(&db, &config.pv("phi2OffAO"), my_origin);
-    let _ch_phi2_hi = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVH"), my_origin);
-    let _ch_phi2_lo = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVL"), my_origin);
+    let ch_phi2_hi = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVH"), my_origin);
+    let ch_phi2_lo = DbChannel::with_origin(&db, &config.pv("phi2AO.DRVL"), my_origin);
     let ch_phi2_rdbk = DbChannel::with_origin(&db, &config.pv("phi2RdbkAO"), my_origin);
 
     // Echo PVs
@@ -422,13 +555,13 @@ pub async fn run(
     let ch_phi1_set_ao = DbChannel::with_origin(&db, &config.pv("phi1SetAO"), my_origin);
     let ch_phi2_set_ao = DbChannel::with_origin(&db, &config.pv("phi2SetAO"), my_origin);
 
-    let _ch_phi1_mot_hilim =
+    let ch_phi1_mot_hilim =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".HLM"), my_origin);
-    let _ch_phi1_mot_lolim =
+    let ch_phi1_mot_lolim =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi1, ".LLM"), my_origin);
-    let _ch_phi2_mot_hilim =
+    let ch_phi2_mot_hilim =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".HLM"), my_origin);
-    let _ch_phi2_mot_lolim =
+    let ch_phi2_mot_lolim =
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".LLM"), my_origin);
 
     let ch_phi1_mot_cmd =
@@ -441,13 +574,31 @@ pub async fn run(
         DbChannel::with_origin(&db, &config.motor_pv(&config.m_phi2, ".RBV"), my_origin);
 
     let ch_world_off = DbChannel::with_origin(&db, &config.pv("worldOffAO"), my_origin);
-    let _ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSetBO"), my_origin);
+    let ch_use_set = DbChannel::with_origin(&db, &config.pv("UseSetBO"), my_origin);
 
-    let _ch_theta_min =
-        DbChannel::with_origin(&db, &config.pv_no_underscore("_thetaMin"), my_origin);
-    let _ch_theta_max =
-        DbChannel::with_origin(&db, &config.pv_no_underscore("_thetaMax"), my_origin);
+    let limits = LimitChannels {
+        e_hi: ch_e_hi,
+        e_lo: ch_e_lo,
+        lambda_hi: ch_lambda_hi,
+        lambda_lo: ch_lambda_lo,
+        theta1_hi: ch_theta1_hi,
+        theta1_lo: ch_theta1_lo,
+        phi1_hi: ch_phi1_hi,
+        phi1_lo: ch_phi1_lo,
+        theta2_hi: ch_theta2_hi,
+        theta2_lo: ch_theta2_lo,
+        phi2_hi: ch_phi2_hi,
+        phi2_lo: ch_phi2_lo,
+    };
+    let pv_theta_min = config.pv_no_underscore("_thetaMin");
+    let pv_theta_max = config.pv_no_underscore("_thetaMax");
 
+    let pv_mot_lims = [
+        config.motor_pv(&config.m_phi1, ".HLM"),
+        config.motor_pv(&config.m_phi1, ".LLM"),
+        config.motor_pv(&config.m_phi2, ".HLM"),
+        config.motor_pv(&config.m_phi2, ".LLM"),
+    ];
     // Build multi-monitor for all event-driving PVs
     let monitored_pvs: Vec<String> = vec![
         config.pv("EAO"),
@@ -473,12 +624,31 @@ pub async fn run(
         config.pv("Mode2MO"),
         config.pv_no_underscore("_GeomMO"),
         config.pv("Moving"),
-    ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    ]
+    .into_iter()
+    .chain(pv_mot_lims.iter().cloned())
+    .collect();
+    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
     // C `monitor autoMode;` syncs no event flag and no waitForCmnd `when`
     // tests it (hrCtl.st:64-66, :693-826): it is written on arrival and only
     // read.
-    monitor.add_vars(&db, &[config.pv("ModeBO")]).await;
+    monitor
+        .add_vars(
+            &db,
+            &[
+                config.pv("ModeBO"),
+                pv_theta_min.clone(),
+                pv_theta_max.clone(),
+                // C's E, lambda, theta1 and theta2 take every monitor, the
+                // sequencer's own posts and a record's clamp of them
+                // included, whether or not waitForCmndEnter cleared the flag.
+                config.pv("EAO"),
+                config.pv("LambdaAO"),
+                config.pv("Theta1AO"),
+                config.pv("Theta2AO"),
+            ],
+        )
+        .await;
     println!(
         "hrCtl: subscribed to {} PVs, {} active",
         monitored_pvs.len(),
@@ -515,7 +685,7 @@ pub async fn run(
     let mut phi1_off = ch_phi1_off.get_f64().await;
     let mut phi2_off = ch_phi2_off.get_f64().await;
     let mut world_off = ch_world_off.get_f64().await;
-    let mut use_set_mode = false;
+    let mut use_set_mode = ch_use_set.get_i16().await != 0;
     let mut _caused_move = false;
 
     // Read motor readbacks and compute initial angles
@@ -600,41 +770,88 @@ pub async fn run(
     let pv_use_set = config.pv("UseSetBO");
     let pv_op_mode = config.pv("Mode2MO");
     let pv_geom = config.pv_no_underscore("_GeomMO");
+    let pv_moving = config.pv("Moving");
 
     println!("hrCtl: ready");
 
     // -- Main loop --
-    let mut deferred_events: HashMap<String, f64> = HashMap::new();
+    // C's first HLM/LLM monitors raise their flags, which waitForCmndEnter
+    // leaves set (hrCtl.st:605-621), so phiLimits runs at boot.
+    let mut deferred_events: HashMap<String, f64> =
+        pv_mot_lims.iter().map(|pv| (pv.clone(), 0.0)).collect();
+    // waitForCmndEnter drops the command flags raised during a pass and the
+    // 0.1 s after it (hrCtl.st:603-621); every pass ends there except
+    // checkAutoMode's manual-mode return to waitForCmnd (:834).
+    let enter_clears = [
+        &pv_h1,
+        &pv_k1,
+        &pv_l1,
+        &pv_a1,
+        &pv_h2,
+        &pv_k2,
+        &pv_l2,
+        &pv_a2,
+        &pv_e,
+        &pv_lambda,
+        &pv_theta1,
+        &pv_theta2,
+        &pv_phi1_off,
+        &pv_phi2_off,
+        &pv_world_off,
+        &pv_use_set,
+        &pv_op_mode,
+        &pv_geom,
+    ];
+    let mut wait_for_cmnd_enter = false;
     loop {
+        if wait_for_cmnd_enter {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for pv in enter_clears {
+                monitor.clear(pv);
+            }
+        }
+        wait_for_cmnd_enter = true;
         let mut proceed_to_theta_changed = false;
+        let mut phi_limits = false;
 
         let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
             let val = deferred_events.remove(&key).unwrap();
+            // One C flag with the live monitors queued behind it.
+            monitor.clear(&key);
             (key, val)
         } else {
             monitor.wait_change().await
         };
+        // putVals and opAck sync no flag: their waitForCmnd clauses test the
+        // value (hrCtl.st:761, :810), and when no clause is true the state set
+        // stays in waitForCmnd and runs no waitForCmndEnter pass.
+        let fires = if changed_pv == pv_put_vals || changed_pv == pv_oper_ack {
+            new_val != 0.0
+        } else {
+            true
+        };
+        if !fires {
+            wait_for_cmnd_enter = false;
+            continue;
+        }
+        e_val = monitor.var(&pv_e);
+        lambda_val = monitor.var(&pv_lambda);
+        theta1_val = monitor.var(&pv_theta1);
+        theta2_val = monitor.var(&pv_theta2);
 
         if changed_pv == pv_e {
-            let new_e = new_val;
-            if (new_e - e_val).abs() > 1e-15 {
-                e_val = new_e;
-                lambda_val = HC / e_val;
-                let _ = ch_lambda.put_f64_process(lambda_val).await;
-                proceed_to_theta_changed = true;
-            }
+            lambda_val = HC / e_val;
+            let _ = ch_lambda.put_f64_process(lambda_val).await;
+            proceed_to_theta_changed = true;
         } else if changed_pv == pv_lambda {
-            let new_l = new_val;
-            if (new_l - lambda_val).abs() > 1e-15 {
-                lambda_val = new_l;
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_theta1 {
-            theta1_val = new_val;
             proceed_to_theta_changed = true;
-        } else if changed_pv == pv_theta2 {
-            theta2_val = new_val;
+        } else if changed_pv == pv_theta1 || changed_pv == pv_theta2 {
+            monitor.clear(&pv_theta1);
+            monitor.clear(&pv_theta2);
             proceed_to_theta_changed = true;
+        } else if changed_pv == pv_moving {
+            // checkAutoMode (:827-835).
+            wait_for_cmnd_enter = monitor.var(&pv_auto_mode) != 0.0;
         } else if changed_pv == pv_h1
             || changed_pv == pv_k1
             || changed_pv == pv_l1
@@ -662,15 +879,11 @@ pub async fn run(
             let _ = ch_d2.put_f64_process(d2).await;
             let _ = ch_auto_mode.put_i16_process(0).await;
         } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 {
-                proceed_to_theta_changed = true;
-            }
+            proceed_to_theta_changed = true;
         } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_msg1.put_string_process(" ").await;
-                let _ = ch_msg2.put_string_process(" ").await;
-            }
+            let _ = ch_alert.put_i16_process(0).await;
+            let _ = ch_msg1.put_string_process(" ").await;
+            let _ = ch_msg2.put_string_process(" ").await;
         } else if changed_pv == pv_phi1_mot_rbv || changed_pv == pv_phi2_mot_rbv {
             let rdbk = calc_readback(
                 ch_phi1_mot_rbv.get_f64().await,
@@ -694,12 +907,48 @@ pub async fn run(
         } else if changed_pv == pv_world_off {
             world_off = ch_world_off.get_f64().await;
             proceed_to_theta_changed = true;
-        } else if changed_pv == pv_phi1_off {
+        } else if pv_mot_lims.contains(&changed_pv) {
+            let _ = ch_msg1.put_string_process("Motor Soft Limit Changed").await;
+            let _ = ch_msg2.put_string_process(" ").await;
+            phi_limits = true;
+        } else if changed_pv == pv_phi1_off || changed_pv == pv_phi2_off {
+            monitor.clear(&pv_phi1_off);
+            monitor.clear(&pv_phi2_off);
             phi1_off = ch_phi1_off.get_f64().await;
-        } else if changed_pv == pv_phi2_off {
             phi2_off = ch_phi2_off.get_f64().await;
+            let rdbk = calc_readback(
+                ch_phi1_mot_rbv.get_f64().await,
+                ch_phi2_mot_rbv.get_f64().await,
+                phi1_off,
+                phi2_off,
+                world_off,
+                d1,
+                d2,
+                op_mode,
+                geom,
+            );
+            let _ = ch_phi1_rdbk.put_f64_process(rdbk.phi1_rdbk).await;
+            let _ = ch_theta1_rdbk.put_f64_process(rdbk.theta1_rdbk).await;
+            if op_mode != HrOpMode::Single {
+                let _ = ch_phi2_rdbk.put_f64_process(rdbk.phi2_rdbk).await;
+                let _ = ch_theta2_rdbk.put_f64_process(rdbk.theta2_rdbk).await;
+            }
+            let _ = ch_lambda_rdbk.put_f64_process(rdbk.lambda_rdbk).await;
+            let _ = ch_e_rdbk.put_f64_process(rdbk.e_rdbk).await;
+            phi_limits = true;
         } else if changed_pv == pv_use_set {
             use_set_mode = new_val as i16 != 0;
+            if use_set_mode {
+                // C goes on to eChanged (hrCtl.st:765-779).
+                limits.zero().await;
+                // Zeroing EHi before ELo clamps E to 0 (aoRecord.c:461),
+                // and eChanged reads that.
+                lambda_val = HC / monitor.var(&pv_e);
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
+                proceed_to_theta_changed = true;
+            } else {
+                phi_limits = true;
+            }
         } else if changed_pv == pv_op_mode {
             op_mode = HrOpMode::from_i16(new_val as i16);
             let _ = ch_auto_mode.put_i16_process(0).await;
@@ -713,6 +962,34 @@ pub async fn run(
             let _ = ch_alert.put_i16_process(1).await;
         }
 
+        if phi_limits {
+            if use_set_mode {
+                limits.zero().await;
+            } else {
+                let mut mot_lims = [0.0; 4];
+                for (lim, ch) in mot_lims.iter_mut().zip([
+                    &ch_phi1_mot_hilim,
+                    &ch_phi1_mot_lolim,
+                    &ch_phi2_mot_hilim,
+                    &ch_phi2_mot_lolim,
+                ]) {
+                    *lim = ch.get_f64().await;
+                }
+                let lim = calc_phi_limits(
+                    mot_lims,
+                    phi1_off,
+                    phi2_off,
+                    world_off,
+                    monitor.var(&pv_theta_min),
+                    monitor.var(&pv_theta_max),
+                    d1,
+                    d2,
+                    geom,
+                );
+                limits.put(&lim, &ch_msg2).await;
+            }
+            continue;
+        }
         if !proceed_to_theta_changed {
             continue;
         }
@@ -1059,6 +1336,37 @@ mod tests {
         );
         let expected_lambda = d1 * (theta1 * D2R).sin();
         assert!((rdbk.lambda_rdbk - expected_lambda).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_phi_limits_nested_clip_to_theta_range() {
+        let lim = calc_phi_limits(
+            [1e6, 0.0, 2e6, 0.0],
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            89.5,
+            2.0,
+            2.0,
+            HrGeometry::Nested,
+        );
+        assert!((lim.theta1_hi - 57.29578).abs() < 1e-4);
+        assert_eq!(lim.theta1_lo, 0.5);
+        // phi2Hi - phi1Lo - theta1Lo = 114.59 - 0 - 0.5, clipped.
+        assert_eq!(lim.theta2_hi, 89.5);
+        assert_eq!(lim.theta2_lo, 0.5);
+        assert!((lim.lambda_hi - 2.0 * (57.29578 * D2R).sin()).abs() < 1e-5);
+        assert!((lim.lambda_lo - 2.0 * (0.5 * D2R).sin()).abs() < 1e-9);
+        assert!((lim.e_hi - HC / lim.lambda_lo).abs() < 1e-9);
+        assert_eq!(
+            lim.msgs,
+            [
+                "Theta1LoLim clipped at 0.500",
+                "Theta2HiLim clipped at 89.500",
+                "Theta2LoLim clipped at 0.500",
+            ]
+        );
     }
 
     #[test]

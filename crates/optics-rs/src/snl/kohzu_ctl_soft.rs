@@ -282,12 +282,20 @@ async fn kohzu_ctl_soft(
         config.motor_pv(&config.m_theta, ".LLM"),
         config.mono_pv("yOffset"),
     ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
+    let mut monitor = DbMultiMonitor::new(&db, &monitored_pvs).await;
     // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
     // waitForCmnd `when` tests them (kohzuCtl_soft.st:74-81, :628-692): they
-    // are written on arrival and only read.
+    // are written on arrival and only read. So is `monitor kohzuMoving;`
+    // (:83-85), read only by waitForCmndEnter (:609).
     monitor
-        .add_vars(&db, &[config.mono_pv("Mode"), config.mono_pv("Mode2")])
+        .add_vars(
+            &db,
+            &[
+                config.mono_pv("Mode"),
+                config.mono_pv("Mode2"),
+                config.mono_pv("Moving"),
+            ],
+        )
         .await;
     println!(
         "kohzuCtl_soft: subscribed to {} PVs, {} active",
@@ -362,6 +370,7 @@ async fn kohzu_ctl_soft(
     let pv_a = config.mono_pv("A");
     let pv_put_vals = config.mono_pv("Put");
     let pv_auto_mode = config.mono_pv("Mode");
+    let pv_moving = config.mono_pv("Moving");
     let pv_cc_mode = config.mono_pv("Mode2");
     let cc_mode_of = |m: &mut DbMultiMonitor| CrystalMode::from_i16(m.var(&pv_cc_mode) as i16);
     let pv_oper_ack = config.mono_pv("OperAck");
@@ -467,7 +476,7 @@ async fn kohzu_ctl_soft(
                     put_readbacks(ch_theta_mot_rbv.get_f64().await, two_d).await;
                 }
                 let _ = ch_oper_ack.put_i16_process(0).await;
-                if kohzu_done && ch_moving.get_i16().await != 0 {
+                if kohzu_done && monitor.var(&pv_moving) != 0.0 {
                     kohzu_done = false;
                     let _ = ch_moving.put_i16_process(0).await;
                 }
@@ -485,7 +494,11 @@ async fn kohzu_ctl_soft(
             KohzuSoftState::WaitForCommand => {
                 // kohzuCtl_soft.st:628-691
                 let (pv, val) = match connect_events.pop_front() {
-                    Some(event) => event,
+                    Some((pv, val)) => {
+                        // One C flag with the live monitors queued behind it.
+                        monitor.clear(&pv);
+                        (pv, val)
+                    }
                     None => monitor.wait_change().await,
                 };
                 if pv == pv_h || pv == pv_k || pv == pv_l || pv == pv_a {

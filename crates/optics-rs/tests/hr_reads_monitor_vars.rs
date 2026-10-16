@@ -10,10 +10,11 @@ use optics_rs::snl::hr_ctl::{self, HrConfig};
 use std::collections::HashMap;
 use std::time::Duration;
 
+const UR2D: f64 = 180.0 / std::f64::consts::PI / 1e6;
 const HR_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db/hrSeq.db");
 const MOTORS: &str = r#"
-record(motor, "H:p1") { field(HLM, "90") field(LLM, "-10") }
-record(motor, "H:p2") { field(HLM, "90") field(LLM, "-10") }
+record(motor, "H:p1") { field(HLM, "1500000") field(LLM, "10000") }
+record(motor, "H:p2") { field(HLM, "1500000") field(LLM, "10000") }
 "#;
 
 async fn f64_of(server: &CaServer, pv: &str) -> f64 {
@@ -54,10 +55,23 @@ async fn boot() -> CaServer {
             .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
             .unwrap()
             .pos
-            .rbv = 10.0;
+            .rbv = 200_000.0;
     }
     tokio::spawn(hr_ctl::run(HrConfig::new("H:", "1", "p1", "p2"), db));
+    // The boot phiLimits pass: theta1Hi = HLM in degrees.
+    wait_near(&server, "H:HR1_Theta1AO.DRVH", 1.5e6 * UR2D).await;
+    assert_eq!(
+        string_of(&server, "H:HR1_SeqMsg1SI").await,
+        "Motor Soft Limit Changed"
+    );
+    settle().await;
     server
+}
+
+/// Past waitForCmndEnter's 0.1 s, which drops a command put inside it
+/// (hrCtl.st:603-621).
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 /// An E put queued with Mode=Auto already sees auto mode and drives phi1,
@@ -65,12 +79,6 @@ async fn boot() -> CaServer {
 #[tokio::test(flavor = "current_thread")]
 async fn an_e_put_queued_after_auto_mode_moves() {
     let server = boot().await;
-    for _ in 0..200 {
-        if string_of(&server, "H:HR1_SeqMsg1SI").await == "HR Control Ready" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let db = (**server.database()).clone();
     let e = f64_of(&server, "H:HR1_EAO").await;
     let before = f64_of(&server, "H:p1.VAL").await;
@@ -97,4 +105,89 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         f64_of(&server, "H:HR1_phi1SetAO").await,
         f64_of(&server, "H:p1.VAL").await
     );
+}
+
+async fn wait_near(server: &CaServer, pv: &str, want: f64) {
+    for _ in 0..100 {
+        if (f64_of(server, pv).await - want).abs() < 1e-4 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{pv} = {}, want {want}", f64_of(server, pv).await);
+}
+
+/// A motor soft-limit change, UseSet=Set and UseSet=Use each run C's
+/// phiLimits (hrCtl.st:697-703, :765-783): Set zeroes the drive limits,
+/// Use derives them again from the motor HLM/LLM.
+#[tokio::test(flavor = "current_thread")]
+async fn use_set_zeroes_the_drive_limits_and_use_restores_them() {
+    let server = boot().await;
+    let db = (**server.database()).clone();
+    let put = |pv: &'static str, v: EpicsValue| {
+        let db = db.clone();
+        async move {
+            let (rec, field) = pv.split_once('.').unwrap_or((pv, "VAL"));
+            db.put_record_field_from_ca(rec, field, v).await.unwrap();
+        }
+    };
+    // phi1Hi = phi1MotHiLim*uR2D + phi1Off + worldOff*uR2D (hrCtl.st:845).
+    let want = 1e6 * UR2D
+        + f64_of(&server, "H:HR1_phi1OffAO").await
+        + f64_of(&server, "H:HR1_worldOffAO").await * UR2D;
+
+    put("H:p1.HLM", EpicsValue::Double(1e6)).await;
+    wait_near(&server, "H:HR1_Theta1AO.DRVH", want).await;
+    assert_eq!(
+        string_of(&server, "H:HR1_SeqMsg1SI").await,
+        "Motor Soft Limit Changed"
+    );
+    assert_ne!(f64_of(&server, "H:HR1_EAO.DRVH").await, 0.0);
+    settle().await;
+
+    put("H:HR1_UseSetBO", EpicsValue::Enum(1)).await;
+    wait_near(&server, "H:HR1_Theta1AO.DRVH", 0.0).await;
+    wait_near(&server, "H:HR1_EAO.DRVH", 0.0).await;
+    wait_near(&server, "H:HR1_phi1AO.DRVH", 0.0).await;
+    settle().await;
+
+    put("H:HR1_UseSetBO", EpicsValue::Enum(0)).await;
+    wait_near(&server, "H:HR1_Theta1AO.DRVH", want).await;
+}
+
+/// C's E takes the sequencer's own posts: UseSet=Set zeroes EHi before
+/// ELo, aoRecord clamps E to 0, and eChanged reads that 0 (C kohzuIoc
+/// oracle: "Wavelength > 2d spacing of crystal 1.", E back from theta1).
+#[tokio::test(flavor = "current_thread")]
+async fn set_mode_takes_e_as_its_own_limit_put_clamped_it() {
+    let server = boot().await;
+    let db = (**server.database()).clone();
+    // The oracle's limits, which leave ELo negative.
+    for (rec, field, v) in [
+        ("H:p1", "HLM", 90.0),
+        ("H:p1", "LLM", -10.0),
+        ("H:p2", "HLM", 90.0),
+        ("H:p2", "LLM", -10.0),
+    ] {
+        db.put_record_field_from_ca(rec, field, EpicsValue::Double(v))
+            .await
+            .unwrap();
+    }
+    wait_near(&server, "H:HR1_EAO.DRVL", -229.18127).await;
+    settle().await;
+    let e = f64_of(&server, "H:HR1_EAO").await;
+    db.put_record_field_from_ca("H:HR1_UseSetBO", "VAL", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if string_of(&server, "H:HR1_SeqMsg1SI").await == "Wavelength > 2d spacing of crystal 1." {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        string_of(&server, "H:HR1_SeqMsg1SI").await,
+        "Wavelength > 2d spacing of crystal 1."
+    );
+    wait_near(&server, "H:HR1_EAO", e).await;
 }

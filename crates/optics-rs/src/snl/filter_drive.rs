@@ -1,13 +1,17 @@
 //! Automatic filter selection state machine.
 //!
-//! Pure Rust port of `filterDrive.st` — drives a set of beamline filters to
-//! achieve a requested transmission, using Chantler table data from
-//! [`crate::data::chantler`].
+//! Port of `filterDrive.st` — drives a set of beamline filters to achieve a
+//! requested transmission, using Chantler table data from
+//! [`crate::data::chantler`]. The runner walks C's states (`start`, `init`,
+//! `waiting`, `update_filters`, `action`, `change_filters`) in order;
+//! [`FilterDrive`] holds C's program variables and does the arithmetic.
+
+use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 
 use crate::data::chantler::{find_material, transmission};
-use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
+use crate::db_access::{DbChannel, DbMultiMonitor};
 
 /// Maximum number of filters supported.
 pub const MAX_FILTERS: usize = 32;
@@ -18,62 +22,11 @@ pub const MAX_ENABLED: usize = 16;
 /// Threshold for floating-point "same transmission" comparison.
 const SMALL_FRAC: f64 = 1.0e-8;
 
-/// A single filter blade configuration.
-#[derive(Debug, Clone)]
-pub struct FilterBlade {
-    /// Material name (e.g. "Al", "Cu").
-    pub material: String,
-    /// Thickness in micrometres.
-    pub thickness: f64,
-    /// Whether this blade is enabled (participates in calculations).
-    pub enabled: bool,
-    /// Whether this blade is locked in its current position.
-    pub locked: bool,
-    /// Current state: true = inserted in beam, false = removed.
-    pub inserted: bool,
-    /// Per-blade transmission at current energy.
-    pub transmission: f64,
-}
-
-impl Default for FilterBlade {
-    fn default() -> Self {
-        Self {
-            material: "Al".into(),
-            thickness: 0.0,
-            enabled: true,
-            locked: false,
-            inserted: false,
-            transmission: 1.0,
-        }
-    }
-}
-
-/// State of the filter drive state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterDriveState {
-    Init,
-    Idle,
-    UpdateFilters,
-    Action,
-    ChangeFilters,
-}
-
-/// Actions that can be requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterAction {
-    /// Go to the transmission setpoint.
-    SetTransmission,
-    /// Step to next higher transmission.
-    StepUp,
-    /// Step to next lower transmission.
-    StepDown,
-    /// Go to a specific filter mask.
-    SetFilterMask,
-}
-
 /// Configuration for the filter_drive state machine.
 #[derive(Debug, Clone)]
 pub struct FilterDriveConfig {
+    /// The `NAME` macro, which prefixes C's console lines.
+    pub name: String,
     pub prefix: String,
     pub record: String,
     pub num_filters: usize,
@@ -82,6 +35,7 @@ pub struct FilterDriveConfig {
 impl FilterDriveConfig {
     pub fn new(p: &str, r: &str, n: usize) -> Self {
         Self {
+            name: "filterDrive".to_string(),
             prefix: p.to_string(),
             record: r.to_string(),
             num_filters: n,
@@ -94,333 +48,386 @@ impl FilterDriveConfig {
     }
 }
 
-/// One entry in the permutation table: filter mask and total transmission.
-#[derive(Debug, Clone, Copy)]
-pub struct Permutation {
-    /// Bitmask of which filters are inserted.
-    pub mask: u32,
-    /// Total transmission for this combination.
-    pub transmission: f64,
-}
-
-/// Precomputed filter permutation table.
-#[derive(Debug, Clone)]
-pub struct PermutationTable {
-    pub entries: Vec<Permutation>,
-    /// Index of current filter combination.
-    pub current_idx: Option<usize>,
-    /// Index of next-higher transmission.
-    pub up_idx: Option<usize>,
-    /// Index of next-lower transmission.
-    pub down_idx: Option<usize>,
-}
-
-/// Calculate per-blade transmission values.
-pub fn calc_blade_transmissions(blades: &mut [FilterBlade], energy_kev: f64) {
-    for blade in blades.iter_mut() {
-        blade.transmission = calc_single_transmission(&blade.material, energy_kev, blade.thickness);
-    }
-}
-
-/// Calculate transmission for a single blade.
+/// C `calcTrans` (`filterDrive.st:270-310`): transmission of `thickness_um`
+/// of `material` at `energy_kev`, 0 for an unknown material or energy.
 pub fn calc_single_transmission(material: &str, energy_kev: f64, thickness_um: f64) -> f64 {
     match find_material(material) {
-        Some(mat) => {
-            let thickness_cm = thickness_um * 1.0e-4; // um -> cm
-            transmission(mat, energy_kev, thickness_cm).unwrap_or(0.0)
-        }
+        Some(mat) => transmission(mat, energy_kev, thickness_um).unwrap_or(0.0),
         None => 0.0,
     }
 }
 
-/// Build the permutation table for all combinations of unlocked+enabled filters.
-///
-/// Locked+enabled+inserted filters contribute their transmission to every
-/// permutation. Disabled filters are completely ignored.
-pub fn build_permutation_table(blades: &[FilterBlade]) -> PermutationTable {
-    let _n_filters = blades.len();
-
-    // Identify unlocked+enabled filter indices
-    let mut free_indices: Vec<usize> = Vec::new();
-    for (i, b) in blades.iter().enumerate() {
-        if b.enabled && !b.locked {
-            free_indices.push(i);
-        }
-    }
-
-    let n_enabled = free_indices.len().min(MAX_ENABLED);
-    let n_perms = 1_usize << n_enabled;
-
-    // Base transmission from locked+inserted+enabled filters
-    let mut base_trans = 1.0;
-    let mut base_mask: u32 = 0;
-    for (i, b) in blades.iter().enumerate() {
-        if b.enabled && b.locked && b.inserted {
-            base_trans *= b.transmission;
-            base_mask |= 1 << i;
-        }
-    }
-
-    let mut entries = Vec::with_capacity(n_perms);
-
-    for perm in 0..n_perms {
-        let mut trans = base_trans;
-        let mut mask = base_mask;
-
-        for (k, &fi) in free_indices.iter().enumerate().take(n_enabled) {
-            if perm & (1 << k) != 0 {
-                trans *= blades[fi].transmission;
-                mask |= 1 << fi;
-            }
-        }
-
-        entries.push(Permutation {
-            mask,
-            transmission: trans,
-        });
-    }
-
-    PermutationTable {
-        entries,
-        current_idx: None,
-        up_idx: None,
-        down_idx: None,
-    }
+/// One blade's slot in C's `THICK`/`MATER`/`LOCK`/`SET`/`ENBL`/`TRANSM`
+/// arrays.
+#[derive(Debug, Clone, Default)]
+pub struct Blade {
+    pub thick: f64,
+    pub mater: String,
+    pub lock: i32,
+    pub set: i32,
+    pub enbl: i32,
+    pub transm: f64,
 }
 
-/// Find the current filter combination in the permutation table.
-pub fn find_current_index(table: &[Permutation], current_mask: u32) -> Option<usize> {
-    table.iter().position(|p| p.mask == current_mask)
-}
-
-/// Update the "step up" and "step down" indices based on the current transmission.
-pub fn update_step_indices(
-    table: &[Permutation],
-    current_trans: f64,
-) -> (Option<usize>, f64, Option<usize>, f64) {
-    let mut up_idx: Option<usize> = None;
-    let mut trans_up = 10.0;
-
-    let mut down_idx: Option<usize> = None;
-    let mut trans_down = -1.0;
-
-    for (i, p) in table.iter().enumerate() {
-        // Step up: smallest transmission > current
-        if p.transmission > current_trans * (1.0 + SMALL_FRAC) && p.transmission < trans_up {
-            trans_up = p.transmission;
-            up_idx = Some(i);
-        }
-        // Step down: largest transmission < current
-        if p.transmission < current_trans * (1.0 - SMALL_FRAC) && p.transmission > trans_down {
-            trans_down = p.transmission;
-            down_idx = Some(i);
-        }
-    }
-
-    // Clamp if no valid step exists
-    if trans_up > 1.0 {
-        trans_up = current_trans;
-        up_idx = None;
-    }
-    if trans_down < 0.0 {
-        trans_down = current_trans;
-        down_idx = None;
-    }
-
-    (up_idx, trans_up, down_idx, trans_down)
-}
-
-/// Find the best permutation index for a given transmission setpoint.
-///
-/// Selects the highest transmission that is <= the setpoint.
-/// If all are above the setpoint, returns the minimum transmission.
-pub fn find_best_for_setpoint(table: &[Permutation], setpoint: f64) -> Option<usize> {
-    let mut best_idx: Option<usize> = None;
-    let mut best_trans = -1.0;
-    let mut min_idx: Option<usize> = None;
-    let mut min_trans = f64::MAX;
-
-    for (i, p) in table.iter().enumerate() {
-        if p.transmission <= setpoint && p.transmission > best_trans {
-            best_trans = p.transmission;
-            best_idx = Some(i);
-        }
-        if p.transmission < min_trans {
-            min_trans = p.transmission;
-            min_idx = Some(i);
-        }
-    }
-
-    if best_trans < min_trans {
-        min_idx
-    } else {
-        best_idx
-    }
-}
-
-/// Find the permutation index that matches a given filter mask.
-pub fn find_mask_index(table: &[Permutation], mask: u32) -> Option<usize> {
-    table.iter().position(|p| p.mask == mask)
-}
-
-/// Build the current filter mask from blade states.
-pub fn current_mask(blades: &[FilterBlade]) -> u32 {
-    let mut mask: u32 = 0;
-    for (i, b) in blades.iter().enumerate() {
-        if b.inserted && b.enabled {
-            mask |= 1 << i;
-        }
-    }
-    mask
-}
-
-/// Calculate the total transmission for the current blade configuration.
-pub fn current_transmission(blades: &[FilterBlade]) -> f64 {
-    let mut trans = 1.0;
-    for b in blades {
-        if b.inserted && b.enabled {
-            trans *= b.transmission;
-        }
-    }
-    trans
-}
-
-/// Main filter-drive controller.
-#[derive(Debug, Clone)]
-pub struct FilterDriveController {
-    pub state: FilterDriveState,
-    pub blades: Vec<FilterBlade>,
-    pub energy_kev: f64,
+/// The puts `update_filters` makes after its blade sync, in C's order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdatePuts {
     pub transmission: f64,
+    pub filter_mask: i32,
+    /// `ERROR: Too many unlocked`, put between the mask and the step values.
+    pub too_many: Option<String>,
     pub transmission_up: f64,
     pub transmission_down: f64,
-    pub filter_mask: u32,
-    pub perm_table: PermutationTable,
-    pub busy: bool,
-    pub message: String,
+    /// `STATUS_BUSY = 0`, put only when `changeFlag` was set.
+    pub clear_busy: bool,
 }
 
-impl FilterDriveController {
-    pub fn new(num_filters: usize) -> Self {
+/// C's program variables that outlive one state (`filterDrive.st:194-229`).
+/// SNL zeroes them at start, and the indices keep their last value across
+/// states as C's do.
+#[derive(Debug, Clone)]
+pub struct FilterDrive {
+    pub change_flag: bool,
+    pub msge: String,
+    pub n_perms: usize,
+    pub ind: i32,
+    pub ind_now: i32,
+    pub ind_up: i32,
+    pub ind_down: i32,
+    pub ind_min: i32,
+    pub trans_now: f64,
+    pub trans_up: f64,
+    pub trans_down: f64,
+    /// `transMis`/`fltrsIn`: only the first `n_perms` are rewritten, so an
+    /// index left from a larger table reads what that table wrote, as in C.
+    pub trans_mis: Vec<f64>,
+    pub fltrs_in: Vec<i32>,
+}
+
+impl Default for FilterDrive {
+    fn default() -> Self {
         Self {
-            state: FilterDriveState::Init,
-            blades: vec![FilterBlade::default(); num_filters],
-            energy_kev: 10.0,
-            transmission: 1.0,
-            transmission_up: 1.0,
-            transmission_down: 1.0,
-            filter_mask: 0,
-            perm_table: PermutationTable {
-                entries: Vec::new(),
-                current_idx: None,
-                up_idx: None,
-                down_idx: None,
-            },
-            busy: false,
-            message: String::new(),
+            change_flag: false,
+            msge: String::new(),
+            n_perms: 0,
+            ind: 0,
+            ind_now: 0,
+            ind_up: 0,
+            ind_down: 0,
+            ind_min: 0,
+            trans_now: 0.0,
+            trans_up: 0.0,
+            trans_down: 0.0,
+            trans_mis: Vec::new(),
+            fltrs_in: Vec::new(),
         }
     }
+}
 
-    /// Recalculate all blade transmissions and rebuild the permutation table.
-    pub fn recalculate(&mut self) {
-        calc_blade_transmissions(&mut self.blades, self.energy_kev);
-        self.perm_table = build_permutation_table(&self.blades);
-
-        self.filter_mask = current_mask(&self.blades);
-        self.transmission = current_transmission(&self.blades);
-
-        self.perm_table.current_idx =
-            find_current_index(&self.perm_table.entries, self.filter_mask);
-
-        let (up, tu, down, td) = update_step_indices(&self.perm_table.entries, self.transmission);
-        self.perm_table.up_idx = up;
-        self.transmission_up = tu;
-        self.perm_table.down_idx = down;
-        self.transmission_down = td;
+impl FilterDrive {
+    fn trans_at(&self, i: i32) -> f64 {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| self.trans_mis.get(i).copied())
+            .unwrap_or(0.0)
     }
 
-    /// Apply a target permutation index: set blade inserted states.
-    /// Returns the list of (blade_index, inserted) pairs that changed.
-    pub fn apply_permutation(&mut self, perm_idx: usize) -> Vec<(usize, bool)> {
-        let mask = self.perm_table.entries[perm_idx].mask;
-        let mut changes = Vec::new();
-        for (i, b) in self.blades.iter_mut().enumerate() {
-            if b.enabled {
-                let should_insert = mask & (1 << i) != 0;
-                if b.inserted != should_insert {
-                    b.inserted = should_insert;
-                    changes.push((i, should_insert));
+    /// The filter pattern `ind` names, or `None` for C's `ind < 0`.
+    pub fn pattern(&self) -> Option<i32> {
+        let i = usize::try_from(self.ind).ok()?;
+        Some(self.fltrs_in.get(i).copied().unwrap_or(0))
+    }
+
+    /// `update_filters` after the blade sync (`filterDrive.st:487-640`):
+    /// blade transmissions at `energy`, the current transmission and mask, the
+    /// permutation table, and the step up/down neighbours.
+    pub fn update(&mut self, blades: &mut [Blade], energy: f64) -> UpdatePuts {
+        for b in blades.iter_mut() {
+            b.transm = calc_single_transmission(&b.mater, energy, b.thick);
+        }
+        self.tabulate(blades)
+    }
+
+    /// [`Self::update`] from the blades' `transm` as they stand.
+    pub fn tabulate(&mut self, blades: &[Blade]) -> UpdatePuts {
+        self.trans_now = 1.0;
+        let mut fltrs_in_now = 0i32;
+        let mut n_enabled = 0usize;
+        for (i, b) in blades.iter().enumerate() {
+            if b.set != 0 && b.enbl != 0 {
+                fltrs_in_now |= 1 << i;
+                self.trans_now *= b.transm;
+            }
+            if b.lock == 0 && b.enbl != 0 {
+                n_enabled += 1;
+            }
+        }
+        let too_many = (n_enabled > MAX_ENABLED)
+            .then(|| format!("ERROR: Too many unlocked ({n_enabled}/{MAX_ENABLED})"));
+
+        // C sizes its arrays for MAX_ENABLED and overruns them past it.
+        self.n_perms = 1 << n_enabled.min(MAX_ENABLED);
+        if self.trans_mis.len() < self.n_perms {
+            self.trans_mis.resize(self.n_perms, 0.0);
+            self.fltrs_in.resize(self.n_perms, 0);
+        }
+        for i in 0..self.n_perms {
+            let mut t = 1.0;
+            let mut m = 0i32;
+            let mut k = 0;
+            for (j, b) in blades.iter().enumerate() {
+                if b.enbl == 0 {
+                    continue;
+                }
+                if b.lock == 1 {
+                    if b.set != 0 {
+                        t *= b.transm;
+                        m |= 1 << j;
+                    }
+                } else {
+                    if i & (1 << k) != 0 {
+                        t *= b.transm;
+                        m |= 1 << j;
+                    }
+                    k += 1;
                 }
             }
+            self.trans_mis[i] = t;
+            self.fltrs_in[i] = m;
         }
-        changes
+
+        // The last pattern whose product equals the current one: both multiply
+        // the same blades in the same order, so equality is exact.
+        self.ind_now = -1;
+        for ind in 0..self.n_perms {
+            if self.trans_mis[ind] == self.trans_now {
+                self.ind_now = ind as i32;
+            }
+        }
+        if self.ind_now < 0 {
+            println!("ERROR: Could not find current filter index");
+        }
+
+        self.ind_up = -1;
+        self.trans_up = 10.0;
+        for ind in 0..self.n_perms {
+            let t = self.trans_mis[ind];
+            if t > self.trans_now * (1.0 + SMALL_FRAC) && t < self.trans_up {
+                self.trans_up = t;
+                self.ind_up = ind as i32;
+            }
+        }
+        if self.trans_up > 1.0 {
+            self.trans_up = self.trans_now;
+            self.ind_up = self.ind_now;
+        }
+
+        self.ind_down = -1;
+        self.trans_down = -1.0;
+        for ind in 0..self.n_perms {
+            let t = self.trans_mis[ind];
+            if t < self.trans_now * (1.0 - SMALL_FRAC) && t > self.trans_down {
+                self.trans_down = t;
+                self.ind_down = ind as i32;
+            }
+        }
+        if self.trans_down < 0.0 {
+            self.trans_down = self.trans_now;
+            self.ind_down = self.ind_now;
+        }
+        // The `for (ind = 0; ind < nPerms; ...)` loops leave it here.
+        self.ind = self.n_perms as i32;
+
+        let clear_busy = std::mem::take(&mut self.change_flag);
+        UpdatePuts {
+            transmission: self.trans_now,
+            filter_mask: fltrs_in_now,
+            too_many,
+            transmission_up: self.trans_up,
+            transmission_down: self.trans_down,
+            clear_busy,
+        }
     }
 
-    /// Execute a filter action: returns blade changes to apply.
-    pub fn execute_action(
+    /// `action`'s choice of `ind` for `my_action` (`filterDrive.st:663-760`),
+    /// leaving in `msge` the message C puts for it. `name` prefixes the one
+    /// unconditional console line.
+    pub fn action(
         &mut self,
-        action: FilterAction,
-        setpoint: f64,
-        mask_setpoint: u32,
-    ) -> Vec<(usize, bool)> {
-        let target_idx = match action {
-            FilterAction::SetTransmission => {
-                find_best_for_setpoint(&self.perm_table.entries, setpoint)
-            }
-            FilterAction::StepUp => self.perm_table.up_idx,
-            FilterAction::StepDown => self.perm_table.down_idx,
-            FilterAction::SetFilterMask => {
-                // Adjust mask for locked filters
-                let mut adjusted = 0u32;
-                for (i, b) in self.blades.iter().enumerate() {
-                    if b.enabled {
-                        if b.locked {
-                            if b.inserted {
-                                adjusted |= 1 << i;
-                            }
-                        } else {
-                            adjusted |= mask_setpoint & (1 << i);
-                        }
+        my_action: i32,
+        blades: &[Blade],
+        transm_setpt: f64,
+        filtermask_setpt: i32,
+        name: &str,
+    ) {
+        self.msge = match my_action {
+            0 => {
+                let mut trans = -1.0;
+                let mut trans_min = 1.0;
+                for k in 0..self.n_perms {
+                    let t = self.trans_mis[k];
+                    if t <= transm_setpt && t > trans {
+                        self.ind = k as i32;
+                        trans = t;
+                    }
+                    if t < trans_min {
+                        trans_min = t;
+                        self.ind_min = k as i32;
                     }
                 }
-                find_mask_index(&self.perm_table.entries, adjusted)
-            }
-        };
-
-        match target_idx {
-            Some(idx) => {
-                let trans = self.perm_table.entries[idx].transmission;
-                if (trans - self.transmission).abs() < SMALL_FRAC {
-                    self.message = "OK - No change".into();
-                    Vec::new()
+                if trans < trans_min {
+                    self.ind = self.ind_min;
+                }
+                if self.trans_at(self.ind) == self.trans_now {
+                    "OK - No change".into()
                 } else {
-                    self.message = "OK".into();
-                    self.apply_permutation(idx)
+                    "OK".into()
                 }
             }
-            None => {
-                self.message = match action {
-                    FilterAction::StepUp => "NO CHANGE! Step unavailable.".into(),
-                    FilterAction::StepDown => "NO CHANGE! Step unavailable.".into(),
-                    FilterAction::SetFilterMask => "ERROR! Filter Mask not found.".into(),
-                    _ => "No matching filter combination found.".into(),
-                };
-                Vec::new()
+            1 => {
+                self.ind = self.ind_up;
+                if self.trans_up == self.trans_now {
+                    "NO CHANGE! Step unavailable.".into()
+                } else {
+                    "OK".into()
+                }
             }
+            2 => {
+                self.ind = self.ind_down;
+                if self.trans_down == self.trans_now {
+                    "NO CHANGE! Step unavailable.".into()
+                } else {
+                    "OK".into()
+                }
+            }
+            _ => {
+                let n = blades.len() as u32;
+                let max_mask = 1i64.checked_shl(n).map_or(i64::MAX, |m| m - 1);
+                if filtermask_setpt < 0 || i64::from(filtermask_setpt) > max_mask {
+                    self.ind = self.ind_now;
+                    "ERROR! Invalid mask.".into()
+                } else {
+                    let mut fltrs_req = 0i32;
+                    for (j, b) in blades.iter().enumerate() {
+                        if b.enbl == 0 {
+                            continue;
+                        }
+                        if b.lock == 1 {
+                            if b.set != 0 {
+                                fltrs_req |= 1 << j;
+                            }
+                        } else {
+                            fltrs_req |= (1 << j) & filtermask_setpt;
+                        }
+                    }
+                    self.ind = -1;
+                    for i in 0..self.n_perms {
+                        if self.fltrs_in[i] == fltrs_req {
+                            self.ind = i as i32;
+                        }
+                    }
+                    if self.ind < 0 {
+                        println!("{name}: Cannot find the requested filter pattern!");
+                        "ERROR! Filter Mask not found.".into()
+                    } else {
+                        "OK".into()
+                    }
+                }
+            }
+        };
+    }
+}
+
+/// The 16 `mbbo` state-string fields, which C's `string MATER` monitor reads
+/// as the `DBR_STRING` form of `Material`.
+pub(super) const MBBO_STATE_FIELDS: [&str; 16] = [
+    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST", "ELST",
+    "TVST", "TTST", "FTST", "FFST",
+];
+
+/// One channel per blade field the program assigns.
+struct BladeChannels {
+    thick: DbChannel,
+    mater: String,
+    transm: DbChannel,
+    lock: DbChannel,
+    set: DbChannel,
+    enbl: DbChannel,
+    outget: DbChannel,
+}
+
+impl BladeChannels {
+    async fn read(&self, db: &PvDatabase) -> Blade {
+        Blade {
+            thick: self.thick.get_f64().await,
+            mater: mbbo_string(db, &self.mater).await,
+            lock: self.lock.get_i32().await,
+            set: self.set.get_i32().await,
+            enbl: self.enbl.get_i32().await,
+            transm: 0.0,
         }
     }
 }
 
-/// Events that drive the filter state machine.
-#[derive(Debug, Clone)]
-pub enum FilterDriveEvent {
-    EnergyChanged(f64),
-    ConfigChanged,
-    TransmissionSetpoint(f64),
-    StepUp,
-    StepDown,
-    FilterMaskSetpoint(u32),
-    ExternalIO,
+async fn mbbo_string(db: &PvDatabase, record: &str) -> String {
+    let idx = DbChannel::new(db, record).get_i32().await;
+    match usize::try_from(idx)
+        .ok()
+        .and_then(|i| MBBO_STATE_FIELDS.get(i))
+    {
+        Some(field) => {
+            DbChannel::new(db, &format!("{record}.{field}"))
+                .get_string()
+                .await
+        }
+        None => "Illegal Value".into(),
+    }
+}
+
+/// C's event flags (`filterDrive.st:107-189`): one per `sync`, raised by any
+/// monitor of the variables synced to it.
+#[derive(Debug, Default)]
+struct Flags {
+    new_energy: bool,
+    need_recalc: bool,
+    transm_setpt: bool,
+    filtermask_setpt: bool,
+    external_io: bool,
+}
+
+struct Names {
+    energy: String,
+    setpt: String,
+    mask_setpt: String,
+    recalc: Vec<String>,
+    outget: Vec<String>,
+}
+
+impl Names {
+    fn raise(&self, flags: &mut Flags, pv: &str) {
+        if pv == self.energy {
+            flags.new_energy = true;
+        } else if pv == self.setpt {
+            flags.transm_setpt = true;
+        } else if pv == self.mask_setpt {
+            flags.filtermask_setpt = true;
+        } else if self.recalc.iter().any(|n| n == pv) {
+            flags.need_recalc = true;
+        } else if self.outget.iter().any(|n| n == pv) {
+            flags.external_io = true;
+        }
+    }
+}
+
+/// Take every monitor already queued, raising the flags it is synced to.
+async fn poll(monitor: &mut DbMultiMonitor, names: &Names, flags: &mut Flags) {
+    while let Ok((pv, _)) = tokio::time::timeout(Duration::ZERO, monitor.wait_change()).await {
+        names.raise(flags, &pv);
+    }
+}
+
+fn sleep_secs(secs: f64) -> tokio::time::Sleep {
+    tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(secs))
 }
 
 /// Async entry point — runs the filter_drive state machine against live PVs.
@@ -428,258 +435,201 @@ pub async fn run(
     config: FilterDriveConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!(
-        "filterDrive: starting for prefix={}{}",
-        config.prefix, config.record
-    );
-
-    let my_origin = alloc_origin();
+    let name = config.name.as_str();
     let pr = format!("{}{}", config.prefix, config.record);
     let n = config.num_filters;
+    let ch = |leaf: &str| DbChannel::new(&db, &format!("{pr}{leaf}"));
 
-    // Connect global PVs
-    let ch_status = DbChannel::with_origin(&db, &format!("{pr}Status"), my_origin);
-    let ch_trans = DbChannel::with_origin(&db, &format!("{pr}Transmission"), my_origin);
-    let ch_trans_up = DbChannel::with_origin(&db, &format!("{pr}TransmissionUp"), my_origin);
-    let ch_trans_down = DbChannel::with_origin(&db, &format!("{pr}TransmissionDown"), my_origin);
-    let ch_mask = DbChannel::with_origin(&db, &format!("{pr}FilterMask"), my_origin);
-    let ch_energy = DbChannel::with_origin(&db, &format!("{pr}Energy"), my_origin);
-    let ch_msg = DbChannel::with_origin(&db, &format!("{pr}Message"), my_origin);
-    let _ch_setpt = DbChannel::with_origin(&db, &format!("{pr}TransmissionSetpoint"), my_origin);
-    let ch_step_up = DbChannel::with_origin(&db, &format!("{pr}TransmissionStepUp"), my_origin);
-    let ch_step_down = DbChannel::with_origin(&db, &format!("{pr}TransmissionStepDown"), my_origin);
-    let _ch_mask_setpt = DbChannel::with_origin(&db, &format!("{pr}FilterMaskSetpoint"), my_origin);
-    let ch_wait_time = DbChannel::with_origin(&db, &format!("{pr}WaitTime"), my_origin);
+    let ch_status = ch("Status");
+    let ch_nfilters = ch("NumFilters");
+    let ch_debug = ch("Debug");
+    let ch_trans = ch("Transmission");
+    let ch_trans_up = ch("TransmissionUp");
+    let ch_trans_down = ch("TransmissionDown");
+    let ch_mask = ch("FilterMask");
+    let ch_setpt = ch("TransmissionSetpoint");
+    let ch_mask_setpt = ch("FilterMaskSetpoint");
+    let ch_step_up = ch("TransmissionStepUp");
+    let ch_step_down = ch("TransmissionStepDown");
+    let ch_energy = ch("Energy");
+    let ch_msg = ch("Message");
+    let ch_wait_time = ch("WaitTime");
 
-    // Per-blade channels
-    let mut ch_thick: Vec<DbChannel> = Vec::new();
-    let mut ch_mater: Vec<DbChannel> = Vec::new();
-    let mut ch_blade_trans: Vec<DbChannel> = Vec::new();
-    let mut ch_set: Vec<DbChannel> = Vec::new();
-    let mut ch_outget: Vec<DbChannel> = Vec::new();
-    let mut ch_lock: Vec<DbChannel> = Vec::new();
-    let mut ch_enbl: Vec<DbChannel> = Vec::new();
-
-    for i in 1..=n {
-        ch_thick.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Thickness"),
-            my_origin,
-        ));
-        ch_mater.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Material"),
-            my_origin,
-        ));
-        ch_blade_trans.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Transmission"),
-            my_origin,
-        ));
-        ch_set.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Set"),
-            my_origin,
-        ));
-        ch_outget.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "OutGet"),
-            my_origin,
-        ));
-        ch_lock.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Lock"),
-            my_origin,
-        ));
-        ch_enbl.push(DbChannel::with_origin(
-            &db,
-            &config.blade_pv(i, "Enable"),
-            my_origin,
-        ));
-    }
-
-    // Build multi-monitor
-    let monitored_pvs: Vec<String> = vec![
-        format!("{pr}Energy"),
-        format!("{pr}TransmissionSetpoint"),
+    // `start` (`filterDrive.st:327-372`).
+    let mut prog = FilterDrive {
+        change_flag: true,
+        ..Default::default()
+    };
+    sleep_secs(1.0).await;
+    let blades_ch: Vec<BladeChannels> = (1..=n)
+        .map(|i| BladeChannels {
+            thick: DbChannel::new(&db, &config.blade_pv(i, "Thickness")),
+            mater: config.blade_pv(i, "Material"),
+            transm: DbChannel::new(&db, &config.blade_pv(i, "Transmission")),
+            lock: DbChannel::new(&db, &config.blade_pv(i, "Lock")),
+            set: DbChannel::new(&db, &config.blade_pv(i, "Set")),
+            enbl: DbChannel::new(&db, &config.blade_pv(i, "Enable")),
+            outget: DbChannel::new(&db, &config.blade_pv(i, "OutGet")),
+        })
+        .collect();
+    let names = Names {
+        energy: format!("{pr}Energy"),
+        setpt: format!("{pr}TransmissionSetpoint"),
+        mask_setpt: format!("{pr}FilterMaskSetpoint"),
+        recalc: (1..=n)
+            .flat_map(|i| {
+                ["Thickness", "Material", "Lock", "Enable"].map(|f| config.blade_pv(i, f))
+            })
+            .collect(),
+        outget: (1..=n).map(|i| config.blade_pv(i, "OutGet")).collect(),
+    };
+    // Every monitored variable wakes the `waiting` clauses; the synced ones
+    // also raise their flag.
+    let mut monitored = vec![
+        format!("{pr}Status"),
+        format!("{pr}Debug"),
+        names.energy.clone(),
+        names.setpt.clone(),
+        names.mask_setpt.clone(),
         format!("{pr}TransmissionStepUp"),
         format!("{pr}TransmissionStepDown"),
-        format!("{pr}FilterMaskSetpoint"),
     ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-
-    // Initialize
-    let mut ctrl = FilterDriveController::new(n);
-    ctrl.energy_kev = {
-        let v = ch_energy.get_f64().await;
-        if v > 0.0 { v } else { 10.0 }
+    monitored.extend(names.recalc.iter().cloned());
+    monitored.extend(names.outget.iter().cloned());
+    monitored.extend((1..=n).map(|i| config.blade_pv(i, "Set")));
+    let mut monitor = DbMultiMonitor::new(&db, &monitored).await;
+    // The first monitor of each synced variable raises its flag at connect.
+    let mut flags = Flags {
+        new_energy: true,
+        need_recalc: true,
+        transm_setpt: true,
+        filtermask_setpt: true,
+        external_io: true,
     };
+    let _ = ch_nfilters.put_i32_process(n as i32).await;
+    println!("{name}: SNL program started for {pr}");
+    println!("{name}:   # of filters = {n}");
+    sleep_secs(1.0).await;
 
-    // Read initial blade configuration
-    for i in 0..n {
-        ctrl.blades[i].thickness = ch_thick[i].get_f64().await;
-        let mat = ch_mater[i].get_string().await;
-        ctrl.blades[i].material = if mat.is_empty() { "Al".into() } else { mat };
-        ctrl.blades[i].locked = ch_lock[i].get_i16().await as i32 != 0;
-        ctrl.blades[i].enabled = ch_enbl[i].get_i16().await as i32 != 0;
-        ctrl.blades[i].inserted = ch_outget[i].get_i16().await as i32 != 0;
-    }
-
-    ctrl.recalculate();
-
-    // Publish initial values
-    let _ = ch_trans.put_f64_process(ctrl.transmission).await;
-    let _ = ch_trans_up.put_f64_process(ctrl.transmission_up).await;
-    let _ = ch_trans_down.put_f64_process(ctrl.transmission_down).await;
-    let _ = ch_mask
-        .put_i16_process(ctrl.filter_mask as i32 as i16)
-        .await;
-    for (ch_bt, blade) in ch_blade_trans.iter().zip(ctrl.blades.iter()).take(n) {
-        let _ = ch_bt.put_f64_process(blade.transmission).await;
-    }
-    let _ = ch_msg.put_string_process("Initialised").await;
-    let _ = ch_status.put_i16_process(0_i16).await;
-
-    tracing::info!("filter_drive state machine running for {pr}");
-
-    let pv_energy = format!("{pr}Energy");
-    let pv_setpt = format!("{pr}TransmissionSetpoint");
-    let pv_step_up = format!("{pr}TransmissionStepUp");
-    let pv_step_down = format!("{pr}TransmissionStepDown");
-    let pv_mask_setpt = format!("{pr}FilterMaskSetpoint");
+    // `init` (`filterDrive.st:377-389`).
+    sleep_secs(2.0).await;
+    let _ = ch_msg.put_string_process("Initialising ...").await;
+    prog.msge.clear();
+    poll(&mut monitor, &names, &mut flags).await;
+    flags.transm_setpt = false;
+    let _ = ch_step_up.put_i32_process(0).await;
+    let _ = ch_step_down.put_i32_process(0).await;
+    flags.need_recalc = true;
 
     loop {
-        let (changed_pv, new_val) = monitor.wait_change().await;
-
-        let event: Option<FilterDriveEvent> = if changed_pv == pv_energy {
-            Some(FilterDriveEvent::EnergyChanged(new_val))
-        } else if changed_pv == pv_setpt {
-            Some(FilterDriveEvent::TransmissionSetpoint(new_val))
-        } else if changed_pv == pv_step_up {
-            if new_val as i32 != 0 {
-                Some(FilterDriveEvent::StepUp)
-            } else {
-                None
+        // `waiting` (`filterDrive.st:396-450`): the first true clause wins.
+        let my_action = loop {
+            poll(&mut monitor, &names, &mut flags).await;
+            if std::mem::take(&mut flags.new_energy) || std::mem::take(&mut flags.need_recalc) {
+                break None;
             }
-        } else if changed_pv == pv_step_down {
-            if new_val as i32 != 0 {
-                Some(FilterDriveEvent::StepDown)
-            } else {
-                None
+            if std::mem::take(&mut flags.transm_setpt) {
+                break Some(0);
             }
-        } else if changed_pv == pv_mask_setpt {
-            Some(FilterDriveEvent::FilterMaskSetpoint(new_val as u32))
-        } else {
-            None
+            if ch_step_up.get_i32().await != 0 {
+                let _ = ch_step_up.put_i32_process(0).await;
+                break Some(1);
+            }
+            if ch_step_down.get_i32().await != 0 {
+                let _ = ch_step_down.put_i32_process(0).await;
+                break Some(2);
+            }
+            if std::mem::take(&mut flags.filtermask_setpt) {
+                break Some(3);
+            }
+            if ch_status.get_i32().await != 0 {
+                prog.change_flag = true;
+                break None;
+            }
+            if std::mem::take(&mut flags.external_io) {
+                break None;
+            }
+            let (pv, _) = monitor.wait_change().await;
+            names.raise(&mut flags, &pv);
         };
 
-        if let Some(ev) = event {
-            match ev {
-                FilterDriveEvent::EnergyChanged(e) => {
-                    ctrl.energy_kev = e;
-                    ctrl.recalculate();
+        let Some(my_action) = my_action else {
+            // `update_filters` (`filterDrive.st:454-640`).
+            let _ = ch_msg.put_string_process(&prog.msge).await;
+            prog.msge = "OK".into();
+            let mut blades = Vec::with_capacity(n);
+            for b in &blades_ch {
+                let outget = b.outget.get_f64().await as i32;
+                poll(&mut monitor, &names, &mut flags).await;
+                flags.external_io = false;
+                let mut blade = b.read(&db).await;
+                if blade.set != outget {
+                    // Only on a difference: the put processes Set, whose busy
+                    // link would bring the program straight back here.
+                    blade.set = outget;
+                    let _ = b.set.put_i32_process(outget).await;
+                    prog.msge = "Filter state set by external agent.".into();
+                    let _ = ch_msg.put_string_process(&prog.msge).await;
                 }
-
-                FilterDriveEvent::ConfigChanged | FilterDriveEvent::ExternalIO => {
-                    // Re-read blade states
-                    for (blade, ch_og) in ctrl.blades.iter_mut().zip(ch_outget.iter()).take(n) {
-                        blade.inserted = ch_og.get_i16().await as i32 != 0;
-                    }
-                    ctrl.recalculate();
-                }
-
-                FilterDriveEvent::TransmissionSetpoint(setpt) => {
-                    let _ = ch_status.put_i16_process(1_i16).await;
-                    let changes = ctrl.execute_action(FilterAction::SetTransmission, setpt, 0);
-                    let wait_time = {
-                        let v = ch_wait_time.get_f64().await;
-                        if v > 0.0 { v } else { 0.5 }
-                    };
-                    apply_filter_changes(&ch_set, &changes, wait_time).await;
-                    ctrl.recalculate();
-                    let _ = ch_status.put_i16_process(0_i16).await;
-                }
-
-                FilterDriveEvent::StepUp => {
-                    let _ = ch_step_up.put_i16_process(0_i16).await;
-                    let _ = ch_status.put_i16_process(1_i16).await;
-                    let changes = ctrl.execute_action(FilterAction::StepUp, 0.0, 0);
-                    let wait_time = {
-                        let v = ch_wait_time.get_f64().await;
-                        if v > 0.0 { v } else { 0.5 }
-                    };
-                    apply_filter_changes(&ch_set, &changes, wait_time).await;
-                    ctrl.recalculate();
-                    let _ = ch_status.put_i16_process(0_i16).await;
-                }
-
-                FilterDriveEvent::StepDown => {
-                    let _ = ch_step_down.put_i16_process(0_i16).await;
-                    let _ = ch_status.put_i16_process(1_i16).await;
-                    let changes = ctrl.execute_action(FilterAction::StepDown, 0.0, 0);
-                    let wait_time = {
-                        let v = ch_wait_time.get_f64().await;
-                        if v > 0.0 { v } else { 0.5 }
-                    };
-                    apply_filter_changes(&ch_set, &changes, wait_time).await;
-                    ctrl.recalculate();
-                    let _ = ch_status.put_i16_process(0_i16).await;
-                }
-
-                FilterDriveEvent::FilterMaskSetpoint(mask) => {
-                    let _ = ch_status.put_i16_process(1_i16).await;
-                    let changes = ctrl.execute_action(FilterAction::SetFilterMask, 0.0, mask);
-                    let wait_time = {
-                        let v = ch_wait_time.get_f64().await;
-                        if v > 0.0 { v } else { 0.5 }
-                    };
-                    apply_filter_changes(&ch_set, &changes, wait_time).await;
-                    ctrl.recalculate();
-                    let _ = ch_status.put_i16_process(0_i16).await;
-                }
+                blades.push(blade);
             }
+            let energy = ch_energy.get_f64().await;
+            let puts = prog.update(&mut blades, energy);
+            for (b, blade) in blades_ch.iter().zip(&blades) {
+                let _ = b.transm.put_f64_process(blade.transm).await;
+            }
+            let _ = ch_trans.put_f64_process(puts.transmission).await;
+            let _ = ch_mask.put_f64_process(f64::from(puts.filter_mask)).await;
+            if let Some(msg) = puts.too_many {
+                prog.msge = msg;
+                let _ = ch_msg.put_string_process(&prog.msge).await;
+            }
+            let _ = ch_trans_up.put_f64_process(puts.transmission_up).await;
+            let _ = ch_trans_down.put_f64_process(puts.transmission_down).await;
+            if puts.clear_busy {
+                let _ = ch_status.put_i32_process(0).await;
+            }
+            continue;
+        };
 
-            // Publish updated values
-            let _ = ch_trans.put_f64_process(ctrl.transmission).await;
-            let _ = ch_trans_up.put_f64_process(ctrl.transmission_up).await;
-            let _ = ch_trans_down.put_f64_process(ctrl.transmission_down).await;
-            let _ = ch_mask
-                .put_i16_process(ctrl.filter_mask as i32 as i16)
+        // `action` (`filterDrive.st:645-765`).
+        let _ = ch_msg.put_string_process("").await;
+        prog.change_flag = true;
+        if ch_debug.get_i32().await & 0x1 != 0 {
+            let _ = ch_msg
+                .put_string_process(&format!("Action = {my_action}"))
                 .await;
-            let _ = ch_msg.put_string_process(ctrl.message.as_str()).await;
-            for (ch_bt, blade) in ch_blade_trans.iter().zip(ctrl.blades.iter()).take(n) {
-                let _ = ch_bt.put_f64_process(blade.transmission).await;
+            println!("Action = {my_action}");
+        }
+        let mut blades = Vec::with_capacity(n);
+        for b in &blades_ch {
+            blades.push(b.read(&db).await);
+        }
+        let setpt = ch_setpt.get_f64().await;
+        let mask_setpt = ch_mask_setpt.get_f64().await as i32;
+        prog.action(my_action, &blades, setpt, mask_setpt, name);
+        let _ = ch_msg.put_string_process(&prog.msge).await;
+        let _ = ch_step_up.put_i32_process(0).await;
+        let _ = ch_step_down.put_i32_process(0).await;
+
+        // `change_filters` (`filterDrive.st:770-815`): put in, wait, take out.
+        if let Some(pattern) = prog.pattern() {
+            for wanted in [1, 0] {
+                let mut do_wait = false;
+                for (j, b) in blades_ch.iter().enumerate() {
+                    if b.enbl.get_i32().await == 0 || (pattern >> j & 1) != wanted {
+                        continue;
+                    }
+                    if b.set.get_i32().await != wanted {
+                        do_wait = true;
+                    }
+                    let _ = b.set.put_i32_process(wanted).await;
+                }
+                if do_wait {
+                    sleep_secs(ch_wait_time.get_f64().await).await;
+                }
             }
         }
-    }
-}
-
-/// Apply filter blade changes: first insert, wait, then remove.
-async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], wait_time: f64) {
-    use tokio::time::sleep;
-
-    // Phase 1: insert filters
-    let mut any_insert = false;
-    for &(idx, inserted) in changes {
-        if inserted {
-            let _ = ch_set[idx].put_i16_process(1).await;
-            any_insert = true;
-        }
-    }
-    if any_insert {
-        sleep(epics_base_rs::runtime::time::duration_from_secs(wait_time)).await;
-    }
-
-    // Phase 2: remove filters
-    let mut any_remove = false;
-    for &(idx, inserted) in changes {
-        if !inserted {
-            let _ = ch_set[idx].put_i16_process(0).await;
-            any_remove = true;
-        }
-    }
-    if any_remove {
-        sleep(epics_base_rs::runtime::time::duration_from_secs(wait_time)).await;
     }
 }
 
@@ -687,276 +637,100 @@ async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], w
 mod tests {
     use super::*;
 
+    fn blade(transm: f64, set: i32, lock: i32, enbl: i32) -> Blade {
+        Blade {
+            set,
+            lock,
+            enbl,
+            transm,
+            ..Default::default()
+        }
+    }
+
+    fn al(set: i32, lock: i32, enbl: i32) -> Blade {
+        Blade {
+            mater: "Al".into(),
+            thick: 100.0,
+            ..blade(0.0, set, lock, enbl)
+        }
+    }
+
     #[test]
     fn test_calc_single_transmission_al() {
         let t = calc_single_transmission("Al", 10.0, 100.0);
-        // 100 um Al at 10 keV should have high transmission
         assert!(t > 0.0 && t < 1.0, "Al transmission at 10keV = {t}");
     }
 
     #[test]
     fn test_calc_single_transmission_unknown() {
-        let t = calc_single_transmission("Unobtainium", 10.0, 100.0);
-        assert_eq!(t, 0.0);
+        assert_eq!(calc_single_transmission("Unobtainium", 10.0, 100.0), 0.0);
     }
 
+    /// No enabled blade leaves one pattern, all out, and the step values
+    /// fall back to the current transmission.
     #[test]
-    fn test_build_permutation_table_no_filters() {
-        let blades: Vec<FilterBlade> = Vec::new();
-        let table = build_permutation_table(&blades);
-        assert_eq!(table.entries.len(), 1); // Only the "all out" permutation
-        assert!((table.entries[0].transmission - 1.0).abs() < 1e-10);
+    fn no_enabled_blade_is_one_pattern() {
+        let mut prog = FilterDrive::default();
+        let puts = prog.update(&mut [al(1, 0, 0)], 10.0);
+        assert_eq!(prog.n_perms, 1);
+        assert_eq!(prog.trans_mis[0], 1.0);
+        assert_eq!((puts.transmission_up, puts.transmission_down), (1.0, 1.0));
+        assert_eq!(prog.ind_now, 0);
     }
 
+    /// A locked inserted blade is in every pattern; a disabled one in none.
     #[test]
-    fn test_build_permutation_table_two_filters() {
-        let blades = vec![
-            FilterBlade {
-                material: "Al".into(),
-                thickness: 100.0,
-                enabled: true,
-                locked: false,
-                inserted: false,
-                transmission: 0.5,
-            },
-            FilterBlade {
-                material: "Cu".into(),
-                thickness: 50.0,
-                enabled: true,
-                locked: false,
-                inserted: false,
-                transmission: 0.3,
-            },
-        ];
-
-        let table = build_permutation_table(&blades);
-        assert_eq!(table.entries.len(), 4); // 2^2 = 4 combinations
-
-        // Check that mask=0 gives transmission=1.0
-        let none = table.entries.iter().find(|p| p.mask == 0).unwrap();
-        assert!((none.transmission - 1.0).abs() < 1e-10);
-
-        // Check that mask=3 gives transmission=0.5*0.3=0.15
-        let both = table.entries.iter().find(|p| p.mask == 3).unwrap();
-        assert!((both.transmission - 0.15).abs() < 1e-10);
+    fn locked_and_disabled_blades_shape_the_patterns() {
+        let mut prog = FilterDrive::default();
+        let puts = prog.update(&mut [al(1, 1, 1), al(0, 0, 1), al(1, 0, 0)], 10.0);
+        assert_eq!(prog.n_perms, 2);
+        assert_eq!(&prog.fltrs_in[..2], &[0b001, 0b011]);
+        assert_eq!(puts.filter_mask, 0b001);
     }
 
+    /// Action 0 takes the highest transmission at or below the setpoint, and
+    /// the lowest one when none is.
     #[test]
-    fn test_build_permutation_table_locked_filter() {
-        let blades = vec![
-            FilterBlade {
-                material: "Al".into(),
-                thickness: 100.0,
-                enabled: true,
-                locked: true,
-                inserted: true, // Locked in beam
-                transmission: 0.5,
-            },
-            FilterBlade {
-                material: "Cu".into(),
-                thickness: 50.0,
-                enabled: true,
-                locked: false,
-                inserted: false,
-                transmission: 0.3,
-            },
-        ];
-
-        let table = build_permutation_table(&blades);
-        // Only 1 free filter => 2 permutations
-        assert_eq!(table.entries.len(), 2);
-
-        // Both should include the locked filter's contribution
-        for p in &table.entries {
-            assert!(p.mask & 1 != 0, "locked filter should always be in mask");
-        }
+    fn a_setpoint_takes_the_highest_pattern_at_or_below_it() {
+        let mut prog = FilterDrive::default();
+        let blades = [blade(0.5, 0, 0, 1), blade(0.3, 0, 0, 1)];
+        prog.tabulate(&blades);
+        prog.action(0, &blades, 0.4, 0, "t");
+        assert_eq!((prog.msge.as_str(), prog.pattern()), ("OK", Some(0b10)));
+        prog.action(0, &blades, 0.1, 0, "t");
+        assert_eq!(prog.pattern(), Some(0b11));
+        prog.action(0, &blades, 1.0, 0, "t");
+        assert_eq!(
+            (prog.msge.as_str(), prog.pattern()),
+            ("OK - No change", Some(0))
+        );
     }
 
+    /// A mask past the blade count keeps the current pattern; a mask asking
+    /// to move a locked blade is adjusted to leave it where it is.
     #[test]
-    fn test_build_permutation_table_disabled_filter() {
-        let blades = vec![
-            FilterBlade {
-                material: "Al".into(),
-                thickness: 100.0,
-                enabled: false, // Disabled
-                locked: false,
-                inserted: false,
-                transmission: 0.5,
-            },
-            FilterBlade {
-                material: "Cu".into(),
-                thickness: 50.0,
-                enabled: true,
-                locked: false,
-                inserted: false,
-                transmission: 0.3,
-            },
-        ];
-
-        let table = build_permutation_table(&blades);
-        // Only 1 enabled filter => 2 permutations
-        assert_eq!(table.entries.len(), 2);
+    fn a_mask_setpoint_is_bounded_and_respects_locks() {
+        let mut prog = FilterDrive::default();
+        let blades = [blade(0.5, 1, 1, 1), blade(0.3, 0, 0, 1)];
+        prog.tabulate(&blades);
+        prog.action(3, &blades, 0.0, 4, "t");
+        assert_eq!(prog.msge, "ERROR! Invalid mask.");
+        assert_eq!(prog.ind, prog.ind_now);
+        prog.action(3, &blades, 0.0, 0b10, "t");
+        assert_eq!((prog.msge.as_str(), prog.pattern()), ("OK", Some(0b11)));
     }
 
+    /// At the top step there is no neighbour above, and the step points at
+    /// the current pattern with C's "unavailable" message.
     #[test]
-    fn test_find_best_for_setpoint() {
-        let entries = vec![
-            Permutation {
-                mask: 0,
-                transmission: 1.0,
-            },
-            Permutation {
-                mask: 1,
-                transmission: 0.5,
-            },
-            Permutation {
-                mask: 2,
-                transmission: 0.3,
-            },
-            Permutation {
-                mask: 3,
-                transmission: 0.15,
-            },
-        ];
-
-        // Setpoint 0.4 -> should pick 0.3 (highest <= 0.4)
-        let idx = find_best_for_setpoint(&entries, 0.4).unwrap();
-        assert_eq!(entries[idx].transmission, 0.3);
-
-        // Setpoint 1.0 -> should pick 1.0
-        let idx = find_best_for_setpoint(&entries, 1.0).unwrap();
-        assert_eq!(entries[idx].transmission, 1.0);
-
-        // Setpoint 0.1 -> should pick 0.15 (minimum, since no entry <= 0.1 other than 0.15)
-        let idx = find_best_for_setpoint(&entries, 0.1).unwrap();
-        // 0.15 > 0.1, so no entry <= setpoint exists. Return minimum.
-        assert_eq!(entries[idx].transmission, 0.15);
-    }
-
-    #[test]
-    fn test_update_step_indices() {
-        let entries = vec![
-            Permutation {
-                mask: 0,
-                transmission: 1.0,
-            },
-            Permutation {
-                mask: 1,
-                transmission: 0.5,
-            },
-            Permutation {
-                mask: 2,
-                transmission: 0.3,
-            },
-            Permutation {
-                mask: 3,
-                transmission: 0.15,
-            },
-        ];
-
-        let (up, tu, down, td) = update_step_indices(&entries, 0.5);
-        assert!(up.is_some());
-        assert!((tu - 1.0).abs() < 1e-10);
-        assert!(down.is_some());
-        assert!((td - 0.3).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_step_up_at_max_returns_none() {
-        let entries = vec![
-            Permutation {
-                mask: 0,
-                transmission: 1.0,
-            },
-            Permutation {
-                mask: 1,
-                transmission: 0.5,
-            },
-        ];
-
-        let (up, tu, _, _) = update_step_indices(&entries, 1.0);
-        assert!(up.is_none());
-        assert!((tu - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_step_down_at_min_returns_none() {
-        let entries = vec![
-            Permutation {
-                mask: 0,
-                transmission: 1.0,
-            },
-            Permutation {
-                mask: 1,
-                transmission: 0.5,
-            },
-        ];
-
-        let (_, _, down, td) = update_step_indices(&entries, 0.5);
-        assert!(down.is_none());
-        assert!((td - 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_controller_recalculate() {
-        let mut ctrl = FilterDriveController::new(2);
-        ctrl.energy_kev = 10.0;
-        ctrl.blades[0] = FilterBlade {
-            material: "Al".into(),
-            thickness: 100.0,
-            enabled: true,
-            locked: false,
-            inserted: false,
-            transmission: 1.0,
-        };
-        ctrl.blades[1] = FilterBlade {
-            material: "Cu".into(),
-            thickness: 50.0,
-            enabled: true,
-            locked: false,
-            inserted: false,
-            transmission: 1.0,
-        };
-
-        ctrl.recalculate();
-        assert_eq!(ctrl.perm_table.entries.len(), 4);
-        assert!((ctrl.transmission - 1.0).abs() < 1e-10); // Nothing inserted
-    }
-
-    #[test]
-    fn test_controller_execute_setpoint() {
-        let mut ctrl = FilterDriveController::new(2);
-        ctrl.energy_kev = 10.0;
-        ctrl.blades[0].transmission = 0.5;
-        ctrl.blades[1].transmission = 0.3;
-        ctrl.perm_table = build_permutation_table(&ctrl.blades);
-        ctrl.transmission = 1.0;
-        ctrl.filter_mask = 0;
-
-        let changes = ctrl.execute_action(FilterAction::SetTransmission, 0.4, 0);
-        // Should try to reach 0.3 (highest <= 0.4)
-        assert!(!changes.is_empty() || ctrl.message.contains("No change"));
-    }
-
-    #[test]
-    fn test_current_mask() {
-        let blades = vec![
-            FilterBlade {
-                inserted: true,
-                enabled: true,
-                ..Default::default()
-            },
-            FilterBlade {
-                inserted: false,
-                enabled: true,
-                ..Default::default()
-            },
-            FilterBlade {
-                inserted: true,
-                enabled: false,
-                ..Default::default()
-            },
-        ];
-        assert_eq!(current_mask(&blades), 0b01);
+    fn a_step_past_the_end_is_unavailable() {
+        let mut prog = FilterDrive::default();
+        let blades = [blade(0.5, 0, 0, 1)];
+        prog.tabulate(&blades);
+        assert_eq!((prog.trans_up, prog.ind_up), (1.0, prog.ind_now));
+        prog.action(1, &blades, 0.0, 0, "t");
+        assert_eq!(prog.msge, "NO CHANGE! Step unavailable.");
+        prog.action(2, &blades, 0.0, 0, "t");
+        assert_eq!((prog.msge.as_str(), prog.pattern()), ("OK", Some(1)));
     }
 }

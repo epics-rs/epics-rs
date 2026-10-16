@@ -26,6 +26,7 @@ record(motor, "K:th") { field(HLM, "90") field(LLM, "-10") }
 record(motor, "K:y") { field(HLM, "250") field(LLM, "-250") }
 record(motor, "K:z") { field(HLM, "250") field(LLM, "-250") }
 record(bo, "K:m:SpeedCtrl") {}
+record(ao, "K:np") { field(OUT, "K:m:Moving.VAL NPP") }
 "#;
 
 /// Boot with these theta, Y and Z readbacks.
@@ -441,4 +442,24 @@ async fn an_e_put_below_1e_12_off_still_moves() {
         inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
     }
     eventually_near(&server, "K:y.VAL", -17.77).await;
+}
+
+/// kohzuMoving is a monitor variable (kohzuCtl_soft.st:83-85): a Moving
+/// write that posts nothing (dbPut through an NPP link, dbAccess.c:1416)
+/// leaves it 0, so the next waitForCmndEnter does not clear Moving (C
+/// kohzuIoc oracle: Moving stays Busy, "kohzuMoving=0; kohzuDone=1").
+#[tokio::test(flavor = "current_thread")]
+async fn a_moving_write_with_no_monitor_is_not_cleared() {
+    let server = boot([10.0, -17.77, 100.78]).await;
+    settled(&server, "y offset changed to 17.500000").await;
+    let db = (**server.database()).clone();
+    db.put_record_field_from_ca("K:np", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    assert_eq!(f64_of(&server, "K:m:Moving").await, 1.0);
+    db.put_record_field_from_ca("K:th", "HLM", EpicsValue::Double(80.0))
+        .await
+        .unwrap();
+    settled(&server, "Theta Motor Soft Limits Changed").await;
+    assert_eq!(f64_of(&server, "K:m:Moving").await, 1.0);
 }

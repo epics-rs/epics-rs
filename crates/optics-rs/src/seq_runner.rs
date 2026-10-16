@@ -57,6 +57,14 @@ fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> Strin
         .unwrap_or_else(|| default.to_string())
 }
 
+/// C `sscanf(s, "%d", &n)` into a variable SNL zeroed: the leading integer,
+/// or 0.
+fn leading_int(s: &str) -> usize {
+    let s = s.trim_start();
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().unwrap_or(0)
+}
+
 /// Start an optics SNL program by name.
 ///
 /// This is the Rust equivalent of the C EPICS `seq &program, "macros"` command.
@@ -69,10 +77,10 @@ fn macro_or(macros: &HashMap<String, String>, key: &str, default: &str) -> Strin
 /// | `kohzuCtl` | P, M_THETA, M_Y, M_Z, GEOM(opt) | Kohzu double-crystal monochromator |
 /// | `kohzuCtl_soft` | P, MONO(opt) | Kohzu soft motor variant |
 /// | `hrCtl` | P, N(opt), M_PHI1, M_PHI2 | High-resolution analyzer |
-/// | `ml_monoCtl` | P, M_THETA, M_THETA2(opt), M_Z(opt) | Multi-layer monochromator |
+/// | `ml_monoCtl` | P, M_THETA, M_THETA2(opt), M_Y(opt), M_Z(opt), Y_OFF(opt) | Multi-layer monochromator |
 /// | `orient` | P, PM, mTTH, mTH, mCHI, mPHI | 4-circle diffractometer |
 /// | `filterDrive` | P, R | Automatic filter selection |
-/// | `pf4` | P, R, H(opt) | XIA PF4 dual filter bank |
+/// | `pf4` | P, B, H(opt), M, BP, B1..B4, name(opt) | XIA PF4 filter bank |
 /// | `Io` | P, R | Ion chamber intensity |
 /// | `flexCombinedMotion` | P, CM, FM | Coarse+fine flexure stage |
 ///
@@ -133,9 +141,9 @@ pub fn seq_start(
                 &macro_or(&macros, "M_THETA2", ""),
                 &macro_or(&macros, "M_Y", ""),
                 &macro_or(&macros, "M_Z", ""),
-                macro_or(&macros, "Y_OFFSET", "35.0")
+                macro_or(&macros, "Y_OFF", "35")
                     .parse::<f64>()
-                    .unwrap_or(35.0),
+                    .unwrap_or(0.0),
                 macro_or(&macros, "GEOM", "0").parse::<i32>().unwrap_or(0),
             );
             spawn_program(bridge, db, "ml_monoCtl", move |db| {
@@ -156,21 +164,27 @@ pub fn seq_start(
             });
         }
         "filterDrive" => {
-            let config = crate::snl::filter_drive::FilterDriveConfig::new(
+            let mut config = crate::snl::filter_drive::FilterDriveConfig::new(
                 &require_macro(&macros, "P", program)?,
                 &require_macro(&macros, "R", program)?,
-                macro_or(&macros, "N", "8").parse::<usize>().unwrap_or(8),
+                leading_int(&require_macro(&macros, "NUM_FILTERS", program)?),
             );
+            // C prints `macValueGet("NAME")` with `%s`, NULL included.
+            config.name = macro_or(&macros, "NAME", "(null)");
             spawn_program(bridge, db, "filterDrive", move |db| {
                 crate::snl::filter_drive::run(config, db)
             });
         }
         "pf4" => {
-            let config = crate::snl::pf4::Pf4Config::new(
+            let mut config = crate::snl::pf4::Pf4Config::new(
                 &require_macro(&macros, "P", program)?,
                 &macro_or(&macros, "H", ""),
                 &require_macro(&macros, "B", program)?,
             );
+            config.name = macro_or(&macros, "name", "pf4");
+            config.mono = macro_or(&macros, "M", "");
+            config.bit_prefix = macro_or(&macros, "BP", "");
+            config.bits = ["B1", "B2", "B3", "B4"].map(|m| macro_or(&macros, m, ""));
             spawn_program(bridge, db, "pf4", move |db| {
                 crate::snl::pf4::run(config, db)
             });
@@ -241,6 +255,63 @@ mod tests {
         let result = seq_start("nonexistent", "P=x:", &bridge, &db);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown program"));
+    }
+
+    /// filterDrive's blade count is the `NUM_FILTERS` macro
+    /// (`filterDrive.st:338`), published to `NumFilters` by `start`.
+    // filterDrive's states sleep on tokio::time, which the exec backend's
+    // callback threads have no reactor for.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn filter_drive_takes_its_blade_count_from_num_filters() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "F:f:NumFilters",
+            Box::new(epics_base_rs::server::records::ai::AiRecord::new(0.0)),
+        )
+        .await
+        .unwrap();
+        db.mark_pini_done();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start(
+            "filterDrive",
+            "NAME=fd,P=F:,R=f:,NUM_FILTERS=2",
+            &bridge,
+            &db,
+        )
+        .unwrap();
+        for _ in 0..300 {
+            if db.get_pv("F:f:NumFilters").unwrap().to_f64() == Some(2.0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("NumFilters is {:?}", db.get_pv("F:f:NumFilters").unwrap());
+    }
+
+    /// ml_monoCtl's y offset is the `Y_OFF` macro (`ml_monoCtl.st:587`),
+    /// put by initSequence; with every motor readback at 0, chkMotorLimits
+    /// then holds and nothing overwrites it.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn ml_mono_takes_its_y_offset_from_y_off() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "Y:ml_mono_yOffset",
+            Box::new(epics_base_rs::server::records::ao::AoRecord::new(0.0)),
+        )
+        .await
+        .unwrap();
+        db.mark_pini_done();
+        let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+        seq_start("ml_monoCtl", "P=Y:,M_THETA=th,Y_OFF=40", &bridge, &db).unwrap();
+        for _ in 0..300 {
+            if db.get_pv("Y:ml_mono_yOffset").unwrap().to_f64() == Some(40.0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("yOffset is {:?}", db.get_pv("Y:ml_mono_yOffset").unwrap());
     }
 
     /// The lattice records kohzuCtl reads on its way to `ready`, as

@@ -1,210 +1,33 @@
 //! Multi-layer monochromator control -- native Rust port of `ml_monoCtl.st`.
 //!
-//! Controls a multilayer monochromator with variable d-spacing (not crystal).
-//! Key difference from Kohzu: uses `D` (layer spacing) and `Order` instead of
-//! Miller indices (H,K,L) and lattice constant. The effective 2d-spacing is
-//! `2d = 2*D/Order`.
+//! Controls a multilayer monochromator with variable d-spacing (not crystal):
+//! the effective 2d-spacing is `2*D/Order`. Motors: Theta, Theta2, Z (beam
+//! tracking, `z = yOffset/tan(2*theta)`); the Y readback is the y offset.
 //!
-//! Motors: Theta, Theta2 (parallel crystals), Z (optional, for beam tracking).
-//! The Y motor provides the y-offset readback but is not commanded.
-//!
-//! Modes: Normal (Z moves) and Freeze-Z (channel-cut, Z frozen).
-//! Z position: z = y_offset / tan(2*theta).
+//! The three state sets run as C's: `ml_monoCtl` through its states, with
+//! every `monitor` variable written as its monitor arrives, every `sync`ed
+//! event flag raised by it (the connect-time monitor and the program's own
+//! puts included), and a state left only when one of its `when` clauses is
+//! true; `updatePsuedo` echoing the motor fields; `updateSet`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
+use epics_base_rs::calc::engine::cvt::fmt_f;
 use epics_base_rs::server::database::PvDatabase;
-use tracing::info;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::db_access::{DbChannel, DbMultiMonitor, alloc_origin};
 use crate::snl::kohzu_ctl::{HC, update_set};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+/// `radConv`, as C sets it in state `init` (ml_monoCtl.st:537).
+const RAD_CONV: f64 = 57.2958;
 
-const RAD_CONV: f64 = 57.29577951308232;
-
-// ---------------------------------------------------------------------------
-// Operating modes
-// ---------------------------------------------------------------------------
-
-/// Multi-layer mono mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlMonoMode {
-    /// Normal -- Z motor moves.
-    Normal = 0,
-    /// Freeze Z -- channel-cut, Z frozen.
-    FreezeZ = 1,
-}
-
-impl MlMonoMode {
-    pub fn from_i16(v: i16) -> Self {
-        if v == 1 { Self::FreezeZ } else { Self::Normal }
-    }
-
-    pub fn z_frozen(self) -> bool {
-        self == Self::FreezeZ
-    }
-}
-
-// ---------------------------------------------------------------------------
-// State enum
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlMonoState {
-    Init,
-    InitSequence,
-    WaitForCommand,
-    DInputChanged,
-    ThetaLimits,
-    EChanged,
-    LambdaChanged,
-    ThetaChanged,
-    CalcMovements,
-    MoveMlMono,
-    UpdateReadback,
-    CheckDone,
-    ThetaMotorStopped,
-    CheckMotorLimits,
-    StopMlMono,
-}
-
-// ---------------------------------------------------------------------------
-// Pure physics functions
-// ---------------------------------------------------------------------------
-
-/// Calculate effective 2d-spacing from layer spacing D and diffraction order.
-/// Returns (two_d, is_error, message).
-///
-/// C computes `result = (2*D)/Order` unconditionally and returns it, only
-/// raising opAlert when `Order < 1` (ml_monoCtl.st:1314-1329). A `0 < Order < 1`
-/// therefore still yields a finite 2d in C; returning 0.0 zeroed the E/lambda
-/// DRVH-DRVL limits instead. We reproduce the finite quotient and the alert, but
-/// guard `Order <= 0` so we never produce C's bare `2*D/0` infinity.
-pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, &'static str) {
-    if order <= 0.0 {
-        return (0.0, true, "Order must be >= 1");
-    }
-    let two_d = (2.0 * d) / order;
-    if order < 1.0 {
-        (two_d, true, "Order must be >= 1")
-    } else {
-        (two_d, false, "New effective d spacing")
-    }
-}
-
-/// Convert energy (keV) to wavelength (Angstrom).
-pub fn energy_to_lambda(e: f64) -> f64 {
-    if e <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / e
-}
-
-/// Convert wavelength to energy.
-pub fn lambda_to_energy(lambda: f64) -> f64 {
-    if lambda <= 0.0 {
-        return f64::INFINITY;
-    }
-    HC / lambda
-}
-
-/// Convert wavelength to theta (degrees) given 2d spacing.
-/// Returns None if impossible.
-pub fn lambda_to_theta(lambda: f64, two_d: f64) -> Option<f64> {
-    if two_d <= 0.0 || lambda <= 0.0 {
-        return None;
-    }
-    let sin_theta = lambda / two_d;
-    if !(-1.0..=1.0).contains(&sin_theta) {
-        return None;
-    }
-    Some(sin_theta.asin() * RAD_CONV)
-}
-
-/// Convert theta (degrees) to wavelength given 2d spacing.
-pub fn theta_to_lambda(theta_deg: f64, two_d: f64) -> f64 {
-    two_d * (theta_deg / RAD_CONV).sin()
-}
-
-/// Calculate Z motor position for the multilayer geometry.
-/// z = y_offset / tan(2*theta)
-pub fn calc_z_position(theta_deg: f64, y_offset: f64) -> f64 {
-    let two_theta_rad = 2.0 * theta_deg / RAD_CONV;
-    let tan_val = two_theta_rad.tan();
-    if tan_val.abs() < 1e-15 {
-        return f64::MAX;
-    }
-    y_offset / tan_val
-}
-
-/// Compute theta limits, clamped to [0.1, 89.0] degrees.
-pub fn compute_theta_limits(motor_hi: f64, motor_lo: f64) -> (f64, f64) {
-    let hi = motor_hi.min(89.0);
-    let lo = motor_lo.max(0.1);
-    (hi, lo)
-}
-
-/// Compute energy/lambda limits from 2d spacing and theta limits.
-pub fn compute_energy_lambda_limits(
-    two_d: f64,
-    theta_hi: f64,
-    theta_lo: f64,
-) -> (f64, f64, f64, f64) {
-    let lambda_hi = two_d * (theta_hi / RAD_CONV).sin();
-    let lambda_lo = two_d * (theta_lo / RAD_CONV).sin();
-    let e_hi = if lambda_lo > 0.0 {
-        HC / lambda_lo
-    } else {
-        f64::INFINITY
-    };
-    let e_lo = if lambda_hi > 0.0 { HC / lambda_hi } else { 0.0 };
-    (e_hi, e_lo, lambda_hi, lambda_lo)
-}
-
-/// Coordinate speeds for theta and Z motors.
-/// Returns (new_th_speed, new_z_speed).
-pub fn coordinate_speeds(
-    theta_delta: f64,
-    z_delta: f64,
-    th_speed: f64,
-    z_speed: f64,
-    cc_mode: MlMonoMode,
-) -> (f64, f64) {
-    let th_time = if th_speed > 0.0 {
-        theta_delta.abs() / th_speed
-    } else {
-        0.0
-    };
-    let z_time = if cc_mode.z_frozen() {
-        0.0
-    } else if z_speed > 0.0 {
-        z_delta.abs() / z_speed
-    } else {
-        0.0
-    };
-
-    let max_time = th_time.max(z_time);
-    if max_time <= 0.0 {
-        return (th_speed, z_speed);
-    }
-
-    let new_th = if theta_delta.abs() > 0.0 {
-        theta_delta.abs() / max_time
-    } else {
-        th_speed
-    };
-    let new_z = if z_delta.abs() > 0.0 {
-        z_delta.abs() / max_time
-    } else {
-        z_speed
-    };
-    (new_th, new_z)
-}
+/// `ccMode` menu (`MODE_NORMAL`, `MODE_FREEZE_Z`).
+const MODE_NORMAL: f64 = 0.0;
+const MODE_FREEZE_Z: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -230,7 +53,8 @@ impl MlMonoConfig {
         y_offset: f64,
         geom: i32,
     ) -> Self {
-        let y_off = if !(1.0..=60.0).contains(&y_offset) {
+        // initSequence (ml_monoCtl.st:588-590).
+        let y_offset = if (y_offset < 1.0) || (y_offset > 60.0) {
             35.0
         } else {
             y_offset
@@ -241,7 +65,7 @@ impl MlMonoConfig {
             m_theta2: m_theta2.to_string(),
             m_y: m_y.to_string(),
             m_z: m_z.to_string(),
-            y_offset: y_off,
+            y_offset,
             geom,
         }
     }
@@ -255,11 +79,338 @@ impl MlMonoConfig {
     }
 }
 
+/// C `ml_monoCtl_calc2dSpacing`: `(2D/Order, opAlert, seqMsg1)`.
+pub fn calc_2d_spacing(d: f64, order: f64) -> (f64, bool, String) {
+    let result = (2.0 * d) / order;
+    let op_alert = order < 1.0;
+    let msg = if op_alert {
+        format!("Order == {}?", fmt_f(order, 6))
+    } else {
+        "New effective d spacing".to_string()
+    };
+    (result, op_alert, msg)
+}
+
+// ---------------------------------------------------------------------------
+// SNL variables
+// ---------------------------------------------------------------------------
+
+// Indices into `Vars`, one per assigned SNL variable that is not a string.
+const OP_ALERT: usize = 0;
+const OP_ACK: usize = 1;
+const PUT_VALS: usize = 2;
+const AUTO_MODE: usize = 3;
+const CC_MODE: usize = 4;
+const MOVING: usize = 5;
+const ORDER: usize = 6;
+const D: usize = 7;
+const E: usize = 8;
+const E_HI: usize = 9;
+const E_LO: usize = 10;
+const E_RDBK: usize = 11;
+const LAMBDA: usize = 12;
+const LAMBDA_HI: usize = 13;
+const LAMBDA_LO: usize = 14;
+const LAMBDA_RDBK: usize = 15;
+const THETA: usize = 16;
+const THETA_HI: usize = 17;
+const THETA_LO: usize = 18;
+const THETA_RDBK: usize = 19;
+const TH_CMD_ECHO: usize = 20;
+const TH2_CMD_ECHO: usize = 21;
+const Z_CMD_ECHO: usize = 22;
+const TH_RDBK_ECHO: usize = 23;
+const TH2_RDBK_ECHO: usize = 24;
+const Z_RDBK_ECHO: usize = 25;
+const TH_VEL_ECHO: usize = 26;
+const TH2_VEL_ECHO: usize = 27;
+const Z_VEL_ECHO: usize = 28;
+const TH_DMOV_ECHO: usize = 29;
+const TH2_DMOV_ECHO: usize = 30;
+const Z_DMOV_ECHO: usize = 31;
+const TH_STOP: usize = 32;
+const TH2_STOP: usize = 33;
+const Z_STOP: usize = 34;
+const TH_DMOV: usize = 35;
+const TH2_DMOV: usize = 36;
+const Z_DMOV: usize = 37;
+const TH_HLS: usize = 38;
+const TH_LLS: usize = 39;
+const TH2_HLS: usize = 40;
+const TH2_LLS: usize = 41;
+const Z_HLS: usize = 42;
+const Z_LLS: usize = 43;
+const TH_DESIRED: usize = 44;
+const TH2_DESIRED: usize = 45;
+const Z_DESIRED: usize = 46;
+const TH_HLM: usize = 47;
+const TH_LLM: usize = 48;
+const TH2_HLM: usize = 49;
+const TH2_LLM: usize = 50;
+const Z_HLM: usize = 51;
+const Z_LLM: usize = 52;
+const TH_CMD: usize = 53;
+const TH2_CMD: usize = 54;
+const Z_CMD: usize = 55;
+const TH_CMD_MON: usize = 56;
+const TH2_CMD_MON: usize = 57;
+const Z_CMD_MON: usize = 58;
+const TH_SPEED: usize = 59;
+const TH2_SPEED: usize = 60;
+const Z_SPEED: usize = 61;
+const TH_RBV: usize = 62;
+const TH2_RBV: usize = 63;
+const Z_RBV: usize = 64;
+const Y_RBV: usize = 65;
+const E_TWEAK: usize = 66;
+const E_INC: usize = 67;
+const E_DEC: usize = 68;
+const L_TWEAK: usize = 69;
+const L_INC: usize = 70;
+const L_DEC: usize = 71;
+const TH_TWEAK: usize = 72;
+const TH_INC: usize = 73;
+const TH_DEC: usize = 74;
+const Y_OFFSET: usize = 75;
+const N_VARS: usize = 76;
+
+/// How C declares a variable: `short` or `double`, `monitor`ed, `sync`ed.
+#[derive(Clone, Copy)]
+struct Decl {
+    short: bool,
+    monitor: bool,
+    sync: bool,
+}
+
+const fn decl(short: bool, monitor: bool, sync: bool) -> Decl {
+    Decl {
+        short,
+        monitor,
+        sync,
+    }
+}
+
+/// Each variable's PV and declaration, by index (ml_monoCtl.st:26-512).
+fn table(cfg: &MlMonoConfig) -> Vec<(String, Decl)> {
+    let m = |motor: &str, field: &str| cfg.motor_pv(motor, field);
+    let (th, th2, z, y) = (&cfg.m_theta, &cfg.m_theta2, &cfg.m_z, &cfg.m_y);
+    let short = decl(true, false, false);
+    let short_mon = decl(true, true, false);
+    let short_sync = decl(true, true, true);
+    let dbl = decl(false, false, false);
+    let dbl_mon = decl(false, true, false);
+    let dbl_sync = decl(false, true, true);
+    let t = vec![
+        (cfg.pv("Alert"), short),
+        (cfg.pv("OperAck"), short_mon),
+        (cfg.pv("Put"), short_mon),
+        (cfg.pv("Mode"), short_mon),
+        (cfg.pv("Mode2"), short_mon),
+        (cfg.pv("Moving"), short_mon),
+        (cfg.pv("Order"), dbl_sync),
+        (cfg.pv("D"), dbl_sync),
+        (cfg.pv("E"), dbl_sync),
+        (cfg.pv("E.DRVH"), dbl),
+        (cfg.pv("E.DRVL"), dbl),
+        (cfg.pv("ERdbk"), dbl),
+        (cfg.pv("Lambda"), dbl_sync),
+        (cfg.pv("Lambda.DRVH"), dbl),
+        (cfg.pv("Lambda.DRVL"), dbl),
+        (cfg.pv("LambdaRdbk"), dbl),
+        (cfg.pv("Theta"), dbl_sync),
+        (cfg.pv("Theta.DRVH"), dbl),
+        (cfg.pv("Theta.DRVL"), dbl),
+        (cfg.pv("ThetaRdbk"), dbl),
+        (cfg.pv("ThetaCmd"), dbl),
+        (cfg.pv("Theta2Cmd"), dbl),
+        (cfg.pv("ZCmd"), dbl),
+        (cfg.pv("ThetaRdbkEcho"), dbl),
+        (cfg.pv("Theta2RdbkEcho"), dbl),
+        (cfg.pv("ZRdbk"), dbl),
+        (cfg.pv("ThetaVel"), dbl),
+        (cfg.pv("Theta2Vel"), dbl),
+        (cfg.pv("ZVel"), dbl),
+        (cfg.pv("ThetaDmov"), short),
+        (cfg.pv("Theta2Dmov"), short),
+        (cfg.pv("ZDmov"), short),
+        (m(th, ".STOP"), short),
+        (m(th2, ".STOP"), short),
+        (m(z, ".STOP"), short),
+        (m(th, ".DMOV"), short_sync),
+        (m(th2, ".DMOV"), short_sync),
+        (m(z, ".DMOV"), short_sync),
+        (m(th, ".HLS"), short_mon),
+        (m(th, ".LLS"), short_mon),
+        (m(th2, ".HLS"), short_mon),
+        (m(th2, ".LLS"), short_mon),
+        (m(z, ".HLS"), short_mon),
+        (m(z, ".LLS"), short_mon),
+        (cfg.pv("ThetaSet"), dbl_mon),
+        (cfg.pv("Theta2Set"), dbl_mon),
+        (cfg.pv("ZSet"), dbl_mon),
+        (m(th, ".HLM"), dbl_sync),
+        (m(th, ".LLM"), dbl_sync),
+        (m(th2, ".HLM"), dbl_sync),
+        (m(th2, ".LLM"), dbl_sync),
+        (m(z, ".HLM"), dbl_mon),
+        (m(z, ".LLM"), dbl_mon),
+        (m(th, ""), dbl),
+        (m(th2, ""), dbl),
+        (m(z, ""), dbl),
+        (m(th, ""), dbl_sync),
+        (m(th2, ""), dbl_sync),
+        (m(z, ""), dbl_sync),
+        (m(th, ".VELO"), dbl_sync),
+        (m(th2, ".VELO"), dbl_sync),
+        (m(z, ".VELO"), dbl_sync),
+        (m(th, ".RBV"), dbl_sync),
+        (m(th2, ".RBV"), dbl_sync),
+        (m(z, ".RBV"), dbl_sync),
+        (m(y, ".RBV"), dbl_sync),
+        (cfg.pv("ETweak"), dbl_mon),
+        (cfg.pv("EInc"), short_mon),
+        (cfg.pv("EDec"), short_mon),
+        (cfg.pv("LambdaTweak"), dbl_mon),
+        (cfg.pv("LambdaInc"), short_mon),
+        (cfg.pv("LambdaDec"), short_mon),
+        (cfg.pv("ThetaTweak"), dbl_mon),
+        (cfg.pv("ThetaInc"), short_mon),
+        (cfg.pv("ThetaDec"), short_mon),
+        (cfg.pv("_yOffset"), dbl_sync),
+    ];
+    debug_assert_eq!(t.len(), N_VARS);
+    t
+}
+
+/// One state set's view of the SNL variables: a `monitor`ed variable is
+/// written as its monitor arrives and raises the flag `sync`ed to it; the
+/// others hold what the program last assigned (0 until then).
+struct Vars {
+    chans: Vec<DbChannel>,
+    decls: Vec<Decl>,
+    val: [f64; N_VARS],
+    flag: [bool; N_VARS],
+    by_pv: HashMap<String, usize>,
+    monitor: DbMultiMonitor,
+}
+
+impl Vars {
+    /// Subscribe the monitored variables among `watch`. Their connect-time
+    /// monitors raise their flags, so each found starts raised.
+    async fn new(db: &PvDatabase, cfg: &MlMonoConfig, origin: u64, watch: &[usize]) -> Self {
+        let table = table(cfg);
+        let mut val = [0.0; N_VARS];
+        let mut flag = [false; N_VARS];
+        let mut by_pv = HashMap::new();
+        let mut names = Vec::new();
+        for &i in watch {
+            let (pv, d) = &table[i];
+            if !d.monitor {
+                continue;
+            }
+            // A PV that never connects delivers no monitor and raises nothing.
+            let Ok(seed) = db.get_pv(pv) else { continue };
+            val[i] = seed.to_f64().unwrap_or(0.0);
+            flag[i] = d.sync;
+            by_pv.insert(pv.clone(), i);
+            names.push(pv.clone());
+        }
+        Self {
+            chans: table
+                .iter()
+                .map(|(pv, _)| DbChannel::with_origin(db, pv, origin))
+                .collect(),
+            decls: table.iter().map(|(_, d)| *d).collect(),
+            val,
+            flag,
+            by_pv,
+            monitor: DbMultiMonitor::new(db, &names).await,
+        }
+    }
+
+    fn take(&mut self, pv: &str, v: f64) {
+        if let Some(&i) = self.by_pv.get(pv) {
+            self.val[i] = v;
+            self.flag[i] |= self.decls[i].sync;
+        }
+    }
+
+    /// Take every monitor already queued.
+    async fn poll(&mut self) {
+        while let Ok((pv, v)) =
+            tokio::time::timeout(std::time::Duration::ZERO, self.monitor.wait_change()).await
+        {
+            self.take(&pv, v);
+        }
+    }
+
+    /// Wait for a monitor or `deadline`, whichever is first.
+    async fn wait(&mut self, deadline: Option<Instant>) {
+        let (pv, v) = match deadline {
+            Some(at) => tokio::select! {
+                r = self.monitor.wait_change() => r,
+                _ = tokio::time::sleep_until(at) => return,
+            },
+            None => self.monitor.wait_change().await,
+        };
+        self.take(&pv, v);
+    }
+
+    fn on(&self, i: usize) -> bool {
+        self.val[i] != 0.0
+    }
+
+    /// `pvPut(var)`.
+    async fn put(&self, i: usize) {
+        let v = self.val[i];
+        let _ = if self.decls[i].short {
+            self.chans[i].put_i16_process(v as i16).await
+        } else {
+            self.chans[i].put_f64_process(v).await
+        };
+    }
+
+    /// `var = v; pvPut(var);`
+    async fn set(&mut self, i: usize, v: f64) {
+        self.val[i] = v;
+        self.put(i).await;
+    }
+
+    /// `efTestAndClear`.
+    fn test_and_clear(&mut self, i: usize) -> bool {
+        std::mem::take(&mut self.flag[i])
+    }
+}
+
+/// `delay()` in a state's `when` clauses: counted from state entry.
+struct Delays {
+    entered: Instant,
+    next: Option<Instant>,
+}
+
+impl Delays {
+    fn new() -> Self {
+        Self {
+            entered: Instant::now(),
+            next: None,
+        }
+    }
+
+    fn delay(&mut self, secs: f64) -> bool {
+        let at = self.entered + epics_base_rs::runtime::time::duration_from_secs(secs);
+        if Instant::now() >= at {
+            return true;
+        }
+        self.next = Some(self.next.map_or(at, |n| n.min(at)));
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Async runner
 // ---------------------------------------------------------------------------
 
-/// Run the multi-layer monochromator control state machine.
+/// Run the ml_monoCtl, updatePsuedo and updateSet state sets.
 pub async fn run(
     config: MlMonoConfig,
     db: PvDatabase,
@@ -275,691 +426,645 @@ pub async fn run(
         [&config.m_theta, &config.m_theta2, &config.m_z].map(|m| config.motor_pv(m, ".SET")),
         use_set_mode.clone(),
     );
+    let pseudo = Arc::new(Pseudo::default());
+    let main = MlMono::new(&config, &db, use_set_mode, pseudo.clone()).await;
     tokio::select! {
-        r = ml_mono_ctl(config, db, use_set_mode) => r,
+        () = main.run() => Ok(()),
+        () = update_pseudo(&config, &db, &pseudo) => Ok(()),
         () = update_set => Ok(()),
     }
 }
 
-/// The ml_monoCtl state set.
-async fn ml_mono_ctl(
-    config: MlMonoConfig,
-    db: PvDatabase,
-    use_set_mode: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("ml_monoCtl: starting for prefix={}", config.prefix);
+/// `thetaMotRdbkPseudo_mon` and `theta2MotRdbkPseudo_mon`: set by
+/// ml_monoCtl, taken by updatePsuedo.
+#[derive(Default)]
+struct Pseudo {
+    theta: AtomicBool,
+    theta2: AtomicBool,
+    wake: Notify,
+}
 
-    let my_origin = alloc_origin();
-
-    // -- Create channels --
-    let _ch_debug = DbChannel::with_origin(&db, &config.pv("CtlDebug"), my_origin);
-    let ch_msg1 = DbChannel::with_origin(&db, &config.pv("SeqMsg1"), my_origin);
-    let ch_msg2 = DbChannel::with_origin(&db, &config.pv("SeqMsg2"), my_origin);
-    let ch_alert = DbChannel::with_origin(&db, &config.pv("Alert"), my_origin);
-    let ch_oper_ack = DbChannel::with_origin(&db, &config.pv("OperAck"), my_origin);
-    let ch_put_vals = DbChannel::with_origin(&db, &config.pv("Put"), my_origin);
-    let ch_auto_mode = DbChannel::with_origin(&db, &config.pv("Mode"), my_origin);
-    let ch_moving = DbChannel::with_origin(&db, &config.pv("Moving"), my_origin);
-
-    // D-spacing parameters
-    let ch_order = DbChannel::with_origin(&db, &config.pv("Order"), my_origin);
-    let ch_d = DbChannel::with_origin(&db, &config.pv("D"), my_origin);
-
-    // Energy / lambda / theta
-    let ch_e = DbChannel::with_origin(&db, &config.pv("E"), my_origin);
-    let ch_e_hi = DbChannel::with_origin(&db, &config.pv("E.DRVH"), my_origin);
-    let ch_e_lo = DbChannel::with_origin(&db, &config.pv("E.DRVL"), my_origin);
-    let ch_e_rdbk = DbChannel::with_origin(&db, &config.pv("ERdbk"), my_origin);
-
-    let ch_lambda = DbChannel::with_origin(&db, &config.pv("Lambda"), my_origin);
-    let ch_lambda_hi = DbChannel::with_origin(&db, &config.pv("Lambda.DRVH"), my_origin);
-    let ch_lambda_lo = DbChannel::with_origin(&db, &config.pv("Lambda.DRVL"), my_origin);
-    let ch_lambda_rdbk = DbChannel::with_origin(&db, &config.pv("LambdaRdbk"), my_origin);
-
-    let ch_theta = DbChannel::with_origin(&db, &config.pv("Theta"), my_origin);
-    let ch_theta_hi = DbChannel::with_origin(&db, &config.pv("Theta.DRVH"), my_origin);
-    let ch_theta_lo = DbChannel::with_origin(&db, &config.pv("Theta.DRVL"), my_origin);
-    let ch_theta_rdbk = DbChannel::with_origin(&db, &config.pv("ThetaRdbk"), my_origin);
-
-    // Echo PVs
-    let ch_theta_mot_name = DbChannel::with_origin(&db, &config.pv("ThetaPv"), my_origin);
-    let ch_theta2_mot_name = DbChannel::with_origin(&db, &config.pv("Theta2Pv"), my_origin);
-    let ch_z_mot_name = DbChannel::with_origin(&db, &config.pv("ZPv"), my_origin);
-    let ch_y_mot_name = DbChannel::with_origin(&db, &config.pv("YPv"), my_origin);
-
-    let _ch_theta_cmd_echo = DbChannel::with_origin(&db, &config.pv("ThetaCmd"), my_origin);
-    let _ch_theta2_cmd_echo = DbChannel::with_origin(&db, &config.pv("Theta2Cmd"), my_origin);
-    let _ch_z_cmd_echo = DbChannel::with_origin(&db, &config.pv("ZCmd"), my_origin);
-    let ch_theta_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ThetaRdbkEcho"), my_origin);
-    let ch_theta2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("Theta2RdbkEcho"), my_origin);
-    let ch_z_rdbk_echo = DbChannel::with_origin(&db, &config.pv("ZRdbk"), my_origin);
-    let ch_theta_vel_echo = DbChannel::with_origin(&db, &config.pv("ThetaVel"), my_origin);
-    let ch_theta2_vel_echo = DbChannel::with_origin(&db, &config.pv("Theta2Vel"), my_origin);
-    let ch_z_vel_echo = DbChannel::with_origin(&db, &config.pv("ZVel"), my_origin);
-    let ch_theta_dmov_echo = DbChannel::with_origin(&db, &config.pv("ThetaDmov"), my_origin);
-    let ch_theta2_dmov_echo = DbChannel::with_origin(&db, &config.pv("Theta2Dmov"), my_origin);
-    let ch_z_dmov_echo = DbChannel::with_origin(&db, &config.pv("ZDmov"), my_origin);
-
-    // Motor records
-    let ch_theta_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".STOP"), my_origin);
-    let ch_theta2_mot_stop =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".STOP"), my_origin);
-    let ch_z_stop = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".STOP"), my_origin);
-
-    let ch_theta_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".DMOV"), my_origin);
-    let ch_theta2_dmov =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".DMOV"), my_origin);
-    let ch_z_dmov = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".DMOV"), my_origin);
-
-    let ch_theta_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLS"), my_origin);
-    let ch_theta_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLS"), my_origin);
-    let ch_theta2_hls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".HLS"), my_origin);
-    let ch_theta2_lls =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".LLS"), my_origin);
-    let ch_z_hls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLS"), my_origin);
-    let ch_z_lls = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLS"), my_origin);
-
-    let ch_theta_set = DbChannel::with_origin(&db, &config.pv("ThetaSet"), my_origin);
-    let ch_theta2_set = DbChannel::with_origin(&db, &config.pv("Theta2Set"), my_origin);
-    let ch_z_set = DbChannel::with_origin(&db, &config.pv("ZSet"), my_origin);
-
-    let ch_theta_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".HLM"), my_origin);
-    let ch_theta_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".LLM"), my_origin);
-    let ch_z_mot_hilim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".HLM"), my_origin);
-    let ch_z_mot_lolim =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".LLM"), my_origin);
-
-    let ch_theta_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ""), my_origin);
-    let ch_theta2_mot_cmd =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ""), my_origin);
-    let ch_z_mot_cmd = DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ""), my_origin);
-
-    let ch_theta_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".VELO"), my_origin);
-    let ch_theta2_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".VELO"), my_origin);
-    let ch_z_mot_velo =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".VELO"), my_origin);
-
-    let ch_theta_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta, ".RBV"), my_origin);
-    let ch_theta2_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_theta2, ".RBV"), my_origin);
-    let ch_z_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_z, ".RBV"), my_origin);
-    let ch_y_mot_rbv =
-        DbChannel::with_origin(&db, &config.motor_pv(&config.m_y, ".RBV"), my_origin);
-
-    let ch_y_offset = DbChannel::with_origin(&db, &config.pv("_yOffset"), my_origin);
-
-    // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
-    // C ml_monoCtl.st:710-773 (state tweak): each button adds ± the matching
-    // step value, limit-checks, and resets the pressed BO to 0.
-    let ch_e_tweak_val = DbChannel::with_origin(&db, &config.pv("ETweak"), my_origin);
-    let ch_e_inc = DbChannel::with_origin(&db, &config.pv("EInc"), my_origin);
-    let ch_e_dec = DbChannel::with_origin(&db, &config.pv("EDec"), my_origin);
-    let ch_lambda_tweak_val = DbChannel::with_origin(&db, &config.pv("LambdaTweak"), my_origin);
-    let ch_lambda_inc = DbChannel::with_origin(&db, &config.pv("LambdaInc"), my_origin);
-    let ch_lambda_dec = DbChannel::with_origin(&db, &config.pv("LambdaDec"), my_origin);
-    let ch_theta_tweak_val = DbChannel::with_origin(&db, &config.pv("ThetaTweak"), my_origin);
-    let ch_theta_inc = DbChannel::with_origin(&db, &config.pv("ThetaInc"), my_origin);
-    let ch_theta_dec = DbChannel::with_origin(&db, &config.pv("ThetaDec"), my_origin);
-
-    // Wait for key channels
-
-    // Build multi-monitor
-    let monitored_pvs: Vec<String> = vec![
-        config.pv("E"),
-        config.pv("Lambda"),
-        config.pv("Theta"),
-        config.pv("Order"),
-        config.pv("D"),
-        config.pv("Put"),
-        config.pv("OperAck"),
-        config.motor_pv(&config.m_theta, ".RBV"),
-        config.motor_pv(&config.m_theta2, ".RBV"),
-        config.motor_pv(&config.m_y, ".RBV"),
-        config.motor_pv(&config.m_theta, ".HLM"),
-        config.motor_pv(&config.m_theta, ".LLM"),
-        config.pv("_yOffset"),
-        config.pv("EInc"),
-        config.pv("EDec"),
-        config.pv("LambdaInc"),
-        config.pv("LambdaDec"),
-        config.pv("ThetaInc"),
-        config.pv("ThetaDec"),
+/// ss updatePsuedo (ml_monoCtl.st:1191-1255).
+async fn update_pseudo(cfg: &MlMonoConfig, db: &PvDatabase, pseudo: &Pseudo) {
+    let watch = [
+        TH_RBV,
+        TH2_RBV,
+        Z_RBV,
+        Y_RBV,
+        TH_SPEED,
+        TH2_SPEED,
+        Z_SPEED,
+        TH_CMD_MON,
+        TH2_CMD_MON,
+        Z_CMD_MON,
+        TH_DMOV,
+        TH2_DMOV,
+        Z_DMOV,
     ];
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
-    // C `monitor autoMode;` and `monitor ccMode;` sync no event flag and no
-    // waitForCmnd `when` tests them (ml_monoCtl.st:55-64, :624-774): they
-    // are written on arrival and only read.
-    monitor
-        .add_vars(&db, &[config.pv("Mode"), config.pv("Mode2")])
-        .await;
-    println!(
-        "ml_monoCtl: subscribed to {} PVs, {} active",
-        monitored_pvs.len(),
-        monitor.sub_count()
-    );
-
-    // -- Initialize --
-    let theta_name = format!("{}{}", config.prefix, config.m_theta);
-    let theta2_name = format!("{}{}", config.prefix, config.m_theta2);
-    let z_name = format!("{}{}", config.prefix, config.m_z);
-    let y_name = format!("{}{}", config.prefix, config.m_y);
-    let _ = ch_theta_mot_name.put_string_process(&theta_name).await;
-    let _ = ch_theta2_mot_name.put_string_process(&theta2_name).await;
-    let _ = ch_z_mot_name.put_string_process(&z_name).await;
-    let _ = ch_y_mot_name.put_string_process(&y_name).await;
-
-    let _ = ch_y_offset.put_f64_process(config.y_offset).await;
-    let _ = ch_put_vals.put_i16_process(0).await;
-    let _ = ch_auto_mode.put_i16_process(0).await;
-    let _ = ch_oper_ack.put_i16_process(0).await;
-
-    // D-spacing
-    let mut order_val = ch_order.get_f64().await;
-    let mut d_val = ch_d.get_f64().await;
-    let (mut two_d, err, msg) = calc_2d_spacing(d_val, order_val);
-    let _ = ch_msg1.put_string_process(msg).await;
-    // C calc2dSpacing sets opAlert from the Order<1 check (1/0).
-    let _ = ch_alert.put_i16_process(err as i16).await;
-
-    // Theta limits
-    let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
-    let mut theta_mot_lo = ch_theta_mot_lolim.get_f64().await;
-    let (mut theta_hi, mut theta_lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-    let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-    let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-    let (e_hi, e_lo, l_hi, l_lo) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-    let _ = ch_e_hi.put_f64_process(e_hi).await;
-    let _ = ch_e_lo.put_f64_process(e_lo).await;
-    let _ = ch_lambda_hi.put_f64_process(l_hi).await;
-    let _ = ch_lambda_lo.put_f64_process(l_lo).await;
-
-    // Initial readback
-    let theta_mot_rdbk = ch_theta_mot_rbv.get_f64().await;
-    let mut theta_rdbk_val = theta_mot_rdbk;
-    let mut lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-    let mut e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-    let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-    let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-    let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-    let mut theta_val = theta_mot_rdbk;
-    let _ = ch_theta.put_f64_process(theta_val).await;
-    let mut lambda_val = theta_to_lambda(theta_val, two_d);
-    let _ = ch_lambda.put_f64_process(lambda_val).await;
-    let mut e_val = lambda_to_energy(lambda_val);
-    let _ = ch_e.put_f64_process(e_val).await;
-
-    let mut y_offset_val = config.y_offset;
-    let mut _caused_move = false;
-
-    let _ = ch_msg1.put_string_process("ml_mono Control Ready").await;
-    let _ = ch_msg2.put_string_process(" ").await;
-
-    info!("ML mono controller initialized for {}", config.prefix);
-
-    // PV name constants for dispatch
-    let pv_e = config.pv("E");
-    let pv_lambda = config.pv("Lambda");
-    let pv_theta = config.pv("Theta");
-    let pv_order = config.pv("Order");
-    let pv_d = config.pv("D");
-    let pv_put_vals = config.pv("Put");
-    let pv_auto_mode = config.pv("Mode");
-    let pv_cc_mode = config.pv("Mode2");
-    let cc_mode_of = |m: &mut DbMultiMonitor| MlMonoMode::from_i16(m.var(&pv_cc_mode) as i16);
-    let pv_oper_ack = config.pv("OperAck");
-    let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
-    let pv_theta2_mot_rbv = config.motor_pv(&config.m_theta2, ".RBV");
-    let pv_y_mot_rbv = config.motor_pv(&config.m_y, ".RBV");
-    let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
-    let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
-    let pv_y_offset = config.pv("_yOffset");
-    let pv_e_inc = config.pv("EInc");
-    let pv_e_dec = config.pv("EDec");
-    let pv_lambda_inc = config.pv("LambdaInc");
-    let pv_lambda_dec = config.pv("LambdaDec");
-    let pv_theta_inc = config.pv("ThetaInc");
-    let pv_theta_dec = config.pv("ThetaDec");
-
-    println!(
-        "ml_monoCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
-        two_d, theta_lo, theta_hi
-    );
-
-    let mut deferred_events: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
-    // -- Main loop --
+    let mut v = Vars::new(db, cfg, alloc_origin(), &watch).await;
+    let echoes = [
+        (Z_RBV, Z_RDBK_ECHO),
+        (Y_RBV, Y_OFFSET),
+        (TH_SPEED, TH_VEL_ECHO),
+        (TH2_SPEED, TH2_VEL_ECHO),
+        (Z_SPEED, Z_VEL_ECHO),
+        (TH_CMD_MON, TH_CMD_ECHO),
+        (TH2_CMD_MON, TH2_CMD_ECHO),
+        (Z_CMD_MON, Z_CMD_ECHO),
+        (TH_DMOV, TH_DMOV_ECHO),
+        (TH2_DMOV, TH2_DMOV_ECHO),
+        (Z_DMOV, Z_DMOV_ECHO),
+    ];
     loop {
-        let mut proceed_to_theta_changed = false;
-
-        let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
-            let val = deferred_events.remove(&key).unwrap();
-            (key, val)
+        v.poll().await;
+        let fired = if pseudo.theta.swap(false, Ordering::AcqRel) {
+            Some((TH_RBV, TH_RDBK_ECHO))
+        } else if pseudo.theta2.swap(false, Ordering::AcqRel) {
+            Some((TH2_RBV, TH2_RDBK_ECHO))
         } else {
-            monitor.wait_change().await
+            echoes.into_iter().find(|&(from, _)| v.test_and_clear(from))
         };
+        match fired {
+            Some((from, to)) => v.set(to, v.val[from]).await,
+            None => tokio::select! {
+                () = v.wait(None) => {}
+                () = pseudo.wake.notified() => {}
+            },
+        }
+    }
+}
 
-        if changed_pv == pv_e {
-            e_val = new_val;
-            lambda_val = energy_to_lambda(e_val);
-            let _ = ch_lambda.put_f64_process(lambda_val).await;
-            if lambda_val > two_d {
-                let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                let _ = ch_alert.put_i16_process(1).await;
-            } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                theta_val = th;
-                let _ = ch_theta.put_f64_process(theta_val).await;
-            }
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_lambda {
-            lambda_val = new_val;
-            if lambda_val > two_d {
-                let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                let _ = ch_alert.put_i16_process(1).await;
-            } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                theta_val = th;
-                let _ = ch_theta.put_f64_process(theta_val).await;
-            }
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_theta {
-            theta_val = new_val;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_e_inc || changed_pv == pv_e_dec {
-            // C ml_monoCtl.st:711-730 — E tweak by ± ETweakVal, limit-checked,
-            // then (on success) eChanged→lChanged→thChanged recompute & move.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_e_inc;
-                let step = ch_e_tweak_val.get_f64().await;
-                let temp = e_val + step * if inc { 1.0 } else { -1.0 };
-                let e_hi = ch_e_hi.get_f64().await;
-                let e_lo = ch_e_lo.get_f64().await;
-                if temp >= e_lo && temp <= e_hi {
-                    e_val = temp;
-                    let _ = ch_e.put_f64_process(e_val).await;
-                    lambda_val = energy_to_lambda(e_val);
-                    let _ = ch_lambda.put_f64_process(lambda_val).await;
-                    if lambda_val > two_d {
-                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16_process(1).await;
-                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                        theta_val = th;
-                        let _ = ch_theta.put_f64_process(theta_val).await;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    InitSequence,
+    WaitForCmndEnter,
+    WaitForCmnd,
+    Tweak,
+    DInputChanged,
+    ThetaLimits,
+    EChanged,
+    LChanged,
+    ThChanged,
+    CalcMovements,
+    MoveMlMono,
+    CheckDone,
+    UpdateRdbk,
+    ThetaMotStopped,
+    ChkMotorLimits,
+    ChkMotorLimitsExit,
+    StopMlMono,
+    StoppedMlMonoWait,
+}
+
+/// ss ml_monoCtl and its program variables.
+struct MlMono {
+    v: Vars,
+    seq_msg1: DbChannel,
+    seq_msg2: DbChannel,
+    mot_names: [(DbChannel, String); 4],
+    y_off: f64,
+    use_set_mode: Arc<AtomicBool>,
+    pseudo: Arc<Pseudo>,
+    ml_mono_done: bool,
+    two_d: f64,
+    caused_move: bool,
+    init_seq: u8,
+    init_seq_done: bool,
+    old_th_speed: f64,
+    old_th2_speed: f64,
+    old_z_speed: f64,
+    new_th_speed: f64,
+    new_z_speed: f64,
+}
+
+impl MlMono {
+    async fn new(
+        cfg: &MlMonoConfig,
+        db: &PvDatabase,
+        use_set_mode: Arc<AtomicBool>,
+        pseudo: Arc<Pseudo>,
+    ) -> Self {
+        let origin = alloc_origin();
+        let all: Vec<usize> = (0..N_VARS).collect();
+        let ch = |suffix: &str| DbChannel::with_origin(db, &cfg.pv(suffix), origin);
+        let name = |suffix: &str, motor: &str| (ch(suffix), format!("{}{}", cfg.prefix, motor));
+        Self {
+            v: Vars::new(db, cfg, origin, &all).await,
+            seq_msg1: ch("SeqMsg1"),
+            seq_msg2: ch("SeqMsg2"),
+            mot_names: [
+                name("ThetaPv", &cfg.m_theta),
+                name("Theta2Pv", &cfg.m_theta2),
+                name("ZPv", &cfg.m_z),
+                name("YPv", &cfg.m_y),
+            ],
+            y_off: cfg.y_offset,
+            use_set_mode,
+            pseudo,
+            ml_mono_done: false,
+            two_d: 0.0,
+            caused_move: false,
+            init_seq: 0,
+            init_seq_done: false,
+            old_th_speed: 0.0,
+            old_th2_speed: 0.0,
+            old_z_speed: 0.0,
+            new_th_speed: 0.0,
+            new_z_speed: 0.0,
+        }
+    }
+
+    async fn msg1(&self, s: &str) {
+        let _ = self.seq_msg1.put_string_process(s).await;
+    }
+
+    async fn msg2(&self, s: &str) {
+        let _ = self.seq_msg2.put_string_process(s).await;
+    }
+
+    /// `x = TwoD*sin(theta/radConv)`.
+    fn lambda_of(&self, theta: f64) -> f64 {
+        self.two_d * (theta / RAD_CONV).sin()
+    }
+
+    async fn run(mut self) {
+        let mut state = State::InitSequence;
+        loop {
+            let mut delays = Delays::new();
+            state = loop {
+                self.v.poll().await;
+                if let Some(next) = self.step(state, &mut delays).await {
+                    break next;
+                }
+                let deadline = delays.next.take();
+                self.v.wait(deadline).await;
+            };
+        }
+    }
+
+    /// Evaluate `state`'s `when` clauses in order; run the first true one's
+    /// action and return its next state, or `None` when no clause is true.
+    async fn step(&mut self, state: State, d: &mut Delays) -> Option<State> {
+        let v = &mut self.v;
+        match state {
+            State::InitSequence => {
+                if self.init_seq == 0 {
+                    v.val[TH_STOP] = 1.0;
+                    v.val[TH2_STOP] = 1.0;
+                    v.val[Z_STOP] = 1.0;
+                    v.set(PUT_VALS, 0.0).await;
+                    v.set(AUTO_MODE, 0.0).await;
+                    v.set(OP_ACK, 0.0).await;
+                    v.set(Y_OFFSET, self.y_off).await;
+                    for (ch, name) in &self.mot_names {
+                        let _ = ch.put_string_process(name).await;
                     }
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1.put_string_process("E tweak exceeds limit").await;
-                    let _ = ch_alert.put_i16_process(1).await;
+                    self.init_seq = 1;
+                    return Some(State::DInputChanged);
                 }
-                let reset = if inc { &ch_e_inc } else { &ch_e_dec };
-                let _ = reset.put_i16_process(0).await;
+                if self.init_seq == 1 {
+                    self.init_seq = 2;
+                    return Some(State::ChkMotorLimits);
+                }
+                if self.init_seq == 2 {
+                    self.init_seq = 3;
+                    return Some(State::UpdateRdbk);
+                }
+                if self.init_seq == 3 && d.delay(1.0) {
+                    self.msg1("ml_mono Control Ready").await;
+                    self.msg2(" ").await;
+                    self.init_seq_done = true;
+                    let v = &mut self.v;
+                    v.set(THETA, v.val[TH_RBV]).await;
+                    return Some(State::ThChanged);
+                }
+                None
             }
-        } else if changed_pv == pv_lambda_inc || changed_pv == pv_lambda_dec {
-            // C ml_monoCtl.st:732-751 — lambda tweak by ± LTweakVal, limit-checked.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_lambda_inc;
-                let step = ch_lambda_tweak_val.get_f64().await;
-                let temp = lambda_val + step * if inc { 1.0 } else { -1.0 };
-                let l_hi = ch_lambda_hi.get_f64().await;
-                let l_lo = ch_lambda_lo.get_f64().await;
-                if temp >= l_lo && temp <= l_hi {
-                    lambda_val = temp;
-                    let _ = ch_lambda.put_f64_process(lambda_val).await;
-                    if lambda_val > two_d {
-                        let _ = ch_msg1.put_string_process("Wavelength > 2d spacing.").await;
-                        let _ = ch_alert.put_i16_process(1).await;
-                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
-                        theta_val = th;
-                        let _ = ch_theta.put_f64_process(theta_val).await;
+            State::WaitForCmndEnter => {
+                if self.init_seq_done && d.delay(0.1) {
+                    for i in [ORDER, D, E, LAMBDA, THETA] {
+                        v.flag[i] = false;
                     }
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1
-                        .put_string_process("Lambda tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
+                    for (to, from) in [
+                        (TH_RDBK_ECHO, TH_RBV),
+                        (TH2_RDBK_ECHO, TH2_RBV),
+                        (Z_RDBK_ECHO, Z_RBV),
+                        (Y_OFFSET, Y_RBV),
+                        (TH_VEL_ECHO, TH_SPEED),
+                        (TH2_VEL_ECHO, TH2_SPEED),
+                        (Z_VEL_ECHO, Z_SPEED),
+                        (TH_CMD_ECHO, TH_CMD_MON),
+                        (TH2_CMD_ECHO, TH2_CMD_MON),
+                        (Z_CMD_ECHO, Z_CMD_MON),
+                        (TH_DMOV_ECHO, TH_DMOV),
+                        (TH2_DMOV_ECHO, TH2_DMOV),
+                        (Z_DMOV_ECHO, Z_DMOV),
+                    ] {
+                        v.set(to, v.val[from]).await;
+                    }
+                    if v.on(AUTO_MODE) || self.use_set_mode.load(Ordering::Acquire) {
+                        self.put_rdbk().await;
+                    }
+                    let v = &mut self.v;
+                    v.set(OP_ACK, 0.0).await;
+                    if v.on(MOVING) && self.ml_mono_done {
+                        self.ml_mono_done = false;
+                        v.set(MOVING, 0.0).await;
+                    }
+                    return Some(State::WaitForCmnd);
                 }
-                let reset = if inc { &ch_lambda_inc } else { &ch_lambda_dec };
-                let _ = reset.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_theta_inc || changed_pv == pv_theta_dec {
-            // C ml_monoCtl.st:753-772 — theta tweak by ± thTweakVal, limit-checked.
-            if new_val as i16 != 0 {
-                let inc = changed_pv == pv_theta_inc;
-                let step = ch_theta_tweak_val.get_f64().await;
-                let temp = theta_val + step * if inc { 1.0 } else { -1.0 };
-                if temp >= theta_lo && temp <= theta_hi {
-                    theta_val = temp;
-                    let _ = ch_theta.put_f64_process(theta_val).await;
-                    proceed_to_theta_changed = true;
-                } else {
-                    let _ = ch_msg1
-                        .put_string_process("Theta tweak exceeds limit")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
+                if !self.init_seq_done {
+                    return Some(State::InitSequence);
                 }
-                let reset = if inc { &ch_theta_inc } else { &ch_theta_dec };
-                let _ = reset.put_i16_process(0).await;
+                None
             }
-        } else if changed_pv == pv_order {
-            order_val = ch_order.get_f64().await;
-            let (td, err, msg) = calc_2d_spacing(d_val, order_val);
-            two_d = td;
-            let _ = ch_msg1.put_string_process(msg).await;
-            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
-            // from the Order<1 check and dInputChanged pvPuts it
-            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16_process(err as i16).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_d {
-            d_val = ch_d.get_f64().await;
-            let (td, err, msg) = calc_2d_spacing(d_val, order_val);
-            two_d = td;
-            let _ = ch_msg1.put_string_process(msg).await;
-            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
-            // from the Order<1 check and dInputChanged pvPuts it
-            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
-            let _ = ch_alert.put_i16_process(err as i16).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_put_vals {
-            if new_val as i16 != 0 {
-                proceed_to_theta_changed = true;
-            }
-        } else if changed_pv == pv_oper_ack {
-            if new_val as i16 != 0 {
-                let _ = ch_alert.put_i16_process(0).await;
-                let _ = ch_msg1.put_string_process(" ").await;
-                let _ = ch_msg2.put_string_process(" ").await;
-                let _ = ch_oper_ack.put_i16_process(0).await;
-            }
-        } else if changed_pv == pv_theta_mot_rbv {
-            let rbv = new_val;
-            let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-        } else if changed_pv == pv_theta2_mot_rbv {
-            let _ = ch_theta2_rdbk_echo.put_f64_process(new_val).await;
-        } else if changed_pv == pv_theta_hilim {
-            theta_mot_hi = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_theta_lolim {
-            theta_mot_lo = new_val;
-            let (hi, lo) = compute_theta_limits(theta_mot_hi, theta_mot_lo);
-            theta_hi = hi;
-            theta_lo = lo;
-            let _ = ch_theta_hi.put_f64_process(theta_hi).await;
-            let _ = ch_theta_lo.put_f64_process(theta_lo).await;
-            let (eh, el, lh, ll) = compute_energy_lambda_limits(two_d, theta_hi, theta_lo);
-            let _ = ch_e_hi.put_f64_process(eh).await;
-            let _ = ch_e_lo.put_f64_process(el).await;
-            let _ = ch_lambda_hi.put_f64_process(lh).await;
-            let _ = ch_lambda_lo.put_f64_process(ll).await;
-        } else if changed_pv == pv_y_offset {
-            y_offset_val = new_val;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
-                .await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            proceed_to_theta_changed = true;
-        } else if changed_pv == pv_y_mot_rbv {
-            // C ml_monoCtl.st:1204-1207 (yMotRdbk_mon): a Y-motor readback change
-            // sets yOffset = yMotRdbk and pvPuts it; the resulting yOffset_mon
-            // (ml_monoCtl.st:689) drops to Manual mode and recomputes the Z
-            // setpoint (calcMovements zMotDesired = yOffset/tan(2θ),
-            // ml_monoCtl.st:885). A standalone Y move must retrack Z geometry,
-            // so mirror that here (a self put_f64 posts no monitor event, so the
-            // recompute is driven inline rather than via a yOffset re-trigger).
-            y_offset_val = new_val;
-            let _ = ch_y_offset.put_f64_process(y_offset_val).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg1
-                .put_string_process(&format!("y offset changed to {:.4}", y_offset_val))
-                .await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-            proceed_to_theta_changed = true;
-        }
-
-        if !proceed_to_theta_changed {
-            continue;
-        }
-
-        // -- Theta changed --
-        if theta_val <= theta_lo || theta_val >= theta_hi {
-            let _ = ch_msg1
-                .put_string_process("Theta constrained to LIMIT")
-                .await;
-            let _ = ch_alert.put_i16_process(1).await;
-            let _ = ch_auto_mode.put_i16_process(0).await;
-            let _ = ch_msg2.put_string_process("Set to Manual Mode").await;
-        }
-
-        lambda_val = theta_to_lambda(theta_val, two_d);
-        let _ = ch_lambda.put_f64_process(lambda_val).await;
-        e_val = lambda_to_energy(lambda_val);
-        let _ = ch_e.put_f64_process(e_val).await;
-
-        let current_rbv = ch_theta_mot_rbv.get_f64().await;
-        theta_rdbk_val = current_rbv;
-        lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-        e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-        let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-        let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-        let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-
-        // -- Calc movements --
-        let theta_mot_desired = theta_val;
-        let theta2_mot_desired = theta_val;
-        let z_mot_desired = calc_z_position(theta_val, y_offset_val);
-
-        let _ = ch_theta_set.put_f64_process(theta_mot_desired).await;
-        let _ = ch_theta2_set.put_f64_process(theta2_mot_desired).await;
-        let _ = ch_z_set.put_f64_process(z_mot_desired).await;
-
-        // Check Z limits
-        if !cc_mode_of(&mut monitor).z_frozen() {
-            let z_hi = ch_z_mot_hilim.get_f64().await;
-            let z_lo = ch_z_mot_lolim.get_f64().await;
-            if z_mot_desired < z_lo || z_mot_desired > z_hi {
-                let _ = ch_msg1
-                    .put_string_process("Z will exceed soft limits")
-                    .await;
-                let _ = ch_msg2.put_string_process("Setting to Manual Mode").await;
-                let _ = ch_alert.put_i16_process(1).await;
-                let _ = ch_auto_mode.put_i16_process(0).await;
-            }
-        }
-
-        // -- Move --
-        let put_requested = ch_put_vals.get_i16().await != 0;
-        if monitor.var(&pv_auto_mode) != 0.0
-            || put_requested
-            || use_set_mode.load(Ordering::Relaxed)
-        {
-            let th_speed = ch_theta_mot_velo.get_f64().await;
-            let z_speed = ch_z_mot_velo.get_f64().await;
-            // Save the pre-coordination motor speeds for restoration after the
-            // move; without it each coordinated move leaves a reduced `.VELO`
-            // that the next move reads back as its baseline, decaying the
-            // speeds geometrically toward zero. C `ml_monoCtl.st` saves
-            // oldThSpeed/oldTh2Speed/oldZSpeed (ml_monoCtl.st:905-907) and
-            // restores them once the motors stop (ml_monoCtl.st:1049-1054).
-            // Theta2 tracks Theta's speed, so read its baseline before it is
-            // overwritten below.
-            let old_th_speed = th_speed;
-            let old_th2_speed = ch_theta2_mot_velo.get_f64().await;
-            let old_z_speed = z_speed;
-            let (new_th, new_z) = coordinate_speeds(
-                theta_val - current_rbv,
-                z_mot_desired - ch_z_mot_rbv.get_f64().await,
-                th_speed,
-                z_speed,
-                cc_mode_of(&mut monitor),
-            );
-            let _ = ch_theta_mot_velo.put_f64_process(new_th).await;
-            let _ = ch_theta2_mot_velo.put_f64_process(new_th).await;
-            if !cc_mode_of(&mut monitor).z_frozen() {
-                let _ = ch_z_mot_velo.put_f64_process(new_z).await;
-            }
-
-            let _ = ch_theta_mot_cmd.put_f64_process(theta_mot_desired).await;
-            let _ = ch_theta2_mot_cmd.put_f64_process(theta2_mot_desired).await;
-            if !cc_mode_of(&mut monitor).z_frozen() {
-                let _ = ch_z_mot_cmd.put_f64_process(z_mot_desired).await;
-            }
-            let _ = ch_put_vals.put_i16_process(0).await;
-            _caused_move = true;
-
-            // Wait for motors
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let th_dmov = ch_theta_dmov.get_i16().await;
-                let th2_dmov = ch_theta2_dmov.get_i16().await;
-                let z_dmov = ch_z_dmov.get_i16().await;
-
-                if ch_theta_hls.get_i16().await != 0
-                    || ch_theta_lls.get_i16().await != 0
-                    || ch_theta2_hls.get_i16().await != 0
-                    || ch_theta2_lls.get_i16().await != 0
+            State::WaitForCmnd => {
+                if v.flag[ORDER] || v.flag[D] {
+                    v.flag[ORDER] = false;
+                    v.flag[D] = false;
+                    self.msg1("Layer Spacing Changed").await;
+                    self.msg2(" ").await;
+                    return Some(State::DInputChanged);
+                }
+                for (hi, lo, msg) in [
+                    (TH_HLM, TH_LLM, "Theta Motor Soft Limits Changed"),
+                    (TH2_HLM, TH2_LLM, "Theta2 Motor Soft Limits Changed"),
+                ] {
+                    let v = &mut self.v;
+                    if v.flag[hi] || v.flag[lo] {
+                        v.flag[hi] = false;
+                        v.flag[lo] = false;
+                        self.msg1(msg).await;
+                        self.msg2(" ").await;
+                        return Some(State::ThetaLimits);
+                    }
+                }
+                let v = &mut self.v;
+                for (rbv, echo) in [(TH_RBV, TH_RDBK_ECHO), (TH2_RBV, TH2_RDBK_ECHO)] {
+                    if v.test_and_clear(rbv) {
+                        v.set(echo, v.val[rbv]).await;
+                        return Some(State::UpdateRdbk);
+                    }
+                }
+                if v.test_and_clear(E) {
+                    return Some(State::EChanged);
+                }
+                if v.test_and_clear(LAMBDA) {
+                    return Some(State::LChanged);
+                }
+                if v.test_and_clear(THETA) {
+                    return Some(State::ThChanged);
+                }
+                if v.on(PUT_VALS) && d.delay(0.1) {
+                    return Some(State::MoveMlMono);
+                }
+                if [E_INC, E_DEC, L_INC, L_DEC, TH_INC, TH_DEC]
+                    .into_iter()
+                    .any(|i| v.on(i))
                 {
-                    let _ = ch_msg1
-                        .put_string_process("Theta Motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
+                    return Some(State::Tweak);
                 }
-                if !cc_mode_of(&mut monitor).z_frozen()
-                    && (ch_z_hls.get_i16().await != 0 || ch_z_lls.get_i16().await != 0)
-                {
-                    let _ = ch_msg1
-                        .put_string_process("Z Motor hit a limit switch!")
-                        .await;
-                    let _ = ch_alert.put_i16_process(1).await;
-                    let _ = ch_auto_mode.put_i16_process(0).await;
-                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
-                    let _ = ch_z_stop.put_i16_process(1).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    break;
+                if v.test_and_clear(Y_OFFSET) && self.init_seq_done {
+                    v.set(AUTO_MODE, 0.0).await;
+                    let msg = format!("y offset changed to {}", fmt_f(v.val[Y_OFFSET], 6));
+                    self.msg1(&msg).await;
+                    self.msg2("Set to Manual Mode").await;
+                    return Some(State::CalcMovements);
                 }
-
-                let rbv = ch_theta_mot_rbv.get_f64().await;
-                theta_rdbk_val = rbv;
-                lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-                e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-                let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-                let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-                let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-                let _ = ch_theta_rdbk_echo.put_f64_process(rbv).await;
-                let _ = ch_theta2_rdbk_echo
-                    .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
-                    .await;
-
-                if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 {
-                    break;
+                if v.on(OP_ACK) {
+                    v.set(OP_ALERT, 0.0).await;
+                    self.msg1(" ").await;
+                    self.msg2(" ").await;
+                    return Some(State::WaitForCmndEnter);
                 }
+                None
             }
-
-            // Restore the pre-coordination motor speeds now the move has
-            // stopped (C `ml_monoCtl.st` state thetaMotStopped,
-            // ml_monoCtl.st:1049-1054). Theta2 tracks Theta's speed and is
-            // restored alongside it.
-            let _ = ch_theta_mot_velo.put_f64_process(old_th_speed).await;
-            let _ = ch_theta2_mot_velo.put_f64_process(old_th2_speed).await;
-            if !cc_mode_of(&mut monitor).z_frozen() {
-                let _ = ch_z_mot_velo.put_f64_process(old_z_speed).await;
+            State::Tweak => {
+                for (inc, dec, val, step, lo, hi, msg, next) in [
+                    (
+                        E_INC,
+                        E_DEC,
+                        E,
+                        E_TWEAK,
+                        E_LO,
+                        E_HI,
+                        "E tweak exceeds limit",
+                        State::EChanged,
+                    ),
+                    (
+                        L_INC,
+                        L_DEC,
+                        LAMBDA,
+                        L_TWEAK,
+                        LAMBDA_LO,
+                        LAMBDA_HI,
+                        "Lambda tweak exceeds limit",
+                        State::LChanged,
+                    ),
+                    (
+                        TH_INC,
+                        TH_DEC,
+                        THETA,
+                        TH_TWEAK,
+                        THETA_LO,
+                        THETA_HI,
+                        "Theta tweak exceeds limit",
+                        State::ThChanged,
+                    ),
+                ] {
+                    let v = &mut self.v;
+                    if !(v.on(inc) || v.on(dec)) {
+                        continue;
+                    }
+                    let sign = if v.on(inc) { 1.0 } else { -1.0 };
+                    let temp = v.val[val] + v.val[step] * sign;
+                    if (temp >= v.val[lo]) && (temp <= v.val[hi]) {
+                        v.set(val, temp).await;
+                    } else {
+                        self.msg1(msg).await;
+                        self.v.set(OP_ALERT, 1.0).await;
+                    }
+                    let v = &mut self.v;
+                    v.set(if v.on(inc) { inc } else { dec }, 0.0).await;
+                    return Some(next);
+                }
+                None
             }
-
-            if _caused_move {
-                _caused_move = false;
+            State::DInputChanged => {
+                v.set(AUTO_MODE, 0.0).await;
+                self.msg2("Set to Manual Mode").await;
+                let (two_d, alert, msg) = calc_2d_spacing(self.v.val[D], self.v.val[ORDER]);
+                self.two_d = two_d;
+                self.v.val[OP_ALERT] = f64::from(u8::from(alert));
+                self.msg1(&msg).await;
+                self.put_e_lambda_limits().await;
+                self.v.put(OP_ALERT).await;
+                Some(State::ThChanged)
             }
-
-            // Final readback
-            let rbv = ch_theta_mot_rbv.get_f64().await;
-            theta_rdbk_val = rbv;
-            lambda_rdbk_val = theta_to_lambda(theta_rdbk_val, two_d);
-            e_rdbk_val = lambda_to_energy(lambda_rdbk_val);
-            let _ = ch_theta_rdbk.put_f64_process(theta_rdbk_val).await;
-            let _ = ch_lambda_rdbk.put_f64_process(lambda_rdbk_val).await;
-            let _ = ch_e_rdbk.put_f64_process(e_rdbk_val).await;
-            let _ = ch_moving.put_i16_process(0).await;
+            State::ThetaLimits => {
+                v.val[THETA_HI] = v.val[TH_HLM];
+                v.val[THETA_LO] = v.val[TH_LLM];
+                if v.val[THETA_HI] > 89.0 {
+                    v.val[THETA_HI] = 89.0;
+                    self.msg2("ThetaHiLim > 89 deg. (Using 89 deg.)").await;
+                }
+                if self.v.val[THETA_LO] < 0.1 {
+                    self.v.val[THETA_LO] = 0.1;
+                    self.msg2("ThetaLoLim < 0.1 deg. (Using 0.1 deg.)").await;
+                }
+                self.v.put(THETA_HI).await;
+                self.v.put(THETA_LO).await;
+                self.put_e_lambda_limits().await;
+                Some(State::CheckDone)
+            }
+            State::EChanged => {
+                v.set(LAMBDA, HC / v.val[E]).await;
+                Some(State::LChanged)
+            }
+            State::LChanged => {
+                if v.val[LAMBDA] > self.two_d {
+                    self.msg1("Wavelength > 2d spacing.").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                } else {
+                    let theta = RAD_CONV * (v.val[LAMBDA] / self.two_d).asin();
+                    v.set(THETA, theta).await;
+                }
+                Some(State::ThChanged)
+            }
+            State::ThChanged => {
+                if (v.val[THETA] <= v.val[THETA_LO]) || (v.val[THETA] >= v.val[THETA_HI]) {
+                    self.msg1("Theta constrained to LIMIT").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Set to Manual Mode").await;
+                }
+                let lambda = self.lambda_of(self.v.val[THETA]);
+                let v = &mut self.v;
+                v.set(LAMBDA, lambda).await;
+                v.set(E, HC / lambda).await;
+                self.put_rdbk().await;
+                Some(State::CalcMovements)
+            }
+            State::CalcMovements => {
+                let theta = v.val[THETA];
+                v.val[TH_DESIRED] = theta;
+                v.val[TH2_DESIRED] = theta;
+                // geom is 1 whatever GEOM says (ml_monoCtl.st:593).
+                v.val[Z_DESIRED] = v.val[Y_OFFSET] / (2.0 * theta / RAD_CONV).tan();
+                let z = v.val[Z_DESIRED];
+                if v.val[CC_MODE] != MODE_FREEZE_Z && ((z < v.val[Z_LLM]) || (z > v.val[Z_HLM])) {
+                    self.msg1("Z will exceed soft limits").await;
+                    self.msg2("Setting to Manual Mode").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                }
+                let v = &mut self.v;
+                for i in [TH_DESIRED, TH2_DESIRED, Z_DESIRED] {
+                    v.put(i).await;
+                }
+                self.old_th_speed = v.val[TH_SPEED];
+                self.old_th2_speed = v.val[TH2_SPEED];
+                self.old_z_speed = v.val[Z_SPEED];
+                let z_dist = (z - v.val[Z_RBV]).abs();
+                let th_dist = (theta - v.val[TH_RBV]).abs();
+                let mut z_time = z_dist / v.val[Z_SPEED];
+                let th_time = th_dist / v.val[TH_SPEED];
+                if v.val[CC_MODE] == MODE_FREEZE_Z {
+                    z_time = 0.0;
+                }
+                if th_time >= z_time {
+                    self.new_th_speed = v.val[TH_SPEED];
+                    self.new_z_speed = z_dist / th_time;
+                } else {
+                    self.new_th_speed = th_dist / z_time;
+                    self.new_z_speed = v.val[Z_SPEED];
+                }
+                Some(State::MoveMlMono)
+            }
+            State::MoveMlMono => {
+                if v.on(AUTO_MODE) || v.on(PUT_VALS) || self.use_set_mode.load(Ordering::Acquire) {
+                    let normal = v.val[CC_MODE] == MODE_NORMAL;
+                    v.val[TH_SPEED] = self.new_th_speed;
+                    v.val[TH2_SPEED] = self.new_th_speed;
+                    v.val[Z_SPEED] = self.new_z_speed;
+                    v.put(TH_SPEED).await;
+                    v.put(TH2_SPEED).await;
+                    if normal {
+                        v.put(Z_SPEED).await;
+                    }
+                    v.val[TH_CMD] = v.val[TH_DESIRED];
+                    v.val[TH2_CMD] = v.val[TH2_DESIRED];
+                    v.val[Z_CMD] = v.val[Z_DESIRED];
+                    v.put(TH_CMD).await;
+                    v.put(TH2_CMD).await;
+                    if normal {
+                        v.put(Z_CMD).await;
+                    }
+                    v.set(PUT_VALS, 0.0).await;
+                    self.caused_move = true;
+                    return Some(State::UpdateRdbk);
+                }
+                Some(State::WaitForCmndEnter)
+            }
+            State::CheckDone => {
+                if v.on(TH_DMOV) && v.on(TH2_DMOV) && v.on(Z_DMOV) {
+                    self.ml_mono_done = true;
+                    return Some(State::WaitForCmndEnter);
+                }
+                Some(State::UpdateRdbk)
+            }
+            State::UpdateRdbk => {
+                let all_done = v.on(TH_DMOV) && v.on(TH2_DMOV) && v.on(Z_DMOV);
+                if v.val[TH_RBV] == 0.0 || v.val[TH2_RBV] == 0.0 {
+                    self.msg1("Theta Motor Readback is 0 !").await;
+                    self.msg2(" ").await;
+                    self.v.set(OP_ALERT, 1.0).await;
+                    return Some(State::WaitForCmndEnter);
+                }
+                if all_done {
+                    self.put_rdbk().await;
+                    self.ml_mono_done = true;
+                    self.pseudo.theta.store(true, Ordering::Release);
+                    self.v.flag[TH_RBV] = false;
+                    self.pseudo.theta2.store(true, Ordering::Release);
+                    self.v.flag[TH2_RBV] = false;
+                    self.pseudo.wake.notify_one();
+                    return Some(State::ThetaMotStopped);
+                }
+                let v = &mut self.v;
+                if v.on(TH_HLS) || v.on(TH_LLS) || v.on(TH2_HLS) || v.on(TH2_LLS) {
+                    self.limit_switch("Theta Motor hit a limit switch!").await;
+                    return Some(State::StopMlMono);
+                }
+                if (v.val[CC_MODE] != MODE_FREEZE_Z) && (v.on(Z_HLS) || v.on(Z_LLS)) {
+                    self.limit_switch("Z Motor hit a limit switch!").await;
+                    return Some(State::StopMlMono);
+                }
+                if d.delay(0.1) {
+                    self.put_rdbk().await;
+                    let v = &mut self.v;
+                    v.set(TH_RDBK_ECHO, v.val[TH_RBV]).await;
+                    v.set(TH2_RDBK_ECHO, v.val[TH2_RBV]).await;
+                    return Some(State::UpdateRdbk);
+                }
+                None
+            }
+            State::ThetaMotStopped => {
+                if self.caused_move {
+                    v.val[TH_SPEED] = self.old_th_speed;
+                    v.val[TH2_SPEED] = self.old_th2_speed;
+                    v.val[Z_SPEED] = self.old_z_speed;
+                    for i in [TH_SPEED, TH2_SPEED, Z_SPEED] {
+                        v.put(i).await;
+                    }
+                    self.caused_move = false;
+                    return Some(State::WaitForCmndEnter);
+                }
+                if self.init_seq_done {
+                    v.set(OP_ALERT, 1.0).await;
+                    self.msg1("Only Theta Motor Moved").await;
+                    self.msg2("Hit MOVE to Adjust Z").await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                }
+                let theta = self.v.val[TH_RBV];
+                self.v.set(THETA, theta).await;
+                let lambda = self.lambda_of(theta);
+                self.v.set(LAMBDA, lambda).await;
+                self.v.set(E, HC / lambda).await;
+                Some(State::ThChanged)
+            }
+            State::ChkMotorLimits => {
+                v.val[OP_ALERT] = 0.0;
+                self.put_rdbk().await;
+                let v = &self.v;
+                let rbv = |i| v.val[i];
+                let mut msgs = Vec::new();
+                if v.val[CC_MODE] != MODE_FREEZE_Z {
+                    if rbv(Z_RBV) == 0.0 {
+                        msgs.push("Z Readback of 0 not reasonable");
+                    }
+                    if (rbv(Z_RBV) < v.val[Z_LLM]) || (rbv(Z_RBV) > v.val[Z_HLM]) {
+                        msgs.push("Z Readback outside Motor Limits");
+                    }
+                }
+                if rbv(Y_RBV) == 0.0 {
+                    msgs.push("Y Readback of 0 not reasonable");
+                }
+                if rbv(TH_RBV) == 0.0 {
+                    msgs.push("Theta Readback of 0 not reasonable");
+                }
+                if (rbv(TH_RBV) < v.val[TH_LLM]) || (rbv(TH_RBV) > v.val[TH_HLM]) {
+                    msgs.push("Theta Readback outside Motor Limits");
+                }
+                if rbv(TH2_RBV) == 0.0 {
+                    msgs.push("Theta2 Readback of 0 not reasonable");
+                }
+                if (rbv(TH2_RBV) < v.val[TH2_LLM]) || (rbv(TH2_RBV) > v.val[TH2_HLM]) {
+                    msgs.push("Theta2 Readback outside Motor Limits");
+                }
+                for msg in &msgs {
+                    self.msg1(msg).await;
+                }
+                if !msgs.is_empty() {
+                    self.v.val[OP_ALERT] = 1.0;
+                    self.v.put(OP_ALERT).await;
+                    self.v.set(AUTO_MODE, 0.0).await;
+                    self.msg2("Set to Manual Mode").await;
+                }
+                Some(State::ChkMotorLimitsExit)
+            }
+            State::ChkMotorLimitsExit => {
+                if !v.on(OP_ALERT) {
+                    v.put(OP_ALERT).await;
+                    self.msg1("All motors within limits").await;
+                    return Some(State::WaitForCmndEnter);
+                }
+                if d.delay(2.0) {
+                    v.put(OP_ALERT).await;
+                    self.msg2("Modify Motor Positions/Limits").await;
+                    return Some(State::ChkMotorLimits);
+                }
+                None
+            }
+            State::StopMlMono => {
+                for i in [TH_STOP, TH2_STOP, Z_STOP] {
+                    v.put(i).await;
+                }
+                Some(State::StoppedMlMonoWait)
+            }
+            State::StoppedMlMonoWait => d.delay(1.0).then_some(State::UpdateRdbk),
         }
+    }
 
-        // Update echoes
-        let _ = ch_theta_rdbk_echo
-            .put_f64_process(ch_theta_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_theta2_rdbk_echo
-            .put_f64_process(ch_theta2_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_z_rdbk_echo
-            .put_f64_process(ch_z_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_theta_vel_echo
-            .put_f64_process(ch_theta_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_theta2_vel_echo
-            .put_f64_process(ch_theta2_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_z_vel_echo
-            .put_f64_process(ch_z_mot_velo.get_f64().await)
-            .await;
-        let _ = ch_theta_dmov_echo
-            .put_i16_process(ch_theta_dmov.get_i16().await)
-            .await;
-        let _ = ch_theta2_dmov_echo
-            .put_i16_process(ch_theta2_dmov.get_i16().await)
-            .await;
-        let _ = ch_z_dmov_echo
-            .put_i16_process(ch_z_dmov.get_i16().await)
-            .await;
+    /// `thetaRdbk = thetaMotRdbk; lambdaRdbk = ...; ERdbk = ...` and their puts.
+    async fn put_rdbk(&mut self) {
+        let theta = self.v.val[TH_RBV];
+        let lambda = self.lambda_of(theta);
+        let v = &mut self.v;
+        v.val[THETA_RDBK] = theta;
+        v.val[LAMBDA_RDBK] = lambda;
+        v.val[E_RDBK] = HC / lambda;
+        for i in [THETA_RDBK, LAMBDA_RDBK, E_RDBK] {
+            v.put(i).await;
+        }
+    }
 
-        // Update y offset from readback
-        let y_rbv = ch_y_mot_rbv.get_f64().await;
-        y_offset_val = y_rbv;
-        let _ = ch_y_offset.put_f64_process(y_offset_val).await;
+    /// lambdaHi/Lo from thetaHi/Lo, then EHi/Lo, each put.
+    async fn put_e_lambda_limits(&mut self) {
+        let hi = self.lambda_of(self.v.val[THETA_HI]);
+        let lo = self.lambda_of(self.v.val[THETA_LO]);
+        let v = &mut self.v;
+        v.set(LAMBDA_HI, hi).await;
+        v.set(LAMBDA_LO, lo).await;
+        v.set(E_HI, HC / lo).await;
+        v.set(E_LO, HC / hi).await;
+    }
+
+    async fn limit_switch(&mut self, msg: &str) {
+        self.msg1(msg).await;
+        self.v.set(OP_ALERT, 1.0).await;
+        self.v.set(AUTO_MODE, 0.0).await;
+        self.msg2("Setting to Manual Mode").await;
     }
 }
 
@@ -972,110 +1077,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_calc_2d_spacing() {
-        let (two_d, err, _) = calc_2d_spacing(25.0, 1.0);
-        assert!(!err);
-        assert!((two_d - 50.0).abs() < 1e-10);
+    fn calc_2d_spacing_is_c_calc2d_spacing() {
+        let (two_d, alert, msg) = calc_2d_spacing(25.0, 1.0);
+        assert_eq!(
+            (two_d, alert, msg.as_str()),
+            (50.0, false, "New effective d spacing")
+        );
+        let (two_d, alert, msg) = calc_2d_spacing(25.0, 2.0);
+        assert_eq!(
+            (two_d, alert, msg.as_str()),
+            (25.0, false, "New effective d spacing")
+        );
+        // C divides unconditionally and words the alert with %f.
+        let (two_d, alert, msg) = calc_2d_spacing(25.0, 0.0);
+        assert_eq!(
+            (two_d, alert, msg.as_str()),
+            (f64::INFINITY, true, "Order == 0.000000?")
+        );
+        let (_, alert, msg) = calc_2d_spacing(25.0, 0.5);
+        assert_eq!((alert, msg.as_str()), (true, "Order == 0.500000?"));
     }
 
     #[test]
-    fn test_calc_2d_spacing_order2() {
-        let (two_d, err, _) = calc_2d_spacing(25.0, 2.0);
-        assert!(!err);
-        assert!((two_d - 25.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_calc_2d_spacing_invalid_order() {
-        // 0 < Order < 1: C still returns the finite (2*D)/Order with opAlert set,
-        // NOT 0.0 (which would zero the E/lambda limits).
-        let (two_d, err, _) = calc_2d_spacing(25.0, 0.5);
-        assert!(err);
-        assert!((two_d - 100.0).abs() < 1e-9);
-        // Order <= 0: guarded to avoid C's 2*D/0 infinity.
-        let (two_d0, err0, _) = calc_2d_spacing(25.0, 0.0);
-        assert!(err0);
-        assert_eq!(two_d0, 0.0);
-    }
-
-    #[test]
-    fn test_energy_lambda_roundtrip() {
-        for e in [5.0, 10.0, 20.0, 50.0] {
-            let l = energy_to_lambda(e);
-            let e2 = lambda_to_energy(l);
-            assert!((e - e2).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_lambda_to_theta() {
-        let two_d = 50.0;
-        let lambda = 2.0;
-        let theta = lambda_to_theta(lambda, two_d).unwrap();
-        // sin(theta) = 2/50 = 0.04, theta = 2.29 deg
-        assert!((theta - 2.292).abs() < 0.01, "theta={}", theta);
-    }
-
-    #[test]
-    fn test_theta_to_lambda_roundtrip() {
-        let two_d = 50.0;
-        let theta = 5.0;
-        let lambda = theta_to_lambda(theta, two_d);
-        let theta2 = lambda_to_theta(lambda, two_d).unwrap();
-        assert!((theta - theta2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_calc_z_position() {
-        // z = y_offset / tan(2*theta)
-        let z = calc_z_position(30.0, 35.0);
-        // tan(60 deg) = 1.7321
-        let expected = 35.0 / (60.0_f64 / RAD_CONV).tan();
-        assert!((z - expected).abs() < 0.01, "z={} expected={}", z, expected);
-    }
-
-    #[test]
-    fn test_compute_theta_limits() {
-        assert_eq!(compute_theta_limits(100.0, -5.0), (89.0, 0.1));
-        assert_eq!(compute_theta_limits(45.0, 5.0), (45.0, 5.0));
-    }
-
-    #[test]
-    fn test_coordinate_speeds() {
-        let (th, z) = coordinate_speeds(10.0, 20.0, 1.0, 1.0, MlMonoMode::Normal);
-        // Z takes 20s, so theta should slow to 0.5
-        assert!((th - 0.5).abs() < 1e-6);
-        assert!((z - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_coordinate_speeds_frozen() {
-        let (th, z) = coordinate_speeds(10.0, 20.0, 1.0, 1.0, MlMonoMode::FreezeZ);
-        // Z frozen, only theta matters
-        assert!((th - 1.0).abs() < 1e-6);
-        // z_delta != 0 but z_time = 0, so z_speed adjusted to theta_time
-        assert!((z - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_ml_mono_mode() {
-        assert!(!MlMonoMode::Normal.z_frozen());
-        assert!(MlMonoMode::FreezeZ.z_frozen());
-    }
-
-    #[test]
-    fn test_config_pv_names() {
+    fn config_pv_names() {
         let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 35.0, 1);
         assert_eq!(cfg.pv("E"), "xxx:ml_monoE");
         assert_eq!(cfg.motor_pv("m9", ".RBV"), "xxx:m9.RBV");
-        assert_eq!(cfg.y_offset, 35.0);
+        assert_eq!(table(&cfg).len(), N_VARS);
     }
 
     #[test]
-    fn test_config_y_offset_clamp() {
-        let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 0.5, 1);
-        assert_eq!(cfg.y_offset, 35.0); // Clamped to default
-        let cfg2 = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", 100.0, 1);
-        assert_eq!(cfg2.y_offset, 35.0); // Clamped to default
+    fn y_offset_outside_1_to_60_is_35() {
+        for (y, want) in [(0.5, 35.0), (1.0, 1.0), (60.0, 60.0), (100.0, 35.0)] {
+            let cfg = MlMonoConfig::new("xxx:", "m9", "m12", "m10", "m11", y, 1);
+            assert_eq!(cfg.y_offset, want, "Y_OFF {y}");
+        }
     }
 }

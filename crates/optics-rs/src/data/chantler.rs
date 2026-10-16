@@ -1229,22 +1229,21 @@ pub fn interpolate_mu(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
     if j < 1 || j >= kev.len() {
         return None;
     }
-    let x0 = kev[j - 1] as f64;
-    let x1 = kev[j] as f64;
-    let y0 = mu[j - 1] as f64;
-    let y1 = mu[j] as f64;
-    let frac = (energy_kev - x0) / (x1 - x0);
-    Some(y0 + frac * (y1 - y0))
+    // Both table differences are `float - float` in C, rounded to float
+    // before they meet a double.
+    let frac = (energy_kev - kev[j - 1] as f64) / (kev[j] - kev[j - 1]) as f64;
+    Some(mu[j - 1] as f64 + frac * (mu[j] - mu[j - 1]) as f64)
 }
 
-/// Compute the X-ray transmission through a filter.
+/// Compute the X-ray transmission through `thickness_um` microns of a filter,
+/// or `None` if the energy is out of range.
 ///
-/// `thickness_cm` is the filter thickness in centimetres.
-/// Returns `exp(-mu/rho * rho * thickness)`, or `None` if the energy is out of range.
-pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) -> Option<f64> {
+/// C `calcTrans` (`filterDrive.st:296-300`) goes through the absorption length
+/// in microns, and the result keeps that rounding order.
+pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_um: f64) -> Option<f64> {
     let mu = interpolate_mu(mat, energy_kev)?;
-    let rho = mat.density;
-    Some((-mu * rho * thickness_cm).exp())
+    let abs_len = 1.0 / (mat.density * mu) * 1.0e4;
+    Some((-(thickness_um / abs_len)).exp())
 }
 
 /// Absorption length in microns, for pf4's `OtherAbsorptionLength`.
@@ -1279,7 +1278,7 @@ pub fn transmission(mat: &FilterMaterial, energy_kev: f64, thickness_cm: f64) ->
 /// to `exp(-x*1000./absLen)` = `exp(-inf)` = `0.0` — reporting the blade as
 /// perfectly opaque, silently. `0.` is C's "no data" sentinel and its only
 /// consumer is a divisor that cannot tell it from a real length. See
-/// [`crate::snl::pf4::calc_blade_transmission`] for what the port does instead.
+/// [`crate::snl::pf4::recalc_filters`] for what the port does instead.
 pub fn other_absorption_length_um(mat: &FilterMaterial, energy_kev: f64) -> Option<f64> {
     // C pf4.st:644-645 — absLen = 1/(matdensity[i]*mu), cm -> microns.
     interpolate_mu(mat, energy_kev).map(|mu| (1.0 / (mat.density * mu)) * 1.0e4)
@@ -1373,7 +1372,7 @@ mod tests {
     #[test]
     fn test_transmission_cu() {
         let cu = find_material("Cu").unwrap();
-        let t = transmission(cu, 10.0, 0.001).expect("10 keV in range");
+        let t = transmission(cu, 10.0, 10.0).expect("10 keV in range");
         // Transmission should be between 0 and 1
         assert!(t > 0.0 && t < 1.0, "t = {t}");
     }
@@ -1386,6 +1385,26 @@ mod tests {
             (t - 1.0).abs() < 1e-10,
             "zero thickness should give transmission 1.0"
         );
+    }
+
+    /// `calcTrans` values read back from a C filterDrive IOC (`caget -g17`).
+    #[test]
+    fn transmission_is_c_calc_trans_to_the_bit() {
+        for (name, kev, um, c) in [
+            ("Mo", 20.0, 10.0, 0.7911141839734291),
+            ("Cu", 20.0, 20.0, 0.5478998747777004),
+            ("C", 20.0, 100.0, 0.9926070572696039),
+            ("Mo", 8.9, 10.0, 0.3055005520281409),
+            ("Cu", 8.9, 20.0, 0.5034056004194204),
+            ("C", 8.9, 100.0, 0.9469568639522092),
+        ] {
+            let mat = find_material(name).unwrap();
+            assert_eq!(
+                transmission(mat, kev, um),
+                Some(c),
+                "{um} um {name} at {kev} keV"
+            );
+        }
     }
 
     /// Relative agreement with a value produced by the C function itself.

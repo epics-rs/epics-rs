@@ -409,7 +409,7 @@ pub async fn run(
     let ch_state = DbChannel::with_origin(&db, &config.pv("state"), origin);
     let ch_doseq = DbChannel::with_origin(&db, &format!("{}.PROC", config.pv("doSeq")), origin);
 
-    let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored, origin).await;
+    let mut monitor = DbMultiMonitor::new(&db, &monitored).await;
     let subscribed = monitor.sub_count() + monitor.add_vars(&db, &vars).await;
     let assigned = monitored.len() + vars.len();
     if subscribed != assigned {

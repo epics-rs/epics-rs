@@ -77,11 +77,15 @@ async fn settled(server: &CaServer, msg1: &str) {
 }
 
 /// An E put queued with Mode=Auto already sees auto mode and drives theta,
-/// though E is taken before Mode.
+/// though E is taken before Mode. The boot's own yOffset put wakes the
+/// yOffset arm last (C kohzuIoc oracle, y at 35: "y offset changed to
+/// 35.000000", then E x1.01 drives th to 9.89998).
 #[tokio::test(flavor = "current_thread")]
 async fn an_e_put_queued_after_auto_mode_moves() {
-    let server = boot([10.0, 10.0, 0.0, 100.0]).await;
-    settled(&server, "ml_mono Control Ready").await;
+    let server = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&server, "y offset changed to 35.000000").await;
+    // Past the waitForCmndEnter that clears E 0.1 s after that pass.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let db = (**server.database()).clone();
     let e = f64_of(&server, "M:ml_monoE").await;
     // No await between the posts: on this one-thread runtime the sequencer
@@ -97,7 +101,7 @@ async fn an_e_put_queued_after_auto_mode_moves() {
     }
     for _ in 0..100 {
         let theta = f64_of(&server, "M:ml_monoTheta").await;
-        if theta != 10.0 && f64_of(&server, "M:th.VAL").await == theta {
+        if (theta - 9.89998).abs() < 1e-5 && f64_of(&server, "M:th.VAL").await == theta {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -107,6 +111,76 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         f64_of(&server, "M:ml_monoTheta").await,
         f64_of(&server, "M:th.VAL").await
     );
+}
+
+/// Write `pv` and post it as a C client's put would, with no await between.
+fn post(server: &CaServer, pv: &str, v: EpicsValue) {
+    let db = (**server.database()).clone();
+    let rec = db.get_record(pv).unwrap();
+    let mut inst = rec.write();
+    inst.record.put_field("VAL", v).unwrap();
+    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+}
+
+async fn theta_driven_to(server: &CaServer, want: f64) {
+    for _ in 0..100 {
+        let theta = f64_of(server, "M:ml_monoTheta").await;
+        if (theta - want).abs() < 1e-5 && f64_of(server, "M:th.VAL").await == theta {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "theta {} not driven: th.VAL {}",
+        f64_of(server, "M:ml_monoTheta").await,
+        f64_of(server, "M:th.VAL").await
+    );
+}
+
+/// OperAck 0 makes no waitForCmnd clause true (ml_monoCtl.st:705), so the
+/// state set stays put and the E put that follows drives theta as in C.
+#[tokio::test(flavor = "current_thread")]
+async fn an_oper_ack_0_leaves_the_e_put_after_it() {
+    let server = boot([10.0, 10.0, 35.0, 100.0]).await;
+    settled(&server, "y offset changed to 35.000000").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let e = f64_of(&server, "M:ml_monoE").await;
+    post(&server, "M:ml_monoMode", EpicsValue::Enum(1));
+    post(&server, "M:ml_monoOperAck", EpicsValue::Enum(0));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    post(&server, "M:ml_monoE", EpicsValue::Double(e * 1.01));
+    theta_driven_to(&server, 9.89998).await;
+}
+
+/// C kohzuIoc oracle, th at 0: chkMotorLimits holds the init sequence,
+/// "Theta Readback of 0 not reasonable" every 2 s until the readback moves; then "All motors
+/// within limits" and the sequence runs on to its yOffset pass.
+#[tokio::test(flavor = "current_thread")]
+async fn a_theta_readback_of_0_holds_init_in_chk_motor_limits() {
+    let server = boot([0.0, 10.0, 35.0, 100.0]).await;
+    settled(&server, "Theta Readback of 0 not reasonable").await;
+    // Two chkMotorLimits rounds: msg2 reads "Modify Motor Positions/Limits"
+    // only until the next round puts "Set to Manual Mode" right after it.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    assert_eq!(
+        string_of(&server, "M:ml_monoSeqMsg1").await,
+        "Theta Readback of 0 not reasonable"
+    );
+    assert_eq!(f64_of(&server, "M:ml_monoAlert").await, 1.0);
+
+    let db = (**server.database()).clone();
+    {
+        let rec = db.get_record("M:th").unwrap();
+        let mut inst = rec.write();
+        inst.record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<motor_rs::MotorRecord>())
+            .unwrap()
+            .pos
+            .rbv = 10.0;
+        inst.notify_field("RBV", EventMask::VALUE | EventMask::LOG);
+    }
+    settled(&server, "y offset changed to 35.000000").await;
 }
 
 async fn set_flags(server: &CaServer) -> [f64; 4] {

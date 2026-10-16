@@ -49,11 +49,11 @@ use std::sync::OnceLock;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     CommonFields, CycleHooks, CycleMarks, CyclePostMask, FieldDesc, FieldMetadataOverride, Ftype,
-    ProcessAction, ProcessContext, ProcessOutcome, Record, uniform_post_table,
+    ProcessAction, ProcessOutcome, Record, uniform_post_table,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
-pub use cycle::{McaCommand, McaDset, McaRead, McaStart, McaStatus, Nack, Sent, StampSource};
+pub use cycle::{McaCommand, McaDset, McaRead, McaStart, McaStatus, Nack, Sent, StampSites};
 
 /// C `mcaRecord.c:197` `#define NUM_ROI 32`.
 pub const NUM_ROI: usize = 32;
@@ -242,16 +242,17 @@ pub struct McaRecord {
     /// spectrum is posted — C `mcaRecord.c:735-742`).
     pub status: McaStatus,
 
-    /// C's `recGblGetTimeStamp` inputs for STIM (`:811`), from this cycle's
-    /// process context. State, not a field.
-    pub clock: cycle::StampSource,
-
     /// Where each open pass's device half stopped. State, not a field.
     pub resume: cycle::ResumeStack,
 
-    /// This pass reached a C `recGblGetTimeStamp` (`:762`, `:811`). State,
-    /// not a field.
-    pub stamp_asked: bool,
+    /// The C `recGblGetTimeStamp` sites (`:762`, `:811`) this pass reached,
+    /// which ask for its stamp. State, not a field.
+    pub stamp_sites: cycle::StampSites,
+
+    /// The sites whose ask the stamp point took, which
+    /// [`Record::time_stamped`] fills from the TIME it stored. State, not a
+    /// field.
+    pub stamp_due: cycle::StampSites,
 }
 
 impl Default for McaRecord {
@@ -322,8 +323,8 @@ impl Default for McaRecord {
             roi: std::array::from_fn(|_| Roi::default()),
             status: McaStatus::default(),
             resume: cycle::ResumeStack::default(),
-            stamp_asked: false,
-            clock: cycle::StampSource::default(),
+            stamp_sites: cycle::StampSites::default(),
+            stamp_due: cycle::StampSites::default(),
         }
     }
 }
@@ -948,8 +949,8 @@ impl Record for McaRecord {
         Ok(())
     }
 
-    /// C `process` `:793-841` — the tail of the cycle, after device support's
-    /// `read()` has run [`McaRecord::finish_device_cycle`].
+    /// C `process` `:793-841` — the tail of the cycle, after device support
+    /// has run [`McaRecord::begin_device_cycle`].
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut actions = Vec::new();
 
@@ -978,8 +979,8 @@ impl Record for McaRecord {
         }
 
         if self.acqg == 0 {
-            self.stamp_asked = true;
-            cycle::format_stim(&mut self.stim, self.clock.stamp());
+            // The value lands with the stamp.
+            self.stamp_sites.stim = true;
             self.mmap |= cycle::M_STIM;
         }
 
@@ -992,7 +993,20 @@ impl Record for McaRecord {
     }
 
     fn take_time_stamp_request(&mut self) -> bool {
-        std::mem::take(&mut self.stamp_asked)
+        self.stamp_due = std::mem::take(&mut self.stamp_sites);
+        self.stamp_due.any()
+    }
+
+    /// C reads the fresh `pmca->time` right after each stamp: RTIM at
+    /// `:763`, STIM at `:812-814`.
+    fn time_stamped(&mut self, time: WallTime) {
+        let due = std::mem::take(&mut self.stamp_due);
+        if due.rtim {
+            self.rtim = cycle::epics_seconds(time);
+        }
+        if due.stim {
+            cycle::format_stim(&mut self.stim, time);
+        }
     }
 
     /// C posts VAL only when it was marked, alarm transition or not (`:1013`).
@@ -1031,10 +1045,6 @@ impl Record for McaRecord {
 
     fn process_posted_fields(&self) -> Option<epics_base_rs::server::record::DeclaredFields> {
         Some(&PROCESS_POSTED_SET)
-    }
-
-    fn set_process_context(&mut self, ctx: &ProcessContext) {
-        self.clock = ctx.into();
     }
 
     /// C `mcaAlarm` (`:962-1003`) — the analog ladder runs on `IDTIM`, the
@@ -1305,14 +1315,21 @@ mod tests {
         }
     }
 
-    /// One pass's device half, as the framework runs it for an answer that
-    /// is not `Pending`: `read_begin`, then `read()`.
+    /// One pass's device half that no callback re-enters: its `read_begin`.
     fn pass(rec: &mut McaRecord, dset: &mut Trips) -> cycle::McaStart {
-        let start = rec.begin_device_cycle(dset, StampSource::default());
-        if start == cycle::McaStart::Synchronous {
-            rec.finish_device_cycle(dset, StampSource::default());
+        rec.begin_device_cycle(dset, false)
+    }
+
+    /// One pass as the framework runs it against callbacks that run inline:
+    /// each `Reentered` runs the nested pass, then asks again
+    /// (`DeviceDoneSource::again`). The passes' ends, innermost first.
+    fn nested_pass(rec: &mut McaRecord, dset: &mut Trips, ends: &mut Vec<cycle::McaStart>) {
+        let mut start = rec.begin_device_cycle(dset, false);
+        while start == cycle::McaStart::Reentered {
+            nested_pass(rec, dset, ends);
+            start = rec.begin_device_cycle(dset, true);
         }
-        start
+        ends.push(start);
     }
 
     /// A read completed inside its send: one pass, status then data.
@@ -1346,8 +1363,7 @@ mod tests {
             data: Some(cycle::Sent::Queued),
             ..Default::default()
         };
-        let pending = rec.begin_device_cycle(&mut dset, StampSource::default());
-        assert_eq!(pending, cycle::McaStart::Pending);
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Pending);
         assert_eq!(dset.log, ["send_status"]);
         assert_eq!((rec.rdns, rec.ertm), (1, 0.0), "the status is not in yet");
         assert_ne!(rec.mmap & cycle::M_RDNS, 0);
@@ -1355,8 +1371,7 @@ mod tests {
         rec.nack = 1;
         rec.mmap = 0;
         dset.log.clear();
-        let pending = rec.begin_device_cycle(&mut dset, StampSource::default());
-        assert_eq!(pending, cycle::McaStart::Pending);
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Pending);
         assert_eq!(dset.log, ["read_status", "send_data"]);
         assert_eq!((rec.rdns, rec.rdng, rec.read, rec.ertm), (0, 1, 0, 2.0));
         assert_eq!(rec.nack, 0);
@@ -1403,12 +1418,11 @@ mod tests {
             data: Some(cycle::Sent::Ran),
             ..Default::default()
         };
-        let clock = StampSource::default();
         let reentered = cycle::McaStart::Reentered;
-        assert_eq!(rec.begin_device_cycle(&mut dset, clock), reentered);
-        assert_eq!(rec.begin_device_cycle(&mut dset, clock), reentered);
+        assert_eq!(rec.begin_device_cycle(&mut dset, false), reentered);
+        assert_eq!(rec.begin_device_cycle(&mut dset, false), reentered);
         assert_eq!(
-            rec.begin_device_cycle(&mut dset, clock),
+            rec.begin_device_cycle(&mut dset, false),
             cycle::McaStart::Synchronous
         );
         assert_eq!(rec.read, 1, "the innermost pass runs before READ clears");
@@ -1417,12 +1431,126 @@ mod tests {
             ["send_status", "read_status", "send_data", "read_array"]
         );
         dset.log.clear();
-        for _ in 0..3 {
-            rec.finish_device_cycle(&mut dset, clock);
+        for _ in 0..2 {
+            assert_eq!(
+                rec.begin_device_cycle(&mut dset, true),
+                cycle::McaStart::Synchronous
+            );
         }
         assert_eq!(dset.log, ["read_array"], "only the data pass reads again");
         assert_eq!((rec.rdns, rec.rdng, rec.read, rec.ertm), (0, 0, 0, 2.0));
         assert_eq!(rec.resume, cycle::ResumeStack::default());
+    }
+
+    /// C sends a MODE put's PHA as `mcaData` (`:630`), which devMcaAsyn
+    /// answers by setting RDNG (`devMcaAsyn.c:287`): on a port without
+    /// `ASYN_CANBLOCK` its callback's pass reads the spectrum nested, the
+    /// status read that follows nests a second, and the outer pass ends
+    /// after them — three ends, so three FLNKs, and one spectrum read.
+    #[test]
+    fn a_pha_mode_put_run_inline_reads_the_spectrum_in_a_nested_pass() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.special("MODE", true).unwrap();
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Ran),
+            data: Some(cycle::Sent::Ran),
+            ..Default::default()
+        };
+        let mut ends = Vec::new();
+        nested_pass(&mut rec, &mut dset, &mut ends);
+        assert_eq!(ends, [cycle::McaStart::Synchronous; 3]);
+        assert_eq!(
+            dset.log,
+            ["send_data", "read_array", "send_status", "read_status"]
+        );
+        assert_eq!((rec.rdns, rec.rdng, rec.read, rec.ertm), (0, 0, 0, 2.0));
+        assert_ne!(rec.mmap & cycle::M_VAL, 0);
+        assert_eq!(rec.resume, cycle::ResumeStack::default());
+    }
+
+    /// On an `ASYN_CANBLOCK` port C queues the PHA `mcaData` with RDNG set
+    /// and goes on to the status read, which queues too (`:678-682`). The
+    /// first callback's pass enters at `read_status:` (`:523`), copies the
+    /// status and reads the spectrum; the second sends a fresh status read.
+    #[test]
+    fn a_pha_mode_put_queued_reads_the_spectrum_in_the_first_callback_pass() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.special("MODE", true).unwrap();
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Queued),
+            data: Some(cycle::Sent::Queued),
+            ..Default::default()
+        };
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Pending);
+        assert_eq!(dset.log, ["send_data", "send_status"]);
+        assert_eq!((rec.rdns, rec.rdng), (1, 1));
+
+        dset.log.clear();
+        rec.mmap = 0;
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(dset.log, ["read_status", "read_array"]);
+        assert_eq!((rec.rdns, rec.rdng), (0, 0));
+        assert_ne!(rec.mmap & cycle::M_VAL, 0);
+
+        dset.log.clear();
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Pending);
+        assert_eq!(dset.log, ["send_status"]);
+    }
+
+    /// A refused PHA `mcaData` still leaves RDNG set (`devMcaAsyn.c:287`,
+    /// `:331-336`): the pass NACKs, and `read_data:` after the status read
+    /// re-reads the old buffer and marks VAL (`:748-757`).
+    #[test]
+    fn a_refused_pha_mode_put_rereads_the_old_buffer_after_the_status_read() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.special("MODE", true).unwrap();
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Done),
+            data: None,
+            ..Default::default()
+        };
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(
+            dset.log,
+            ["send_data", "send_status", "read_status", "read_array"]
+        );
+        assert_eq!((rec.nack, rec.rdng), (1, 0));
+        assert_ne!(rec.mmap & cycle::M_VAL, 0);
+    }
+
+    /// The same refusal with the status read queued: the callback pass
+    /// lands the old buffer, as on a queued PHA.
+    #[test]
+    fn a_refused_pha_mode_put_rereads_the_old_buffer_in_the_status_callback_pass() {
+        let mut rec = loaded(8, &[0; 8]);
+        rec.special("MODE", true).unwrap();
+        let mut dset = Trips {
+            status: Some(cycle::Sent::Queued),
+            data: None,
+            ..Default::default()
+        };
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Pending);
+        assert_eq!((rec.nack, rec.rdns, rec.rdng), (1, 1, 1));
+
+        dset.log.clear();
+        rec.mmap = 0;
+        assert_eq!(pass(&mut rec, &mut dset), cycle::McaStart::Synchronous);
+        assert_eq!(dset.log, ["read_status", "read_array"]);
+        assert_eq!((rec.rdns, rec.rdng), (0, 0));
+        assert_ne!(rec.mmap & cycle::M_VAL, 0);
+    }
+
+    /// MCS and List are `mcaStartAcquire` and `mcaStopAcquire` (`:630`),
+    /// plain commands; neither reads.
+    #[test]
+    fn an_mcs_or_list_mode_put_sends_a_plain_command() {
+        for (mode, cmd) in [(1, McaCommand::StartAcquire), (2, McaCommand::StopAcquire)] {
+            let mut rec = loaded(8, &[0; 8]);
+            rec.mode = mode;
+            rec.special("MODE", true).unwrap();
+            assert_eq!(sent(&mut rec), [cmd]);
+            assert_eq!(rec.rdng, 0);
+        }
     }
 
     /// What C `:509-659` sends this cycle.
@@ -1481,7 +1609,7 @@ mod tests {
 
         rec.apply_status(status(false));
         assert_eq!(rec.acqg, 1, "still 1 — the spectrum has not landed yet");
-        rec.read_data(&mut Probe::default(), StampSource::default());
+        rec.read_data(&mut Probe::default());
         assert_eq!(rec.acqg, 1);
         rec.process().unwrap();
         assert_eq!(rec.acqg, 0, "and only now");
@@ -1552,7 +1680,7 @@ mod tests {
     fn nack_is_cleared_by_the_next_cycle() {
         let mut rec = loaded(8, &[0; 8]);
         rec.nack = 1;
-        rec.run_device_cycle(&mut Probe::default(), StampSource::default());
+        rec.run_device_cycle(&mut Probe::default());
         assert_eq!(rec.nack, 0);
         assert_ne!(rec.mmap & cycle::M_NACK, 0, "and the clear is posted");
     }
@@ -1628,7 +1756,7 @@ mod tests {
                 fail,
                 ..Default::default()
             };
-            rec.read_data(&mut probe, StampSource::default());
+            rec.read_data(&mut probe);
             assert_eq!(probe.sent, vec![McaCommand::Data]);
             assert_eq!(rec.nack, i16::from(fail), "fail={fail}");
             assert_eq!(rec.mmap & cycle::M_VAL == 0, fail, "fail={fail}");
@@ -1637,39 +1765,37 @@ mod tests {
         }
     }
 
-    /// RTIM and STIM are C's `recGblGetTimeStamp` (`:762`, `:811`): TSE -2
-    /// takes the record's TIME as it stands, TSE 0 the current time.
+    /// RTIM and STIM are read from `pmca->time` right after C's
+    /// `recGblGetTimeStamp` (`:762-763`, `:811-814`): the stamp a pass that
+    /// reached either site asked for, TSEL applied.
     #[test]
-    fn rtim_and_stim_follow_tse() {
-        use epics_base_rs::types::WallTime;
+    fn rtim_and_stim_take_the_stamped_time() {
         // 2000-01-01T00:00:00.25Z, 315532800.25 s past the EPICS epoch.
         let time = WallTime::from_unix(946_684_800, 250_000_000);
-        let run = |tse: i16| {
-            let clock = StampSource { tse, time };
-            let mut rec = loaded(8, &[0; 8]);
-            rec.read = 1;
-            rec.read_data(&mut Probe::default(), clock);
-            rec.clock = clock;
-            rec.process().unwrap();
-            (rec.rtim, rec.stim.clone())
-        };
-        let mut stim = PvString::new();
-        cycle::format_stim(&mut stim, time);
-        assert_eq!(run(-2), (315_532_800.25, stim.clone()));
-        let (rtim, now) = run(0);
-        assert!(rtim > 315_532_800.25 + 1.0e8, "{rtim}");
-        assert_ne!(now, stim);
-
-        // C's unset `{0, 0}` TIME under TSE -2.
         let mut rec = loaded(8, &[0; 8]);
         rec.read = 1;
-        rec.read_data(
-            &mut Probe::default(),
-            StampSource {
-                tse: -2,
-                time: WallTime::UNIX_EPOCH,
-            },
-        );
+        rec.read_data(&mut Probe::default());
+        rec.process().unwrap();
+        assert!(rec.take_time_stamp_request());
+        rec.time_stamped(time);
+        let mut stim = PvString::new();
+        cycle::format_stim(&mut stim, time);
+        assert_eq!((rec.rtim, rec.stim.clone()), (315_532_800.25, stim));
+        assert!(!rec.take_time_stamp_request(), "the asking cleared it");
+
+        // A poll while acquiring reaches neither site, and a later stamp
+        // does not move them.
+        rec.status.acquiring = true;
+        rec.process().unwrap();
+        assert!(!rec.take_time_stamp_request());
+        rec.time_stamped(WallTime::UNIX_EPOCH);
+        assert_eq!(rec.rtim, 315_532_800.25);
+
+        // C's unset `{0, 0}` TIME.
+        rec.read = 1;
+        rec.read_data(&mut Probe::default());
+        assert!(rec.take_time_stamp_request());
+        rec.time_stamped(WallTime::UNIX_EPOCH);
         assert_eq!(rec.rtim, 0.0);
     }
 
@@ -1697,7 +1823,7 @@ mod tests {
             assert_eq!(get(), level);
             let mut rec = loaded(8, &[0; 8]);
             rec.strt = 1;
-            rec.run_device_cycle(&mut Probe::default(), StampSource::default());
+            rec.run_device_cycle(&mut Probe::default());
             errlog_flush();
             set(0);
             std::mem::take(&mut *lines.lock().unwrap())

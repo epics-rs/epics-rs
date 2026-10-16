@@ -439,8 +439,12 @@ pub enum ReadStart {
     /// without `ASYN_CANBLOCK` runs `processUser` inline (asynManager.c:1555-
     /// 1584), and devMcaAsyn's callback calls `prset->process` from there
     /// (devMcaAsyn.c:357-382). The record is PACT; its re-entered pass runs
-    /// nested now, monitors and FLNK included, and then this pass calls
-    /// [`DeviceSupport::read`] for the rest of its own.
+    /// nested now, monitors and FLNK included, and then this pass asks
+    /// `read_begin` again with [`DeviceDoneSource::again`] set, as C's code
+    /// after that `send_msg` may send the next one, until it answers
+    /// `Synchronous` or `Pending`.
+    ///
+    /// [`DeviceDoneSource::again`]: crate::server::database::DeviceDoneSource::again
     Reentered,
 }
 

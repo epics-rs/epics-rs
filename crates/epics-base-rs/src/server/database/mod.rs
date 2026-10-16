@@ -191,16 +191,17 @@ mod tsel_stamp {
         /// and is called only on the `TSE == -2` arm, so a record that never
         /// uses device time pays nothing for it: with no SIOL to take a stamp
         /// from (`siol == NULL`, every output record) a simulating `SIMM`
-        /// stamps the current time (`recGbl.c:331-342`).
+        /// stamps the current time (`recGbl.c:331-342`). `false` is
+        /// [`Self::Withheld`], which stores nothing.
         #[inline(always)]
         pub(crate) fn stamp(
             self,
             name: &[u8],
             common: &mut CommonFields,
             simm_set: impl FnOnce() -> bool,
-        ) {
+        ) -> bool {
             let begun = common.begin_stamp();
-            self.stamp_begun(begun, name, common, simm_set);
+            self.stamp_begun(begun, name, common, simm_set)
         }
 
         /// [`Self::stamp`] for a cycle that opened its stamp earlier, so a
@@ -213,7 +214,7 @@ mod tsel_stamp {
             name: &[u8],
             common: &mut CommonFields,
             simm_set: impl FnOnce() -> bool,
-        ) {
+        ) -> bool {
             match self {
                 TselStamp::Time(time, utag) => {
                     common.time = time;
@@ -222,9 +223,9 @@ mod tsel_stamp {
                     // the event lookup does not run. Writing `TSE = -2` to get
                     // the same effect made the record report a value its `.db`
                     // never declared, and overwrote one that did.
-                    return;
+                    return true;
                 }
-                TselStamp::Withheld => return,
+                TselStamp::Withheld => return false,
                 TselStamp::None => {}
                 TselStamp::Tse(tse) => common.set_tse(tse),
                 TselStamp::Failed => {
@@ -240,11 +241,13 @@ mod tsel_stamp {
                 crate::server::record::StampMode::Event
                 | crate::server::record::StampMode::FromTsel => {
                     if common.tse() == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
-                        return device_time(common, simm_set);
+                        device_time(common, simm_set);
+                    } else {
+                        apply_timestamp(name, common);
                     }
-                    apply_timestamp(name, common);
                 }
             }
+            true
         }
     }
 

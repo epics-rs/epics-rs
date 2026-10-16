@@ -118,7 +118,7 @@ impl DeviceSupport for TwoTrips {
         _record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        if !done.pact() {
+        if !done.pact() && !done.again() {
             self.trips = 0;
         }
         Ok(if self.trips < 2 {

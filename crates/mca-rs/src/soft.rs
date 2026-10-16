@@ -16,16 +16,13 @@
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
-use epics_base_rs::server::record::{ProcessContext, Record};
+use epics_base_rs::server::record::Record;
 
-use crate::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack, StampSource};
+use crate::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack};
 
 /// `device(mca, CONSTANT, devMCA_soft, "Soft Channel")`.
 #[derive(Debug, Default)]
-pub struct SoftMca {
-    /// This cycle's `TSE`/`TIME`, for the record's read-start stamp.
-    clock: StampSource,
-}
+pub struct SoftMca;
 
 impl SoftMca {
     fn mca(record: &mut dyn Record) -> CaResult<&mut McaRecord> {
@@ -55,13 +52,8 @@ impl DeviceSupport for SoftMca {
     /// the record against this dset — see [`crate::record::cycle`] for why it
     /// is invoked from here rather than from `Record::process`.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let clock = self.clock;
-        Self::mca(record)?.run_device_cycle(self, clock);
+        Self::mca(record)?.run_device_cycle(self);
         Ok(DeviceReadOutcome::ok())
-    }
-
-    fn set_process_context(&mut self, ctx: &ProcessContext) {
-        self.clock = ctx.into();
     }
 
     /// An mca has no output: C's dset carries `send_msg` and `read_array`, and no
@@ -128,7 +120,7 @@ mod tests {
         };
         rec.init_record(0).unwrap();
         rec.init_record(1).unwrap();
-        let mut dev = SoftMca::default();
+        let mut dev = SoftMca;
         dev.init(&mut rec).unwrap();
         (dev, rec)
     }

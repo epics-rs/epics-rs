@@ -12,9 +12,9 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, ProcessContext, Record};
+use epics_base_rs::server::record::{DbLinkType, DevSup, Dset, Record};
 use epics_base_rs::types::{EpicsValue, WallTime};
-use mca_rs::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack, StampSource};
+use mca_rs::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack};
 
 static ACQUIRING: AtomicBool = AtomicBool::new(true);
 
@@ -26,10 +26,7 @@ static BUSY_MCA: DevSup = DevSup {
 };
 
 /// A device whose status reports [`ACQUIRING`].
-#[derive(Default)]
-struct Busy {
-    clock: StampSource,
-}
+struct Busy;
 
 impl DeviceSupport for Busy {
     fn dtyp(&self) -> &str {
@@ -39,16 +36,12 @@ impl DeviceSupport for Busy {
         Ok(DeviceInitOutcome::ok())
     }
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let clock = self.clock;
         let mca = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<McaRecord>())
             .unwrap();
-        mca.run_device_cycle(self, clock);
+        mca.run_device_cycle(self);
         Ok(DeviceReadOutcome::ok())
-    }
-    fn set_process_context(&mut self, ctx: &ProcessContext) {
-        self.clock = ctx.into();
     }
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
@@ -89,7 +82,7 @@ async fn time_moves_only_at_its_stamp_points() {
     let (name, factory) = mca_rs::mca_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
-        .register_device_support("mca", &BUSY_MCA, || Box::new(Busy::default()))
+        .register_device_support("mca", &BUSY_MCA, || Box::new(Busy))
         .db_string(
             r#"record(mca, "M") { field(DTYP, "Busy") field(NMAX, "4") field(NUSE, "4") }"#,
             &HashMap::new(),

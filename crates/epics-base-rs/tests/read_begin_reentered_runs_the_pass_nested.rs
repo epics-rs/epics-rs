@@ -1,17 +1,20 @@
 //! `ReadStart::Reentered` runs the re-entered pass nested, as C mca does on a
 //! port without `ASYN_CANBLOCK`: `queueRequest` runs `asynCallback` inline
 //! (asynManager.c:1555-1584), which calls `prset->process` (devMcaAsyn.c:
-//! 357-382). The passes' heads run in order and their rests innermost first,
-//! each with its own monitor and FLNK — so a READ cycle reads twice and links
-//! three times (mcaRecord.c:770-790).
+//! 357-382), each pass with its own monitor and FLNK. The outer pass then
+//! asks `read_begin` again, as C's code after that `send_msg` may send the
+//! next one (mcaRecord.c:630, then the status read): a second inline callback
+//! is a sibling nested pass, and a queued one leaves the record PACT.
 
 mod declared_rows;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::database::DeviceDoneSource;
+use epics_base_rs::runtime::task::CallbackPriority;
+use epics_base_rs::server::database::{DeviceDone, DeviceDoneSource, PvDatabase};
 use epics_base_rs::server::device_support::{
     DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
 };
@@ -19,33 +22,44 @@ use epics_base_rs::server::ioc_app::DeviceSupportContext;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::{DbLinkType, Record};
-use epics_base_rs::types::DbFieldType;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 type Log = Arc<Mutex<Vec<String>>>;
+type Queued = Arc<Mutex<Option<(DeviceDone, CallbackPriority)>>>;
 
-/// Its first two `read_begin`s complete inline; the third reads.
-struct Inline {
+#[derive(Clone, Copy)]
+enum Answer {
+    Synchronous,
+    Pending,
+    Reentered,
+}
+
+/// Answers its `read_begin`s from `script`, in call order across the nested
+/// passes; a `Pending` keeps the completion in `queued`.
+struct Scripted {
     log: Log,
-    begins: usize,
+    script: VecDeque<Answer>,
+    queued: Queued,
     reads: f64,
 }
 
-impl DeviceSupport for Inline {
+impl DeviceSupport for Scripted {
     fn read_begin(
         &mut self,
         _record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        self.begins += 1;
         self.log
             .lock()
             .unwrap()
-            .push(format!("begin pact={}", done.pact()));
-        Ok(if self.begins < 3 {
-            ReadStart::Reentered
-        } else {
-            ReadStart::Synchronous
+            .push(format!("begin pact={} again={}", done.pact(), done.again()));
+        Ok(match self.script.pop_front().expect("a scripted answer") {
+            Answer::Synchronous => ReadStart::Synchronous,
+            Answer::Reentered => ReadStart::Reentered,
+            Answer::Pending => {
+                *self.queued.lock().unwrap() = Some((done.device_done(), done.priority()));
+                ReadStart::Pending
+            }
         })
     }
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -61,7 +75,7 @@ impl DeviceSupport for Inline {
         Ok(())
     }
     fn dtyp(&self) -> &str {
-        "Inline"
+        "Scripted"
     }
 }
 
@@ -78,20 +92,30 @@ impl DeviceSupport for Sink {
     }
 }
 
-#[epics_macros_rs::epics_test]
-async fn an_inline_completion_runs_its_pass_nested() {
+struct Ioc {
+    db: Arc<PvDatabase>,
+    log: Log,
+    queued: Queued,
+}
+
+async fn ioc(script: &[Answer]) -> Ioc {
     let log: Log = Arc::default();
-    let l = Arc::clone(&log);
+    let queued: Queued = Arc::default();
+    let (l, q, script) = (Arc::clone(&log), Arc::clone(&queued), script.to_vec());
     let devices = [
-        ("ai", declared_rows::rows(&["Inline"], DbLinkType::Constant)),
+        (
+            "ai",
+            declared_rows::rows(&["Scripted"], DbLinkType::Constant),
+        ),
         ("ao", declared_rows::rows(&["Sink"], DbLinkType::Constant)),
     ];
     let (db, _) = IocBuilder::new()
         .register_dynamic_device_support(&devices, move |ctx: &DeviceSupportContext| {
             match ctx.dtyp {
-                "Inline" => Some(Box::new(Inline {
+                "Scripted" => Some(Box::new(Scripted {
                     log: Arc::clone(&l),
-                    begins: 0,
+                    script: script.iter().copied().collect(),
+                    queued: Arc::clone(&q),
                     reads: 0.0,
                 }) as Box<dyn DeviceSupport>),
                 "Sink" => Some(Box::new(Sink(Arc::clone(&l))) as Box<dyn DeviceSupport>),
@@ -100,7 +124,7 @@ async fn an_inline_completion_runs_its_pass_nested() {
         })
         .db_string(
             r#"
-            record(ai, "AI") { field(DTYP, "Inline") field(FLNK, "SINK") }
+            record(ai, "AI") { field(DTYP, "Scripted") field(FLNK, "SINK") }
             record(ao, "SINK") { field(DTYP, "Sink") }
             "#,
             &HashMap::new(),
@@ -109,8 +133,19 @@ async fn an_inline_completion_runs_its_pass_nested() {
         .build()
         .await
         .unwrap();
+    Ioc { db, log, queued }
+}
 
-    let mut val_rx = db
+fn processing(db: &PvDatabase) -> bool {
+    db.get_record("AI").unwrap().read().is_processing()
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_reentered_pass_then_synchronous_reads_in_the_outer_pass() {
+    use Answer::*;
+    let ioc = ioc(&[Reentered, Synchronous, Synchronous]).await;
+    let mut val_rx = ioc
+        .db
         .get_record("AI")
         .unwrap()
         .write()
@@ -118,28 +153,87 @@ async fn an_inline_completion_runs_its_pass_nested() {
         .unwrap();
     while val_rx.try_recv().is_ok() {}
 
-    db.process_record("AI").await.unwrap();
+    ioc.db.process_record("AI").await.unwrap();
     assert_eq!(
-        *log.lock().unwrap(),
+        *ioc.log.lock().unwrap(),
         [
-            "begin pact=false",
-            "begin pact=true",
-            "begin pact=true",
+            "begin pact=false again=false",
+            // The nested pass.
+            "begin pact=true again=false",
             "read 1",
             "flnk",
+            // The outer pass, asked again with PACT as the nested pass left it.
+            "begin pact=false again=true",
             "read 2",
-            "flnk",
-            "read 3",
             "flnk",
         ]
     );
-    // Each pass's monitor posts the value its own read left.
     let mut posted = Vec::new();
     while let Ok(e) = val_rx.try_recv() {
         posted.push(e.value().as_value().cloned().unwrap());
     }
-    assert_eq!(posted, [1.0, 2.0, 3.0].map(EpicsValue::Double));
-    let rec = db.get_record("AI").unwrap();
-    assert!(!rec.read().is_processing(), "the outer pass ends the cycle");
-    assert_eq!(db.get_pv("AI").unwrap(), EpicsValue::Double(3.0));
+    assert_eq!(posted, [1.0, 2.0].map(EpicsValue::Double));
+    assert!(!processing(&ioc.db), "the outer pass ends the cycle");
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_second_reentered_answer_runs_a_sibling_pass() {
+    use Answer::*;
+    let ioc = ioc(&[Reentered, Synchronous, Reentered, Synchronous, Synchronous]).await;
+    ioc.db.process_record("AI").await.unwrap();
+    assert_eq!(
+        *ioc.log.lock().unwrap(),
+        [
+            "begin pact=false again=false",
+            "begin pact=true again=false",
+            "read 1",
+            "flnk",
+            "begin pact=false again=true",
+            // The sibling, nested in the outer pass, not in the first one.
+            "begin pact=true again=false",
+            "read 2",
+            "flnk",
+            "begin pact=false again=true",
+            "read 3",
+            "flnk",
+        ]
+    );
+    assert_eq!(ioc.db.get_pv("AI").unwrap(), EpicsValue::Double(3.0));
+}
+
+#[epics_macros_rs::epics_test]
+async fn a_reentered_pass_then_pending_leaves_the_record_pact() {
+    use Answer::*;
+    let ioc = ioc(&[Reentered, Synchronous, Pending, Synchronous]).await;
+    ioc.db.process_record("AI").await.unwrap();
+    assert_eq!(
+        *ioc.log.lock().unwrap(),
+        [
+            "begin pact=false again=false",
+            "begin pact=true again=false",
+            "read 1",
+            "flnk",
+            "begin pact=false again=true",
+        ]
+    );
+    assert!(
+        processing(&ioc.db),
+        "the outer pass waits for its completion"
+    );
+
+    let (done, band) = ioc.queued.lock().unwrap().take().unwrap();
+    std::thread::spawn(move || done.reprocess(band).unwrap())
+        .join()
+        .unwrap();
+    for _ in 0..400 {
+        if !processing(&ioc.db) {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!processing(&ioc.db));
+    assert_eq!(
+        ioc.log.lock().unwrap()[5..],
+        ["begin pact=true again=false", "read 2", "flnk"]
+    );
 }

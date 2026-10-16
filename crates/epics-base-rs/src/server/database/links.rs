@@ -459,15 +459,16 @@ pub(crate) enum ExternalDone<'a> {
     Record(&'a super::DeviceDone),
 }
 
-/// C `processTarget`'s `psrc`: the source's frame, whose PACT reads 1 while
+/// C `processTarget`'s `psrc`: the source record, whose PACT reads 1 while
 /// the target processes (`dbDbLink.c:457`, `:514`), and the PUTF and
 /// wait-set the target takes from it.
 #[derive(Clone, Copy)]
 pub(crate) struct TargetSrc<'a> {
-    pub rec: Option<InFrame<'a>>,
+    pub rec: Option<&'a Arc<RecordCell>>,
     pub putf: bool,
     pub notify: Option<&'a Arc<NotifyWaitSet>>,
 }
+
 impl OutLinkSrc<'_> {
     /// The completion this put's external staging reports to.
     fn external_done(&self) -> ExternalDone<'_> {
@@ -2876,6 +2877,10 @@ impl PvDatabase {
         Ok(())
     }
 
+    /// C `dbDbGetValue`'s `dbScanPassive(precord, …)` (`dbDbLink.c:175`):
+    /// `processTarget` with the reader as `psrc`, so the source takes the
+    /// reader's PUTF (or RPRO when busy) and joins its put-notify, as a
+    /// forward link's target does.
     #[inline(never)]
     fn process_pp_db_source(
         &self,
@@ -2883,18 +2888,19 @@ impl PvDatabase {
         db: &crate::server::record::DbLink,
         visited: &mut ProcStack,
     ) -> DbResult {
-        if let Some(at) = self.db_link_addr(db) {
-            let is_passive = at.rec.read().common.scan == crate::server::record::ScanType::Passive;
-            if is_passive {
-                // recursive INP-link source processing within
-                // one chain — gate held by the foreign entry record.
-                let _pact = src.map(|src| src.hold_chain_pact());
-                return self
-                    .process_record_with_links_recursive_at(&at.name, &at.rec, visited)
-                    .map_err(|e| DbStatus::of_error(&e));
-            }
-        }
-        Ok(())
+        let Some(at) = self.db_link_addr(db) else {
+            return Ok(());
+        };
+        let (putf, notify) = src.map_or((false, None), |src| {
+            let reader = src.read();
+            (reader.common.putf, reader.notify.clone())
+        });
+        let src = TargetSrc {
+            rec: src,
+            putf,
+            notify: notify.as_ref(),
+        };
+        self.process_target_at(src, &at.rec, ProcessTargetGate::ScanPassive, None, visited)
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
@@ -3053,7 +3059,7 @@ impl PvDatabase {
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there. Its status is
         // `processTarget`'s return (`dbDbLink.c:511-528`).
-        let _pact = src_rec.map(|src| src.unframed().hold_chain_pact());
+        let _pact = src_rec.map(|src| src.hold_chain_pact());
         self.process_record_with_links_recursive_at(target_rec.name(), target_rec, visited)
             .map_err(|e| DbStatus::of_error(&e))
     }
@@ -3315,7 +3321,7 @@ impl PvDatabase {
         // `dbDbPutValue` returns `processTarget`'s status (`dbDbLink.c:387-392`).
         if let (Some(gate), Some(rec)) = (gate, &target) {
             let src = TargetSrc {
-                rec: source,
+                rec: source.map(|source| source.unframed()),
                 putf: src.putf,
                 notify: src.notify,
             };
@@ -4491,7 +4497,7 @@ impl PvDatabase {
                             // `dbScanFwdLink` returns nothing to the fanout.
                             if let Some(target) = self.record_at(target) {
                                 let src = TargetSrc {
-                                    rec: Some(rec),
+                                    rec: Some(rec.unframed()),
                                     putf: src_putf,
                                     notify: src_notify.as_ref(),
                                 };

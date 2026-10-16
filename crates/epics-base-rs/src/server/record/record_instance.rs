@@ -6209,12 +6209,27 @@ impl RecordInstance {
     ) {
         let record = &self.record;
         let before_siml = self.simm_before_siml_read.filter(|_| output_before_siml);
-        tsel.stamp_begun(begun, &self.name, &mut self.common, || {
+        let stored = tsel.stamp_begun(begun, &self.name, &mut self.common, || {
             !record.simulation_substitutes_input_stage()
                 && before_siml
                     .or_else(|| record.simm_value())
                     .is_some_and(|simm| simm != 0)
         });
+        if stored {
+            self.hand_cycle_stamp();
+        }
+    }
+
+    /// [`Record::time_stamped`] for a [`CycleHooks::STAMP_REQUEST`] pass whose
+    /// stamp point just stored TIME, before the pass posts. A pass that did
+    /// not ask stored nothing, so its stamp point does not get here.
+    ///
+    /// [`CycleHooks::STAMP_REQUEST`]: crate::server::record::CycleHooks::STAMP_REQUEST
+    #[inline(always)]
+    pub(crate) fn hand_cycle_stamp(&mut self) {
+        if self.has_hook(crate::server::record::CycleHooks::STAMP_REQUEST) {
+            self.record.time_stamped(self.common.time);
+        }
     }
 
     /// [`Self::invalidate_plan`] when `field` is one the plan reads. Both

@@ -12,11 +12,10 @@
 //! framework calls `DeviceSupport::read()` BEFORE `Record::process()`. So the
 //! half of C's `process` that crosses into the driver, C `:509-790`, is
 //! [`McaRecord::begin_device_cycle`], which device support's `read_begin`
-//! invokes on every pass with its [`McaDset`], and
-//! [`McaRecord::finish_device_cycle`], which its `read()` invokes: the record
-//! sends each message at C's site and decides what each answer, and each
-//! failure, means. A read whose callback re-enters the record splits the pass
-//! where C's `send_msg` returns. C `:793-841` (ROI sums, preset
+//! invokes on every pass with its [`McaDset`]: the record sends each message
+//! at C's site and decides what each answer, and each failure, means. A read
+//! whose callback re-enters the record splits the pass where C's `send_msg`
+//! returns, and the ask after the nested pass goes on from there. C `:793-841` (ROI sums, preset
 //! stop, commit ACQG, UDF, STIM, alarms, forward link) is the record's
 //! `process()`.
 //!
@@ -27,8 +26,7 @@
 use std::time::SystemTime;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::recgbl::get_time_stamp;
-use epics_base_rs::server::record::{CommonFields, ProcessContext};
+use epics_base_rs::server::record::CommonFields;
 use epics_base_rs::types::{EpicsValue, PvString, WallTime, c_cast};
 
 use super::McaRecord;
@@ -109,10 +107,12 @@ pub enum Sent {
 /// The `mcaDSET` entries the record calls (`mcaRecord.c:158-168`), each
 /// answering C's `(-1,0)=>(failure,success)` as `Err(Nack)` / `Ok`.
 pub trait McaDset {
-    /// `send_msg(pmca, command, parg)`.
+    /// `send_msg(pmca, command, parg)` for a command that is not a read:
+    /// the record sends `mcaReadStatus` and `mcaData` through
+    /// [`Self::send_read`] only.
     fn send_msg(&mut self, command: McaCommand) -> Result<(), Nack>;
     /// `send_msg(pmca, mcaReadStatus | mcaData, ...)` on the pass that
-    /// starts the read. A device that completes it inside the send keeps
+    /// starts the read, the MODE put's `mcaData` (`:630`) included. A device that completes it inside the send keeps
     /// the default: the status is then whatever [`Self::read_status`]
     /// returns, and the data is sent as a plain [`Self::send_msg`].
     fn send_read(&mut self, read: McaRead) -> Result<Sent, Nack> {
@@ -147,44 +147,46 @@ pub struct McaStatus {
     pub dead_time: f64,
 }
 
-/// Where a pass's device half stopped, for the `read()` that finishes it.
+/// Where a pass's device half stopped when a send's callback ran inline,
+/// for the ask that goes on once the nested pass is done: C's code after
+/// that `send_msg` returns.
 ///
-/// One per pass, innermost on top: a nested pass runs between its outer
-/// pass's begin and finish, as C's nested `process` calls do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One per open pass, innermost on top: a nested pass runs between its outer
+/// pass's two asks, as C's nested `process` calls do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resume {
-    /// The pass reached the tail: nothing is left for `read()`.
-    #[default]
-    Nothing,
-    /// Its status read ran inline: C's code after that `send_msg` returns.
-    AfterStatus,
-    /// Its data read ran inline: C's code after that `send_msg` returns.
-    AfterData,
+    /// After the MODE put's `mcaData` (`:630`): the start/stop sends, then
+    /// the status read.
+    Mode,
+    /// After the status read (`:678`), which reuses the `pstatus` the nested
+    /// pass filled.
+    Status,
+    /// After the data read (`:777`), which reads the data again.
+    Data,
 }
 
 /// C's nesting is at most three `process` calls deep (one per read trip).
 const RESUME_DEPTH: usize = 3;
 
-/// The open passes' resume points, for [`McaRecord::finish_device_cycle`].
+/// The open passes' resume points, for [`McaRecord::begin_device_cycle`]'s
+/// ask again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResumeStack {
-    at: [Resume; RESUME_DEPTH],
+    at: [Option<Resume>; RESUME_DEPTH],
     len: usize,
 }
 
 impl ResumeStack {
     fn push(&mut self, resume: Resume) {
         assert!(self.len < RESUME_DEPTH, "mca passes nested past C's three");
-        self.at[self.len] = resume;
+        self.at[self.len] = Some(resume);
         self.len += 1;
     }
 
-    fn pop(&mut self) -> Resume {
-        let Some(len) = self.len.checked_sub(1) else {
-            return Resume::Nothing;
-        };
+    fn pop(&mut self) -> Option<Resume> {
+        let len = self.len.checked_sub(1)?;
         self.len = len;
-        std::mem::take(&mut self.at[len])
+        self.at[len].take()
     }
 }
 
@@ -192,68 +194,62 @@ impl ResumeStack {
 /// [`epics_base_rs::server::device_support::ReadStart`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McaStart {
-    /// Run `read()` now; it calls [`McaRecord::finish_device_cycle`].
+    /// The device half is done; `read()` has nothing left.
     Synchronous,
     /// A read is queued and the pass ends with the record PACT.
     Pending,
     /// A read's callback ran inline; the pass it re-entered runs nested,
-    /// then this pass's `read()` finishes it.
+    /// then this pass asks again.
     Reentered,
 }
 
+/// How far one stretch of the device half got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// It ended the pass's device half, `Synchronous` or `Pending`.
+    Ended(McaStart),
+    /// A send's callback ran inline; the pass goes on from here.
+    Nested(Resume),
+}
+
 impl McaRecord {
-    /// C `process` `:509-790` up to the first read that is still out: every
-    /// message the cycle sends device support, at C's site and in C's
-    /// order, and what each answer means. Device support's `read_begin`
-    /// calls it on every pass, the re-entered ones included.
-    ///
-    /// `clock` is what C's `recGblGetTimeStamp` reads at the read's start.
-    pub fn begin_device_cycle(&mut self, dset: &mut impl McaDset, clock: StampSource) -> McaStart {
-        let start = self.device_head(dset, clock);
-        if start != McaStart::Pending {
-            let resume = match start {
-                McaStart::Reentered if self.rdns != 0 => Resume::AfterStatus,
-                McaStart::Reentered => Resume::AfterData,
-                _ => Resume::Nothing,
-            };
-            self.resume.push(resume);
-        }
-        start
-    }
-
-    /// The rest of the pass [`Self::begin_device_cycle`] began: C's code
-    /// after a `send_msg` whose callback already ran, which sees the
-    /// `rdns`/`rdng` the nested pass cleared (`:678`, `:777`).
-    pub fn finish_device_cycle(&mut self, dset: &mut impl McaDset, clock: StampSource) {
-        match self.resume.pop() {
-            Resume::Nothing => {}
-            Resume::AfterStatus => {
-                // C reuses `pstatus`, which the nested pass filled.
-                self.apply_status(Ok(self.status));
-                let start = self.read_data(dset, clock);
-                // The nested passes committed ACQG and cleared READ, so no
-                // read is left to start here.
-                debug_assert_eq!(start, McaStart::Synchronous);
+    /// C `process` `:509-790` up to the first read that is still out or
+    /// whose callback ran inline: every message the cycle sends device
+    /// support, at C's site and in C's order, and what each answer means.
+    /// Device support's `read_begin` calls it on every pass, the re-entered
+    /// ones included, with `again` set on the ask after a `Reentered`
+    /// answer (`DeviceDoneSource::again`), which goes on where that pass
+    /// stopped.
+    pub fn begin_device_cycle(&mut self, dset: &mut impl McaDset, again: bool) -> McaStart {
+        let step = if again {
+            match self.resume.pop() {
+                Some(at) => self.resume_at(at, dset),
+                None => {
+                    debug_assert!(false, "an ask again follows a Reentered answer");
+                    Step::Ended(McaStart::Synchronous)
+                }
             }
-            // C finds `rdng` clear and reads the data a second time (`:778-788`).
-            Resume::AfterData => {
-                self.read = 0;
-                self.mmap |= M_READ;
-                self.read_value(dset);
+        } else {
+            self.device_head(dset)
+        };
+        match step {
+            Step::Ended(start) => start,
+            Step::Nested(at) => {
+                self.resume.push(at);
+                McaStart::Reentered
             }
         }
     }
 
-    /// [`Self::begin_device_cycle`] and [`Self::finish_device_cycle`] in one,
-    /// for a device that completes every message inside its send.
-    pub fn run_device_cycle(&mut self, dset: &mut impl McaDset, clock: StampSource) {
-        let start = self.begin_device_cycle(dset, clock);
+    /// [`Self::begin_device_cycle`] for a device that completes every
+    /// message inside its send.
+    pub fn run_device_cycle(&mut self, dset: &mut impl McaDset) {
+        let start = self.begin_device_cycle(dset, false);
         debug_assert_eq!(start, McaStart::Synchronous);
-        self.finish_device_cycle(dset, clock);
     }
 
     /// C `:507-790` from the `reprocess:` label.
-    fn device_head(&mut self, dset: &mut impl McaDset, clock: StampSource) -> McaStart {
+    fn device_head(&mut self, dset: &mut impl McaDset) -> Step {
         if self.nack != 0 {
             debug_print!(1, "process: clearing NACK field\n");
             self.nack = 0;
@@ -270,71 +266,103 @@ impl McaRecord {
             // The status callback's pass: `send_msg` copies what it read.
             let status = dset.read_status(self);
             self.apply_status(status);
-            return self.read_data(dset, clock);
+            return self.read_data(dset);
         }
-        if self.rdng == 0 {
-            self.send_device_requests(dset);
-            debug_print!(5, "process: reading elapsed time, etc.\n");
-            match dset.send_read(McaRead::Status) {
-                Err(Nack) => self.apply_status(Err(Nack)),
-                Ok(Sent::Done) => {
-                    let status = dset.read_status(self);
-                    self.apply_status(status);
-                }
-                Ok(sent) => {
-                    self.rdns = 1;
-                    if sent == Sent::Queued {
-                        debug_print!(5, "process: waiting for read status callback.\n");
-                        self.mmap |= M_RDNS;
-                        return McaStart::Pending;
-                    }
-                    return McaStart::Reentered;
-                }
+        if self.rdng != 0 {
+            return self.read_data(dset);
+        }
+        if let Some(at) = self.send_device_requests(dset) {
+            return Step::Nested(at);
+        }
+        self.status_read(dset)
+    }
+
+    /// C's code after the `send_msg` a nested pass ran inside.
+    fn resume_at(&mut self, at: Resume, dset: &mut impl McaDset) -> Step {
+        match at {
+            Resume::Mode => {
+                self.send_start_stop(dset);
+                self.status_read(dset)
+            }
+            Resume::Status => {
+                // C reuses `pstatus`, which the nested pass filled.
+                self.apply_status(Ok(self.status));
+                self.read_data(dset)
+            }
+            // C finds `rdng` clear and reads the data a second time (`:778-788`).
+            Resume::Data => {
+                self.read = 0;
+                self.mmap |= M_READ;
+                self.read_value(dset);
+                Step::Ended(McaStart::Synchronous)
             }
         }
-        self.read_data(dset, clock)
+    }
+
+    /// C `read_status:` (`:660-742`).
+    fn status_read(&mut self, dset: &mut impl McaDset) -> Step {
+        debug_print!(5, "process: reading elapsed time, etc.\n");
+        match dset.send_read(McaRead::Status) {
+            Err(Nack) => self.apply_status(Err(Nack)),
+            Ok(Sent::Done) => {
+                let status = dset.read_status(self);
+                self.apply_status(status);
+            }
+            Ok(Sent::Queued) => {
+                self.rdns = 1;
+                debug_print!(5, "process: waiting for read status callback.\n");
+                self.mmap |= M_RDNS;
+                return Step::Ended(McaStart::Pending);
+            }
+            Ok(Sent::Ran) => {
+                self.rdns = 1;
+                return Step::Nested(Resume::Status);
+            }
+        }
+        self.read_data(dset)
     }
 
     /// C `read_data:` (`:744-790`).
-    pub(crate) fn read_data(&mut self, dset: &mut impl McaDset, clock: StampSource) -> McaStart {
+    pub(crate) fn read_data(&mut self, dset: &mut impl McaDset) -> Step {
         if self.rdng != 0 {
             debug_print!(5, "process: get data\n");
             self.read_value(dset);
             self.rdng = 0;
             self.mmap |= M_RDNG;
-            return McaStart::Synchronous;
+            return Step::Ended(McaStart::Synchronous);
         }
         if self.read == 0 {
-            return McaStart::Synchronous;
+            return Step::Ended(McaStart::Synchronous);
         }
         debug_print!(5, "process: initiate read.\n");
         // C records the time the read BEGAN, for clients computing counts per
-        // second across it (`:762-764`).
-        self.stamp_asked = true;
-        self.rtim = epics_seconds(clock.stamp());
+        // second across it (`:762-764`); the value lands with the stamp.
+        self.stamp_sites.rtim = true;
         self.mmap |= M_RTIM;
         let sent = dset.send_read(McaRead::Data);
         if sent == Ok(Sent::Ran) {
             // The nested pass runs inside C's `send_msg`, before `READ` clears.
             self.rdng = 1;
-            return McaStart::Reentered;
+            return Step::Nested(Resume::Data);
         }
         self.read = 0;
         self.mmap |= M_READ;
         match sent {
-            // A failed send still reads (`:767-783`).
+            // A failed send still reads (`:767-783`). C's device has already
+            // set RDNG (devMcaAsyn.c:287), so a refused queue leaves the record
+            // PACT for good; the port completes the pass with NACK instead.
             Err(Nack) => self.not_acknowledged(),
             Ok(Sent::Done) => {}
             Ok(_) => {
                 self.rdng = 1;
                 debug_print!(5, "process: waiting for read data callback.\n");
                 self.mmap |= M_RDNG;
-                return McaStart::Pending;
+                return Step::Ended(McaStart::Pending);
             }
         }
         debug_print!(5, "process: get data\n");
         self.read_value(dset);
-        McaStart::Synchronous
+        Step::Ended(McaStart::Synchronous)
     }
 
     /// C `:509-659` — everything the record does BEFORE the status read.
@@ -344,7 +372,11 @@ impl McaRecord {
     /// reason — cheaper than forcing a read back from device support), `STRT`
     /// forces `ACQG` to 1 (`:644`), and every consumed `NEWV` bit is cleared,
     /// so a message goes out once per put.
-    pub(crate) fn send_device_requests(&mut self, dset: &mut impl McaDset) {
+    ///
+    /// `Some` when the MODE put's `mcaData` ran its callback inline: the
+    /// nested pass reads the spectrum, and this one sends start and stop
+    /// from [`Resume::Mode`].
+    pub(crate) fn send_device_requests(&mut self, dset: &mut impl McaDset) -> Option<Resume> {
         // C's NEWV block, in C's field order (`:525-634`). `special()` sets one
         // bit per setup field written; `process` then sends that field's CURRENT
         // value, not the value that was written.
@@ -393,12 +425,38 @@ impl McaRecord {
 
         if self.newv & NEWV_MODE != 0 {
             self.mmap |= NEWV_MODE;
-            if let Some(cmd) = McaCommand::for_mode(self.mode) {
-                self.send_acknowledged(dset, cmd);
-            }
             self.newv &= !NEWV_MODE;
+            match McaCommand::for_mode(self.mode) {
+                // PHA is `mcaData`, a read like the one `read_data:` starts:
+                // C's device sets RDNG (devMcaAsyn.c:287) and its callback
+                // re-enters the record, which then reads the spectrum (`:524`).
+                Some(McaCommand::Data) => match dset.send_read(McaRead::Data) {
+                    Ok(Sent::Done) => {}
+                    // C goes on to the status read with RDNG set; the callback
+                    // pass lands the data.
+                    Ok(Sent::Queued) => self.rdng = 1,
+                    Ok(Sent::Ran) => {
+                        self.rdng = 1;
+                        return Some(Resume::Mode);
+                    }
+                    // C's device sets RDNG before the refused queue
+                    // (devMcaAsyn.c:287, :331-336), so `read_data:` after the
+                    // status read re-reads the old buffer and marks VAL.
+                    Err(Nack) => {
+                        self.rdng = 1;
+                        self.not_acknowledged();
+                    }
+                },
+                Some(cmd) => self.send_acknowledged(dset, cmd),
+                None => {}
+            }
         }
+        self.send_start_stop(dset);
+        None
+    }
 
+    /// C `:636-659`.
+    fn send_start_stop(&mut self, dset: &mut impl McaDset) {
         // Start and stop go last, so the status read that follows sees them —
         // C's comment at `:636` says so; the start block is `:637-654`. C
         // ignores both sends' status.
@@ -627,37 +685,18 @@ pub(crate) fn c_min(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
 }
 
-/// C `recGblGetTimeStamp(pmca)` (`recGbl.c:305-308`) for the mca's stamp
-/// points: the record's `TSE` resolved against its `TIME`, as framework
-/// context hands them to the record and to its device support.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StampSource {
-    pub tse: i16,
-    pub time: WallTime,
+/// Which of C's two `recGblGetTimeStamp` sites a pass passed: `:762`,
+/// where a read begins (RTIM), and `:811`, where acquisition is seen
+/// stopped (STIM). Both read the TIME the stamp stores, TSEL applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StampSites {
+    pub rtim: bool,
+    pub stim: bool,
 }
 
-impl Default for StampSource {
-    fn default() -> Self {
-        Self {
-            tse: 0,
-            time: WallTime::UNIX_EPOCH,
-        }
-    }
-}
-
-impl From<&ProcessContext> for StampSource {
-    fn from(ctx: &ProcessContext) -> Self {
-        Self {
-            tse: ctx.tse,
-            time: ctx.time,
-        }
-    }
-}
-
-impl StampSource {
-    /// A TSE whose event has no time keeps the old `TIME`, as C does.
-    pub fn stamp(self) -> WallTime {
-        get_time_stamp(self.tse, self.time).unwrap_or(self.time)
+impl StampSites {
+    pub fn any(self) -> bool {
+        self.rtim || self.stim
     }
 }
 

@@ -351,7 +351,7 @@ impl DeviceDone {
                 band: std::sync::atomic::AtomicU8::new(band_index(prio)),
                 generation,
                 epoch: AtomicU64::new(0),
-                outcome: std::sync::Mutex::new(None),
+                owed: std::sync::Mutex::new(Owed::default()),
             },
         ))
     }
@@ -394,8 +394,7 @@ impl DeviceDone {
         priority: crate::runtime::task::CallbackPriority,
         outcome: CaResult<()>,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        *self.0.body().outcome.lock().unwrap() = Some(Completion::Write(outcome));
-        crate::runtime::task::request_cell(priority, &self.0)
+        self.owe(priority, Completion::Write(outcome.map_err(Box::new)))
     }
 
     /// Queue the pass that ends a [`ReadStart::Pending`](crate::server::device_support::ReadStart::Pending)
@@ -406,7 +405,20 @@ impl DeviceDone {
         &self,
         priority: crate::runtime::task::CallbackPriority,
     ) -> Result<(), crate::runtime::background::CallbackError> {
-        *self.0.body().outcome.lock().unwrap() = Some(Completion::Read);
+        self.owe(priority, Completion::Read)
+    }
+
+    /// One pass per request, in order, as C's asyn callback processes the
+    /// record once per callback (devMcaAsyn.c:357-382): the band may take
+    /// this request into a run already queued, the pass it owes is not.
+    fn owe(
+        &self,
+        priority: crate::runtime::task::CallbackPriority,
+        completion: Completion,
+    ) -> Result<(), crate::runtime::background::CallbackError> {
+        if !self.0.body().owed.lock().unwrap().push(completion) {
+            return Err(crate::runtime::background::CallbackError::QueueFull);
+        }
         crate::runtime::task::request_cell(priority, &self.0)
     }
 
@@ -421,10 +433,47 @@ impl DeviceDone {
     }
 }
 
+/// The passes a [`DeviceDone`] owes, oldest first, in place: four deep,
+/// deeper than any device keeps requests in flight (devMcaAsyn queues a
+/// status and then a data read), and a request past it is refused as a full
+/// band is. The oldest sits apart, so the one-pass run takes it as a single
+/// slot; `next.is_none()` implies `behind` is empty.
+#[derive(Default)]
+struct Owed {
+    next: Option<Completion>,
+    behind: [Option<Completion>; 3],
+    behind_len: usize,
+}
+
+impl Owed {
+    fn push(&mut self, completion: Completion) -> bool {
+        if self.next.is_none() {
+            self.next = Some(completion);
+        } else if self.behind_len < self.behind.len() {
+            self.behind[self.behind_len] = Some(completion);
+            self.behind_len += 1;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn pop(&mut self) -> Option<Completion> {
+        let completion = self.next.take()?;
+        if self.behind_len != 0 {
+            self.next = self.behind[0].take();
+            self.behind.rotate_left(1);
+            self.behind_len -= 1;
+        }
+        Some(completion)
+    }
+}
+
 /// Which pass a [`DeviceDone`] request runs.
 enum Completion {
-    /// The tail after an asynchronous write, with its outcome.
-    Write(CaResult<()>),
+    /// The tail after an asynchronous write, with its outcome; the error
+    /// boxed so a success owes a pointer-sized entry, not a `CaError`.
+    Write(Result<(), Box<CaError>>),
     /// The record's `process()` re-entered after an asynchronous read.
     Read,
 }
@@ -436,6 +485,7 @@ enum Completion {
 pub struct DeviceDoneSource<'a> {
     done: &'a DeviceDone,
     pact: bool,
+    again: bool,
 }
 
 impl<'a> DeviceDoneSource<'a> {
@@ -452,17 +502,37 @@ impl<'a> DeviceDoneSource<'a> {
         Self::arm(done, true)
     }
 
+    /// The ask after a [`ReadStart::Reentered`](crate::server::device_support::ReadStart::Reentered)
+    /// pass, in the pass that answered it; `pact` is the record's PACT as the
+    /// nested pass left it.
+    pub fn asked_again(done: &'a DeviceDone, pact: bool) -> Self {
+        Self {
+            again: true,
+            ..Self::arm(done, pact)
+        }
+    }
+
     fn arm(done: &'a DeviceDone, pact: bool) -> Self {
         let body = done.0.body();
         body.epoch
             .store(body.generation.load(Ordering::Acquire), Ordering::Release);
-        Self { done, pact }
+        Self {
+            done,
+            pact,
+            again: false,
+        }
     }
 
     /// C `pr->pact` as the dset reads it: set on a pass a completion
     /// re-entered, where devAsyn's `if (!pr->pact) queueRequest` does not queue.
     pub fn pact(&self) -> bool {
         self.pact
+    }
+
+    /// Whether this pass already answered `Reentered` and ran that nested
+    /// pass: C's code after a `send_msg` whose callback ran inline.
+    pub fn again(&self) -> bool {
+        self.again
     }
 
     /// The record's band, C `pr->prio`.
@@ -495,31 +565,42 @@ struct DeviceReentry {
     /// was queued.
     generation: Arc<AtomicU64>,
     epoch: AtomicU64,
-    outcome: std::sync::Mutex<Option<Completion>>,
+    owed: std::sync::Mutex<Owed>,
 }
 
 impl crate::runtime::background::CallbackBody for DeviceReentry {
     fn run(&self) {
-        let Some(completion) = self.outcome.lock().unwrap().take() else {
-            return;
-        };
         let Some(inner) = self.db.upgrade() else {
             return;
         };
         let db = PvDatabase { inner };
-        match completion {
-            Completion::Write(outcome) => {
-                let _ = db.complete_async_write(&self.name, outcome);
+        loop {
+            let mut owed = self.owed.lock().unwrap();
+            let Some(completion) = owed.pop() else {
+                return;
+            };
+            // The cell went idle before this run, so a pass owed after the
+            // last was taken queues a run of its own.
+            let more = owed.next.is_some();
+            // Down while the pass runs: the pass may owe the next one.
+            drop(owed);
+            match completion {
+                Completion::Write(outcome) => {
+                    let _ = db.complete_async_write(&self.name, outcome.map_err(|e| *e));
+                }
+                Completion::Read => {
+                    let Some(rec) = db.get_record_no_resolve(&self.name) else {
+                        continue;
+                    };
+                    let _ = db.reenter_if_current(
+                        ProcessTarget::Resolved(&self.name, &rec),
+                        &self.generation,
+                        self.epoch.load(Ordering::Acquire),
+                    );
+                }
             }
-            Completion::Read => {
-                let Some(rec) = db.get_record_no_resolve(&self.name) else {
-                    return;
-                };
-                let _ = db.reenter_if_current(
-                    ProcessTarget::Resolved(&self.name, &rec),
-                    &self.generation,
-                    self.epoch.load(Ordering::Acquire),
-                );
+            if !more {
+                return;
             }
         }
     }
@@ -6129,26 +6210,39 @@ impl PvDatabase {
                         } else {
                             DeviceDoneSource::new(&instance.device_done)
                         };
-                        let begun = dev.read_begin(&mut *instance.record, &done);
-                        match begun {
-                            Ok(crate::server::device_support::ReadStart::Pending) => {
-                                instance.enter_pact();
-                                instance.device = Some(dev);
-                                self.apply_pact_exit(name, cycle_end.take());
-                                return Ok(());
-                            }
-                            Ok(crate::server::device_support::ReadStart::Reentered) => {
-                                instance.enter_pact();
-                                instance.device = Some(dev);
+                        let mut begun = dev.read_begin(&mut *instance.record, &done);
+                        // C mca's next `send_msg` after one whose callback ran
+                        // inline: each runs its own nested pass, siblings in
+                        // this one (mcaRecord.c:630, then the status read).
+                        while let Ok(crate::server::device_support::ReadStart::Reentered) = begun {
+                            instance.enter_pact();
+                            instance.device = Some(dev);
+                            guard.release();
+                            self.run_reentered_pass(name, guard.rec, visited);
+                            instance = guard.hold();
+                            dev = instance
+                                .device
+                                .take()
+                                .expect("the nested pass puts the device back");
+                            let done = DeviceDoneSource::asked_again(
+                                &instance.device_done,
+                                instance.is_processing(),
+                            );
+                            begun = dev.read_begin(&mut *instance.record, &done);
+                        }
+                        if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
+                            instance.enter_pact();
+                            instance.device = Some(dev);
+                            // A queued read still stamps when the pass asked:
+                            // `mcaRecord.c:762-764` ahead of the `return(0)`
+                            // at `:778`.
+                            if Self::stamp_requested(instance) {
                                 guard.release();
-                                self.run_reentered_pass(name, guard.rec, visited);
-                                instance = guard.hold();
-                                dev = instance
-                                    .device
-                                    .take()
-                                    .expect("the nested pass puts the device back");
+                                self.rec_gbl_get_time_stamp_in(guard.rec);
+                                guard.rec.write().hand_cycle_stamp();
                             }
-                            _ => {}
+                            self.apply_pact_exit(name, cycle_end.take());
+                            return Ok(());
                         }
                         let read = match begun {
                             Ok(_) => dev.read(&mut *instance.record),
@@ -6453,6 +6547,7 @@ impl PvDatabase {
                 guard.release();
                 if stamps {
                     self.rec_gbl_get_time_stamp_in(rec);
+                    rec.write().hand_cycle_stamp();
                 }
 
                 // `ReprocessAfter` for a delayed re-entry, and the record's own
@@ -6514,7 +6609,9 @@ impl PvDatabase {
                         }
                     }
                     let inst = &mut *instance;
-                    tsel.stamp(&inst.name, &mut inst.common, || false);
+                    if tsel.stamp(&inst.name, &mut inst.common, || false) {
+                        inst.hand_cycle_stamp();
+                    }
                     // The pass's posts, through the owner this path shares with
                     // `RecordInstance::process_local`.
                     let changed_fields = instance.collect_notify_posts(fields);
@@ -7773,7 +7870,7 @@ impl PvDatabase {
         };
         // `recGblFwdLink` drops `dbScanFwdLink`'s status.
         let src = super::links::TargetSrc {
-            rec: Some(rec),
+            rec: Some(rec.unframed()),
             putf,
             notify: notify.as_ref(),
         };
@@ -10778,8 +10875,11 @@ fn sim_process_tail(
     // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
     // (`recGbl.c:321`) and for any TSE but device time.
     let stamp = |inst: &mut RecordInstance| {
-        tsel.stamp(&inst.name, &mut inst.common, || false);
+        let stored = tsel.stamp(&inst.name, &mut inst.common, || false);
         siol_stamp.apply(&mut inst.common);
+        if stored {
+            inst.hand_cycle_stamp();
+        }
     };
     if !alarms_first {
         stamp(&mut *instance);
@@ -11410,5 +11510,78 @@ mod write_done_prio_tests {
         let held = rec.write();
         assert_eq!(held.common.prio, 2);
         assert_eq!(cell.priority(), CallbackPriority::High);
+    }
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use super::{Completion, Owed};
+    use crate::error::CaError;
+
+    fn tag(n: u8) -> Completion {
+        Completion::Write(Err(Box::new(CaError::Protocol(n.to_string()))))
+    }
+
+    fn drain(owed: &mut Owed) -> Vec<String> {
+        std::iter::from_fn(|| owed.pop())
+            .map(|c| match c {
+                Completion::Write(Err(e)) => e.to_string(),
+                Completion::Read => "read".into(),
+                Completion::Write(Ok(())) => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_owed_pops_nothing() {
+        assert!(Owed::default().pop().is_none());
+    }
+
+    #[test]
+    fn a_single_pass_leaves_nothing_behind_it() {
+        let mut owed = Owed::default();
+        assert!(owed.push(Completion::Read));
+        assert!(owed.pop().is_some());
+        assert!(owed.next.is_none());
+        assert!(owed.pop().is_none());
+    }
+
+    #[test]
+    fn four_passes_are_owed_in_order_and_a_fifth_is_refused() {
+        let mut owed = Owed::default();
+        for n in 1..=4 {
+            assert!(owed.push(tag(n)));
+        }
+        assert!(!owed.push(tag(5)));
+        assert_eq!(
+            drain(&mut owed),
+            [
+                "protocol error: 1",
+                "protocol error: 2",
+                "protocol error: 3",
+                "protocol error: 4"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pass_owed_after_a_pop_runs_after_the_ones_before_it() {
+        let mut owed = Owed::default();
+        assert!(owed.push(tag(1)));
+        assert!(owed.push(Completion::Read));
+        assert!(owed.push(tag(2)));
+        assert!(owed.pop().is_some());
+        assert!(owed.push(tag(3)));
+        assert!(owed.push(tag(4)));
+        assert!(!owed.push(tag(5)));
+        assert_eq!(
+            drain(&mut owed),
+            [
+                "read",
+                "protocol error: 2",
+                "protocol error: 3",
+                "protocol error: 4"
+            ]
+        );
     }
 }

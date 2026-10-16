@@ -5736,11 +5736,17 @@ pub trait Record: Send + Sync + 'static {
     /// asked once per pass at the pass's stamp point, so an answer of `true`
     /// is cleared by the asking. Only a [`CycleHooks::STAMP_REQUEST`] type is
     /// asked; its pass that answers `false` leaves TIME as it was. The stamp
-    /// lands after `process()` returns; the next pass sees it as
-    /// [`ProcessContext::time`].
+    /// lands after `process()` returns and reaches the record through
+    /// [`Self::time_stamped`].
     fn take_time_stamp_request(&mut self) -> bool {
         false
     }
+
+    /// The TIME the stamp point just stored for a pass whose
+    /// [`Self::take_time_stamp_request`] answered `true`, TSEL applied, before
+    /// the pass posts: C's code after `recGblGetTimeStamp` reads the fresh
+    /// `prec->time` (mcaRecord.c:762-764 RTIM, :811-814 STIM).
+    fn time_stamped(&mut self, _time: crate::types::WallTime) {}
 
     /// Whether this record type's support reads SIML through the `recGbl`
     /// simulation helpers (`recGblGetSimm`/`recGblInitSimm`, and therefore

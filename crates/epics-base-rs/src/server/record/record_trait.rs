@@ -2251,13 +2251,23 @@ pub enum ProcessAction {
         value: CycleValue,
     },
 
-    /// Store `field` and post it `DBE_VALUE` at this place among the cycle's
-    /// link writes, so the puts after it see the new value: scanparm's
-    /// `go = 0` between `dbPutLink(OGO)` and `dbPutLink(OLOAD)`
-    /// (`scanparmRecord.c:248-262`).
+    /// Store `field` at this place among the cycle's link writes, posted as
+    /// `post` says: the puts ahead of it see the old value and the puts after
+    /// it the new one (scanparm's `go = 0` between `dbPutLink(OGO)` and
+    /// `dbPutLink(OLOAD)`, `scanparmRecord.c:248-262`).
+    ///
+    /// Last in the list, it is a flag C clears under the `dbScanLock` its
+    /// puts ran in (`sseqRecord.c:714-792` then `:498-505`). The port
+    /// releases the data guard across the writes, so a store made in
+    /// `process()` would let `dbGetField` read `BUSY == 0` with `LNKn`
+    /// unwritten. A clear C makes after `recGblFwdLink` is a
+    /// [`Self::PutAfterEpilogue`]; a flag a later decision of the same cycle
+    /// reads keeps its `process()` store (motor's `DMOV`,
+    /// `motorRecord.cc:1509-1510`).
     PutInLinkStage {
         field: &'static str,
         value: CycleValue,
+        post: PostStage,
     },
 }
 
@@ -2270,6 +2280,35 @@ pub enum ReturnPact {
     /// Never set: the return comes ahead of `pact = TRUE`
     /// (`scanparmRecord.c:206`, `:219`).
     Clear,
+}
+
+/// Where a C `process()` calls `recGblGetTimeStamp` for its cycle
+/// ([`Record::stamp_point`]). The cycle reads TSEL at this point too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StampPoint {
+    /// Before `checkAlarms` and the outputs (`aiRecord.c:156/164`,
+    /// `aoRecord.c:190`).
+    #[default]
+    BeforeAlarms,
+    /// After `checkAlarms`, before the outputs: calcout, scalcout and
+    /// acalcout (`calcoutRecord.c:244/249`), so a failed TSEL read's LINK
+    /// alarm loses an equal-severity tie to the record's own limit alarm.
+    AfterAlarms,
+    /// After every link put of `process()`, before `monitor()`
+    /// (`tableRecord.c:594`, `scanparmRecord.c:263`). A cycle that returns a
+    /// failed put's status leaves before it and does not move TIME.
+    AfterLinkWrites,
+    /// After `monitor()` and `recGblFwdLink`: sseq's `asyncFinish`
+    /// (`sseqRecord.c:474`, `:499`, `:501`), so the VAL event carries the
+    /// previous completion's time.
+    AfterCompletion,
+}
+
+impl StampPoint {
+    /// Stamps after the record's link writes, with its own TSEL read there.
+    pub const fn is_late(self) -> bool {
+        matches!(self, Self::AfterLinkWrites | Self::AfterCompletion)
+    }
 }
 
 /// A list a record hands the framework for one cycle — the actions of
@@ -2614,9 +2653,11 @@ pub struct ProcessStatusRule {
     /// unconnected link (`dbLink.c:504-505`).
     pub ls: bool,
     pub dol: DolStatus,
-    /// The link of a [`ProcessAction::WriteDbLink`] whose `dbPutLink`
-    /// status `process()` returns (`motorRecord.cc:1495`, RLNK).
-    pub status_link: Option<&'static str>,
+    /// The links of the [`ProcessAction::WriteDbLink`]s that assign
+    /// `process()`'s returned `status`: the last of them to be put wins, a
+    /// success over an earlier failure (`motorRecord.cc:1495` RLNK,
+    /// `scanparmRecord.c:250-258` OGO then OLOAD).
+    pub status_links: &'static [&'static str],
 }
 
 impl ProcessStatusRule {
@@ -2626,7 +2667,7 @@ impl ProcessStatusRule {
         soft: SoftStatus::NONE,
         ls: false,
         dol: DolStatus::Dropped,
-        status_link: None,
+        status_links: &[],
     };
 
     /// `readValue`/`writeValue`'s status, with `soft`'s dsets passing the
@@ -2647,9 +2688,9 @@ impl ProcessStatusRule {
         Self { ls: true, ..self }
     }
 
-    pub const fn with_status_link(self, link: &'static str) -> Self {
+    pub const fn with_status_links(self, links: &'static [&'static str]) -> Self {
         Self {
-            status_link: Some(link),
+            status_links: links,
             ..self
         }
     }
@@ -2705,46 +2746,16 @@ pub struct ProcessOutcome {
     /// skip its built-in computation (e.g., PID). Replaces the `pid_done`
     /// flag pattern.
     pub device_did_compute: bool,
-    /// Field stores this cycle owes the framework, to be applied only AFTER
-    /// the cycle's queued [`ProcessAction::WriteDbLink`] have executed.
-    ///
-    /// C runs a record's `dbPutLink` calls and the completion-flag clear that
-    /// follows them inside ONE `dbScanLock` — `sseqRecord.c::processCallback`
-    /// puts `LNKn` (`:714-792`) and `asyncFinish` clears `busy` (`:498-505`)
-    /// with the lock held throughout, and `scalerRecord.c::process` clears
-    /// `cnt` (`:370`) and puts `COUT`/`COUTP` (`:457`, `:463`) in one cycle —
-    /// so `dbGetField`, which takes the same lock, can never observe the flag
-    /// clear ahead of the writes. The port cannot hold the record's data guard
-    /// across the writes (a self/cyclic OUT link would dead-lock the
-    /// non-reentrant guard), so a `process()` that both queues a write and
-    /// clears its flag exposes a state C cannot produce: `BUSY == 0` with
-    /// `LNKn` unwritten, `CNT == 0` with `COUT` unwritten.
-    ///
-    /// A record therefore does not store such a field in `process()`; it emits
-    /// it here with the [`PostStage`] that names who posts it, and the
-    /// framework stores the list, in order, once the writes have run. One
-    /// owner for one transition. A clear C makes after `recGblFwdLink` is a
-    /// [`ProcessAction::PutAfterEpilogue`] instead, so that a cycle that
-    /// raises and clears the same field (`sseqRecord.c:302-305` `busy = 1`
-    /// then an invalid `SELN` reaching `asyncFinish`) publishes both
-    /// transitions in C's order.
-    ///
-    /// Only the STORE moves. A flag whose value is an input to a later
-    /// decision in the same cycle keeps its `process()` store: motor's `DMOV`
-    /// gates `recGblFwdLink` at `motorRecord.cc:1509-1510`, so it is read after
-    /// it is set and does not belong here.
-    pub post_write_fields: Vec<(PostStage, String, EpicsValue)>,
     /// The status the record's own `process()` returns: epid's `do_pid`
     /// status (`epidRecord.c:214`), aao's failed DOL (`aaoRecord.c:167-168`).
     /// The framework's statuses are [`Record::process_status_rule`]'s.
     pub status: crate::error::DbResult,
 }
 
-/// Who posts a [`ProcessOutcome::post_write_fields`] entry, stored after the
-/// cycle's link writes.
+/// Who posts a [`ProcessAction::PutInLinkStage`] store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostStage {
-    /// Posted there, `DBE_VALUE` (`sseqRecord.c:304`).
+    /// Posted there, `DBE_VALUE` (`sseqRecord.c:304`, `scanparmRecord.c:250`).
     Output,
     /// Posted by the cycle's `monitor()` change walk with the field's mask,
     /// after `recGblResetAlarms` (`asyncFinish`'s `abort`/`aborting`,
@@ -2760,7 +2771,6 @@ impl ProcessOutcome {
             result: RecordProcessResult::Complete,
             actions: Vec::new(),
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -2771,7 +2781,6 @@ impl ProcessOutcome {
             result: RecordProcessResult::Complete,
             actions,
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -2784,7 +2793,6 @@ impl ProcessOutcome {
             result: RecordProcessResult::CompleteNoEmit { raise: None },
             actions: Vec::new(),
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -2814,7 +2822,6 @@ impl ProcessOutcome {
             result: RecordProcessResult::CompleteAlarmOnly,
             actions: Vec::new(),
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -2825,7 +2832,6 @@ impl ProcessOutcome {
             result: RecordProcessResult::AsyncPending,
             actions: Vec::new(),
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -4388,22 +4394,9 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
-    /// C parity: a record whose completion restamps `TIME` AFTER the VAL
-    /// monitor post and the forward link, not before the value post like
-    /// every standard record (`aoRecord.c:190` stamps ahead of `writeValue`).
-    ///
-    /// Only sseq's `asyncFinish` (`sseqRecord.c`) has this ordering: it posts
-    /// VAL at `:474`, runs `recGblFwdLink` at `:499`, and only then calls
-    /// `recGblGetTimeStamp` at `:501`. So the first VAL monitor event carries
-    /// the record's pre-update timestamp, and `TIME` advances only for the
-    /// following BUSY post and the next cycle — the VAL timestamp always lags
-    /// one completion behind. The framework's synchronous `Complete` tail
-    /// consults this to skip the pre-output restamp and apply it after the
-    /// forward-link tail instead. Default false: every other record (including
-    /// the base `seq`, whose `seqRecord.c:224` restamps BEFORE the `:229` VAL
-    /// post) stamps before the value post.
-    fn restamps_time_after_completion(&self) -> bool {
-        false
+    /// Where this type's cycle stamps TIME; see [`StampPoint`].
+    fn stamp_point(&self) -> StampPoint {
+        StampPoint::BeforeAlarms
     }
 
     /// Whether this output's `recGblGetTimeStampSimm(prec, prec->simm, NULL)`
@@ -4412,15 +4405,6 @@ pub trait Record: Send + Sync + 'static {
     /// `recGblGetSimm` reads SIML, so the stamp sees the previous cycle's
     /// SIMM unless this is true, and this cycle's when it is.
     fn stamps_after_write(&self) -> bool {
-        false
-    }
-
-    /// C `process()` order of `recGblGetTimeStamp` against `checkAlarms`. Every
-    /// record stamps first (`aiRecord.c:156/164`); calcout, scalcout and
-    /// acalcout run `checkAlarms` first (`calcoutRecord.c:244/249`), so a
-    /// failed TSEL read's LINK alarm loses an equal-severity tie to the
-    /// record's own limit alarm there.
-    fn alarms_before_stamp(&self) -> bool {
         false
     }
 
@@ -5757,9 +5741,11 @@ pub trait Record: Send + Sync + 'static {
     }
 
     /// Whether this cycle's `monitor()` runs `recGblResetAlarms`. Only a
-    /// [`CycleHooks::MONITOR_RESET`] type is asked; a cycle that answers
+    /// [`CycleHooks::MONITOR_RESET`] type is asked, once, on a cycle that
+    /// reaches `monitor()`, so it may advance the state C's `monitor()` keeps
+    /// (scanparm `lstp = step`, `scanparmRecord.c:282`). A cycle that answers
     /// `false` leaves the pending NSTA/NSEV for the next reset.
-    fn monitor_resets_alarms(&self) -> bool {
+    fn monitor_resets_alarms(&mut self) -> bool {
         true
     }
 

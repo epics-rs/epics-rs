@@ -719,8 +719,8 @@ impl Record for CalcoutRecord {
         MLST => mlst,
         DLYA => dlya);
 
-    fn alarms_before_stamp(&self) -> bool {
-        true
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterAlarms
     }
 
     /// C posts these only from `checkLinks` (`calcoutRecord.c:404`, `:752`,
@@ -1086,7 +1086,6 @@ impl Record for CalcoutRecord {
                 result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             });
         }

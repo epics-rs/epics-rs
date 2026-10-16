@@ -405,7 +405,6 @@ impl Record for BoRecord {
             result: crate::server::record::RecordProcessResult::Complete,
             actions,
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         })
     }

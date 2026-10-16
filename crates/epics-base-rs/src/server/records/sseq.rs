@@ -549,16 +549,17 @@ impl SseqRecord {
     /// Build the selection mask and start a sequence (C `process`, the
     /// `!pact` branch). Returns the first step's scheduling outcome, or a
     /// `Complete` (running the forward link) when nothing is selected.
-    fn start_sequence(
-        &mut self,
-        live: &mut Vec<(PostStage, String, EpicsValue)>,
-    ) -> ProcessOutcome {
+    fn start_sequence(&mut self, live: &mut Vec<ProcessAction>) -> ProcessOutcome {
         // C `process` (sseqRecord.c:302-305) raises `busy` at the top of a
         // start, before the selection is resolved — so an invalid selection
         // posts the same `busy` 1→0 transition C does.
         if self.busy == 0 {
             self.busy = 1;
-            live.push((PostStage::Output, "BUSY".to_string(), EpicsValue::Short(1)));
+            live.push(ProcessAction::PutInLinkStage {
+                field: "BUSY",
+                value: CycleValue::Short(1),
+                post: PostStage::Output,
+            });
             // The stand-in for C's 0.5s `checkLinks` re-poll, which C keeps
             // armed only while `linkStat == LINKS_NOT_OK` (sseqRecord.c:955):
             // some link still classifies EXT_NC. A record whose links all
@@ -587,17 +588,15 @@ impl SseqRecord {
                 return self.finish(live);
             }
         }
-        // C `process` (sseqRecord.c:339-344) clears every `waiting` flag
-        // before building the list.
-        for i in 0..NUM_STEPS {
-            if self.steps[i].waiting != 0 {
-                self.steps[i].waiting = 0;
-                live.push((
-                    PostStage::Output,
-                    WTG_FIELDS[i].to_string(),
-                    EpicsValue::Short(0),
-                ));
-            }
+        // C `process` (sseqRecord.c:339-344) clears and posts every `waiting`
+        // flag before building the list, the ones already 0 too.
+        for (step, field) in self.steps.iter_mut().zip(WTG_FIELDS) {
+            step.waiting = 0;
+            live.push(ProcessAction::PutInLinkStage {
+                field,
+                value: CycleValue::Short(0),
+                post: PostStage::Output,
+            });
         }
         // Fresh per-sequence concurrency state: the in-flight put-callback set
         // (C `pcb->plinkGroups` re-initialised each `process`) and the wake
@@ -628,7 +627,6 @@ impl SseqRecord {
             result: RecordProcessResult::AsyncPending,
             actions: Vec::new(),
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -639,7 +637,7 @@ impl SseqRecord {
     /// `WTGn` here, under the record lock, so the post always belongs to the
     /// current sequence (C `putCallbackCB` posts `waiting=0`, but doing it
     /// owner-side keeps a stale waiter from clobbering a fresh sequence).
-    fn prune_done(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) {
+    fn prune_done(&mut self, live: &mut Vec<ProcessAction>) {
         let mut done_steps = Vec::new();
         self.in_flight.retain(|f| {
             if f.done.load(Ordering::SeqCst) {
@@ -652,11 +650,11 @@ impl SseqRecord {
         for i in done_steps {
             if self.steps[i].waiting != 0 {
                 self.steps[i].waiting = 0;
-                live.push((
-                    PostStage::Output,
-                    WTG_FIELDS[i].to_string(),
-                    EpicsValue::Short(0),
-                ));
+                live.push(ProcessAction::PutInLinkStage {
+                    field: WTG_FIELDS[i],
+                    value: CycleValue::Short(0),
+                    post: PostStage::Output,
+                });
             }
         }
     }
@@ -681,10 +679,7 @@ impl SseqRecord {
     /// Advance the sequence from the current cursor (C `processNextLink`):
     /// prune completed put-callbacks, then either finish, drain, block on a
     /// barrier, or schedule the current step's `DLYn` delay.
-    fn advance_sequence(
-        &mut self,
-        live: &mut Vec<(PostStage, String, EpicsValue)>,
-    ) -> ProcessOutcome {
+    fn advance_sequence(&mut self, live: &mut Vec<ProcessAction>) -> ProcessOutcome {
         self.prune_done(live);
         if self.cursor >= self.active.len() {
             // C `processNextLink` plinkGroupCurrent == NULL (sseqRecord.c:
@@ -715,7 +710,6 @@ impl SseqRecord {
             result: RecordProcessResult::AsyncPending,
             actions: vec![ProcessAction::ReprocessAfter(dly)],
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         }
     }
@@ -766,10 +760,7 @@ impl SseqRecord {
     /// Both put seams then carry the buffer this one decision produced — the
     /// framework never re-resolves the target and never makes a second,
     /// possibly different, no-put call.
-    fn fire_current_step(
-        &mut self,
-        live: &mut Vec<(PostStage, String, EpicsValue)>,
-    ) -> ProcessOutcome {
+    fn fire_current_step(&mut self, live: &mut Vec<ProcessAction>) -> ProcessOutcome {
         let i = self.active[self.cursor];
         let buffer = self.typed_output_buffer(LNK_FIELDS[i], &self.steps[i].lnk_target);
         // C `processCallback` (sseqRecord.c:717,739,763) uses the
@@ -858,7 +849,7 @@ impl SseqRecord {
         &mut self,
         i: usize,
         value: EpicsValue,
-        live: &mut Vec<(PostStage, String, EpicsValue)>,
+        live: &mut Vec<ProcessAction>,
     ) -> bool {
         let admitted = match &self.async_ctx {
             Some((_, handle)) => handle.put_link_admitted(&self.steps[i].lnk),
@@ -868,16 +859,20 @@ impl SseqRecord {
         };
         if !admitted {
             self.abort = 1;
-            live.push((PostStage::Output, "ABORT".to_string(), EpicsValue::Short(1)));
+            live.push(ProcessAction::PutInLinkStage {
+                field: "ABORT",
+                value: CycleValue::Short(1),
+                post: PostStage::Output,
+            });
             println!("sseq:processCallback: dbCaPutLinkCallback for link {i} failed.  Aborting.");
             return false;
         }
         self.steps[i].waiting = 1;
-        live.push((
-            PostStage::Output,
-            WTG_FIELDS[i].to_string(),
-            EpicsValue::Short(1),
-        ));
+        live.push(ProcessAction::PutInLinkStage {
+            field: WTG_FIELDS[i],
+            value: CycleValue::Short(1),
+            post: PostStage::Output,
+        });
         let done = Arc::new(AtomicBool::new(false));
         self.in_flight.push(InFlight {
             step: i,
@@ -947,7 +942,7 @@ impl SseqRecord {
     /// end path under `pR->abort`): no new step fires; prune completed
     /// callbacks and finish once they have all drained, otherwise stay
     /// blocked and let the next completion wake the finish.
-    fn drain_abort(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) -> ProcessOutcome {
+    fn drain_abort(&mut self, live: &mut Vec<ProcessAction>) -> ProcessOutcome {
         self.prune_done(live);
         if self.in_flight.is_empty() {
             return self.finish(live);
@@ -970,7 +965,7 @@ impl SseqRecord {
     /// the framework runs after `process()` returns, so storing the clears
     /// now would expose `BUSY == 0` with `LNKn` unwritten — a state C cannot
     /// produce. The `waiting`, `abort` and `aborting` clears travel out as
-    /// [`ProcessOutcome::post_write_fields`], stored once the writes have run;
+    /// [`ProcessAction::PutInLinkStage`] after them, stored once they have run;
     /// `monitor()`'s walk posts `abort` and `aborting` after
     /// `recGblResetAlarms` with its mask (`:471`, `:479-482`). `busy` is a
     /// [`ProcessAction::PutAfterEpilogue`], stored and posted after
@@ -985,28 +980,28 @@ impl SseqRecord {
     /// per-record processing gate (`processing.rs::run_process_frame`, the
     /// `dbScanLock` analogue) is held across this whole body, and both a
     /// foreign `process()` and a client put take it.
-    fn finish(&mut self, live: &mut Vec<(PostStage, String, EpicsValue)>) -> ProcessOutcome {
+    fn finish(&mut self, live: &mut Vec<ProcessAction>) -> ProcessOutcome {
         if self.abort != 0 {
-            live.push((
-                PostStage::Monitor,
-                "ABORT".to_string(),
-                EpicsValue::Short(0),
-            ));
+            live.push(ProcessAction::PutInLinkStage {
+                field: "ABORT",
+                value: CycleValue::Short(0),
+                post: PostStage::Monitor,
+            });
         }
         if self.aborting != 0 {
-            live.push((
-                PostStage::Monitor,
-                "ABORTING".to_string(),
-                EpicsValue::Short(0),
-            ));
+            live.push(ProcessAction::PutInLinkStage {
+                field: "ABORTING",
+                value: CycleValue::Short(0),
+                post: PostStage::Monitor,
+            });
         }
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting != 0 {
-                live.push((
-                    PostStage::Output,
-                    WTG_FIELDS[i].to_string(),
-                    EpicsValue::Short(0),
-                ));
+                live.push(ProcessAction::PutInLinkStage {
+                    field: WTG_FIELDS[i],
+                    value: CycleValue::Short(0),
+                    post: PostStage::Output,
+                });
             }
         }
         self.active.clear();
@@ -1353,17 +1348,17 @@ impl Record for SseqRecord {
                 SeqPhase::Wait => self.advance_sequence(&mut live),
             }
         };
-        // The cycle's status posts leave through the outcome: the framework
-        // stores each once the cycle's queued `LNKn` writes have run and posts
-        // it at its [`PostStage`].
+        // The cycle's status posts go last among its actions, so each lands
+        // once the cycle's queued `LNKn` writes have run.
         //
         // The whole list travels, not just `finish`'s clears. A cycle can both
         // raise and clear `BUSY` (C `process` sets it at `:302-305`, and an
         // out-of-range `SELN` reaches `asyncFinish` in the same call), and the
         // raise must land first: it is in this list, the clear a deferred
-        // action the framework runs after both. A spawned post of the raise
-        // could land after the clear and leave the record busy forever.
-        outcome.post_write_fields = live;
+        // action the framework runs after the link stage. A spawned post of
+        // the raise could land after the clear and leave the record busy
+        // forever.
+        outcome.actions.extend(live);
         Ok(outcome)
     }
 
@@ -1421,13 +1416,10 @@ impl Record for SseqRecord {
         }
     }
 
-    /// C `sseqRecord.c::asyncFinish` posts VAL (`:474`) and runs
-    /// `recGblFwdLink` (`:499`) BEFORE `recGblGetTimeStamp` (`:501`), so the
-    /// first VAL monitor event carries the record's pre-update timestamp and
-    /// TIME advances only for the following BUSY post and the next cycle. The
-    /// framework `Complete` tail defers the restamp accordingly.
-    fn restamps_time_after_completion(&self) -> bool {
-        true
+    /// `sseqRecord.c:501`, after the VAL post (`:474`) and `recGblFwdLink`
+    /// (`:499`).
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterCompletion
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
@@ -2230,20 +2222,27 @@ mod tests {
         // clear is EMITTED: `finish` hands it to the framework so it cannot
         // become visible before the forward link has run.
         assert_eq!(rec.busy, 1, "the clear is the framework's to store");
-        assert_eq!(
-            outcome.post_write_fields,
-            vec![(PostStage::Output, "BUSY".to_string(), EpicsValue::Short(1))],
-            "the raise travels to the output site"
-        );
         assert!(
             matches!(
                 outcome.actions.as_slice(),
-                [ProcessAction::PutAfterEpilogue {
-                    field: "BUSY",
-                    value: crate::server::record::CycleValue::Short(0),
-                }]
+                [
+                    ProcessAction::PutAfterEpilogue {
+                        field: "BUSY",
+                        value: CycleValue::Short(0),
+                    },
+                    ProcessAction::PutInLinkStage {
+                        field: "BUSY",
+                        value: CycleValue::Short(1),
+                        post: PostStage::Output,
+                    },
+                    wtg @ ..,
+                ] if wtg.len() == NUM_STEPS && wtg.iter().zip(WTG_FIELDS).all(|(a, f)| matches!(
+                    a,
+                    ProcessAction::PutInLinkStage { field, value: CycleValue::Short(0), post: PostStage::Output }
+                        if *field == f
+                ))
             ),
-            "the clear runs after the epilogue: {:?}",
+            "the raise travels to the link stage, the clear after the epilogue: {:?}",
             outcome.actions
         );
     }

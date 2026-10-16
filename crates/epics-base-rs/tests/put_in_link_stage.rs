@@ -11,7 +11,9 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::{CycleValue, FieldDesc, ProcessAction, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    CycleValue, FieldDesc, PostStage, ProcessAction, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, DbfCode, EpicsValue};
 
 static FIELDS: &[FieldDesc] = &[
@@ -52,6 +54,7 @@ impl Record for Clearing {
             ProcessAction::PutInLinkStage {
                 field: "GO",
                 value: CycleValue::Short(0),
+                post: PostStage::Output,
             },
             ProcessAction::WriteDbLink {
                 link_field: "OLD",

@@ -3656,7 +3656,6 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
                         std::time::Duration::from_millis(20),
                     )],
                     device_did_compute: false,
-                    post_write_fields: Vec::new(),
                     status: Ok(()),
                 })
             } else {

@@ -14,7 +14,7 @@ use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
     InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
-    ProcessOutcome, Record, ReturnPact,
+    ProcessOutcome, Record, ReturnPact, StampPoint,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -2565,6 +2565,11 @@ const TABLE_ANGULAR_UNIT_FIELDS: &[&str] = &[
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
+    }
+
+    /// `tableRecord.c:594`, after the motor puts and the `:576` return.
+    fn stamp_point(&self) -> StampPoint {
+        StampPoint::AfterLinkWrites
     }
 
     fn set_async_context(&mut self, name: epics_base_rs::types::RecordName, db: AsyncDbHandle) {

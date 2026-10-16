@@ -37,7 +37,7 @@ impl Record for Resetting {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::complete())
     }
-    fn monitor_resets_alarms(&self) -> bool {
+    fn monitor_resets_alarms(&mut self) -> bool {
         self.rst != 0
     }
     fn value_is_undefined(&self) -> bool {

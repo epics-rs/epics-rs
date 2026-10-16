@@ -76,7 +76,6 @@ impl Record for AsyncOnceRecord {
                 result: RecordProcessResult::AsyncPending,
                 actions: Vec::new(),
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             })
         } else {
@@ -642,7 +641,6 @@ impl Record for OdlyRecord {
                     std::time::Duration::from_secs(100),
                 )],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             })
         } else {

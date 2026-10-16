@@ -1162,8 +1162,8 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
-    fn alarms_before_stamp(&self) -> bool {
-        true
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterAlarms
     }
 
     fn acts_before_process(&self) -> bool {
@@ -1504,7 +1504,6 @@ impl Record for AcalcoutRecord {
                 result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             });
         }

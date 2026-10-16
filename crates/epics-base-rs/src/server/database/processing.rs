@@ -105,7 +105,7 @@ use crate::error::{CaError, CaResult, DbResult, DbStatus};
 use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
-    RecordInstance, SoftRead, SoftReading,
+    RecordInstance, SoftRead, SoftReading, StampPoint,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, RecordName};
 
@@ -3631,52 +3631,6 @@ impl PvDatabase {
         Ok(posted)
     }
 
-    /// The single owner of [`crate::server::record::ProcessOutcome::post_write_fields`]: apply the
-    /// field stores a `process()` withheld until its queued link writes had
-    /// run, and post each at `DBE_VALUE`.
-    ///
-    /// Called on every arm that leaves a process cycle, immediately after that
-    /// arm has executed the cycle's [`crate::server::record::ProcessAction::WriteDbLink`] and before
-    /// its snapshot notification — which is where C's single `dbScanLock`
-    /// makes the clear visible (`sseqRecord.c::asyncFinish` after
-    /// `processCallback`'s `dbPutLink`s; `scalerRecord.c:370` under the same
-    /// lock as `:457`/`:463`). A reader that takes the record between
-    /// `process()` returning and this call sees the flag still SET, which is
-    /// the conservative half of C's two observable states.
-    ///
-    /// [`RecordInstance::apply_post_write_fields`] stores them and posts each
-    /// at its [`crate::server::record::PostStage`]. A clear C posts after
-    /// `recGblFwdLink` is not one of them: it is a
-    /// [`crate::server::record::ProcessAction::PutAfterEpilogue`].
-    #[cfg_attr(not(debug_assertions), inline(always))]
-    pub(crate) fn publish_post_write_fields(
-        &self,
-        rec: InFrame<'_>,
-        fields: crate::server::record::CycleList<(
-            crate::server::record::PostStage,
-            String,
-            EpicsValue,
-        )>,
-    ) {
-        if fields.is_empty() {
-            return;
-        }
-        Self::publish_fields(rec, fields);
-    }
-
-    /// [`Self::publish_post_write_fields`] for a non-empty list, out of line
-    /// so the cycles of every other type pay a branch and not this frame.
-    fn publish_fields(
-        rec: InFrame<'_>,
-        fields: crate::server::record::CycleList<(
-            crate::server::record::PostStage,
-            String,
-            EpicsValue,
-        )>,
-    ) {
-        rec.write().apply_post_write_fields(fields.into_vec());
-    }
-
     /// Resolve a link's target field [`DbFieldType`] for a LOCAL `DB_LINK`,
     /// or `None` for a constant / external / unresolvable link.
     ///
@@ -4591,6 +4545,17 @@ impl PvDatabase {
         let mut instance = rec.write();
         let inst = &mut *instance;
         tsel.stamp(&inst.name, &mut inst.common, || false);
+    }
+
+    /// The cycle stamp of a [`StampPoint::is_late`] type, its TSEL read
+    /// included.
+    #[cold]
+    #[inline(never)]
+    fn stamp_at_late_point(&self, rec: InFrame<'_>, visited: &mut ProcStack) {
+        let tsel = self.cycle_tsel(rec, visited);
+        let mut instance = rec.write();
+        let begun = instance.common.begin_stamp();
+        instance.stamp_time_begun(begun, tsel, false);
     }
 
     /// The text every link in [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) held when this
@@ -6454,13 +6419,7 @@ impl PvDatabase {
             // `!Send`); each branch re-acquires the data lock as it needs it. The
             // Segment-A mutations were committed under that guard and are visible
             // through this fresh acquisition (same `Arc`).
-            let (
-                process_result,
-                process_actions,
-                post_write_fields,
-                result_is_defer_output,
-                result_is_alarm_only,
-            ) = {
+            let (process_result, process_actions, result_is_defer_output, result_is_alarm_only) = {
                 let instance = guard.hold();
 
                 // Tell the record which input link fields actually resolved
@@ -6592,8 +6551,6 @@ impl PvDatabase {
                 }
                 let process_result = outcome.result;
                 let process_actions = crate::server::record::ProcessActions::from(outcome.actions);
-                let post_write_fields =
-                    crate::server::record::CycleList::from(outcome.post_write_fields);
                 // Captured before the `AsyncPendingNotify` `if let` below moves
                 // `process_result`; consulted after the monitor epilogue to defer
                 // the OUT/OEVT/FLNK tail (swait ODLY — see `CompleteDeferOutput`).
@@ -6613,7 +6570,6 @@ impl PvDatabase {
                 (
                     process_result,
                     process_actions,
-                    post_write_fields,
                     result_is_defer_output,
                     result_is_alarm_only,
                 )
@@ -6665,12 +6621,6 @@ impl PvDatabase {
                     self.return_from_process(name, rec, e.pact, cycle_end.take());
                     return cycle_status.frame_result(guard);
                 }
-                // After every action this arm runs, so the ordering rule holds
-                // whatever the outcome carried. The `ReprocessAfter` a pending
-                // cycle usually arms cannot overtake this: the continuation
-                // enters through `process_record_continuation`, which acquires
-                // the same per-record gate this body still holds.
-                self.publish_post_write_fields(rec, post_write_fields);
                 // A record left idle replays a queued notify straight away; one
                 // that went async again (the SIM continuation released the SDLY
                 // PACT and the body re-entered it) leaves the queue head where it
@@ -6763,7 +6713,6 @@ impl PvDatabase {
                         return cycle_status.frame_result(guard);
                     }
                 }
-                self.publish_post_write_fields(rec, post_write_fields);
                 {
                     let inst = rec.read();
                     inst.notify_from_snapshot(&snapshot);
@@ -6827,11 +6776,16 @@ impl PvDatabase {
             // `plan`, not the instance: the plain arm folds the test away. An
             // arm that releases the guard takes it back before the merge, so
             // the no-TSEL arm reaches Segment C with its guard and constant.
-            let tsel = if plan.hooks.withholds_cycle_stamp() {
-                guard.release();
-                let tsel = self.cycle_tsel_out_of_line(rec, visited);
-                guard.hold();
-                tsel
+            // A type that stamps after its link writes reads TSEL there.
+            let tsel = if plan.reads_tsel_out_of_line {
+                if plan.stamp_point.is_late() {
+                    super::TselStamp::Withheld
+                } else {
+                    guard.release();
+                    let tsel = self.cycle_tsel_out_of_line(rec, visited);
+                    guard.hold();
+                    tsel
+                }
             } else {
                 match Self::tsel_link(guard.hold()) {
                     None => super::TselStamp::None,
@@ -7040,7 +6994,7 @@ impl PvDatabase {
                 // async-completion re-entry (`complete_async_record_inner`) stamps
                 // unconditionally, matching C's `if (pact)` re-stamp
                 // (mbboRecord.c:256-258).
-                let restamps_after = plan.restamps_time_after_completion;
+                let restamps_after = plan.stamp_point == StampPoint::AfterCompletion;
                 // Either way into C's `goto CONTINUE` skips the same
                 // `recGblGetTimeStampSimm`: `else if (prec->udf)`
                 // (mbboRecord.c:210) and the failed closed-loop DOL read
@@ -7052,7 +7006,7 @@ impl PvDatabase {
                 }
                 // The stamp after `checkAlarms` takes the same `begun`: TIME_LAST
                 // was set before the device time landed.
-                let stamp_late = if plan.stamps_before_alarms {
+                let stamp_after_alarms = if plan.stamps_before_alarms {
                     if !skips_ts_undef {
                         instance.stamp_time_begun(
                             begun,
@@ -7062,7 +7016,7 @@ impl PvDatabase {
                     }
                     None
                 } else {
-                    Some(begun)
+                    (plan.stamp_point == StampPoint::AfterAlarms).then_some(begun)
                 };
 
                 // Per-record alarm hook — record-type-specific STATE / COS
@@ -7079,8 +7033,8 @@ impl PvDatabase {
                 instance.evaluate_alarms();
 
                 // calcout, scalcout and acalcout stamp after `checkAlarms`; none
-                // skips the stamp or restamps after completion.
-                if let (true, Some(begun)) = (plan.alarms_before_stamp, stamp_late) {
+                // skips the stamp.
+                if let Some(begun) = stamp_after_alarms {
                     instance.stamp_time_begun(
                         begun,
                         tsel,
@@ -7138,11 +7092,14 @@ impl PvDatabase {
                 // so the commit happens here and the path returns.
                 if result_is_alarm_only {
                     // This path performs no output — it drops the cycle's
-                    // actions by design — so a withheld store would have
-                    // nothing to be ordered against and nothing to publish it.
+                    // actions by design — so a link-stage store would have
+                    // nothing to be ordered against and nothing to run it.
                     debug_assert!(
-                        post_write_fields.is_empty(),
-                        "CompleteAlarmOnly runs no outputs and must carry no post-write fields"
+                        !process_actions.iter().any(|a| matches!(
+                            a,
+                            crate::server::record::ProcessAction::PutInLinkStage { .. }
+                        )),
+                        "CompleteAlarmOnly runs no outputs and must carry no link-stage stores"
                     );
                     let alarm_result =
                         crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
@@ -7281,8 +7238,7 @@ impl PvDatabase {
             let has_output = !skip_out
                 || plan.multi_output_dispatch
                 || sim_output.is_some()
-                || link_writes.is_some()
-                || !post_write_fields.is_empty();
+                || link_writes.is_some();
             let dispatched = if !has_output {
                 super::links::MultiOutDispatch::default()
             } else {
@@ -7583,11 +7539,6 @@ impl PvDatabase {
                         }
                     }
                 }
-                // Every link-carried output of the cycle has now run, so the
-                // withheld stores become visible here — still ahead of Segment
-                // E, which therefore change-detects against the published value
-                // and does not post it a second time.
-                self.publish_post_write_fields(rec, post_write_fields);
                 dispatched
             };
 
@@ -7607,11 +7558,17 @@ impl PvDatabase {
             }
             let push_alarm = dispatched.alarm;
 
-            // What `process()` marked by hand, its own alarm reset included,
-            // posts ahead of the `monitor()` commit below.
-            if plan.hooks.has(CycleHooks::HAND_POSTED) {
+            if plan.works_before_monitor {
                 guard.release();
-                self.drain_cycle_marks(rec, visited);
+                // What `process()` marked by hand, its own alarm reset
+                // included, posts ahead of the `monitor()` commit below.
+                if plan.hooks.has(CycleHooks::HAND_POSTED) {
+                    self.drain_cycle_marks(rec, visited);
+                }
+                // Past every put of the cycle, so a return above never stamps.
+                if plan.stamp_point == StampPoint::AfterLinkWrites {
+                    self.stamp_at_late_point(rec, visited);
+                }
             }
 
             // Segment E (guarded): commit alarms, build the snapshot, resolve the
@@ -7711,12 +7668,11 @@ impl PvDatabase {
         // record (no device support), so `apply_timestamp` resolves TSE→TIME
         // the same as the pre-output site it replaces.
         if tail_restamps {
-            // Its own TSEL read, not the one Segment C took: C's stamp here is
-            // a whole `recGblGetTimeStamp` running AFTER `recGblFwdLink`, so a
-            // `.TIME` TSEL adopts whatever the forward-link chain just did to
-            // its source.
+            // A whole `recGblGetTimeStamp` AFTER `recGblFwdLink`, so a `.TIME`
+            // TSEL adopts whatever the forward-link chain just did to its
+            // source.
             guard.release();
-            self.rec_gbl_get_time_stamp_in(rec, visited);
+            self.stamp_at_late_point(rec, visited);
         }
 
         // 8. Execute the deferred ProcessActions after the FLNK tail:
@@ -8353,9 +8309,10 @@ impl PvDatabase {
 
     /// [`Self::execute_process_actions_in`] for the actions a record's
     /// `process()` makes before it returns: the status of the record's
-    /// [`ProcessStatusRule::status_link`] put, the one C's `process()` returns.
+    /// last [`ProcessStatusRule::status_links`] put, the one C's `process()`
+    /// returns.
     ///
-    /// [`ProcessStatusRule::status_link`]: crate::server::record::ProcessStatusRule::status_link
+    /// [`ProcessStatusRule::status_links`]: crate::server::record::ProcessStatusRule::status_links
     fn execute_link_writes_in(
         &self,
         record_name: &[u8],
@@ -8367,11 +8324,13 @@ impl PvDatabase {
         for action in actions {
             match action {
                 crate::server::record::ProcessAction::WriteDbLink { link_field, value } => {
-                    if let Err(e) =
-                        self.write_db_link_action(record_name, rec, link_field, value, visited)?
-                        && Self::is_status_link(rec, link_field)
-                    {
-                        status = Err(e);
+                    // A success is looked up only when it would clear a failure.
+                    match self.write_db_link_action(record_name, rec, link_field, value, visited)? {
+                        Err(e) if Self::is_status_link(rec, link_field) => status = Err(e),
+                        Ok(()) if status.is_err() && Self::is_status_link(rec, link_field) => {
+                            status = Ok(())
+                        }
+                        _ => {}
                     }
                 }
                 other => {
@@ -8404,7 +8363,10 @@ impl PvDatabase {
     #[cold]
     fn is_status_link(rec: InFrame<'_>, link_field: &'static str) -> bool {
         let instance = rec.read();
-        rec.rdes().process_status(&*instance.record).status_link == Some(link_field)
+        rec.rdes()
+            .process_status(&*instance.record)
+            .status_links
+            .contains(&link_field)
     }
 
     /// Execute ProcessActions returned by a record's process() call.
@@ -8611,12 +8573,8 @@ impl PvDatabase {
                     let reset = inst.take_alarm_reset();
                     inst.put_after_epilogue(field, value, reset);
                 }
-                ProcessAction::PutInLinkStage { field, value } => {
-                    rec.write().put_after_epilogue(
-                        field,
-                        value,
-                        crate::server::recgbl::EventMask::NONE,
-                    );
+                ProcessAction::PutInLinkStage { field, value, post } => {
+                    rec.write().put_in_link_stage(field, value, post);
                 }
             }
         }
@@ -8784,8 +8742,7 @@ impl PvDatabase {
                 // aiRecord.c:156/164), and BEFORE the output stage — C
                 // `aoRecord.c:190` stamps the record ahead of `writeValue` so a
                 // downstream TSEL fetch sees this cycle's time.
-                let alarms_first = rec.process_plan().alarms_before_stamp;
-                debug_assert_eq!(alarms_first, instance.record.alarms_before_stamp());
+                let alarms_first = rec.process_plan().stamp_point == StampPoint::AfterAlarms;
                 let stamp_late = if alarms_first {
                     Some(begun)
                 } else {
@@ -10959,8 +10916,7 @@ fn sim_process_tail(
     clear_udf: bool,
     plan: &crate::server::record::record_instance::ProcessPlan,
 ) {
-    let alarms_first = plan.alarms_before_stamp;
-    debug_assert_eq!(alarms_first, instance.record.alarms_before_stamp());
+    let alarms_first = plan.stamp_point == StampPoint::AfterAlarms;
     // `read_sim_stamp` already returned `Keep` for a `.TIME` TSEL
     // (`recGbl.c:321`) and for any TSE but device time.
     let stamp = |inst: &mut RecordInstance| {

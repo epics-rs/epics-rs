@@ -10,8 +10,8 @@
 //! (`sseq.rs::fire_current_step`) that the framework executes after
 //! `process()` returns, so the clear had to stop being a `process()` store:
 //! `finish` emits the whole `busy`/`abort`/`aborting`/`waiting` group as
-//! `ProcessOutcome::post_write_fields` and the drain applies it once the
-//! writes have run.
+//! `ProcessAction::PutInLinkStage` after the writes, so it lands once they
+//! have run.
 //!
 //! The reader here is the step's own target: it samples `SS_ORD.BUSY` from
 //! inside the put the step is making, which is the one instant a `caget` could

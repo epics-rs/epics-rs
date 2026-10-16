@@ -1,5 +1,5 @@
-//! `ProcessOutcome::post_write_fields`: a completion flag becomes visible only
-//! after the cycle's queued link writes have run.
+//! `ProcessAction::PutInLinkStage` after a cycle's link writes: a completion
+//! flag becomes visible only after the queued writes have run.
 //!
 //! C runs both under ONE `dbScanLock`. `sseqRecord.c::processCallback` puts
 //! `LNKn` (`:714-792`) and `asyncFinish` clears `busy` (`:498-505`) inside the
@@ -10,8 +10,7 @@
 //!
 //! This port cannot hold the record's data guard across the writes (a
 //! self/cyclic OUT link would dead-lock the non-reentrant guard), so the flag
-//! store travels out of `process()` in `post_write_fields` and the framework's
-//! drain applies it after the writes.
+//! store travels out of `process()` as a `PutInLinkStage` behind the writes.
 //!
 //! The reader here is the write TARGET: its `put_field` samples the source's
 //! flag at the instant the source's own link write lands on it — the exact
@@ -47,7 +46,7 @@ enum Arm {
     /// `Complete` + a `WriteDbLink`, the group led by a field that cannot
     /// store.
     DeferredAfterAFailingField,
-    /// The pre-`post_write_fields` shape: `Complete` + a `WriteDbLink`, with
+    /// The pre-`PutInLinkStage` shape: `Complete` + a `WriteDbLink`, with
     /// the clear stored inside `process()`.
     StoredInProcess,
 }
@@ -73,7 +72,11 @@ static SRC_FIELDS: &[FieldDesc] = &[
     },
 ];
 
-const CLEAR: (&str, EpicsValue) = ("FLAG", EpicsValue::Short(0));
+const CLEAR: ProcessAction = ProcessAction::PutInLinkStage {
+    field: "FLAG",
+    value: CycleValue::Short(0),
+    post: PostStage::Output,
+};
 
 impl Record for FlagSource {
     fn record_type(&self) -> &'static str {
@@ -85,36 +88,26 @@ impl Record for FlagSource {
             link_field: "LNK",
             value: EpicsValue::Long(42),
         };
-        let clear = vec![(PostStage::Output, CLEAR.0.to_string(), CLEAR.1)];
         Ok(match self.arm {
-            Arm::SyncComplete => ProcessOutcome {
-                post_write_fields: clear,
-                ..ProcessOutcome::complete_with(vec![write])
-            },
+            Arm::SyncComplete => ProcessOutcome::complete_with(vec![write, CLEAR]),
             Arm::AsyncNotify => ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(vec![
                     const { epics_base_rs::server::record::declared_field_ix(SRC_FIELDS, "VAL") },
                 ]),
-                actions: vec![write],
+                actions: vec![write, CLEAR],
                 device_did_compute: false,
-                post_write_fields: clear,
                 status: Ok(()),
             },
-            Arm::NoLinkWrites => ProcessOutcome {
-                post_write_fields: clear,
-                ..ProcessOutcome::complete()
-            },
-            Arm::DeferredAfterAFailingField => ProcessOutcome {
-                post_write_fields: vec![
-                    (
-                        PostStage::Output,
-                        "REJECT".to_string(),
-                        EpicsValue::Short(1),
-                    ),
-                    (PostStage::Output, CLEAR.0.to_string(), CLEAR.1),
-                ],
-                ..ProcessOutcome::complete_with(vec![write])
-            },
+            Arm::NoLinkWrites => ProcessOutcome::complete_with(vec![CLEAR]),
+            Arm::DeferredAfterAFailingField => ProcessOutcome::complete_with(vec![
+                write,
+                ProcessAction::PutInLinkStage {
+                    field: "REJECT",
+                    value: CycleValue::Short(1),
+                    post: PostStage::Output,
+                },
+                CLEAR,
+            ]),
             Arm::StoredInProcess => {
                 self.flag.store(0, Ordering::SeqCst);
                 ProcessOutcome::complete_with(vec![write])
@@ -267,7 +260,7 @@ async fn the_sync_complete_arm_publishes_the_clear_after_its_link_write() {
 }
 
 /// The control, and the proof that the reader above discriminates: a source
-/// that stores the clear inside `process()` — the shape `post_write_fields`
+/// that stores the clear inside `process()` — the shape `PutInLinkStage`
 /// replaces — is caught by the same probe, which sees the flag ALREADY clear
 /// while its own write has not yet been made.
 #[epics_macros_rs::epics_test]

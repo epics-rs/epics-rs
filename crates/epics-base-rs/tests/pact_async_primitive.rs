@@ -377,7 +377,6 @@ impl Record for NotifySourceRecord {
                     value: EpicsValue::Long(42),
                 }],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             })
         } else {
@@ -416,7 +415,6 @@ impl Record for AbortSourceRecord {
             result: RecordProcessResult::Complete,
             actions: vec![ProcessAction::CancelReprocess],
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         })
     }
@@ -569,7 +567,6 @@ impl Record for PendingNotifyWriteSource {
                 value: EpicsValue::Long(42),
             }],
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         })
     }

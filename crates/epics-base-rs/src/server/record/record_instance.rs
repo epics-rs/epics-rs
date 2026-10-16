@@ -1086,9 +1086,10 @@ impl ProcessPlan {
         skips_forward_convert_when_undefined: false,
         posts_output_event: false,
         reads_links_at_output: false,
-        restamps_time_after_completion: false,
-        alarms_before_stamp: false,
+        stamp_point: crate::server::record::StampPoint::BeforeAlarms,
         stamps_before_alarms: true,
+        reads_tsel_out_of_line: false,
+        works_before_monitor: false,
         stamps_before_siml_read: false,
         clears_udf: true,
         soft_read_clears_udf: true,
@@ -1127,9 +1128,10 @@ impl ProcessPlan {
             skips_forward_convert_when_undefined,
             posts_output_event,
             reads_links_at_output,
-            restamps_time_after_completion,
-            alarms_before_stamp,
+            stamp_point,
             stamps_before_alarms,
+            reads_tsel_out_of_line,
+            works_before_monitor,
             stamps_before_siml_read,
             clears_udf,
             soft_read_clears_udf,
@@ -1162,9 +1164,10 @@ impl ProcessPlan {
             && skips_forward_convert_when_undefined == p.skips_forward_convert_when_undefined
             && posts_output_event == p.posts_output_event
             && reads_links_at_output == p.reads_links_at_output
-            && restamps_time_after_completion == p.restamps_time_after_completion
-            && alarms_before_stamp == p.alarms_before_stamp
+            && stamp_point == p.stamp_point
             && stamps_before_alarms == p.stamps_before_alarms
+            && reads_tsel_out_of_line == p.reads_tsel_out_of_line
+            && works_before_monitor == p.works_before_monitor
             && stamps_before_siml_read == p.stamps_before_siml_read
             && clears_udf == p.clears_udf
             && soft_read_clears_udf == p.soft_read_clears_udf
@@ -1227,10 +1230,15 @@ impl ProcessPlan {
             skips_forward_convert_when_undefined: record.skips_forward_convert_when_undefined(),
             posts_output_event: field_desc_of(record, "OEVT").is_some(),
             reads_links_at_output: record.declares_output_time_input_links(),
-            restamps_time_after_completion: record.restamps_time_after_completion(),
-            alarms_before_stamp: record.alarms_before_stamp(),
-            stamps_before_alarms: !record.alarms_before_stamp()
-                && !record.restamps_time_after_completion(),
+            stamp_point: record.stamp_point(),
+            stamps_before_alarms: record.stamp_point()
+                == crate::server::record::StampPoint::BeforeAlarms,
+            reads_tsel_out_of_line: record.cycle_hooks().withholds_cycle_stamp()
+                || record.stamp_point().is_late(),
+            works_before_monitor: record
+                .cycle_hooks()
+                .has(crate::server::record::CycleHooks::HAND_POSTED)
+                || record.stamp_point() == crate::server::record::StampPoint::AfterLinkWrites,
             stamps_before_siml_read: output_stage && !record.stamps_after_write(),
             clears_udf: record.clears_udf(),
             soft_read_clears_udf: record.soft_read_clears_udf(),
@@ -2263,12 +2271,20 @@ pub(crate) struct ProcessPlan {
     pub(crate) posts_output_event: bool,
     /// See [`Record::declares_output_time_input_links`].
     pub(crate) reads_links_at_output: bool,
-    pub(crate) restamps_time_after_completion: bool,
-    pub(crate) alarms_before_stamp: bool,
-    /// The cycle stamps before `checkAlarms`: neither `alarms_before_stamp`
-    /// nor `restamps_time_after_completion`. A pass whose stamp is withheld
-    /// holds `TselStamp::Withheld`, which stores nothing at either point.
+    /// A pass whose stamp is withheld holds `TselStamp::Withheld`, which
+    /// stores nothing at any point.
+    pub(crate) stamp_point: crate::server::record::StampPoint,
+    /// The three below are [`Self::stamp_point`] and [`Self::hooks`] folded
+    /// into the one test each cycle pays. `stamp_point == BeforeAlarms`.
     pub(crate) stamps_before_alarms: bool,
+    /// The cycle's TSEL is not read inline: a withheld stamp
+    /// ([`CycleHooks::withholds_cycle_stamp`]) or a late stamp point.
+    ///
+    /// [`CycleHooks::withholds_cycle_stamp`]: crate::server::record::CycleHooks::withholds_cycle_stamp
+    pub(crate) reads_tsel_out_of_line: bool,
+    /// Work between the link stage and `monitor()`: the `HAND_POSTED`
+    /// drain or the `AfterLinkWrites` stamp.
+    pub(crate) works_before_monitor: bool,
     /// An output whose `recGblGetTimeStampSimm(prec, prec->simm, NULL)` runs
     /// before `writeValue` reads SIML, so it sees the previous cycle's SIMM
     /// ([`Record::stamps_after_write`] is the one exception).
@@ -6915,7 +6931,7 @@ impl RecordInstance {
 
     /// [`Self::put_declared_field`] for the framework's own stores
     /// (`Record::put_field_internal`): device property posts, `post_fields`,
-    /// withheld `post_write_fields`.
+    /// `PutInLinkStage` stores.
     pub(crate) fn put_internal_field(&mut self, field: &str, value: EpicsValue) -> CaResult<()> {
         self.invalidate_plan_for(field);
         self.debug_assert_not_slotted(field, &value);
@@ -7415,31 +7431,23 @@ impl RecordInstance {
         )
     }
 
-    /// The single owner of [`crate::server::record::ProcessOutcome::post_write_fields`]:
-    /// store each withheld field, in list order, and post the
-    /// [`PostStage::Output`] ones at `DBE_VALUE`. A [`PostStage::Monitor`]
-    /// field is left to the cycle's `monitor()` walk, which posts its change
-    /// with the type's mask.
-    ///
-    /// Each field is applied independently. The group is one transition and a
-    /// field that fails to store must not strand the rest of it — a partial
-    /// apply that abandoned `BUSY` would leave the record busy forever.
-    pub(crate) fn apply_post_write_fields(
+    /// The [`crate::server::record::ProcessAction::PutInLinkStage`] action.
+    pub(crate) fn put_in_link_stage(
         &mut self,
-        fields: impl IntoIterator<Item = (PostStage, String, EpicsValue)>,
+        field: &str,
+        value: crate::server::record::CycleValue,
+        post: PostStage,
     ) {
-        for (stage, field, value) in fields {
-            // C's `db_post_events` result is never read nor printed
-            // (`scalerRecord.c:316`).
-            if self.put_internal_field(&field, value).is_err() {
-                continue;
-            }
-            // Snapshot-cache contract, as `post_fields_with_mask`: rebuild
-            // before the monitor snapshot is built.
-            self.notify_field_written(&field);
-            if stage == PostStage::Output {
-                self.notify_field(&field, crate::server::recgbl::EventMask::VALUE);
-            }
+        // C's `db_post_events` result is never read nor printed
+        // (`scalerRecord.c:316`).
+        if self.put_internal_field(field, value.into()).is_err() {
+            return;
+        }
+        // Snapshot-cache contract, as `post_fields_with_mask`: rebuild
+        // before the monitor snapshot is built.
+        self.notify_field_written(field);
+        if post == PostStage::Output {
+            self.notify_field(field, crate::server::recgbl::EventMask::VALUE);
         }
     }
 
@@ -11800,17 +11808,17 @@ impl RecordInstance {
         // handled by the full process_record_with_links() path in processing.rs
         // — save the `PutAfterEpilogue`s, applied after `monitor()` below.
         //
-        // It must still apply `post_write_fields`. There are no link writes
-        // here for them to be ordered against, so they apply now, through the
-        // engine's owner; what is NOT optional is applying them at all — a
-        // record that hands its completion-flag clear to the framework (sseq's
-        // `busy`, scaler's `cnt`) would otherwise stay busy forever on this
-        // path.
-        self.apply_post_write_fields(outcome.post_write_fields);
+        // It must still apply the `PutInLinkStage` stores. There are no link
+        // writes here for them to be ordered against, so they apply now; what
+        // is NOT optional is applying them at all — a record that hands its
+        // completion-flag clear to the framework (sseq's `busy`) would
+        // otherwise stay busy forever on this path.
         let after_epilogue = outcome.actions;
         for action in &after_epilogue {
-            if let crate::server::record::ProcessAction::PutInLinkStage { field, value } = *action {
-                self.put_after_epilogue(field, value, crate::server::recgbl::EventMask::NONE);
+            if let crate::server::record::ProcessAction::PutInLinkStage { field, value, post } =
+                *action
+            {
+                self.put_in_link_stage(field, value, post);
             }
         }
 

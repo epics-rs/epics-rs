@@ -424,7 +424,7 @@ impl Record for MotorRecord {
     /// `motorRecord.cc:1495`: `status = dbPutLink(&pmr->rlnk, ...)` is what
     /// `process()` returns.
     fn process_status_rule(&self) -> epics_base_rs::server::record::ProcessStatusRule {
-        epics_base_rs::server::record::ProcessStatusRule::ZERO.with_status_link("RLNK")
+        epics_base_rs::server::record::ProcessStatusRule::ZERO.with_status_links(&["RLNK"])
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

@@ -365,7 +365,6 @@ impl ScalcoutRecord {
                 value,
             }],
             device_did_compute: false,
-            post_write_fields: Vec::new(),
             status: Ok(()),
         })
     }
@@ -714,8 +713,8 @@ const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 
 impl Record for ScalcoutRecord {
-    fn alarms_before_stamp(&self) -> bool {
-        true
+    fn stamp_point(&self) -> crate::server::record::StampPoint {
+        crate::server::record::StampPoint::AfterAlarms
     }
 
     /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
@@ -1109,7 +1108,6 @@ impl Record for ScalcoutRecord {
                 result: RecordProcessResult::AsyncPendingNotify(Vec::new()),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
-                post_write_fields: Vec::new(),
                 status: Ok(()),
             });
         }

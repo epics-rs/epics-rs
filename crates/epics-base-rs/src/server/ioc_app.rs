@@ -3060,7 +3060,8 @@ pub(crate) fn wire_subroutine(
 /// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
 /// `scanpiol` and `dbla` report from.
 ///
-/// `message` is C's `pmessage` verbatim, trailing space included, and the
+/// `message` is C's `pmessage` verbatim, trailing space included (`None` for
+/// a hook that declined, which C demotes without a line), and the
 /// report goes through [`rec_gbl_record_error`] rather than being spelt out
 /// here. Both matter to a site: C's line is `recGblRecordError: <message>
 /// <errSym> PV: <name>` and it goes to the *errlog*, so an operator grepping
@@ -3070,7 +3071,7 @@ pub(crate) fn wire_subroutine(
 /// demotion is `scanAdd`'s documented behaviour, not news.
 ///
 /// [`rec_gbl_record_error`]: crate::server::recgbl::rec_gbl_record_error
-async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: &str) {
+async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: Option<&str>) {
     let Some(rec_arc) = db.get_record(name) else {
         return;
     };
@@ -3091,7 +3092,9 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: &str) 
     }
     // C passes `-1`, for which `errSymLookup` is skipped and the slot is
     // empty (`recGbl.c:65-70`) — hence the doubled space in C's own output.
-    crate::server::recgbl::rec_gbl_record_error("", &String::from_utf8_lossy(name), message);
+    if let Some(message) = message {
+        crate::server::recgbl::rec_gbl_record_error("", &String::from_utf8_lossy(name), message);
+    }
 }
 
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
@@ -3117,7 +3120,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
     // demotion runs after the loop: it takes the registration mutex and the
     // records map (`update_scan_index`), which must not be entered while this
     // loop holds a record's write guard.
-    let mut demote: Vec<(crate::types::RecordName, &'static str)> = Vec::new();
+    let mut demote: Vec<(crate::types::RecordName, Option<&'static str>)> = Vec::new();
     for (name, rec_arc) in io_intr_recs {
         let mut inst = rec_arc.write();
         // Wire poll feedback when the record is on I/O Intr scan, OR when the
@@ -3146,13 +3149,13 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                 let row = record::dev_sup_of(inst.record.record_type(), inst.common.dtyp.as_str());
                 demote.push((
                     name,
-                    match row {
+                    Some(match row {
                         None => "scanAdd: I/O Intr not valid (no DSET) ",
                         Some(row) if !row.has_get_ioint_info() => {
                             "scanAdd: I/O Intr not valid (no get_ioint_info)"
                         }
                         Some(_) => "scanAdd: I/O Intr not valid",
-                    },
+                    }),
                 ));
             }
             continue;
@@ -3208,13 +3211,15 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             });
             count += 1;
         } else if on_io_intr {
-            // C `dbScan.c:278-293` — device support with no `get_ioint_info`,
-            // or one whose `get_ioint_info` yields no scan list. The port
-            // collapses all three into "the device offers no interrupt
-            // receiver"; the observable is the same demotion, and the message
-            // is C's first and dominant case (`dbScan.c:281-282`), the one a
-            // device support that never implemented the hook produces.
-            demote.push((name, "scanAdd: I/O Intr not valid (no get_ioint_info)"));
+            // C `dbScan.c:280-289`: a dset row with the hook means it ran and
+            // declined (devAsyn* after a failed `initCommon` returns -1), which
+            // demotes silently; with no row or no hook, C logs the refusal.
+            let row = record::dev_sup_of(inst.record.record_type(), inst.common.dtyp.as_str());
+            let message = match row {
+                Some(row) if row.has_get_ioint_info() => None,
+                _ => Some("scanAdd: I/O Intr not valid (no get_ioint_info)"),
+            };
+            demote.push((name, message));
         }
         inst.device = Some(dev);
     }
@@ -3311,10 +3316,7 @@ mod io_intr_scan_add_tests {
     }
 
     /// R6-8 — C `scanAdd` (`dbScan.c:278-293`): device support that supplies no
-    /// interrupt source (`get_ioint_info == NULL`, or it returns non-zero, or it
-    /// yields a NULL scan list) is the same failure exit — log and demote. The
-    /// port collapses those three C cases into "the device offers no
-    /// `io_intr_receiver`", so this covers all of them.
+    /// interrupt source is demoted to Passive.
     #[epics_macros_rs::epics_test]
     async fn io_intr_with_device_but_no_interrupt_source_is_demoted_to_passive() {
         use crate::error::CaResult;

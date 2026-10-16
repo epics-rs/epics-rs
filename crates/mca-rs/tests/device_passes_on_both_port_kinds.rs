@@ -8,7 +8,7 @@
 //! (`devMcaAsyn.c:287`) and its callback re-enters the record, which reads
 //! the spectrum (`:524`, `:746-753`).
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — runs on the exec backend
+// RTEMS-EXEC-MODEL-ALLOW(7): checked, not waived — runs on the exec backend
 // (`EPICS_RS_BUILD_EXEC_BACKEND=thread`); no CA server is built.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

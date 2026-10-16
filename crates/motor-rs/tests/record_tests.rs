@@ -1383,11 +1383,8 @@ fn test_field_list_coverage() {
 ///
 /// What remains is the set `motorRecord.cc` never assigns at all:
 /// `HSV`/`LSV` (declared but read by nothing in `motorRecord.cc` — `alarm_sub`
-/// raises both limit alarms at `HLSV`, `:3379-3386`), `INIT` (startup command
-/// string, consumed by device support at `motordevCom.cc:310`), `PREM`
-/// (pre-move command, consumed by vendor device support, e.g.
-/// `devPM304.cc:209-211`) and `LOCK` (soft-channel position lock, read at
-/// `devSoft.cc:237`).
+/// raises both limit alarms at `HLSV`, `:3379-3386`) and `LOCK` (soft-channel
+/// position lock, read at `devSoft.cc:237`).
 ///
 /// Being on this list is not the same as being unreachable. A client asking
 /// this port for one of them gets an answer: `RecordInstance::resolve_field`
@@ -1400,7 +1397,7 @@ fn test_field_list_coverage() {
 /// `CARD` left this list when the OUT-link derivation landed
 /// (`motorRecord.cc:653-670`); `card_is_derived_from_the_out_link.rs` is what
 /// it turned into.
-const UNIMPLEMENTED: &[&str] = &["HSV", "LSV", "INIT", "PREM", "LOCK"];
+const UNIMPLEMENTED: &[&str] = &["HSV", "LSV", "LOCK"];
 
 #[test]
 fn test_dly_delays_finalization() {

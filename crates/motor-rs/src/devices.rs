@@ -305,15 +305,20 @@ fn bind_asyn(out: &str) -> Result<MotorDeviceSupport, Failure> {
 }
 
 fn bind_model1(device: &'static str, out: &str) -> Result<MotorDeviceSupport, Failure> {
-    let ParsedLink::Hw(HwLink::VmeIo { card, signal, .. }) = parse_link_v2(out) else {
+    let ParsedLink::Hw(HwLink::VmeIo { card, signal, parm }) = parse_link_v2(out) else {
         return Err(Failure::BadBus);
     };
     let card = i32::from(card);
-    take(Controller::Card { device, card }, i32::from(signal)).map_err(|taken| match taken {
-        Taken::NoController => Failure::NoCard,
-        Taken::NoAxis => Failure::NoSignal,
-        Taken::InUse => Failure::InUse,
-    })
+    let support =
+        take(Controller::Card { device, card }, i32::from(signal)).map_err(
+            |taken| match taken {
+                Taken::NoController => Failure::NoCard,
+                Taken::NoAxis => Failure::NoSignal,
+                Taken::InUse => Failure::InUse,
+            },
+        )?;
+    support.send_out_parm(parm);
+    Ok(support)
 }
 
 /// `pasynEpicsUtils->parseLink` (asynEpicsUtils.c:56-148): the port and

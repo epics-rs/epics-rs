@@ -92,7 +92,7 @@ impl MotorRecord {
         });
 
         DeviceActions {
-            commands: effects.commands.clone(),
+            commands: self.transaction(effects.commands.clone()),
             force_poll,
             schedule_delay,
             status_refresh: effects.status_refresh,
@@ -382,6 +382,14 @@ impl MotorRecord {
             ParsedLink::None | ParsedLink::Constant(_)
         ) {
             self.internal.dol_udf = Some(false);
+        }
+
+        // motordevCom sends INIT before anything else (motordevCom.cc:
+        // 309-327); devMotorAsyn has no INIT, and its drivers ignore it.
+        if !self.links.init.is_empty() {
+            effects.commands.push(MotorCommand::Primitive {
+                init: self.links.init.clone(),
+            });
         }
 
         // C init_controller (devMotorAsyn.c:183-198) downloads the encoder

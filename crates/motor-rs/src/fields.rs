@@ -342,9 +342,10 @@ impl Default for DisplayFields {
 
 /// Database-link and menu fields imported from the public C `motorRecord.dbd`
 /// surface (motorRecord.dbd:233-265, 739-760). The link strings hold the
-/// `DBF_INLINK` / `DBF_OUTLINK` specification clients open by C name; `post` is
-/// the `DBF_STRING` post-move command. `omsl` is the `menuOmsl` selector
-/// (0 = supervisory, 1 = closed_loop).
+/// `DBF_INLINK` / `DBF_OUTLINK` specification clients open by C name; `init`,
+/// `prem` and `post` are the `DBF_STRING` startup, pre-move and post-move
+/// commands. `omsl` is the `menuOmsl` selector (0 = supervisory, 1 =
+/// closed_loop).
 #[derive(Debug, Clone, Default)]
 pub struct LinkFields {
     pub out: PvString,
@@ -360,6 +361,8 @@ pub struct LinkFields {
     pub stoo: PvString,
     pub dinp: PvString,
     pub rinp: PvString,
+    pub init: PvString,
+    pub prem: PvString,
     pub post: PvString,
     pub omsl: i16,
 }

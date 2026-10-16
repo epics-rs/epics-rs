@@ -1,4 +1,5 @@
 use bitflags::bitflags;
+use epics_base_rs::types::PvString;
 
 pub use asyn_rs::interfaces::motor::PidGainKind;
 
@@ -372,6 +373,22 @@ pub enum MotorCommand {
         defer: bool,
     },
     Poll,
+    /// A model-1 record's OUT parm, `mr->out.value.vmeio.parm`, sent when
+    /// the record binds its axis.
+    OutParm {
+        parm: PvString,
+    },
+    /// A model-1 record's INIT text, C `build_trans(PRIMITIVE)` at init
+    /// (motordevCom.cc:309-327); no model-2/3 device sends it.
+    Primitive {
+        init: PvString,
+    },
+    /// The record's PREM and POST, ahead of the move they belong to: C
+    /// `build_trans` reads both from the record at each move it builds.
+    MoveStrings {
+        prem: PvString,
+        post: PvString,
+    },
     ProfileInitialize {
         max_points: usize,
     },

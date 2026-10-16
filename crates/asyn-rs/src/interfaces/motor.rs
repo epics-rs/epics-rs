@@ -269,6 +269,29 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
+    /// A model-1 record's OUT parm, the text after `@` in `#C card S signal
+    /// @parm`, given once when the record binds the axis: C devices read it
+    /// from the record (devMVP2001.cc:262, :361). Not given when empty.
+    fn set_out_parm(&mut self, _user: &AsynUser, _parm: &[u8]) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 device's `PRIMITIVE`: the record's INIT text, sent once at
+    /// record init before anything else (motordevCom.cc:309-327). Each C
+    /// device formats it its own way (`"? "` + INIT on an IM483PL).
+    fn primitive(&mut self, _user: &AsynUser, _init: &[u8]) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// A model-1 record's PREM and POST for the move called next, which C
+    /// `build_trans` reads at every MOVE_ABS, MOVE_REL, HOME and JOG
+    /// (devIM483PL.cc:191-205): the device puts PREM ahead of that move its
+    /// own way, and sends POST once the move is done (drvIM483PL.cc:361-366).
+    /// Called only when either is set, so they belong to that one move.
+    fn set_move_strings(&mut self, _user: &AsynUser, _prem: &[u8], _post: &[u8]) -> AsynResult<()> {
+        Ok(())
+    }
+
     /// Poll the motor for current status.
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
 

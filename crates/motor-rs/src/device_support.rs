@@ -5,7 +5,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString};
 use tokio::sync::mpsc;
 
 use crate::device_state::*;
@@ -190,6 +190,16 @@ impl MotorDeviceSupport {
     /// The record's mailbox.
     pub(crate) fn device_state(&self) -> &SharedDeviceState {
         &self.port.device_state
+    }
+
+    /// Hand the driver a model-1 record's VME_IO parm, which C devices read
+    /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361).
+    pub(crate) fn send_out_parm(&self, parm: String) {
+        if !parm.is_empty() {
+            self.port.send(vec![MotorCommand::OutParm {
+                parm: PvString::from_bytes(parm),
+            }]);
+        }
     }
 
     /// Get the io_intr sender (for poll loop to trigger record re-processing).

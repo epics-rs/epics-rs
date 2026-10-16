@@ -406,7 +406,10 @@ fn c_write(cmd: &MotorCommand) -> Option<(i32, CValue)> {
         MotorCommand::ProfileExecute => (c::PROFILE_EXECUTE, Int32(1)),
         MotorCommand::ProfileAbort => (c::PROFILE_ABORT, Int32(1)),
         MotorCommand::ProfileReadback => (c::PROFILE_READBACK, Int32(1)),
-        MotorCommand::ProfileInitialize { .. } => return None,
+        MotorCommand::ProfileInitialize { .. }
+        | MotorCommand::OutParm { .. }
+        | MotorCommand::Primitive { .. }
+        | MotorCommand::MoveStrings { .. } => return None,
     };
     Some((function as i32, value))
 }
@@ -437,7 +440,10 @@ fn drv_motor_asyn_reason(cmd: &MotorCommand) -> Option<i32> {
         | MotorCommand::ProfileBuild
         | MotorCommand::ProfileExecute
         | MotorCommand::ProfileAbort
-        | MotorCommand::ProfileReadback => return None,
+        | MotorCommand::ProfileReadback
+        | MotorCommand::OutParm { .. }
+        | MotorCommand::Primitive { .. }
+        | MotorCommand::MoveStrings { .. } => return None,
     })
 }
 
@@ -473,6 +479,9 @@ fn sent_by_dev_motor_asyn(cmd: &MotorCommand) -> bool {
             | MotorCommand::ProfileExecute
             | MotorCommand::ProfileAbort
             | MotorCommand::ProfileReadback
+            | MotorCommand::OutParm { .. }
+            | MotorCommand::Primitive { .. }
+            | MotorCommand::MoveStrings { .. }
     )
 }
 
@@ -645,6 +654,11 @@ pub fn execute_commands(
             }
             MotorCommand::ProfileInitialize { max_points } => {
                 motor.initialize_profile(&user, max_points)
+            }
+            MotorCommand::OutParm { ref parm } => motor.set_out_parm(&user, parm.as_bytes()),
+            MotorCommand::Primitive { ref init } => motor.primitive(&user, init.as_bytes()),
+            MotorCommand::MoveStrings { ref prem, ref post } => {
+                motor.set_move_strings(&user, prem.as_bytes(), post.as_bytes())
             }
             MotorCommand::Poll => Ok(()),
         };

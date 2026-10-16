@@ -16,7 +16,6 @@ pub struct SimMotor {
     high_limit: f64,
     low_limit: f64,
     homed: bool,
-    powered: bool,
     closed_loop_enabled: bool,
     /// If true, velocity move mode (JOG)
     velocity_mode: bool,
@@ -52,7 +51,6 @@ impl SimMotor {
             high_limit: 1000.0,
             low_limit: -1000.0,
             homed: false,
-            powered: true,
             closed_loop_enabled: false,
             velocity_mode: false,
             velocity_direction: true,
@@ -324,7 +322,6 @@ impl AsynMotor for SimMotor {
             // as the switch.
             has_encoder: true,
             encoder_home: self.encoder_position == 0.0,
-            powered: self.powered,
             problem: false,
             direction: self.velocity_direction,
             homed: self.homed,
@@ -346,6 +343,8 @@ mod tests {
         assert_eq!(status.position, 0.0);
         assert!(status.done);
         assert!(!status.moving);
+        // motorSimDriver.cpp's poll never sets motorStatusPowerOn_: MSTA 2.
+        assert!(!status.powered);
     }
 
     #[test]

@@ -255,6 +255,7 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::CallParamCallbacks { addr } => Self::CallParamCallbacks {
                 addr: *addr,
                 updates: vec![],
+                time_stamp: None,
             },
             PortCommand::GetOption { key } => Self::GetOption { key: key.clone() },
             PortCommand::SetOption { key, value } => Self::SetOption {

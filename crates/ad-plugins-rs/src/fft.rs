@@ -64,16 +64,19 @@ fn float64_spectrum(dims: Vec<NDDimension>) -> NDArray {
 }
 
 /// The output array for `spectrum`, as C's gated block (NDPluginFFT.cpp:212-218):
-/// a pool `alloc`, the averaged values copied in, `src`'s attributes, and a
-/// fresh time stamp — a spectrum is not the input frame, so it does not
-/// inherit the input's. `unique_id` stays at the pool default: [`FFTProcessor`]
-/// owns that counter.
+/// a pool `alloc`, the averaged values copied in, and `src`'s attributes. C
+/// stamps it with `getTimeStamp(&epicsTS)`, the port timestamp
+/// `beginProcessCallbacks` set from the input's epicsTS (NDPluginFFT.cpp:216,
+/// :295; NDPluginDriver.cpp:232), and `timeStamp` with the wall clock
+/// (:217-218), so the pair disagrees by design. `unique_id` stays at the pool
+/// default: [`FFTProcessor`] owns that counter.
 fn pool_output(pool: &NDArrayPool, src: &NDArray, spectrum: &NDArray) -> ADResult<NDArray> {
     let mut arr = pool.alloc(spectrum.dims.clone(), NDDataType::Float64)?;
     if let NDDataBuffer::F64(values) = &spectrum.data {
         f64_slice(&mut arr).copy_from_slice(values);
     }
-    arr.update_time_stamps_now();
+    arr.timestamp = src.timestamp;
+    arr.time_stamp = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
     arr.attributes = src.attributes.clone();
     Ok(arr)
 }
@@ -882,13 +885,11 @@ impl NDPluginProcess for FFTProcessor {
 mod tests {
     use super::*;
 
-    /// `pool_output` carries both halves of its source's timestamp pair.
-    ///
-    /// The two are independent in C — a hardware clock feeds `timeStamp` while
-    /// the registered time source feeds `epicsTS` — so the source is stamped
-    /// with values that cannot be derived from each other.
+    /// C NDPluginFFT.cpp:216-218: the spectrum's epicsTS is the input's, by
+    /// way of the port timestamp; its `timeStamp` is the wall clock, not the
+    /// input's double.
     #[test]
-    fn the_pool_output_is_stamped_fresh_not_from_the_input() {
+    fn the_pool_output_takes_the_input_epics_ts_and_a_fresh_time_stamp() {
         let mut src = NDArray::with_data(
             vec![NDDimension::new(4), NDDimension::new(2)],
             NDDataBuffer::F64(vec![0.0; 8]),
@@ -897,17 +898,11 @@ mod tests {
         src.time_stamp = 123.5;
 
         let pool = NDArrayPool::new(0);
+        let before = ad_core_rs::timestamp::EpicsTimestamp::now().as_f64();
         let out = pool_output(&pool, &src, &float64_spectrum(src.dims.clone())).unwrap();
 
-        // C stamps the spectrum from the time source and the wall clock
-        // (NDPluginFFT.cpp:216-218); it never carries the input frame's.
-        assert_ne!(out.timestamp, src.timestamp, "epicsTS came from the input");
-        assert_ne!(
-            out.time_stamp, src.time_stamp,
-            "the derived double came from the input"
-        );
-        // The pair still derives from one source, so it cannot disagree.
-        assert_eq!(out.time_stamp, out.timestamp.as_f64());
+        assert_eq!(out.timestamp, src.timestamp);
+        assert!(out.time_stamp >= before, "timeStamp is the wall clock");
     }
 
     /// The paired-row and half-column transforms against one complex
@@ -1315,9 +1310,10 @@ mod tests {
     }
 
     /// C `NDPluginFFT::doArrayCallbacks` (NDPluginFFT.cpp:212-220) allocates a
-    /// bare array, copies the attribute list, stamps it fresh and numbers it
-    /// `uniqueId_++` — so a spectrum carries the input's attributes but neither
-    /// its id nor its timestamps.
+    /// bare array, copies the attribute list, takes epicsTS from the port (the
+    /// input's, :295) and timeStamp from the wall clock, and numbers it
+    /// `uniqueId_++` — so a spectrum carries the input's attributes and
+    /// epicsTS but neither its id nor its timeStamp.
     #[test]
     fn test_fft_output_identity_is_the_plugins_not_the_inputs() {
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
@@ -1341,7 +1337,7 @@ mod tests {
             .output_arrays;
         let result = &output[0];
         assert_ne!(result.unique_id, 42, "the input's id was inherited");
-        assert_ne!(result.timestamp, arr.timestamp);
+        assert_eq!(result.timestamp, arr.timestamp);
         assert_ne!(result.time_stamp, arr.time_stamp);
         assert!(result.attributes.get("ColorMode").is_some());
     }

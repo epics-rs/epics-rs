@@ -938,6 +938,10 @@ pub enum RequestOp {
         /// Param updates to apply before firing callbacks.
         /// Empty = just fire callbacks for previously changed params.
         updates: Vec<ParamSetValue>,
+        /// C `setTimeStamp` ahead of the sets, as NDPluginDriver's
+        /// `beginProcessCallbacks` stamps the port with the frame's epicsTS
+        /// (NDPluginDriver.cpp:232); `None` keeps the port's timestamp.
+        time_stamp: Option<std::time::SystemTime>,
     },
     /// Get a port/driver option by key.
     GetOption {

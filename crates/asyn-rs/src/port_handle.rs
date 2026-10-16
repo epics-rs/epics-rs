@@ -884,6 +884,7 @@ impl PortHandle {
             RequestOp::CallParamCallbacks {
                 addr,
                 updates: vec![],
+                time_stamp: None,
             },
             user,
         )
@@ -956,6 +957,7 @@ impl PortHandle {
             RequestOp::CallParamCallbacks {
                 addr,
                 updates: vec![],
+                time_stamp: None,
             },
             user,
         )?;
@@ -995,8 +997,35 @@ impl PortHandle {
         addr: i32,
         updates: Vec<crate::request::ParamSetValue>,
     ) -> AsynResult<()> {
-        self.enqueue(RequestOp::CallParamCallbacks { addr, updates }, addr)
-            .await
+        self.enqueue(
+            RequestOp::CallParamCallbacks {
+                addr,
+                updates,
+                time_stamp: None,
+            },
+            addr,
+        )
+        .await
+    }
+
+    /// [`Self::set_params_and_notify`] after C `setTimeStamp(ts)`, under the
+    /// same lock: every callback of the batch, and every later one until the
+    /// next update, carries `ts`.
+    pub async fn set_time_stamp_params_and_notify(
+        &self,
+        addr: i32,
+        ts: std::time::SystemTime,
+        updates: Vec<crate::request::ParamSetValue>,
+    ) -> AsynResult<()> {
+        self.enqueue(
+            RequestOp::CallParamCallbacks {
+                addr,
+                updates,
+                time_stamp: Some(ts),
+            },
+            addr,
+        )
+        .await
     }
 
     /// Sync version of [`set_params_and_notify`](Self::set_params_and_notify)
@@ -1014,7 +1043,14 @@ impl PortHandle {
     ) -> AsynResult<()> {
         self.blocking(
             "set_params_and_notify_blocking",
-            self.enqueue(RequestOp::CallParamCallbacks { addr, updates }, addr),
+            self.enqueue(
+                RequestOp::CallParamCallbacks {
+                    addr,
+                    updates,
+                    time_stamp: None,
+                },
+                addr,
+            ),
         )
     }
 
@@ -3024,6 +3060,7 @@ mod tests {
             .submit_blocking(
                 RequestOp::CallParamCallbacks {
                     addr: 0,
+                    time_stamp: None,
                     updates: vec![
                         // Int32 into a Float64 param: the store cannot hold it.
                         ParamSetValue::new(1, 0, ParamValue::Int32(7)),

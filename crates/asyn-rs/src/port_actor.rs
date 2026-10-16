@@ -2118,8 +2118,15 @@ impl PortActor {
                 self.driver.write_float32_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::CallParamCallbacks { addr, updates } => {
+            RequestOp::CallParamCallbacks {
+                addr,
+                updates,
+                time_stamp,
+            } => {
                 let base = self.driver.base_mut();
+                if let Some(ts) = time_stamp {
+                    base.set_time_stamp(*ts);
+                }
                 // One dispatch for every parameter type (`ParamList::set_value`),
                 // so this carrier and the store cannot support different type sets.
                 let mut failed: Option<AsynError> = None;
@@ -4480,6 +4487,7 @@ mod tests {
                 &tx,
                 RequestOp::CallParamCallbacks {
                     addr: 0,
+                    time_stamp: None,
                     updates: vec![crate::request::ParamSetValue::new(
                         val,
                         0,
@@ -4561,6 +4569,7 @@ mod tests {
             &tx,
             RequestOp::CallParamCallbacks {
                 addr: 0,
+                time_stamp: None,
                 updates: (0..3)
                     .map(|a| {
                         crate::request::ParamSetValue::new(
@@ -4580,6 +4589,45 @@ mod tests {
             vec![(0, 10), (1, 11), (2, 12)],
             "every address the batch wrote is flushed, request address first"
         );
+    }
+
+    /// NDPluginDriver.cpp:232 `setTimeStamp` before the cycle's sets: the
+    /// batch's callbacks carry it, and so does a later unstamped flush.
+    #[test]
+    fn a_stamped_batch_sets_the_port_time_stamp_before_its_callbacks() {
+        let mut base = PortDriverBase::new("stamp_pub", 1, PortFlags::default());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base.interrupts.register_sync_callback(
+            InterruptFilter {
+                reason: Some(val),
+                ..InterruptFilter::default()
+            },
+            move |iv| recorder.lock().push(iv.timestamp),
+        );
+        let tx = spawn_actor(TestDriverBase(base));
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (n, time_stamp) in [(1, Some(ts)), (2, None)] {
+            send_and_wait(
+                &tx,
+                RequestOp::CallParamCallbacks {
+                    addr: 0,
+                    updates: vec![crate::request::ParamSetValue::new(
+                        val,
+                        0,
+                        crate::param::ParamValue::Int32(n),
+                    )],
+                    time_stamp,
+                },
+                AsynUser::new(0).with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap();
+        }
+        assert_eq!(*seen.lock(), vec![ts, ts]);
     }
 
     /// `ParamSetValue::Status` is the background-thread half of C's alarm
@@ -4619,7 +4667,11 @@ mod tests {
             let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
             send_and_wait(
                 &tx,
-                RequestOp::CallParamCallbacks { addr: 0, updates },
+                RequestOp::CallParamCallbacks {
+                    addr: 0,
+                    updates,
+                    time_stamp: None,
+                },
                 user,
             )
             .unwrap();

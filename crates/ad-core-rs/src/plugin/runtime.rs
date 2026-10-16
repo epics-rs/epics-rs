@@ -1125,6 +1125,10 @@ impl SharedProcessorInner {
             count_frame,
         );
         output.batch.merge(self.build_status_params_batch());
+        // C `beginProcessCallbacks` `setTimeStamp(&pArray->epicsTS)`
+        // (NDPluginDriver.cpp:232): the input's, for every callback until
+        // the next frame.
+        output.batch.time_stamp = Some(array.timestamp.to_system_time());
         output.addressed = result.addressed;
         output
     }
@@ -1236,6 +1240,7 @@ impl SharedProcessorInner {
     fn build_sort_params_batch(&self) -> ParamBatch {
         use asyn_rs::request::ParamSetValue;
         let mut batch = ParamBatch {
+            time_stamp: None,
             addr0: vec![
                 ParamSetValue::new(
                     self.plugin_params.disordered_arrays,
@@ -1645,7 +1650,11 @@ impl SharedProcessorInner {
             // still published.
             arrays: if deliver { output_arrays } else { Vec::new() },
             scatter,
-            batch: ParamBatch { addr0, extra },
+            batch: ParamBatch {
+                addr0,
+                extra,
+                time_stamp: None,
+            },
             addressed: vec![],
         }
     }
@@ -1754,6 +1763,8 @@ impl ProcessOutput {
 struct ParamBatch {
     addr0: Vec<asyn_rs::request::ParamSetValue>,
     extra: std::collections::HashMap<i32, Vec<asyn_rs::request::ParamSetValue>>,
+    /// The port timestamp set ahead of the sets; `None` keeps it.
+    time_stamp: Option<std::time::SystemTime>,
 }
 
 impl ParamBatch {
@@ -1761,10 +1772,12 @@ impl ParamBatch {
         Self {
             addr0: Vec::new(),
             extra: std::collections::HashMap::new(),
+            time_stamp: None,
         }
     }
 
     fn merge(&mut self, other: ParamBatch) {
+        self.time_stamp = other.time_stamp.or(self.time_stamp);
         self.addr0.extend(other.addr0);
         for (addr, updates) in other.extra {
             self.extra.entry(addr).or_default().extend(updates);
@@ -1773,10 +1786,16 @@ impl ParamBatch {
 
     /// Flush via reliable async enqueue. Call from async context.
     async fn flush(self, port: &asyn_rs::port_handle::PortHandle) {
-        if !self.addr0.is_empty() {
-            if let Err(e) = port.set_params_and_notify(0, self.addr0).await {
-                eprintln!("plugin param flush error (addr 0): {e}");
+        let sent = match self.time_stamp {
+            Some(ts) => {
+                port.set_time_stamp_params_and_notify(0, ts, self.addr0)
+                    .await
             }
+            None if !self.addr0.is_empty() => port.set_params_and_notify(0, self.addr0).await,
+            None => Ok(()),
+        };
+        if let Err(e) = sent {
+            eprintln!("plugin param flush error (addr 0): {e}");
         }
         for (addr, updates) in self.extra {
             if let Err(e) = port.set_params_and_notify(addr, updates).await {
@@ -2865,6 +2884,7 @@ fn queue_status_batch(
 ) -> ParamBatch {
     use asyn_rs::request::ParamSetValue;
     ParamBatch {
+        time_stamp: None,
         addr0: vec![
             ParamSetValue::new(
                 plugin_params.queue_size,
@@ -4352,6 +4372,61 @@ mod tests {
         // Verify port name
         assert_eq!(handle.port_name(), "TYPE_TEST");
         assert_eq!(handle.port_runtime().port_name(), "TYPE_TEST");
+    }
+
+    /// C `beginProcessCallbacks` `setTimeStamp(&pArray->epicsTS)`
+    /// (NDPluginDriver.cpp:232): the port timestamp a cycle's callbacks and
+    /// reads carry is the input's epicsTS, not the output's nor the epoch.
+    #[test]
+    fn a_plugin_cycle_stamps_its_callbacks_with_the_input_epics_ts() {
+        struct Restamp;
+        impl NDPluginProcess for Restamp {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let mut out = NDArray::clone(array);
+                out.timestamp = crate::timestamp::EpicsTimestamp { sec: 9, nsec: 9 };
+                ProcessResult::arrays(vec![Arc::new(out)])
+            }
+            fn plugin_type(&self) -> &str {
+                "Restamp"
+            }
+        }
+        let pool = NDArrayPool::new(1_000_000);
+        let (ds, _rx) = ndarray_channel("DS_STAMP", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(ds);
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("STAMP").unwrap(),
+            Restamp,
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        let port = handle.port_runtime().port_handle().clone();
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.timestamp = crate::timestamp::EpicsTimestamp {
+            sec: 1234,
+            nsec: 5678,
+        };
+        let input = arr.timestamp.to_system_time();
+        send_array(handle.array_sender(), Arc::new(arr));
+        let counter = handle.ndarray_params.array_counter;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while port.read_int32_blocking(counter, 0).unwrap() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the frame was not processed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stamp = port
+            .with_driver_blocking::<PluginPortDriver, _>(|d| d.base().get_time_stamp())
+            .unwrap();
+        assert_eq!(stamp, input);
     }
 
     #[test]

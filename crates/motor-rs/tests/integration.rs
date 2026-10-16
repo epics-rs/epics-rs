@@ -282,7 +282,7 @@ async fn test_poll_loop_lifecycle() {
         motor,
         {
             let subscribers = motor_rs::device_state::AxisSubscribers::new();
-            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers.attach(device_state.clone(), io_intr_tx, Default::default());
             subscribers
         },
         Duration::from_millis(5),
@@ -340,7 +340,7 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
         motor,
         {
             let subscribers = motor_rs::device_state::AxisSubscribers::new();
-            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers.attach(device_state.clone(), io_intr_tx, Default::default());
             subscribers
         },
         Duration::from_millis(5),
@@ -401,7 +401,7 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
         motor,
         {
             let subscribers = motor_rs::device_state::AxisSubscribers::new();
-            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers.attach(device_state.clone(), io_intr_tx, Default::default());
             subscribers
         },
         Duration::from_millis(5),
@@ -696,8 +696,8 @@ async fn init_forwards_dial_limits_to_driver() {
     setup.poll_loop.run_queued_commands();
 
     let m = sim.lock().unwrap();
-    assert_eq!(m.forwarded_high_limit, Some(100.0));
-    assert_eq!(m.forwarded_low_limit, Some(-100.0));
+    assert_eq!(m.forwarded_high_limit, Some(100_000.0));
+    assert_eq!(m.forwarded_low_limit, Some(-100_000.0));
 }
 
 /// C special set_dial_highlimit (motorRecord.cc:4236-4277): a runtime
@@ -726,7 +726,7 @@ async fn limit_put_forward_reaches_driver() {
     setup.device_support.write(&mut setup.record).unwrap();
     setup.poll_loop.run_queued_commands();
 
-    assert_eq!(sim.lock().unwrap().forwarded_high_limit, Some(50.0));
+    assert_eq!(sim.lock().unwrap().forwarded_high_limit, Some(50_000.0));
 }
 
 /// C special pidcof (motorRecord.cc:3003-3026): a PCOF put under
@@ -848,7 +848,7 @@ async fn failed_poll_posts_comms_error_status() {
         motor,
         {
             let subscribers = motor_rs::device_state::AxisSubscribers::new();
-            subscribers.attach(device_state.clone(), io_intr_tx);
+            subscribers.attach(device_state.clone(), io_intr_tx, Default::default());
             subscribers
         },
         Duration::from_millis(5),
@@ -1021,7 +1021,10 @@ async fn pass0_restored_val_is_not_a_move_command() {
     );
     let user = AsynUser::new(0);
     let st = motor.lock().unwrap().poll(&user).unwrap();
-    assert_eq!(st.position, 1.5, "the controller was redefined, not moved");
+    assert_eq!(
+        st.position, 1500.0,
+        "the controller was redefined, not moved"
+    );
 }
 
 /// A driver stuck in a serial/TCP read timeout blocks only the axis's
@@ -1280,7 +1283,7 @@ async fn the_axis_polls_with_no_record_request() {
     let state = new_shared_state();
     state.lock().unwrap().accept();
     let (io_intr_tx, mut io_intr) = mpsc::channel::<()>(64);
-    subscribers.attach(state.clone(), io_intr_tx);
+    subscribers.attach(state.clone(), io_intr_tx, Default::default());
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
         motor_rs::poll_loop::PollerInbox {
             poll: poll_cmd_rx,
@@ -1303,6 +1306,113 @@ async fn the_axis_polls_with_no_record_request() {
         .unwrap();
     let posted = tokio::time::timeout(Duration::from_millis(500), io_intr.recv()).await;
     assert!(posted.is_ok(), "a timed poll saw the move");
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
+/// C `motorUpdateStatus_` polls on the port thread (asynMotorController.cpp:
+/// 217-222) and leaves the poller alone: only `wakeupPoller` — a move, here —
+/// reloads `forcedFastPolls_` (:636-642). A ForcePoll on an idle axis is one
+/// poll, and the idle period continues.
+#[tokio::test(flavor = "multi_thread")]
+async fn force_poll_does_not_reload_the_forced_fast_polls() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(Arc<AtomicUsize>);
+    impl AsynMotor for Counting {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, _position: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+    }
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Counting(polls.clone())));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(64);
+    tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: motor_cmd_rx,
+        },
+        motor,
+        {
+            let subscribers = motor_rs::device_state::AxisSubscribers::new();
+            subscribers.attach(
+                motor_rs::device_state::new_shared_state(),
+                io_intr_tx,
+                Default::default(),
+            );
+            subscribers
+        },
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+        5,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+    let settled = |n: usize| {
+        let polls = polls.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let seen = polls.load(Ordering::SeqCst);
+            assert_eq!(seen, n, "polls so far");
+        }
+    };
+    // Startup: the startup poll and its 5 forced fast polls.
+    settled(6).await;
+
+    poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    settled(7).await;
+
+    motor_cmd_tx
+        .send(motor_rs::poll_loop::CommandBatch {
+            trace: Arc::new(motor_rs::trace::MotorTrace::new("forcePollFast", 0)),
+            record: 0,
+            commands: vec![MotorCommand::MoveAbsolute {
+                position: 10.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            }],
+        })
+        .unwrap();
+    // The move wakes the poller: one poll and 5 forced fast polls.
+    settled(13).await;
+
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
 }

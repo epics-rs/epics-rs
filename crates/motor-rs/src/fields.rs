@@ -488,10 +488,6 @@ pub struct InternalFields {
     /// The last pass committed STAT = COMM_ALARM: what C `build_trans`
     /// reads during the next pass's `do_work`, ahead of its `alarm_sub`.
     pub comm_alarm: bool,
-    /// ERES of the last encoder-ratio download: the driver's encoder EGU
-    /// carries the scale it was told, so REP converts with this one, not a
-    /// later ERES put the driver never heard of (C REP is the raw count).
-    pub drv_eres: Option<f64>,
     /// `monitor()` found a mark below its short circuit this cycle
     /// (motorRecord.cc:3550-3551), so an alarm move posts that group too.
     pub monitor_lower_marked: bool,

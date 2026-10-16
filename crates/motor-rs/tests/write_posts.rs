@@ -12,7 +12,7 @@ use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, StatusWrit
 use asyn_rs::user::AsynUser;
 use motor_rs::device_state::{AxisSubscribers, SharedDeviceState, new_shared_state};
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox, QueuedCommand};
+use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
 use motor_rs::trace::{MotorTrace, TraceUser};
 use tokio::sync::mpsc;
 
@@ -130,7 +130,7 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         let (io_intr_tx, io_intr) = mpsc::channel(8);
         let state = new_shared_state();
         state.lock().unwrap().accept();
-        subscribers.attach(state.clone(), io_intr_tx);
+        subscribers.attach(state.clone(), io_intr_tx, Default::default());
         Bound { io_intr, state }
     };
     let (record, observer) = (bind(), bind());
@@ -181,7 +181,7 @@ impl Rig {
             .send(CommandBatch {
                 trace: self.trace.clone(),
                 record: 0,
-                commands: vec![QueuedCommand { command, mres: 1.0 }],
+                commands: vec![command],
             })
             .unwrap();
         self.poll_loop.run_queued_commands();

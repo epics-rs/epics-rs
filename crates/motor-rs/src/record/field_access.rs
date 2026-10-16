@@ -932,11 +932,15 @@ pub(crate) fn motor_put_field(
                     // dial frame as emit_jog does.
                     if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
                         let forward = !rec.ctrl.jogr;
+                        let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
                         rec.send_special(vec![MotorCommand::MoveVelocity {
-                            direction: forward != (rec.conv.dir == MotorDir::Neg),
-                            min_velocity: rec.effective_vbas(),
-                            velocity: rec.vel.jvel,
-                            acceleration: rec.jog_accel_egu(),
+                            min_velocity: rec.raw_rate(rec.effective_vbas()),
+                            velocity: rec.raw_position(if dial_forward {
+                                rec.vel.jvel
+                            } else {
+                                -rec.vel.jvel
+                            }),
+                            acceleration: rec.raw_rate(rec.jog_accel_egu()),
                         }]);
                     }
                 }
@@ -1945,19 +1949,13 @@ enum DialLimit {
 /// 4236-4277 / set_dial_lowlimit 4287-4328 send SET_HIGH/LOW_LIMIT from
 /// special() before the pp pass runs do_work). Init-gated like the raw
 /// helpers: during dbLoadRecords C applies field() as raw struct writes
-/// and special never runs, so a load must not emit. The boundary speaks
-/// dial-frame EGU (like `MotorCommand::SetPosition`) — C's raw-steps
-/// wire value and the MRES-sign register swap live only in the raw pair
-/// (`update_raw_from_dial_high`/`_low`), so the dial side maps to the
-/// command unswapped.
+/// and special never runs, so a load must not emit.
 fn queue_limit_forward(rec: &mut MotorRecord, side: DialLimit, dial: f64) {
     if !rec.internal.init_invariants_synced {
         return;
     }
-    rec.send_special(vec![match side {
-        DialLimit::High => MotorCommand::SetHighLimit { position: dial },
-        DialLimit::Low => MotorCommand::SetLowLimit { position: dial },
-    }]);
+    let command = rec.dial_limit_command(side == DialLimit::High, dial);
+    rec.send_special(vec![command]);
 }
 
 /// Send the driver forward for a PID-coefficient put (C special pidcof,

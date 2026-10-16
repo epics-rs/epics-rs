@@ -48,8 +48,6 @@ pub struct MotorRecord {
     port: Option<crate::device_support::CommandPort>,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
-    /// Last seen status sequence number
-    last_seen_seq: u64,
     /// Whether `init_record`'s device half ran, which in C ends in
     /// `monitor()` and its alarm reset.
     initialized: bool,
@@ -180,7 +178,6 @@ impl Default for MotorRecord {
             last_write: None,
             port: None,
             device_state: None,
-            last_seen_seq: 0,
             initialized: false,
             next_delay_id: 0,
         }
@@ -253,13 +250,7 @@ impl MotorRecord {
     /// record with no device support has nowhere to send.
     pub(crate) fn send_special(&self, commands: Vec<MotorCommand>) {
         if let Some(port) = &self.port {
-            let mres = self.conv.mres;
-            port.send(
-                commands
-                    .into_iter()
-                    .map(|command| crate::poll_loop::QueuedCommand { command, mres })
-                    .collect(),
-            );
+            port.send(commands);
         }
     }
 

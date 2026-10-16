@@ -159,7 +159,16 @@ impl MotorFixture {
             inst.device = Some(Box::new(dev));
         }
 
-        // Startup pass consumes the status `init` seeded (seq 1).
+        // init took the cached status (seq 1); the startup pass reads the
+        // poller's first post.
+        state.lock().unwrap().latest_status = Some(StampedStatus {
+            seq: 2,
+            status: asyn_rs::interfaces::motor::AsynMotor::poll(
+                &mut *motor.lock().unwrap(),
+                &AsynUser::new(0),
+            )
+            .unwrap(),
+        });
         db.process_record_readback("M1", &mut ProcStack::new())
             .await
             .unwrap();
@@ -168,7 +177,7 @@ impl MotorFixture {
             db,
             motor,
             state,
-            seq: 1,
+            seq: 2,
             _poll_cmd_rx,
             motor_cmd_rx,
         }

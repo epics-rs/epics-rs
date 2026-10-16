@@ -109,6 +109,13 @@ impl MotorTrace {
         if self.is_model2() { 108 } else { 26 }
     }
 
+    /// The reason `pPvt->pasynUser` keeps after init_record's last
+    /// `findDrvInfo` (devMotorAsyn.c:345), `driverReasons[motorUpdateStatus]`:
+    /// the user `update_values` and `build_trans` print through.
+    pub fn update_status_reason(&self) -> i32 {
+        if self.is_model2() { 109 } else { 27 }
+    }
+
     /// `asynPrint(pasynUser, mask, ...)` with `pasynUser->reason = reason`.
     pub fn print(&self, mask: TraceMask, reason: i32, args: std::fmt::Arguments<'_>) {
         if let TraceUser::Asyn { port, addr } | TraceUser::Model2 { port, addr } = &self.user {

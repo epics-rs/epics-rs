@@ -361,7 +361,7 @@ impl MotorRecord {
                             self.stat.mip.insert(MipFlags::STOP);
                             self.mark(m::MIP);
                             effects.commands.push(MotorCommand::Stop {
-                                acceleration: self.move_accel_egu(),
+                                acceleration: self.raw_rate(self.move_accel_egu()),
                             });
                             return effects;
                         }
@@ -909,7 +909,7 @@ impl MotorRecord {
         // considers itself idle (e.g. after an InPosition retry, which
         // finalizes the record but leaves the servo moving).
         effects.commands.push(MotorCommand::Stop {
-            acceleration: self.move_accel_egu(),
+            acceleration: self.raw_rate(self.move_accel_egu()),
         });
     }
 
@@ -940,7 +940,7 @@ impl MotorRecord {
             self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.move_accel_egu(),
+                acceleration: self.raw_rate(self.move_accel_egu()),
             });
             return true;
         }
@@ -1018,10 +1018,13 @@ impl MotorRecord {
         let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
         self.stat.cdir = dial_forward != (self.conv.mres < 0.0);
         effects.commands.push(MotorCommand::MoveVelocity {
-            direction: dial_forward,
-            min_velocity: self.effective_vbas(),
-            velocity: self.vel.jvel,
-            acceleration: self.jog_accel_egu(),
+            min_velocity: self.raw_rate(self.effective_vbas()),
+            velocity: self.raw_position(if dial_forward {
+                self.vel.jvel
+            } else {
+                -self.vel.jvel
+            }),
+            acceleration: self.raw_rate(self.jog_accel_egu()),
         });
     }
 
@@ -1040,7 +1043,7 @@ impl MotorRecord {
         self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
-            acceleration: self.jog_accel_egu(),
+            acceleration: self.raw_rate(self.jog_accel_egu()),
         });
     }
 
@@ -1256,7 +1259,7 @@ impl MotorRecord {
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.move_accel_egu(),
+                acceleration: self.raw_rate(self.move_accel_egu()),
             });
             return;
         }
@@ -1301,9 +1304,9 @@ impl MotorRecord {
 
         effects.commands.push(MotorCommand::Home {
             forward: hw_forward,
-            min_velocity: self.effective_vbas(),
-            velocity: self.vel.hvel,
-            acceleration: self.home_accel_egu(),
+            min_velocity: self.raw_rate(self.effective_vbas()),
+            velocity: self.raw_rate(self.vel.hvel),
+            acceleration: self.raw_rate(self.home_accel_egu()),
         });
     }
 
@@ -1432,7 +1435,7 @@ impl MotorRecord {
                     self.mark(m::MIP);
                 }
                 effects.commands.push(MotorCommand::Stop {
-                    acceleration: self.move_accel_egu(),
+                    acceleration: self.raw_rate(self.move_accel_egu()),
                 });
             }
             SpmgMode::Go => {
@@ -1530,18 +1533,42 @@ impl MotorRecord {
         let min_velocity = self.effective_vbas();
         if use_rel {
             effects.commands.push(MotorCommand::MoveRelative {
-                distance: rel_distance,
-                min_velocity,
-                velocity,
-                acceleration,
+                distance: self.raw_position(rel_distance),
+                min_velocity: self.raw_rate(min_velocity),
+                velocity: self.raw_rate(velocity),
+                acceleration: self.raw_rate(acceleration),
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
-                position: abs_position,
-                min_velocity,
-                velocity,
-                acceleration,
+                position: self.raw_position(abs_position),
+                min_velocity: self.raw_rate(min_velocity),
+                velocity: self.raw_rate(velocity),
+                acceleration: self.raw_rate(acceleration),
             });
+        }
+    }
+
+    /// A dial position or distance in the driver's units, C's raw steps
+    /// (`dval / mres`).
+    pub(crate) fn raw_position(&self, dial: f64) -> f64 {
+        dial / self.conv.mres
+    }
+
+    /// A speed or acceleration in the driver's units, C's steps/s and
+    /// steps/s² (`velo / fabs(mres)`).
+    pub(crate) fn raw_rate(&self, egu: f64) -> f64 {
+        egu / self.conv.mres.abs()
+    }
+
+    /// set_dial_highlimit / set_dial_lowlimit's write (motorRecord.cc:
+    /// 4236-4328): `dial / mres`, to the raw register that dial limit is
+    /// under the MRES sign.
+    pub(crate) fn dial_limit_command(&self, high: bool, dial: f64) -> MotorCommand {
+        let position = self.raw_position(dial);
+        if high != (self.conv.mres < 0.0) {
+            MotorCommand::SetHighLimit { position }
+        } else {
+            MotorCommand::SetLowLimit { position }
         }
     }
 
@@ -1721,7 +1748,7 @@ impl MotorRecord {
         self.mark(m::MIP);
         self.set_dmov(false);
         effects.commands.push(MotorCommand::SetPosition {
-            position: self.pos.dval,
+            position: self.raw_position(self.pos.dval),
         });
         // C sends GET_INFO after LOAD_POS (motorRecord.cc:3814-3816).
         effects.request_poll = true;
@@ -1762,7 +1789,6 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::SetEncoderRatio {
                 ratio: (m / eres) / (m / mres),
             });
-            self.internal.drv_eres = Some(eres);
         }
         if self.conv.set && !self.conv.igset {
             self.internal.pp = true;

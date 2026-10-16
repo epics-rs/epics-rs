@@ -3,7 +3,6 @@
 //! Also re-exports async runtime primitives (`sync`, `task`, `select!`)
 //! so that driver authors can use `asyn_rs::runtime::` instead of `tokio::` directly.
 
-pub mod axis;
 pub mod config;
 pub mod event;
 pub mod port;
@@ -74,10 +73,6 @@ pub mod task {
 /// Re-export `tokio::select!` macro.
 pub use tokio::select;
 
-pub use axis::{
-    AxisActions, AxisDelayRequest, AxisMotorCommand, AxisPollDirective, AxisRuntime,
-    AxisRuntimeHandle, create_axis_runtime,
-};
 pub use config::{BackoffConfig, RuntimeConfig, SupervisionPolicy};
 pub use event::RuntimeEvent;
 #[cfg(any(test, feature = "test-support"))]
@@ -118,14 +113,13 @@ mod tokio_is_not_the_executor {
 
     #[test]
     fn library_tasks_go_through_the_runtime_task_seam() {
-        let files: [(&str, &str); 6] = [
+        let files: [(&str, &str); 5] = [
             ("adapter.rs", include_str!("../adapter.rs")),
             ("asyn_record/mod.rs", include_str!("../asyn_record/mod.rs")),
             (
                 "transport/in_process.rs",
                 include_str!("../transport/in_process.rs"),
             ),
-            ("runtime/axis.rs", include_str!("axis.rs")),
             ("runtime/supervisor.rs", include_str!("supervisor.rs")),
             ("runtime/mod.rs", include_str!("mod.rs")),
         ];
@@ -135,7 +129,6 @@ mod tokio_is_not_the_executor {
             ("adapter.rs", "fn property_post_receiver"),
             ("asyn_record/mod.rs", "fn register_exception_callback"),
             ("transport/in_process.rs", "fn subscribe("),
-            ("runtime/axis.rs", "async fn handle_command("),
             ("runtime/supervisor.rs", "pub async fn supervise<"),
             ("runtime/mod.rs", "pub fn spawn<F>("),
         ];

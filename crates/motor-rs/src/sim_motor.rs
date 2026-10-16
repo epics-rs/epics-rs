@@ -42,10 +42,6 @@ pub struct SimMotor {
     /// The axis parameters, as the last step or command wrote them.
     posted: MotorStatus,
     closed_loop_enabled: bool,
-    /// MRES/ERES as the record last downloaded it. motorSim ignores it
-    /// (asynMotorAxis::setEncoderRatio is a no-op), so the encoder counts
-    /// motor steps; in EGU that is the position over this ratio.
-    encoder_ratio: f64,
     /// Profile move support
     profile_positions: Vec<f64>,
     profile_readbacks: Vec<f64>,
@@ -62,8 +58,10 @@ pub struct SimMotor {
 }
 
 impl SimMotor {
+    /// C motorSimController's axis defaults: hard limits ±10000 steps,
+    /// home and start 0 (motorSimDriver.cpp:31-34).
     pub fn new() -> Self {
-        Self::starting_at(0.0, -1000.0, 1000.0)
+        Self::starting_at(0.0, -10_000.0, 10_000.0)
     }
 
     /// C motorSimAxis's constructor: at rest at `start`, Amax = Vmax = 1.
@@ -89,7 +87,6 @@ impl SimMotor {
             last_step: Instant::now(),
             posted: MotorStatus::default(),
             closed_loop_enabled: false,
-            encoder_ratio: 1.0,
             profile_positions: Vec::new(),
             profile_readbacks: Vec::new(),
             pid_gains: Vec::new(),
@@ -188,8 +185,8 @@ impl SimMotor {
         let p = self.nextpoint.p;
         self.posted = MotorStatus {
             position: p + self.offset,
-            encoder_position: (p + self.offset) / self.encoder_ratio,
-            velocity: self.nextpoint.v,
+            encoder_position: p + self.offset,
+            // motorSim never sets motorActVelocity_, so RVEL stays 0.
             direction: self.nextpoint.v > 0.0,
             done,
             high_limit: p >= self.high_limit,
@@ -322,14 +319,6 @@ impl AsynMotor for SimMotor {
         Ok(())
     }
 
-    fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
-        if ratio.is_finite() && ratio != 0.0 {
-            self.encoder_ratio = ratio;
-            self.post(self.posted.done);
-        }
-        Ok(())
-    }
-
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.closed_loop_enabled = enable;
         Ok(())
@@ -352,15 +341,17 @@ impl AsynMotor for SimMotor {
 
     /// C `motorSimController::writeInt32` for `motorDeferMoves_` and
     /// `processDeferredMoves` (motorSimDriver.cpp:155-212).
+    /// motorSimController::writeInt32 (motorSimDriver.cpp:188-199) drops
+    /// processDeferredMoves()'s status: a deferred move into a hard limit
+    /// stays pending and the write still succeeds.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
         self.advance_to(Instant::now());
-        let mut status = Ok(());
         if !defer && self.defer {
             if let Some(position) = self.deferred_position {
                 let p = self.nextpoint.p;
-                if (p >= self.high_limit && position > p) || (p <= self.low_limit && position < p) {
-                    status = Err(hard_limit());
-                } else {
+                let blocked =
+                    (p >= self.high_limit && position > p) || (p <= self.low_limit && position < p);
+                if !blocked {
                     self.endpoint.p = position - self.offset;
                     self.endpoint.v = 0.0;
                     self.posted.done = false;
@@ -369,7 +360,7 @@ impl AsynMotor for SimMotor {
             }
         }
         self.defer = defer;
-        status
+        Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
@@ -477,13 +468,13 @@ mod tests {
         assert!(!away.encoder_home && !away.home);
     }
 
-    /// Where a 5 EGU/s² ramp from rest is after one step.
+    /// Where a 5 steps/s² ramp from rest is after one step.
     fn ramp_after_one_step() -> f64 {
         let t = PERIOD.as_secs_f64();
         0.5 * 5.0 * t * t
     }
 
-    /// A unit move at VELO 1, ACCL 0.2 (5 EGU/s²) is the 1.2 s trapezoid:
+    /// A 1-step move at 1 step/s and 5 steps/s² is the 1.2 s trapezoid:
     /// done on the twelfth step, accelerating on the first.
     #[test]
     fn test_sim_motor_move_follows_the_ramp() {
@@ -571,6 +562,43 @@ mod tests {
         assert!(status.done && status.homed, "{status:?}");
         assert_eq!(status.position, 0.0);
         assert!(peak > 2.0, "went past the limit before reversing: {peak}");
+    }
+
+    /// Clearing the defer flag with the deferred move blocked by a hard limit
+    /// succeeds and leaves the move pending, as motorSim's writeInt32 does.
+    #[test]
+    fn test_sim_motor_deferred_move_into_a_hard_limit_still_clears() {
+        let mut motor = SimMotor::new().with_limits(-2.0, 2.0).with_position(1.0);
+        motor.move_absolute(&user(), 3.0, 0.0, 1.0, 5.0).unwrap();
+        motor.set_deferred_moves(&user(), true).unwrap();
+        motor.move_absolute(&user(), 3.0, 0.0, 1.0, 5.0).unwrap();
+        let mut status = step(&mut motor, 1);
+        for _ in 0..100 {
+            if status.high_limit && motor.nextpoint.v == 0.0 {
+                break;
+            }
+            status = step(&mut motor, 1);
+        }
+        assert!(status.high_limit, "{status:?}");
+        assert!(motor.set_deferred_moves(&user(), false).is_ok());
+        assert_eq!(motor.deferred_position, Some(3.0));
+        assert!(
+            !step(&mut motor, 1).done,
+            "the blocked move is still pending"
+        );
+    }
+
+    /// motorSim posts no actual velocity (motorSimDriver.cpp:470-478 never
+    /// writes motorActVelocity_), moving or not.
+    #[test]
+    fn test_sim_motor_posts_no_velocity() {
+        let mut motor = SimMotor::new();
+        motor
+            .move_absolute(&user(), 100.0, 0.0, 10.0, 50.0)
+            .unwrap();
+        let status = step(&mut motor, 3);
+        assert!(status.moving && status.position > 0.0, "{status:?}");
+        assert_eq!(status.velocity, 0.0);
     }
 
     /// A long idle is skipped, not stepped, and leaves the axis where it was.

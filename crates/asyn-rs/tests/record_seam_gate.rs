@@ -7,8 +7,8 @@
 //! which has a tokio runtime.
 //!
 //! Only the record layer is in scope, and that is expressed as the root rather
-//! than as a list of files: the port actors, the axis runtime and the
-//! adapter's receiver tasks live outside `src/asyn_record`, are started from
+//! than as a list of files: the port actors and the adapter's receiver
+//! tasks live outside `src/asyn_record`, are started from
 //! the IOC's own runtime, and are meant to stay on it. A new file added to the
 //! record layer is censused the moment it exists; a hand-written list would
 //! have waited for someone to remember it.

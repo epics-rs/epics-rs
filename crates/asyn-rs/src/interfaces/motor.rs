@@ -15,11 +15,11 @@ use crate::user::AsynUser;
 /// case.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MotorStatus {
-    /// Current position in user coordinates.
+    /// Motor position, steps.
     pub position: f64,
-    /// Encoder position (if available).
+    /// Encoder position, counts.
     pub encoder_position: f64,
-    /// Current velocity.
+    /// Actual velocity, steps/s.
     pub velocity: f64,
     /// True if the last move has completed.
     pub done: bool,
@@ -130,13 +130,13 @@ impl StatusWrite {
 ///
 /// Provides motor axis control for motor-capable drivers.
 ///
-/// Units: `velocity` is in EGU/sec and `acceleration` is in EGU/sec²
-/// (matching C `accEGUfromVelo`). The motor record converts its ACCL
-/// (time-to-velocity, sec) field into an EGU/sec² rate before calling.
+/// Units are C `asynMotorAxis`'s: positions in steps, velocities in
+/// steps/s, accelerations in steps/s². The motor record owns the MRES/ERES
+/// conversion, as motorRecord.cc does; a driver does no scaling.
 pub trait AsynMotor: Send + Sync {
     /// Move to an absolute position.
     ///
-    /// `min_velocity` is the base/start velocity (motor record VBAS, EGU/sec):
+    /// `min_velocity` is the base/start velocity (motor record VBAS):
     /// canonical `asynMotorAxis::move(position, relative, minVelocity,
     /// maxVelocity, acceleration)` carries it, and the motor record emits it as
     /// `SET_VEL_BASE` ahead of the move (`devMotorAsyn.c` `motorVelBase`).
@@ -221,20 +221,14 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
-    /// Set the controller's high soft-travel limit, dial-frame EGU.
-    /// C set_dial_highlimit (motorRecord.cc 4236-4277) forwards the
-    /// limit so controllers with their own read-only travel limits can
-    /// vet it; C's wire value is raw steps (dhlm/mres) with an
-    /// MRES-sign register swap — this interface speaks dial EGU like
-    /// [`set_position`](Self::set_position), so the dial high limit
-    /// arrives here unconditionally and raw-frame drivers fold below.
+    /// Set the controller's high soft-travel limit (C `motorHighLimit`):
+    /// the record's dial high limit over MRES, or its dial low limit
+    /// under a negative MRES (motorRecord.cc 4236-4328).
     fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
         Ok(())
     }
 
-    /// Set the controller's low soft-travel limit, dial-frame EGU.
-    /// Mirror of [`set_high_limit`](Self::set_high_limit) (C
-    /// set_dial_lowlimit, motorRecord.cc 4287-4328).
+    /// Set the controller's low soft-travel limit (C `motorLowLimit`).
     fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
         Ok(())
     }

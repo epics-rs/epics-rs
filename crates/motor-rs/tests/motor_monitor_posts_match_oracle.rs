@@ -570,14 +570,14 @@ async fn move_streams(reversed: bool) -> (Vec<String>, Vec<String>) {
     fx.poll_pass(|m| {
         m.moving = true;
         m.direction = true;
-        m.position = 0.5;
+        m.position = 500.0;
     })
     .await;
     let _ = drain_user(&user);
     fx.poll_pass(|m| {
         m.moving = false;
         m.direction = false;
-        m.position = 1.0;
+        m.position = 1000.0;
     })
     .await;
     (start, stream(&user, &order))
@@ -741,14 +741,14 @@ async fn move_phases(fields: &[(&str, DbFieldType)]) -> [Vec<String>; 3] {
     fx.poll_pass(|m| {
         m.moving = true;
         m.direction = true;
-        m.position = 0.5;
+        m.position = 500.0;
     })
     .await;
     let moving = posts(&user);
     fx.poll_pass(|m| {
         m.moving = false;
         m.direction = false;
-        m.position = 1.0;
+        m.position = 1000.0;
     })
     .await;
     [start, moving, posts(&user)]

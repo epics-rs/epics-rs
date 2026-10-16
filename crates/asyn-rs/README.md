@@ -30,8 +30,6 @@ actor, and callers hold handles:
 - **PortHandle** — a cloneable async handle with typed methods
   (`read_int32()`, `write_float64()`, …)
 - **AsyncCompletionHandle** — `Future`, plus `wait_blocking()` for sync callers
-- **AxisRuntime** — the per-axis motor actor: poll loop, event emission, I/O
-  Intr notification
 - **Supervision** — a restart loop with a configurable policy
   (`max_restarts`, `restart_window`)
 
@@ -227,7 +225,7 @@ The adapter handles:
 | `port_handle` | `PortHandle` — cloneable async handle with typed convenience methods |
 | `protocol` | Pure-data message types: `PortCommand`, `PortReply`, `ParamValue`, `PortEvent` |
 | `transport` | `RuntimeClient` trait, `InProcessClient` (zero-cost fast path) |
-| `runtime` | `PortRuntime`, `AxisRuntime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
+| `runtime` | `PortRuntime`, supervision, `RuntimeEvent` lifecycle, async runtime facade (`sync`, `task`, `select!`) |
 | `adapter` | `AsynDeviceSupport` — the record bridge *(requires `epics`)* |
 
 ## Runtime Facade

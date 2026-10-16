@@ -141,7 +141,7 @@ async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
     let batch = sent.try_recv().unwrap();
     assert!(matches!(
         batch.commands.as_slice(),
-        [q] if matches!(q.command, MotorCommand::SetPidGain { .. })
+        [q] if matches!(q, MotorCommand::SetPidGain { .. })
     ));
 }
 
@@ -203,7 +203,8 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
             _accel: f64,
         ) -> Result<(), AsynError> {
             let n = self.moves.fetch_add(1, Ordering::SeqCst);
-            self.position = if n == 0 { position - 0.05 } else { position };
+            // 0.05 EGU short at MRES 0.001.
+            self.position = if n == 0 { position - 50.0 } else { position };
             Ok(())
         }
         fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
@@ -279,7 +280,12 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         inst.device = Some(Box::new(dev));
     }
 
-    // Startup pass consumes the init-seeded status (seq 1).
+    // init_record took the cached status (seq 1); the startup pass reads
+    // the poller's first post.
+    state.lock().unwrap().latest_status = Some(StampedStatus {
+        seq: 2,
+        status: motor.lock().unwrap().poll(&user).unwrap(),
+    });
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
@@ -299,7 +305,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
         let status = motor.lock().unwrap().poll(&user).unwrap();
         state.lock().unwrap().latest_status = Some(StampedStatus { seq, status });
     };
-    stamp(2);
+    stamp(3);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await
@@ -312,7 +318,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     );
 
     // Retry landed on target: the next callback pass finalizes.
-    stamp(3);
+    stamp(4);
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_readback("M1", &mut visited)
         .await

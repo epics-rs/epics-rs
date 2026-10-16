@@ -1,6 +1,21 @@
 use super::*;
 
 impl MotorRecord {
+    /// C `update_values`'s line (devMotorAsyn.c:445-447), which every
+    /// process prints.
+    fn trace_update_values(&self, need_update: bool) {
+        let trace = self.trace();
+        trace.print(
+            asyn_rs::trace::TraceMask::IO_DEVICE,
+            trace.update_status_reason(),
+            format_args!(
+                "{} devMotorAsyn::update_values, needUpdate={}",
+                trace.record(),
+                i32::from(need_update)
+            ),
+        );
+    }
+
     /// Determine the event for this process cycle by reading shared device state.
     pub(crate) fn determine_event(&mut self) -> Option<MotorEvent> {
         // C dbScanLock serializes one pass per signal: a dbPutField pass
@@ -13,22 +28,16 @@ impl MotorRecord {
         // take. The io_intr pulse that announced a pending status or
         // delay expiry is already queued and triggers its own pass.
         if self.last_write.is_some() || self.internal.res_reanchor {
+            self.trace_update_values(false);
             return None;
         }
         // Extract data from shared state, then drop the lock before mutating self
         let (delay_id, new_status) = {
             let state = self.device_state.as_ref()?;
             let mut ds = state.lock().ok()?;
-
-            let delay_id = ds.expired_delay_id.take();
-            let new_status = ds
-                .latest_status
-                .as_ref()
-                .filter(|s| s.seq != self.last_seen_seq)
-                .cloned();
-
-            (delay_id, new_status)
+            (ds.expired_delay_id.take(), ds.update_values())
         };
+        self.trace_update_values(new_status.is_some());
 
         // Check delay expiry first (higher priority)
         if let Some(delay_id) = delay_id {
@@ -39,9 +48,7 @@ impl MotorRecord {
         }
 
         // Check for new motor status
-        if let Some(stamped) = new_status {
-            self.last_seen_seq = stamped.seq;
-            let status = stamped.status;
+        if let Some(status) = new_status {
             // C process_exit (1498-1502): a CALLBACK_DATA pass returns a
             // BUSY STUP to OFF — the GET_INFO response has arrived. The
             // pre-clear value is latched one pass so the done branch can
@@ -85,14 +92,7 @@ impl MotorRecord {
         });
 
         DeviceActions {
-            commands: effects
-                .commands
-                .iter()
-                .map(|command| crate::poll_loop::QueuedCommand {
-                    command: command.clone(),
-                    mres: self.conv.mres,
-                })
-                .collect(),
+            commands: effects.commands.clone(),
             force_poll,
             schedule_delay,
             status_refresh: effects.status_refresh,
@@ -141,33 +141,14 @@ impl MotorRecord {
         let (old_tdir, old_movn) = (self.stat.tdir, self.stat.movn);
         let (old_hls, old_lls, old_athm) = (self.limits.hls, self.limits.lls, self.stat.athm);
 
-        // Layer 1: update raw positions. C devMotorAsyn.c:452/459 rounds the
-        // raw motor and encoder counts with floor(x + 0.5) (half toward +inf),
-        // NOT NINT (half away from zero). They differ only at an exact .5 on a
-        // negative count (raw -2.5 -> C -2, Rust .round() -> -3). The other raw
-        // conversions in this file (rdif, rval, URIP rrbv) use C NINT
-        // (motorRecord.cc) == Rust .round(), so they must stay .round().
-        // RMP/REP/RVEL are a direct `(epicsInt32)floor(..)` there, so an
-        // out-of-range count is INT_MIN (x86), not a 64-bit truncation.
-        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32(
-            (status.position / self.conv.mres + 0.5).floor(),
-        );
-
-        // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
-        // independent of UEIP (C rounds the count the asyn layer already
-        // reports raw; the Rust EGU convention converts at the boundary,
-        // with the ERES the driver was last given). MRES is only a fallback
-        // for an invalid ERES.
-        let valid = |res: f64| res.is_finite() && res != 0.0;
-        let eres_valid = valid(self.conv.eres);
-        let scale = match self.internal.drv_eres {
-            Some(eres) if valid(eres) => eres,
-            _ if eres_valid => self.conv.eres,
-            _ => self.conv.mres,
-        };
-        self.pos.rep = epics_base_rs::types::c_cast::f64_to_i32(
-            (status.encoder_position / scale + 0.5).floor(),
-        );
+        // Layer 1: the raw counts, devMotorAsyn update_values
+        // (devMotorAsyn.c:452-464): `(epicsInt32)floor(x + 0.5)`, half toward
+        // +inf and INT_MIN out of range (x86) — not NINT, which the other raw
+        // conversions in this file (rdif, rval, URIP rrbv) use.
+        self.pos.rmp = epics_base_rs::types::c_cast::f64_to_i32((status.position + 0.5).floor());
+        self.pos.rep =
+            epics_base_rs::types::c_cast::f64_to_i32((status.encoder_position + 0.5).floor());
+        let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
 
         // RRBV depends on UEIP
         self.pos.rrbv = if self.conv.ueip {
@@ -274,62 +255,7 @@ impl MotorRecord {
             self.mark(m::LLS);
         }
 
-        // Build MSTA from driver status
-        let mut msta = MstaFlags::empty();
-        if status.direction {
-            msta |= MstaFlags::DIRECTION;
-        }
-        if status.done {
-            msta |= MstaFlags::DONE;
-        }
-        if status.moving {
-            msta |= MstaFlags::MOVING;
-        }
-        if status.high_limit {
-            msta |= MstaFlags::PLUS_LS;
-        }
-        if status.low_limit {
-            msta |= MstaFlags::MINUS_LS;
-        }
-        if status.home {
-            msta |= MstaFlags::HOME_LS;
-        }
-        if status.encoder_home {
-            msta |= MstaFlags::EA_HOME;
-        }
-        if status.powered {
-            msta |= MstaFlags::POSITION;
-        }
-        if status.problem {
-            msta |= MstaFlags::PROBLEM;
-        }
-        if status.slip_stall {
-            msta |= MstaFlags::SLIP_STALL;
-        }
-        if status.comms_error {
-            msta |= MstaFlags::COMM_ERR;
-        }
-        if status.gain_support {
-            msta |= MstaFlags::GAIN_SUPPORT;
-        }
-        if status.has_encoder {
-            msta |= MstaFlags::ENCODER_PRESENT;
-        }
-        // epics-modules/motor #76 — drivers that don't honor VBAS expose it
-        // via MSTA bit 15 so the record can drop VBAS from accel math.
-        if !status.vbas_supported {
-            msta |= MstaFlags::VBAS_UNSUPPORTED;
-        }
-        // RA_HOMED (bit 14) mirrors the driver status word like every
-        // other MSTA bit. C copies pmr->msta wholesale from the driver
-        // each poll (devMotorAsyn.c:467) and never record-manages
-        // RA_HOMED — motorRecord.cc writes it nowhere. A record-side
-        // sticky latch would report a permanently-homed axis after the
-        // driver de-asserts homed (re-home, controller reset, a
-        // SetPosition redefine the controller treats as un-homed).
-        if status.homed {
-            msta |= MstaFlags::HOMED;
-        }
+        let msta = MstaFlags::from_status(status);
         let msta_changed = msta != self.stat.msta;
         self.stat.msta = msta;
         // C process() 1277-1278, right after update_values.
@@ -356,16 +282,8 @@ impl MotorRecord {
             self.mark(m::ATHM);
         }
 
-        // C devMotorAsyn.c:469-474 — RVEL is the RAW velocity in steps/s
-        // (motorRecord.dbd DBF_LONG "Raw Velocity"), floor()ed as in C.
-        // The C asyn layer reports controller units (raw steps); the Rust
-        // driver convention is EGU (AsynMotor docs), so convert through
-        // MRES at the record boundary exactly like RMP above.
-        self.stat.rvel = if self.conv.mres != 0.0 {
-            epics_base_rs::types::c_cast::f64_to_i32((status.velocity / self.conv.mres).floor())
-        } else {
-            0
-        };
+        // C devMotorAsyn.c:469-474.
+        self.stat.rvel = epics_base_rs::types::c_cast::f64_to_i32(status.velocity.floor());
 
         // LVIO is NOT recomputed here. C re-evaluates it only at
         // enter_do_work (1463-1484: jog from live RBV, home disabled,
@@ -473,11 +391,6 @@ impl MotorRecord {
         } else {
             self.conv.mres / self.conv.eres
         };
-        self.internal.drv_eres = Some(if self.conv.eres == 0.0 {
-            self.conv.mres
-        } else {
-            self.conv.eres
-        });
         effects
             .commands
             .push(MotorCommand::InitEncoderRatio { ratio });
@@ -487,11 +400,10 @@ impl MotorRecord {
         // the autosaved DVAL is meaningful but the driver currently sits near
         // zero (i.e. the controller lost its position across the IOC restart).
         //
-        // C compares `fabs(status.position * mres)` — the *motor* position
-        // dial value, always via MRES. Use the motor raw position (RMP), not
-        // DRBV, since DRBV follows the encoder (ERES) when UEIP=Yes.
+        // C compares `fabs(status.position * mres)` — the motor position,
+        // not DRBV, which follows the encoder when UEIP=Yes.
         let rdbd = self.retry.rdbd.abs().max(self.conv.mres.abs());
-        let motor_dial = coordinate::raw_to_dial(self.pos.rmp, self.conv.mres);
+        let motor_dial = status.position * self.conv.mres;
         let dval_non_zero_pos_near_zero =
             autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
         let mut restore = self
@@ -530,7 +442,7 @@ impl MotorRecord {
             self.internal.lval = self.pos.val;
             self.internal.lrvl = self.pos.rval;
             effects.commands.push(MotorCommand::InitPosition {
-                position: autosaved_dval,
+                position: self.raw_position(autosaved_dval),
             });
         } else {
             self.trace().print(
@@ -539,7 +451,7 @@ impl MotorRecord {
                 format_args!(
                     "devMotorAsyn::init_controller, {} setting of position not required, position={:.6}, mres={:.6}, dval={autosaved_dval:.6}, rdbd={rdbd:.6}",
                     self.trace().record(),
-                    self.pos.rmp as f64,
+                    status.position,
                     self.conv.mres,
                 ),
             );

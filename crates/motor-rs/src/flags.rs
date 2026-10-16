@@ -53,6 +53,69 @@ bitflags! {
     }
 }
 
+impl MstaFlags {
+    /// The driver's status word, C `MotorStatus.status`: what
+    /// `update_values` copies to MSTA (devMotorAsyn.c:467).
+    pub fn from_status(status: &asyn_rs::interfaces::motor::MotorStatus) -> Self {
+        let mut msta = Self::empty();
+        if status.direction {
+            msta |= Self::DIRECTION;
+        }
+        if status.done {
+            msta |= Self::DONE;
+        }
+        if status.moving {
+            msta |= Self::MOVING;
+        }
+        if status.high_limit {
+            msta |= Self::PLUS_LS;
+        }
+        if status.low_limit {
+            msta |= Self::MINUS_LS;
+        }
+        if status.home {
+            msta |= Self::HOME_LS;
+        }
+        if status.encoder_home {
+            msta |= Self::EA_HOME;
+        }
+        if status.powered {
+            msta |= Self::POSITION;
+        }
+        if status.problem {
+            msta |= Self::PROBLEM;
+        }
+        if status.slip_stall {
+            msta |= Self::SLIP_STALL;
+        }
+        if status.comms_error {
+            msta |= Self::COMM_ERR;
+        }
+        if status.gain_support {
+            msta |= Self::GAIN_SUPPORT;
+        }
+        if status.has_encoder {
+            msta |= Self::ENCODER_PRESENT;
+        }
+        // epics-modules/motor #76 — drivers that don't honor VBAS expose it
+        // via MSTA bit 15 so the record can drop VBAS from accel math.
+        if !status.vbas_supported {
+            msta |= Self::VBAS_UNSUPPORTED;
+        }
+        // RA_HOMED (bit 14) mirrors the driver status word like every
+        // other MSTA bit. C copies pmr->msta wholesale from the driver
+        // each poll (devMotorAsyn.c:467) and never record-manages
+        // RA_HOMED — motorRecord.cc writes it nowhere. A record-side
+        // sticky latch would report a permanently-homed axis after the
+        // driver de-asserts homed (re-home, controller reset, a
+        // SetPosition redefine the controller treats as un-homed).
+        if status.homed {
+            msta |= Self::HOMED;
+        }
+        msta
+    }
+}
+
 /// Motor motion phase — internal state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MotionPhase {
@@ -242,12 +305,15 @@ pub enum CommandSource {
     Cnen,
 }
 
-/// Commands to send to the motor driver.
+/// Commands to send to the motor driver, in C's raw units as
+/// motorRecord's `build_trans` calls carry them: positions in steps
+/// (`dial / mres`), speeds in steps/s and accelerations in steps/s²
+/// (`egu / fabs(mres)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MotorCommand {
     MoveAbsolute {
         position: f64,
-        /// Base/start velocity (VBAS, EGU/sec) sent to the driver ahead of the
+        /// Base/start velocity (VBAS) sent to the driver ahead of the
         /// move — canonical asyn `SET_VEL_BASE`/`minVelocity`.
         min_velocity: f64,
         velocity: f64,
@@ -260,12 +326,8 @@ pub enum MotorCommand {
         acceleration: f64,
     },
     MoveVelocity {
-        /// DIAL-frame forward. The jog button is USER-frame; the
-        /// planner folds DIR before emitting (C motorRecord.cc:2119
-        /// commands `jogv = (jvel * dir) / mres` — the velocity sign
-        /// carries DIR).
-        direction: bool,
         min_velocity: f64,
+        /// Signed: C's `jogv = (jvel * dir) / mres` (motorRecord.cc:2119).
         velocity: f64,
         acceleration: f64,
     },
@@ -324,18 +386,13 @@ pub enum MotorCommand {
         kind: PidGainKind,
         gain: f64,
     },
-    /// Forward the high soft-travel limit, dial-frame EGU (C
-    /// set_dial_highlimit, motorRecord.cc 4236-4277). C's wire value is
-    /// raw steps (dhlm/mres) with an MRES-sign register swap; the
-    /// AsynMotor boundary speaks dial EGU (like SetPosition), so the
-    /// dial high limit is forwarded as the high limit unconditionally —
-    /// the raw-frame fold lives where the raw pair is tracked
-    /// (RHLM/RLLM).
+    /// The controller's high raw limit (SET_HIGH_LIMIT): the dial high
+    /// limit, or the dial low one under a negative MRES (C
+    /// set_dial_highlimit / set_dial_lowlimit, motorRecord.cc 4236-4328).
     SetHighLimit {
         position: f64,
     },
-    /// Forward the low soft-travel limit, dial-frame EGU (C
-    /// set_dial_lowlimit, motorRecord.cc 4287-4328).
+    /// The controller's low raw limit (SET_LOW_LIMIT).
     SetLowLimit {
         position: f64,
     },

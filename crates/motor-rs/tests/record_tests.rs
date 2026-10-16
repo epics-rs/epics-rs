@@ -19,7 +19,7 @@ fn sent(
 ) -> Vec<MotorCommand> {
     let mut commands = Vec::new();
     while let Ok(batch) = rx.try_recv() {
-        commands.extend(batch.commands.into_iter().map(|q| q.command));
+        commands.extend(batch.commands);
     }
     commands
 }
@@ -184,8 +184,8 @@ fn test_process_motor_info() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.001,
+        position: 10000.0,
+        encoder_position: 10001.0,
         done: true,
         moving: false,
         ..Default::default()
@@ -334,8 +334,8 @@ fn test_sync_positions_rval_is_motor_raw_not_rrbv() {
     rec.conv.eres = 0.002;
     rec.conv.ueip = true;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
         ..Default::default()
@@ -417,6 +417,7 @@ fn test_stop_during_move() {
 #[test]
 fn test_jog_start_stop() {
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
 
@@ -428,10 +429,7 @@ fn test_jog_start_stop() {
     assert!(rec.stat.mip.contains(MipFlags::JOGF));
     assert!(matches!(
         effects.commands[0],
-        MotorCommand::MoveVelocity {
-            direction: true,
-            ..
-        }
+        MotorCommand::MoveVelocity { velocity, .. } if velocity > 0.0
     ));
 
     // Stop jog
@@ -799,9 +797,9 @@ fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
     assert!(rec.internal.pp, "C 1982: pp = TRUE");
     assert!(rec.stat.dmov, "no motion: DMOV stays TRUE");
 
-    // GET_INFO callback: readback now reports in the new resolution.
+    // GET_INFO callback: the controller still reports 8 steps, now 4 EGU.
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 4.0,
+        position: 8.0,
         done: true,
         ..Default::default()
     };
@@ -885,8 +883,8 @@ fn test_db_loaded_ueip_kept_when_encoder_present() {
 
     rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
         ..Default::default()
@@ -945,8 +943,8 @@ fn test_encoder_loss_demotes_ueip_on_poll() {
     rec.conv.ueip = true;
 
     let with_encoder = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
         ..Default::default()
@@ -956,8 +954,8 @@ fn test_encoder_loss_demotes_ueip_on_poll() {
     assert!(rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT));
 
     let lost_encoder = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         has_encoder: false,
         ..Default::default()
@@ -1754,14 +1752,14 @@ fn test_ueip_eres_readback() {
     rec.conv.ueip = true;
     rec.conv.eres = 0.002;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    // REP = round(10.0 / 0.002) = 5000
+    // REP = encoder counts = 5000
     // RRBV = REP = 5000 (UEIP=true)
     // DRBV = 5000 * 0.002 = 10.0
     assert_eq!(rec.pos.rep, 5000);
@@ -1776,8 +1774,8 @@ fn test_ueip_eres_nan_fallback_to_mres() {
     rec.conv.ueip = true;
     rec.conv.eres = f64::NAN;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 10000.0,
         done: true,
         has_encoder: true,
         ..Default::default()
@@ -1795,8 +1793,8 @@ fn test_ueip_false_uses_motor_position() {
     rec.conv.ueip = false;
     rec.conv.eres = 0.002;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 20.0,
+        position: 10000.0,
+        encoder_position: 10000.0,
         done: true,
         ..Default::default()
     };
@@ -1808,22 +1806,21 @@ fn test_ueip_false_uses_motor_position() {
 }
 
 #[test]
-fn test_rep_scales_by_eres_even_under_ueip_no() {
-    // C devMotorAsyn.c:459-464: REP is the raw encoder count whether or
-    // not the readback uses it — UEIP selects the RRBV source, not the
-    // REP scale.
+fn test_rep_is_the_driver_encoder_count_even_under_ueip_no() {
+    // C devMotorAsyn.c:459-464: REP is the driver's encoder count whether
+    // or not the readback uses it — UEIP selects the RRBV source only.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     rec.conv.eres = 0.002;
     rec.conv.ueip = false;
     let status = asyn_rs::interfaces::motor::MotorStatus {
-        position: 10.0,
-        encoder_position: 10.0,
+        position: 10000.0,
+        encoder_position: 5000.0,
         done: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    assert_eq!(rec.pos.rep, 5000, "REP in encoder counts via ERES");
+    assert_eq!(rec.pos.rep, 5000, "REP is the encoder count");
     assert_eq!(rec.pos.rrbv, 10000, "readback still follows the motor");
     assert_eq!(rec.pos.drbv, 10.0);
 }
@@ -2730,6 +2727,7 @@ fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
     // the still-latched jog BUTTON survives; Go re-arms the jog from the
     // button (motorRecord.cc:1916-1918).
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.dval = 50.0;
@@ -2773,10 +2771,7 @@ fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "Go re-arms the jog from the still-latched button"
     );
@@ -2886,6 +2881,7 @@ fn test_latent_homf_during_move_stops_and_queues_home() {
 #[test]
 fn test_latent_jogf_fires_on_move_block_pass() {
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.jogf = true; // bare put, never dispatched
@@ -2896,10 +2892,7 @@ fn test_latent_jogf_fires_on_move_block_pass() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "latent JOGF must start the jog (C jog section, 2079)"
     );
@@ -3145,7 +3138,7 @@ fn test_latent_spmg_go_resumes_without_double_plan() {
         .collect();
     assert_eq!(moves.len(), 1, "exactly one move — no double plan");
     assert!(
-        matches!(moves[0], MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9),
+        matches!(moves[0], MotorCommand::MoveAbsolute { position, .. } if (position - 8000.0).abs() < 1e-9),
         "the resume targets the freshest DVAL, got {:?}",
         moves[0]
     );
@@ -3218,7 +3211,7 @@ fn test_latent_stop_consumes_latent_spmg_go() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveAbsolute { position, .. } if (position - 85.0).abs() < 1e-9
+            MotorCommand::MoveAbsolute { position, .. } if (position - 8500.0).abs() < 1e-9
         )),
         "the tweak targets VAL+TWV=85; a replayed Go would have targeted 80"
     );
@@ -3966,27 +3959,26 @@ fn test_rvel_is_floored_raw_velocity() {
 }
 
 #[test]
-fn test_rvel_converts_egu_velocity_to_raw_steps() {
+fn test_rvel_is_the_floored_driver_velocity() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    // C devMotorAsyn.c:469-474 fills RVEL with the raw steps/s the
-    // controller reports. The Rust driver reports EGU/s, so the record
-    // converts through MRES like it does for RMP.
+    // C devMotorAsyn.c:469-474 fills RVEL with the floored steps/s the
+    // controller reports.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     let status = MotorStatus {
-        velocity: 2.5, // EGU/s
+        velocity: 2500.0,
         ..Default::default()
     };
     rec.process_motor_info(&status);
     assert_eq!(
         rec.get_field("RVEL"),
         Some(EpicsValue::Long(2500)),
-        "2.5 EGU/s at 0.001 EGU/step = 2500 steps/s"
+        "steps/s pass through"
     );
 
     // Negative raw velocity keeps C's floor() semantics.
     let status = MotorStatus {
-        velocity: -0.0015,
+        velocity: -1.5,
         ..Default::default()
     };
     rec.process_motor_info(&status);
@@ -4140,6 +4132,7 @@ fn test_home_reverse_proceeds_below_low_soft_limit() {
 #[test]
 fn test_spmg_go_resumes_latched_jog() {
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Jog button latched while paused.
@@ -4150,10 +4143,7 @@ fn test_spmg_go_resumes_latched_jog() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "SPMG=Go must resume the latched forward jog"
     );
@@ -4182,6 +4172,7 @@ fn test_spmg_go_without_jog_replans_to_dval() {
 #[test]
 fn test_jogr_command_clears_latched_jogf() {
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Both buttons latched (the ambiguous state #170 addresses)
@@ -4193,16 +4184,14 @@ fn test_jogr_command_clears_latched_jogf() {
     // Reverse jog issued
     assert!(effects.commands.iter().any(|c| matches!(
         c,
-        MotorCommand::MoveVelocity {
-            direction: false,
-            ..
-        }
+        MotorCommand::MoveVelocity { velocity, .. } if *velocity < 0.0
     )));
 }
 
 #[test]
 fn test_jogf_command_clears_latched_jogr() {
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.jogf = true;
@@ -4211,10 +4200,7 @@ fn test_jogf_command_clears_latched_jogr() {
     assert!(!rec.ctrl.jogr, "JOGF command must clear latched JOGR");
     assert!(effects.commands.iter().any(|c| matches!(
         c,
-        MotorCommand::MoveVelocity {
-            direction: true,
-            ..
-        }
+        MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
     )));
 }
 
@@ -4357,6 +4343,7 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
     // A jog command issued while a move is in progress: the record stops the
     // current motion, then resumes the queued jog once the driver is done.
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // A move is in progress.
@@ -4382,10 +4369,7 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(effects.commands.iter().any(|c| matches!(
         c,
-        MotorCommand::MoveVelocity {
-            direction: true,
-            ..
-        }
+        MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
     )));
 }
 
@@ -6603,6 +6587,7 @@ fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     // post-processes (sync) instead of arming a move resume; the
     // still-latched button resumes the JOG on Go (1916-1918).
     let mut rec = MotorRecord::new();
+    rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.jogf = true;
@@ -6623,10 +6608,7 @@ fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "Go resumes the jog, not a position move"
     );
@@ -7413,6 +7395,7 @@ fn test_jogf_put_while_paused_parks_jog_req() {
     // !hls) arms MIP_JOG_REQ; the dispatch gate (2082) refuses while
     // stop_or_pause, so the request parks in the MIP readback.
     let mut rec = paused_idle_record();
+    rec.vel.jvel = 1.0;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "armed at the put");
     let effects = rec.plan_motion(CommandSource::Jogf);
@@ -7426,10 +7409,7 @@ fn test_jogf_put_while_paused_parks_jog_req() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "Go dispatches the parked jog"
     );
@@ -7680,7 +7660,7 @@ fn test_jog_direction_folds_dir_into_dial_command() {
     rec.ctrl.jogf = true;
     let effects = rec.plan_motion(CommandSource::Jogf);
     let dial_dir = effects.commands.iter().find_map(|c| match c {
-        MotorCommand::MoveVelocity { direction, .. } => Some(*direction),
+        MotorCommand::MoveVelocity { velocity, .. } => Some(*velocity > 0.0),
         _ => None,
     });
     assert_eq!(
@@ -7714,7 +7694,7 @@ fn test_queued_jog_replay_folds_dir_and_updates_cdir() {
     rec.stat.movn = false;
     let effects = rec.check_completion();
     let dial_dir = effects.commands.iter().find_map(|c| match c {
-        MotorCommand::MoveVelocity { direction, .. } => Some(*direction),
+        MotorCommand::MoveVelocity { velocity, .. } => Some(*velocity > 0.0),
         _ => None,
     });
     assert_eq!(
@@ -8027,9 +8007,8 @@ fn test_pid_gain_put_no_forward_without_gain_support() {
 #[test]
 fn test_dial_limit_put_forwards_one_sided() {
     // C set_dial_highlimit (4236-4277) / set_dial_lowlimit (4287-4328):
-    // a dial-limit put sends exactly ONE limit command. The boundary is
-    // dial-frame EGU (like SetPosition), so DHLM maps to SetHighLimit
-    // unswapped — C's MRES-sign register swap lives in the raw pair.
+    // a dial-limit put sends exactly ONE limit command, dial/MRES in
+    // steps, on the register MRES's sign selects.
     let mut rec = MotorRecord::new();
     let mut rx = capture(&mut rec);
     rec.conv.mres = 0.01;
@@ -8039,13 +8018,26 @@ fn test_dial_limit_put_forwards_one_sided() {
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
         sent(&mut rx),
-        [MotorCommand::SetHighLimit { position: 10.0 }]
+        [MotorCommand::SetHighLimit { position: 1000.0 }]
     );
 
     rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
     assert_eq!(
         sent(&mut rx),
-        [MotorCommand::SetLowLimit { position: -10.0 }]
+        [MotorCommand::SetLowLimit { position: -1000.0 }]
+    );
+
+    // C 4246-4250: MRES<0 flips the dial high limit onto the low register.
+    rec.conv.mres = -0.01;
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetLowLimit { position: -1000.0 }]
+    );
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetHighLimit { position: 1000.0 }]
     );
 }
 
@@ -8063,14 +8055,14 @@ fn test_user_limit_put_folds_dir_into_forwarded_side() {
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
         sent(&mut rx),
-        [MotorCommand::SetHighLimit { position: 10.0 }]
+        [MotorCommand::SetHighLimit { position: 1000.0 }]
     );
 
     rec.conv.dir = MotorDir::Neg;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     assert_eq!(
         sent(&mut rx),
-        [MotorCommand::SetLowLimit { position: -10.0 }],
+        [MotorCommand::SetLowLimit { position: -1000.0 }],
         "user high under DIR=Neg is the dial low limit"
     );
 }
@@ -8625,11 +8617,7 @@ mod jvel_live_retune {
         assert!(
             matches!(
                 commands.as_slice(),
-                [MotorCommand::MoveVelocity {
-                    direction: true,
-                    velocity,
-                    ..
-                }] if *velocity == 2.5
+                [MotorCommand::MoveVelocity { velocity, .. }] if *velocity == 2.5
             ),
             "retune re-emits the jog at the new JVEL: {commands:?}"
         );
@@ -8645,10 +8633,7 @@ mod jvel_live_retune {
         assert!(
             matches!(
                 commands.as_slice(),
-                [MotorCommand::MoveVelocity {
-                    direction: false,
-                    ..
-                }]
+                [MotorCommand::MoveVelocity { velocity, .. }] if *velocity < 0.0
             ),
             "reverse jog retunes in the reverse direction: {commands:?}"
         );
@@ -8667,10 +8652,7 @@ mod jvel_live_retune {
         assert!(
             matches!(
                 commands.as_slice(),
-                [MotorCommand::MoveVelocity {
-                    direction: true,
-                    ..
-                }]
+                [MotorCommand::MoveVelocity { velocity, .. }] if *velocity > 0.0
             ),
             "JOGR 0 retunes forward: {commands:?}"
         );
@@ -9708,4 +9690,73 @@ fn every_field_default_is_the_dbd_initial() {
         }
     }
     assert!(wrong.is_empty(), "(field, default, dbd initial): {wrong:?}");
+}
+
+/// motorRecord.cc build_trans arguments at a negative MRES, as C
+/// motorSim receives them: positions dial/MRES, rates EGU/|MRES|
+/// (do_work 2330-2449), jog jvel*dir/MRES (2119), LOAD_POS dval/MRES
+/// (3771-3817); the readback is steps*MRES (process_motor_info 3717).
+#[test]
+fn test_driver_sees_raw_steps_at_negative_mres() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = -0.01;
+    rec.vel.velo = 1.0;
+    rec.vel.accl = 0.2;
+    rec.vel.jvel = 1.0;
+    rec.vel.jar = 5.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("VAL", EpicsValue::Double(1.5)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(
+        effects.commands,
+        [MotorCommand::MoveAbsolute {
+            position: -150.0,
+            min_velocity: 0.0,
+            velocity: 100.0,
+            acceleration: 500.0,
+        }]
+    );
+
+    rec.process_motor_info(&MotorStatus {
+        position: -150.0,
+        encoder_position: -150.0,
+        velocity: -37.5,
+        done: true,
+        ..Default::default()
+    });
+    let _ = rec.check_completion();
+    assert_eq!(rec.pos.rmp, -150);
+    assert_eq!(rec.pos.rep, -150);
+    assert_eq!(rec.pos.drbv, 1.5);
+    assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(-38)));
+    assert!(rec.stat.dmov);
+
+    rec.ctrl.jogf = true;
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(
+        effects.commands,
+        [MotorCommand::MoveVelocity {
+            min_velocity: 0.0,
+            velocity: -100.0,
+            acceleration: 500.0,
+        }],
+        "forward jog at MRES<0 runs the raw axis negative"
+    );
+    assert!(!rec.stat.cdir, "C 2135-2136: CDIR flips with the MRES sign");
+
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = -0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(4.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        effects
+            .commands
+            .contains(&MotorCommand::SetPosition { position: -400.0 }),
+        "{:?}",
+        effects.commands
+    );
 }

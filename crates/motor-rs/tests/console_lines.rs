@@ -43,10 +43,12 @@ fn named_record() -> MotorRecord {
     rec
 }
 
+/// A moving status at dial `position`, reported in steps.
 fn moving(rec: &mut MotorRecord, position: f64, direction: bool) {
+    let steps = position / rec.conv.mres;
     rec.process_motor_info(&MotorStatus {
-        position,
-        encoder_position: position,
+        position: steps,
+        encoder_position: steps,
         done: false,
         moving: true,
         direction,

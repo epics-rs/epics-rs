@@ -317,8 +317,8 @@ Values must be set before the `miniBeamlineConfig()` call.
 Motors are configured in `st.cmd` using `simMotorCreate` and `dbLoadRecords`:
 
 ```
-# simMotorCreate(port, lowLimit, highLimit, [pollMs])
-simMotorCreate("ph_mtr", -100, 100, 100)
+# simMotorCreate(port, lowLimit, highLimit, [pollMs]), limits in steps
+simMotorCreate("ph_mtr", -100000, 100000, 100)
 
 # dbLoadRecords(template, macros)
 #   VELO, ACCL, HLM, LLM, MRES, PREC have defaults in motor.template
@@ -343,9 +343,9 @@ Optics devices are configured in `st.cmd`:
 
 ```bash
 # Kohzu DCM: 3 SimMotors + kohzuSeq.db + kohzuCtl state machine
-simMotorCreate("dcm_theta", -10, 90, 100)
-simMotorCreate("dcm_y", -50, 50, 100)
-simMotorCreate("dcm_z", -50, 50, 100)
+simMotorCreate("dcm_theta", -10000, 90000, 100)
+simMotorCreate("dcm_y", -50000, 50000, 100)
+simMotorCreate("dcm_z", -50000, 50000, 100)
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:theta,PORT=dcm_theta")
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:y,PORT=dcm_y")
 dbLoadRecords("$(MOTOR)/motor.template", "P=mini:,M=dcm:z,PORT=dcm_z")

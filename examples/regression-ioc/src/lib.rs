@@ -97,8 +97,9 @@ impl RegressionIoc {
         let macros = std::collections::HashMap::from([("MPORT".to_string(), port.clone())]);
         // io_intr_scan_independent drives the record on every readback even
         // though SCAN=Passive, which is exactly the v0.20.0 path under test.
+        // Limits in steps: the db's ±100 at MRES 0.01.
         let motor: Arc<Mutex<dyn AsynMotor>> =
-            Arc::new(Mutex::new(SimMotor::new().with_limits(-100.0, 100.0)));
+            Arc::new(Mutex::new(SimMotor::new().with_limits(-10_000.0, 10_000.0)));
         let AxisSetup {
             axis,
             poll_loop,

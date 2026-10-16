@@ -8,7 +8,7 @@ use asyn_rs::manager::PortManager;
 use asyn_rs::trace::TraceFile;
 use asyn_rs::user::AsynUser;
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::{QueuedCommand, execute_commands};
+use motor_rs::poll_loop::execute_commands;
 use motor_rs::trace::{MotorTrace, TraceUser};
 
 /// An axis whose controller dropped the connection: every write fails the way
@@ -74,21 +74,10 @@ fn traced_by(port: &str, body: impl FnOnce()) -> Vec<String> {
 /// Run `commands` queued at MRES 1 on a port whose trace file is a fresh
 /// file; return its lines.
 fn traced(port: &str, commands: &[MotorCommand]) -> Vec<String> {
-    traced_at(port, 1.0, commands)
-}
-
-fn traced_at(port: &str, mres: f64, commands: &[MotorCommand]) -> Vec<String> {
-    let queued: Vec<QueuedCommand> = commands
-        .iter()
-        .map(|command| QueuedCommand {
-            command: command.clone(),
-            mres,
-        })
-        .collect();
     traced_by(port, || {
         let trace = MotorTrace::new(port, 0);
         trace.set_record("XPS:m1");
-        execute_commands(&mut Disconnected, &trace, &queued, &mut |_| {});
+        execute_commands(&mut Disconnected, &trace, commands, &mut |_| {});
     })
 }
 
@@ -152,7 +141,7 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
     state.lock().unwrap().latest_status = Some(StampedStatus {
         seq: 1,
         status: MotorStatus {
-            position: 2.5,
+            position: 250.0,
             comms_error: true,
             problem: true,
             ..MotorStatus::default()
@@ -180,10 +169,9 @@ fn init_reads_the_cached_status_and_a_lost_controller_prints_nothing() {
 
 #[test]
 fn a_refused_init_position_load_prints_init_controller_in_raw_steps() {
-    let lines = traced_at(
+    let lines = traced(
         "traceLinesInitPos",
-        0.01,
-        &[MotorCommand::InitPosition { position: 5.0 }],
+        &[MotorCommand::InitPosition { position: 500.0 }],
     );
     assert_eq!(lines.len(), 2, "{lines:#?}");
     assert!(
@@ -201,21 +189,20 @@ fn a_refused_init_position_load_prints_init_controller_in_raw_steps() {
 }
 
 #[test]
-fn limits_print_in_steps_and_swap_for_a_negative_mres() {
+fn limits_print_on_the_parameter_they_write() {
     use asyn_rs::trace::TraceMask;
 
-    // set_dial_highlimit sends dhlm/mres as SET_LOW_LIMIT when MRES < 0
-    // (motorRecord.cc:4243-4249); the driver still gets the dial pair.
+    // What the record sends for DHLM 2, DLLM -1 at MRES -0.01
+    // (motorRecord.cc:4243-4249).
     let port = "traceLinesNegLimits";
     PortManager::global()
         .trace_manager()
         .set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
-    let lines = traced_at(
+    let lines = traced(
         port,
-        -0.01,
         &[
-            MotorCommand::SetHighLimit { position: 2.0 },
-            MotorCommand::SetLowLimit { position: -1.0 },
+            MotorCommand::SetLowLimit { position: -200.0 },
+            MotorCommand::SetHighLimit { position: 100.0 },
         ],
     );
     let tails: Vec<&str> = lines
@@ -234,21 +221,20 @@ fn limits_print_in_steps_and_swap_for_a_negative_mres() {
 }
 
 #[test]
-fn a_move_prints_steps_and_step_rates() {
+fn a_move_prints_the_raw_values_it_carries() {
     use asyn_rs::trace::TraceMask;
 
     let port = "traceLinesMoveSteps";
     PortManager::global()
         .trace_manager()
         .set_trace_mask(Some(port), TraceMask::FLOW);
-    let lines = traced_at(
+    let lines = traced(
         port,
-        -0.01,
         &[MotorCommand::MoveAbsolute {
-            position: 5.0,
-            min_velocity: 0.1,
-            velocity: 1.0,
-            acceleration: 2.0,
+            position: -500.0,
+            min_velocity: 10.0,
+            velocity: 100.0,
+            acceleration: 200.0,
         }],
     );
     assert_eq!(
@@ -316,7 +302,7 @@ fn an_init_that_loads_no_position_says_so_under_flow() {
         rec.conv.rstm = motor_rs::flags::RestoreMode::Never;
         rec.pos.dval = 3.0;
         rec.initial_readback(&MotorStatus {
-            position: 1.0,
+            position: 100.0,
             ..MotorStatus::default()
         });
     });
@@ -344,10 +330,7 @@ fn stop_traced(user: TraceUser) -> Vec<String> {
         execute_commands(
             &mut Disconnected,
             &trace,
-            &[QueuedCommand {
-                command: MotorCommand::Stop { acceleration: 1.0 },
-                mres: 1.0,
-            }],
+            &[MotorCommand::Stop { acceleration: 1.0 }],
             &mut |_| {},
         );
     });
@@ -399,8 +382,7 @@ fn move_and_stop_traced(port: &str, user: TraceUser) -> Vec<String> {
                 acceleration: 0.2,
             },
             MotorCommand::Stop { acceleration: 1.0 },
-        ]
-        .map(|command| QueuedCommand { command, mres: 1.0 });
+        ];
         execute_commands(&mut Disconnected, &trace, &queued, &mut |_| {});
     });
     lines
@@ -453,5 +435,98 @@ fn a_model2_axis_prints_drv_motor_asyn_write_lines_and_no_controller_line() {
             "drvMotorAsyn::writeInt32, reason=107, value=0",
             refused,
         ]
+    );
+}
+
+/// The device-support half of a move under ASYN_TRACEIO_DEVICE, as C
+/// motorSim prints it: init's `update_values`, the put pass that reads no
+/// status, the posts while the move is pending (`P`), and a callback pass
+/// per post once it finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_callback_and_update_values_print_under_traceio_device() {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use asyn_rs::trace::TraceMask;
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use epics_base_rs::types::EpicsValue;
+    use motor_rs::builder::{AxisSetup, MotorBuilder};
+    use motor_rs::devices::{
+        PortDriver, device_support_factory, devices, register_axis, register_port,
+    };
+
+    let port = "traceLinesIoDevice";
+    PortManager::global()
+        .trace_manager()
+        .set_trace_mask(Some(port), TraceMask::IO_DEVICE);
+    let path = std::env::temp_dir().join(format!("motor-trace-{port}-{}", std::process::id()));
+    PortManager::global().trace_manager().set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+    );
+    register_port(port, PortDriver::Controller, 1).unwrap();
+    let motor: Arc<Mutex<dyn AsynMotor>> =
+        Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
+    let AxisSetup {
+        axis, poll_loop, ..
+    } = MotorBuilder::new(motor)
+        .trace_user(TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        })
+        .poll_interval(Duration::from_millis(10))
+        .build_axis();
+    register_axis(axis).unwrap();
+    tokio::spawn(poll_loop.run());
+    let (name, factory) = motor_rs::motor_record_factory();
+    let ioc = IocBuilder::new()
+        .register_record_type(name, factory)
+        .register_dynamic_device_support(&devices(), device_support_factory())
+        .db_string(
+            &format!(
+                r#"record(motor, "TL:m") {{ field(DTYP, "asynMotor") field(OUT, "@asyn({port},0)") field(MRES, "0.01") field(VELO, "10") }}"#
+            ),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build_ioc()
+        .await
+        .unwrap();
+    let db = Arc::clone(ioc.database());
+    assert!(ioc.run().await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let booted = std::fs::read_to_string(&path).unwrap().len();
+    db.put_record_field_from_ca("TL:m", "VAL", EpicsValue::Double(0.1))
+        .await
+        .unwrap();
+    for _ in 0..300 {
+        if db.get_pv("TL:m.DMOV").unwrap() == EpicsValue::Short(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let tail = |l: &str| l[l.find("TL:m ").unwrap()..].to_owned();
+    let boot: Vec<String> = text[..booted].lines().map(tail).collect();
+    let moved: Vec<String> = text[booted..].lines().map(tail).collect();
+    assert_eq!(boot, ["TL:m devMotorAsyn::update_values, needUpdate=1"]);
+    assert_eq!(
+        moved[..3],
+        [
+            "TL:m devMotorAsyn::update_values, needUpdate=0",
+            "TL:m devMotorAsyn::statusCallback new value=[p:0.000000,e:0.000000,s:80]  P",
+            "TL:m devMotorAsyn::update_values, needUpdate=1",
+        ],
+        "{moved:#?}"
+    );
+    assert_eq!(
+        moved[moved.len() - 2..],
+        [
+            "TL:m devMotorAsyn::statusCallback new value=[p:10.000000,e:10.000000,s:2]   ",
+            "TL:m devMotorAsyn::update_values, needUpdate=1",
+        ],
+        "{moved:#?}"
     );
 }

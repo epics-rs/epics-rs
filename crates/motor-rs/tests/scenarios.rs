@@ -9,10 +9,13 @@ use epics_base_rs::types::EpicsValue;
 
 use std::time::Duration;
 
+/// `make_record`'s motor resolution, EGU per step.
+const MRES: f64 = 0.001;
+
 /// Helper: create a default motor record with typical settings.
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
-    rec.conv.mres = 0.001;
+    rec.conv.mres = MRES;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.limits.hlm = 100.0;
@@ -29,11 +32,13 @@ fn make_record() -> MotorRecord {
     rec
 }
 
-/// Helper: simulate a completed move by updating motor info.
+/// Helper: simulate a completed move by updating motor info. The driver
+/// reports steps; `target_pos` is dial EGU.
 fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
+    let steps = target_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: target_pos,
-        encoder_position: target_pos,
+        position: steps,
+        encoder_position: steps,
         done: true,
         moving: false,
         ..Default::default()
@@ -43,9 +48,10 @@ fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
 
 /// Helper: simulate motor in-progress.
 fn motor_moving(rec: &mut MotorRecord, current_pos: f64) {
+    let steps = current_pos / rec.conv.mres;
     let status = MotorStatus {
-        position: current_pos,
-        encoder_position: current_pos,
+        position: steps,
+        encoder_position: steps,
         done: false,
         moving: true,
         ..Default::default()
@@ -68,7 +74,7 @@ fn absolute_move_reaches_target_and_sets_dmov() {
     assert_eq!(effects.commands.len(), 1);
     assert!(matches!(
         effects.commands[0],
-        MotorCommand::MoveAbsolute { position, .. } if (position - 50.0).abs() < 1e-10
+        MotorCommand::MoveAbsolute { position, .. } if (position - 50_000.0).abs() < 1e-6
     ));
 
     // Simulate motor reaching target
@@ -149,12 +155,13 @@ fn backlash_generates_two_phase_move() {
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert!(rec.internal.backlash_pending);
 
-    // First command should go to pretarget (dval - bdst = -10 - 1 = -11)
+    // First command should go to pretarget (dval - bdst = -10 - 1 = -11),
+    // in steps at MRES 0.001.
     assert_eq!(effects.commands.len(), 1);
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
         assert!(
-            (*position - (-11.0)).abs() < 1e-10,
-            "pretarget should be -11.0, got {position}"
+            (*position - (-11_000.0)).abs() < 1e-6,
+            "pretarget should be -11000 steps, got {position}"
         );
     } else {
         panic!("expected MoveAbsolute");
@@ -173,8 +180,8 @@ fn backlash_generates_two_phase_move() {
         position, velocity, ..
     } = &effects.commands[0]
     {
-        assert!((*position - (-10.0)).abs() < 1e-10);
-        assert_eq!(*velocity, rec.vel.bvel);
+        assert!((*position - (-10_000.0)).abs() < 1e-6);
+        assert_eq!(*velocity, rec.vel.bvel / rec.conv.mres);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -245,7 +252,7 @@ fn retry_modes_arithmetic_geometric_inposition() {
     // retry_target = 10.0 (= dval), use_rel=false:
     // position = dval + frac*(retry_target - dval) = 10.0 + 0.5*0 = 10.0
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
-        assert!((position - 10.0).abs() < 1e-6);
+        assert!((position - 10_000.0).abs() < 1e-6);
     } else {
         panic!("expected MoveAbsolute");
     }
@@ -292,10 +299,7 @@ fn jog_start_stop_backlash_sequence() {
     assert!(rec.stat.mip.contains(MipFlags::JOGF));
     assert!(matches!(
         effects.commands[0],
-        MotorCommand::MoveVelocity {
-            direction: true,
-            ..
-        }
+        MotorCommand::MoveVelocity { velocity, .. } if velocity > 0.0
     ));
 
     // Stop jog
@@ -513,8 +517,8 @@ fn startup_syncs_positions_from_driver() {
     let mut rec = make_record();
 
     let status = MotorStatus {
-        position: 25.0,
-        encoder_position: 25.0,
+        position: 25_000.0,
+        encoder_position: 25_000.0,
         done: true,
         moving: false,
         ..Default::default()
@@ -575,7 +579,7 @@ fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> 
     dev.init(rec as &mut dyn Record).unwrap();
     let mut commands = Vec::new();
     while let Ok(batch) = motor_cmd_rx.try_recv() {
-        commands.extend(batch.commands.into_iter().map(|q| q.command));
+        commands.extend(batch.commands);
     }
     commands
 }
@@ -589,8 +593,8 @@ fn device_init_runs_initial_readback() {
     device_init(
         &mut rec,
         MotorStatus {
-            position: 25.0,
-            encoder_position: 25.0,
+            position: 25_000.0,
+            encoder_position: 25_000.0,
             done: true,
             moving: false,
             ..Default::default()
@@ -631,7 +635,7 @@ fn device_init_queues_the_rstm_restore_before_the_limits() {
                 MotorCommand::InitPosition { position },
                 MotorCommand::SetHighLimit { .. },
                 MotorCommand::SetLowLimit { .. },
-            ] if *position == 5.0
+            ] if *position == 5000.0
         ),
         "{commands:?}"
     );
@@ -648,8 +652,8 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
     rec.pos.dval = 7.0;
 
     let status = MotorStatus {
-        position: 25.0,
-        encoder_position: 25.0,
+        position: 25_000.0,
+        encoder_position: 25_000.0,
         done: true,
         moving: false,
         ..Default::default()
@@ -709,13 +713,14 @@ fn stup_protocol_round_trip_through_live_path() {
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
 }
 
-/// Helper: an idle done status stamped with the given seq.
+/// Helper: an idle done status at dial `pos` on a `make_record` axis,
+/// stamped with the given seq.
 fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
     motor_rs::device_state::StampedStatus {
         seq,
         status: MotorStatus {
-            position: pos,
-            encoder_position: pos,
+            position: pos / MRES,
+            encoder_position: pos / MRES,
             done: true,
             moving: false,
             ..Default::default()
@@ -748,9 +753,10 @@ fn set_mode_load_pos_collapses_through_live_path() {
     assert!(!rec.stat.dmov);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions.commands.iter().any(
-            |c| matches!(&c.command, MotorCommand::SetPosition { position } if *position == 3.0)
-        ),
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 3000.0)),
         "redefinition reaches the driver"
     );
 
@@ -852,9 +858,10 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     assert!(!rec.stat.dmov);
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
     assert!(
-        actions.commands.iter().any(
-            |c| matches!(&c.command, MotorCommand::SetPosition { position } if *position == 7.0)
-        ),
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 7000.0)),
         "parked redefinition replays to the driver"
     );
 
@@ -1159,7 +1166,7 @@ fn new_target_opposite_direction_stops_immediately() {
 #[test]
 fn sim_motor_end_to_end() {
     let user = AsynUser::new(0);
-    let mut motor = SimMotor::new().with_limits(-100.0, 100.0);
+    let mut motor = SimMotor::new().with_limits(-100_000.0, 100_000.0);
     let mut rec = make_record();
 
     // Initial readback
@@ -1181,7 +1188,7 @@ fn sim_motor_end_to_end() {
     } = &effects.commands[0]
     {
         motor
-            .move_absolute(&user, *position, *min_velocity, 100000.0, *acceleration)
+            .move_absolute(&user, *position, *min_velocity, 1.0e8, *acceleration)
             .unwrap();
     }
 
@@ -1195,7 +1202,7 @@ fn sim_motor_end_to_end() {
         }
     }
     assert!(status.done);
-    assert_eq!(status.position, 10.0);
+    assert_eq!(status.position, 10_000.0);
 
     rec.process_motor_info(&status);
     let _effects = rec.check_completion();
@@ -1660,10 +1667,7 @@ fn give_up_refires_held_jogf_same_pass() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "give-up must re-fire the held jog same-pass, got {:?}",
         effects.commands
@@ -1756,10 +1760,7 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "idle poll must resume the held jog, got {:?}",
         effects.commands
@@ -1833,10 +1834,7 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
     assert!(
         effects.commands.iter().any(|c| matches!(
             c,
-            MotorCommand::MoveVelocity {
-                direction: true,
-                ..
-            }
+            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
         )),
         "SPMG=Go resumes the held jog, got {:?}",
         effects.commands
@@ -1851,7 +1849,7 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
 fn sim_motor_rep_counts_motor_steps_whatever_eres() {
     for eres in [0.001, 0.002] {
         let user = AsynUser::new(0);
-        let mut motor = SimMotor::new().with_position(3.0);
+        let mut motor = SimMotor::new().with_position(3000.0);
         let mut rec = make_record();
         rec.conv.eres = eres;
         let effects = rec.initial_readback(&motor.poll(&user).unwrap());

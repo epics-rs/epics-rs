@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::device_state::*;
 use crate::flags::MotorCommand;
-use crate::poll_loop::{CommandBatch, MissingAxis, MotorCommandSender, PollCommand, QueuedCommand};
+use crate::poll_loop::{CommandBatch, MissingAxis, MotorCommandSender, PollCommand};
 use crate::trace::{MotorTrace, TraceUser};
 
 /// One axis as its create command registers it: the poller's queues and the
@@ -55,11 +55,12 @@ impl MotorAxis {
     pub fn attach(&self) -> MotorDeviceSupport {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
-        let record = self
-            .subscribers
-            .attach(device_state.clone(), io_intr_tx.clone());
+        let trace = Arc::new(MotorTrace::with_user(self.user.clone()));
+        let record =
+            self.subscribers
+                .attach(device_state.clone(), io_intr_tx.clone(), trace.clone());
         MotorDeviceSupport::with_link(
-            Arc::new(MotorTrace::with_user(self.user.clone())),
+            trace,
             self.timeout,
             AxisLink::Bound {
                 poll_cmd_tx: self.poll_cmd_tx.clone(),
@@ -220,8 +221,8 @@ impl CommandPort {
     /// Queue `commands` on the poller thread, or refuse them as the port
     /// does for a missing axis. Each move-class command is counted pending
     /// first, as C `build_trans` does; a record in COMM_ALARM sends nothing.
-    pub(crate) fn send(&self, commands: Vec<QueuedCommand>) {
-        let moves = commands.iter().filter(|q| q.command.is_move()).count();
+    pub(crate) fn send(&self, commands: Vec<MotorCommand>) {
+        let moves = commands.iter().filter(|c| c.is_move()).count();
         if let Ok(mut ds) = self.device_state.lock() {
             if ds.comm_alarm() {
                 return;
@@ -247,11 +248,11 @@ impl CommandPort {
             AxisLink::Missing(missing) => {
                 crate::poll_loop::refuse_commands(&self.trace, *missing, &commands);
                 // asynCallback runs for a refused write as for any other.
-                for queued in commands.iter().filter(|q| q.command.is_move()) {
+                for command in commands.iter().filter(|c| c.is_move()) {
                     let done = self
                         .device_state
                         .lock()
-                        .is_ok_and(|mut ds| ds.move_done(&queued.command));
+                        .is_ok_and(|mut ds| ds.move_done(command));
                     if done {
                         self.pulse();
                     }
@@ -347,15 +348,16 @@ impl DeviceSupport for MotorDeviceSupport {
             let mut ds = self.port.device_state.lock().map_err(|e| {
                 epics_base_rs::error::CaError::InvalidValue(format!("device state lock: {e}"))
             })?;
-            let stamped = ds.latest_status.get_or_insert_with(|| StampedStatus {
-                seq: 1,
-                status: asyn_rs::interfaces::motor::MotorStatus {
-                    done: false,
-                    ..Default::default()
-                },
-            });
-            stamped.status.clone()
+            ds.init_status()
         };
+        self.port.trace.print(
+            asyn_rs::trace::TraceMask::IO_DEVICE,
+            self.port.trace.update_status_reason(),
+            format_args!(
+                "{} devMotorAsyn::update_values, needUpdate=1",
+                self.port.trace.record()
+            ),
+        );
 
         // C init_record: the dset's init_controller, then
         // process_motor_info(initcall) and the drive sync, all before any
@@ -363,11 +365,9 @@ impl DeviceSupport for MotorDeviceSupport {
         let anchor = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-            .map(|rec| (rec.initial_readback(&status), rec.conv.mres));
-        if let Some((effects, mres)) = anchor {
-            let queued = |command| QueuedCommand { command, mres };
-            self.port
-                .send(effects.commands.into_iter().map(queued).collect());
+            .map(|rec| rec.initial_readback(&status));
+        if let Some(effects) = anchor {
+            self.port.send(effects.commands);
             if effects.request_poll {
                 self.port.send_poll(PollCommand::ForcePoll);
             }
@@ -385,17 +385,17 @@ impl DeviceSupport for MotorDeviceSupport {
                         Some(EpicsValue::Double(d)) => d,
                         _ => 0.0,
                     };
-                (read(rec, "DHLM"), read(rec, "DLLM"), rec.conv.mres)
+                let (dhlm, dllm) = (read(rec, "DHLM"), read(rec, "DLLM"));
+                vec![
+                    rec.dial_limit_command(true, dhlm),
+                    rec.dial_limit_command(false, dllm),
+                ]
             });
-        if let Some((dhlm, dllm, mres)) = dial_limits {
+        if let Some(commands) = dial_limits {
             // Queued like C's SEND_MSG; non-fatal, as C ignores the
             // build_trans return, and a refusal prints asynCallback's line
             // on the poller.
-            let queued = |command| QueuedCommand { command, mres };
-            self.port.send(vec![
-                queued(MotorCommand::SetHighLimit { position: dhlm }),
-                queued(MotorCommand::SetLowLimit { position: dllm }),
-            ]);
+            self.port.send(commands);
         }
 
         self.initialized = true;

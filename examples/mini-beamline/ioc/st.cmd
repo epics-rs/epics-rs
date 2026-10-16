@@ -7,12 +7,12 @@ epicsEnvSet("BEAM_PERIOD",    "4.0")
 epicsEnvSet("BEAM_UPDATE_MS", "100")
 
 # ===== Simulated Motors =====
-# simMotorCreate(port, lowLimit, highLimit, pollMs)
-simMotorCreate("ph_mtr", -100, 100, 100)
-simMotorCreate("edge_mtr", -100, 100, 100)
-simMotorCreate("slit_mtr", -100, 100, 100)
-simMotorCreate("dot_mtrx", -500, 500, 100)
-simMotorCreate("dot_mtry", -500, 500, 100)
+# simMotorCreate(port, lowLimit, highLimit, pollMs), limits in steps
+simMotorCreate("ph_mtr", -100000, 100000, 100)
+simMotorCreate("edge_mtr", -100000, 100000, 100)
+simMotorCreate("slit_mtr", -100000, 100000, 100)
+simMotorCreate("dot_mtrx", -500000, 500000, 100)
+simMotorCreate("dot_mtry", -500000, 500000, 100)
 
 # ===== Kohzu DCM (Double Crystal Monochromator) =====
 # Y/Z hard travel must cover the +-250 soft limits set below: Z needs
@@ -20,9 +20,9 @@ simMotorCreate("dot_mtry", -500, 500, 100)
 # narrower simulated range the motor slams into the simulator's limit switch
 # mid-move and kohzuCtl aborts the whole move and drops to Manual mode
 # ("Z Motor hit a limit switch!").
-simMotorCreate("dcm_theta", -10, 90, 100)
-simMotorCreate("dcm_y", -250, 250, 100)
-simMotorCreate("dcm_z", -250, 250, 100)
+simMotorCreate("dcm_theta", -10000, 90000, 100)
+simMotorCreate("dcm_y", -250000, 250000, 100)
+simMotorCreate("dcm_z", -250000, 250000, 100)
 
 # ===== Simulated HSC-1 Slit Controller =====
 simHscCreate("HSC1", 100)

@@ -137,7 +137,7 @@ machines. Only the `Create` command changes:
 
 ```bash
 # Development / testing
-simMotorCreate("dcm_theta", -10, 90, 100)
+simMotorCreate("dcm_theta", -10000, 90000, 100)  # steps, at MRES 0.001
 simHscCreate("HSC1", 100)
 simQxbpmCreate("QXBPM1", 0.0, 0.0, 100)
 

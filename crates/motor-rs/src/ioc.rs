@@ -39,7 +39,8 @@ impl SimMotorHolder {
     ///
     /// Usage: `simMotorCreate("port", lowLimit, highLimit, pollMs)`
     ///
-    /// Creates a SimMotor with the given limits and poll interval,
+    /// Creates a SimMotor with the given limits, in steps as C
+    /// `motorSimConfigAxis` takes them, and poll interval,
     /// spawns the poll loop on the tokio runtime, and registers the axis
     /// for the record whose OUT names it.
     pub fn sim_motor_create_command(self: &Arc<Self>) -> CommandDef {
@@ -64,7 +65,7 @@ impl SimMotorHolder {
                     arg_type: ArgType::Int,
                 },
             ],
-            "simMotorCreate(port, lowLimit, highLimit, [pollMs]) - Create a simulated motor",
+            "simMotorCreate(port, lowLimit, highLimit, [pollMs]) - Create a simulated motor (limits in steps)",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),

@@ -35,7 +35,7 @@ impl MotorRecord {
             // completion), not like a Pause (resume armed).
             self.internal.pp = true;
             effects.commands.push(MotorCommand::Stop {
-                acceleration: self.move_accel_egu(),
+                acceleration: self.raw_rate(self.move_accel_egu()),
             });
             return effects;
         }
@@ -98,7 +98,7 @@ impl MotorRecord {
                 self.mark(m::MIP);
                 self.internal.pp = false;
                 effects.commands.push(MotorCommand::Stop {
-                    acceleration: self.move_accel_egu(),
+                    acceleration: self.raw_rate(self.move_accel_egu()),
                 });
                 return effects;
             }
@@ -188,9 +188,9 @@ impl MotorRecord {
                         self.stat.cdir = hw_forward;
                         effects.commands.push(MotorCommand::Home {
                             forward: hw_forward,
-                            min_velocity: self.effective_vbas(),
-                            velocity: self.vel.hvel,
-                            acceleration: self.home_accel_egu(),
+                            min_velocity: self.raw_rate(self.effective_vbas()),
+                            velocity: self.raw_rate(self.vel.hvel),
+                            acceleration: self.raw_rate(self.home_accel_egu()),
                         });
                     }
                     QueuedMotion::Jog { forward } => {
@@ -838,10 +838,10 @@ impl MotorRecord {
             // C 973: CDIR follows the (frac-scaled) raw-unit stroke.
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
-                distance: rel_distance,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.bvel),
-                acceleration: self.backlash_accel_egu(),
+                distance: self.raw_position(rel_distance),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                acceleration: self.raw_rate(self.backlash_accel_egu()),
             });
         } else {
             // C absolute: position = pretarget + frac * (dval - pretarget)
@@ -853,10 +853,10 @@ impl MotorRecord {
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
-                position,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.bvel),
-                acceleration: self.backlash_accel_egu(),
+                position: self.raw_position(position),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                acceleration: self.raw_rate(self.backlash_accel_egu()),
             });
         }
     }
@@ -890,17 +890,17 @@ impl MotorRecord {
         self.stat.cdir = (pretarget - self.pos.drbv) / self.conv.mres >= 0.0;
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {
-                distance: pretarget - self.pos.drbv,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.velo),
-                acceleration: self.move_accel_egu(),
+                distance: self.raw_position(pretarget - self.pos.drbv),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
+                acceleration: self.raw_rate(self.move_accel_egu()),
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
-                position: pretarget,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.velo),
-                acceleration: self.move_accel_egu(),
+                position: self.raw_position(pretarget),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
+                acceleration: self.raw_rate(self.move_accel_egu()),
             });
         }
     }
@@ -923,10 +923,10 @@ impl MotorRecord {
             // C 1020: CDIR follows the scaled raw-unit stroke.
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
-                distance: rel_distance,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.bvel),
-                acceleration: self.backlash_accel_egu(),
+                distance: self.raw_position(rel_distance),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                acceleration: self.raw_rate(self.backlash_accel_egu()),
             });
         } else {
             let position = pretarget + frac * (self.pos.dval - pretarget);
@@ -935,10 +935,10 @@ impl MotorRecord {
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
-                position,
-                min_velocity: self.effective_vbas(),
-                velocity: self.backlash_leg_velocity(self.vel.bvel),
-                acceleration: self.backlash_accel_egu(),
+                position: self.raw_position(position),
+                min_velocity: self.raw_rate(self.effective_vbas()),
+                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                acceleration: self.raw_rate(self.backlash_accel_egu()),
             });
         }
     }

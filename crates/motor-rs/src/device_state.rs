@@ -1,6 +1,9 @@
 use asyn_rs::interfaces::motor::MotorStatus;
+use asyn_rs::trace::TraceMask;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::trace::MotorTrace;
 
 /// Stamped motor status with sequence number for change detection.
 #[derive(Debug, Clone)]
@@ -19,7 +22,7 @@ pub struct DelayRequest {
 /// Atomic bundle of actions from Record → DeviceSupport.
 #[derive(Debug, Default)]
 pub struct DeviceActions {
-    pub commands: Vec<crate::poll_loop::QueuedCommand>,
+    pub commands: Vec<crate::flags::MotorCommand>,
     /// Poll now and post even an unchanged status: C `motorUpdateStatus_`
     /// forcing `statusChanged_ = 1` (asynMotorController.cpp:217-222), for
     /// `request_poll` / `status_refresh`, so STUP=BUSY clears on a
@@ -56,6 +59,9 @@ pub struct MotorDeviceState {
     /// C `pPvt->status` as the record's pass sees it; a new `seq` is
     /// `needUpdate` (devMotorAsyn.c:446).
     pub latest_status: Option<StampedStatus>,
+    /// The `seq` [`Self::update_values`] last took: `needUpdate` is
+    /// `latest_status` past it.
+    consumed_seq: u64,
     pub expired_delay_id: Option<u64>,
 
     // Record → DeviceSupport
@@ -102,7 +108,7 @@ impl MotorDeviceState {
     pub fn status_callback(&mut self, status: &MotorStatus) -> bool {
         self.callbacks.status = status.clone();
         if !self.callbacks.accepting {
-            self.need_update(status.clone());
+            self.set_need_update(status.clone());
             return false;
         }
         if self.callbacks.move_request_pending > 0 {
@@ -172,7 +178,7 @@ impl MotorDeviceState {
     /// process.
     pub fn begin_callback_pass(&mut self) {
         match self.callbacks.queued.pop_front() {
-            Some(Callback::Status(status)) => self.need_update(status),
+            Some(Callback::Status(status)) => self.set_need_update(status),
             Some(Callback::Delay(id)) => self.expired_delay_id = Some(id),
             None => {}
         }
@@ -184,7 +190,39 @@ impl MotorDeviceState {
         self.callbacks.status = status.status.clone();
     }
 
-    fn need_update(&mut self, status: MotorStatus) {
+    /// C `update_values` (devMotorAsyn.c:437-480): the status a pending
+    /// `needUpdate` carries, clearing it.
+    pub fn update_values(&mut self) -> Option<MotorStatus> {
+        let stamped = self
+            .latest_status
+            .as_ref()
+            .filter(|s| s.seq != self.consumed_seq)?;
+        self.consumed_seq = stamped.seq;
+        Some(stamped.status.clone())
+    }
+
+    /// The status init_record reads, then takes with motorRecord's
+    /// init-time `update_values` (motorRecord.cc:690): the axis' cache, or
+    /// C's calloc-zeroed status when the poller never filled it.
+    pub fn init_status(&mut self) -> MotorStatus {
+        let stamped = self.latest_status.get_or_insert_with(|| StampedStatus {
+            seq: 1,
+            status: MotorStatus {
+                done: false,
+                ..Default::default()
+            },
+        });
+        self.consumed_seq = stamped.seq;
+        stamped.status.clone()
+    }
+
+    fn need_update(&self) -> bool {
+        self.latest_status
+            .as_ref()
+            .is_some_and(|s| s.seq != self.consumed_seq)
+    }
+
+    fn set_need_update(&mut self, status: MotorStatus) {
         let seq = self.latest_status.as_ref().map_or(1, |s| s.seq + 1);
         self.latest_status = Some(StampedStatus { seq, status });
     }
@@ -214,7 +252,15 @@ struct Subscribed {
     /// The axis' parameter cache: what `readGenericPointer` returns to a
     /// record that binds after the poller primed it.
     latest: Option<StampedStatus>,
-    records: Vec<(SharedDeviceState, tokio::sync::mpsc::Sender<()>)>,
+    records: Vec<Bound>,
+}
+
+/// One bound record: its mailbox, its io_intr pulse and the user its
+/// `statusCallback` prints through.
+struct Bound {
+    device_state: SharedDeviceState,
+    io_intr: tokio::sync::mpsc::Sender<()>,
+    trace: Arc<MotorTrace>,
 }
 
 /// The io_intr pulses a post or a finished move owes, one per process.
@@ -235,12 +281,17 @@ impl AxisSubscribers {
         &self,
         device_state: SharedDeviceState,
         io_intr: tokio::sync::mpsc::Sender<()>,
+        trace: Arc<MotorTrace>,
     ) -> RecordId {
         let mut subscribed = self.lock();
         if let (Some(latest), Ok(mut ds)) = (&subscribed.latest, device_state.lock()) {
             ds.seed(latest);
         }
-        subscribed.records.push((device_state, io_intr));
+        subscribed.records.push(Bound {
+            device_state,
+            io_intr,
+            trace,
+        });
         subscribed.records.len() - 1
     }
 
@@ -257,8 +308,8 @@ impl AxisSubscribers {
     /// poller's startup poll.
     pub fn store(&self, status: StampedStatus) {
         let mut subscribed = self.lock();
-        for (device_state, _) in &subscribed.records {
-            if let Ok(mut ds) = device_state.lock() {
+        for bound in &subscribed.records {
+            if let Ok(mut ds) = bound.device_state.lock() {
                 ds.seed(&status);
             }
         }
@@ -270,10 +321,11 @@ impl AxisSubscribers {
     pub fn post(&self, status: StampedStatus) -> Pulses {
         let mut subscribed = self.lock();
         let mut pulses = Pulses::new();
-        for (device_state, io_intr) in &subscribed.records {
-            if let Ok(mut ds) = device_state.lock() {
+        for bound in &subscribed.records {
+            if let Ok(mut ds) = bound.device_state.lock() {
+                print_status_callback(&bound.trace, &ds, &status.status);
                 if ds.status_callback(&status.status) {
-                    pulses.push(io_intr.clone());
+                    pulses.push(bound.io_intr.clone());
                 }
             }
         }
@@ -288,20 +340,38 @@ impl AxisSubscribers {
         command: &crate::flags::MotorCommand,
     ) -> Option<tokio::sync::mpsc::Sender<()>> {
         let subscribed = self.lock();
-        let (device_state, io_intr) = subscribed.records.get(record)?;
-        let mut ds = device_state.lock().ok()?;
-        ds.move_done(command).then(|| io_intr.clone())
+        let bound = subscribed.records.get(record)?;
+        let mut ds = bound.device_state.lock().ok()?;
+        ds.move_done(command).then(|| bound.io_intr.clone())
     }
+}
+
+/// C `statusCallback`'s line (devMotorAsyn.c:750-754), printed before the
+/// copy: `N` for a `needUpdate` no pass has taken, `P` for a pending move.
+fn print_status_callback(trace: &MotorTrace, ds: &MotorDeviceState, status: &MotorStatus) {
+    trace.print(
+        TraceMask::IO_DEVICE,
+        trace.status_reason(),
+        format_args!(
+            "{} devMotorAsyn::statusCallback new value=[p:{:.6},e:{:.6},s:{:x}] {}{}",
+            trace.record(),
+            status.position,
+            status.encoder_position,
+            crate::flags::MstaFlags::from_status(status).bits(),
+            if ds.need_update() { 'N' } else { ' ' },
+            if ds.callbacks.move_request_pending > 0 {
+                'P'
+            } else {
+                ' '
+            },
+        ),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flags::MotorCommand;
-
-    fn queued(command: MotorCommand) -> crate::poll_loop::QueuedCommand {
-        crate::poll_loop::QueuedCommand { command, mres: 1.0 }
-    }
 
     fn stamped(seq: u64, position: f64) -> StampedStatus {
         StampedStatus {
@@ -354,7 +424,7 @@ mod tests {
         assert!(axis.post(stamped(4, 1.5)).is_empty());
         let state = accepting();
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        assert_eq!(axis.attach(state.clone(), tx), 0);
+        assert_eq!(axis.attach(state.clone(), tx, Arc::default()), 0);
         assert_eq!(seq_of(&state), Some(4));
         assert!(
             rx.try_recv().is_err(),
@@ -367,7 +437,7 @@ mod tests {
         let axis = AxisSubscribers::new();
         let state = accepting();
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        axis.attach(state.clone(), tx);
+        axis.attach(state.clone(), tx, Arc::default());
         axis.store(stamped(2, 0.0));
         assert_eq!(seq_of(&state), Some(2));
         assert_eq!(pass(&state), None);
@@ -379,8 +449,8 @@ mod tests {
         let (a, b) = (accepting(), accepting());
         let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
-        assert_eq!(axis.attach(a.clone(), tx_a), 0);
-        assert_eq!(axis.attach(b.clone(), tx_b), 1);
+        assert_eq!(axis.attach(a.clone(), tx_a, Arc::default()), 0);
+        assert_eq!(axis.attach(b.clone(), tx_b, Arc::default()), 1);
         assert_eq!(axis.post(stamped(2, 1.0)).len(), 2);
         assert_eq!(axis.post(stamped(3, 2.0)).len(), 2);
         for state in [&a, &b] {
@@ -466,18 +536,18 @@ mod tests {
     #[test]
     fn merge_newer_appends_commands_fifo() {
         let mut a = DeviceActions {
-            commands: vec![queued(MotorCommand::Stop { acceleration: 1.0 })],
+            commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
             ..Default::default()
         };
         let b = DeviceActions {
-            commands: vec![queued(MotorCommand::Poll)],
+            commands: vec![MotorCommand::Poll],
             ..Default::default()
         };
         a.merge_newer(b);
         assert_eq!(a.commands.len(), 2);
         // earlier batch's command stays first
-        assert!(matches!(a.commands[0].command, MotorCommand::Stop { .. }));
-        assert!(matches!(a.commands[1].command, MotorCommand::Poll));
+        assert!(matches!(a.commands[0], MotorCommand::Stop { .. }));
+        assert!(matches!(a.commands[1], MotorCommand::Poll));
     }
 
     #[test]

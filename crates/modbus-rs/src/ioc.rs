@@ -1100,23 +1100,6 @@ impl ModbusPortDriver {
         }
         self.flush_write(offset, regs)
     }
-
-    /// After a successful write, stage the value into the parameter cache and
-    /// fan its monitor out.
-    ///
-    /// Relative mode only: the parameter library is sized to `config.length`
-    /// addresses and feeds the poller's I/O-Intr callbacks. In absolute mode
-    /// the asyn `addr` is a Modbus wire address (up to 65535) unrelated to the
-    /// parameter table, and there is no poller fan-out — C `writeInt32` in
-    /// absolute mode likewise does no parameter callback. So this is a no-op
-    /// in absolute mode.
-    fn cache_write_numeric(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
-        if self.is_absolute() {
-            return Ok(());
-        }
-        self.base.set_float64_param(user.reason, user.addr, value)?;
-        self.base.call_param_callbacks(user.addr)
-    }
 }
 
 /// Parse a drvUser `=N` string-length suffix the way C does
@@ -1580,16 +1563,14 @@ impl PortDriver for ModbusPortDriver {
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int32(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)?;
-        self.cache_write_numeric(user, value as f64)
+        self.flush_write(user.addr, &regs)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int64(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)?;
-        self.cache_write_numeric(user, value as f64)
+        self.flush_write(user.addr, &regs)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -1612,8 +1593,7 @@ impl PortDriver for ModbusPortDriver {
         let dt = self.datatype_of(user.reason)?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
-        self.flush_write(user.addr, &regs)?;
-        self.cache_write_numeric(user, value)
+        self.flush_write(user.addr, &regs)
     }
 
     fn write_uint32_digital(
@@ -1753,14 +1733,6 @@ impl PortDriver for ModbusPortDriver {
         };
         let (regs, consumed) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
         self.flush_write_staged(user.addr, &regs)?;
-        // Relative mode caches the value and fans out its monitor (see
-        // `cache_write_numeric`); absolute mode has no parameter-table slot
-        // for a wire address and no poller, so it skips the cache.
-        if !self.is_absolute() {
-            let s = String::from_utf8_lossy(data).into_owned();
-            self.base.set_string_param(user.reason, user.addr, s)?;
-            self.base.call_param_callbacks(user.addr)?;
-        }
         // Bytes transferred = caller chars written, capped by the register
         // budget and excluding the appended NUL terminator for Z-strings
         // (C `writeOctet` reports the character count, not the NUL,
@@ -6027,6 +5999,36 @@ mod tests {
             0x1111,
             "a read on the write port is served the polled value, not the written one"
         );
+    }
+
+    /// C's data writes (drvModbusAsyn.cpp:739-787, :1506-1550) send the
+    /// registers and stop: no param is set and no `callParamCallbacks` runs,
+    /// so neither the written value nor the statistics the write moved post.
+    #[test]
+    fn relative_data_write_posts_nothing() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_NOPOST",
+            write_config(ModbusFunctionCode::WriteMultipleRegisters, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x01])),
+                Ok(tcp_response(2, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x01])),
+            ])),
+        )
+        .expect("config must build");
+        let mut rx = subscribe_opened(&mut driver);
+        let find = |d: &ModbusPortDriver, t: ModbusDataType| {
+            d.base.find_param(t.as_str()).expect("data parameter")
+        };
+        let mut user = AsynUser::new(find(&driver, ModbusDataType::UInt16)).with_addr(0);
+        driver.write_int32(&mut user, 7).expect("int32 write");
+        let mut user = AsynUser::new(find(&driver, ModbusDataType::StringHigh)).with_addr(0);
+        driver.write_octet(&mut user, b"Hi").expect("octet write");
+
+        assert_eq!(driver.engine.stats.write_ok, 2);
+        if let Ok(iv) = rx.try_recv() {
+            panic!("a data write posted {iv:?}");
+        }
     }
 
     /// The uint32-digital scalar write is the same C shape (`epicsUInt16 data

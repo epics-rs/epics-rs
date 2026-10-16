@@ -881,6 +881,12 @@ pub trait DeviceSupport: Send + Sync + 'static {
     ) {
     }
 
+    /// Hand the device its record's database before [`Self::init`], for a
+    /// device that reads other records itself, as devAsynOctet's
+    /// `asynOctetWriteRead` reads its command record (`initDbAddr`,
+    /// devAsynOctet.c:645-657). Default: ignore.
+    fn bind_database(&mut self, _db: crate::server::database::AsyncDbHandle) {}
+
     /// Return a receiver for I/O Intr scan notifications.
     /// Called for records with `SCAN="I/O Intr"`, and for any device that
     /// reports [`io_intr_scan_independent`](Self::io_intr_scan_independent).
@@ -953,6 +959,13 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// not process, so `getCallbackValue` is called to drop the stale ring
     /// entry. Default no-op; see [`Self::arm_readback_callback`].
     fn reconcile_readback_callback(&mut self) {}
+
+    /// The pass that completes a [`WriteStart::Pending`] write reached C's
+    /// second `processXxx`, which takes the write's result for
+    /// [`Self::last_alarm`], raised next, and requests a driver callback
+    /// devAsyn deferred while the write held the record
+    /// (`devAsynInt32.c:1013-1018`). Default no-op.
+    fn async_write_completed(&mut self) {}
 
     /// Whether a driver-callback (`asyn:READBACK`) processing cycle replaces
     /// this device's output stage with a value readback.
@@ -1111,6 +1124,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         return;
     };
     let name = instance.name.clone();
+    dev.bind_database(instance.device_done.database());
     let status = match dev.init(&mut *instance.record) {
         Ok(DeviceInitOutcome::Ok(udf)) => {
             apply_init_udf(instance, udf);

@@ -5632,6 +5632,17 @@ pub(crate) struct SourceRender {
 }
 
 impl SourceRender {
+    /// The render of a record seen only through its [`Record`] face: no
+    /// display precision or choice table to apply.
+    pub(crate) fn of_record(rec: &dyn Record, field: &str, value: &EpicsValue) -> Self {
+        use crate::server::record::record_trait::FieldDeclaration;
+        Self {
+            long_string: value.is_array() && rec.field_is_long_string(field),
+            precision: None,
+            label: None,
+        }
+    }
+
     /// The value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it: one
     /// element, so an array source converts its element 0 (none, at NORD 0,
     /// is a failed read).

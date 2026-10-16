@@ -371,6 +371,13 @@ impl DeviceDone {
         }
     }
 
+    /// The database this record's completion re-enters.
+    pub(crate) fn database(&self) -> AsyncDbHandle {
+        AsyncDbHandle {
+            inner: self.0.body().db.clone(),
+        }
+    }
+
     /// Only `RecordInstance::set_prio` stores here, beside `common.prio`.
     pub(crate) fn set_prio(&self, prio: i16) {
         self.0
@@ -605,6 +612,50 @@ impl AsyncDbHandle {
     /// True while the backing database is still alive.
     pub fn is_alive(&self) -> bool {
         self.inner.strong_count() > 0
+    }
+
+    /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
+    /// serves. `held` is the record the caller holds, as a device's own
+    /// record during its `init` or `process`, which is asked directly.
+    pub fn has_pv(
+        &self,
+        name: impl AsRef<[u8]>,
+        held: Option<(&[u8], &dyn crate::server::record::Record)>,
+    ) -> bool {
+        let name = name.as_ref();
+        let (base, field) = super::parse_pv_name(name);
+        match held {
+            Some((own, rec)) if own == base => rec.get_field(field).is_some(),
+            _ => self.db().is_some_and(|db| db.get_pv(name).is_ok()),
+        }
+    }
+
+    /// C `dbGet(&addr, DBR_STRING, buf, 0, 0, 0)`: one element as the
+    /// source renders it, cut to `MAX_STRING_SIZE`. `None` is a failed
+    /// `dbGet`. `held` as for [`Self::has_pv`].
+    pub fn get_dbr_string(
+        &self,
+        name: impl AsRef<[u8]>,
+        held: Option<(&[u8], &dyn crate::server::record::Record)>,
+    ) -> Option<PvString> {
+        let name = name.as_ref();
+        let (base, field) = super::parse_pv_name(name);
+        let rendered = match held {
+            Some((own, rec)) if own == base => {
+                let value = rec.get_field(field)?;
+                crate::server::record::record_instance::SourceRender::of_record(rec, field, &value)
+                    .dbr_string(value)
+            }
+            _ => {
+                let db = self.db()?;
+                let value = db.get_pv(name).ok()?;
+                match db.get_record(base) {
+                    Some(rec) => rec.read().source_render_of(field, &value).dbr_string(value),
+                    None => crate::server::record::record_instance::value_as_dbr_string(&value),
+                }
+            }
+        };
+        rendered.map(crate::types::codec::cap_dbr_string)
     }
 
     /// Out-of-band field post — see [`PvDatabase::post_fields`]. Returns an
@@ -6524,12 +6575,6 @@ impl PvDatabase {
                 // Evaluate alarms (accumulates into nsta/nsev)
                 instance.evaluate_alarms();
 
-                // An output's device raises its alarm in `writeValue`, after
-                // `checkAlarms` (an input's, in `readValue`, before it: above).
-                if plan.output_stage {
-                    apply_device_alarm(instance, is_soft);
-                }
-
                 // calcout, scalcout and acalcout stamp after `checkAlarms`; none
                 // skips the stamp or restamps after completion.
                 if let (true, Some(begun)) = (plan.alarms_before_stamp, stamp_late) {
@@ -6637,62 +6682,7 @@ impl PvDatabase {
                 // The cycle drives no outputs when the type has no output stage
                 // (`ProcessPlan::output_stage`: C `calcRecord.c::process` has no
                 // OUT lines) or IVOA vetoes them on an INVALID cycle.
-                let skip_out = if !plan.output_stage {
-                    true
-                } else if real_sev == crate::server::record::AlarmSeverity::Invalid {
-                    let ivoa = instance
-                        .record
-                        .get_field("IVOA")
-                        .and_then(|v| v.to_menu_index())
-                        .unwrap_or(0);
-                    match ivoa {
-                        1 => true, // Don't drive outputs
-                        2 => {
-                            // Set output to IVOV. Each record type knows
-                            // which field its OUT writeback consumes — see
-                            // [`Record::apply_invalid_output_value`]. The
-                            // earlier path special-cased `calcout`
-                            // (OVAL) and fell back to `set_val` (VAL) for
-                            // every other record. That hid a real bug:
-                            // ao/lso/bo/mbbo/busy left their OVAL/RVAL
-                            // staging field stale, so the OUT writeback —
-                            // which reads `OVAL.or(VAL)` — sent the
-                            // pre-IVOA value to the linked record. Per-type
-                            // overrides now apply IVOV to the field that
-                            // matches the C convention.
-                            // C's IVOA=2 arm cannot fail. It is a plain store into the
-                            // record's own fields — `prec->val = prec->ivov`
-                            // plus the mask conversion (`boRecord.c:231-238`),
-                            // `strncpy(prec->val, prec->ivov, sizv-1)` plus
-                            // `len` (`lsoRecord.c:131-137`) — with C's only
-                            // failure arm reserved for an ILLEGAL IVOA choice
-                            // (`boRecord.c:241-244`), which this `match` has
-                            // already excluded. So an `Err` here is a port bug
-                            // in the record's `apply_invalid_output_value` /
-                            // `put_field` pair, never a runtime condition, and
-                            // discarding it silently is what let lso's arm be a
-                            // complete no-op for a whole round: `put_field` had
-                            // no `"OVAL"` case, so the `?` returned
-                            // `FieldNotFound` before VAL was ever written and
-                            // the record kept its stale value with no monitor.
-                            // Loud in test/debug; release behaviour unchanged,
-                            // because C has no alarm for this case to copy.
-                            if let Some(ivov) = instance.record.get_field("IVOV") {
-                                let applied = instance.apply_invalid_output_value_and_drain(ivov);
-                                debug_assert!(
-                                    applied.is_ok(),
-                                    "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
-                                    instance.record.record_type(),
-                                    applied.err()
-                                );
-                            }
-                            false
-                        }
-                        _ => false, // Continue normally
-                    }
-                } else {
-                    false
-                };
+                let skip_out = !plan.output_stage || ivoa_skips_output(instance, real_sev, true);
 
                 // Output-time input links (swait DOL). C
                 // `swaitRecord.c::execOutput` (763-772) fetches DOL through
@@ -6896,6 +6886,7 @@ impl PvDatabase {
                             // output stage on callback cycles like any other C `dbProcess`:
                             // the motor record's retry / backlash / NTM-stop commands are
                             // emitted on exactly these passes.
+                            raise_write_value_alarm(instance, false, false);
                             None
                         } else if !record_should_output {
                             // OOPT gating for hardware outputs (longout DTYP=...).
@@ -6909,50 +6900,33 @@ impl PvDatabase {
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
                                 let done = DeviceDoneSource::new(&instance.device_done);
-                                match dev.write_begin(&mut *instance.record, &done) {
-                                    Ok(WriteStart::Pending) => {
-                                        // Async write submitted -- set PACT, return early.
-                                        // The device's `DeviceDone` re-enters the record
-                                        // on a callback band when the write lands, and
-                                        // `complete_async_write` ends the cycle there.
-                                        instance.enter_pact();
-                                        instance.device = Some(dev);
-                                        // Not an end: `complete_async_record_inner`
-                                        // owns this cycle's tail now, and mints its own
-                                        // token from the record when the write lands.
-                                        cycle_end.hand_off_to_async_completion();
-                                        return Ok(());
-                                    }
-                                    // The value is at the device; the cycle goes on
-                                    // as after a synchronous write.
-                                    Ok(WriteStart::Completed) => {}
-                                    Ok(WriteStart::Synchronous) => {
+                                let write_failed =
+                                    match dev.write_begin(&mut *instance.record, &done) {
+                                        Ok(WriteStart::Pending) => {
+                                            // Async write submitted -- set PACT, return early.
+                                            // The device's `DeviceDone` re-enters the record
+                                            // on a callback band when the write lands, and
+                                            // `complete_async_write` ends the cycle there.
+                                            instance.enter_pact();
+                                            instance.device = Some(dev);
+                                            // Not an end: `complete_async_record_inner`
+                                            // owns this cycle's tail now, and mints its own
+                                            // token from the record when the write lands.
+                                            cycle_end.hand_off_to_async_completion();
+                                            return Ok(());
+                                        }
+                                        // The value is at the device; the cycle goes on
+                                        // as after a synchronous write.
+                                        Ok(WriteStart::Completed) => false,
                                         // C prints nothing for a failed `write_ao`
                                         // (`aoRecord.c:565`, `dbAccess.c:612`).
-                                        if dev.write(&mut *instance.record).is_err() {
-                                            // C device support raises the write failure
-                                            // through `recGblSetSevr` (a PENDING alarm),
-                                            // and `process()`'s `monitor()` commits it in
-                                            // the same cycle — the commit now follows this
-                                            // output stage, so the pending raise is what
-                                            // reaches SEVR/STAT (a direct `stat`/`sevr`
-                                            // poke would be overwritten by the commit).
-                                            crate::server::recgbl::rec_gbl_set_sevr(
-                                                &mut instance.common,
-                                                crate::server::recgbl::alarm_status::WRITE_ALARM,
-                                                crate::server::record::AlarmSeverity::Invalid,
-                                            );
+                                        Ok(WriteStart::Synchronous) => {
+                                            dev.write(&mut *instance.record).is_err()
                                         }
-                                    }
-                                    Err(_) => {
-                                        crate::server::recgbl::rec_gbl_set_sevr(
-                                            &mut instance.common,
-                                            crate::server::recgbl::alarm_status::WRITE_ALARM,
-                                            crate::server::record::AlarmSeverity::Invalid,
-                                        );
-                                    }
-                                }
+                                        Err(_) => true,
+                                    };
                                 instance.device = Some(dev);
+                                raise_write_value_alarm(instance, write_failed, false);
                             }
                             None
                         }
@@ -8124,18 +8098,6 @@ impl PvDatabase {
                 if clears_udf {
                     instance.common.udf = instance.record.value_is_undefined() as u8;
                 }
-                // A failed async device write — the same pending raise the
-                // synchronous branch makes, ahead of `checkAlarms` as C's
-                // device support raises it ahead of the record's own
-                // (devAsynFloat64.c:668-671), so on an INVALID tie the WRITE
-                // status is the one that reaches STAT.
-                if write_error.is_some() {
-                    crate::server::recgbl::rec_gbl_set_sevr(
-                        &mut instance.common,
-                        crate::server::recgbl::alarm_status::WRITE_ALARM,
-                        crate::server::record::AlarmSeverity::Invalid,
-                    );
-                }
                 // Any soft flavour: the framework owns the transfer, so there
                 // is no device to take an alarm, time stamp or user tag from.
                 let is_soft = instance.common.dtyp.is_soft();
@@ -8199,9 +8161,9 @@ impl PvDatabase {
                     );
                 }
 
-                // Device support alarm override.
-                apply_device_alarm(&mut instance, is_soft);
-                // UDF was already updated before `evaluate_alarms` above.
+                if let Some(dev) = instance.device.as_mut() {
+                    dev.async_write_completed();
+                }
 
                 // ---- Output stage. C `process()` performs the record's output
                 // BEFORE `monitor()`, and `monitor()` is where `recGblResetAlarms`
@@ -8214,40 +8176,13 @@ impl PvDatabase {
                 // IVOA check — on the PENDING severity, which is what C's
                 // `writeValue` call site tests (`if (prec->nsev < INVALID_ALARM)`,
                 // aoRecord.c:196).
-                let skip_out = if instance.common.nsev
-                    == crate::server::record::AlarmSeverity::Invalid
-                {
-                    let ivoa = instance
-                        .record
-                        .get_field("IVOA")
-                        .and_then(|v| v.to_menu_index())
-                        .unwrap_or(0);
-                    match ivoa {
-                        1 => true,
-                        2 => {
-                            // See the IVOA=2 comment in
-                            // `process_record_with_links_inner` — IVOA=2
-                            // delegates to the per-record
-                            // `apply_invalid_output_value` so OVAL/RVAL/VAL
-                            // get the C-convention values.
-                            // The same "cannot fail in C" contract as the
-                            // sync arm above; see its note.
-                            if let Some(ivov) = instance.record.get_field("IVOV") {
-                                let applied = instance.apply_invalid_output_value_and_drain(ivov);
-                                debug_assert!(
-                                    applied.is_ok(),
-                                    "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
-                                    instance.record.record_type(),
-                                    applied.err()
-                                );
-                            }
-                            false
-                        }
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
+                let nsev = instance.common.nsev;
+                let skip_out = ivoa_skips_output(&mut instance, nsev, false);
+                // The device's alarm is raised inside `writeValue`, after the
+                // test above, and only on a cycle that drives the output.
+                if !skip_out {
+                    raise_write_value_alarm(&mut instance, write_error.is_some(), is_soft);
+                }
 
                 // OEVT: queue the output event when the output fires — same
                 // IVOA-gated event-twin of the OUT write as
@@ -10205,6 +10140,91 @@ impl SiolStamp {
             SiolStamp::Keep => {}
         }
     }
+}
+
+/// C's IVOA test at an output record's `writeValue` call site
+/// (`aoRecord.c:196-217`): whether an INVALID `sev` vetoes the output.
+/// `Set output to IVOV` stores IVOV only on a first pass (`if (prec->pact ==
+/// FALSE)`), not on the pass that completes an asynchronous write.
+#[inline(always)]
+fn ivoa_skips_output(
+    instance: &mut RecordInstance,
+    sev: crate::server::record::AlarmSeverity,
+    first_pass: bool,
+) -> bool {
+    sev == crate::server::record::AlarmSeverity::Invalid
+        && invalid_output_action(instance, first_pass)
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_output_action(instance: &mut RecordInstance, first_pass: bool) -> bool {
+    let ivoa = instance
+        .record
+        .get_field("IVOA")
+        .and_then(|v| v.to_menu_index())
+        .unwrap_or(0);
+    match ivoa {
+        1 => true, // Don't drive outputs
+        2 => {
+            // Set output to IVOV. Each record type knows
+            // which field its OUT writeback consumes — see
+            // [`Record::apply_invalid_output_value`]. The
+            // earlier path special-cased `calcout`
+            // (OVAL) and fell back to `set_val` (VAL) for
+            // every other record. That hid a real bug:
+            // ao/lso/bo/mbbo/busy left their OVAL/RVAL
+            // staging field stale, so the OUT writeback —
+            // which reads `OVAL.or(VAL)` — sent the
+            // pre-IVOA value to the linked record. Per-type
+            // overrides now apply IVOV to the field that
+            // matches the C convention.
+            // C's IVOA=2 arm cannot fail. It is a plain store into the
+            // record's own fields — `prec->val = prec->ivov`
+            // plus the mask conversion (`boRecord.c:231-238`),
+            // `strncpy(prec->val, prec->ivov, sizv-1)` plus
+            // `len` (`lsoRecord.c:131-137`) — with C's only
+            // failure arm reserved for an ILLEGAL IVOA choice
+            // (`boRecord.c:241-244`), which this `match` has
+            // already excluded. So an `Err` here is a port bug
+            // in the record's `apply_invalid_output_value` /
+            // `put_field` pair, never a runtime condition, and
+            // discarding it silently is what let lso's arm be a
+            // complete no-op for a whole round: `put_field` had
+            // no `"OVAL"` case, so the `?` returned
+            // `FieldNotFound` before VAL was ever written and
+            // the record kept its stale value with no monitor.
+            // Loud in test/debug; release behaviour unchanged,
+            // because C has no alarm for this case to copy.
+            if first_pass && let Some(ivov) = instance.record.get_field("IVOV") {
+                let applied = instance.apply_invalid_output_value_and_drain(ivov);
+                debug_assert!(
+                    applied.is_ok(),
+                    "{}: IVOA=Set_output_to_IVOV could not apply IVOV: {:?}",
+                    instance.record.record_type(),
+                    applied.err()
+                );
+            }
+            false
+        }
+        _ => false, // Continue normally
+    }
+}
+
+/// The alarm C's `writeValue` raises through the device's `processXxx`:
+/// the write's failure (a PENDING raise that this cycle's `monitor()`
+/// commits), then the device's own. Only a cycle whose IVOA test let the
+/// output through reaches it.
+#[inline(always)]
+fn raise_write_value_alarm(instance: &mut RecordInstance, write_failed: bool, is_soft: bool) {
+    if write_failed {
+        crate::server::recgbl::rec_gbl_set_sevr(
+            &mut instance.common,
+            crate::server::recgbl::alarm_status::WRITE_ALARM,
+            crate::server::record::AlarmSeverity::Invalid,
+        );
+    }
+    apply_device_alarm(instance, is_soft);
 }
 
 /// The alarm a device support's last transfer left, raised into the record.

@@ -60,6 +60,19 @@ pub struct AsynLink {
 /// `processMbbi:1268-1270`, `processLi:1057-1060` (devAsynInt32.c). Kept here
 /// rather than on `DeviceReadOutcome` so the framework's constructors never
 /// grow a form that infers UDF from the value half.
+/// C processCommon's alarm for an output's result: the result's own, or the
+/// failed status mapped with the WRITE_ALARM default (devAsynOctet.c:806-809,
+/// devAsynInt32.c:494-500).
+fn write_alarm(ran: &AsynResult<RequestResult>) -> (u16, u16) {
+    match ran {
+        Ok(r) => (r.alarm_status, r.alarm_severity),
+        Err(e) => asyn_error_to_alarm_with_default(
+            e,
+            epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
+        ),
+    }
+}
+
 fn stored(wrote_val: bool) -> DeviceReadOutcome {
     if wrote_val {
         DeviceReadOutcome::computed(DeviceUdf::Defined)
@@ -444,6 +457,9 @@ pub struct AsynDeviceSupport {
     /// record's own put leaves the FIFO desynced and the final driver value
     /// (e.g. AD `Acquire` returning to 0) is never popped.
     output_callback_pending: bool,
+    /// The ring's wakeup, for the callback a queued write deferred
+    /// ([`InterruptFifo::end_processing`]).
+    readback_wake: Option<tokio::sync::mpsc::Sender<()>>,
     /// True once the `asynFloat64` ai path has written VAL at least once.
     /// The SMOO filter primes on the first read (C `processAi` skips
     /// smoothing while `pr->udf`, devAsynFloat64.c:599); this is the
@@ -672,6 +688,11 @@ struct InterruptFifo {
     /// Running count of drop-oldest overwrites since the last
     /// successful pop. Logged + reset by `pop_callback_value`.
     overflows: u64,
+    /// C `asyncProcessingActive`: a queued write holds the record PACT.
+    processing_async: bool,
+    /// C `numDeferredOutputCallbacks`: callbacks that arrived meanwhile,
+    /// each owed one record process after the cycle ends.
+    deferred: u32,
 }
 
 /// C `DEFAULT_RING_BUFFER_SIZE` at `devAsynInt32.c:63`.
@@ -683,6 +704,31 @@ impl InterruptFifo {
             entries: std::collections::VecDeque::with_capacity(DEFAULT_RING_BUFFER_SIZE),
             ring_size: DEFAULT_RING_BUFFER_SIZE,
             overflows: 0,
+            processing_async: false,
+            deferred: 0,
+        }
+    }
+
+    /// A fresh entry's wakeup: now, or — inside a queued write — owed to
+    /// the end of that cycle (`devAsynInt32.c:607-613`).
+    fn wake_or_defer(&mut self) -> bool {
+        if self.processing_async {
+            self.deferred += 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// The bottom of C's `processXxx` (`devAsynInt32.c:1013-1018`): the
+    /// cycle is over, and one deferred callback, if any, is requested.
+    fn end_processing(&mut self) -> bool {
+        self.processing_async = false;
+        if self.deferred > 0 {
+            self.deferred -= 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -717,6 +763,24 @@ impl InterruptFifo {
 }
 
 impl AsynDeviceSupport {
+    /// Whether this devAsyn file defers a driver callback that arrives
+    /// while a queued write holds the record (`numDeferredOutputCallbacks`):
+    /// every one with output callbacks but `devAsynXXXArray`.
+    fn defers_output_callbacks(&self) -> bool {
+        self.asyn_readback && DevFile::of(&self.iface_type) != DevFile::Array
+    }
+
+    /// The bottom of C's `processXxx`: the cycle is over, and a callback
+    /// it deferred is requested now (`devAsynInt32.c:1013-1018`).
+    fn end_processing(&self) {
+        let wake = self.interrupt_fifo.lock().unwrap().end_processing();
+        if wake {
+            if let Some(tx) = &self.readback_wake {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
     /// Create from a [`PortHandle`].
     pub fn from_handle(handle: PortHandle, link: AsynLink, iface_type: &str) -> Self {
         let iface = InterfaceType::from_asyn_name(iface_type);
@@ -755,6 +819,7 @@ impl AsynDeviceSupport {
             time_series: None,
             time_series_sub: None,
             interrupt_sub: None,
+            readback_wake: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
             smoo_primed: false,
@@ -1300,6 +1365,8 @@ struct DeviceJob {
     request: parking_lot::Mutex<Option<(RequestOp, AsynUser, Finish)>>,
     /// A put's write outcome until `done` completes the cycle with it.
     wrote: parking_lot::Mutex<Option<AsynResult<()>>>,
+    /// The last put's [`write_alarm`], which the completing pass raises.
+    write_alarm: parking_lot::Mutex<(u16, u16)>,
     /// A read's result until the re-entered pass consumes it; apart from
     /// `wrote`, so a write never moves a `RequestResult`.
     read: parking_lot::Mutex<Option<AsynResult<RequestResult>>>,
@@ -1315,6 +1382,77 @@ struct DeviceJob {
     last_status: LastStatus,
     /// Set with the record's request cell.
     trace: std::sync::OnceLock<ProcessTrace>,
+    /// `asynOctetWriteRead`'s command record, read where the request runs.
+    write_read: std::sync::OnceLock<WriteReadSource>,
+}
+
+/// C devAsynOctet's `asynOctetWriteRead` command: the record `userParam` names
+/// (`initDbAddr`), read with `dbGet(DBR_STRING)` and escape-translated each
+/// process (devAsynOctet.c:878-899).
+struct WriteReadSource {
+    pv: String,
+    /// C `callbackWfWriteRead` prints its function name; the stringin and lsi
+    /// callbacks do not.
+    waveform: bool,
+    db: std::sync::OnceLock<epics_base_rs::server::database::AsyncDbHandle>,
+}
+
+impl WriteReadSource {
+    /// The command bytes up to the translated string's NUL, or `None` for a
+    /// failed `dbGet`. `held` is the record the caller holds.
+    fn command(&self, held: Option<(&[u8], &dyn Record)>) -> Option<Vec<u8>> {
+        let raw = self.db.get()?.get_dbr_string(&self.pv, held)?;
+        let mut cmd = crate::asyn_record::translate_escape(&raw.as_str_lossy());
+        if let Some(nul) = cmd.iter().position(|&b| b == 0) {
+            cmd.truncate(nul);
+        }
+        Some(cmd)
+    }
+
+    /// Put the command into `op`'s write buffer; `false` is a failed `dbGet`.
+    fn fill(&self, op: &mut RequestOp, held: Option<(&[u8], &dyn Record)>) -> bool {
+        let RequestOp::OctetWriteRead { data, .. } = op else {
+            return true;
+        };
+        let Some(cmd) = self.command(held) else {
+            return false;
+        };
+        data.clear();
+        data.extend_from_slice(&cmd);
+        true
+    }
+
+    /// The failed `dbGet`'s line and `recGblSetSevr(READ_ALARM, INVALID_ALARM)`,
+    /// with neither write nor read made; the result is still a success.
+    fn failed(&self, line: Option<&ProcessLine<'_>>) -> AsynResult<RequestResult> {
+        if let Some(line) = line {
+            self.print_failed(line);
+        }
+        Ok(RequestResult {
+            alarm_status: epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+            alarm_severity: epics_base_rs::server::record::AlarmSeverity::Invalid as u16,
+            ..RequestResult::write_ok()
+        })
+    }
+
+    fn print_failed(&self, line: &ProcessLine<'_>) {
+        let rec = line.record;
+        if self.waveform {
+            line.print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{rec} devAsynOctet::callbackWfWriteRead dbGet failed"),
+            );
+        } else {
+            line.print(
+                crate::trace::TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{rec} dbGet failed"),
+            );
+        }
+    }
 }
 
 /// C `pPvt->lastStatus`: a failure prints once per change of status, not once
@@ -1420,6 +1558,28 @@ impl<'a> Sent<'a> {
             write,
             read,
             len,
+        }
+    }
+
+    /// C writeIt's `nbytes != nbytesTransferred` (devAsynOctet.c:680): the
+    /// port returns a short write without read data, as the write-read's
+    /// read is never made.
+    fn came_up_short(&self, r: &RequestResult) -> bool {
+        self.write && self.len != r.nbytes && r.data.is_none()
+    }
+
+    /// The short write's `recGblSetSevr(precord, WRITE_ALARM, MINOR_ALARM)`
+    /// (devAsynOctet.c:685), folded into the result whose own alarm
+    /// processCommon raises after it (:806-809): equal severity keeps
+    /// WRITE, a higher one replaces it.
+    fn raise_short_write(&self, file: DevFile, ran: &mut AsynResult<RequestResult>) {
+        use epics_base_rs::server::{recgbl::alarm_status, record::AlarmSeverity};
+        let minor = AlarmSeverity::Minor as u16;
+        if let Ok(r) = ran {
+            if file == DevFile::Octet && self.came_up_short(r) && r.alarm_severity <= minor {
+                r.alarm_status = alarm_status::WRITE_ALARM;
+                r.alarm_severity = minor;
+            }
         }
     }
 
@@ -1586,7 +1746,7 @@ impl ProcessLine<'_> {
             }
             (DevFile::Octet, None, Ok(r)) => {
                 if sent.write {
-                    if !sent.read && r.nbytes != sent.len {
+                    if sent.came_up_short(r) {
                         self.print(
                             TraceMask::ERROR,
                             file!(),
@@ -1606,8 +1766,7 @@ impl ProcessLine<'_> {
                         );
                     }
                 }
-                if sent.read {
-                    let data = r.data.as_deref().unwrap_or_default();
+                if let (true, Some(data)) = (sent.read, r.data.as_deref()) {
                     self.print_io(
                         TraceMask::IO_DEVICE,
                         &data[..r.nbytes.min(data.len())],
@@ -1684,7 +1843,10 @@ impl DeviceJob {
 
     fn ran(&self, finish: Finish, ran: AsynResult<RequestResult>) {
         match finish {
-            Finish::Complete => *self.wrote.lock() = Some(ran.map(|_| ())),
+            Finish::Complete => {
+                *self.write_alarm.lock() = write_alarm(&ran);
+                *self.wrote.lock() = Some(ran.map(|_| ()));
+            }
             Finish::Reprocess => *self.read.lock() = Some(ran),
         }
     }
@@ -1692,27 +1854,36 @@ impl DeviceJob {
 
 impl CellBody for DeviceJob {
     fn process(&self, port: &mut dyn PortCalls) {
-        let (op, user, finish) = self
+        let (mut op, user, finish) = self
             .request
             .lock()
             .take()
             .expect("a request is queued with its op");
         let (addr, reason) = (user.addr, user.reason as i32);
-        let mut ran = port.call(&op, user);
-        // C prints in the callback the port thread ran.
-        if let Some(t) = self.trace.get() {
-            if let Ok(result) = &mut ran {
-                Int32Mask::apply_to_read(t.int32_mask, result);
+        let line = self.trace.get().map(|t| ProcessLine {
+            trace: &t.trace,
+            record: &t.record,
+            file: t.file,
+            addr,
+            reason,
+        });
+        // The port thread holds no record: the command record is read here.
+        let ran = match self.write_read.get() {
+            Some(src) if !src.fill(&mut op, None) => src.failed(line.as_ref()),
+            _ => {
+                let mut ran = port.call(&op, user);
+                // C prints in the callback the port thread ran.
+                if let (Some(t), Some(line)) = (self.trace.get(), &line) {
+                    if let Ok(result) = &mut ran {
+                        Int32Mask::apply_to_read(t.int32_mask, result);
+                    }
+                    let sent = Sent::of(&op);
+                    sent.raise_short_write(t.file, &mut ran);
+                    line.finished(&self.last_status, &sent, ran.as_ref());
+                }
+                ran
             }
-            ProcessLine {
-                trace: &t.trace,
-                record: &t.record,
-                file: t.file,
-                addr,
-                reason,
-            }
-            .finished(&self.last_status, &Sent::of(&op), ran.as_ref());
-        }
+        };
         self.keep_spare(op);
         self.ran(finish, ran);
     }
@@ -1953,6 +2124,12 @@ impl AsynDeviceSupport {
                         data.extend_from_slice(cmd);
                         data
                     },
+                    buf_size: self.octet_max_size,
+                    flush: false,
+                },
+                // asynOctetWriteRead: the command is read where the request runs.
+                None if self.device_job.write_read.get().is_some() => RequestOp::OctetWriteRead {
+                    data: self.recycled(),
                     buf_size: self.octet_max_size,
                     flush: false,
                 },
@@ -2285,6 +2462,7 @@ impl AsynDeviceSupport {
         if let Ok(result) = &mut ran {
             Int32Mask::apply_to_read(self.int32_mask, result);
         }
+        sent.raise_short_write(DevFile::of(&self.iface_type), &mut ran);
         // The callback ran inside `queueRequest`, before `processXxx` reports
         // its status (devAsynInt32.c:838-841).
         if !ran.as_ref().is_err_and(AsynError::is_queue_refused) {
@@ -2299,6 +2477,27 @@ impl AsynDeviceSupport {
         }
         self.report_queued(ran.as_ref().err());
         ran
+    }
+
+    /// [`Self::submit_traced`] for a read. The callback runs under this
+    /// record's hold, so `asynOctetWriteRead` asks a self-named command record
+    /// through `record`.
+    fn submit_read(&mut self, mut op: RequestOp, record: &dyn Record) -> AsynResult<RequestResult> {
+        if let Some(src) = self.device_job.write_read.get() {
+            if !src.fill(&mut op, Some((self.record_name.as_bytes(), record))) {
+                let trace = self.handle.user_trace();
+                let ran = src.failed(Some(&ProcessLine {
+                    trace: &trace,
+                    record: &self.record_name,
+                    file: DevFile::Octet,
+                    addr: self.addr,
+                    reason: self.reason as i32,
+                }));
+                self.report_queued(None);
+                return ran;
+            }
+        }
+        self.submit_traced(op)
     }
 
     /// The `reportQueueRequestStatus` a process owes once its request ran
@@ -2333,7 +2532,9 @@ impl AsynDeviceSupport {
     /// of `write_begin` end here, so the trace line and the alarm mapping
     /// cannot differ between them.
     fn write_now(&mut self, op: RequestOp) -> CaResult<()> {
-        self.submit_traced(op).map(|_| ()).map_err(asyn_to_ca_error)
+        let ran = self.submit_traced(op);
+        (self.last_alarm_status, self.last_alarm_severity) = write_alarm(&ran);
+        ran.map(|_| ()).map_err(asyn_to_ca_error)
     }
 
     /// Store a freshly-read scalar value into the record and report whether
@@ -2662,6 +2863,22 @@ impl DeviceSupport for AsynDeviceSupport {
                 epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid,
             ));
+        }
+
+        // C `initDbAddr` (devAsynOctet.c:645-657): the command record must
+        // exist at init, or the record is dead at LINK/INVALID.
+        if let Some(src) = self.device_job.write_read.get() {
+            let held = Some((self.record_name.as_bytes(), &*record as &dyn Record));
+            if !src.db.get().is_some_and(|db| db.has_pv(&src.pv, held)) {
+                println!(
+                    "{} devAsynOctet::initDbAddr record {} not present",
+                    self.record_name, src.pv
+                );
+                return Ok(DeviceInitOutcome::dead_with_alarm(
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    epics_base_rs::server::record::AlarmSeverity::Invalid,
+                ));
+            }
         }
 
         // Read NELM from the record to set max_array_elements for array reads.
@@ -3022,31 +3239,9 @@ impl DeviceSupport for AsynDeviceSupport {
                     .map(|op| self.submit_traced(op)),
             };
             if let Some(ran) = ran {
-                // Apply the write result's alarm, mirroring the read path
-                // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
-                // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
-                // A successful write carries NO_ALARM (clears any prior); a
-                // failure maps via asyn_error_to_alarm. Without this the
-                // write-only path swallowed every write failure silently.
-                // This is an output (isOutput=1) record, so a generic
-                // transport failure raises WRITE_ALARM, not READ_ALARM
-                // (C processCommon: isOutput ? WRITE_ALARM : READ_ALARM,
-                // devAsynOctet.c:806-807; partial write recGblSetSevr
-                // WRITE_ALARM, :685).
-                match ran {
-                    Ok(result) => {
-                        self.last_alarm_status = result.alarm_status;
-                        self.last_alarm_severity = result.alarm_severity;
-                    }
-                    Err(e) => {
-                        let (alarm_status, alarm_severity) = asyn_error_to_alarm_with_default(
-                            &e,
-                            epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
-                        );
-                        self.last_alarm_status = alarm_status;
-                        self.last_alarm_severity = alarm_severity;
-                    }
-                }
+                // C callbackWfWrite/WriteBinary: writeIt, then processCommon
+                // raises the result's alarm (devAsynOctet.c:1071-1091).
+                (self.last_alarm_status, self.last_alarm_severity) = write_alarm(&ran);
             }
             return Ok(DeviceReadOutcome::ok());
         }
@@ -3286,7 +3481,7 @@ impl DeviceSupport for AsynDeviceSupport {
                 self.report_queued(ran.as_ref().err());
                 Some(ran)
             }
-            None => self.read_op().map(|op| self.submit_traced(op)),
+            None => self.read_op().map(|op| self.submit_read(op, &*record)),
         };
         if let Some(ran) = ran {
             match ran {
@@ -3302,6 +3497,11 @@ impl DeviceSupport for AsynDeviceSupport {
                         if let Some(val) = self.result_to_value(&result) {
                             let wrote_val = self.store_read_value(record, val);
                             read_outcome = stored(wrote_val);
+                        } else if self.iface_type == "asynOctet" {
+                            // A write-read whose write came up short read
+                            // nothing, and processCommon still succeeds
+                            // (devAsynOctet.c:853-860, :816-818).
+                            read_outcome = stored(true);
                         }
                     }
                     self.last_alarm_status = result.alarm_status;
@@ -3352,12 +3552,15 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             return Ok(());
         }
-        if let Some(val) = self.device_output_value(record) {
-            if let Some(op) = self.write_op(&val) {
-                self.write_now(op)?;
-            }
-        }
-        Ok(())
+        let written = match self.device_output_value(record) {
+            Some(val) => match self.write_op(&val) {
+                Some(op) => self.write_now(op),
+                None => Ok(()),
+            },
+            None => Ok(()),
+        };
+        self.end_processing();
+        written
     }
 
     fn dtyp(&self) -> &str {
@@ -3443,15 +3646,33 @@ impl DeviceSupport for AsynDeviceSupport {
         // would see the value twice (a USB-CTR pulse generator restarted
         // twice per put).
         if !self.handle.can_block() {
-            self.write_now(op)?;
+            let written = self.write_now(op);
+            self.end_processing();
+            written?;
             return Ok(WriteStart::Completed);
         }
 
         self.arm_reentry(done);
         let user = self.process_user();
-        self.queue(op, user, Finish::Complete)
-            .map_err(asyn_to_ca_error)?;
+        if self.defers_output_callbacks() {
+            self.interrupt_fifo.lock().unwrap().processing_async = true;
+        }
+        if let Err(e) = self.queue(op, user, Finish::Complete) {
+            self.end_processing();
+            return Err(asyn_to_ca_error(e));
+        }
         Ok(WriteStart::Pending)
+    }
+
+    fn bind_database(&mut self, db: epics_base_rs::server::database::AsyncDbHandle) {
+        if let Some(src) = self.device_job.write_read.get() {
+            let _ = src.db.set(db);
+        }
+    }
+
+    fn async_write_completed(&mut self) {
+        (self.last_alarm_status, self.last_alarm_severity) = *self.device_job.write_alarm.lock();
+        self.end_processing();
     }
 
     /// C `processAi` and its kin on an `ASYN_CANBLOCK` port: set PACT, queue
@@ -3762,6 +3983,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // like C's interruptCallbackInput; the mpsc<()> is only the
         // scanIoRequest wakeup that setup_io_intr() consumes.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let wake_tx = tx.clone();
         let fifo = self.interrupt_fifo.clone();
         let gate = self.gate.clone();
         let sub = self
@@ -3809,18 +4031,19 @@ impl DeviceSupport for AsynDeviceSupport {
                 //     newer tail; a duplicate request would just
                 //     flood dbScan.
                 //   - On normal add, request the record to process.
-                let was_fresh_add = {
+                let wake = {
                     let mut g = fifo.lock().unwrap();
-                    g.push_with_overflow(entry)
+                    g.push_with_overflow(entry) && g.wake_or_defer()
                 };
                 // try_send: inline in the driver's notify(), so it must not
                 // block; a full wakeup channel means a process is already
                 // pending and will drain the ring.
-                if was_fresh_add {
+                if wake {
                     let _ = tx.try_send(());
                 }
             });
         self.interrupt_sub = Some(sub);
+        self.readback_wake = Some(wake_tx);
         Some(rx)
     }
 
@@ -3873,6 +4096,9 @@ impl DeviceSupport for AsynDeviceSupport {
                 let _ = fifo.pop();
             }
             self.output_callback_pending = false;
+        } else {
+            // The cycle processed, so it reached the bottom of `processXxx`.
+            self.end_processing();
         }
     }
 
@@ -4013,6 +4239,7 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
         || dtyp == "asynOctetWrite"
         || dtyp == "asynOctetWriteBinary"
         || dtyp == "asynOctetCmdResponse"
+        || dtyp == "asynOctetWriteRead"
     {
         return "asynOctet".to_string();
     }
@@ -4145,6 +4372,17 @@ pub fn universal_asyn_factory(
             cmd.truncate(nul);
         }
         adapter.octet_cmd = Some(cmd);
+        adapter.reason_set = true;
+    }
+
+    // asynOctetWriteRead: the DRVINFO names the record whose value is the
+    // command (C `initSiWriteRead` and kin, useDrvUser=0, devAsynOctet.c:866-875).
+    if ctx.dtyp == "asynOctetWriteRead" {
+        let _ = adapter.device_job.write_read.set(WriteReadSource {
+            pv: adapter.drv_info.clone(),
+            waveform: ctx.record_type == "waveform",
+            db: std::sync::OnceLock::new(),
+        });
         adapter.reason_set = true;
     }
 
@@ -9537,6 +9775,7 @@ mod tests {
         // asynOctetCmdResponse also collapses to asynOctet — the write-then-read
         // is carried by octet_cmd, not a distinct interface.
         assert_eq!(normalize_asyn_dtyp("asynOctetCmdResponse"), "asynOctet");
+        assert_eq!(normalize_asyn_dtyp("asynOctetWriteRead"), "asynOctet");
         // asynOctetWriteBinary likewise — write-only/no-NUL-trim is carried by
         // octet_binary, not a distinct interface.
         assert_eq!(normalize_asyn_dtyp("asynOctetWriteBinary"), "asynOctet");

@@ -1688,8 +1688,15 @@ impl PortActor {
                     self.octet_flush(user)
                         .map_err(|e| e.in_octet_step(OctetStep::Flush))?;
                 }
-                self.octet_write(user, data)
+                let sent = self
+                    .octet_write(user, data)
                     .map_err(|e| e.in_octet_step(OctetStep::Write))?;
+                // devAsynOctet's writeIt ends the exchange on a short write
+                // before readIt (devAsynOctet.c:680-686, :853-854): the result
+                // carries no read data. SyncIO's writeRead reads regardless.
+                if !*flush && sent != data.len() {
+                    return Ok(RequestResult::write_n(sent));
+                }
                 let (buf, n, eom) = self
                     .octet_read(user, *buf_size)
                     .map_err(|e| e.in_octet_step(OctetStep::Read))?;

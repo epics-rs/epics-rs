@@ -1869,6 +1869,7 @@ fn partition_special_actions(
                 | A::ReadDbLink { .. }
                 | A::GetLink { .. }
                 | A::WriteDbLinkNotify { .. }
+                | A::PutInLinkStage { .. }
         )
     });
     (FrameActions(frame), LinkActions(links))

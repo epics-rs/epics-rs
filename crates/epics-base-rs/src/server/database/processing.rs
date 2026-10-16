@@ -6602,8 +6602,8 @@ impl PvDatabase {
                 if let ControlFlow::Break(e) =
                     self.run_process_actions(name, rec, process_actions, visited)
                 {
-                    cycle_status.record(Err(e));
-                    self.return_with_pact_held(name, rec, cycle_end.take());
+                    cycle_status.record(Err(e.status));
+                    self.return_from_process(name, rec, e.pact, cycle_end.take());
                     return cycle_status.frame_result(guard);
                 }
                 // After every action this arm runs, so the ordering rule holds
@@ -6699,8 +6699,8 @@ impl PvDatabase {
                 match self.execute_link_writes_in(name, rec, link_writes, visited) {
                     ControlFlow::Continue(status) => cycle_status.record(status),
                     ControlFlow::Break(e) => {
-                        cycle_status.record(Err(e));
-                        self.return_with_pact_held(name, rec, cycle_end.take());
+                        cycle_status.record(Err(e.status));
+                        self.return_from_process(name, rec, e.pact, cycle_end.take());
                         return cycle_status.frame_result(guard);
                     }
                 }
@@ -7518,8 +7518,8 @@ impl PvDatabase {
                     match self.execute_link_writes_in(name, rec, link_writes, visited) {
                         ControlFlow::Continue(status) => cycle_status.record(status),
                         ControlFlow::Break(e) => {
-                            cycle_status.record(Err(e));
-                            self.return_with_pact_held(name, rec, cycle_end.take());
+                            cycle_status.record(Err(e.status));
+                            self.return_from_process(name, rec, e.pact, cycle_end.take());
                             return cycle_status.frame_result(guard);
                         }
                     }
@@ -8228,7 +8228,7 @@ impl PvDatabase {
         link_field: &'static str,
         value: EpicsValue,
         visited: &mut ProcStack,
-    ) -> ControlFlow<DbStatus, DbResult> {
+    ) -> ControlFlow<Returned, DbResult> {
         // 1. Get the record's stored link for the field
         // and the source PUTF for processTarget propagation.
         let (parsed, src_putf, src_notify) = {
@@ -8303,7 +8303,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
-    ) -> ControlFlow<DbStatus, DbResult> {
+    ) -> ControlFlow<Returned, DbResult> {
         let mut status = Ok(());
         for action in actions {
             match action {
@@ -8324,18 +8324,21 @@ impl PvDatabase {
     }
 
     /// A failed [`ProcessAction::WriteDbLinkOrReturn`]: C's `process()` has
-    /// returned with `pact` still set, so the cycle ends here and nothing
-    /// releases PACT.
+    /// returned, so the cycle ends here; a held PACT is left for nothing to
+    /// release.
     ///
     /// [`ProcessAction::WriteDbLinkOrReturn`]: crate::server::record::ProcessAction::WriteDbLinkOrReturn
     #[cold]
-    fn return_with_pact_held(
+    fn return_from_process(
         &self,
         name: &[u8],
         rec: InFrame<'_>,
+        pact: crate::server::record::ReturnPact,
         exit: crate::server::record::PactExit,
     ) {
-        rec.read().enter_pact();
+        if pact == crate::server::record::ReturnPact::Held {
+            rec.read().enter_pact();
+        }
         self.apply_pact_exit(name, exit);
     }
 
@@ -8380,7 +8383,7 @@ impl PvDatabase {
         rec: InFrame<'_>,
         actions: impl IntoIterator<Item = crate::server::record::ProcessAction>,
         visited: &mut ProcStack,
-    ) -> ControlFlow<DbStatus> {
+    ) -> ControlFlow<Returned> {
         use crate::server::record::ProcessAction;
 
         for action in actions {
@@ -8409,11 +8412,15 @@ impl PvDatabase {
                     let _ =
                         self.write_db_link_action(record_name, rec, link_field, value, visited)?;
                 }
-                ProcessAction::WriteDbLinkOrReturn { link_field, value } => {
-                    if let Err(e) =
+                ProcessAction::WriteDbLinkOrReturn {
+                    link_field,
+                    value,
+                    pact,
+                } => {
+                    if let Err(status) =
                         self.write_db_link_action(record_name, rec, link_field, value, visited)?
                     {
-                        return ControlFlow::Break(e);
+                        return ControlFlow::Break(Returned { status, pact });
                     }
                 }
                 ProcessAction::DeviceCommand { command, ref args } => {
@@ -8544,6 +8551,13 @@ impl PvDatabase {
                     let mut inst = rec.write();
                     let reset = inst.take_alarm_reset();
                     inst.put_after_epilogue(field, value, reset);
+                }
+                ProcessAction::PutInLinkStage { field, value } => {
+                    rec.write().put_after_epilogue(
+                        field,
+                        value,
+                        crate::server::recgbl::EventMask::NONE,
+                    );
                 }
             }
         }
@@ -11467,7 +11481,18 @@ fn runs_in_link_stage(a: &crate::server::record::ProcessAction) -> bool {
             | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
             | crate::server::record::ProcessAction::GetLink { .. }
             | crate::server::record::ProcessAction::ReadDbLink { .. }
+            | crate::server::record::ProcessAction::PutInLinkStage { .. }
     )
+}
+
+/// A failed [`ProcessAction::WriteDbLinkOrReturn`]: the status C's
+/// `process()` returned, and PACT as it left it.
+///
+/// [`ProcessAction::WriteDbLinkOrReturn`]: crate::server::record::ProcessAction::WriteDbLinkOrReturn
+#[derive(Clone, Copy, Debug)]
+struct Returned {
+    status: DbStatus,
+    pact: crate::server::record::ReturnPact,
 }
 
 /// [`PvDatabase::fetch_input_link`]'s answer: C `dbGetLink`'s status and what

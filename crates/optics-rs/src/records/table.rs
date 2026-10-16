@@ -14,7 +14,7 @@ use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
     CycleMarks, CyclePostMask, FieldDeclaration, FieldDesc, FieldMetadataOverride,
     InputLinkRequest, LinkRead, LinkReadAs, OutTarget, ProcessAction, ProcessActions,
-    ProcessOutcome, Record,
+    ProcessOutcome, Record, ReturnPact,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -2284,6 +2284,7 @@ impl TableRecord {
                     .then(|| ProcessAction::WriteDbLinkOrReturn {
                         link_field: SPEED_OUT_LINK[i],
                         value: EpicsValue::Double(sv0x[i]),
+                        pact: ReturnPact::Held,
                     }),
             };
             if let Some(action) = action {
@@ -4177,9 +4178,9 @@ mod tests {
         while let [action] = next.as_slice() {
             let (returns, link_field, value) = match action {
                 ProcessAction::WriteDbLink { link_field, value } => (false, *link_field, value),
-                ProcessAction::WriteDbLinkOrReturn { link_field, value } => {
-                    (true, *link_field, value)
-                }
+                ProcessAction::WriteDbLinkOrReturn {
+                    link_field, value, ..
+                } => (true, *link_field, value),
                 _ => break,
             };
             puts.push((returns, link_field, value.to_f64().unwrap()));

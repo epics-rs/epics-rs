@@ -6051,7 +6051,16 @@ impl RecordInstance {
         &mut self,
         snapshot: &mut ProcessSnapshot,
     ) -> crate::server::database::AlarmPosts {
-        let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common);
+        let alarm_result = if self
+            .monitor_plan
+            .hooks
+            .has(crate::server::record::CycleHooks::MONITOR_RESET)
+            && !self.record.monitor_resets_alarms()
+        {
+            crate::server::recgbl::AlarmResetResult::unchanged(&self.common)
+        } else {
+            crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common)
+        };
         // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
         // (recGbl.c:194/203/212) when the severity/status OR the alarm
         // message moved — every monitored-value post this cycle carries
@@ -11306,6 +11315,11 @@ impl RecordInstance {
         // path.
         self.apply_post_write_fields(outcome.post_write_fields);
         let after_epilogue = outcome.actions;
+        for action in &after_epilogue {
+            if let crate::server::record::ProcessAction::PutInLinkStage { field, value } = *action {
+                self.put_after_epilogue(field, value, crate::server::recgbl::EventMask::NONE);
+            }
+        }
 
         // If the record reports it modified a metadata-class field during
         // process(), invalidate the metadata cache so the next snapshot

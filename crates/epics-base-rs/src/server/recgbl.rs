@@ -303,6 +303,19 @@ fn transfer_amsg(common: &mut CommonFields) {
     common.amsg = std::mem::take(&mut common.namsg);
 }
 
+impl AlarmResetResult {
+    /// A cycle that ran no `recGblResetAlarms`: nothing moved, nothing posts.
+    pub(crate) fn unchanged(common: &CommonFields) -> Self {
+        Self {
+            alarm_changed: false,
+            prev_sevr: common.sevr,
+            prev_stat: common.stat,
+            amsg_changed: false,
+            acks_posted: false,
+        }
+    }
+}
+
 /// Transfer nsta/nsev to stat/sevr, detect alarm change, reset nsta/nsev.
 /// Matches EPICS recGblResetAlarms. Call at end of process cycle.
 ///

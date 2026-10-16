@@ -2068,13 +2068,13 @@ pub enum ProcessAction {
     },
 
     /// A [`Self::WriteDbLink`] whose failure is C's `if (status) return
-    /// status;` with `pact` still set (`tableRecord.c:574-576`, `:1001-1004`):
-    /// `process()` returns the put's status there, and the cycle runs no
-    /// further action, alarm commit, monitor or forward link. The record
-    /// stays PACT, as C leaves it.
+    /// status;`: `process()` returns the put's status there, and the cycle
+    /// runs no further action, alarm commit, monitor or forward link. `pact`
+    /// is what the C `process()` had done to PACT by then.
     WriteDbLinkOrReturn {
         link_field: &'static str,
         value: EpicsValue,
+        pact: ReturnPact,
     },
 
     /// Resolve an OUT link's TARGET ([`OutTarget`]) and hand it to the record
@@ -2250,6 +2250,26 @@ pub enum ProcessAction {
         field: &'static str,
         value: CycleValue,
     },
+
+    /// Store `field` and post it `DBE_VALUE` at this place among the cycle's
+    /// link writes, so the puts after it see the new value: scanparm's
+    /// `go = 0` between `dbPutLink(OGO)` and `dbPutLink(OLOAD)`
+    /// (`scanparmRecord.c:248-262`).
+    PutInLinkStage {
+        field: &'static str,
+        value: CycleValue,
+    },
+}
+
+/// PACT where a C `process()` returns a failed put's status
+/// ([`ProcessAction::WriteDbLinkOrReturn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnPact {
+    /// Set, and nothing clears it (`tableRecord.c:574-576`, `:1001-1004`).
+    Held,
+    /// Never set: the return comes ahead of `pact = TRUE`
+    /// (`scanparmRecord.c:206`, `:219`).
+    Clear,
 }
 
 /// A list a record hands the framework for one cycle — the actions of
@@ -2361,6 +2381,10 @@ impl CycleHooks {
     /// passes (`mcaRecord.c:762`, `:811`). The cycle stamps such a pass only
     /// when its `process()` asked, and reads no `TSEL` otherwise.
     pub const STAMP_REQUEST: Self = Self(8192);
+    /// [`Record::monitor_resets_alarms`]: outside [`Self::ALL`], declared by a
+    /// type whose C `monitor()` calls `recGblResetAlarms` only on some cycles
+    /// (`scanparmRecord.c:280`).
+    pub const MONITOR_RESET: Self = Self(16384);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2411,6 +2435,7 @@ const _: () = {
         CycleHooks::OUTPUT_HOOKS.0,
         CycleHooks::CONTINUATION.0,
         CycleHooks::STAMP_REQUEST.0,
+        CycleHooks::MONITOR_RESET.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -5729,6 +5754,13 @@ pub trait Record: Send + Sync + 'static {
     /// `valuePut` drains. Empty unless a `valuePut` ran since the last take.
     fn take_value_put_tail(&mut self) -> CycleMarks {
         CycleMarks::NONE
+    }
+
+    /// Whether this cycle's `monitor()` runs `recGblResetAlarms`. Only a
+    /// [`CycleHooks::MONITOR_RESET`] type is asked; a cycle that answers
+    /// `false` leaves the pending NSTA/NSEV for the next reset.
+    fn monitor_resets_alarms(&self) -> bool {
+        true
     }
 
     /// Whether the `process()` that just ran called C `recGblGetTimeStamp`,

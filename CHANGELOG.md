@@ -16,7 +16,10 @@ interruptAccept gate; `CaChannel::on_connection_change`,
 helpers are gone and `subscribe_async` returns a per-subscriber ring
 instead of a tokio broadcast; `PriorityInheritanceMutex` is the movable
 form, with `PinnedPriorityInheritanceMutex` beside it; and
-`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`.
+`epics-bridge-rs` drops `run_ca_pva_qsrv_ioc` and `BridgeMonitor`;
+`DeviceInitOutcome::Live` splits into `Ok(DeviceUdf)` (C status 0) and
+`DoNotConvert(DeviceUdf)` (C 2), with `DeviceInitOutcome::ok()` as the
+default init's value.
 
 ### A monitored IOC's realtime tail at C's
 
@@ -61,7 +64,11 @@ records' posts with softIoc's and the std/calc oracle IOCs'. asyn's
 request queue keeps C's states: a disabled or disconnected port refuses
 at queueRequest and parks what is already queued, and `cancelRequest`
 unlinks and reports as C's does. Every port gets its owner gate at
-`register_port`.
+`register_port`. An asyn output whose dset reads the driver back at init
+converts RVAL and comes up defined, as C's status 0 does. modbus keeps
+its I/O statistics in the param library, set by each I/O and posted only
+through the generic write, and a data write sets no param, as
+drvModbusAsyn does.
 
 ### SCHED_FIFO thread banding is on by default, under C's switch
 

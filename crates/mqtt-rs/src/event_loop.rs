@@ -523,7 +523,14 @@ fn decode_for_subscribers(
             // A JSON subscriber fails in `json::parse`, a flat one in its value
             // parser.
             let json = addr.format == PayloadFormat::Json;
-            report_drop(report, topic, addr, json, &"payload is not UTF-8 text");
+            report_drop(
+                report,
+                topic,
+                payload,
+                addr,
+                json,
+                &"payload is not UTF-8 text",
+            );
             continue;
         };
         let text = match input {
@@ -588,7 +595,7 @@ fn decode_for_subscribers(
             }
             Err(e) => {
                 let json = matches!(e, MqttError::JsonParse(_) | MqttError::JsonFieldNotFound(_));
-                report_drop(report, topic, addr, json, &e);
+                report_drop(report, topic, payload, addr, json, &e);
             }
         }
     }
@@ -602,6 +609,7 @@ fn decode_for_subscribers(
 fn report_drop(
     report: &mut dyn FnMut(std::fmt::Arguments<'_>),
     topic: &str,
+    payload: &[u8],
     addr: &TopicAddress,
     json: bool,
     why: &dyn std::fmt::Display,
@@ -612,10 +620,27 @@ fn report_drop(
             "MqttDriver::onMessageCb: Failed to parse JSON payload for topic '{topic}', field '{field}': {why}"
         ));
     } else {
+        // C's argument order, unbalanced `)` included.
         report(format_args!(
-            "MqttDriver::onMessageCb: Unexpected value received for topic '{topic}' ({}): {why}",
-            addr.value_type.label(),
+            "MqttDriver::onMessageCb:{why}: Unexpected value received for topic: '{topic}': {})",
+            CText(payload),
         ));
+    }
+}
+
+/// C's `payload.c_str()` as trace text: cut at the first NUL, bytes that are
+/// not UTF-8 shown as U+FFFD.
+struct CText<'a>(&'a [u8]);
+
+impl std::fmt::Display for CText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for chunk in octet_bytes_cstr(self.0).utf8_chunks() {
+            f.write_str(chunk.valid())?;
+            if !chunk.invalid().is_empty() {
+                f.write_str("\u{FFFD}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -710,19 +735,6 @@ async fn handle_incoming_message(
         && let Err(e) = port_handle.set_params_and_notify(0, batch_updates).await
     {
         eprintln!("set_params_and_notify error (mqtt payload): {e}");
-    }
-}
-
-impl ValueType {
-    fn label(&self) -> &'static str {
-        match self {
-            ValueType::Int => "INT",
-            ValueType::Float => "FLOAT",
-            ValueType::Digital => "DIGITAL",
-            ValueType::String => "STRING",
-            ValueType::IntArray => "INTARRAY",
-            ValueType::FloatArray => "FLOATARRAY",
-        }
     }
 }
 
@@ -1535,12 +1547,13 @@ mod tests {
         );
         assert!(batch.is_empty());
         assert_eq!(lines.len(), 3, "{lines:#?}");
-        assert!(lines[0].starts_with(
-            "MqttDriver::onMessageCb: Unexpected value received for topic 'dev' (FLOAT)"
-        ));
-        assert!(lines[1].starts_with(
-            "MqttDriver::onMessageCb: Unexpected value received for topic 'dev' (INT)"
-        ));
+        // C: "%s::%s:%s: Unexpected value received for topic: '%s': %s)", the
+        // cause before the topic and the whole payload last.
+        let tail = r#": Unexpected value received for topic: 'dev': {"temperature":"warm","battery":99.7})"#;
+        for line in &lines[..2] {
+            assert!(line.starts_with("MqttDriver::onMessageCb:"), "{line}");
+            assert!(line.ends_with(tail), "{line}");
+        }
         assert!(lines[2].starts_with(
             "MqttDriver::onMessageCb: Failed to parse JSON payload for topic 'dev', field 'humidity'"
         ));
@@ -1554,6 +1567,21 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("Failed to parse JSON payload for topic 'dev', field 'temperature'")
+        );
+
+        // The payload prints as C's `c_str()`: cut at the NUL.
+        lines.clear();
+        let flat = vec![(4usize, TopicAddress::parse("FLAT:INT dev").unwrap())];
+        let bound: HashSet<usize> = [4usize].into_iter().collect();
+        let batch = decode_for_subscribers(b"x\xffy\0tail", &flat, &bound, "dev", &mut |args| {
+            lines.push(args.to_string())
+        });
+        assert!(batch.is_empty());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].ends_with(": Unexpected value received for topic: 'dev': x\u{FFFD}y)"),
+            "{}",
+            lines[0]
         );
     }
 

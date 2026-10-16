@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::interfaces::InterfaceType;
 use crate::manager::PortManager;
 use crate::port_handle::PortHandle;
 use crate::request::RequestOp;
@@ -19,62 +20,141 @@ use crate::user::AsynUser;
 ///
 /// All operations submit requests to the actor and block until completion.
 pub struct SyncIOHandle {
-    /// `None` is C's asynUser whose `connectDevice` failed (`pport == NULL`).
-    handle: Option<PortHandle>,
+    link: Link,
     addr: i32,
     timeout: Duration,
+}
+
+/// Where a C SyncIO `connect` left its asynUser.
+enum Link {
+    Port(PortHandle),
+    /// `connectDevice` found the port but it lacks an interface the SyncIO
+    /// needs: the user is on the port (its trace), and C leaves the ioPvt
+    /// interface NULL, dereferenced by the next transfer. That crash is not
+    /// copied: every transfer refuses with the connect's message.
+    NoInterface(PortHandle, String),
+    /// `connectDevice` failed (`pport == NULL`).
+    NoPort,
+}
+
+/// C SyncIO `connect`'s `findInterface` checks: `asynCommon`, then the
+/// interface the SyncIO transfers on, each refusal in its C file's words.
+fn missing_interface(handle: &PortHandle, iface: InterfaceType) -> Option<String> {
+    for needed in [InterfaceType::Common, iface] {
+        if handle.has_interface(needed) {
+            continue;
+        }
+        let message = match iface {
+            // asynOctetSyncIO.c:124-137, asynUInt32DigitalSyncIO.c.
+            InterfaceType::Octet | InterfaceType::UInt32Digital => {
+                format!("{needed} interface not supported")
+            }
+            // asynInt32SyncIO.c, asynInt64SyncIO.c, asynEnumSyncIO.c,
+            // asynOptionSyncIO.c.
+            InterfaceType::Int32
+            | InterfaceType::Int64
+            | InterfaceType::Enum
+            | InterfaceType::Option => format!("port does not implement interface {needed}"),
+            // asynCommonSyncIO.c:76-80, asynFloat64SyncIO.c, the array and
+            // genericPointer SyncIOs.
+            _ => format!("interface {needed} is not supported by port"),
+        };
+        return Some(message);
+    }
+    None
+}
+
+fn refused(message: String) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message,
+    }
 }
 
 impl SyncIOHandle {
     /// Create from a PortHandle.
     pub fn from_handle(handle: PortHandle, addr: i32, timeout: Duration) -> Self {
         Self {
-            handle: Some(handle),
+            link: Link::Port(handle),
             addr,
             timeout,
         }
     }
 
-    /// Connect to a named port via the PortManager (actor path).
+    /// The `asyn<iface>SyncIO->connect` of a named port via the PortManager
+    /// (actor path); `iface` is [`InterfaceType::Common`] for
+    /// `asynCommonSyncIO`.
     pub fn connect(
         manager: &PortManager,
         port_name: &str,
         addr: i32,
         timeout: Duration,
+        iface: InterfaceType,
     ) -> AsynResult<Self> {
         let handle = manager.find_port_handle(port_name)?;
+        if let Some(message) = missing_interface(&handle, iface) {
+            return Err(refused(message));
+        }
         Ok(Self::from_handle(handle, addr, timeout))
     }
 
-    /// C `pasynOctetSyncIO->connect` against the global registry: the user
-    /// exists even when `connectDevice` fails (asynOctetSyncIO.c:117-123), so
-    /// a driver that ignores the status keeps a user whose every transfer
-    /// fails in `queueLockPort`.
-    pub fn connect_port(port_name: &str, addr: i32, timeout: Duration) -> (Self, AsynResult<()>) {
-        match crate::registry::get_port(port_name) {
-            Some(entry) => (Self::from_handle(entry.handle, addr, timeout), Ok(())),
+    /// C `pasyn<iface>SyncIO->connect` against the global registry; `iface`
+    /// is [`InterfaceType::Common`] for `asynCommonSyncIO`. The user exists
+    /// even when the connect fails (asynOctetSyncIO.c:117-137), so a driver
+    /// that ignores the status keeps a user whose every transfer fails.
+    pub fn connect_port(
+        port_name: &str,
+        addr: i32,
+        timeout: Duration,
+        iface: InterfaceType,
+    ) -> (Self, AsynResult<()>) {
+        let (link, status) = match crate::registry::get_port(port_name) {
+            Some(entry) => match missing_interface(&entry.handle, iface) {
+                None => (Link::Port(entry.handle), Ok(())),
+                Some(message) => (
+                    Link::NoInterface(entry.handle, message.clone()),
+                    Err(refused(message)),
+                ),
+            },
             None => (
-                Self {
-                    handle: None,
-                    addr,
-                    timeout,
-                },
+                Link::NoPort,
                 Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("asynManager:connectDevice port {port_name} not found"),
                 }),
             ),
-        }
+        };
+        (
+            Self {
+                link,
+                addr,
+                timeout,
+            },
+            status,
+        )
     }
 
     /// The port this user transfers through — for a driver that submits its
-    /// own requests asynchronously — or C `queueLockPort`'s refusal for a user
-    /// whose connect found no port (asynManager.c:1843-1847).
+    /// own requests asynchronously — or the refusal of a user whose connect
+    /// failed: C `queueLockPort`'s for one that found no port
+    /// (asynManager.c:1843-1847), the connect's own for a missing interface.
     pub fn port(&self) -> AsynResult<&PortHandle> {
-        self.handle.as_ref().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "asynManager::queueLockPort not connected".into(),
-        })
+        match &self.link {
+            Link::Port(handle) => Ok(handle),
+            Link::NoInterface(_, message) => Err(refused(message.clone())),
+            Link::NoPort => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "asynManager::queueLockPort not connected".into(),
+            }),
+        }
+    }
+
+    /// The port `connectDevice` found, whether or not it has the interfaces.
+    fn device(&self) -> Option<&PortHandle> {
+        match &self.link {
+            Link::Port(handle) | Link::NoInterface(handle, _) => Some(handle),
+            Link::NoPort => None,
+        }
     }
 
     /// C `asynPrint(pasynUser, mask, ...)` on this user: the port's rung for a
@@ -82,7 +162,7 @@ impl SyncIOHandle {
     /// port (`findTracePvt`, asynManager.c:548-553). `args` is the line
     /// without its newline.
     pub fn print(&self, reason: i32, mask: TraceMask, args: std::fmt::Arguments<'_>) {
-        match &self.handle {
+        match self.device() {
             Some(handle) => handle.trace().print(
                 Some(handle.port_name()),
                 (self.addr >= 0).then_some(self.addr),
@@ -100,7 +180,7 @@ impl SyncIOHandle {
         let user = AsynUser::new(reason)
             .with_addr(self.addr)
             .with_timeout(self.timeout);
-        match &self.handle {
+        match self.device() {
             Some(handle) => user.locking_port(handle),
             None => user,
         }
@@ -269,8 +349,8 @@ impl SyncIOHandle {
         // asynOctetSyncIO.c:143-156); on a port without it the pasynUser keeps
         // reason 0 and the connect succeeds. The interface registry answers that,
         // not a failed `create`. A connect that found no port returned before the
-        // drvInfo step (:117-123), leaving reason 0 as well.
-        let Some(handle) = &self.handle else {
+        // drvInfo step (:117-137), leaving reason 0 as well.
+        let Link::Port(handle) = &self.link else {
             return Ok(0);
         };
         if !handle.has_interface(crate::interfaces::InterfaceType::DrvUser) {
@@ -464,7 +544,14 @@ mod tests {
         let mgr = PortManager::new();
         mgr.register_port_unclaimed(TestPort::new(), &crate::registry::open_owner())
             .unwrap();
-        let sio = SyncIOHandle::connect(&mgr, "synctest", 0, Duration::from_secs(1)).unwrap();
+        let sio = SyncIOHandle::connect(
+            &mgr,
+            "synctest",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         sio.write_int32(0, 100).unwrap();
         assert_eq!(sio.read_int32(0).unwrap(), 100);
     }
@@ -474,8 +561,12 @@ mod tests {
     /// fails in `queueLockPort` (asynManager.c:1843-1847).
     #[test]
     fn a_user_connected_to_a_missing_port_refuses_every_transfer() {
-        let (sio, status) =
-            SyncIOHandle::connect_port("sync_no_such_port", 0, Duration::from_secs(1));
+        let (sio, status) = SyncIOHandle::connect_port(
+            "sync_no_such_port",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        );
         let msg = |e: AsynError| match e {
             AsynError::Status {
                 status: AsynStatus::Error,
@@ -511,11 +602,161 @@ mod tests {
             &crate::registry::open_owner(),
         )
         .unwrap();
-        let (live, status) =
-            SyncIOHandle::connect_port("sync_connect_port_live", 0, Duration::from_secs(1));
+        let (live, status) = SyncIOHandle::connect_port(
+            "sync_connect_port_live",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        );
         status.unwrap();
         live.write_int32(0, 7).unwrap();
         assert_eq!(live.read_int32(0).unwrap(), 7);
+    }
+
+    /// A published port declaring exactly `caps`.
+    fn port_with(name: &str, caps: Vec<crate::interfaces::Capability>) {
+        struct Declared(PortDriverBase, Vec<crate::interfaces::Capability>);
+        impl PortDriver for Declared {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
+                self.1.clone()
+            }
+        }
+        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        base.create_param("V", ParamType::Int32).unwrap();
+        PortManager::new()
+            .register_port_unclaimed(Declared(base, caps), &crate::registry::open_owner())
+            .unwrap();
+    }
+
+    fn refusal(e: AsynError) -> String {
+        match e {
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message,
+            } => message,
+            other => panic!("not asynError: {other:?}"),
+        }
+    }
+
+    /// asynOctetSyncIO.c:124-130: a port without asynCommon refuses the
+    /// connect, and the user it hands back transfers nothing.
+    #[test]
+    fn an_octet_connect_to_a_port_without_asyn_common_is_refused() {
+        use crate::interfaces::Capability::*;
+        port_with("sync_no_common", vec![OctetRead, OctetWrite]);
+        let (sio, status) = SyncIOHandle::connect_port(
+            "sync_no_common",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        );
+        let refused = "asynCommon interface not supported";
+        assert_eq!(refusal(status.unwrap_err()), refused);
+        assert_eq!(refusal(sio.write_octet(0, b"x").unwrap_err()), refused);
+        assert_eq!(refusal(sio.port().err().unwrap()), refused);
+    }
+
+    /// asynOctetSyncIO.c:131-137: asynCommon present, asynOctet missing.
+    #[test]
+    fn an_octet_connect_to_a_port_without_asyn_octet_is_refused() {
+        use crate::interfaces::Capability::*;
+        port_with("sync_no_octet", vec![Int32Read, Int32Write, Connect]);
+        let (sio, status) = SyncIOHandle::connect_port(
+            "sync_no_octet",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        );
+        let refused = "asynOctet interface not supported";
+        assert_eq!(refusal(status.unwrap_err()), refused);
+        assert_eq!(refusal(sio.read_octet(0, 8).unwrap_err()), refused);
+    }
+
+    /// asynCommonSyncIO.c:76-80 checks asynCommon alone, in its own words.
+    #[test]
+    fn a_common_connect_needs_only_asyn_common() {
+        use crate::interfaces::Capability::*;
+        port_with("sync_common_absent", vec![OctetRead, OctetWrite]);
+        let (_, status) = SyncIOHandle::connect_port(
+            "sync_common_absent",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Common,
+        );
+        assert_eq!(
+            refusal(status.unwrap_err()),
+            "interface asynCommon is not supported by port"
+        );
+        port_with("sync_common_only", vec![Connect]);
+        let (_, status) = SyncIOHandle::connect_port(
+            "sync_common_only",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Common,
+        );
+        status.unwrap();
+    }
+
+    /// Each SyncIO file's refusal text for its own missing interface:
+    /// asynInt32SyncIO.c, asynFloat64SyncIO.c, asynUInt32DigitalSyncIO.c.
+    #[test]
+    fn each_syncio_refuses_its_missing_interface_in_its_own_words() {
+        port_with(
+            "sync_transport_only",
+            crate::interfaces::octet_transport_capabilities(),
+        );
+        for (iface, refused) in [
+            (
+                InterfaceType::Int32,
+                "port does not implement interface asynInt32",
+            ),
+            (
+                InterfaceType::Float64,
+                "interface asynFloat64 is not supported by port",
+            ),
+            (
+                InterfaceType::UInt32Digital,
+                "asynUInt32Digital interface not supported",
+            ),
+        ] {
+            let (_, status) =
+                SyncIOHandle::connect_port("sync_transport_only", 0, Duration::from_secs(1), iface);
+            assert_eq!(refusal(status.unwrap_err()), refused, "{iface}");
+        }
+        let (_, status) = SyncIOHandle::connect_port(
+            "sync_transport_only",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        );
+        status.unwrap();
+    }
+
+    /// The PortManager connect refuses the same missing interface.
+    #[test]
+    fn a_manager_connect_refuses_a_missing_interface() {
+        let mgr = PortManager::new();
+        mgr.register_port_unclaimed(TestPort::new(), &crate::registry::open_owner())
+            .unwrap();
+        let err = SyncIOHandle::connect(
+            &mgr,
+            "synctest",
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Int32Array,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            refusal(err),
+            "interface asynInt32Array is not supported by port"
+        );
     }
 
     /// C `asynPrint` on a user whose connect found no port prints on the
@@ -529,7 +770,12 @@ mod tests {
         let trace = PortServices::global().trace().clone();
         trace.set_trace_file(None, TraceFile::File(Arc::new(std::sync::Mutex::new(file))));
 
-        let (sio, _) = SyncIOHandle::connect_port("sync_print_no_port", 0, Duration::ZERO);
+        let (sio, _) = SyncIOHandle::connect_port(
+            "sync_print_no_port",
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        );
         sio.print(0, TraceMask::ERROR, format_args!("unconnected line"));
         trace.set_trace_file(None, TraceFile::default());
 
@@ -570,6 +816,7 @@ mod tests {
     #[test]
     fn read_octet_error_carries_the_partial_transfer() {
         use crate::error::{AsynError, AsynResult, AsynStatus};
+        use crate::interfaces::InterfaceType;
         use crate::interpose::{EomReason, PartialOctetRead};
         use crate::user::AsynUser;
 

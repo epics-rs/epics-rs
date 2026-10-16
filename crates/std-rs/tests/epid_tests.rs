@@ -1136,8 +1136,14 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
         .register_port(claim, OutputPort { base }, &asyn_rs::registry::open_owner())
         .unwrap();
 
-    let sync_io = SyncIOHandle::connect(&manager, "EPID_OUT_PORT", 0, Duration::from_secs(1))
-        .expect("connect to output port");
+    let sync_io = SyncIOHandle::connect(
+        &manager,
+        "EPID_OUT_PORT",
+        0,
+        Duration::from_secs(1),
+        asyn_rs::interfaces::InterfaceType::Float64,
+    )
+    .expect("connect to output port");
     // Sanity: the port reports the value we seeded.
     assert!((sync_io.read_float64(reason).unwrap() - 33.0).abs() < 1e-9);
 

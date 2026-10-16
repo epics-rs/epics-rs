@@ -2223,14 +2223,24 @@ impl CommandHandler for ModbusConfigHandler {
         // with `initialized_` false and Configure still returns asynSuccess
         // (drvModbusAsyn.cpp:3134-3140).
         let built = args.config().and_then(|config| {
-            let entry = asyn_rs::asyn_record::get_port(octet_port).ok_or_else(|| {
+            let refused = |iface: &str| {
                 format!(
-                    "drvModbusAsyn::drvModbusAsyn port {port_name} can't connect to asynOctet on Octet server {octet_port}."
+                    "drvModbusAsyn::drvModbusAsyn port {port_name} can't connect to {iface} on Octet server {octet_port}."
                 )
-            })?;
-            Ok((config, entry))
+            };
+            let (sync, octet) = SyncIOHandle::connect_port(
+                octet_port,
+                0,
+                interpose.timeout,
+                InterfaceType::Octet,
+            );
+            octet.map_err(|_| refused("asynOctet"))?;
+            SyncIOHandle::connect_port(octet_port, 0, interpose.timeout, InterfaceType::Common)
+                .1
+                .map_err(|_| refused("asynCommon"))?;
+            Ok((config, sync))
         });
-        let (config, entry) = match built {
+        let (config, sync) = match built {
             Ok(built) => built,
             Err(line) => {
                 let half =
@@ -2254,7 +2264,6 @@ impl CommandHandler for ModbusConfigHandler {
         // The configured timeout (C `modbusInterposeConfig timeoutMsec`) drives
         // both the underlying read and write; the write delay is applied by the
         // transport before each frame write (R53).
-        let sync = SyncIOHandle::from_handle(entry.handle.clone(), 0, interpose.timeout);
         let transport = Box::new(SyncIoTransport::with_write_delay(
             sync,
             interpose.write_delay,
@@ -3878,9 +3887,45 @@ mod tests {
             )
         };
         if std::env::var_os(CHILD).is_some() {
+            // asynOctetSyncIO checks asynCommon before asynOctet, so a port
+            // missing either fails the first connect (drvModbusAsyn.cpp:294).
+            struct Declared(PortDriverBase, Vec<asyn_rs::interfaces::Capability>);
+            impl PortDriver for Declared {
+                fn base(&self) -> &PortDriverBase {
+                    &self.0
+                }
+                fn base_mut(&mut self) -> &mut PortDriverBase {
+                    &mut self.0
+                }
+                fn capabilities(&self) -> Vec<asyn_rs::interfaces::Capability> {
+                    self.1.clone()
+                }
+            }
+            use asyn_rs::interfaces::Capability as C;
+            let mut runtimes = Vec::new();
+            for (octet, caps) in [
+                ("OCTET_NO_OCTET", vec![C::Connect, C::Flush, C::Option]),
+                (
+                    "OCTET_NO_COMMON",
+                    vec![C::OctetRead, C::OctetWrite, C::Option],
+                ),
+            ] {
+                let driver = Declared(PortDriverBase::new(octet, 1, PortFlags::default()), caps);
+                let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+                    .expect("octet runtime must start");
+                asyn_rs::asyn_record::register_port(
+                    octet,
+                    rt.port_handle().clone(),
+                    &asyn_rs::registry::open_owner(),
+                )
+                .expect("the octet port must publish");
+                runtimes.push(rt);
+            }
             for (port, octet, function) in [
                 ("MB_HALF_FN", "NO_SUCH_OCTET", 99),
                 ("MB_HALF_OCTET", "NO_SUCH_OCTET", 3),
+                ("MB_HALF_NO_OCTET", "OCTET_NO_OCTET", 3),
+                ("MB_HALF_NO_COMMON", "OCTET_NO_COMMON", 3),
             ] {
                 assert!(matches!(
                     configure(port, octet, function, "UINT16"),
@@ -3917,6 +3962,8 @@ mod tests {
         for line in [
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_FN unsupported Modbus function 99",
             "drvModbusAsyn::drvModbusAsyn port MB_HALF_OCTET can't connect to asynOctet on Octet server NO_SUCH_OCTET.",
+            "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_OCTET can't connect to asynOctet on Octet server OCTET_NO_OCTET.",
+            "drvModbusAsyn::drvModbusAsyn port MB_HALF_NO_COMMON can't connect to asynOctet on Octet server OCTET_NO_COMMON.",
         ] {
             assert!(
                 stderr.lines().any(|l| l.ends_with(line)),

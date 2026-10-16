@@ -4733,4 +4733,61 @@ mod tests {
             assert_eq!(cnt, Some(1.0), "member b was not rewritten");
         });
     }
+
+    /// pvxs `linkBuildPut` assigns a scalar to `value.index` when the target
+    /// `value` is an `enum_t` (`pvalink_channel.cpp:152-154`): a softIocPVX
+    /// longout linked to an mbbo with 2 leaves the mbbo at index 2.
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+    // suite.
+    #[test]
+    #[ignore = "spawns pvxs softIocPVX; runs in --profile interop"]
+    fn a_scalar_put_to_an_enum_target_writes_its_index() {
+        use epics_oracle_rs::ioc::{Ioc as _, PvxIoc, PvxTools};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("enum.db");
+        std::fs::write(
+            &db,
+            "record(mbbo, \"ENUM:MB\") { field(ZRST, \"A\") field(ONST, \"B\")\n\
+               field(TWST, \"C\") field(VAL, \"0\") }\n",
+        )
+        .expect("write the db");
+        let tools = PvxTools::discover().expect("the pvxs tools");
+        let ioc = PvxIoc::boot(&tools, &db).expect("boot softIocPVX");
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], ioc.port()).into();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = PvaClient::builder()
+                .server_addr(addr)
+                .timeout(Duration::from_secs(5))
+                .build();
+            let index = async || match client.pvget("ENUM:MB").await.expect("read MB") {
+                PvField::Structure(s) => match s.get_field("value") {
+                    Some(PvField::Structure(e)) => e.get_field("index").cloned(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let mut cfg = PvaLinkConfig::defaults_for("ENUM:MB", LinkDirection::Out);
+            cfg.proc = ProcMode::Pp;
+            let link = PvaLink::for_test_with_client(cfg.clone(), client.clone());
+            link.write_pv_field(&PvField::Scalar(ScalarValue::Int(2)))
+                .await
+                .expect("typed write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(2))));
+            let link = PvaLink::for_test_with_client(cfg.clone(), client.clone());
+            link.write("1").await.expect("text write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(1))));
+            // An ao source stages a double; the index takes it converted.
+            let link = PvaLink::for_test_with_client(cfg, client.clone());
+            link.write_pv_field(&PvField::Scalar(ScalarValue::Double(2.0)))
+                .await
+                .expect("double write");
+            assert_eq!(index().await, Some(PvField::Scalar(ScalarValue::Int(2))));
+        });
+    }
 }

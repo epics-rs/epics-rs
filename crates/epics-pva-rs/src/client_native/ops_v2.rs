@@ -1522,33 +1522,29 @@ async fn op_put_value_field_with_request_attempt(
     result
 }
 
-/// Resolve the effective leaf path for a typed field-targeted PUT.
-/// If the field at `field_path` is an NT-style structure that has a
-/// `value` sub-field, returns `<field_path>.value` (`value` for the
-/// root); otherwise returns `field_path` unchanged. Mirrors pvxs
-/// `linkBuildPut:138-143`.
+/// Resolve the effective leaf path for a typed field-targeted PUT, as pvxs
+/// `linkBuildPut` does (`pvalink_channel.cpp:138-154`): a structure with a
+/// `value` sub-field drills into it, and an `enum_t` there drills into its
+/// `index`.
 pub fn effective_typed_put_path(intro: &FieldDesc, field_path: &str) -> String {
     let parts: Vec<&str> = field_path.split('.').filter(|s| !s.is_empty()).collect();
-    let mut cursor = intro;
-    for seg in &parts {
-        match cursor {
-            FieldDesc::Structure { fields, .. } => match fields.iter().find(|(n, _)| n == seg) {
-                Some((_, child)) => cursor = child,
-                None => return field_path.to_string(),
-            },
-            _ => return field_path.to_string(),
-        }
+    let Some(mut target) = field_desc_at_path(intro, &parts) else {
+        return field_path.to_string();
+    };
+    let mut drill: Vec<&str> = Vec::new();
+    if let Some(value) = field_desc_at_path(target, &["value"]) {
+        drill.push("value");
+        target = value;
     }
-    if let FieldDesc::Structure { fields, .. } = cursor {
-        if fields.iter().any(|(n, _)| n == "value") {
-            return if parts.is_empty() {
-                "value".to_string()
-            } else {
-                format!("{field_path}.value")
-            };
-        }
+    if matches!(target, FieldDesc::Structure { struct_id, .. } if struct_id == "enum_t")
+        && field_desc_at_path(target, &["index"]).is_some()
+    {
+        drill.push("index");
     }
-    field_path.to_string()
+    if drill.is_empty() {
+        return field_path.to_string();
+    }
+    parts.into_iter().chain(drill).collect::<Vec<_>>().join(".")
 }
 
 /// Like [`build_put_value_for_path`] but places a pre-built typed
@@ -7234,6 +7230,20 @@ mod tests {
                 .into(),
             }
         }
+        /// pvxs `linkBuildPut` (`pvalink_channel.cpp:138-154`): the link's
+        /// field drills into `value`, and an `enum_t` there into `index`.
+        #[test]
+        fn a_typed_put_to_an_enum_lands_on_the_index() {
+            let desc = nt_enum();
+            assert_eq!(effective_typed_put_path(&desc, ""), "value.index");
+            assert_eq!(effective_typed_put_path(&desc, "value"), "value.index");
+            assert_eq!(
+                effective_typed_put_path(&desc, "alarm.severity"),
+                "alarm.severity"
+            );
+            assert_eq!(effective_typed_put_path(&desc, "nosuch"), "nosuch");
+        }
+
         /// A get-first snapshot whose `value.choices` are the given labels.
         fn previous_with_choices(choices: &[&str]) -> PvField {
             let mut enum_v = PvStructure::new("enum_t");

@@ -884,10 +884,7 @@ mod tests {
         let driver_sees_flow = runtime
             .port_handle()
             .with_driver_blocking(|d: &mut TestPort| {
-                d.base
-                    .trace
-                    .as_ref()
-                    .is_some_and(|t| t.is_enabled(PORT, crate::trace::TraceMask::FLOW))
+                d.base.trace.is_enabled(PORT, crate::trace::TraceMask::FLOW)
             })
             .unwrap();
         assert!(

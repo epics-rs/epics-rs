@@ -1918,6 +1918,32 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
         "drvAsynFTDIPortConfigure portName vendorID productID baudrate latency [priority] \
          [noAutoConnect] [noProcessEos] [mode] - create an FTDI octet port",
         move |args: &[ArgValue], ctx: &CommandContext| {
+            // drvAsynFTDIPort.cpp:522-526, before any argument is checked.
+            let mode = arg_int(args, 8).unwrap_or(0) as i32;
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: latency={}",
+                arg_int(args, 4).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: priority={}",
+                arg_int(args, 5).unwrap_or(0) as u32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noAutoconnect={}",
+                arg_int(args, 6).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noProcessEos={}",
+                arg_int(args, 7).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: mode={}",
+                if mode & crate::drivers::ftdi::UART_SPI_BIT != 0 {
+                    "SPI"
+                } else {
+                    "UART"
+                }
+            ));
             let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
@@ -2177,6 +2203,13 @@ mod tests {
             d
         }
 
+        /// An `ASYN_CANBLOCK` port, where a SyncIO call queues.
+        fn blocking(name: &str) -> Self {
+            let mut d = Self::new(name);
+            d.base.flags.can_block = true;
+            d
+        }
+
         /// A multi-device port — the other half of C's `findDpCommon` split.
         fn multi_device(name: &str, max_addr: usize) -> Self {
             let mut base = PortDriverBase::new(
@@ -2404,7 +2437,12 @@ mod tests {
         use crate::sync_io::SyncIOHandle;
         use std::time::Duration;
 
-        let mgr = fresh_mgr_with_port("qlp_port");
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            DummyDriver::blocking("qlp_port"),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
         let handle = mgr.find_port_handle("qlp_port").unwrap();
         let deadline = |timeout_ms| {
             SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(timeout_ms))
@@ -3475,7 +3513,7 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {
+            fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -3789,6 +3827,69 @@ mod tests {
 
     fn call_configure(cmd: &CommandDef, args: &[ArgValue]) {
         cmd.handler.call(args, &make_ctx()).expect("the command");
+    }
+
+    /// A Configure that succeeds prints nothing, except FTDI's five argument
+    /// lines, which C prints first (drvAsynIPPort.c:1017-1133,
+    /// drvAsynIPServerPort.c:544-743, drvAsynFTDIPort.cpp:522-526).
+    #[test]
+    fn a_configure_that_succeeds_prints_only_what_c_prints() {
+        const CHILD: &str = "ASYN_RS_CONFIGURE_QUIET_CHILD";
+        const TEST: &str = "iocsh::tests::a_configure_that_succeeds_prints_only_what_c_prints";
+        if std::env::var_os(CHILD).is_some() {
+            println!("---begin");
+            call_configure(
+                &drv_asyn_ip_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_ip".into()),
+                    ArgValue::String("127.0.0.1:9001".into()),
+                ],
+            );
+            call_configure(
+                &drv_asyn_ip_server_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_srv".into()),
+                    ArgValue::String("127.0.0.1:0".into()),
+                    ArgValue::Int(1),
+                ],
+            );
+            call_configure(
+                &drv_asyn_prologix_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_gpib".into()),
+                    ArgValue::String("127.0.0.1".into()),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            call_configure(
+                &drv_asyn_ftdi_port_configure_command(PortServices::new()),
+                &[
+                    ArgValue::String("quiet_ftdi".into()),
+                    ArgValue::Int(0x0403),
+                    ArgValue::Int(0x6001),
+                    ArgValue::Int(9600),
+                    ArgValue::Int(16),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                    ArgValue::Int(0),
+                    ArgValue::Int(1),
+                ],
+            );
+            println!("---end");
+            return;
+        }
+        let (stdout, _) = run_child(TEST, CHILD);
+        let a = stdout.find("---begin\n").expect("begin") + "---begin\n".len();
+        let b = stdout.find("---end").expect("end");
+        assert_eq!(
+            &stdout[a..b],
+            "drvAsynFTDIPortConfigure: latency=16\n\
+             drvAsynFTDIPortConfigure: priority=0\n\
+             drvAsynFTDIPortConfigure: noAutoconnect=1\n\
+             drvAsynFTDIPortConfigure: noProcessEos=0\n\
+             drvAsynFTDIPortConfigure: mode=SPI\n"
+        );
     }
 
     /// A Configure whose `registerPort` is refused prints the driver's own

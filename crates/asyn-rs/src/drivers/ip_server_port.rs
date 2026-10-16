@@ -672,7 +672,7 @@ struct Acceptor {
     /// port's *name* from inside the listener thread (:389-398) — that is how
     /// an IOC learns which child port a client landed on.
     interrupts: InterruptManager,
-    trace: Option<Arc<TraceManager>>,
+    trace: Arc<TraceManager>,
     /// Set to stop the loop. The listener is non-blocking and the loop polls it,
     /// so the flag is observed within one poll interval — the portable stand-in
     /// for C's `tty->fd = INVALID_SOCKET`, which unblocks its blocking `accept`
@@ -684,7 +684,7 @@ impl Acceptor {
     /// Copy the parent's trace masks onto the child port that just took a
     /// connection — C `drvAsynIPServerPort.c:385-386`.
     fn seed_child_trace(&self, child: &str) {
-        let Some(trace) = &self.trace else { return };
+        let trace = &self.trace;
         trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
         trace.set_trace_io_mask(Some(child), trace.get_trace_io_mask(Some(&self.port_name)));
     }
@@ -735,7 +735,7 @@ impl Acceptor {
                 // parent does not follow (C copies once, here too).
                 self.seed_child_trace(&child);
                 asyn_trace!(
-                    Some(self.trace),
+                    self.trace,
                     &self.port_name,
                     TraceMask::FLOW,
                     "new connection from {peer} on {child}"
@@ -776,7 +776,7 @@ impl Acceptor {
     /// only teardown ends it.
     fn run(&self) {
         asyn_trace!(
-            Some(self.trace),
+            self.trace,
             &self.port_name,
             TraceMask::FLOW,
             "started listening for connections on {}",
@@ -787,7 +787,7 @@ impl Acceptor {
                 Ok(Some(_)) => {}
                 Ok(None) => std::thread::sleep(ACCEPT_POLL_INTERVAL),
                 Err(e) => asyn_trace!(
-                    Some(self.trace),
+                    self.trace,
                     &self.port_name,
                     TraceMask::ERROR,
                     "accept error on {}: {}",
@@ -797,7 +797,7 @@ impl Acceptor {
             }
         }
         asyn_trace!(
-            Some(self.trace),
+            self.trace,
             &self.port_name,
             TraceMask::FLOW,
             "terminating connection thread for {}",

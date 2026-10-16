@@ -51,7 +51,7 @@ impl SyncIOHandle {
         AsynUser::new(reason)
             .with_addr(self.addr)
             .with_timeout(self.timeout)
-            .locking_port(self.handle.queue_lock_port_timeout())
+            .locking_port(&self.handle)
     }
 
     /// Read the configured per-call timeout. The handle is `&self`-only

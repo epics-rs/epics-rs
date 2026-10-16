@@ -14,6 +14,8 @@
 //! actor thread starts. No other site may assign `base.trace` or
 //! `base.exception_sink` — that is what keeps "a running port has both" true
 //! by construction rather than by every port creator remembering to do it.
+//! A base is born on the global trace so that a driver constructor, which C
+//! runs on an already registered port, has its `asynPrint`s printed too.
 //! Before this, injection lived in `PortManager::register_port` alone, and
 //! `drvAsynIPPortConfigure` & co. — the way an st.cmd actually builds a port —
 //! bypassed it, leaving trace and exceptions inert on every real IOC port.
@@ -74,7 +76,7 @@ impl PortServices {
     /// `base.trace` / `base.exception_sink`; called by `create_port_runtime`
     /// on every port, so no port can run without them.
     pub(crate) fn bind(&self, base: &mut PortDriverBase) {
-        base.trace = Some(self.trace.clone());
+        base.trace = self.trace.clone();
         base.bind_exception_sink(self.exceptions.clone());
     }
 }
@@ -109,5 +111,17 @@ mod tests {
                 .expect("the trace is wired to a sink");
             assert!(Arc::ptr_eq(&sink, services.exceptions()));
         }
+    }
+
+    /// A driver constructor's prints reach the console before the port is
+    /// created, as C's do on its already registered port.
+    #[test]
+    fn a_base_traces_before_its_port_is_created() {
+        let base = PortDriverBase::new("SVC_UNBOUND", 1, Default::default());
+        assert!(Arc::ptr_eq(&base.trace, PortServices::global().trace()));
+        assert!(
+            base.trace
+                .is_enabled("SVC_UNBOUND", crate::trace::TraceMask::ERROR)
+        );
     }
 }

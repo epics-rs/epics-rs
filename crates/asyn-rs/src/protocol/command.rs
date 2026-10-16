@@ -153,6 +153,9 @@ pub enum PortCommand {
     /// `RequestOp::WithDriver`. Code does not serialize, so only the kind of
     /// request survives; converting back yields a call the actor refuses.
     WithDriver,
+    /// `RequestOp::LockPort`, which carries code the same way; converting back
+    /// yields a call the actor refuses.
+    LockPort,
     /// `RequestOp::Cell`, which carries code the same way; it converts back to
     /// the same refused call `WithDriver` does.
     Callback {
@@ -308,6 +311,7 @@ mod tests {
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
             PortCommand::WithDriver,
+            PortCommand::LockPort,
             PortCommand::Callback {
                 connect_queue: true,
             },

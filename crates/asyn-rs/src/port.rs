@@ -627,10 +627,11 @@ pub struct PortDriverBase {
     eos: HashMap<i32, DeviceEos>,
     pub interpose_octet: OctetInterposeStack,
     /// Trace configuration — C `dpCommon.trace`, inited by `dpCommonInit`
-    /// (asynManager.c:530). Same
-    /// owner as [`Self::announcer`]: bound by
-    /// [`crate::services::PortServices::bind`] at port creation.
-    pub(crate) trace: Option<Arc<TraceManager>>,
+    /// (asynManager.c:530). Born on the global services' trace, because a C
+    /// driver constructor already runs on a registered port and its
+    /// `asynPrint`s print; [`crate::services::PortServices::bind`] rebinds it
+    /// at port creation.
+    pub(crate) trace: Arc<TraceManager>,
     /// C `octetPvt.interruptProcess` — the last argument of
     /// `pasynOctetBase->initialize` (asynOctetBase.c:161-169). When set, every
     /// successful octet read fans the data out to the port's octet interrupt
@@ -761,7 +762,7 @@ impl PortDriverBase {
             options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
-            trace: None,
+            trace: crate::services::PortServices::global().trace().clone(),
             octet_interrupt_process: false,
             device_states: Arc::default(),
             timestamp_source: None,
@@ -905,16 +906,10 @@ impl PortDriverBase {
     /// this crate, an out-of-crate driver had no way to say anything at all,
     /// and the failures it could not return became silent.
     ///
-    /// A port whose services were never bound has no trace manager and the
-    /// call is a no-op; that is the same port that has no trace file to write
-    /// to and no mask to consult.
-    ///
     /// `args` is formatted only when `mask` is enabled, onto the stack: a
     /// driver write that fails under a record's lock allocates nothing.
     pub fn trace_print(&self, mask: crate::trace::TraceMask, args: std::fmt::Arguments<'_>) {
-        if let Some(trace) = &self.trace {
-            trace.print(Some(&self.port_name), None, 0, mask, args);
-        }
+        self.trace.print(Some(&self.port_name), None, 0, mask, args);
     }
 
     /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::read*` and
@@ -1370,9 +1365,12 @@ impl PortDriverBase {
     ///    device's request *waits in the queue* (`continue`), it is not refused
     ///    — so applying them here refused requests C parks (R15-47). Every real
     ///    transport port is CANBLOCK.
+    ///
+    /// A SyncIO call on a synchronous port ([`ConnectCheck::SynchronousLock`])
+    /// never reaches `queueRequest`: C `queueLockPort` refuses only block 1.
     fn check_queue_inner(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
         self.queue_gate().check(connect)?;
-        if !self.flags.can_block {
+        if !self.flags.can_block && connect != ConnectCheck::SynchronousLock {
             // C :1563-1569 — the device-enabled refusal in the synchronous block
             // is *not* conditioned on `checkPortConnect`; only the connected one
             // below is (:1570).
@@ -1714,9 +1712,8 @@ impl PortDriverBase {
         line: u32,
         args: std::fmt::Arguments<'_>,
     ) {
-        if let Some(trace) = &self.trace
-            && trace.is_enabled_device(&self.port_name, addr, mask)
-        {
+        let trace = &self.trace;
+        if trace.is_enabled_device(&self.port_name, addr, mask) {
             trace.output_device_with_source(
                 &self.port_name,
                 Some(addr),
@@ -1738,9 +1735,8 @@ impl PortDriverBase {
             return Ok(address);
         }
         let mask = crate::trace::TraceMask::ERROR;
-        if let Some(trace) = &self.trace
-            && trace.is_enabled_device(&self.port_name, addr, mask)
-        {
+        let trace = &self.trace;
+        if trace.is_enabled_device(&self.port_name, addr, mask) {
             trace.output_device_with_source(
                 &self.port_name,
                 Some(addr),
@@ -1800,11 +1796,7 @@ impl PortDriverBase {
             _ => return,
         };
         // An undefined read is routine; nothing is formatted unless it prints.
-        if !self
-            .trace
-            .as_ref()
-            .is_some_and(|t| t.is_enabled(&self.port_name, mask))
-        {
+        if !self.trace.is_enabled(&self.port_name, mask) {
             return;
         }
         let port = &self.port_name;
@@ -2356,10 +2348,9 @@ impl DrvUserRequest {
 ///
 /// # LockPort/UnlockPort
 ///
-/// C asyn provides `lockPort`/`unlockPort` for direct mutex locking. In asyn-rs,
-/// the port is always behind `Arc<Mutex<dyn PortDriver>>`, so callers hold the
-/// parking_lot mutex directly. For multi-request exclusive access, use
-/// `BlockProcess`/`UnblockProcess` via the worker queue.
+/// C `lockPort`/`unlockPort` is [`crate::port_handle::PortHandle::lock_port_blocking`]:
+/// the closure runs on the port's actor and calls its interfaces with no queue
+/// gate.
 /// C `epicsTimeToStrftime(buff, ..., "%Y/%m/%d %H:%M:%S.%03f", &timeStamp)` —
 /// the port timestamp line of `asynPortDriver::report` (asynPortDriver.cpp:3682-3684).
 /// Local time, as `epicsTimeToStrftime` renders it.
@@ -2549,7 +2540,13 @@ pub trait PortDriver: Any + Send + Sync {
     /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
     /// stream. `crate::port_actor::PortActor::report_port` is the one owner that
     /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        self.asyn_port_driver_report(out, level);
+    }
+
+    /// C++ `asynPortDriver::report`, callable from a [`Self::report`] override
+    /// the way a C++ subclass ends with `asynPortDriver::report(fp, details)`.
+    fn asyn_port_driver_report(&self, out: &mut dyn std::fmt::Write, level: i32) {
         use std::fmt::Write as _;
         let base = self.base();
         let _ = writeln!(out, "Port: {}", base.port_name);
@@ -2722,6 +2719,9 @@ pub trait PortDriver: Any + Send + Sync {
         Ok(())
     }
 
+    /// C `asynPortDriver::readOctet`: `getStringParam(maxChars)` keeps at most
+    /// `maxChars - 1` bytes and the NUL, and `*nActual = strlen(value) + 1`
+    /// counts that NUL — a waveform's NORD includes it.
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let base = self.base();
         let addr = base.parse_user(user)?;
@@ -2729,14 +2729,19 @@ pub trait PortDriver: Any + Send + Sync {
         let bytes = base.get_string_param(user.reason, addr).map_err(|e| {
             param_access_error(params, user, "readOctet", e, format_args!("value="))
         })?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
+        let Some(room) = buf.len().checked_sub(1) else {
+            return Ok(0);
+        };
+        let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
+        let n = text.len().min(room);
+        buf[..n].copy_from_slice(&text[..n]);
+        buf[n] = 0;
         base.trace_io(
             user,
             "readOctet",
             format_args!("{}", crate::fixed_text::LossyText(&buf[..n])),
         );
-        Ok(n)
+        Ok(n + 1)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3610,7 +3615,12 @@ mod tests {
         let user = AsynUser::new(2);
         let mut buf = [0u8; 32];
         let n = drv.read_octet(&user, &mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
+        // C readOctet: `*nActual = strlen(value) + 1`.
+        assert_eq!(&buf[..n], b"hello\0");
+        // getStringParam(maxChars) keeps maxChars - 1 bytes and the NUL.
+        let mut short = [0xffu8; 4];
+        assert_eq!(drv.read_octet(&user, &mut short).unwrap(), 4);
+        assert_eq!(&short, b"hel\0");
     }
 
     #[test]
@@ -5183,7 +5193,7 @@ mod tests {
         let n = drv
             .read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf)
             .unwrap();
-        assert_eq!(&buf[..n], b"hi");
+        assert_eq!(&buf[..n], b"hi\0");
         assert_eq!(
             drv.read_uint32_digital(&AsynUser::new(u32_idx).with_addr(0), 0xFFFF_FFFF)
                 .unwrap(),
@@ -5456,7 +5466,7 @@ mod tests {
             .set_uint32_interrupt(bits, 0, 0x0f, InterruptReason::ZeroToOne)
             .unwrap();
         // Addr 1 is left untouched: its parameters must report as undefined.
-        let drv = Drv { base };
+        let mut drv = Drv { base };
 
         // details 0 — C prints the port line and stops (:3678-3680).
         let mut out = String::new();

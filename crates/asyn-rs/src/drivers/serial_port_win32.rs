@@ -700,7 +700,7 @@ impl PortDriver for DrvAsynSerialPort {
 
         self.base.set_connected(true);
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "connected to {} at {} baud",
@@ -712,7 +712,7 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "disconnect"
@@ -725,7 +725,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         use std::fmt::Write as _;
         let _ = writeln!(
             out,
@@ -740,14 +740,11 @@ impl PortDriver for DrvAsynSerialPort {
         if level >= 1 {
             let _ = writeln!(
                 out,
-                "                commHandle: {:?}",
+                "            commHandle: {:?}",
                 self.io.handle().unwrap_or(std::ptr::null_mut())
             );
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
-            // The level is passed through, as C's `asynPortDriver::report`
-            // passes it to `reportParams` (asynPortDriver.cpp:3693).
-            self.base.report_params(out, level);
         }
     }
 
@@ -778,7 +775,7 @@ impl PortDriver for DrvAsynSerialPort {
         self.base.check_ready()?;
         let result = self.io.read(user, buf)?;
         asyn_trace_io!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             &buf[..result.nbytes_transferred],
@@ -790,7 +787,7 @@ impl PortDriver for DrvAsynSerialPort {
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
         asyn_trace_io!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
@@ -801,7 +798,7 @@ impl PortDriver for DrvAsynSerialPort {
             Err(e) => {
                 if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
-                        Some(self.base.trace),
+                        self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
                         "write error, disconnecting: {e}"

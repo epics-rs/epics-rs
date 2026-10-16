@@ -74,6 +74,23 @@ pub enum ConnectCheck {
     Required,
     /// C `checkPortConnect = FALSE`: queue it on a disconnected port.
     Waived,
+    /// C `queueLockPort` on a synchronous port (asynManager.c:1851-1856,
+    /// :1913-1916): the port-enabled refusal and nothing else — no connected,
+    /// device or auto-connect step.
+    SynchronousLock,
+}
+
+/// The two halves of C `queueLockPort` (asynManager.c:1834-1916), chosen by
+/// the port's `ASYN_CANBLOCK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPort {
+    /// A CANBLOCK port: the call is a Low-priority `queueRequest` whose
+    /// never-ran outcomes carry queueLockPort's own text and status
+    /// (`AsynError::through_queue_lock_port`).
+    Queued,
+    /// A synchronous port: `epicsMutexMustLock(pport->synchronousLock)`, with
+    /// no queue, no deadline and no text of its own.
+    Synchronous,
 }
 
 /// Per-request context, equivalent to C asyn's asynUser.
@@ -122,6 +139,10 @@ pub struct AsynUser {
     /// `queueTimeoutCallback` returns immediately when `!isQueued`
     /// (asynManager.c:657-663). A request that has begun running always completes.
     pub queue_timeout: Option<QueueDeadline>,
+    /// `Some` when this request is a SyncIO call's `queueLockPort`
+    /// (asynManager.c:1838), not a plain `queueRequest`; which half of it is
+    /// the port's class. Set only by [`Self::locking_port`].
+    pub lock_port: Option<LockPort>,
     /// Queue priority.
     pub priority: QueuePriority,
     /// Timestamp set by the driver.
@@ -225,6 +246,7 @@ impl Default for AsynUser {
             addr: -1,
             timeout: Some(DEFAULT_TIMEOUT),
             queue_timeout: None,
+            lock_port: None,
             priority: QueuePriority::default(),
             timestamp: None,
             alarm_status: 0,
@@ -276,7 +298,9 @@ impl AsynUser {
     /// producer of a [`ConnectCheck`], so the connected refusal is waived
     /// exactly where C waives it and the enabled refusal is waived nowhere.
     pub fn connect_check(&self, multi_device: bool) -> ConnectCheck {
-        if self.priority == QueuePriority::Connect {
+        if self.lock_port == Some(LockPort::Synchronous) {
+            ConnectCheck::SynchronousLock
+        } else if self.priority == QueuePriority::Connect {
             self.connect_check_at_connect_priority(multi_device)
         } else {
             ConnectCheck::Required
@@ -321,15 +345,23 @@ impl AsynUser {
         self
     }
 
-    /// C `queueLockPort`'s queue-wait deadline, which every SyncIO call queues
-    /// with (asynManager.c:1894-1896): the port's `queueLockPortTimeout`
-    /// (`port_timeout`, see `PortHandle::queue_lock_port_timeout`), or this
-    /// user's own timeout when longer. A queued SyncIO call fails at it
-    /// (`queueLockPortTimeoutCallback`, :972-990) instead of waiting out a
-    /// port that went down. A maximum of zero arms no timer, as in C.
-    pub fn locking_port(self, port_timeout: Duration) -> Self {
+    /// Mark this request as a SyncIO call's C `queueLockPort` on `port`.
+    ///
+    /// On a CANBLOCK port it queues with a deadline (asynManager.c:1894-1896):
+    /// the port's `queueLockPortTimeout` (see
+    /// `PortHandle::queue_lock_port_timeout`), or this user's own timeout when
+    /// longer. It fails at it (`queueLockPortTimeoutCallback`, :972-990)
+    /// instead of waiting out a port that went down; a maximum of zero arms no
+    /// timer, as in C. A synchronous port only takes `synchronousLock`
+    /// (:1913-1916), so there is no deadline.
+    pub fn locking_port(mut self, port: &crate::port_handle::PortHandle) -> Self {
+        if !port.can_block() {
+            self.lock_port = Some(LockPort::Synchronous);
+            return self;
+        }
         let timeout = self.timeout.unwrap_or_default();
-        self.with_queue_timeout(timeout.max(port_timeout))
+        self.lock_port = Some(LockPort::Queued);
+        self.with_queue_timeout(timeout.max(port.queue_lock_port_timeout()))
     }
 
     /// Ask for C's `queueRequest(pasynUser, priority, timeout)` queue-wait

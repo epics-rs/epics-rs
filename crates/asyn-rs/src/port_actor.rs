@@ -160,6 +160,9 @@ pub(crate) struct ActorMessage {
     pub reply: Option<oneshot::Sender<AsynResult<RequestResult>>>,
     pub seq: u64,
     pub priority: QueuePriority,
+    /// Where the message sorts ahead of `seq`. Set only by
+    /// [`PortActor::enqueue_message`], which knows the port.
+    rank: Rank,
     pub block_token: Option<u64>,
 }
 
@@ -185,7 +188,8 @@ impl ActorMessage {
         // `callbackSetOption` that asynRecord *escalates* to Connect by hand
         // (:566-569), and that escalation still arrives through
         // [`AsynUser::queue_even_if_not_connected`].
-        let priority = match PortActor::c_dispatch(&op) {
+        let dispatch = PortActor::c_dispatch(&op);
+        let priority = match dispatch {
             CDispatch::ConnectQueue => QueuePriority::Connect,
             CDispatch::Direct | CDispatch::Queued => user.priority,
         };
@@ -197,6 +201,7 @@ impl ActorMessage {
             reply: Some(reply),
             seq: next_seq(),
             priority,
+            rank: Rank::Arrival,
             block_token,
         }
     }
@@ -215,6 +220,7 @@ impl ActorMessage {
             reply: None,
             seq,
             priority: request.priority,
+            rank: Rank::Arrival,
             block_token: None,
             op: RequestOp::Cell(cell),
         }
@@ -296,6 +302,22 @@ impl Drop for FinishGuard {
 // timeout never reorders it relative to same-priority peers. An earlier
 // deadline-based tiebreaker let a later-submitted request with a shorter
 // timeout jump ahead of an earlier one, violating that FIFO.
+/// The heap key in front of `seq`.
+///
+/// A port without `ASYN_CANBLOCK` has no queue in C: `queueRequest` runs each
+/// request at once in the caller's thread under `synchronousLock`
+/// (asynManager.c:1555-1584), so arrival order is the only order — every
+/// message ranks [`Rank::Arrival`]. A CANBLOCK port drains its bands
+/// Connect first, and a [`CDispatch::Direct`] call (`lockPort` and the
+/// `pasynManager` getters) waits only for the request in progress
+/// (:1778-1808), so it ranks above every band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Arrival,
+    Band(QueuePriority),
+    Direct,
+}
+
 impl Eq for ActorMessage {}
 impl PartialEq for ActorMessage {
     fn eq(&self, other: &Self) -> bool {
@@ -304,8 +326,8 @@ impl PartialEq for ActorMessage {
 }
 impl Ord for ActorMessage {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
+        self.rank
+            .cmp(&other.rank)
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }
@@ -909,7 +931,7 @@ impl PortActor {
     /// prints one line and nothing else, driver included (:1040-1044) — its
     /// interfaces are gone. Disabled and disconnected are *not* such states: they
     /// report, as `enabled:No` / `connected:No`.
-    fn report_port(&self, details: i32) {
+    fn report_port(&mut self, details: i32) {
         use std::io::Write as _;
         let mut out = self.manager_report(details);
         // C ends by calling the port's `asynCommon->report` (:1115-1124) — the
@@ -1063,13 +1085,10 @@ impl PortActor {
     }
 
     /// The port's (or one device's) trace masks, as `reportPrintPort` prints them
-    /// (asynManager.c:1072-1074, :1101-1103). A port registered without a trace
-    /// manager has no masks to print, which is C's zero-initialised `dpCommon.trace`.
+    /// (asynManager.c:1072-1074, :1101-1103).
     fn trace_masks(&self, addr: Option<i32>) -> (u32, u32, u32) {
         let base = self.driver.base();
-        let Some(trace) = base.trace.as_ref() else {
-            return (0, 0, 0);
-        };
+        let trace = &base.trace;
         // `snapshot` is the single owner of C's `findTracePvt` fallback chain —
         // device, else port, else global (asynManager.c:548-553) — so the report
         // prints the masks the port actually traces with.
@@ -1129,7 +1148,10 @@ impl PortActor {
             // `asynPortDriver::lock()` (asynPortDriver.cpp:3858) is a mutex take
             // on the driver's own thread: no `queueRequest`, no connected or
             // enabled check. The actor's serial ownership is that mutex.
-            | RequestOp::WithDriver(_) => CDispatch::Direct,
+            | RequestOp::WithDriver(_)
+            // `lockPort` (asynManager.c:1778-1808) takes `synchronousLock` and
+            // nothing else; the defunct refusal is the dispatch arm's.
+            | RequestOp::LockPort(_) => CDispatch::Direct,
 
             // The caller's own callback, queued at the band it names.
             RequestOp::Cell(cell) if cell.connect_queue() => CDispatch::ConnectQueue,
@@ -1212,7 +1234,7 @@ impl PortActor {
         Self::c_dispatch(op) != CDispatch::Queued
     }
 
-    fn enqueue_message(&mut self, msg: ActorMessage) {
+    fn enqueue_message(&mut self, mut msg: ActorMessage) {
         // C `queueRequest` sets `pport->queueStateChange` and signals the port
         // thread (asynManager.c:1615, 1628) — the queue changed, so anything the
         // thread had skipped is looked at again.
@@ -1227,6 +1249,14 @@ impl PortActor {
         if Self::c_dispatch(&msg.op) != CDispatch::Direct {
             self.woken = true;
         }
+        // Ranked before a block can divert it: the release re-pushes it as is.
+        msg.rank = if !self.driver.base().flags.can_block {
+            Rank::Arrival
+        } else if Self::c_dispatch(&msg.op) == CDispatch::Direct {
+            Rank::Direct
+        } else {
+            Rank::Band(msg.priority)
+        };
         // C parity: lifecycle/state ops are not queued, so neither block
         // holder ever stalls them — only non-owner I/O is diverted.
         // Previously only UnblockProcess was exempt, so a non-owner's
@@ -1449,8 +1479,8 @@ impl PortActor {
     /// bumps.
     fn user_trace(&self) -> Option<crate::user::UserTrace> {
         let base = self.driver.base();
-        base.trace.as_ref().map(|manager| crate::user::UserTrace {
-            manager: manager.clone(),
+        Some(crate::user::UserTrace {
+            manager: base.trace.clone(),
             port: Arc::clone(&base.port_name),
         })
     }
@@ -1763,6 +1793,17 @@ impl PortActor {
                 // handles, etc.). Errors are tolerated — the port is
                 // already defunct and there is no recovery path.
                 let _ = self.driver.shutdown();
+                Ok(RequestResult::write_ok())
+            }
+            // A single-device port has no device dpCommon: C's
+            // `asynCommon->connect`/`disconnect` is the port's whatever the
+            // user's addr (drvAsynIPPort.c:611 closes the socket at any addr).
+            RequestOp::ConnectAddr if !self.driver.base().flags.multi_device => {
+                self.driver.connect(user)?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::DisconnectAddr if !self.driver.base().flags.multi_device => {
+                self.driver.disconnect(user)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::ConnectAddr => {
@@ -2194,6 +2235,36 @@ impl PortActor {
                     message: "driver call carries no closure".into(),
                 }),
             },
+            RequestOp::LockPort(call) => {
+                let port = self.driver.base().port_name.clone();
+                let trace = |actor: &Self, what: &str| {
+                    actor
+                        .driver
+                        .base()
+                        .trace_print(crate::trace::TraceMask::FLOW, format_args!("{port} {what}"));
+                };
+                // C `lockPort` traces before it looks (:1789), and refuses only
+                // a destroyed port (:1790-1795).
+                trace(self, "lockPort");
+                if self.driver.base().is_defunct() {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Disabled,
+                        message: "asynManager:lockPort: port has been shut down".into(),
+                    });
+                }
+                let result = match call.take() {
+                    Some(f) => {
+                        f(&mut ActorCalls(self));
+                        Ok(RequestResult::write_ok())
+                    }
+                    None => Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "port lock call carries no closure".into(),
+                    }),
+                };
+                trace(self, "unlockPort");
+                result
+            }
             RequestOp::SetInputEos { eos } => {
                 // C parity: asynRecord IEOS write at asynRecord.c:1964-1967
                 // calls `pasynOctet->setInputEos(pasynUser, eos, len)`.
@@ -2871,6 +2942,7 @@ mod tests {
                 reply: Some(reply),
                 seq,
                 priority: QueuePriority::Medium,
+                rank: Rank::Band(QueuePriority::Medium),
                 block_token: None,
             }
         };
@@ -2898,11 +2970,13 @@ mod tests {
             let (reply, _rx) = oneshot::channel();
             ActorMessage::new(op, user, CancelToken::new(), reply)
         };
-        let mut heap = BinaryHeap::new();
+        // Bands exist only on a CANBLOCK port.
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut actor = PortActor::new(Box::new(multi_device_driver(true)), rx);
 
         // A High scan stream already queued...
         for _ in 0..8 {
-            heap.push(mk(
+            actor.enqueue_message(mk(
                 RequestOp::Int32Read,
                 AsynUser::new(0).with_priority(QueuePriority::High),
             ));
@@ -2912,18 +2986,18 @@ mod tests {
         let connect_seq = {
             let m = mk(RequestOp::Connect, AsynUser::new(0).with_addr(-1));
             let seq = m.seq;
-            heap.push(m);
+            actor.enqueue_message(m);
             seq
         };
         // ...and more of the stream behind it.
         for _ in 0..8 {
-            heap.push(mk(
+            actor.enqueue_message(mk(
                 RequestOp::Int32Read,
                 AsynUser::new(0).with_priority(QueuePriority::High),
             ));
         }
 
-        let first = heap.pop().unwrap();
+        let first = actor.heap.pop().unwrap();
         assert_eq!(
             first.seq, connect_seq,
             "the connect must be drained before the High band"
@@ -2968,6 +3042,48 @@ mod tests {
         );
     }
 
+    /// On a CANBLOCK port C `lockPort` and the other direct calls never join
+    /// `queueRequest`'s bands, so they wait only for the request in progress:
+    /// a Direct op pops before any queued one, at any band, and Direct ops
+    /// keep FIFO order. On any other port C runs every request at once in the
+    /// caller's thread (asynManager.c:1555-1584): no bands, arrival order only.
+    #[test]
+    fn a_port_without_canblock_keeps_arrival_order() {
+        let mk = |op: RequestOp, priority: QueuePriority| {
+            let (reply, _rx) = oneshot::channel();
+            ActorMessage::new(
+                op,
+                AsynUser::new(0).with_priority(priority),
+                CancelToken::new(),
+                reply,
+            )
+        };
+        let order = |can_block: bool| {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            let mut actor = PortActor::new(Box::new(multi_device_driver(can_block)), rx);
+            let mut seqs = Vec::new();
+            for msg in [
+                mk(RequestOp::Int32Read, QueuePriority::High),
+                mk(RequestOp::Connect, QueuePriority::Medium),
+                mk(
+                    RequestOp::LockPort(crate::request::PortLockCall::spent()),
+                    QueuePriority::Low,
+                ),
+                mk(RequestOp::GetConnected, QueuePriority::Low),
+                mk(RequestOp::Int32Read, QueuePriority::High),
+            ] {
+                seqs.push(msg.seq);
+                actor.enqueue_message(msg);
+            }
+            let popped: Vec<usize> = std::iter::from_fn(|| actor.heap.pop())
+                .map(|m| seqs.iter().position(|&s| s == m.seq).unwrap())
+                .collect();
+            popped
+        };
+        assert_eq!(order(true), vec![2, 3, 1, 0, 4]);
+        assert_eq!(order(false), vec![0, 1, 2, 3, 4]);
+    }
+
     #[test]
     fn heap_pops_higher_priority_first() {
         // Priority dominates the seq FIFO tiebreaker.
@@ -2980,6 +3096,7 @@ mod tests {
                 reply: Some(reply),
                 seq,
                 priority,
+                rank: Rank::Band(priority),
                 block_token: None,
             }
         };
@@ -3126,7 +3243,7 @@ mod tests {
         let replies: Vec<_> = (0..3)
             .map(|_| send(&tx, RequestOp::Int32Read, AsynUser::new(0)))
             .collect();
-        // Same priority, so FIFO: its reply means the reads were dequeued.
+        // Not a CANBLOCK port, so FIFO: its reply means the reads were dequeued.
         send_and_wait(&tx, RequestOp::GetAutoConnect, AsynUser::new(0)).unwrap();
 
         // Only the first attempt fired; every later one fell inside the 2s
@@ -4748,7 +4865,7 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
-            fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {
+            fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {
                 self.reports
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -4882,7 +4999,7 @@ mod tests {
 
         // No octet interface → no EOS lines. C reads them off
         // `pasynStdInterfaces->octet.pinterface`, which such a port never set.
-        let int32_only = build(vec![Capability::Int32Read]);
+        let mut int32_only = build(vec![Capability::Int32Read]);
         let mut out = String::new();
         int32_only.report(&mut out, 1);
         assert!(out.starts_with("Port: drv_rep\n"), "{out}");
@@ -4910,7 +5027,7 @@ mod tests {
         assert_eq!(out0, "Port: drv_rep\n");
 
         // An octet port reports the terminators it actually has.
-        let octet = build(crate::interfaces::octet_transport_capabilities());
+        let mut octet = build(crate::interfaces::octet_transport_capabilities());
         let mut out = String::new();
         octet.report(&mut out, 1);
         assert!(
@@ -4919,7 +5036,7 @@ mod tests {
         );
 
         // details >= 3: one line per interrupt client, and none below 3.
-        let with_client = build(vec![Capability::Int32Read]);
+        let mut with_client = build(vec![Capability::Int32Read]);
         let (_sub, _rx) = with_client.0.interrupts.register_interrupt_user(
             InterruptFilter {
                 reason: Some(0),
@@ -4966,7 +5083,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_some() {
             let base = PortDriverBase::new("stdout_rep", 1, PortFlags::default());
             let (_tx, rx) = mpsc::unbounded_channel();
-            let actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
+            let mut actor = PortActor::new(Box::new(TestDriverBase(base)), rx);
             actor.report_port(0);
             return;
         }
@@ -5235,9 +5352,9 @@ mod tests {
         // Address 1 — a different dpCommon — is not gated by it. Probed
         // without blocking on the reply: under a port-wide holder this read
         // is diverted and never answers, and a test that waited on it would
-        // hang rather than fail. `GetEnable` behind it is the barrier — it is
-        // enqueued after this read and can only answer once the actor has
-        // dealt with it, so the receiver's state is settled by then.
+        // hang rather than fail. A second read on address 1 is the barrier —
+        // same band, so FIFO, it can only answer once the actor has dealt with
+        // the first. A direct call is no barrier: it jumps every band.
         let (other_tx, mut other_rx) = oneshot::channel();
         tx.send(ActorMessage::new(
             RequestOp::Int32Read,
@@ -5250,8 +5367,10 @@ mod tests {
         .unwrap();
         send_and_wait(
             &tx,
-            RequestOp::GetEnable,
-            AsynUser::new(0).with_timeout(Duration::from_secs(1)),
+            RequestOp::Int32Read,
+            AsynUser::new(0)
+                .with_addr(1)
+                .with_timeout(Duration::from_secs(1)),
         )
         .unwrap();
         assert_eq!(

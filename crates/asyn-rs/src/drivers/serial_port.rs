@@ -1032,6 +1032,19 @@ fn seed_termios(config: &SerialConfig) -> AsynResult<platform::termios> {
 }
 
 impl DrvAsynSerialPort {
+    /// C `readIt`/`writeIt` (drvAsynSerialPort.c:868-872, :779-783) ask the fd,
+    /// not the manager: the enabled/connected gate is `queueRequest`'s, and a
+    /// reader under `lockPort` never passes it.
+    fn require_fd(&self) -> AsynResult<()> {
+        if self.io.fd.is_some() {
+            return Ok(());
+        }
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{} disconnected:", self.device),
+        })
+    }
+
     /// Close the fd and mark the port disconnected so the actor's
     /// auto-reconnect re-opens it on the next request. C parity:
     /// `drvAsynSerialPort.c::closeConnection` (close, fd=-1,
@@ -1287,7 +1300,7 @@ impl PortDriver for DrvAsynSerialPort {
 
         self.base.set_connected(true);
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "connected to {} at {} baud",
@@ -1299,7 +1312,7 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "disconnect"
@@ -1320,7 +1333,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         use std::fmt::Write as _;
         // C parity (drvAsynSerialPort.c:666-680): report the connection state,
         // and at details>=1 the fd plus cumulative bytes written/read.
@@ -1338,9 +1351,6 @@ impl PortDriver for DrvAsynSerialPort {
             let _ = writeln!(out, "                    fd: {}", self.io.fd.unwrap_or(-1));
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
-            // The level is passed through, as C's `asynPortDriver::report`
-            // passes it to `reportParams` (asynPortDriver.cpp:3693).
-            self.base.report_params(out, level);
         }
     }
 
@@ -1358,7 +1368,7 @@ impl PortDriver for DrvAsynSerialPort {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        self.base.check_ready()?;
+        self.require_fd()?;
         let result = match self.io.read(user, buf) {
             Ok(r) => r,
             Err(e) => {
@@ -1368,7 +1378,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // SerialIoState::read, so an error reaching here is fatal.
                 if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
-                        Some(self.base.trace),
+                        self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
                         "read error, disconnecting: {e}"
@@ -1379,7 +1389,7 @@ impl PortDriver for DrvAsynSerialPort {
             }
         };
         asyn_trace_io!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             &buf[..result.nbytes_transferred],
@@ -1389,9 +1399,9 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.base.check_ready()?;
+        self.require_fd()?;
         asyn_trace_io!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
@@ -1405,7 +1415,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // ip_port DRV-5).
                 if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
-                        Some(self.base.trace),
+                        self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
                         "write error, disconnecting: {e}"
@@ -1911,6 +1921,27 @@ impl Drop for DrvAsynSerialPort {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    /// C `readIt`/`writeIt` answer a closed fd themselves, with asynError and
+    /// `"<device> disconnected:"`.
+    #[test]
+    fn a_transfer_with_no_fd_is_the_drivers_error() {
+        let mut drv = DrvAsynSerialPort::new("s_nofd", "/dev/ttyS0").unwrap();
+        let mut user = AsynUser::default();
+        let mut buf = [0u8; 8];
+        for err in [
+            drv.io_read_octet_eom(&user, &mut buf).unwrap_err(),
+            drv.write_octet(&mut user, b"x").unwrap_err(),
+        ] {
+            match err {
+                AsynError::Status { status, message } => {
+                    assert_eq!(status, AsynStatus::Error);
+                    assert_eq!(message, "/dev/ttyS0 disconnected:");
+                }
+                other => panic!("expected the driver's error, got {other:?}"),
+            }
+        }
+    }
 
     // --- Config parsing tests ---
 

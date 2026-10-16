@@ -106,6 +106,13 @@ impl LongStringVal {
         });
     }
 
+    /// devAsynOctet's `val[n] = 0` and `len = n + 1` over the `n` bytes a
+    /// read delivered, a NUL among them included (an asynPortDriver string
+    /// arrives with its own, so LEN is `strlen + 2`).
+    pub fn set_read(&mut self, bytes: &[u8]) {
+        self.write_text(bytes);
+    }
+
     /// `devEnviron.c::read_lsi`'s `strncpy` and `len = strlen`: the one
     /// writer whose LEN leaves the NUL out.
     pub fn set_text_strlen(&mut self, text: &[u8]) {

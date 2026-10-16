@@ -117,6 +117,7 @@ impl From<&RequestOp> for PortCommand {
             },
             RequestOp::Report { level } => Self::Report { level: *level },
             RequestOp::WithDriver(_) => Self::WithDriver,
+            RequestOp::LockPort(_) => Self::LockPort,
             RequestOp::Cell(cell) => Self::Callback {
                 connect_queue: cell.connect_queue(),
             },
@@ -263,6 +264,7 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::Report { level } => Self::Report { level: *level },
             PortCommand::WithDriver => Self::WithDriver(crate::request::DriverCall::spent()),
             PortCommand::Callback { .. } => Self::WithDriver(crate::request::DriverCall::spent()),
+            PortCommand::LockPort => Self::LockPort(crate::request::PortLockCall::spent()),
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             PortCommand::SetTimeStampSource { name } => {

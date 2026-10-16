@@ -4920,19 +4920,19 @@ impl Record for AsynRecord {
             // C sets the trace and leaves the other half of the mask/bit pair to
             // the `monitorStatus` the setter's exception runs (:409-448).
             "TMSK" => {
-                self.apply_trace_mask(TraceMask::from_bits_truncate(self.tmsk as u32));
+                self.apply_trace_mask(TraceMask::from_bits_retain(self.tmsk as u32));
             }
             "TB0" | "TB1" | "TB2" | "TB3" | "TB4" | "TB5" => {
                 self.apply_trace_mask(self.trace_mask_of_bits());
             }
             "TIOM" => {
-                self.apply_trace_io_mask(TraceIoMask::from_bits_truncate(self.tiom as u32));
+                self.apply_trace_io_mask(TraceIoMask::from_bits_retain(self.tiom as u32));
             }
             "TIB0" | "TIB1" | "TIB2" => {
                 self.apply_trace_io_mask(self.io_mask_of_bits());
             }
             "TINM" => {
-                self.apply_trace_info_mask(TraceInfoMask::from_bits_truncate(self.tinm as u32));
+                self.apply_trace_info_mask(TraceInfoMask::from_bits_retain(self.tinm as u32));
             }
             "TINB0" | "TINB1" | "TINB2" | "TINB3" => {
                 self.apply_trace_info_mask(self.info_mask_of_bits());
@@ -9165,7 +9165,13 @@ mod tests {
             let (entered_tx, entered) = mpsc::sync_channel(1);
             let (release, release_rx) = mpsc::channel();
             let line_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            // Parking on a dropped line is the port thread's (:808-810), which
+            // only a CANBLOCK port has.
+            let flags = PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            };
+            let mut base = PortDriverBase::new(name, 1, flags);
             base.seconds_between_port_connect = Duration::from_millis(20);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = PortActor::new(
@@ -9181,13 +9187,14 @@ mod tests {
             // The production loop: the test loop runs no connect-retry timer.
             let (shutdown, shutdown_rx) = tokio::sync::mpsc::channel(1);
             std::thread::spawn(move || actor.run_with_shutdown(shutdown_rx));
-            let handle = PortHandle::new(
+            let mut handle = PortHandle::new(
                 tx,
                 name.into(),
                 Arc::new(InterruptManager::new()),
                 link,
                 Arc::new(TraceManager::new()),
             );
+            handle.set_can_block(true);
 
             let jammer = handle.clone();
             let jam = std::thread::spawn(move || {
@@ -12622,6 +12629,66 @@ A.OEOS
             rec.status_dirty.load(Ordering::Acquire),
             "a foreign exception still reaches the callback"
         );
+    }
+
+    /// C TMSK is an int (asynRecord.c:410), so a driver-defined bit such as
+    /// twincat's ASYN_TRACE_INFO 0x40 reaches the port and reads back.
+    #[test]
+    fn a_trace_mask_write_keeps_every_bit() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct PlainDriver(PortDriverBase);
+        impl PortDriver for PlainDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_tmsk_driver_bit";
+        let trace = Arc::new(TraceManager::new());
+        let base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            trace.clone(),
+        );
+        register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.tmod = TransferMode::NoIo as i32;
+        let _ = rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+
+        rec.tmsk = 0x41;
+        rec.special("TMSK", true).unwrap();
+        assert_eq!(trace.get_trace_mask(Some(port_name)).bits(), 0x41);
+        rec.read_trace_state();
+        assert_eq!(rec.tmsk, 0x41);
+        assert_eq!(rec.tb0, 1);
+
+        // TIOM and TINM are ints too (asynManager.c:2828, :2870).
+        rec.tiom = 0x9;
+        rec.special("TIOM", true).unwrap();
+        rec.tinm = 0x11;
+        rec.special("TINM", true).unwrap();
+        let snap = trace.snapshot(Some(port_name), None);
+        assert_eq!(snap.io_mask.bits(), 0x9);
+        assert_eq!(snap.info_mask.bits(), 0x11);
+        rec.read_trace_state();
+        assert_eq!((rec.tiom, rec.tinm), (0x9, 0x11));
     }
 
     /// C `connectDevice`'s `bad:` tail removes the exception callback

@@ -3,10 +3,10 @@
 //! [`PortHandle`] is a lightweight, cloneable handle that sends requests to the
 //! actor via an mpsc channel and receives replies via oneshot channels.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked, not waived — all 8 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(9): checked, not waived — all 9 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// --all-features`, 1266/1266). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -30,7 +30,7 @@ use crate::interrupt::InterruptManager;
 use crate::port::QueueGate;
 use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorLink, ActorMessage};
-use crate::request::{CancelToken, DriverCall, PortCalls, RequestOp, RequestResult};
+use crate::request::{CancelToken, DriverCall, PortCalls, PortLockCall, RequestOp, RequestResult};
 use crate::trace::TraceManager;
 use crate::user::{AsynUser, QueueDeadline};
 
@@ -59,8 +59,13 @@ use crate::user::{AsynUser, QueueDeadline};
 /// oneshot receive), which are documented as runtime-agnostic: polling them
 /// needs no reactor and no timer, so a bare parking executor is both sufficient
 /// and incapable of panicking on a runtime-flavour check.
+///
+/// The future runs outside the enclosing tokio task's coop budget. Inside a
+/// task, a `tokio::sync` poll past the budget returns `Pending` and hands its
+/// waker to the scheduler, and the scheduler never runs while this thread is
+/// parked, so the wait would never end.
 fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
-    let mut fut = pin!(fut);
+    let mut fut = pin!(tokio::task::unconstrained(fut));
     let drive = crate::runtime::task::ThreadDrive::enter();
     let mut cx = Context::from_waker(drive.waker());
     loop {
@@ -539,11 +544,20 @@ impl PortHandle {
         user: AsynUser,
         cancel: CancelToken,
     ) -> AsynResult<RequestResult> {
-        crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
-        let queue_timeout = user.queue_timeout;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.send(ActorMessage::new(op, user, cancel.clone(), reply_tx))?;
-        self.await_reply(reply_rx, cancel, queue_timeout).await
+        let lock_port = user.lock_port == Some(crate::user::LockPort::Queued);
+        let result = async {
+            crate::port_actor::queue_request_gate(&self.gate, &op, &user, self.multi_device)?;
+            let queue_timeout = user.queue_timeout;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.send(ActorMessage::new(op, user, cancel.clone(), reply_tx))?;
+            self.await_reply(reply_rx, cancel, queue_timeout).await
+        }
+        .await;
+        if lock_port {
+            result.map_err(AsynError::through_queue_lock_port)
+        } else {
+            result
+        }
     }
 
     /// Wait for the actor's reply, honouring the request's queue-wait deadline —
@@ -689,9 +703,7 @@ impl PortHandle {
         data: &[u8],
         buf_size: usize,
     ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
-        let user = AsynUser::new(reason)
-            .with_addr(addr)
-            .locking_port(self.queue_lock_port_timeout());
+        let user = AsynUser::new(reason).with_addr(addr).locking_port(self);
         let result = self
             .submit_async(
                 RequestOp::OctetWriteRead {
@@ -1072,6 +1084,32 @@ impl PortHandle {
         stamp.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("port {}: the timestamp update did not run", self.port_name),
+        })
+    }
+
+    /// C `pasynManager->lockPort` … `unlockPort`: run `f` on the actor, where
+    /// each [`PortCalls::call`] goes straight to the port's interfaces (through
+    /// its interpose stack) with no queue gate and no autoconnect — so a read on
+    /// a down link returns the driver's own error, as a C driver thread's
+    /// `pasynOctet->read` between the two does. Several calls in one `f` run with
+    /// nothing in between. A shut-down port refuses with C's `asynDisabled`.
+    pub fn lock_port_blocking<R>(
+        &self,
+        f: impl FnOnce(&mut dyn PortCalls) -> R + Send + 'static,
+    ) -> AsynResult<R>
+    where
+        R: Send + 'static,
+    {
+        let result = Arc::new(Mutex::new(None));
+        let slot = result.clone();
+        let call = PortLockCall::new(move |calls| {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f(calls));
+        });
+        self.submit_blocking(RequestOp::LockPort(call), AsynUser::default())?;
+        let value = result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        value.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("port {}: port lock call did not run", self.port_name),
         })
     }
 
@@ -1904,6 +1942,109 @@ mod tests {
         assert!(handle.submit_blocking(op, AsynUser::default()).is_err());
     }
 
+    /// C `lockPort` boundaries: a down link answers a locked read with the
+    /// driver's own error and no connect attempt, a live one serves several
+    /// calls in one hold, and a shut-down port refuses (asynManager.c:1778-1808).
+    #[test]
+    fn lock_port_reads_past_the_connect_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Line {
+            base: PortDriverBase,
+            connects: Arc<AtomicUsize>,
+        }
+        impl PortDriver for Line {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "line down".into(),
+                })
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                if !self.base.is_connected() {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "disconnected:".into(),
+                    });
+                }
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let read = |calls: &mut dyn PortCalls| {
+            calls.call(&RequestOp::OctetRead { buf_size: 4 }, AsynUser::new(0))
+        };
+        let connects = Arc::new(AtomicUsize::new(0));
+        let flags = PortFlags {
+            destructible: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("lock_port", 1, flags);
+        base.set_connected(false);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let trace_path = dir.path().join("lock_port_trace.txt");
+        base.trace
+            .set_trace_mask(Some("lock_port"), crate::trace::TraceMask::FLOW);
+        base.trace.set_trace_file(
+            Some("lock_port"),
+            crate::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&trace_path).unwrap(),
+            ))),
+        );
+        let handle = make_handle(Line {
+            base,
+            connects: connects.clone(),
+        });
+
+        // Down: the driver's error, not the gate's asynDisconnected.
+        match handle.lock_port_blocking(read).unwrap() {
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Error);
+                assert_eq!(message, "disconnected:");
+            }
+            other => panic!("expected the driver's error, got {other:?}"),
+        }
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            0,
+            "lockPort never autoconnects"
+        );
+
+        // Up: two reads in one hold.
+        handle
+            .with_driver_blocking(|d: &mut Line| d.base.set_connected(true))
+            .unwrap();
+        let (a, b) = handle
+            .lock_port_blocking(move |calls| (read(calls), read(calls)))
+            .unwrap();
+        assert_eq!(a.unwrap().data.as_deref(), Some(&b"x"[..]));
+        assert_eq!(b.unwrap().data.as_deref(), Some(&b"x"[..]));
+        // asynManager.c:1789/:1817, one pair per hold.
+        let trace = std::fs::read_to_string(&trace_path).unwrap();
+        assert_eq!(trace.matches("lock_port lockPort\n").count(), 2);
+        assert_eq!(trace.matches("lock_port unlockPort\n").count(), 2);
+
+        // Shut down: C's asynDisabled.
+        handle
+            .submit_blocking(RequestOp::ShutdownPort, AsynUser::default())
+            .unwrap();
+        match handle.lock_port_blocking(|_| ()) {
+            Err(AsynError::Status { status, message }) => {
+                assert_eq!(status, AsynStatus::Disabled);
+                assert_eq!(message, "asynManager:lockPort: port has been shut down");
+            }
+            other => panic!("expected the shutdown refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn handle_blocking_int32() {
         let handle = make_handle(TestDriver::new());
@@ -1928,6 +2069,36 @@ mod tests {
         handle.call_param_callbacks_blocking(0).unwrap();
         // Enqueue-only path: previously refused outright inside any runtime.
         handle.set_params_and_notify_blocking(0, vec![]).unwrap();
+    }
+
+    /// A driver task makes many blocking requests without ever yielding to its
+    /// runtime. Past tokio's per-task coop budget (128) the reply wait parked
+    /// forever: the exhausted budget hands the waker to the scheduler, which
+    /// never runs again because this task is parked.
+    #[test]
+    fn blocking_requests_outlast_the_tasks_coop_budget() {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let handle = make_handle(TestDriver::new());
+                for i in 0..300 {
+                    handle.write_int32_blocking(0, 0, i).unwrap();
+                    let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+                    let read = handle
+                        .try_submit(RequestOp::Int32Read, user)
+                        .unwrap()
+                        .wait_blocking(Duration::from_secs(1))
+                        .unwrap();
+                    assert_eq!(read.int_val, Some(i));
+                }
+            });
+            done_tx.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(10))
+            .expect("a blocking request past the coop budget never completed");
     }
 
     /// The multi-threaded path (device support under `#[epics_main]`) keeps
@@ -2302,6 +2473,141 @@ mod tests {
         (handle, reads)
     }
 
+    /// [`slow_port`] with `ASYN_CANBLOCK`, where a SyncIO call queues.
+    fn blocking_slow_port(delay: Duration) -> (PortHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut handle = make_handle(SlowDriver {
+            base: PortDriverBase::new("handle_test", 1, flags),
+            delay,
+            reads: reads.clone(),
+        });
+        handle.set_can_block(true);
+        (handle, reads)
+    }
+
+    /// A SyncIO call on a CANBLOCK port is C `queueLockPort`'s queued half
+    /// (asynManager.c:1858-1912), which answers its caller in its own words:
+    /// the `queueRequest` refusal behind its prefix, the queue deadline as
+    /// `asynTimeout`, and a disabled port with the bare refusal it makes itself
+    /// before queueing.
+    #[test]
+    fn a_syncio_call_that_never_ran_reports_as_queue_lock_port() {
+        let sync = |handle: &PortHandle| {
+            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10))
+                .read_int32(0)
+                .expect_err("the call never ran")
+        };
+
+        // Not connected, no autoconnect: queueRequest refuses.
+        let flags = PortFlags {
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("qlp", 1, flags);
+        base.init_connected(false);
+        base.init_auto_connect(false);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handle = make_handle(SlowDriver {
+            base,
+            delay: Duration::ZERO,
+            reads: reads.clone(),
+        });
+        handle.set_can_block(true);
+        let err = sync(&handle);
+        assert_eq!(err.status(), AsynStatus::Disconnected);
+        assert_eq!(
+            err.message(),
+            "asynManager::queueLockPort queueRequest failed: port qlp not connected"
+        );
+        assert!(err.never_ran());
+        // A plain queueRequest keeps the bare text.
+        let plain = handle
+            .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+            .expect_err("refused");
+        assert_eq!(plain.message(), "port qlp not connected");
+
+        // Disabled: queueLockPort's own refusal, unprefixed.
+        handle
+            .submit_blocking(RequestOp::SetEnable { yes: false }, AsynUser::default())
+            .unwrap();
+        let err = sync(&handle);
+        assert_eq!(err.status(), AsynStatus::Disabled);
+        assert_eq!(err.message(), "port qlp disabled");
+
+        // The queue deadline: asynTimeout, never ran.
+        let (handle, reads) = blocking_slow_port(Duration::from_millis(300));
+        handle.set_queue_lock_port_timeout(Duration::from_millis(10));
+        let jammer = handle.clone();
+        let jam = std::thread::spawn(move || {
+            jammer
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let err = sync(&handle);
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        assert_eq!(
+            err.message(),
+            "asynManager::queueLockPort queueRequest timed out"
+        );
+        assert!(err.is_queue_timeout());
+        jam.join().unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// C `queueLockPort` on a synchronous port refuses only a disabled port
+    /// (asynManager.c:1851-1856) and then takes `synchronousLock`: a SyncIO
+    /// call on a port that is down still reaches the driver.
+    #[test]
+    fn a_syncio_call_on_a_synchronous_port_skips_the_connect_gate() {
+        let mut base = PortDriverBase::new("qlp", 1, PortFlags::default());
+        base.init_connected(false);
+        base.init_auto_connect(false);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = make_handle(SlowDriver {
+            base,
+            delay: Duration::ZERO,
+            reads: reads.clone(),
+        });
+        let syncio =
+            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        assert_eq!(syncio.read_int32(0).unwrap(), 7);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        handle
+            .submit_blocking(RequestOp::SetEnable { yes: false }, AsynUser::default())
+            .unwrap();
+        let err = syncio.read_int32(0).expect_err("disabled");
+        assert_eq!(err.status(), AsynStatus::Disabled);
+        assert_eq!(err.message(), "port qlp disabled");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// On a synchronous port C `queueLockPort` only takes `synchronousLock`
+    /// (asynManager.c:1913-1916): no queue deadline, so a SyncIO call behind
+    /// a long request waits it out instead of timing out.
+    #[test]
+    fn a_syncio_call_on_a_synchronous_port_has_no_queue_deadline() {
+        let (handle, _reads) = slow_port(Duration::from_millis(300));
+        handle.set_queue_lock_port_timeout(Duration::from_millis(10));
+        let syncio =
+            crate::sync_io::SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_millis(10));
+        assert_eq!(syncio.user(0).queue_timeout(), None);
+        let jammer = handle.clone();
+        let jam = std::thread::spawn(move || {
+            jammer
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(syncio.read_int32(0).unwrap(), 7);
+        jam.join().unwrap();
+    }
+
     /// R10-49. C `queueRequest(pasynUser, priority, timeout)` arms a timer
     /// (asynManager.c:1619-1625) whose callback unlinks a still-queued request
     /// (:649-703) and runs the caller's `timeoutUser` **instead of** its
@@ -2402,7 +2708,7 @@ mod tests {
         user_timeout: Duration,
         jam: Duration,
     ) -> (AsynResult<i32>, Duration) {
-        let (handle, _reads) = slow_port(jam);
+        let (handle, _reads) = blocking_slow_port(jam);
         handle.set_queue_lock_port_timeout(port_floor);
         let jammer = handle.clone();
         let jam = std::thread::spawn(move || {

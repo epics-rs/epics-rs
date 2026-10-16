@@ -436,7 +436,8 @@ async fn test_octet_write_read() {
         .await
         .unwrap();
     let data = h.read_octet(reason, 0, 64).await.unwrap();
-    assert_eq!(String::from_utf8_lossy(&data), "Hello, EPICS!");
+    // C asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
+    assert_eq!(data, b"Hello, EPICS!\0");
 }
 
 #[tokio::test]
@@ -449,7 +450,7 @@ async fn test_octet_overwrite() {
     h.write_octet(reason, 0, b"first".to_vec()).await.unwrap();
     h.write_octet(reason, 0, b"second".to_vec()).await.unwrap();
     let data = h.read_octet(reason, 0, 64).await.unwrap();
-    assert_eq!(String::from_utf8_lossy(&data), "second");
+    assert_eq!(data, b"second\0");
 }
 
 // ============================================================

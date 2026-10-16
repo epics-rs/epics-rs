@@ -189,6 +189,17 @@ pub struct InterruptValue {
     pub iface: Option<InterfaceType>,
 }
 
+impl InterruptValue {
+    /// Whether C counts a NUL past an octet value's bytes: a
+    /// `call_param_callbacks` value (`iface` None) goes as
+    /// `paramList::octetCallback` sends it, `strlen(value) + 1`
+    /// (asynPortDriver.cpp:817); a typed fire — an octet read fan-out, a
+    /// driver poller — is its own count.
+    pub fn octet_counts_nul(&self) -> bool {
+        self.iface.is_none()
+    }
+}
+
 impl Default for InterruptValue {
     fn default() -> Self {
         Self {

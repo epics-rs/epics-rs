@@ -143,6 +143,12 @@ pub enum AsynError {
     #[error("queueRequest timeout on port {port}")]
     QueueTimeout { port: String },
 
+    /// [`AsynError::QueueTimeout`] for a SyncIO call: C `queueLockPort` turns
+    /// its queue deadline into `asynTimeout` with its own text
+    /// (asynManager.c:1907-1912), which the SyncIO caller prints.
+    #[error("asynManager::queueLockPort queueRequest timed out")]
+    QueueLockPortTimeout { port: String },
+
     /// The port's queue gate refused the request, so it was **never queued and
     /// never ran** — C's `queueRequest` returning `asynDisabled` /
     /// `asynDisconnected` (asynManager.c:1543-1554).
@@ -272,6 +278,7 @@ impl AsynError {
             | AsynError::PartialWrite { source, .. }
             | AsynError::OctetStep { source, .. }
             | AsynError::ParamAccess { source, .. } => source.status(),
+            AsynError::QueueLockPortTimeout { .. } => AsynStatus::Timeout,
             _ => AsynStatus::Error,
         }
     }
@@ -299,6 +306,24 @@ impl AsynError {
     pub(crate) fn into_queue_refusal(self) -> AsynError {
         match self {
             AsynError::Status { status, message } => AsynError::QueueRefused { status, message },
+            other => other,
+        }
+    }
+
+    /// A never-ran outcome as C `queueLockPort` reports it to its SyncIO
+    /// caller (asynManager.c:1897-1912): a `queueRequest` refusal behind
+    /// "asynManager::queueLockPort queueRequest failed: ", the queue deadline
+    /// as `asynTimeout`. A disabled port keeps its bare text, because
+    /// `queueLockPort` refuses it itself before queueing (:1851-1856).
+    pub(crate) fn through_queue_lock_port(self) -> AsynError {
+        match self {
+            AsynError::QueueRefused { status, message } if status != AsynStatus::Disabled => {
+                AsynError::QueueRefused {
+                    status,
+                    message: format!("asynManager::queueLockPort queueRequest failed: {message}"),
+                }
+            }
+            AsynError::QueueTimeout { port } => AsynError::QueueLockPortTimeout { port },
             other => other,
         }
     }
@@ -345,7 +370,7 @@ impl AsynError {
     /// implies (asynRecord's `setOption` → `getOptions` fall-through) may run.
     pub fn is_queue_timeout(&self) -> bool {
         match self {
-            AsynError::QueueTimeout { .. } => true,
+            AsynError::QueueTimeout { .. } | AsynError::QueueLockPortTimeout { .. } => true,
             AsynError::PartialRead { source, .. }
             | AsynError::PartialWrite { source, .. }
             | AsynError::OctetStep { source, .. } => source.is_queue_timeout(),

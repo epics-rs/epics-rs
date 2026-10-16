@@ -1114,10 +1114,11 @@ mod tests {
         port.set_params_and_notify(0, batch)
             .await
             .expect("the store takes the batch");
+        // asynPortDriver::readOctet counts the NUL: `strlen(value) + 1`.
         let got = port.read_octet(reason, 0, 32).await.expect("octet read");
         assert_eq!(
             got.as_slice(),
-            b"\xff\xfe",
+            b"\xff\xfe\0",
             "the record must read the raw bytes, not U+FFFD and not nothing"
         );
 
@@ -1126,7 +1127,7 @@ mod tests {
             decode_for_subscribers(b"hello", &subscribers, &bound, "sensor/raw", &mut |_| {});
         port.set_params_and_notify(0, batch).await.unwrap();
         let got = port.read_octet(reason, 0, 32).await.unwrap();
-        assert_eq!(got.as_slice(), b"hello");
+        assert_eq!(got.as_slice(), b"hello\0");
 
         rt.shutdown();
     }

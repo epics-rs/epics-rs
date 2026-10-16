@@ -23,8 +23,9 @@ bitflags! {
     ///   ASYN_TRACE_FLOW      0x0010
     ///   ASYN_TRACE_WARNING   0x0020
     /// ```
-    /// C asyn defines exactly these 6 bits — no `ASYN_TRACE_STATE`
-    /// or any other bit is referenced anywhere in the C source.
+    /// The C mask is a plain `int`, and drivers define bits of their own
+    /// (`ASYN_TRACE_INFO 0x0040` in twincat and motorNewport), so every bit
+    /// is kept, not only the six named ones.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TraceMask: u32 {
         const ERROR      = 0x0001;
@@ -33,6 +34,7 @@ bitflags! {
         const IO_DRIVER  = 0x0008;
         const FLOW       = 0x0010;
         const WARNING    = 0x0020;
+        const _ = !0;
     }
 }
 
@@ -63,7 +65,7 @@ impl TraceMask {
                 continue;
             }
             if let Some(n) = parse_numeric(tok) {
-                mask |= TraceMask::from_bits_truncate(n);
+                mask |= TraceMask::from_bits_retain(n);
                 continue;
             }
             let normalized = strip_c_prefixes(tok, &["TRACE_", "TRACEIO_"]);
@@ -99,7 +101,7 @@ impl TraceIoMask {
                 continue;
             }
             if let Some(n) = parse_numeric(tok) {
-                mask |= TraceIoMask::from_bits_truncate(n);
+                mask |= TraceIoMask::from_bits_retain(n);
                 continue;
             }
             let normalized = strip_c_prefixes(tok, &["TRACEIO_"]);
@@ -134,7 +136,7 @@ impl TraceInfoMask {
                 continue;
             }
             if let Some(n) = parse_numeric(tok) {
-                mask |= TraceInfoMask::from_bits_truncate(n);
+                mask |= TraceInfoMask::from_bits_retain(n);
                 continue;
             }
             let normalized = strip_c_prefixes(tok, &["TRACEINFO_"]);
@@ -205,6 +207,8 @@ bitflags! {
         const ASCII  = 0x0001;
         const ESCAPE = 0x0002;
         const HEX    = 0x0004;
+        // C stores whatever int it is given (asynManager.c:2828).
+        const _ = !0;
     }
 }
 
@@ -221,6 +225,8 @@ bitflags! {
         const PORT   = 0x0002;
         const SOURCE = 0x0004;
         const THREAD = 0x0008;
+        // C stores whatever int it is given (asynManager.c:2870).
+        const _ = !0;
     }
 }
 
@@ -1529,6 +1535,40 @@ mod tests {
     /// test fences that we don't accidentally re-introduce extra
     /// bits — `grep -rn "ASYN_TRACE_STATE" $EPICS_MODULES/asyn`
     /// returns 0 hits, so any additional bit would be invented.
+    #[test]
+    fn test_driver_defined_bits_survive() {
+        // asynSetTraceMask takes any int; twincat's ASYN_TRACE_INFO is 0x40.
+        let info = TraceMask::from_bits_retain(0x40);
+        let m = TraceMask::from_symbolic("0x41").unwrap();
+        assert_eq!(m.bits(), 0x41);
+        assert_eq!(TraceMask::from_bits_truncate(0x41).bits(), 0x41);
+
+        let mgr = TraceManager::new();
+        mgr.set_trace_mask(Some("p"), m);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_info_bit.txt");
+        let file = std::fs::File::create(&temp).unwrap();
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
+        mgr.print(Some("p"), None, 0, info, format_args!("info line"));
+        assert!(
+            std::fs::read_to_string(&temp)
+                .unwrap()
+                .contains("info line")
+        );
+    }
+
+    #[test]
+    fn test_io_and_info_masks_keep_every_bit() {
+        assert_eq!(TraceIoMask::from_symbolic("0x9").unwrap().bits(), 0x9);
+        assert_eq!(TraceInfoMask::from_symbolic("0x11").unwrap().bits(), 0x11);
+        let mgr = TraceManager::new();
+        mgr.set_trace_io_mask(Some("p"), TraceIoMask::from_bits_retain(0x9));
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::from_bits_retain(0x11));
+        let snap = mgr.snapshot(Some("p"), None);
+        assert_eq!(snap.io_mask.bits(), 0x9);
+        assert_eq!(snap.info_mask.bits(), 0x11);
+    }
+
     #[test]
     fn test_six_bits_match_c_asyn_header() {
         assert_eq!(TraceMask::ERROR.bits(), 0x0001);

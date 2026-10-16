@@ -580,6 +580,39 @@ pub(super) fn write_with_retry(
 
 struct IpIoState {
     inner: Option<IpIoInner>,
+    /// C `tty->nRead` / `tty->nWritten`: bytes the socket moved since the last
+    /// `parseHostInfo`, the only place C zeroes them (:287-288).
+    n_read: u64,
+    n_written: u64,
+}
+
+impl IpIoState {
+    fn new() -> Self {
+        Self {
+            inner: None,
+            n_read: 0,
+            n_written: 0,
+        }
+    }
+
+    /// C `tty->fd` as `asynCommonReport` prints it: `INVALID_SOCKET` reads -1.
+    fn fd(&self) -> i64 {
+        #[cfg(unix)]
+        fn raw(s: &impl std::os::fd::AsRawFd) -> i64 {
+            i64::from(s.as_raw_fd())
+        }
+        #[cfg(windows)]
+        fn raw(s: &impl std::os::windows::io::AsRawSocket) -> i64 {
+            s.as_raw_socket() as i64
+        }
+        match &self.inner {
+            None => -1,
+            Some(IpIoInner::Tcp(stream)) => raw(stream),
+            Some(IpIoInner::Udp(socket, _)) => raw(socket),
+            #[cfg(asyn_af_unix)]
+            Some(IpIoInner::Unix(stream)) => raw(stream),
+        }
+    }
 }
 
 impl IpIoInner {
@@ -609,8 +642,8 @@ impl IpIoInner {
     }
 }
 
-impl OctetNext for IpIoState {
-    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+impl IpIoState {
+    fn recv(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
         let inner = self.inner.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
@@ -716,7 +749,7 @@ impl OctetNext for IpIoState {
         }
     }
 
-    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn send(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let inner = self.inner.as_mut().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
@@ -771,6 +804,27 @@ impl OctetNext for IpIoState {
             #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => write_with_retry(stream, data, poll, None),
         }
+    }
+}
+
+impl OctetNext for IpIoState {
+    fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
+        let result = self.recv(user, buf);
+        if let Ok(r) = &result {
+            self.n_read += r.nbytes_transferred as u64;
+        }
+        result
+    }
+
+    fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let result = self.send(user, data);
+        // C counts each partial `send` as it goes (:728), so a write that
+        // fails part-way still counts what left.
+        self.n_written += match &result {
+            Ok(n) => *n,
+            Err(e) => e.partial_write().unwrap_or(0),
+        } as u64;
+        result
     }
 
     /// Base-layer flush — C parity with `drvAsynIPPort.c::flushIt`,
@@ -1343,12 +1397,12 @@ impl DrvAsynIPPort {
         if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
             self.connect(&AsynUser::default())?;
         }
-        self.base.check_ready()?;
+        self.require_socket("disconnected:")?;
         let result = self.with_base_link(|link| link.read(user, buf));
         match result {
             Ok(r) => {
                 asyn_trace_io!(
-                    Some(self.base.trace),
+                    self.base.trace,
                     &self.base.port_name,
                     TraceMask::IO_DRIVER,
                     &buf[..r.nbytes_transferred],
@@ -1393,7 +1447,7 @@ impl DrvAsynIPPort {
                 );
                 if failure.disconnect && self.base.is_connected() {
                     asyn_trace!(
-                        Some(self.base.trace),
+                        self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
                         "read error, disconnecting: {}",
@@ -1440,7 +1494,7 @@ impl DrvAsynIPPort {
         Ok(Self {
             base,
             config,
-            io: IpIoState { inner: None },
+            io: IpIoState::new(),
             disconnect_on_read_timeout: false,
             // C parseHostInfo: tty->IPDeviceName = epicsStrDup(hostInfo).
             host_info: config_str.to_string(),
@@ -1480,6 +1534,19 @@ impl DrvAsynIPPort {
     /// beneath every stack layer by construction (see [`ComState::octet`]). Every
     /// octet path goes through here, so read, write and flush cannot disagree
     /// about where the chain ends.
+    /// C `readIt`/`writeIt` (drvAsynIPPort.c:776-785, :645-657) ask the socket,
+    /// not the manager: the enabled/connected gate is `queueRequest`'s, and a
+    /// reader under `lockPort` never passes it. `what` is the suffix each uses.
+    fn require_socket(&self, what: &str) -> AsynResult<()> {
+        if self.io.inner.is_some() {
+            return Ok(());
+        }
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("{} {what}", self.host_info),
+        })
+    }
+
     fn with_base_link<T>(&mut self, f: impl FnOnce(&mut dyn OctetNext) -> T) -> T {
         match self.com.as_mut() {
             Some(com) => {
@@ -1537,7 +1604,7 @@ impl DrvAsynIPPort {
             return;
         };
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::ERROR,
             "Unable to restore parameters for port {}: {}",
@@ -1821,7 +1888,7 @@ impl PortDriver for DrvAsynIPPort {
         };
         self.publish_transport(inner)?;
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "connected to {}:{} ({:?})",
@@ -1838,7 +1905,7 @@ impl PortDriver for DrvAsynIPPort {
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         asyn_trace!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
             "disconnect"
@@ -1846,6 +1913,26 @@ impl PortDriver for DrvAsynIPPort {
         self.io.inner = None;
         self.base.set_connected(false);
         Ok(())
+    }
+
+    /// C `asynCommonReport` (drvAsynIPPort.c:223-239): nothing at details 0 —
+    /// the IP port is no `asynPortDriver`, so it has no name line or parameter
+    /// list — and "connected" is whether a socket is open.
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        use std::fmt::Write as _;
+        if level >= 1 {
+            let _ = writeln!(
+                out,
+                "    Port {}: {}onnected",
+                self.host_info,
+                if self.io.inner.is_some() { "C" } else { "Disc" }
+            );
+        }
+        if level >= 2 {
+            let _ = writeln!(out, "                    fd: {}", self.io.fd());
+            let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
+            let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
+        }
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
@@ -1875,9 +1962,9 @@ impl PortDriver for DrvAsynIPPort {
         if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
             self.connect(&AsynUser::default())?;
         }
-        self.base.check_ready()?;
+        self.require_socket("disconnected")?;
         asyn_trace_io!(
-            Some(self.base.trace),
+            self.base.trace,
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
@@ -1894,7 +1981,7 @@ impl PortDriver for DrvAsynIPPort {
                 // self-heals.
                 if e.is_fatal_transport() && self.base.is_connected() {
                     asyn_trace!(
-                        Some(self.base.trace),
+                        self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
                         "write error, disconnecting: {e}"
@@ -2000,6 +2087,8 @@ impl PortDriver for DrvAsynIPPort {
             self.config.port = new_config.port;
             self.config.local_port = new_config.local_port;
             self.config.protocol = new_config.protocol;
+            self.io.n_read = 0;
+            self.io.n_written = 0;
             // no_delay is not re-applied on a hostInfo reparse: C
             // parseHostInfo leaves it alone (connectIt sets it unconditionally).
             //
@@ -2219,6 +2308,49 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
 
         handle.join().unwrap();
+    }
+
+    /// C `asynCommonReport`: silent at 0, the endpoint and socket state at 1,
+    /// the fd and the byte counts at 2.
+    #[test]
+    fn report_prints_what_c_asyn_common_report_prints() {
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(&buf[..n]).unwrap();
+        });
+        let host = format!("127.0.0.1:{port}");
+        let mut drv = DrvAsynIPPort::new("iprep", &host).unwrap();
+        let report = |drv: &mut DrvAsynIPPort, level| {
+            let mut out = String::new();
+            drv.report(&mut out, level);
+            out
+        };
+        assert_eq!(report(&mut drv, 0), "");
+        assert_eq!(
+            report(&mut drv, 1),
+            format!("    Port {host}: Disconnected\n")
+        );
+
+        drv.connect(&AsynUser::default()).unwrap();
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        drv.write_octet(&mut user, b"hello").unwrap();
+        let mut buf = [0u8; 32];
+        let n = drv.read_octet(&user, &mut buf).unwrap();
+        assert_eq!(n, 5);
+        handle.join().unwrap();
+
+        let fd = drv.io.fd();
+        assert!(fd >= 0);
+        assert_eq!(
+            report(&mut drv, 2),
+            format!(
+                "    Port {host}: Connected\n                    fd: {fd}\n    \
+                 Characters written: 5\n       Characters read: 5\n"
+            )
+        );
     }
 
     #[test]
@@ -4356,6 +4488,33 @@ mod tests {
         let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:9999").unwrap();
         let mut user = AsynUser::new(0);
         drv.io_flush(&mut user).unwrap();
+    }
+
+    /// C `readIt`/`writeIt` answer a missing socket themselves, with asynError
+    /// and their own text — the read's with a colon, the write's without.
+    #[test]
+    fn a_transfer_with_no_socket_is_the_drivers_error() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:9999").unwrap();
+        let mut user = AsynUser::new(0);
+        let mut buf = [0u8; 8];
+        for (err, text) in [
+            (
+                drv.io_read_octet_eom(&user, &mut buf).unwrap_err(),
+                "127.0.0.1:9999 disconnected:",
+            ),
+            (
+                drv.write_octet(&mut user, b"x").unwrap_err(),
+                "127.0.0.1:9999 disconnected",
+            ),
+        ] {
+            match err {
+                AsynError::Status { status, message } => {
+                    assert_eq!(status, AsynStatus::Error);
+                    assert_eq!(message, text);
+                }
+                other => panic!("expected the driver's error, got {other:?}"),
+            }
+        }
     }
 
     // --- UDP broadcast flag test ---

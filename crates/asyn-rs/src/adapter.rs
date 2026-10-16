@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(54): checked, not waived — all 54 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(55): checked, not waived — all 55 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1158/1158). asyn-rs became a census subject when its
+// --all-features`, 1266/1266). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
@@ -26,6 +26,9 @@ use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
 use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
+
+/// C `MAX_STRING_SIZE`, a stringin/stringout VAL.
+const MAX_STRING_SIZE: usize = 40;
 
 /// Parsed `@asyn(portName, addr, timeout) drvInfoString` link specification.
 #[derive(Debug, Clone)]
@@ -360,14 +363,13 @@ pub struct AsynDeviceSupport {
     /// Maximum number of array elements for array read operations.
     /// Default: 307200 (enough for 640x480 images).
     max_array_elements: usize,
-    /// Buffer cap for `asynOctet` reads, including the trailing NUL.
-    /// C asyn devAsynOctet.c:1103 passes `plsi->sizv` as the read
-    /// limit for lsi/lso/printf — the byte the driver leaves at
-    /// position `sizv` is overwritten with `\0` (line 1124). For
-    /// stringin/stringout the C path is the fixed 40-byte record
-    /// field; for waveform it uses NELM*FTVL. We pick the per-record
-    /// SIZV at init time when available; otherwise fall back to the
-    /// stringin-grade 256-byte default.
+    /// C devAsynOctet `valSize`, the record buffer a read lands in: SIZV for
+    /// lsi/lso/printf, NELM for waveform, `sizeof(val)` = 40 for
+    /// stringin/stringout (devAsynOctet.c `initCommon` callers). A read keeps
+    /// at most `valSize - 1` bytes of it.
+    octet_val_size: usize,
+    /// The `asynOctet` read request size: `octet_val_size`, cut to
+    /// `octet_len_cap`.
     octet_max_size: usize,
     /// Per-record octet length cap from `drv_user_create` (C
     /// `modbusDrvUser_t.len` parsed from a `TYPE=N` drvInfo). `Some(n)` caps
@@ -654,6 +656,8 @@ struct CachedInterrupt {
     /// read maps it to an alarm and gates the value store on `Success`, exactly
     /// as C `processAi`/`processBo`/array `process()` gate on `result.status`.
     aux_status: crate::error::AsynStatus,
+    /// [`crate::interrupt::InterruptValue::octet_counts_nul`] of the fire.
+    octet_nul: bool,
 }
 
 /// The `interruptAccept` a record's callbacks read: the gate of the database
@@ -801,6 +805,7 @@ impl AsynDeviceSupport {
             mask: 0xFFFFFFFF,
             int32_mask: None,
             max_array_elements: 307200,
+            octet_val_size: 256,
             octet_max_size: 256,
             octet_len_cap: None,
             octet_cmd: None,
@@ -847,7 +852,7 @@ impl AsynDeviceSupport {
     /// SyncIO, whose `queueLockPort` queues at Low (asynManager.c:1896).
     fn init_user(&self) -> AsynUser {
         self.request_user(QueuePriority::Low)
-            .locking_port(self.handle.queue_lock_port_timeout())
+            .locking_port(&self.handle)
     }
 
     fn request_user(&self, priority: QueuePriority) -> AsynUser {
@@ -2199,9 +2204,14 @@ impl AsynDeviceSupport {
     /// the same `value &= mask` + bipolar sign-extend as `processCallbackInput` at
     /// :485-488). A free function could not reach `int32_mask`, and the two paths
     /// would silently disagree again — this time about the mask instead of the type.
+    ///
+    /// `octet_nul` is the fire's
+    /// [`crate::interrupt::InterruptValue::octet_counts_nul`]: C hands an
+    /// asynOctet user the text and its NUL.
     fn param_value_for_iface(
         &self,
         pv: &crate::param::ParamValue,
+        octet_nul: bool,
     ) -> Result<Option<EpicsValue>, AsynError> {
         let iface_type = self.iface_type.as_str();
         if let Some(arr) = convert_param_array_to_iface(iface_type, pv) {
@@ -2211,7 +2221,15 @@ impl AsynDeviceSupport {
             "asynInt32" => EpicsValue::Long(self.apply_int32_mask(pv.as_int32()?)),
             "asynInt64" => EpicsValue::Int64(pv.as_int64()?),
             "asynFloat64" => EpicsValue::Double(pv.as_float64()?),
-            "asynOctet" => EpicsValue::String(pv.as_octet()?.into()),
+            "asynOctet" => {
+                let bytes = pv.as_octet()?;
+                EpicsValue::String(if octet_nul {
+                    let text = &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())];
+                    epics_base_rs::types::PvString::from_bytes([text, &[0]].concat())
+                } else {
+                    bytes.into()
+                })
+            }
             "asynUInt32Digital" => EpicsValue::Long(pv.as_uint32()? as i32),
             "asynEnum" => EpicsValue::Enum(pv.as_enum()?.0 as u16),
             // An array interface reached here only because the sample is not an
@@ -2236,8 +2254,8 @@ impl AsynDeviceSupport {
             "asynInt64" => result.int64_val.map(EpicsValue::Int64),
             "asynFloat64" => result.float_val.map(EpicsValue::Double),
             "asynOctet" => result.data.as_ref().map(|d| {
-                let n = result.nbytes.min(d.len());
-                EpicsValue::String(String::from_utf8_lossy(&d[..n]).into_owned().into())
+                let n = result.nbytes.min(d.len()).min(self.octet_read_cap());
+                EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&d[..n]))
             }),
             "asynUInt32Digital" => result.uint_val.map(|v| EpicsValue::Long(v as i32)),
             "asynEnum" => result.enum_index.map(|v| EpicsValue::Enum(v as u16)),
@@ -2286,12 +2304,21 @@ impl AsynDeviceSupport {
     /// untouched. Bytes are truncated verbatim — `PvString` is raw bytes, matching the
     /// polled path's `&d[..n]` slice.
     fn cap_octet_read_value(&self, val: EpicsValue) -> EpicsValue {
+        let cap = self.octet_read_cap();
         match val {
-            EpicsValue::String(s) if s.len() > self.octet_max_size => EpicsValue::String(
-                epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..self.octet_max_size]),
+            EpicsValue::String(s) if s.len() > cap => EpicsValue::String(
+                epics_base_rs::types::PvString::from_bytes(&s.as_bytes()[..cap]),
             ),
             other => other,
         }
+    }
+
+    /// The most bytes a read hands the record: C `if (nBytesRead == valSize)
+    /// nBytesRead--` (callbackWfRead and kin) and `if (len >= valSize) len =
+    /// valSize-1` (interruptCallback), within the request size.
+    fn octet_read_cap(&self) -> usize {
+        self.octet_max_size
+            .min(self.octet_val_size.saturating_sub(1))
     }
 
     /// Build a `RequestOp` for writing an `EpicsValue` for the current interface type.
@@ -2322,6 +2349,19 @@ impl AsynDeviceSupport {
         Some(RequestOp::OctetWrite {
             data: self.cap_octet_write(bytes),
         })
+    }
+
+    /// Every text octet write — stringout, lso, printf, scalcout, the
+    /// `asynOctetWrite` waveform — sends `my_strnlen(val, size)` bytes
+    /// (devAsynOctet.c:943-958, 1076, 1214, 1229, 1256), so no NUL a VAL holds
+    /// reaches the driver. Only [`Self::binary_write_op`] sends NULs.
+    fn text_octet_write(&self, bytes: &[u8]) -> RequestOp {
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        let mut data = self.recycled();
+        data.extend_from_slice(&bytes[..len]);
+        RequestOp::OctetWrite {
+            data: self.cap_octet_write(data),
+        }
     }
 
     /// The write of `val` through this record's interface; a data-carrying op
@@ -2355,24 +2395,11 @@ impl AsynDeviceSupport {
             ("asynFloat64", EpicsValue::Enum(v)) => {
                 Some(RequestOp::Float64Write { value: *v as f64 })
             }
-            ("asynOctet", EpicsValue::String(s)) => {
-                let mut bytes = self.recycled();
-                bytes.extend_from_slice(s.as_bytes());
-                Some(RequestOp::OctetWrite {
-                    data: self.cap_octet_write(bytes),
-                })
-            }
-            ("asynOctet", EpicsValue::CharArray(data)) => {
-                // Trim trailing nulls (waveform FTVL=CHAR pads to NELM)
-                let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                let mut bytes = self.recycled();
-                bytes.extend_from_slice(&data[..len]);
-                Some(RequestOp::OctetWrite {
-                    data: self.cap_octet_write(bytes),
-                })
-            }
+            ("asynOctet", EpicsValue::String(s)) => Some(self.text_octet_write(s.as_bytes())),
+            ("asynOctet", EpicsValue::CharArray(data)) => Some(self.text_octet_write(data)),
             // Coerce numeric types to octet (e.g. longout writing to NDArrayPort string param)
             ("asynOctet", v) => {
+                // A number's text holds no NUL, so the strnlen cut is moot.
                 use std::io::Write as _;
                 let mut bytes = self.recycled();
                 let _ = write!(bytes, "{v}");
@@ -2637,13 +2664,33 @@ impl AsynDeviceSupport {
         // Delivering a `String` instead made the bytes arrive as a DBR_STRING
         // put, which C's `putStringChar` parses with `epicsParseInt8` and
         // refuses for any non-numeric reply.
-        if self.iface_type == "asynOctet" && record.val().is_some_and(|v| v.is_array()) {
-            let bytes = match val {
-                EpicsValue::String(s) => EpicsValue::CharArray(s.as_bytes().into()),
-                other => other,
-            };
-            let _ = record.set_val(bytes);
-            return true;
+        //
+        // The `n` bytes kept (see `octet_read_cap`) land as C lands them: a
+        // waveform's NORD is `n`; lsi/lso take `val[n] = 0` and `len = n + 1`;
+        // a DBF_STRING VAL reads as a C string, to the first NUL.
+        if self.iface_type == "asynOctet" {
+            if let EpicsValue::String(s) = &val {
+                use epics_base_rs::server::records::{lsi::LsiRecord, lso::LsoRecord};
+                let bytes = s.as_bytes();
+                if let Some(any) = record.as_any_mut() {
+                    if let Some(lsi) = any.downcast_mut::<LsiRecord>() {
+                        lsi.val.set_read(bytes);
+                        return true;
+                    }
+                    if let Some(lso) = any.downcast_mut::<LsoRecord>() {
+                        lso.val.set_read(bytes);
+                        return true;
+                    }
+                }
+                let delivered = if record.val().is_some_and(|v| v.is_array()) {
+                    EpicsValue::CharArray(bytes.into())
+                } else {
+                    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+                    EpicsValue::String(epics_base_rs::types::PvString::from_bytes(&bytes[..end]))
+                };
+                let _ = record.set_val(delivered);
+                return true;
+            }
         }
         let _ = record.set_val(val);
         true
@@ -2940,19 +2987,14 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
-        // Read SIZV from lsi/lso/printf records to size the asynOctet
-        // read buffer. C parity: devAsynOctet.c:1103 passes
-        // `plsi->sizv` to initCommon as the per-record buffer size;
-        // the read path (line 1117-1124) then writes up to sizv-1
-        // bytes and stuffs `\0` at the boundary. For stringin /
-        // stringout (no SIZV) we keep the 256-byte default. SIZV is
-        // DBF_USHORT (lsiRecord/lsoRecord/printfRecord.dbd.pod), so the
-        // field reads back as an unsigned 16-bit value.
-        if let Some(EpicsValue::UShort(sizv)) = record.get_field("SIZV") {
-            if sizv > 0 {
-                self.octet_max_size = sizv as usize;
-            }
-        }
+        // C devAsynOctet `valSize`. SIZV is DBF_USHORT
+        // (lsiRecord/lsoRecord/printfRecord.dbd.pod).
+        self.octet_val_size = match (record.get_field("SIZV"), record.get_field("NELM")) {
+            (Some(EpicsValue::UShort(sizv)), _) if sizv > 0 => sizv as usize,
+            (_, Some(nelm)) => nelm.to_f64().map_or(0, |n| n as usize),
+            _ => MAX_STRING_SIZE,
+        };
+        self.octet_max_size = self.octet_val_size;
 
         // Apply the per-record octet cap from `drv_user_create` after SIZV has
         // finalized the buffer length, mirroring C `getStringLen`: the effective
@@ -3112,8 +3154,12 @@ impl DeviceSupport for AsynDeviceSupport {
                                 EpicsValue::Double(raw) => record.apply_float64_readback(raw),
                                 _ => false,
                             };
+                            // The seed lands as every read does, through
+                            // `store_read_value`: a DBF_STRING VAL is C's
+                            // `strcpy` of the reply, cut at the first NUL
+                            // (devAsynOctet.c:373-376).
                             if !seeded {
-                                let _ = record.set_val(val);
+                                self.store_read_value(record, val);
                             }
                             read_back = true;
                         }
@@ -3348,7 +3394,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     // interrupt gets the per-interface `convert` (C fires all six
                     // array interfaces, NDPluginStdArrays.cpp:170-197) and a
                     // scalar gets its interface's read rule.
-                    match self.param_value_for_iface(&ci.value) {
+                    match self.param_value_for_iface(&ci.value, ci.octet_nul) {
                         Ok(Some(val)) => {
                             let val = self.cap_octet_read_value(val);
                             let wrote_val = self.store_read_value(record, val);
@@ -3892,6 +3938,7 @@ impl DeviceSupport for AsynDeviceSupport {
                             alarm_status: iv.alarm_status,
                             alarm_severity: iv.alarm_severity,
                             aux_status: iv.aux_status,
+                            octet_nul: false,
                         };
                         // C: ring full → evict oldest + overflow, NO
                         // scanIoRequest; fresh add → scanIoRequest
@@ -4023,6 +4070,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     // pasynUser->auxStatus`, devAsynInt32.c:600); the read maps
                     // it and gates the value store.
                     aux_status: iv.aux_status,
+                    octet_nul: iv.octet_counts_nul(),
                 };
                 // C parity (devAsynInt32.c:564-576):
                 //   - On overflow (ring full), drop oldest +
@@ -5143,7 +5191,8 @@ mod tests {
             Some(EpicsValue::Int64(v))
         );
         assert_eq!(
-            ads.param_value_for_iface(&ParamValue::Int64(v)).unwrap(),
+            ads.param_value_for_iface(&ParamValue::Int64(v), false)
+                .unwrap(),
             Some(EpicsValue::Int64(v))
         );
 
@@ -5193,7 +5242,7 @@ mod tests {
         Int32Mask::apply_to_read(ads.int32_mask, &mut read);
         let polled = ads.result_to_value(&read);
         let io_intr = ads
-            .param_value_for_iface(&ParamValue::Int32(0xF0))
+            .param_value_for_iface(&ParamValue::Int32(0xF0), false)
             .expect("an Int32 sample is readable through asynInt32");
 
         assert_eq!(
@@ -6453,6 +6502,7 @@ mod tests {
                     alarm_status: 0,
                     alarm_severity: 0,
                     aux_status: crate::error::AsynStatus::Success,
+                    octet_nul: false,
                 });
         }
         let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().entries.len();
@@ -7590,6 +7640,7 @@ mod tests {
             alarm_status: 0,
             alarm_severity: 0,
             aux_status: crate::error::AsynStatus::Success,
+            octet_nul: false,
         }
     }
 
@@ -7736,15 +7787,14 @@ mod tests {
 
     /// C parity: devAsynOctet initCommon passes `plsi->sizv` as the
     /// asynOctet read-buffer size; an lsi record with a non-default
-    /// SIZV must produce read ops sized accordingly, not the fixed
-    /// 256-byte stringin default.
+    /// SIZV must produce read ops sized accordingly.
     #[test]
     fn octet_buffer_picks_up_sizv_from_record() {
         let mut ads = make_adapter(ScanType::Passive);
         // The adapter only routes asynOctet through octet_max_size,
         // so re-target it.
         ads.set_iface_type("asynOctet");
-        // Default (no init yet) is the stringin fallback.
+        // Before init.
         assert_eq!(ads.octet_max_size, 256);
 
         use epics_base_rs::server::records::lsi::LsiRecord;
@@ -8593,6 +8643,7 @@ mod tests {
                 alarm_status: 3,   // e.g. READ_ALARM
                 alarm_severity: 1, // e.g. MINOR
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         }
         ads.read(&mut rec).unwrap();
@@ -8651,6 +8702,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Timeout,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
@@ -8683,6 +8735,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Error,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
@@ -8711,6 +8764,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Error,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
@@ -8738,6 +8792,7 @@ mod tests {
                 alarm_status: 7,   // STATE_ALARM (sample's own)
                 alarm_severity: 2, // MAJOR
                 aux_status: crate::error::AsynStatus::Timeout, // would map to (10, 3)
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
@@ -8765,6 +8820,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Disconnected,
+                octet_nul: false,
             });
             g.push_with_overflow(intr_entry(50, 0)); // clean follow-up
         }
@@ -8840,6 +8896,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![1, 2, 3].into())));
@@ -8855,6 +8912,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Error,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(
@@ -8875,6 +8933,162 @@ mod tests {
     /// (devAsynInt32.c:848-855). The alarm is still raised (mapped + recGblSetSevr
     /// before the gate, :844-847). This is the polled-read sibling of the I/O
     /// Intr ring's aux_status store gate.
+    /// An asynOctet adapter on an asynPortDriver string parameter holding
+    /// `text`.
+    fn octet_param_adapter(text: &[u8], scan: ScanType) -> AsynDeviceSupport {
+        let mut base = PortDriverBase::new("octparam", 1, PortFlags::default());
+        let fw = base.create_param("FW", ParamType::Octet).unwrap();
+        base.params.set_string(fw, 0, text).unwrap();
+        let interrupts = Arc::new(InterruptManager::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort { base }), rx);
+        let actor_link = actor.link();
+        std::thread::Builder::new()
+            .name("test-octparam-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(
+            tx,
+            "octparam".into(),
+            interrupts,
+            actor_link,
+            std::sync::Arc::new(crate::trace::TraceManager::new()),
+        );
+        let link = AsynLink {
+            port_name: "octparam".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "FW".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.set_record_info("TEST:FW", scan);
+        ads
+    }
+
+    /// C readOctet counts the NUL (`strlen + 1`) and callbackWfRead sets
+    /// `nord = nBytesRead`, so a CHAR waveform's NORD includes it.
+    #[test]
+    fn a_waveform_reading_a_string_parameter_counts_its_nul() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = octet_param_adapter(b"AH501BE 1.0", ScanType::Passive);
+        let mut rec = WaveformRecord::new(256, DbFieldType::Char);
+        ads.init(&mut rec).unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 12);
+        let EpicsValue::CharArray(v) = &rec.val else {
+            panic!("CHAR waveform VAL")
+        };
+        assert_eq!(&v[..rec.nord as usize], b"AH501BE 1.0\0");
+    }
+
+    /// NELM is the waveform's valSize: at most `valSize - 1` bytes land
+    /// (C `if (nBytesRead == pwf->nelm) nBytesRead--`).
+    #[test]
+    fn a_waveform_keeps_one_byte_less_than_nelm() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = octet_param_adapter(b"AH501BE 1.0", ScanType::Passive);
+        let mut rec = WaveformRecord::new(8, DbFieldType::Char);
+        ads.init(&mut rec).unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 7);
+        let EpicsValue::CharArray(v) = &rec.val else {
+            panic!("CHAR waveform VAL")
+        };
+        assert_eq!(&v[..rec.nord as usize], b"AH501BE");
+    }
+
+    /// A stringin reads the text, its valSize is `sizeof(val)`, and an lsi
+    /// takes `len = nBytesRead + 1` over bytes that already hold the NUL.
+    #[test]
+    fn stringin_and_lsi_take_a_string_parameter_as_c_does() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+        let mut ads = octet_param_adapter(b"AH501BE 1.0", ScanType::Passive);
+        let mut si = StringinRecord::new("");
+        ads.init(&mut si).unwrap();
+        assert_eq!(ads.octet_max_size, MAX_STRING_SIZE);
+        ads.read(&mut si).unwrap();
+        assert_eq!(si.val(), Some(EpicsValue::String("AH501BE 1.0".into())));
+
+        let mut ads = octet_param_adapter(b"AH501BE 1.0", ScanType::Passive);
+        let mut lsi = LsiRecord::new("");
+        ads.init(&mut lsi).unwrap();
+        ads.read(&mut lsi).unwrap();
+        assert_eq!(lsi.get_field("LEN"), Some(EpicsValue::ULong(13)));
+        assert_eq!(lsi.val.text(), b"AH501BE 1.0\0");
+    }
+
+    /// `asyn:INITIAL_READBACK` on a stringout seeds VAL as C's `strcpy` does
+    /// (devAsynOctet.c:373-376), and the next processing writes
+    /// `my_strnlen(val, 40)` bytes (:958): the parameter's NUL never reaches the
+    /// driver.
+    #[test]
+    fn stringout_initial_readback_then_proc_writes_no_nul() {
+        use epics_base_rs::server::records::stringout::StringoutRecord;
+        let mut ads = octet_param_adapter(b"abc", ScanType::Passive);
+        ads.initial_readback = true;
+        let mut so = StringoutRecord::new("");
+        ads.init(&mut so).unwrap();
+        assert_eq!(so.val(), Some(EpicsValue::String("abc".into())));
+
+        let val = so.val().unwrap();
+        match ads.write_op_pub(&val) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"abc"),
+            other => panic!("{other:?}"),
+        }
+        ads.write(&mut so).unwrap();
+
+        // A VAL holding a NUL some other way still stops there on the wire.
+        let held = EpicsValue::String(epics_base_rs::types::PvString::from_bytes(b"ab\0c"));
+        match ads.write_op_pub(&held) {
+            Some(RequestOp::OctetWrite { data }) => assert_eq!(data, b"ab"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An I/O Intr waveform takes what the fire counts: a parameter callback
+    /// `strlen + 1` (asynPortDriver.cpp:817), an octet read fan-out its bytes
+    /// alone (asynOctetBase).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_io_intr_waveform_takes_the_count_its_fire_carries() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let gate = open_gate();
+        let mut ads = octet_param_adapter(b"", ScanType::IoIntr);
+        ads.bind_interrupt_gate(&gate);
+        let mut rec = WaveformRecord::new(256, DbFieldType::Char);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        for (iface, bytes, nord) in [
+            (None, &b"AH501BE 1.0"[..], 12),
+            (Some(InterfaceType::Octet), &b"abc\r\n"[..], 5),
+        ] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Octet(bytes.into()),
+                timestamp: SystemTime::now(),
+                iface,
+                ..Default::default()
+            });
+            // Wait for the fire to land, then hand it back for the read.
+            let entry = loop {
+                if let Some(e) = ads.interrupt_fifo.lock().unwrap().pop() {
+                    break e;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            ads.interrupt_fifo.lock().unwrap().push_with_overflow(entry);
+            ads.read(&mut rec).unwrap();
+            assert_eq!(rec.nord, nord, "{iface:?}");
+        }
+    }
+
     #[test]
     fn polled_read_transport_error_discards_value_keeps_prior() {
         use epics_base_rs::server::records::longin::LonginRecord;
@@ -9004,6 +9218,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
@@ -9050,6 +9265,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
@@ -9086,6 +9302,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
@@ -9115,6 +9332,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute(), "bo readback computed");
@@ -9143,6 +9361,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
@@ -9177,6 +9396,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute(), "uint32digital bi readback computed");
@@ -9192,6 +9412,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.rval, 0, "out-of-mask bits masked away");
@@ -9224,6 +9445,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute(), "mbbiDirect readback computed");
@@ -9269,6 +9491,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute(), "mbbi readback computed");
@@ -9314,6 +9537,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(outcome.did_compute(), "mbbi readback computed");
@@ -9440,6 +9664,7 @@ mod tests {
             alarm_status: 0,
             alarm_severity: 0,
             aux_status: crate::error::AsynStatus::Success,
+            octet_nul: false,
         });
     }
 
@@ -9585,6 +9810,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 aux_status: crate::error::AsynStatus::Success,
+                octet_nul: false,
             });
         }
         ads.read(&mut rec).unwrap();

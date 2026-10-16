@@ -12,35 +12,52 @@ use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
 use crate::param::ParamValue;
 use crate::port::PortDriver;
 
-/// The closure a [`RequestOp::WithDriver`] carries.
+/// A closure a request carries to the actor — [`DriverCall`] or [`PortLockCall`].
 ///
 /// A request is `Clone`, a closure runs once: the clones share one slot and the
 /// first to reach the actor takes it. A call with nothing left to run — a second
 /// clone, or one rebuilt from a serialized `PortCommand`, which cannot carry
 /// code — is refused by the actor rather than silently succeeding.
-#[derive(Clone)]
-pub struct DriverCall(Arc<Mutex<Option<DriverFn>>>);
+pub struct OnceCall<F: ?Sized>(Arc<Mutex<Option<Box<F>>>>);
 
-type DriverFn = Box<dyn FnOnce(&mut dyn PortDriver) + Send>;
+/// The closure a [`RequestOp::WithDriver`] carries.
+pub type DriverCall = OnceCall<dyn FnOnce(&mut dyn PortDriver) + Send>;
+
+/// The closure a [`RequestOp::LockPort`] carries.
+pub type PortLockCall = OnceCall<dyn FnOnce(&mut dyn PortCalls) + Send>;
 
 impl DriverCall {
     pub fn new(f: impl FnOnce(&mut dyn PortDriver) + Send + 'static) -> Self {
         Self(Arc::new(Mutex::new(Some(Box::new(f)))))
     }
+}
 
+impl PortLockCall {
+    pub fn new(f: impl FnOnce(&mut dyn PortCalls) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(f)))))
+    }
+}
+
+impl<F: ?Sized> OnceCall<F> {
     /// A call with no closure, which the actor refuses.
     pub fn spent() -> Self {
         Self(Arc::new(Mutex::new(None)))
     }
 
-    pub(crate) fn take(&self) -> Option<DriverFn> {
+    pub(crate) fn take(&self) -> Option<Box<F>> {
         self.0.lock().take()
     }
 }
 
-impl std::fmt::Debug for DriverCall {
+impl<F: ?Sized> Clone for OnceCall<F> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<F: ?Sized> std::fmt::Debug for OnceCall<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DriverCall")
+        f.write_str("OnceCall")
     }
 }
 
@@ -944,6 +961,12 @@ pub enum RequestOp {
     /// threads do between `lock()` and `unlock()` (asynPortDriver.cpp:3858).
     /// Built by [`crate::port_handle::PortHandle::with_driver`].
     WithDriver(DriverCall),
+    /// C `pasynManager->lockPort` … `unlockPort` (asynManager.c:1778-1808): the
+    /// closure calls the port's interfaces with no `queueRequest`, so neither
+    /// the enabled nor the connected check runs and no autoconnect is tried —
+    /// a down link answers with the driver's own error. Only a shut-down port
+    /// refuses. Built by [`crate::port_handle::PortHandle::lock_port_blocking`].
+    LockPort(PortLockCall),
     /// A preallocated request the port thread runs — C `queueRequest` of a
     /// user that carries its own callbacks; see [`RequestCell`].
     Cell(Arc<RequestCell>),

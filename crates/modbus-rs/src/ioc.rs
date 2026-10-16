@@ -1852,11 +1852,6 @@ pub fn modbus_interpose_config_command() -> CommandDef {
         |args: &[ArgValue], _ctx: &CommandContext| -> CommandResult {
             let (port, settings) = parse_interpose_args(args)?;
             record_interpose(&port, settings);
-            println!(
-                "modbusInterposeConfig: octet port '{port}' link={:?} \
-                 timeout={:?} write_delay={:?}",
-                settings.link, settings.timeout, settings.write_delay
-            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -2077,8 +2072,6 @@ impl CommandHandler for ModbusConfigHandler {
         // The registry above holds a live `PortHandle` for this port, which is
         // what keeps its actor alive; the `PortRuntimeHandle` may drop here.
         drop(runtime);
-
-        println!("drvModbusAsynConfigure: port='{port_name}' octet='{octet_port}' link={link:?}");
 
         // Spawn the read poller — periodically triggers a poll cycle by
         // writing the MODBUS_READ parameter. Port of the `readPoller` thread.

@@ -1111,6 +1111,14 @@ impl DrvAsynIPServerPort {
     /// `SocketAddr::parse` of `host:port` rejected empty-host,
     /// `localhost`, and every hostname.
     fn resolve_bind_addr(&self) -> AsynResult<SocketAddr> {
+        let addr = self.lookup_bind_addr()?;
+        // C `createServerSocket` (:439-443), on configure and every connect.
+        println!("serverAddr: {addr}");
+        println!("serverPort: {}", self.config.bind_port);
+        Ok(addr)
+    }
+
+    fn lookup_bind_addr(&self) -> AsynResult<SocketAddr> {
         let host = self.config.bind_host.trim();
         let port = self.config.bind_port;
         // Empty or "localhost" => INADDR_ANY, exactly as C (:421,

@@ -148,7 +148,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDStdArraysConfigure: wiring failed: {e}");
                 }
-                println!("NDStdArraysConfigure: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -187,7 +186,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDStatsConfigure: wiring failed: {e}");
                 }
-                println!("NDStatsConfigure: port={port_name}");
 
                 Ok(CommandOutcome::Continue)
             },
@@ -224,7 +222,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDROIConfigure: wiring failed: {e}");
                 }
-                println!("NDROIConfigure: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -357,7 +354,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDOverlayConfigure: wiring failed: {e}");
                 }
-                println!("NDOverlayConfigure: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -487,7 +483,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     eprintln!("NDGatherConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
-                println!("NDGatherConfigure: port={port_name} (maxPorts={max_ports})");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -575,7 +570,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &in_port) {
                     eprintln!("NDAttrPlotConfig: wiring failed: {e}");
                 }
-                println!("NDAttrPlotConfig: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -720,7 +714,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDAttrConfigure: wiring failed: {e}");
                 }
-                println!("NDAttrConfigure: port={port_name}");
 
                 Ok(CommandOutcome::Continue)
             },
@@ -760,7 +753,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDROIStatConfigure: wiring failed: {e}");
                 }
-                println!("NDROIStatConfigure: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -868,11 +860,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                         {
                             eprintln!("NDTimeSeriesConfigure: wiring failed: {e}");
                         }
-                        println!(
-                            "NDTimeSeriesConfigure: port={port_name} \
-                             (standalone raw-array, maxSignals={max_signals}, \
-                             upstream={ndarray_port})"
-                        );
                         return Ok(CommandOutcome::Continue);
                     }
                 };
@@ -895,7 +882,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     eprintln!("NDTimeSeriesConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
                 }
-                println!("NDTimeSeriesConfigure: port={port_name} (upstream={ndarray_port})");
 
                 Ok(CommandOutcome::Continue)
             },
@@ -977,8 +963,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                     eprintln!("NDPvaConfigure: wiring failed: {e}");
                 }
-                #[cfg(feature = "pva")]
-                println!("NDPvaConfigure: port={port_name}, PV={pva_pv_name}");
                 #[cfg(not(feature = "pva"))]
                 println!("NDPvaConfigure: port={port_name} (stub — enable 'pva' feature)");
                 Ok(CommandOutcome::Continue)
@@ -1089,7 +1073,6 @@ where
             if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {
                 eprintln!("{cmd_name}: wiring failed: {e}");
             }
-            println!("{cmd_name}: port={port_name}");
             Ok(CommandOutcome::Continue)
         },
     ))

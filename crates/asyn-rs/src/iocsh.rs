@@ -1475,9 +1475,6 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "drvAsynIPPortConfigure: octet port '{port}' -> {host}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1636,9 +1633,6 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 }
             }
 
-            ctx.println(&format!(
-                "drvAsynIPServerPortConfigure: server port '{port}' -> {server_info}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1717,9 +1711,6 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1792,9 +1783,6 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
             {
                 return Ok(CommandOutcome::Continue);
             }
-            ctx.println(&format!(
-                "prologixGPIBConfigure: GPIB port '{port}' -> {host}"
-            ));
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1927,6 +1915,32 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
             let port = arg_str(args, 0)?
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| "portName required".to_string())?;
+            // C prints these first, before any refusal (drvAsynFTDIPort.cpp:522-526).
+            let mode = arg_int(args, 8).unwrap_or(0) as i32;
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: latency={}",
+                arg_int(args, 4).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: priority={}",
+                arg_int(args, 5).unwrap_or(0) as u32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noAutoconnect={}",
+                arg_int(args, 6).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: noProcessEos={}",
+                arg_int(args, 7).unwrap_or(0) as i32
+            ));
+            ctx.println(&format!(
+                "drvAsynFTDIPortConfigure: mode={}",
+                if mode & crate::drivers::ftdi::UART_SPI_BIT != 0 {
+                    "SPI"
+                } else {
+                    "UART"
+                }
+            ));
             let driver = match DrvAsynFtdiPort::configure(
                 &port,
                 arg_int(args, 1).unwrap_or(0) as i32,
@@ -1936,7 +1950,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                 arg_int(args, 5).unwrap_or(0) as u32,
                 arg_int(args, 6).unwrap_or(0) != 0,
                 arg_int(args, 7).unwrap_or(0) != 0,
-                arg_int(args, 8).unwrap_or(0) as i32,
+                mode,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1944,7 +1958,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port(
+            publish_configured_port(
                 Refusal::Line("drvAsynFTDIPortConfigure: Can't register myself."),
                 &port,
                 driver,
@@ -1952,13 +1966,7 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
                 FTDI_STACK_SIZE,
                 &services,
                 ctx,
-            )
-            .is_some()
-            {
-                ctx.println(&format!(
-                    "drvAsynFTDIPortConfigure: FTDI port '{port}' created"
-                ));
-            }
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -2027,7 +2035,7 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port(
+            publish_configured_port(
                 Refusal::Gpib,
                 &port,
                 driver,
@@ -2035,11 +2043,7 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
                 0,
                 &services,
                 ctx,
-            )
-            .is_some()
-            {
-                ctx.println(&format!("vxi11Configure: VXI-11 port '{port}' -> {host}"));
-            }
+            );
             Ok(CommandOutcome::Continue)
         },
     )
@@ -2101,7 +2105,18 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 }
             };
-            if publish_configured_port(
+            // drvAsynUSBTMC.c:1243-1252.
+            let vendor_id = arg_int(args, 1).unwrap_or(0) as i32;
+            let product_id = arg_int(args, 2).unwrap_or(0) as i32;
+            if arg_str(args, 3)?.unwrap_or_default().is_empty() {
+                ctx.println(&match (vendor_id, product_id) {
+                    (0, 0) => "No device information specified.  Will connect to first USB TMC device found.".to_string(),
+                    (0, p) => format!("Will connect to first USB TMC device found with product ID {p:#06x}."),
+                    (v, 0) => format!("Will connect to first USB TMC device found with vendor ID {v:#06x}."),
+                    (v, p) => format!("Will connect to first USB TMC device found with vendor ID {v:#06x} and product ID {p:#06x}."),
+                });
+            }
+            publish_configured_port(
                 Refusal::Line("registerPort failed"),
                 &port,
                 driver,
@@ -2109,11 +2124,7 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
                 0,
                 &services,
                 ctx,
-            )
-            .is_some()
-            {
-                ctx.println(&format!("usbtmcConfigure: USBTMC port '{port}' created"));
-            }
+            );
             Ok(CommandOutcome::Continue)
         },
     )

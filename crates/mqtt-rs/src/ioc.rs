@@ -125,10 +125,6 @@ impl CommandHandler for MqttConfigHandler {
         // Pre-bind config overlay (Z2M `normalize_on_off`); empty for generic
         // MQTT. Topic params themselves are created on demand when records bind.
         let overlay = take_pending_topics(&port_name);
-        println!(
-            "mqttDriverConfigure: port={port_name} broker={}:{}",
-            config.broker_host, config.broker_port,
-        );
 
         let (publish_tx, publish_rx) = tokio::sync::mpsc::unbounded_channel();
         // Shared broker-connection flag: the event loop is the sole writer, the

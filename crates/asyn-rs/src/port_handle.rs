@@ -420,6 +420,21 @@ impl PortHandle {
         self.cells.new_cell(body)
     }
 
+    /// C `pasynManager->queueRequest` for a cell from [`Self::new_cell`]: the
+    /// port's enabled/connected refusals on the calling thread, then
+    /// [`crate::request::RequestCell::queue`]. A dset whose `processUser` makes
+    /// several calls under one queue entry (devDigitelPump, devVacSen) queues
+    /// through this and ends its record's cycle from the cell's body.
+    pub fn queue_request(
+        &self,
+        cell: &Arc<crate::request::RequestCell>,
+        user: &AsynUser,
+    ) -> AsynResult<()> {
+        self.gate.check(user.connect_check(self.multi_device))?;
+        cell.queue(user)?;
+        Ok(())
+    }
+
     /// Whether `cell` queues on this port.
     pub fn owns_cell(&self, cell: &crate::request::RequestCell) -> bool {
         cell.queues_on(&self.cells)
@@ -1629,6 +1644,41 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         )
+    }
+
+    /// C `queueRequest` refuses a disconnected port before queueing
+    /// (asynManager.c:1549-1552), and a queued cell's body runs on the port.
+    #[test]
+    fn queue_request_gates_then_runs_the_cell() {
+        use crate::request::{CellBody, Unrun};
+        use std::sync::mpsc as std_mpsc;
+
+        struct Ran(std_mpsc::SyncSender<()>);
+        impl CellBody for Ran {
+            fn process(&self, port: &mut dyn PortCalls) {
+                let _ = port.call(&RequestOp::Int32Read, AsynUser::new(0));
+                self.0.send(()).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the queued request did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
+        let mut down = TestDriver::new();
+        down.base.set_connected(false);
+        let handle = make_handle(down);
+        let (tx, _rx) = std_mpsc::sync_channel(1);
+        let cell = handle.new_cell(Arc::new(Ran(tx)));
+        let e = handle.queue_request(&cell, &AsynUser::new(0)).unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Disconnected);
+        assert_eq!(e.message(), "port handle_test not connected");
+
+        let handle = make_handle(TestDriver::new());
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        let cell = handle.new_cell(Arc::new(Ran(tx)));
+        handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     /// C `connectDevice` runs on the caller's thread under `asynManagerLock`

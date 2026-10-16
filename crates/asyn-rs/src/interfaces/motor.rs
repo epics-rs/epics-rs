@@ -36,7 +36,9 @@ pub struct MotorStatus {
     /// `motorStatusHome_`, MSTA bit 7 EA_HOME). The motor record reads
     /// this one for ATHM when UEIP=Yes.
     pub encoder_home: bool,
-    /// True if the motor is powered on / closed-loop is active.
+    /// True if the motor is powered on / closed-loop is active (C
+    /// `motorStatusPowerOn_`, MSTA bit 5). Off by default: C starts every
+    /// status bit at 0, and only drivers that read the drive state set it.
     pub powered: bool,
     /// True if a problem was detected (driver stopped polling).
     pub problem: bool,
@@ -71,7 +73,7 @@ impl Default for MotorStatus {
             low_limit: false,
             home: false,
             encoder_home: false,
-            powered: true,
+            powered: false,
             problem: false,
             direction: false,
             slip_stall: false,

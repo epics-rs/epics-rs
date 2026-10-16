@@ -439,8 +439,11 @@ pub(crate) struct OutLinkSrc<'a> {
 pub(crate) enum AsyncPutStatus {
     /// `putAsync` took it: the record is PACT until the put completes.
     Taken,
-    /// Nothing more to do this cycle: no value, or a refused put, alarmed.
+    /// Nothing more to do this cycle: no value to put.
     Done,
+    /// `putAsync` refused the put, alarmed; `dbPutLinkAsync` returns its
+    /// status (`dbLink.c:468-472`), which `write_ao` hands to `process()`.
+    Refused,
     /// `S_db_noLSET`: the write goes through `dbPutLink` as a plain one.
     NoLset,
 }
@@ -2143,7 +2146,7 @@ impl PvDatabase {
             return true;
         };
         let (target, body) = Self::split_external_link_name(external.name);
-        super::link_put_queue::find_lset(&self.inner, &target, |lset| {
+        super::link_put_queue::find_lset(&self.inner, target, |lset| {
             lset.is_connected(body).then_some(())
         })
         .is_some()
@@ -3969,7 +3972,7 @@ impl PvDatabase {
             Err(refusal) => {
                 refusal.report(name);
                 crate::server::recgbl::rec_gbl_set_link_alarm(&mut instance.common, "OUT");
-                AsyncPutStatus::Done
+                AsyncPutStatus::Refused
             }
         }
     }

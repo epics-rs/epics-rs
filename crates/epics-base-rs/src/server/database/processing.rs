@@ -7083,6 +7083,10 @@ impl PvDatabase {
                                             return Ok(());
                                         }
                                         AsyncPutStatus::Done => None,
+                                        AsyncPutStatus::Refused => {
+                                            cycle_status.io(Err(DbStatus::FAILED));
+                                            None
+                                        }
                                         AsyncPutStatus::NoLset => {
                                             super::PutSrc::of_output(rec, instance, true)
                                         }

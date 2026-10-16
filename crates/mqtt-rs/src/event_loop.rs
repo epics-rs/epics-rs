@@ -79,6 +79,8 @@ pub async fn mqtt_event_loop(
     // spelling) in place of v3.1.1's `clean_session`.
     mqttoptions.set_clean_start(config.clean_session);
     mqttoptions.set_socket_connector(|host, _| paho_connect(host));
+    // paho's `connectTimeout` in C's v5 connect options (MQTTAsync.h:1394).
+    mqttoptions.set_connect_timeout(Duration::from_secs(30));
 
     let (client, mut eventloop) = AsyncClient::builder(mqttoptions).capacity(256).build();
 

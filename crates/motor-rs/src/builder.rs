@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::device_state::{self, SharedDeviceState};
 use crate::device_support::MotorDeviceSupport;
-use crate::poll_loop::{MotorPollLoop, PollCommand};
+use crate::poll_loop::{MotorPollLoop, PollCommand, PollerInbox};
 use crate::record::MotorRecord;
 
 /// Assembled motor components ready for use.
@@ -93,17 +93,22 @@ impl MotorBuilder {
             configure(&mut record);
         }
 
+        let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
         let device_support = MotorDeviceSupport::new(
             self.motor.clone(),
             self.addr,
             self.timeout,
             poll_cmd_tx.clone(),
+            motor_cmd_tx,
             device_state.clone(),
         );
 
         let io_intr_tx = device_support.io_intr_sender();
         let poll_loop = MotorPollLoop::new(
-            poll_cmd_rx,
+            PollerInbox {
+                poll: poll_cmd_rx,
+                commands: motor_cmd_rx,
+            },
             io_intr_tx,
             self.motor,
             device_state,

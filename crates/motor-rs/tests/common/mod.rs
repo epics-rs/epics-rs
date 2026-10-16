@@ -95,6 +95,9 @@ pub struct MotorFixture {
     seq: u64,
     /// Held so the record's `PollCommand` sends succeed.
     pub(crate) _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
+    /// The driver commands the record queued for the poller thread, which
+    /// this fixture stands in for.
+    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<motor_rs::flags::MotorCommand>>,
 }
 
 impl MotorFixture {
@@ -124,11 +127,13 @@ impl MotorFixture {
         configure(&mut rec);
 
         let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (motor_cmd_tx, motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut dev = MotorDeviceSupport::new(
             motor.clone() as Arc<Mutex<dyn AsynMotor>>,
             0,
             Duration::from_secs(1),
             poll_cmd_tx,
+            motor_cmd_tx,
             state.clone(),
         );
         {
@@ -157,6 +162,7 @@ impl MotorFixture {
             state,
             seq: 1,
             _poll_cmd_rx,
+            motor_cmd_rx,
         }
     }
 
@@ -186,6 +192,9 @@ impl MotorFixture {
         let user = AsynUser::new(0);
         let status = {
             let mut motor = self.motor.lock().unwrap();
+            while let Ok(commands) = self.motor_cmd_rx.try_recv() {
+                motor_rs::poll_loop::execute_commands(&mut *motor, &commands);
+            }
             edit(&mut motor);
             motor.poll(&user).unwrap()
         };

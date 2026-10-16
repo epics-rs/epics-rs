@@ -269,7 +269,10 @@ async fn test_poll_loop_lifecycle() {
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -334,7 +337,10 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
 
     // idle interval 0 == C idlePollPeriod_ == 0 (event-only); moving 5ms.
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -389,7 +395,10 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 
     // Non-zero idle interval so the timed arm fires repeatedly; moving 5ms.
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -593,6 +602,7 @@ async fn init_does_not_clobber_live_controller_position() {
     // zero, so NearZero does not restore — no SetPosition reaches the driver.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
         "RSTM=NearZero with a live controller far from zero must not reseed"
@@ -632,6 +642,7 @@ async fn startup_reseeds_controller_that_lost_position() {
     // The Startup process restores: controller near zero + meaningful DVAL.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
         "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
@@ -657,6 +668,7 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert!(
         (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
@@ -695,6 +707,7 @@ async fn limit_put_forward_reaches_driver() {
     setup.record.internal.init_invariants_synced = true;
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     setup
         .record
@@ -702,6 +715,7 @@ async fn limit_put_forward_reaches_driver() {
         .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(sim.lock().unwrap().forwarded_high_limit, Some(50.0));
 }
@@ -718,6 +732,7 @@ async fn pid_gain_put_forward_reaches_driver() {
     setup.device_support.init(&mut setup.record).unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     // SimMotor's status does not report gain support; model a
     // gain-capable controller the way C reads it — from MSTA.
@@ -728,6 +743,7 @@ async fn pid_gain_put_forward_reaches_driver() {
         .unwrap();
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(
         sim.lock().unwrap().pid_gains,
@@ -814,7 +830,10 @@ async fn failed_poll_posts_comms_error_status() {
     let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
 
     let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
-        poll_cmd_rx,
+        motor_rs::poll_loop::PollerInbox {
+            poll: poll_cmd_rx,
+            commands: mpsc::unbounded_channel().1,
+        },
         io_intr_tx,
         motor,
         device_state.clone(),
@@ -965,6 +984,7 @@ async fn pass0_restored_val_is_not_a_move_command() {
     // First status pass = Startup -> initial_readback -> RSTM restore.
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
+    setup.poll_loop.run_queued_commands();
 
     assert_eq!(
         setup.record.pos.val, 1.5,
@@ -985,4 +1005,112 @@ async fn pass0_restored_val_is_not_a_move_command() {
     let user = AsynUser::new(0);
     let st = motor.lock().unwrap().poll(&user).unwrap();
     assert_eq!(st.position, 1.5, "the controller was redefined, not moved");
+}
+
+/// A driver stuck in a serial/TCP read timeout blocks only the axis's
+/// `motorPoller` thread, as C runs `asynMotorPoller` and the port's queued
+/// writes on their own threads: neither its poll nor a move the record
+/// queues may hold the IOC runtime, here a single-threaded one.
+#[tokio::test]
+async fn blocked_driver_does_not_stall_the_ioc_runtime() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use asyn_rs::user::AsynUser;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Answers until `dead`, then every call sits out a read timeout.
+    struct DeadLine {
+        dead: Arc<AtomicBool>,
+    }
+    impl DeadLine {
+        fn wire(&self) {
+            if self.dead.load(Ordering::SeqCst) {
+                std::thread::sleep(TIMEOUT);
+            }
+        }
+    }
+    impl AsynMotor for DeadLine {
+        fn poll(&mut self, _user: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.wire();
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _user: &AsynUser,
+            _position: f64,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+        ) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn stop(&mut self, _user: &AsynUser, _accel: f64) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _max_vel: f64,
+            _accel: f64,
+            _forwards: bool,
+        ) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+        fn set_position(&mut self, _user: &AsynUser, _position: f64) -> Result<(), AsynError> {
+            self.wire();
+            Ok(())
+        }
+    }
+
+    let dead = Arc::new(AtomicBool::new(false));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DeadLine { dead: dead.clone() }));
+    let mut setup = make_builder(motor).build();
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    let poll_handle = tokio::spawn(setup.poll_loop.run());
+    dead.store(true, Ordering::SeqCst);
+
+    // Poll path: the forced poll sits in the dead read while the runtime
+    // keeps serving its other tasks.
+    setup
+        .poll_cmd_tx
+        .send(PollCommand::StartPolling)
+        .await
+        .unwrap();
+    let start = Instant::now();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        start.elapsed() < TIMEOUT / 2,
+        "a blocked poll held the runtime for {:?}",
+        start.elapsed()
+    );
+
+    // Command path: the record pass that dispatches a move returns at once.
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(1.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    let start = Instant::now();
+    setup.device_support.write(&mut setup.record).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        start.elapsed() < TIMEOUT / 2,
+        "a blocked move held the record pass and runtime for {:?}",
+        start.elapsed()
+    );
+
+    dead.store(false, Ordering::SeqCst);
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
 }

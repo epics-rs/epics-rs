@@ -157,6 +157,17 @@ async fn pid_gain_put_rides_its_pass_to_the_driver() {
     );
 }
 
+/// Stands in for the poller thread: runs the driver commands the record
+/// passes queued.
+fn run_queued(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<MotorCommand>>,
+    motor: &std::sync::Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>,
+) {
+    while let Ok(commands) = rx.try_recv() {
+        motor_rs::poll_loop::execute_commands(&mut *motor.lock().unwrap(), &commands);
+    }
+}
+
 /// A retry dispatch is emitted on a driver-callback (CALLBACK_DATA) pass —
 /// C `maybeRetry` arms MIP_RETRY and the same `dbProcess` re-enters
 /// `do_work`, whose move block re-fires through devMotorAsyn's write. The
@@ -244,11 +255,13 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // poll_cmd_rx is held alive so PollDirective sends succeed; the test
     // drives statuses by hand instead of running the poll loop.
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut dev = MotorDeviceSupport::new(
         motor.clone(),
         0,
         Duration::from_secs(1),
         poll_cmd_tx,
+        motor_cmd_tx,
         state.clone(),
     );
     {
@@ -270,11 +283,13 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
 
     // Move to 1.0 — the put pass dispatches, the driver undershoots.
     db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(moves.load(Ordering::SeqCst), 1, "put pass dispatched");
 
     // Completion callback pass: diff = 0.05 >= RDBD -> maybeRetry arms and
@@ -288,6 +303,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(
         moves.load(Ordering::SeqCst),
         2,
@@ -300,6 +316,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(
         db.get_pv("M1.DMOV").unwrap(),
         EpicsValue::Short(1),
@@ -399,11 +416,13 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     rec.stat.msta = MstaFlags::DONE;
 
     let (poll_cmd_tx, _poll_cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (motor_cmd_tx, mut motor_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut dev = MotorDeviceSupport::new(
         motor.clone(),
         0,
         Duration::from_secs(1),
         poll_cmd_tx,
+        motor_cmd_tx,
         state.clone(),
     );
     {
@@ -427,6 +446,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     db.put_record_field_from_ca_no_notify("M1", "VAL", EpicsValue::Double(1.0))
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
 
     assert_eq!(
         moves.load(Ordering::SeqCst),
@@ -461,6 +481,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(
         moves.load(Ordering::SeqCst),
         1,
@@ -473,6 +494,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
+    run_queued(&mut motor_cmd_rx, &motor);
     assert_eq!(db.get_pv("M1.DMOV").unwrap(), EpicsValue::Short(1));
     assert_eq!(db.get_pv("M1.MIP").unwrap(), EpicsValue::UShort(0));
     assert_eq!(db.get_pv("M1.RBV").unwrap(), EpicsValue::Double(1.0));

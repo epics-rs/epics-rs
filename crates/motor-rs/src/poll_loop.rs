@@ -3,9 +3,17 @@ use std::time::Duration;
 
 use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
 use asyn_rs::user::AsynUser;
-use tokio::sync::mpsc;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::device_state::*;
+use crate::flags::MotorCommand;
+
+/// Queue of driver commands from the device support to the poller thread.
+///
+/// Unbounded like the asyn request queue C `devMotorAsyn::build_trans` feeds,
+/// so a record pass never waits on the driver.
+pub type MotorCommandSender = mpsc::UnboundedSender<Vec<MotorCommand>>;
 
 /// Commands sent to the poll loop.
 #[derive(Debug)]
@@ -16,9 +24,22 @@ pub enum PollCommand {
     Shutdown,
 }
 
+/// The poller's two queues: poll control, and the driver commands a record
+/// pass queued (drained first, so a StartPolling sees their effect).
+pub struct PollerInbox {
+    pub poll: mpsc::Receiver<PollCommand>,
+    pub commands: mpsc::UnboundedReceiver<Vec<MotorCommand>>,
+}
+
 /// Motor poll loop — one per record, stays alive for the record's lifetime.
+///
+/// It is the only caller of the driver after `init`: polls and the record's
+/// commands both run on its own `motorPoller` OS thread (see [`Self::run`]),
+/// as C runs `asynMotorPoller` on an epicsThread, so a driver blocked on a
+/// dead serial line or TCP peer never stalls the IOC's async executor.
 pub struct MotorPollLoop {
     cmd_rx: mpsc::Receiver<PollCommand>,
+    motor_cmd_rx: mpsc::UnboundedReceiver<Vec<MotorCommand>>,
     io_intr_tx: mpsc::Sender<()>,
     motor: Arc<Mutex<dyn AsynMotor>>,
     device_state: SharedDeviceState,
@@ -40,7 +61,7 @@ pub struct MotorPollLoop {
 
 impl MotorPollLoop {
     pub fn new(
-        cmd_rx: mpsc::Receiver<PollCommand>,
+        inbox: PollerInbox,
         io_intr_tx: mpsc::Sender<()>,
         motor: Arc<Mutex<dyn AsynMotor>>,
         device_state: SharedDeviceState,
@@ -49,7 +70,8 @@ impl MotorPollLoop {
         forced_fast_polls: u32,
     ) -> Self {
         Self {
-            cmd_rx,
+            cmd_rx: inbox.poll,
+            motor_cmd_rx: inbox.commands,
             io_intr_tx,
             motor,
             device_state,
@@ -60,6 +82,21 @@ impl MotorPollLoop {
             last_moving: false,
             status_seq: 1, // starts at 1 (init already wrote seq=1)
             last_status: None,
+        }
+    }
+
+    /// Run the commands queued so far on the calling thread: for a harness
+    /// standing in for the poller thread. The IOC path is [`Self::run`].
+    pub fn run_queued_commands(&mut self) {
+        while let Ok(commands) = self.motor_cmd_rx.try_recv() {
+            self.execute(&commands);
+        }
+    }
+
+    fn execute(&self, commands: &[MotorCommand]) {
+        match self.motor.lock() {
+            Ok(mut motor) => execute_commands(&mut *motor, commands),
+            Err(e) => tracing::error!("motor lock poisoned: {e}"),
         }
     }
 
@@ -159,10 +196,13 @@ impl MotorPollLoop {
     /// Spawn a settle-delay timer as an independent task so the `select!`
     /// loop keeps servicing commands (Shutdown/Stop/Start) while the delay
     /// runs. On expiry it records `expired_delay_id` and pulses io_intr.
-    fn spawn_delay(&self, delay_id: u64, dur: Duration) {
+    ///
+    /// The timer runs on the IOC runtime (`ioc`), not on the poller thread, so
+    /// a driver call blocked there cannot hold the settle delay past expiry.
+    fn spawn_delay(&self, ioc: &Handle, delay_id: u64, dur: Duration) {
         let device_state = self.device_state.clone();
         let io_intr_tx = self.io_intr_tx.clone();
-        tokio::spawn(async move {
+        ioc.spawn(async move {
             tokio::time::sleep(dur).await;
             match device_state.lock() {
                 Ok(mut ds) => ds.expired_delay_id = Some(delay_id),
@@ -186,8 +226,33 @@ impl MotorPollLoop {
         }
     }
 
-    /// Run the poll loop. Call from a spawned task.
-    pub async fn run(mut self) {
+    /// Run the poll loop on a dedicated `motorPoller` thread until Shutdown;
+    /// the returned future completes when that thread ends. Call from a task
+    /// on the IOC runtime, which keeps the settle-delay timers.
+    pub async fn run(self) {
+        let ioc = Handle::current();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("motorPoller".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(self.serve(ioc)),
+                    Err(e) => tracing::error!("motorPoller: runtime build failed: {e}"),
+                }
+                drop(done_tx);
+            });
+        match spawned {
+            Ok(_) => {
+                let _ = done_rx.await;
+            }
+            Err(e) => tracing::error!("motorPoller: thread create failed: {e}"),
+        }
+    }
+
+    async fn serve(mut self, ioc: Handle) {
         // Start idle: device support init() sends StartPolling after
         // iocInit, matching C EPICS where the poller starts in init_record.
         let mut active = false;
@@ -197,6 +262,8 @@ impl MotorPollLoop {
                 // Poll mode: check for commands or poll on interval
                 let interval = self.effective_poll_interval();
                 tokio::select! {
+                    biased;
+                    Some(commands) = self.motor_cmd_rx.recv() => self.execute(&commands),
                     cmd = self.cmd_rx.recv() => {
                         match cmd {
                             Some(PollCommand::StartPolling) => {
@@ -211,7 +278,7 @@ impl MotorPollLoop {
                             }
                             Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
                                 active = false;
-                                self.spawn_delay(delay_id, dur);
+                                self.spawn_delay(&ioc, delay_id, dur);
                             }
                             Some(PollCommand::Shutdown) => {
                                 return;
@@ -233,7 +300,15 @@ impl MotorPollLoop {
                 }
             } else {
                 // Idle mode: wait for commands only
-                match self.cmd_rx.recv().await {
+                let cmd = tokio::select! {
+                    biased;
+                    Some(commands) = self.motor_cmd_rx.recv() => {
+                        self.execute(&commands);
+                        continue;
+                    }
+                    cmd = self.cmd_rx.recv() => cmd,
+                };
+                match cmd {
                     Some(PollCommand::StartPolling) => {
                         active = true;
                         self.forced_fast_polls_remaining = self.forced_fast_polls_config;
@@ -244,13 +319,124 @@ impl MotorPollLoop {
                         active = false;
                     }
                     Some(PollCommand::ScheduleDelay(delay_id, dur)) => {
-                        self.spawn_delay(delay_id, dur);
+                        self.spawn_delay(&ioc, delay_id, dur);
                     }
                     Some(PollCommand::Shutdown) | None => {
                         return;
                     }
                 }
             }
+        }
+    }
+}
+
+/// Run `commands` against the driver in order. Only the poller thread calls
+/// this outside tests, so a blocking driver stalls nothing but that thread.
+pub fn execute_commands(motor: &mut dyn AsynMotor, commands: &[MotorCommand]) {
+    let user = AsynUser::new(0);
+    for cmd in commands {
+        let result = match cmd {
+            MotorCommand::MoveAbsolute {
+                position,
+                min_velocity,
+                velocity,
+                acceleration,
+            } => {
+                tracing::info!("motor command: MoveAbsolute pos={position}, vel={velocity}");
+                motor.move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
+            }
+            MotorCommand::MoveRelative {
+                distance,
+                min_velocity,
+                velocity,
+                acceleration,
+            } => {
+                tracing::info!("motor command: MoveRelative dist={distance}, vel={velocity}");
+                motor.move_relative(&user, *distance, *min_velocity, *velocity, *acceleration)
+            }
+            MotorCommand::MoveVelocity {
+                direction,
+                min_velocity,
+                velocity,
+                acceleration,
+            } => {
+                let signed_vel = if *direction { *velocity } else { -*velocity };
+                tracing::info!("motor command: MoveVelocity dir={direction}, vel={velocity}");
+                motor.move_velocity(&user, *min_velocity, signed_vel, *acceleration)
+            }
+            MotorCommand::Home {
+                forward,
+                min_velocity,
+                velocity,
+                acceleration,
+            } => {
+                tracing::info!("motor command: Home forward={forward}");
+                motor.home(&user, *min_velocity, *velocity, *acceleration, *forward)
+            }
+            MotorCommand::Stop { acceleration } => {
+                tracing::info!("motor command: Stop");
+                motor.stop(&user, *acceleration)
+            }
+            MotorCommand::SetPosition { position } => {
+                tracing::info!("motor command: SetPosition pos={position}");
+                motor.set_position(&user, *position)
+            }
+            MotorCommand::SetClosedLoop { enable } => {
+                tracing::info!("motor command: SetClosedLoop enable={enable}");
+                motor.set_closed_loop(&user, *enable)
+            }
+            MotorCommand::DeferMoves { defer } => {
+                tracing::info!("motor command: DeferMoves defer={defer}");
+                motor.set_deferred_moves(&user, *defer)
+            }
+            MotorCommand::ProfileInitialize { max_points } => {
+                tracing::info!("motor command: ProfileInitialize max_points={max_points}");
+                motor.initialize_profile(&user, *max_points)
+            }
+            MotorCommand::ProfileBuild => {
+                tracing::info!("motor command: ProfileBuild");
+                motor.build_profile(&user)
+            }
+            MotorCommand::ProfileExecute => {
+                tracing::info!("motor command: ProfileExecute");
+                motor.execute_profile(&user)
+            }
+            MotorCommand::ProfileAbort => {
+                tracing::info!("motor command: ProfileAbort");
+                motor.abort_profile(&user)
+            }
+            MotorCommand::ProfileReadback => {
+                tracing::info!("motor command: ProfileReadback");
+                motor.readback_profile(&user).map(|_| ())
+            }
+            MotorCommand::MoveToHome {
+                position,
+                min_velocity,
+                velocity,
+                acceleration,
+            } => {
+                tracing::info!(
+                    "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
+                );
+                motor.move_to_home(&user, *position, *min_velocity, *velocity, *acceleration)
+            }
+            MotorCommand::SetPidGain { kind, gain } => {
+                tracing::info!("motor command: SetPidGain kind={kind:?} gain={gain}");
+                motor.set_pid_gain(&user, *kind, *gain)
+            }
+            MotorCommand::SetHighLimit { position } => {
+                tracing::info!("motor command: SetHighLimit pos={position}");
+                motor.set_high_limit(&user, *position)
+            }
+            MotorCommand::SetLowLimit { position } => {
+                tracing::info!("motor command: SetLowLimit pos={position}");
+                motor.set_low_limit(&user, *position)
+            }
+            MotorCommand::Poll => Ok(()),
+        };
+
+        if let Err(e) = result {
+            tracing::error!("motor command error: {e}");
         }
     }
 }

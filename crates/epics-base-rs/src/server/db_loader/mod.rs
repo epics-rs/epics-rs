@@ -4841,7 +4841,7 @@ record(ai, "T") { field(LINR, "typeJdegC") }
 
     #[test]
     fn test_sub_record_register_and_call() {
-        use crate::server::record::{Record, RecordInstance, SubroutineFn};
+        use crate::server::record::{Record, RecordInstance, Subroutine, SubroutineFn};
         use crate::server::records::sub_record::SubRecord;
         use std::sync::Arc;
 
@@ -4857,7 +4857,7 @@ record(ai, "T") { field(LINR, "typeJdegC") }
             }
             Ok(0)
         });
-        instance.subroutine = Some(Arc::new(sub_fn));
+        instance.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
 
         instance.process_local().unwrap();
 

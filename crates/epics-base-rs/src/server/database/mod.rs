@@ -19,6 +19,7 @@ mod record_lock;
 mod record_table;
 pub(crate) mod scan_index;
 mod snapshot;
+mod subroutine_context;
 
 pub use ca_link::CA_LINK_EVENT_MASK;
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
@@ -45,6 +46,8 @@ pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, scan_lock_held,
 };
 pub(crate) use record_table::RecordIdx;
+pub(crate) use subroutine_context::RecordDb;
+pub use subroutine_context::SubroutineContext;
 
 use crate::error::{CaError, CaResult};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -915,7 +918,7 @@ struct PvDatabaseInner {
     /// (§3 row L8j). `OnceLock` was rejected: install is a `pub async fn` that
     /// tests and a second `iocInit` may call again, and `OnceLock` would
     /// silently drop the second registry instead of replacing it.
-    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::Subroutine>>>,
     /// C's process-global device support table, seen through
     /// `dbDTYPtoDevSup`: the lookup `doInitRecord0` makes to fill
     /// `precord->dset` BEFORE it calls `prset->init_record(precord, 0)`
@@ -1665,7 +1668,7 @@ impl PvDatabase {
     /// IocApp/IocBuilder registry. See `Self::find_subroutine_named`.
     pub async fn install_subroutine_registry(
         &self,
-        registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
+        registry: HashMap<String, Arc<crate::server::record::Subroutine>>,
     ) {
         self.inner.subroutine_registry.store(Arc::new(registry));
     }
@@ -1718,7 +1721,7 @@ impl PvDatabase {
     pub(crate) fn find_subroutine_named(
         &self,
         name: &str,
-    ) -> Option<Arc<crate::server::record::SubroutineFn>> {
+    ) -> Option<Arc<crate::server::record::Subroutine>> {
         self.inner.subroutine_registry.load().get(name).cloned()
     }
 
@@ -3350,6 +3353,7 @@ impl PvDatabase {
 
         // After the load, so the cell starts on the loaded `PRIO`.
         instance.device_done = crate::server::database::DeviceDone::new(self, &instance);
+        instance.set_record_db(RecordDb::of(self));
 
         // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
         // calls `init_record(pass 0)`. Both lines are here, in that order,

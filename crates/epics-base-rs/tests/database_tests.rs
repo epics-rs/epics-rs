@@ -9562,7 +9562,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
             }
             Ok(0)
         });
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     // Drive the MAIN engine path (not process_local).
@@ -9614,7 +9614,7 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
             record.put_field("VAL", EpicsValue::Double(100.0))?;
             Ok(0)
         });
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     for name in ["SUB_HIHI", "SUB_OK"] {
@@ -9766,7 +9766,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
                 status
             })
         });
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     for name in ["SUB_SOFT", "SUB_OK0"] {
@@ -9831,7 +9831,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
             record.put_field("VAL", EpicsValue::Double(999.0))?;
             Ok(42)
         });
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
     {
         let arc = db.get_record("ASUB_NEG").unwrap();
@@ -9840,7 +9840,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
             .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
             .unwrap();
         let sub_fn: SubroutineFn = Box::new(|_record: &mut dyn Record| Ok(-5));
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     for name in ["ASUB_POS", "ASUB_NEG"] {
@@ -9910,7 +9910,7 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
             record.put_field("VALA", EpicsValue::DoubleArray(v.into()))?;
             Ok(0)
         });
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     let mut rx = {
@@ -9973,10 +9973,12 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
 
     // Two registered subroutines; each publishes its identity via VAL (the
     // aSub return-status -> VAL contract, C `aSubRecord.c:224`).
-    let mk = |status: i64| -> Arc<SubroutineFn> {
-        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    let mk = |status: i64| -> Arc<Subroutine> {
+        Arc::new(Subroutine::Plain(Box::new(move |_: &mut dyn Record| {
+            Ok(status)
+        })))
     };
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("sub_a".into(), mk(11));
     registry.insert("sub_b".into(), mk(22));
     db.install_subroutine_registry(registry).await;
@@ -10202,10 +10204,12 @@ async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     use std::collections::HashMap;
 
     let db = PvDatabase::new();
-    let mk = |status: i64| -> Arc<SubroutineFn> {
-        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    let mk = |status: i64| -> Arc<Subroutine> {
+        Arc::new(Subroutine::Plain(Box::new(move |_: &mut dyn Record| {
+            Ok(status)
+        })))
     };
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("sub_a".into(), mk(11));
     registry.insert("sub_b".into(), mk(22));
     db.install_subroutine_registry(registry).await;

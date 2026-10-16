@@ -22,7 +22,7 @@ use super::menu_choices::MenuBound;
 use super::record_trait::{
     AuxPostMask, CommonFieldPutResult, DeclaredFields, EnumSlots, FieldDeclaration, FieldDesc,
     InputLinkRequest, LinkReadAs, PostName, PostStage, PostedValue, ProcessSnapshot, Record,
-    RecordProcessResult, SubroutineFn,
+    RecordProcessResult, Subroutine,
 };
 use super::scan::{ScanType, SimModeScan};
 
@@ -4739,7 +4739,7 @@ pub struct RecordInstance {
     /// C `prec->dpvt` for the soft dsets; see [`Dpvt`](crate::server::device_support::Dpvt).
     pub dpvt: crate::server::device_support::Dpvt,
     // Subroutine (for sub records)
-    pub subroutine: Option<Arc<SubroutineFn>>,
+    pub subroutine: Option<Arc<Subroutine>>,
     /// Generation counter for ReprocessAfter timer cancellation.
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
@@ -4924,7 +4924,14 @@ struct RecordCold {
     /// that, while only the database holds the registry. Resolving from
     /// outside the passes, as both builders used to, put the lookup after the
     /// tail it is supposed to skip.
-    init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
+    init_subroutines: Option<Arc<HashMap<String, Arc<Subroutine>>>>,
+    /// The database a [`Subroutine::Context`] routine reaches; set at
+    /// creation beside `device_done`.
+    db: crate::server::database::RecordDb,
+    /// What a [`Subroutine::Context`] routine stored as C `prec->dpvt`. Not
+    /// a [`Dpvt`](crate::server::device_support::Dpvt) variant: a boxed `dyn`
+    /// there makes every soft-input read's `Dpvt` overwrite an outlined drop.
+    subroutine_pvt: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// Published values for the fields [`RecordInstance::collect_subscriber_posts`]'s
     /// change-detection walk SKIPS whatever happens — the deadband field, the
     /// `recGblResetAlarms` set, `UDF`, and the record's event-posted fields.
@@ -6698,6 +6705,8 @@ impl RecordInstance {
             cold: Box::new(RecordCold {
                 cell: std::sync::Weak::new(),
                 init_subroutines: None,
+                db: Default::default(),
+                subroutine_pvt: None,
                 skipped_posted: SkippedLog::default(),
                 declared_overrides: HashMap::new(),
                 link_backed_metadata_links,
@@ -6769,11 +6778,27 @@ impl RecordInstance {
     /// Hand the record the function registry its pending init pass 1 resolves
     /// INAM/SNAM against. The creation sink's line; see
     /// [`RecordCold::init_subroutines`].
-    pub(crate) fn arm_init_subroutines(
-        &mut self,
-        registry: Arc<HashMap<String, Arc<SubroutineFn>>>,
-    ) {
+    pub(crate) fn arm_init_subroutines(&mut self, registry: Arc<HashMap<String, Arc<Subroutine>>>) {
         self.cold.init_subroutines = Some(registry);
+    }
+
+    pub(crate) fn set_record_db(&mut self, db: crate::server::database::RecordDb) {
+        self.cold.db = db;
+    }
+
+    /// C `(*psubroutine)(prec)`, for INAM at init and SNAM in `do_sub`.
+    pub(crate) fn call_subroutine(&mut self, sub: &Subroutine) -> CaResult<i64> {
+        match sub {
+            Subroutine::Plain(f) => f(&mut *self.record),
+            Subroutine::Context(f) => {
+                let mut ctx = crate::server::database::SubroutineContext {
+                    name: &self.name,
+                    db: &self.cold.db,
+                    pvt: &mut self.cold.subroutine_pvt,
+                };
+                f(&mut *self.record, &mut ctx)
+            }
+        }
     }
 
     /// C's `if (!pdset) { recGblRecordError(S_dev_noDSET, prec, "init_record");
@@ -10488,7 +10513,7 @@ impl RecordInstance {
             });
         };
         // C `do_sub` returns the subroutine's `long` status.
-        let status = sub_fn(&mut *self.record)?;
+        let status = self.call_subroutine(&sub_fn)?;
 
         // A negative status raises SOFT_ALARM at the record's BRSV severity
         // (C `do_sub`: `if (status < 0) recGblSetSevr(SOFT_ALARM,

@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod config_menu;
 pub mod error;
 pub mod format;
 pub mod iocsh;

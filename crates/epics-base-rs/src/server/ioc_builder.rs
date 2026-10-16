@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::ERL_ERROR;
-use crate::server::record::{Record, SubroutineFn};
+use crate::server::record::{ContextSubroutineFn, Record, Subroutine};
 use crate::types::EpicsValue;
 
 use super::cvt_bpt::BrkTable;
@@ -44,7 +44,7 @@ pub struct IocBuilder {
     /// dispatch) work in both build paths.
     dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, RecordFactory>,
-    subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
+    subroutine_registry: HashMap<String, Arc<Subroutine>>,
     autosave_config: Option<autosave::SaveSetConfig>,
     link_set_installers: Vec<crate::server::ioc_app::LinkSetInstaller>,
     /// The link types those installers serve ([`Self::register_link_type`]).
@@ -284,8 +284,18 @@ impl IocBuilder {
     where
         F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
+        self.subroutine_registry.insert(
+            name.to_string(),
+            Arc::new(Subroutine::Plain(Box::new(func))),
+        );
+        self
+    }
+
+    /// [`Self::register_subroutine`] for a routine that also needs its
+    /// record's name, `dpvt` or database ([`Subroutine::Context`]).
+    pub fn register_context_subroutine(mut self, name: &str, func: ContextSubroutineFn) -> Self {
         self.subroutine_registry
-            .insert(name.to_string(), Arc::new(Box::new(func)));
+            .insert(name.to_string(), Arc::new(Subroutine::Context(func)));
         self
     }
 

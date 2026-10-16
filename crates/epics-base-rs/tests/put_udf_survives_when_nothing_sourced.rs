@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::server::records::lsi::LsiRecord;
@@ -107,13 +107,13 @@ async fn asub_udf_put_survives_without_subroutine() {
 async fn asub_clears_udf_when_subroutine_runs() {
     let db = PvDatabase::new();
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert(
         "writer".into(),
-        Arc::new(Box::new(|rec: &mut dyn Record| {
+        Arc::new(Subroutine::Plain(Box::new(|rec: &mut dyn Record| {
             rec.put_field("VALA", EpicsValue::Double(42.0))?;
             Ok(0_i64)
-        }) as SubroutineFn),
+        }))),
     );
     db.install_subroutine_registry(registry).await;
 

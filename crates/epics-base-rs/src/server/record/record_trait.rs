@@ -7780,6 +7780,22 @@ pub(crate) fn served_element_size<R: Record + ?Sized>(
 /// processing — it is distinct from a negative status.
 pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync>;
 
+/// A subroutine that also sees what C's reaches through `prec` besides the
+/// fields: its record's name, `dpvt`, and the IOC it takes `dbScanLock` and
+/// `scanOnce` against (autosave's `configMenuSub.c`).
+pub type ContextSubroutineFn = Box<
+    dyn Fn(&mut dyn Record, &mut crate::server::database::SubroutineContext<'_>) -> CaResult<i64>
+        + Send
+        + Sync,
+>;
+
+/// A registered `INAM`/`SNAM` function. The kind is fixed at registration,
+/// so a record resolves it once and `do_sub` only dispatches.
+pub enum Subroutine {
+    Plain(SubroutineFn),
+    Context(ContextSubroutineFn),
+}
+
 #[cfg(test)]
 mod declaration_numbering_tests {
     use super::*;

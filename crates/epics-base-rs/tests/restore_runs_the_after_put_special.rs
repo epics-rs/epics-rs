@@ -45,18 +45,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// A `sub` subroutine that writes `marker` into VAL, so VAL names which
 /// routine actually ran.
-fn writes_val(marker: f64) -> Arc<SubroutineFn> {
-    Arc::new(Box::new(move |rec: &mut dyn Record| {
+fn writes_val(marker: f64) -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(move |rec: &mut dyn Record| {
         rec.put_field("VAL", EpicsValue::Double(marker))?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -111,7 +111,7 @@ async fn a_restored_calc_recompiles_the_expression() {
 #[epics_macros_rs::epics_test]
 async fn a_restored_snam_rebinds_the_subroutine() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     registry.insert("fnB".into(), writes_val(2.0));
     db.install_subroutine_registry(registry.clone()).await;
@@ -151,7 +151,7 @@ async fn a_restored_snam_rebinds_the_subroutine() {
 #[epics_macros_rs::epics_test]
 async fn a_restored_unregistered_snam_fails_the_put() {
     let db = PvDatabase::new();
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("fnA".into(), writes_val(1.0));
     db.install_subroutine_registry(registry.clone()).await;
 

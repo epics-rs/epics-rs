@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::stringout::StringoutRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
@@ -61,10 +61,10 @@ async fn asub_db() -> PvDatabase {
         .await
         .unwrap();
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert(
         "check".into(),
-        Arc::new(Box::new(|_: &mut dyn Record| Ok(0i64)) as SubroutineFn),
+        Arc::new(Subroutine::Plain(Box::new(|_: &mut dyn Record| Ok(0i64)))),
     );
     db.install_subroutine_registry(registry).await;
     db.add_record("NAME_HOLDER", Box::new(StringoutRecord::new("check")))

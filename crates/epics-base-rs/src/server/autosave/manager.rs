@@ -459,6 +459,22 @@ impl AutosaveManager {
             .map(|(s, l)| (s.clone(), l.clone()))
     }
 
+    /// The set built from `request_file`, as C matches `plist->reqFile`
+    /// (`getMacroString`, `op_SaveFile`).
+    pub fn find_set_by_request_file(&self, request_file: &str) -> Option<SetEntry> {
+        self.sets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(s, _)| {
+                s.config()
+                    .request_file
+                    .as_deref()
+                    .is_some_and(|f| f == std::path::Path::new(request_file))
+            })
+            .map(|(s, l)| (s.clone(), l.clone()))
+    }
+
     /// A snapshot of the built sets.
     pub fn sets(&self) -> Vec<SetEntry> {
         self.sets.lock().unwrap().clone()

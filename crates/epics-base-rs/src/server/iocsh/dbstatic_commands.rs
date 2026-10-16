@@ -2180,15 +2180,14 @@ variable(seqDLYprecision,int)
 
         let mut registry: std::collections::HashMap<
             String,
-            Arc<crate::server::record::SubroutineFn>,
+            Arc<crate::server::record::Subroutine>,
         > = std::collections::HashMap::new();
         for name in ["mySubZebra", "mySubAlpha"] {
             registry.insert(
                 name.to_string(),
-                Arc::new(
-                    Box::new(|_r: &mut dyn crate::server::record::Record| Ok(0i64))
-                        as crate::server::record::SubroutineFn,
-                ),
+                Arc::new(crate::server::record::Subroutine::Plain(Box::new(
+                    |_r: &mut dyn crate::server::record::Record| Ok(0i64),
+                ))),
             );
         }
         ctx.block_on(db.install_subroutine_registry(registry));

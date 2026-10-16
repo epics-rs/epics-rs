@@ -1000,7 +1000,7 @@ struct AsubDynamicSub {
     snam: Option<String>,
     /// `Some` → swap the live subroutine and set ONAM to `snam` (the name
     /// changed and was found in the registry).
-    swap: Option<Arc<crate::server::record::SubroutineFn>>,
+    swap: Option<Arc<crate::server::record::Subroutine>>,
     /// `true` → do not run the subroutine this cycle, matching C skipping
     /// `do_sub`: the link read failed, or the changed name was not registered
     /// (`S_db_BadSub`).

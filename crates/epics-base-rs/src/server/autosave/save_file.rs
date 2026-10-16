@@ -225,7 +225,7 @@ fn has_end_marker(content: &str) -> bool {
     false
 }
 
-fn parse_save_content(content: &str) -> SaveFileContents {
+pub(super) fn parse_save_content(content: &str) -> SaveFileContents {
     let mut out = SaveFileContents::default();
 
     for (idx, raw) in content.lines().enumerate() {

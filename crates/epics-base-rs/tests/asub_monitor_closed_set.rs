@@ -37,7 +37,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -52,12 +52,12 @@ const FT_DOUBLE: i16 = 10;
 
 /// Copies the input channel `A` into the output channel `VALA`, so one cycle
 /// moves both sides at once.
-fn copy_a_to_vala() -> Arc<SubroutineFn> {
-    Arc::new(Box::new(|rec: &mut dyn Record| {
+fn copy_a_to_vala() -> Arc<Subroutine> {
+    Arc::new(Subroutine::Plain(Box::new(|rec: &mut dyn Record| {
         let a = rec.get_field("A").unwrap_or(EpicsValue::Double(0.0));
         rec.put_field("VALA", a)?;
         Ok(0_i64)
-    }) as SubroutineFn)
+    })))
 }
 
 async fn process(db: &PvDatabase, name: &str) {
@@ -96,7 +96,7 @@ async fn asub_reading_a_waveform(eflg: i16) -> PvDatabase {
         .unwrap();
     db.add_record("X", Box::new(x)).await.unwrap();
 
-    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    let mut registry: HashMap<String, Arc<Subroutine>> = HashMap::new();
     registry.insert("copy".into(), copy_a_to_vala());
     db.install_subroutine_registry(registry.clone()).await;
     db.get_record("X").unwrap().write().subroutine = registry.get("copy").cloned();
@@ -165,11 +165,11 @@ async fn asub_val_posts_in_every_eflg_arm() {
     for eflg in [EFLG_NEVER, EFLG_ON_CHANGE, EFLG_ALWAYS] {
         let db = asub_reading_a_waveform(eflg).await;
         // A subroutine whose return status moves 0 -> 3 on the second cycle.
-        let bump: Arc<SubroutineFn> = {
+        let bump: Arc<Subroutine> = {
             let seen = std::sync::atomic::AtomicI64::new(0);
-            Arc::new(Box::new(move |_rec: &mut dyn Record| {
+            Arc::new(Subroutine::Plain(Box::new(move |_rec: &mut dyn Record| {
                 Ok(seen.fetch_add(3, std::sync::atomic::Ordering::Relaxed))
-            }) as SubroutineFn)
+            })))
         };
         db.get_record("X").unwrap().write().subroutine = Some(bump);
 

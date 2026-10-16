@@ -497,11 +497,12 @@ mod tests {
             "(nil)",
             "nothing is registered yet"
         );
-        let mut registry: HashMap<String, Arc<crate::server::record::SubroutineFn>> =
-            HashMap::new();
+        let mut registry: HashMap<String, Arc<crate::server::record::Subroutine>> = HashMap::new();
         registry.insert(
             "mySub".to_string(),
-            Arc::new(Box::new(|_r: &mut dyn crate::server::record::Record| Ok(0))),
+            Arc::new(crate::server::record::Subroutine::Plain(Box::new(
+                |_r: &mut dyn crate::server::record::Record| Ok(0),
+            ))),
         );
         ctx.block_on(ctx.db().install_subroutine_registry(registry));
         assert_ne!(

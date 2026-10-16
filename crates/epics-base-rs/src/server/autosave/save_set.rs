@@ -236,6 +236,40 @@ impl SaveSet {
         Ok(entries)
     }
 
+    /// Every member's current value in this set's file encoding, an
+    /// unreachable member as `connected: false`.
+    fn collect_entries(&self, db: &PvDatabase) -> Vec<SaveEntry> {
+        self.pv_names()
+            .into_iter()
+            .map(|pv| match db.get_pv(&pv) {
+                Ok(val) => SaveEntry {
+                    value: match self.compat {
+                        CompatMode::Native => save_file::value_to_save_str(&val),
+                        CompatMode::CRead => save_file::value_to_save_str_c(&val),
+                    },
+                    pv_name: pv,
+                    connected: true,
+                },
+                Err(_) => SaveEntry {
+                    pv_name: pv,
+                    value: String::new(),
+                    connected: false,
+                },
+            })
+            .collect()
+    }
+
+    /// C `write_save_file(plist, configName, ...)` with a `configName`:
+    /// this set's values written to `path` alone, with no backups and no
+    /// change to the set's own file or status. Returns how many members
+    /// could not be read.
+    pub async fn save_to(&self, db: &PvDatabase, path: &std::path::Path) -> AutosaveResult<usize> {
+        let entries = self.collect_entries(db);
+        let missing = entries.iter().filter(|e| !e.connected).count();
+        write_save_file_with_mode(path, &entries, self.compat).await?;
+        Ok(missing)
+    }
+
     /// Perform one save cycle: collect PV values -> guarantee `.savB` ->
     /// write `.sav` -> advance `.savB`.
     pub async fn save_once(&self, db: &PvDatabase) -> AutosaveResult<usize> {
@@ -247,34 +281,7 @@ impl SaveSet {
         // Collect PV values. Read before the rotation because the `.savB`
         // that C writes when the old one is unusable is written from the
         // values about to be saved, not copied from a file.
-        let pv_names = self.pv_names();
-        let mut save_entries = Vec::with_capacity(pv_names.len());
-
-        for pv in &pv_names {
-            match db.get_pv(pv) {
-                Ok(val) => {
-                    // Encode the value in the configured format so
-                    // the `.sav` file matches the header banner the
-                    // file is written with.
-                    let value = match self.compat {
-                        CompatMode::Native => save_file::value_to_save_str(&val),
-                        CompatMode::CRead => save_file::value_to_save_str_c(&val),
-                    };
-                    save_entries.push(SaveEntry {
-                        pv_name: pv.clone(),
-                        value,
-                        connected: true,
-                    });
-                }
-                Err(_) => {
-                    save_entries.push(SaveEntry {
-                        pv_name: pv.clone(),
-                        value: String::new(),
-                        connected: false,
-                    });
-                }
-            }
-        }
+        let save_entries = self.collect_entries(db);
 
         let saved_count = save_entries.iter().filter(|e| e.connected).count();
 
@@ -507,7 +514,43 @@ pub async fn restore_from_entries_with_mode(
             path: path.display().to_string(),
             message: "missing <END> marker".to_string(),
         })?;
+    Ok(restore_contents(db, path, &contents, mode).await)
+}
 
+/// C `fdbrestoreX`'s `do_manual_restore(file, FROM_ASCII_FILE, macros)`
+/// (save_restore.c:3195): no header to skip and no `<END>` required, each
+/// line macro-expanded with the set's macros before it is parsed, every
+/// value written with `dbPutField`.
+pub async fn restore_ascii_file(
+    db: &PvDatabase,
+    path: &std::path::Path,
+    macros: &HashMap<String, String>,
+) -> AutosaveResult<RestoreResult> {
+    let text = crate::runtime::fs::read_to_string(path).await?;
+    // Line by line, as C's `fgets` + `macExpandString`: an unterminated
+    // reference must not swallow the lines after it. An undefined one stays
+    // as text, and the put to the name it leaves fails and counts.
+    let text = if macros.is_empty() {
+        text
+    } else {
+        text.split_inclusive('\n')
+            .map(|line| {
+                crate::server::db_loader::expand_macros(line, macros, Default::default()).text
+            })
+            .collect()
+    };
+    let contents = save_file::parse_save_content(&text);
+    Ok(restore_contents(db, path, &contents, RestoreMode::Process).await)
+}
+
+/// Write every entry of a parsed file into the database; one failed put
+/// does not stop the rest.
+async fn restore_contents(
+    db: &PvDatabase,
+    path: &std::path::Path,
+    contents: &save_file::SaveFileContents,
+    mode: RestoreMode,
+) -> RestoreResult {
     let mut result = RestoreResult {
         source_file: path.to_path_buf(),
         restored: 0,
@@ -516,7 +559,7 @@ pub async fn restore_from_entries_with_mode(
         not_found: Vec::new(),
         disconnected_skipped: Vec::new(),
         not_connected_at_save: contents.not_connected,
-        malformed_lines: contents.malformed,
+        malformed_lines: contents.malformed.clone(),
     };
     if result.not_connected_at_save > 0 {
         // C logs this and marks the set WARN
@@ -581,5 +624,5 @@ pub async fn restore_from_entries_with_mode(
         }
     }
 
-    Ok(result)
+    result
 }

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::net::cas_server_port;
-use crate::server::record::{self, Record, SubroutineFn};
+use crate::server::record::{self, ContextSubroutineFn, Record, Subroutine};
 
 use crate::server::database::PvDatabase;
 use crate::server::device_support::DeviceSupport;
@@ -1798,7 +1798,7 @@ pub struct IocApplication {
     device_factories: HashMap<String, DeviceSupportFactory>,
     dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
     record_factories: HashMap<String, super::RecordFactory>,
-    subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
+    subroutine_registry: HashMap<String, Arc<Subroutine>>,
     acf: Option<access_security::AccessSecurityConfig>,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
@@ -2095,8 +2095,18 @@ impl IocApplication {
     where
         F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
+        self.subroutine_registry.insert(
+            name.to_string(),
+            Arc::new(Subroutine::Plain(Box::new(func))),
+        );
+        self
+    }
+
+    /// [`Self::register_subroutine`] for a routine that also needs its
+    /// record's name, `dpvt` or database ([`Subroutine::Context`]).
+    pub fn register_context_subroutine(mut self, name: &str, func: ContextSubroutineFn) -> Self {
         self.subroutine_registry
-            .insert(name.to_string(), Arc::new(Box::new(func)));
+            .insert(name.to_string(), Arc::new(Subroutine::Context(func)));
         self
     }
 
@@ -2233,7 +2243,7 @@ impl IocApplication {
             device_factories,
             dynamic_device_factory,
             record_factories,
-            subroutine_registry,
+            mut subroutine_registry,
             acf,
             autosave_config,
             autosave_startup,
@@ -2277,6 +2287,12 @@ impl IocApplication {
         if let Some(ref config) = autosave_startup {
             let cmds = AutosaveStartupConfig::register_startup_commands(config.clone());
             commands.extend(cmds);
+            // C asSupport.dbd's `configMenuRegistrar`.
+            for (name, func) in crate::server::autosave::config_menu::subroutines(config.clone()) {
+                subroutine_registry
+                    .entry(name.to_string())
+                    .or_insert_with(|| Arc::new(Subroutine::Context(func)));
+            }
         }
 
         // Register the QSRV `dbLoadGroup` startup command so a
@@ -2751,7 +2767,7 @@ pub(crate) fn attach_device_support(
 pub(crate) fn wire_subroutine(
     instance: &mut record::RecordInstance,
     name: &str,
-    registry: &HashMap<String, Arc<SubroutineFn>>,
+    registry: &HashMap<String, Arc<Subroutine>>,
 ) -> bool {
     // Both `sub` and `aSub` resolve their subroutine from SNAM via the
     // function registry at init (C `registryFunctionFind`).
@@ -2779,7 +2795,7 @@ pub(crate) fn wire_subroutine(
             // `subRecord.c:116`, `aSubRecord.c:143`: the status is dropped
             // and nothing is printed, whatever the routine returned.
             let init_fn = init_fn.clone();
-            let _ = init_fn(&mut *instance.record);
+            let _ = instance.call_subroutine(&init_fn);
         }
     }
     // C resolves SNAM at init only for a record that will USE the resolution:

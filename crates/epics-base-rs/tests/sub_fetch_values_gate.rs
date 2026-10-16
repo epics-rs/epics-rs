@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{Record, SubroutineFn};
+use epics_base_rs::server::record::{Record, Subroutine, SubroutineFn};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::sub_record::SubRecord;
@@ -78,7 +78,7 @@ async fn sub_db(inpb: &str) -> PvDatabase {
     // Stale "previous cycle" values the C gate must preserve.
     r.put_field("C", EpicsValue::Double(99.0)).unwrap();
     r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
-    inst.subroutine = Some(Arc::new(sum_a_c()));
+    inst.subroutine = Some(Arc::new(Subroutine::Plain(sum_a_c())));
     drop(inst);
     db
 }
@@ -162,7 +162,7 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
         // Returns 7: had the subroutine run, the framework would publish the
         // status as aSub's VAL (C `aSubRecord.c:224` `prec->val = status`).
         let sub_fn: SubroutineFn = Box::new(|_rec: &mut dyn Record| Ok(7));
-        inst.subroutine = Some(Arc::new(sub_fn));
+        inst.subroutine = Some(Arc::new(Subroutine::Plain(sub_fn)));
     }
 
     let mut v = epics_base_rs::server::database::ProcStack::new();

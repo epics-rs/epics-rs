@@ -904,6 +904,30 @@ impl PortDriverBase {
         Ok(())
     }
 
+    /// C `asynPortDriver::writeInt64`; see [`Self::write_int32_param`].
+    pub fn write_int64_param(&mut self, user: &AsynUser, value: i64) -> AsynResult<()> {
+        self.params.set_int64(user.reason, user.addr, value)?;
+        self.call_param_callbacks(user.addr)?;
+        self.trace_write(user, "writeInt64", format_args!("{value}"));
+        Ok(())
+    }
+
+    /// C `asynPortDriver::writeUInt32Digital`; see [`Self::write_int32_param`].
+    /// The write carries no forced interrupt mask: the changed bits derive
+    /// from value^old.
+    pub fn write_uint32_digital_param(
+        &mut self,
+        user: &AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> AsynResult<()> {
+        self.params
+            .set_uint32(user.reason, user.addr, value, mask, 0)?;
+        self.call_param_callbacks(user.addr)?;
+        self.trace_write(user, "writeUInt32Digital", format_args!("{value}"));
+        Ok(())
+    }
+
     /// Single owner-API for the port-level `connected` transition.
     ///
     /// C parity: `exceptionConnect` (asynManager.c:2153-2162) and
@@ -2285,13 +2309,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
-        self.base_mut()
-            .params
-            .set_int64(user.reason, user.addr, value)?;
-        self.base_mut().call_param_callbacks(user.addr)?;
-        self.base()
-            .trace_write(user, "writeInt64", format_args!("{value}"));
-        Ok(())
+        self.base_mut().write_int64_param(user, value)
     }
 
     /// C `asynInt32Base.c:99` default: report `low = high = 0` so a
@@ -2376,15 +2394,8 @@ pub trait PortDriver: Any + Send + Sync {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        // The asynUInt32Digital write interface carries no forced interrupt
-        // mask — changed bits derive from value^old (interrupt_mask = 0).
         self.base_mut()
-            .params
-            .set_uint32(user.reason, user.addr, value, mask, 0)?;
-        self.base_mut().call_param_callbacks(user.addr)?;
-        self.base()
-            .trace_write(user, "writeUInt32Digital", format_args!("{value}"));
-        Ok(())
+            .write_uint32_digital_param(user, value, mask)
     }
 
     /// Configure rising / falling interrupt masks for a

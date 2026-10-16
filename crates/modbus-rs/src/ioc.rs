@@ -1567,7 +1567,11 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
-        let dt = self.datatype_of(user.reason)?;
+        // C `writeInt64` hands a non-data reason to `asynPortDriver::writeInt64`
+        // (drvModbusAsyn.cpp:951).
+        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            return self.base.write_int64_param(user, value);
+        };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_int64(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)
@@ -1590,7 +1594,11 @@ impl PortDriver for ModbusPortDriver {
             self.poll_wake.notify_one();
             return Ok(());
         }
-        let dt = self.datatype_of(user.reason)?;
+        // C `writeFloat64` ignores any other non-data reason and returns
+        // asynSuccess (drvModbusAsyn.cpp:1094-1101).
+        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+            return Ok(());
+        };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         let regs = datatype::write_float(dt, value).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)
@@ -1614,6 +1622,17 @@ impl PortDriver for ModbusPortDriver {
             }
             self.engine.stats.histogram_enabled = enabling;
             return Ok(());
+        }
+        // Any other non-data reason is C's `asynPortDriver::writeUInt32Digital`
+        // (drvModbusAsyn.cpp:643).
+        if self
+            .reason_to_datatype
+            .get(user.reason)
+            .copied()
+            .flatten()
+            .is_none()
+        {
+            return self.base.write_uint32_digital_param(user, value, mask);
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // C `writeUInt32Digital` (drvModbusAsyn.cpp:595-625) dispatches on the
@@ -6029,6 +6048,57 @@ mod tests {
         if let Ok(iv) = rx.try_recv() {
             panic!("a data write posted {iv:?}");
         }
+    }
+
+    /// C hands a non-data `writeUInt32Digital`/`writeInt64` to
+    /// `asynPortDriver` (drvModbusAsyn.cpp:643, :951), which stores and posts
+    /// it, and ignores a non-data `writeFloat64` (:1094-1101). None of them
+    /// touches the wire.
+    #[test]
+    fn non_data_writes_take_the_asyn_port_driver_path() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_WR_NONDATA",
+            write_config(ModbusFunctionCode::WriteMultipleRegisters, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![])),
+        )
+        .expect("config must build");
+        let u32_reason = driver
+            .base
+            .create_param("X_U32", ParamType::UInt32Digital)
+            .unwrap();
+        let i64_reason = driver.base.create_param("X_I64", ParamType::Int64).unwrap();
+        let mut rx = subscribe_opened(&mut driver);
+
+        driver
+            .write_uint32_digital(&mut AsynUser::new(u32_reason).with_addr(0), 0x5, 0xF)
+            .expect("generic uint32 write");
+        driver
+            .write_int64(&mut AsynUser::new(i64_reason).with_addr(0), 1 << 40)
+            .expect("generic int64 write");
+        driver
+            .write_float64(&mut AsynUser::new(driver.read_ok_reason).with_addr(0), 1.0)
+            .expect("a non-data float64 write is ignored");
+
+        assert_eq!(driver.base.get_uint32_param(u32_reason, 0).unwrap(), 0x5);
+        assert_eq!(driver.base.get_int64_param(i64_reason, 0).unwrap(), 1 << 40);
+        assert_eq!(
+            driver
+                .base
+                .get_int32_param(driver.read_ok_reason, 0)
+                .unwrap(),
+            0
+        );
+        let mut posted = Vec::new();
+        while let Ok(iv) = rx.try_recv() {
+            posted.push(iv.reason);
+        }
+        assert!(posted.contains(&u32_reason), "{posted:?}");
+        assert!(posted.contains(&i64_reason), "{posted:?}");
+        assert_eq!(
+            driver.engine.stats.write_ok + driver.engine.stats.io_errors,
+            0
+        );
     }
 
     /// The uint32-digital scalar write is the same C shape (`epicsUInt16 data

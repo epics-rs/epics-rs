@@ -104,10 +104,16 @@ async fn enum_ioc(
         .expect("port name is free");
     drop(runtime);
 
+    // devAsynUInt32Digital parses only `@asynMask` (asynEpicsUtils.c:152-213).
+    let link = if dtyp == "asynUInt32Digital" {
+        format!("@asynMask({port},0,0x1)MODE")
+    } else {
+        format!("@asyn({port},0)MODE")
+    };
     let db_text = format!(
         r#"record({record_type}, "{REC}") {{
             field(DTYP, "{dtyp}")
-            field(INP,  "@asyn({port},0)MODE")
+            field(INP,  "{link}")
             field(SCAN, "Passive")
         }}"#
     );

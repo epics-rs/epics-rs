@@ -42,17 +42,6 @@ pub struct AsynLink {
     pub drv_info: String,
 }
 
-/// Strip an optional sign and detect the C `strtol(.., 0)` base of a
-/// numeric link field: a leading `0x`/`0X` selects hexadecimal, a leading
-/// `0` (with further digits) octal, otherwise decimal. Returns
-/// `(negative, digit_str, radix)`.
-///
-/// Unlike C — which consumes the longest valid prefix and leaves the rest
-/// in `endp` — these require the *whole* (trimmed) token to be a valid
-/// number. asyn's comma/space split already isolates each numeric field,
-/// so there is no trailing remainder for C's `endp` walk to pick up;
-/// rejecting a partly-numeric field is closer to the link parser's intent
-/// than silently binding its leading digits.
 /// The outcome of a store that landed a value.
 ///
 /// `wrote_val` is `store_read_value`'s answer: `true` when the adapter
@@ -84,105 +73,168 @@ fn stored(wrote_val: bool) -> DeviceReadOutcome {
     }
 }
 
-fn split_base0(tok: &str) -> Option<(bool, &str, u32)> {
-    let tok = tok.trim();
-    let (neg, rest) = match tok.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, tok.strip_prefix('+').unwrap_or(tok)),
+/// C `strtol(s, &endp, 0)` / `strtoul`'s scan: optional sign, then `0x`
+/// hex, leading-`0` octal or decimal digits. Returns the sign, the magnitude
+/// and the unread rest; no digits is C's `endp == s` (0, nothing read), and
+/// `None` is `errno == ERANGE`.
+fn strto_base0(s: &str) -> Option<(bool, u64, &str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let neg = match b.first() {
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        _ => false,
     };
-    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-        // `0x` with no following digits is not a number (C: endp stays at 'x').
-        (!hex.is_empty()).then_some((neg, hex, 16))
-    } else if rest.len() > 1 && rest.starts_with('0') {
-        // Leading `0` + more digits → octal. C `strtol(.., 0)` does NOT
-        // recognise a `0o` prefix, so `0o..` falls here and fails the
-        // octal digit parse (matching C, which stops at the 'o').
-        Some((neg, &rest[1..], 8))
-    } else if rest.is_empty() {
-        None
+    // `0x` counts as a prefix only with a hex digit after it; otherwise the
+    // `0` is the whole number and `x` is where the scan stops.
+    let radix = if b.get(i) == Some(&b'0')
+        && matches!(b.get(i + 1), Some(b'x' | b'X'))
+        && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+    {
+        i += 2;
+        16
+    } else if b.get(i) == Some(&b'0') {
+        8
     } else {
-        // Plain decimal, including a bare "0".
-        Some((neg, rest, 10))
+        10
+    };
+    let start = i;
+    let mut mag: Option<u64> = Some(0);
+    while let Some(d) = b.get(i).and_then(|&c| (c as char).to_digit(radix)) {
+        mag = mag.and_then(|m| m.checked_mul(u64::from(radix))?.checked_add(u64::from(d)));
+        i += 1;
     }
-}
-
-/// C `strtol(s, _, 0)` for the signed `addr` link field. The `long`→`int`
-/// assignment in C truncates on overflow, mirrored here by the `as i32`
-/// wrap.
-fn strtol_base0_i32(tok: &str) -> Option<i32> {
-    let (neg, digits, radix) = split_base0(tok)?;
-    let mag = i64::from_str_radix(digits, radix).ok()?;
-    Some((if neg { mag.wrapping_neg() } else { mag }) as i32)
-}
-
-/// C `strtoul(s, _, 0)` for the unsigned `mask` link field. A leading `-`
-/// negates modulo 2^32 (the C standard mandates strtoul negate-then-cast),
-/// so `-8` yields `0xFFFFFFF8` — the bit pattern asynInt32 reinterprets as
-/// signed nbits via [`Int32Mask::from_nbits`].
-fn strtoul_base0_u32(tok: &str) -> Option<u32> {
-    let (neg, digits, radix) = split_base0(tok)?;
-    let mag = u64::from_str_radix(digits, radix).ok()?;
-    Some((if neg { mag.wrapping_neg() } else { mag }) as u32)
-}
-
-/// Parse an asyn link string.
-///
-/// Accepted formats (comma or space delimited, matching C EPICS):
-/// - `@asyn(portName) drvInfo`
-/// - `@asyn(portName, addr) drvInfo`
-/// - `@asyn(portName, addr, timeout) drvInfo`
-/// - `@asyn(portName addr) drvInfo`
-/// - `@asyn(portName addr timeout) drvInfo`
-pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
-    let s = s.trim();
-    let rest = s
-        .strip_prefix("@asyn(")
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("must start with @asyn(: {s}")))?;
-
-    let paren_end = rest
-        .find(')')
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("missing closing paren: {s}")))?;
-
-    let args_str = &rest[..paren_end];
-    let drv_info = rest[paren_end + 1..].trim().to_string();
-
-    // C EPICS pasynEpicsUtils->parseLink accepts both comma and space as delimiters.
-    // Split by comma first; if only one part, try splitting by whitespace.
-    let parts: Vec<&str> = if args_str.contains(',') {
-        args_str.split(',').map(|p| p.trim()).collect()
-    } else {
-        args_str.split_whitespace().collect()
-    };
-    if parts.is_empty() || parts[0].is_empty() {
-        return Err(AsynError::InvalidLinkSyntax("portName is required".into()));
+    if i == start {
+        return Some((false, 0, s));
     }
+    Some((neg, mag?, &s[i..]))
+}
 
-    let port_name = parts[0].to_string();
-    let addr = if parts.len() > 1 {
-        // C asynEpicsUtils.c:114 `strtol(pnext, &endp, 0)` — base auto.
-        strtol_base0_i32(parts[1])
-            .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?
+/// C `strtol(s, &endp, 0)` into the link's `int addr`: `long` range, then the
+/// C assignment's truncation to `int`.
+fn strtol_i32(s: &str) -> Option<(i32, &str)> {
+    let (neg, mag, rest) = strto_base0(s)?;
+    let value = if neg {
+        0i64.checked_sub_unsigned(mag)?
     } else {
-        0
+        i64::try_from(mag).ok()?
     };
-    let timeout = if parts.len() > 2 {
-        // C asynEpicsUtils.c:125 `strtod(pnext, &endp)` into `pasynUser->timeout`.
-        // A negative value is C's "wait forever" and reaches the drivers as one;
-        // `timeout_from_secs` owns that mapping (DRV-42).
-        let secs: f64 = parts[2]
-            .parse()
-            .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[2])))?;
-        timeout_from_secs(secs)
-    } else {
-        // C asynEpicsUtils.c:109,121 — `pasynUser->timeout = 1.0`.
-        Some(DEFAULT_TIMEOUT)
-    };
+    Some((value as i32, rest))
+}
 
-    Ok(AsynLink {
+/// C `strtoul(s, &endp, 0)` into the link's `epicsUInt32 mask`: a leading `-`
+/// negates modulo 2^64 (so `-8` is `0xFFFFFFF8` after the cast — the bit
+/// pattern asynInt32 reads as a signed nbits, see [`Int32Mask::from_nbits`]).
+fn strtoul_u32(s: &str) -> Option<(u32, &str)> {
+    let (neg, mag, rest) = strto_base0(s)?;
+    let value = if neg { mag.wrapping_neg() } else { mag };
+    Some((value as u32, rest))
+}
+
+/// C `skipWhite` (asynEpicsUtils.c:48-52): whitespace, and commas too where
+/// `comma_ok` — so `p 0 1`, `p,0,1`, `p, 0 ,1` and `p 0,` all separate alike.
+fn skip_white(s: &str, comma_ok: bool) -> &str {
+    s.trim_start_matches(|c| epics_base_rs::runtime::stdlib::c_isspace(c) || (comma_ok && c == ','))
+}
+
+/// The fields C's `parseLink` / `parseLinkMask` fill.
+struct InstIo {
+    port_name: String,
+    addr: i32,
+    mask: u32,
+    timeout: Option<Duration>,
+    drv_info: String,
+}
+
+const PARSE_LINK_ERROR: &str = "invalid INST_IO Must be asyn(<port> <addr> <timeout>)userParams";
+const PARSE_LINK_MASK_ERROR: &str =
+    "invalid INST_IO Must be asynMask(<port> <addr> <mask> <timeout>)userParams";
+
+/// C `parseLink`'s INST_IO arm (asynEpicsUtils.c:91-145) and, with `mask`,
+/// `parseLinkMask` (:152-213): one scanner, the mask field sitting between
+/// addr and timeout. `Err` is C's `pasynUser->errorMessage`.
+fn parse_inst_io(link: &str, mask: bool) -> Result<InstIo, &'static str> {
+    let (opening, error, not_inst_io) = if mask {
+        ("asynMask(", PARSE_LINK_MASK_ERROR, "Link must be INST_IO")
+    } else {
+        ("asyn(", PARSE_LINK_ERROR, "Link must be INST_IO or VME_IO")
+    };
+    // dbParseLink trims the field and an INST_IO link is the text after `@`.
+    let Some(text) = link.trim().strip_prefix('@') else {
+        return Err(not_inst_io);
+    };
+    let at = text.find(opening).ok_or(error)?;
+    let p = skip_white(&text[at + opening.len()..], false);
+    let port_len = p
+        .find(|c| epics_base_rs::runtime::stdlib::c_isspace(c) || c == ',' || c == ')')
+        .ok_or(error)?;
+    let port_name = p[..port_len].to_string();
+
+    let mut p = skip_white(&p[port_len..], true);
+    let mut addr = 0;
+    let mut bits = 0;
+    let mut timeout = Some(DEFAULT_TIMEOUT);
+    'fields: {
+        if p.is_empty() || (mask && p.starts_with(')')) {
+            return Err(error);
+        }
+        if p.starts_with(')') {
+            break 'fields;
+        }
+        let rest;
+        (addr, rest) = strtol_i32(p).ok_or(error)?;
+        p = skip_white(rest, true);
+        if mask {
+            if p.is_empty() || p.starts_with(')') {
+                return Err(error);
+            }
+            let rest;
+            (bits, rest) = strtoul_u32(p).ok_or(error)?;
+            p = skip_white(rest, true);
+        }
+        if p.is_empty() {
+            return Err(error);
+        }
+        if p.starts_with(')') {
+            break 'fields;
+        }
+        let read = epics_base_rs::calc::engine::strtod::strtod(p.as_bytes());
+        if read.erange {
+            return Err(error);
+        }
+        // A negative value is C's "wait forever"; `timeout_from_secs` owns
+        // that mapping (DRV-42).
+        timeout = timeout_from_secs(read.value);
+        // No comma here: C closes the timeout with `skipWhite(pnext, 0)`.
+        p = skip_white(&p[read.len..], false);
+        if !p.starts_with(')') {
+            return Err(error);
+        }
+    }
+    Ok(InstIo {
         port_name,
         addr,
+        mask: bits,
         timeout,
-        drv_info,
+        drv_info: skip_white(&p[1..], false).to_string(),
+    })
+}
+
+/// Parse an `@asyn(portName addr timeout)drvInfo` link as C `parseLink` does:
+/// addr and timeout are optional, and whitespace and commas both separate.
+pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
+    let io = parse_inst_io(s, false).map_err(|e| AsynError::InvalidLinkSyntax(e.into()))?;
+    Ok(AsynLink {
+        port_name: io.port_name,
+        addr: io.addr,
+        timeout: io.timeout,
+        drv_info: io.drv_info,
     })
 }
 
@@ -197,60 +249,16 @@ pub struct AsynMaskLink {
     pub drv_info: String,
 }
 
-/// Parse an asynMask link string.
-///
-/// Format: `@asynMask(portName, addr, mask[, timeout]) drvInfo`
+/// Parse an `@asynMask(portName addr mask timeout)drvInfo` link as C
+/// `parseLinkMask` does: addr and mask are required, the timeout optional.
 pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
-    let s = s.trim();
-    let rest = s
-        .strip_prefix("@asynMask(")
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("must start with @asynMask(: {s}")))?;
-
-    let paren_end = rest
-        .find(')')
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("missing closing paren: {s}")))?;
-
-    let args_str = &rest[..paren_end];
-    let drv_info = rest[paren_end + 1..].trim().to_string();
-
-    let parts: Vec<&str> = args_str.split(',').map(|p| p.trim()).collect();
-    if parts.len() < 3 {
-        return Err(AsynError::InvalidLinkSyntax(
-            "asynMask requires at least 3 arguments: portName, addr, mask".into(),
-        ));
-    }
-
-    let port_name = parts[0].to_string();
-    // C asynEpicsUtils.c:186 `strtol(pnext, &endp, 0)` — base auto.
-    let addr = strtol_base0_i32(parts[1])
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?;
-
-    // C asynEpicsUtils.c:193 `strtoul(pnext, &endp, 0)` — base auto
-    // (0x hex, leading-0 octal, else decimal). The resulting 32-bit
-    // pattern is reinterpreted per interface: asynInt32 reads it as a
-    // signed nbits via `as i32` (a negative count like `-8` parses through
-    // strtoul to 0xFFFFFFF8; see `Int32Mask::from_nbits`), asynUInt32Digital
-    // as a raw bitmask.
-    let mask_str = parts[2];
-    let mask = strtoul_base0_u32(mask_str)
-        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?;
-
-    let timeout = if parts.len() > 3 {
-        // Same `strtod` timeout field as `@asyn` (asynEpicsUtils.c:200).
-        let secs: f64 = parts[3]
-            .parse()
-            .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[3])))?;
-        timeout_from_secs(secs)
-    } else {
-        Some(DEFAULT_TIMEOUT)
-    };
-
+    let io = parse_inst_io(s, true).map_err(|e| AsynError::InvalidLinkSyntax(e.into()))?;
     Ok(AsynMaskLink {
-        port_name,
-        addr,
-        mask,
-        timeout,
-        drv_info,
+        port_name: io.port_name,
+        addr: io.addr,
+        mask: io.mask,
+        timeout: io.timeout,
+        drv_info: io.drv_info,
     })
 }
 
@@ -4325,6 +4333,173 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
     dtyp.to_string()
 }
 
+/// The C dset a DTYP binds, for what its `initCommon` does with the link:
+/// which parser it calls and the line it prints when the parse fails.
+#[derive(Clone, Copy)]
+enum LinkDset {
+    /// devAsynInt32.c:220-230 and devBusyAsyn.c:158-167: `parseLink`, then
+    /// `parseLinkMask`, whose message is the one left to print.
+    Int32 {
+        busy: bool,
+    },
+    UInt32Digital,
+    Float64,
+    Int64,
+    Octet,
+    Array,
+    TimeSeries(&'static str),
+}
+
+impl LinkDset {
+    fn of(record_type: &str, dtyp: &str) -> Self {
+        match dtyp {
+            "asynInt32TimeSeries" => Self::TimeSeries("devAsynInt32TimeSeries"),
+            "asynInt64TimeSeries" => Self::TimeSeries("devAsynInt64TimeSeries"),
+            "asynFloat64TimeSeries" => Self::TimeSeries("devAsynFloat64TimeSeries"),
+            d if d.contains("Array") => Self::Array,
+            d if d.starts_with("asynOctet") => Self::Octet,
+            "asynUInt32Digital" => Self::UInt32Digital,
+            "asynInt64" => Self::Int64,
+            "asynFloat64" | "asynFloat64Average" => Self::Float64,
+            _ => Self::Int32 {
+                busy: record_type == "busy",
+            },
+        }
+    }
+
+    /// The link's fields, with `Some(mask)` when it parsed as `@asynMask`.
+    fn parse(self, link: &str) -> Result<(InstIo, Option<u32>), &'static str> {
+        let plain = |link| parse_inst_io(link, false).map(|io| (io, None));
+        let mask = |link| {
+            parse_inst_io(link, true).map(|io| {
+                let mask = io.mask;
+                (io, Some(mask))
+            })
+        };
+        match self {
+            Self::Int32 { .. } => plain(link).or_else(|_| mask(link)),
+            Self::UInt32Digital => mask(link),
+            _ => plain(link),
+        }
+    }
+
+    /// The C dset's `driverName`.
+    fn driver(self) -> &'static str {
+        match self {
+            Self::Int32 { busy: true } => "devBusyAsyn",
+            Self::Int32 { busy: false } => "devAsynInt32",
+            Self::UInt32Digital => "devAsynUInt32Digital",
+            Self::Float64 => "devAsynFloat64",
+            Self::Int64 => "devAsynInt64",
+            Self::Octet => "devAsynOctet",
+            Self::Array => "devAsynXXXArray",
+            Self::TimeSeries(driver) => driver,
+        }
+    }
+
+    /// C's line for an `initCommon` refusal, and whether C sends it through
+    /// errlog (`true`) or `printf`.
+    fn refusal_line(self, record: &str, refusal: &LinkRefusal) -> (String, bool) {
+        let driver = self.driver();
+        match refusal {
+            LinkRefusal::Parse(message) => match self {
+                Self::Int32 { .. } | Self::Int64 => {
+                    (format!("{record} {driver}::initCommon  {message}"), false)
+                }
+                Self::UInt32Digital | Self::Float64 => {
+                    (format!("{record} {driver}::initCommon {message}"), false)
+                }
+                Self::Octet => (
+                    format!("{record} {driver}::initCommon error in link {message}"),
+                    false,
+                ),
+                Self::Array => (
+                    format!("{driver}::devAsynXXXArray, {record} error in link {message}"),
+                    true,
+                ),
+                Self::TimeSeries(_) => (
+                    format!("{driver}::initCommon, {record} error in link {message}"),
+                    true,
+                ),
+            },
+            LinkRefusal::NoPort(port) => {
+                let message = format!("asynManager:connectDevice port {port} not found");
+                match self {
+                    Self::Array => (
+                        format!(
+                            "{driver}::devAsynXXXArray, {record} connectDevice failed {message}"
+                        ),
+                        true,
+                    ),
+                    Self::TimeSeries(_) => (
+                        format!("{driver}::initCommon, {record} connectDevice failed {message}"),
+                        true,
+                    ),
+                    _ => (
+                        format!("{record} {driver}::initCommon connectDevice failed {message}"),
+                        false,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Why a dset's `initCommon` refused the record's link.
+enum LinkRefusal {
+    /// `parseLink`/`parseLinkMask` failed with this `errorMessage`.
+    Parse(&'static str),
+    /// `connectDevice` found no port of this name.
+    NoPort(String),
+}
+
+/// A record whose link C's dset refused: the dset is bound, and its
+/// `init_record` prints why and takes the `bad:` arm.
+struct BadLink {
+    dset: LinkDset,
+    dtyp: String,
+    refusal: LinkRefusal,
+    record: String,
+}
+
+impl DeviceSupport for BadLink {
+    fn dtyp(&self) -> &str {
+        &self.dtyp
+    }
+
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.record = name.to_string();
+    }
+
+    fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        match self.dset.refusal_line(&self.record, &self.refusal) {
+            (line, true) => epics_base_rs::runtime::log::errlog_vprintf(format_args!("{line}\n")),
+            (line, false) => println!("{line}"),
+        }
+        Ok(match self.dset {
+            // devAsynXXXTimeSeries.h:118-120 raises no alarm.
+            LinkDset::TimeSeries(_) => DeviceInitOutcome::dead(),
+            _ => DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ),
+        })
+    }
+
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+}
+
+fn bad_link(dset: LinkDset, dtyp: &str, refusal: LinkRefusal) -> Box<dyn DeviceSupport> {
+    Box::new(BadLink {
+        dset,
+        dtyp: dtyp.to_string(),
+        refusal,
+        record: String::new(),
+    })
+}
+
 /// Create a universal asyn device support factory.
 ///
 /// Handles all standard asyn DTYPs (`asynInt32`, `asynFloat64`, `asynOctet`,
@@ -4371,33 +4546,37 @@ pub fn universal_asyn_factory(
         return None;
     }
 
-    // Try @asyn() link in INP or OUT. An OUT link is always an output; an INP
-    // link is an output only when the DTYP itself names the direction.
-    let (link_str, is_output, output_via_inp) =
-        if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
-            (ctx.out, true, false)
-        } else if ctx.inp.contains("@asyn") || ctx.inp.contains("@asynMask") {
-            let out = dtyp_is_output(ctx.dtyp);
-            (ctx.inp, out, out)
-        } else {
-            return None;
-        };
-
-    // Parse the link
-    let link = if link_str.contains("@asynMask") {
-        let ml = parse_asyn_mask_link(link_str).ok()?;
-        AsynLink {
-            port_name: ml.port_name,
-            addr: ml.addr,
-            timeout: ml.timeout,
-            drv_info: ml.drv_info,
-        }
+    // C device support reads the record's own link: OUT on an output record,
+    // INP otherwise. An INP link is an output only when the DTYP names the
+    // direction.
+    let (link_str, is_output, output_via_inp) = if !ctx.out.trim().is_empty() {
+        (ctx.out, true, false)
     } else {
-        parse_asyn_link(link_str).ok()?
+        let out = dtyp_is_output(ctx.dtyp);
+        (ctx.inp, out, out)
     };
 
-    // Look up port in global registry
-    let entry = crate::asyn_record::get_port(&link.port_name)?;
+    let dset = LinkDset::of(ctx.record_type, ctx.dtyp);
+    let (link, mask) = match dset.parse(link_str) {
+        Ok((io, mask)) => (
+            AsynLink {
+                port_name: io.port_name,
+                addr: io.addr,
+                timeout: io.timeout,
+                drv_info: io.drv_info,
+            },
+            mask,
+        ),
+        Err(message) => return Some(bad_link(dset, ctx.dtyp, LinkRefusal::Parse(message))),
+    };
+
+    let Some(entry) = crate::asyn_record::get_port(&link.port_name) else {
+        return Some(bad_link(
+            dset,
+            ctx.dtyp,
+            LinkRefusal::NoPort(link.port_name),
+        ));
+    };
 
     // Normalize DTYP: strip "In"/"Out" suffixes from array types.
     // C EPICS uses DTYPs like "asynFloat64ArrayIn" / "asynFloat64ArrayOut"
@@ -4505,11 +4684,9 @@ pub fn universal_asyn_factory(
     // blocking read against an unconnected driver, and overwriting a
     // template's deliberate default value with a stale/zero readback.
 
-    // UInt32Digital: apply mask
-    if link_str.contains("@asynMask") {
-        if let Ok(ml) = parse_asyn_mask_link(link_str) {
-            adapter = adapter.with_mask(ml.mask);
-        }
+    // A plain `@asyn` link leaves C's mask 0: no mask.
+    if let Some(mask) = mask {
+        adapter = adapter.with_mask(mask);
     }
 
     Some(Box::new(adapter))
@@ -5035,28 +5212,300 @@ mod tests {
         assert_eq!(link.mask, 0xFF);
     }
 
+    /// C `parseLink` / `parseLinkMask` (asynEpicsUtils.c:91-213), one case
+    /// per boundary of their scan: `(link, mask?, port, addr, mask, timeout
+    /// secs (None = forever), drvInfo)` or the C errorMessage.
     #[test]
-    fn strtol_base0_covers_hex_octal_decimal_sign() {
-        assert_eq!(strtol_base0_i32("0x10"), Some(16));
-        assert_eq!(strtol_base0_i32("010"), Some(8));
-        assert_eq!(strtol_base0_i32("10"), Some(10));
-        assert_eq!(strtol_base0_i32("0"), Some(0));
-        assert_eq!(strtol_base0_i32("-0x10"), Some(-16));
-        assert_eq!(strtol_base0_i32("+7"), Some(7));
-        // Invalid digit for the detected base / non-numeric → reject.
-        assert_eq!(strtol_base0_i32("08"), None);
-        assert_eq!(strtol_base0_i32("0o20"), None);
-        assert_eq!(strtol_base0_i32("abc"), None);
-        assert_eq!(strtol_base0_i32("0x"), None);
+    fn link_parsers_take_what_c_takes_and_refuse_what_it_refuses() {
+        type Want = Result<(&'static str, i32, u32, Option<f64>, &'static str), &'static str>;
+        let plain_err = Err(PARSE_LINK_ERROR);
+        let mask_err = Err(PARSE_LINK_MASK_ERROR);
+        let cases: &[(&str, bool, Want)] = &[
+            // separators: comma, whitespace, and both mixed
+            ("@asyn(p,1,2.5)X", false, Ok(("p", 1, 0, Some(2.5), "X"))),
+            ("@asyn(p 1 2.5) X", false, Ok(("p", 1, 0, Some(2.5), "X"))),
+            ("@asyn( p , 1 2.5)X", false, Ok(("p", 1, 0, Some(2.5), "X"))),
+            ("@asyn(p ,, 1,)X", false, Ok(("p", 1, 0, Some(1.0), "X"))),
+            // the timeout closes on whitespace only (`skipWhite(pnext, 0)`)
+            ("@asyn(p 1 2.5,)X", false, plain_err),
+            ("@asyn(p 1 2.5 3)X", false, plain_err),
+            // optional fields and the drvInfo after `)`
+            ("@asyn(p)", false, Ok(("p", 0, 0, Some(1.0), ""))),
+            ("@asyn(p 0)  a b", false, Ok(("p", 0, 0, Some(1.0), "a b"))),
+            ("@asyn(p,0,-1)X", false, Ok(("p", 0, 0, None, "X"))),
+            ("@asyn(,1)X", false, Ok(("", 1, 0, Some(1.0), "X"))),
+            // refusals
+            ("@asyn(p", false, plain_err),
+            ("@asyn(p 1", false, plain_err),
+            ("@asyn(p x)", false, plain_err),
+            ("@asyn(p 1 1e999)", false, plain_err),
+            ("@asynMask(p 0 1)", false, plain_err),
+            ("p 0", false, Err("Link must be INST_IO or VME_IO")),
+            // asynMask: addr and mask required
+            (
+                "@asynMask(SP1_Bit_In 0 0x1)",
+                true,
+                Ok(("SP1_Bit_In", 0, 1, Some(1.0), "")),
+            ),
+            (
+                "@asynMask(SP2 20 10)MODBUS_DATA",
+                true,
+                Ok(("SP2", 20, 10, Some(1.0), "MODBUS_DATA")),
+            ),
+            (
+                "@asynMask(p,0,0xFF,2)D",
+                true,
+                Ok(("p", 0, 0xFF, Some(2.0), "D")),
+            ),
+            (
+                "@asynMask(p, 0 -8)D",
+                true,
+                Ok(("p", 0, 0xFFFF_FFF8, Some(1.0), "D")),
+            ),
+            ("@asynMask(p)", true, mask_err),
+            ("@asynMask(p 0)", true, mask_err),
+            ("@asynMask(p 0 0x1q)", true, mask_err),
+            ("@asynMask(p 0 zz)", true, mask_err),
+            ("@asyn(p 0 1)", true, mask_err),
+            ("p 0 1", true, Err("Link must be INST_IO")),
+        ];
+        for &(link, mask, want) in cases {
+            let got = parse_inst_io(link, mask).map(|io| {
+                (
+                    io.port_name,
+                    io.addr,
+                    io.mask,
+                    io.timeout.map(|t| t.as_secs_f64()),
+                    io.drv_info,
+                )
+            });
+            let want = want.map(|(p, a, m, t, d)| (p.to_string(), a, m, t, d.to_string()));
+            assert_eq!(got, want, "{link}");
+        }
+    }
+
+    /// Each DTYP parses with its C dset's parser, and a link that parser
+    /// refuses binds a device whose init prints that dset's line and takes the
+    /// `bad:` arm, instead of the record having no device support.
+    #[test]
+    fn a_refused_link_prints_its_dsets_line_and_kills_the_record() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "@asyn(p 0 1 2)",
+                Some("R devAsynInt32::initCommon  "),
+                PARSE_LINK_MASK_ERROR,
+            ),
+            (
+                "busy",
+                "asynInt32",
+                "@asyn(p 0 1 2)",
+                Some("R devBusyAsyn::initCommon  "),
+                PARSE_LINK_MASK_ERROR,
+            ),
+            (
+                "bi",
+                "asynUInt32Digital",
+                "@asyn(p 0)",
+                Some("R devAsynUInt32Digital::initCommon "),
+                PARSE_LINK_MASK_ERROR,
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "@asynMask(p 0 1)",
+                Some("R devAsynFloat64::initCommon "),
+                PARSE_LINK_ERROR,
+            ),
+            (
+                "ai",
+                "asynInt64",
+                "@asyn(p x)",
+                Some("R devAsynInt64::initCommon  "),
+                PARSE_LINK_ERROR,
+            ),
+            (
+                "stringin",
+                "asynOctetRead",
+                "",
+                Some("R devAsynOctet::initCommon error in link "),
+                "Link must be INST_IO or VME_IO",
+            ),
+            (
+                "waveform",
+                "asynInt8ArrayIn",
+                "@asyn(p",
+                Some("devAsynXXXArray::devAsynXXXArray, R error in link "),
+                PARSE_LINK_ERROR,
+            ),
+            (
+                "waveform",
+                "asynInt32TimeSeries",
+                "@asyn(p",
+                None,
+                PARSE_LINK_ERROR,
+            ),
+        ];
+        for (record_type, dtyp, inp, prefix, message) in cases {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp,
+                out: "",
+            };
+            let dset = LinkDset::of(record_type, dtyp);
+            assert_eq!(dset.parse(inp).err(), Some(message), "{dtyp} {inp}");
+            let (line, errlog) = dset.refusal_line("R", &LinkRefusal::Parse(message));
+            let prefix = prefix.unwrap_or("devAsynInt32TimeSeries::initCommon, R error in link ");
+            assert_eq!(line, format!("{prefix}{message}"), "{dtyp}");
+            assert_eq!(
+                errlog,
+                matches!(dset, LinkDset::Array | LinkDset::TimeSeries(_))
+            );
+
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            assert_eq!(dev.dtyp(), dtyp);
+            dev.set_record_info("R", ScanType::Passive);
+            let mut rec = epics_base_rs::server::records::ai::AiRecord::default();
+            let outcome = dev.init(&mut rec).unwrap();
+            let want = if dtyp.ends_with("TimeSeries") {
+                DeviceInitOutcome::dead()
+            } else {
+                DeviceInitOutcome::dead_with_alarm(
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    epics_base_rs::server::record::AlarmSeverity::Invalid,
+                )
+            };
+            assert_eq!(outcome, want, "{dtyp}");
+        }
+        // The forms each C dset accepts: asynInt32 falls back to the mask
+        // parser and keeps its mask, a plain link leaves the mask off.
+        let int32 = LinkDset::of("ai", "asynInt32");
+        assert_eq!(int32.parse("@asynMask(p 0 8)D").unwrap().1, Some(8));
+        assert_eq!(int32.parse("@asyn(p 0)D").unwrap().1, None);
+    }
+
+    /// A link naming a port no one created: the dset still binds, as C's
+    /// does, and its init prints C's `connectDevice failed` line and dies.
+    #[test]
+    fn a_link_to_a_missing_port_prints_connect_device_failed_and_kills_the_record() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+
+        let no_port = "asynManager:connectDevice port NOPORT_X not found";
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "@asyn(NOPORT_X 0)D",
+                "R devAsynInt32::initCommon",
+            ),
+            (
+                "busy",
+                "asynInt32",
+                "@asyn(NOPORT_X 0)D",
+                "R devBusyAsyn::initCommon",
+            ),
+            (
+                "bi",
+                "asynUInt32Digital",
+                "@asynMask(NOPORT_X 0 1)D",
+                "R devAsynUInt32Digital::initCommon",
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "@asyn(NOPORT_X 0)D",
+                "R devAsynFloat64::initCommon",
+            ),
+            (
+                "int64in",
+                "asynInt64",
+                "@asyn(NOPORT_X 0)D",
+                "R devAsynInt64::initCommon",
+            ),
+            (
+                "stringin",
+                "asynOctetRead",
+                "@asyn(NOPORT_X 0)D",
+                "R devAsynOctet::initCommon",
+            ),
+            (
+                "waveform",
+                "asynInt8ArrayIn",
+                "@asyn(NOPORT_X 0)D",
+                "devAsynXXXArray::devAsynXXXArray, R",
+            ),
+            (
+                "waveform",
+                "asynInt32TimeSeries",
+                "@asyn(NOPORT_X 0)D",
+                "devAsynInt32TimeSeries::initCommon, R",
+            ),
+        ];
+        for (record_type, dtyp, inp, prefix) in cases {
+            let dset = LinkDset::of(record_type, dtyp);
+            let (line, errlog) = dset.refusal_line("R", &LinkRefusal::NoPort("NOPORT_X".into()));
+            assert_eq!(
+                line,
+                format!("{prefix} connectDevice failed {no_port}"),
+                "{dtyp}"
+            );
+            assert_eq!(
+                errlog,
+                matches!(dset, LinkDset::Array | LinkDset::TimeSeries(_))
+            );
+
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp,
+                out: "",
+            };
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            dev.set_record_info("R", ScanType::Passive);
+            let mut rec = epics_base_rs::server::records::ai::AiRecord::default();
+            let outcome = dev.init(&mut rec).unwrap();
+            let want = if dtyp.ends_with("TimeSeries") {
+                DeviceInitOutcome::dead()
+            } else {
+                DeviceInitOutcome::dead_with_alarm(
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    epics_base_rs::server::record::AlarmSeverity::Invalid,
+                )
+            };
+            assert_eq!(outcome, want, "{dtyp}");
+        }
     }
 
     #[test]
-    fn strtoul_base0_negation_wraps_mod_2_32() {
+    fn strtol_reads_hex_octal_decimal_sign_and_stops_where_c_does() {
+        assert_eq!(strtol_i32("0x10)"), Some((16, ")")));
+        assert_eq!(strtol_i32("010"), Some((8, "")));
+        assert_eq!(strtol_i32("10 1.0"), Some((10, " 1.0")));
+        assert_eq!(strtol_i32("0"), Some((0, "")));
+        assert_eq!(strtol_i32("-0x10"), Some((-16, "")));
+        assert_eq!(strtol_i32("+7"), Some((7, "")));
+        // C stops at the first character that is not a digit of the base.
+        assert_eq!(strtol_i32("08"), Some((0, "8")));
+        assert_eq!(strtol_i32("0o20"), Some((0, "o20")));
+        assert_eq!(strtol_i32("0x"), Some((0, "x")));
+        // No digits: nothing read, `endp == s`.
+        assert_eq!(strtol_i32("abc"), Some((0, "abc")));
+        assert_eq!(strtol_i32("-x"), Some((0, "-x")));
+        // `long` overflow is ERANGE; the `int` assignment then truncates.
+        assert_eq!(strtol_i32("99999999999999999999"), None);
+        assert_eq!(strtol_i32("0x100000001"), Some((1, "")));
+    }
+
+    #[test]
+    fn strtoul_negation_wraps_before_the_u32_cast() {
         // C strtoul negates-then-casts: -8 => 0xFFFFFFF8.
-        assert_eq!(strtoul_base0_u32("-8"), Some(0xFFFF_FFF8));
-        assert_eq!(strtoul_base0_u32("0xFF00"), Some(0xFF00));
-        assert_eq!(strtoul_base0_u32("010"), Some(8));
-        assert_eq!(strtoul_base0_u32("255"), Some(255));
+        assert_eq!(strtoul_u32("-8"), Some((0xFFFF_FFF8, "")));
+        assert_eq!(strtoul_u32("0xFF00"), Some((0xFF00, "")));
+        assert_eq!(strtoul_u32("010"), Some((8, "")));
+        assert_eq!(strtoul_u32("255)X"), Some((255, ")X")));
     }
 
     #[test]

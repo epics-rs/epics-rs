@@ -1,0 +1,525 @@
+record(bo, "$(P)SR_heartbeat") {
+  field(DTYP, "Soft Channel")
+  field(ZNAM, "0")
+  field(ONAM, "1")
+  field(FLNK, "$(P)SR_i_am_alive")
+}
+
+record(bo, "$(P)SR_i_am_alive") {
+  field(DTYP, "Soft Channel")
+  field(DOL, "1")
+  field(UDF, "0")
+  field(ZNAM, "0")
+  field(ONAM, "1")
+  field(OUT, "$(P)SR_deadIfZero.VAL PP")
+}
+
+record(bo, "$(P)SR_deadIfZero") {
+  field(DTYP, "Soft Channel")
+  field(ZNAM, "0")
+  field(ONAM, "1")
+  field(HIGH, "$(DEAD_SECONDS=300)")
+}
+
+record(mbbo, "$(P)SR_rebootStatus") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(mbbo, "$(P)SR_status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_recentlyStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_rebootStatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_rebootTime") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_statusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_0_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_0_State") {
+  field(DESC, "Save method for pass 0")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_0_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_0_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_0_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_0_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_0_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_1_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_1_State") {
+  field(DESC, "Save method for pass 1")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_1_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_1_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_1_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_1_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_1_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_2_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_2_State") {
+  field(DESC, "Save method for pass 2")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_2_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_2_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_2_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_2_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_2_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_3_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_3_State") {
+  field(DESC, "Save method for pass 3")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_3_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_3_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_3_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_3_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_3_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_4_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_4_State") {
+  field(DESC, "Save method for pass 4")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_4_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_4_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_4_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_4_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_4_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_5_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_5_State") {
+  field(DESC, "Save method for pass 5")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_5_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_5_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_5_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_5_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_5_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_6_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_6_State") {
+  field(DESC, "Save method for pass 6")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_6_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_6_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_6_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_6_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_6_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(stringout, "$(P)SR_7_Name") {
+  field(VAL, "Not In Use")
+  field(DTYP, "Soft Channel")
+}
+
+record(longout, "$(P)SR_7_State") {
+  field(DESC, "Save method for pass 7")
+  field(DTYP, "Soft Channel")
+}
+
+record(mbbi, "$(P)SR_7_StateEnum") {
+  field(DESC, "Save method (enumerated)")
+  field(INP, "$(P)SR_7_State CP")
+  field(DTYP, "Raw Soft Channel")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "4")
+  field(FRVL, "12")
+  field(FVVL, "16")
+  field(ZRST, "None")
+  field(ONST, "Periodic")
+  field(TWST, "Triggered")
+  field(THST, "Timer")
+  field(FRST, "Monitored")
+  field(FVST, "Manual")
+}
+
+record(mbbo, "$(P)SR_7_Status") {
+  field(DTYP, "Soft Channel")
+  field(NOBT, "3")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(ZRST, "No Status")
+  field(ONST, "Failure")
+  field(TWST, "Warning")
+  field(THST, "Seq Fail")
+  field(FRST, "Ok")
+  field(ONSV, "MAJOR")
+  field(TWSV, "MINOR")
+  field(THSV, "MAJOR")
+}
+
+record(stringout, "$(P)SR_7_StatusStr") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Status unknown")
+}
+
+record(stringout, "$(P)SR_7_Time") {
+  field(DTYP, "Soft Channel")
+  field(VAL, "Not yet saved")
+}
+
+record(longout, "$(P)SR_disableMaxSecs") {
+  field(DTYP, "Soft Channel")
+}
+record(bo, "$(P)SR_disable") {
+  field(DTYP, "Soft Channel")
+  field(ZNAM, "Enable")
+  field(ONAM, "Disable")
+}

@@ -2268,6 +2268,12 @@ impl IocApplication {
     /// the config during st.cmd execution. After iocInit, the config is consumed to
     /// build an `AutosaveManager`.
     pub fn autosave_startup(mut self, config: Arc<Mutex<AutosaveStartupConfig>>) -> Self {
+        // `$(AUTOSAVE)` as C's envPaths sets it, for
+        // `$(AUTOSAVE)/db/save_restoreStatus.db`.
+        crate::runtime::env::set_default(
+            "AUTOSAVE",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/autosave"),
+        );
         self.autosave_startup = Some(config);
         self
     }

@@ -111,6 +111,10 @@ pub mod trace;
 pub(crate) mod transport;
 pub mod user;
 
+/// What C's envPaths names `$(ASYN)`: this crate's directory, holding the
+/// `db/asynRecord.db` a startup script loads as `$(ASYN)/db/asynRecord.db`.
+pub const ASYN_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
 #[cfg(feature = "epics")]
 pub mod adapter;
 #[cfg(feature = "epics")]

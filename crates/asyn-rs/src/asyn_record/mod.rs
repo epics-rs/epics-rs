@@ -54,16 +54,23 @@ use crate::user::AsynUser;
 /// name `epics_base_rs` record machinery, so both exist only under the `epics`
 /// feature, and neither is reachable from the framework core.
 pub fn asyn_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    export_asyn_dir();
     ("asyn", Box::new(|| Box::new(AsynRecord::default())))
 }
 
 /// Register the "asyn" record type via the global registry (legacy).
 /// Prefer `asyn_record_factory()` with `IocBuilder::register_record_type()`.
 pub fn register_asyn_record_type() {
+    export_asyn_dir();
     epics_base_rs::server::db_loader::register_record_type(
         "asyn",
         Box::new(|| Box::new(AsynRecord::default())),
     );
+}
+
+/// `$(ASYN)` for the startup script, as the IOC's envPaths sets it in C.
+fn export_asyn_dir() {
+    epics_base_rs::runtime::env::set_default("ASYN", crate::ASYN_DIR);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -582,6 +582,48 @@ pub type LinkSetInstaller = Box<
         + 'static,
 >;
 
+/// The ports a server init binds ([`IocApplication::register_server_init`]),
+/// as the protocol runner would be given them in [`IocRunConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServerInitArgs {
+    pub port: u16,
+    pub tcp_port: Option<u16>,
+}
+
+/// C `dbServer.init` (`dbServer.h`), which `dbInitServers()` calls inside
+/// `iocBuild` (`iocInit.c:222`): the server binds here, so a port it cannot
+/// have fails `iocInit` instead of a later `iocRun`. What it returns is handed
+/// to the protocol runner through [`IocRunConfig::servers`].
+type ServerInit = Box<
+    dyn FnOnce(
+            ServerInitArgs,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = CaResult<Box<dyn std::any::Any + Send>>>
+                    + Send
+                    + 'static,
+            >,
+        > + Send
+        + 'static,
+>;
+
+/// What each [`IocApplication::register_server_init`] init produced, by the
+/// name it was registered under.
+#[derive(Default)]
+pub struct InitializedServers(Vec<(&'static str, Box<dyn std::any::Any + Send>)>);
+
+impl InitializedServers {
+    /// Take the state `name`'s init produced. `None` when no such init ran —
+    /// a runner given an `IocRunConfig` by hand binds for itself.
+    pub fn take<T: 'static>(&mut self, name: &str) -> Option<T> {
+        let at = self
+            .0
+            .iter()
+            .position(|(n, state)| *n == name && state.is::<T>())?;
+        self.0.swap_remove(at).1.downcast().ok().map(|state| *state)
+    }
+}
+
 /// Configuration passed to the protocol runner after IOC initialization.
 ///
 /// Contains all the pieces needed to start a protocol-specific server
@@ -613,6 +655,9 @@ pub struct IocRunConfig {
     /// (doing so is a no-op on the empty vec, but the hooks have
     /// already run).
     pub after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    /// What the [`IocApplication::register_server_init`] inits bound at
+    /// `dbInitServers`.
+    pub servers: InitializedServers,
 }
 
 /// The two independent questions C softMain asks between the startup script
@@ -822,6 +867,7 @@ async fn run_uninitialized_tail(
     bridge: crate::runtime::task::BlockingBridge,
     acf: access_security::AcfCell,
     interactive: bool,
+    mut cannot_proceed_rx: crate::runtime::sync::oneshot::Receiver<()>,
 ) -> Result<(), IocRunFailure> {
     if !interactive {
         // C `softMain.cpp:264-265`: `while (true) epicsThreadSleep(1000.0);`
@@ -850,7 +896,16 @@ async fn run_uninitialized_tail(
     })
     .map_err(|e| CaError::InvalidValue(format!("could not start the iocsh thread: {e}")))?;
 
-    match rx.await {
+    let shell = tokio::select! {
+        shell = rx => shell,
+        () = cannot_proceed(&mut cannot_proceed_rx) => {
+            return match take_lifecycle() {
+                Some(IocLifecycle::Failed(e)) => Err(e.into()),
+                _ => unreachable!("a shell signals only after putting its build error"),
+            };
+        }
+    };
+    match shell {
         Ok(Ok(())) => Ok(()),
         // C `softMain.cpp:253-256`: a non-zero `iocsh(NULL)` is
         // `epicsExit(1)`, which is this port's serving-phase status.
@@ -1024,6 +1079,8 @@ struct IocBuild {
     link_set_installers: Vec<LinkSetInstaller>,
     after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    /// Run at `dbInitServers`, in registration order.
+    server_inits: Vec<(&'static str, ServerInit)>,
     protocol: ProtocolStart,
 }
 
@@ -1034,10 +1091,12 @@ struct BuiltIoc {
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     /// Drained by the run half, at C's `initHookAfterIocRunning` point.
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
-    /// Carried, not used: C's servers are initialised by `dbInitServers()` in
-    /// `iocBuild` (`iocInit.c:222`) and only *started* by `dbRunServers()` in
-    /// `iocRun` (`:265-267`), and this port's runner does both at once, so the
-    /// whole of it belongs on the run half.
+    /// The [`ServerInit`]s' state: C's servers are initialised by
+    /// `dbInitServers()` in `iocBuild` (`iocInit.c:222`), which
+    /// [`IocBuild::perform_build`] ran, and only *started* by `dbRunServers()`
+    /// in `iocRun` (`:265-267`), which is the runner's.
+    servers: InitializedServers,
+    /// Carried, not used: everything the runner needs to start.
     protocol: ProtocolStart,
 }
 
@@ -1071,7 +1130,7 @@ enum IocLifecycle {
     /// Armed before the startup script; C's `iocVoid`.
     /// Boxed: `IocBuild` carries the whole database and every registry, and
     /// the other variants are a fraction of its size.
-    Armed(Box<IocBuild>),
+    Armed(Box<IocBuild>, CannotProceed),
     /// C's `iocBuilt`. Boxed for the same reason [`Self::Armed`] is.
     Built(Box<BuiltIoc>),
     /// C's `iocRunning`.
@@ -1086,8 +1145,23 @@ enum IocLifecycle {
 /// (see [`set_ioc_state`]), so this is scoped the same way.
 static LIFECYCLE_OWNER: Mutex<Option<IocLifecycle>> = Mutex::new(None);
 
-fn arm_build(build: IocBuild) {
-    *LIFECYCLE_OWNER.lock().unwrap() = Some(IocLifecycle::Armed(Box::new(build)));
+/// Sent by a shell whose build failed, once [`IocLifecycle::Failed`] holds
+/// the error. C `cantProceed` suspends the thread that ran `iocInit`, so no
+/// later line runs at any script depth; the port parks that thread too, and
+/// this is how the lifecycle owner, which would otherwise wait for the shell
+/// to return, learns it never will.
+type CannotProceed = crate::runtime::sync::oneshot::Sender<()>;
+
+/// Resolves when a shell's build has failed; never when the build succeeded
+/// or ran off the shell, which drop the sender.
+async fn cannot_proceed(rx: &mut crate::runtime::sync::oneshot::Receiver<()>) {
+    if rx.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn arm_build(build: IocBuild, cannot_proceed: CannotProceed) {
+    *LIFECYCLE_OWNER.lock().unwrap() = Some(IocLifecycle::Armed(Box::new(build), cannot_proceed));
 }
 
 fn take_lifecycle() -> Option<IocLifecycle> {
@@ -1116,7 +1190,7 @@ pub(crate) enum ShellTransition {
 pub(crate) fn build_from_shell(bridge: &crate::runtime::task::BlockingBridge) -> ShellTransition {
     match take_lifecycle() {
         None => ShellTransition::NotOurs,
-        Some(IocLifecycle::Armed(build)) => match bridge.block_on(build.perform_build()) {
+        Some(IocLifecycle::Armed(build, signal)) => match bridge.block_on(build.perform_build()) {
             Ok(BuildOutcome::Built(built)) => {
                 put_lifecycle(IocLifecycle::Built(built));
                 ShellTransition::Done
@@ -1127,7 +1201,14 @@ pub(crate) fn build_from_shell(bridge: &crate::runtime::task::BlockingBridge) ->
             }
             Err(e) => {
                 put_lifecycle(IocLifecycle::Failed(e));
-                ShellTransition::Failed
+                let _ = signal.send(());
+                // C `cantProceed` (`rsrv_init`, `caservertask.c:752`); the
+                // lifecycle owner returns the error instead of hanging (user
+                // sign-off 2026-10-14). `epicsThreadResume` must not let the
+                // script run on.
+                loop {
+                    crate::runtime::task::suspend_self();
+                }
             }
         },
         Some(other) => {
@@ -1344,6 +1425,7 @@ impl IocBuild {
             link_set_installers,
             after_init_database_hooks,
             after_init_hooks,
+            server_inits,
             protocol,
         } = self;
 
@@ -1676,10 +1758,17 @@ impl IocBuild {
             None
         };
 
-        // C: rsrv init / iocBuild end. The Rust CA/PVA listener is
-        // owned by the protocol runner, but PINI is already complete
-        // (Phase 2b.6) so announcing here keeps hook ordering correct
-        // for consumers that key off these states.
+        // C `dbInitServers()` (`iocInit.c:222`): each server binds here, so a
+        // port it cannot have fails this build and no later `st.cmd` line
+        // runs. Started by the runner at `iocRun`.
+        let mut servers = InitializedServers::default();
+        let args = ServerInitArgs {
+            port: protocol.port,
+            tcp_port: protocol.tcp_port,
+        };
+        for (name, init) in server_inits {
+            servers.0.push((name, init(args).await?));
+        }
         announce!(InitHookState::AfterCaServerInit);
         announce!(InitHookState::AfterIocBuilt);
         // C `iocBuild` ends here, and the IOC is quiescent — `iocBuilt` is
@@ -1690,6 +1779,7 @@ impl IocBuild {
             db,
             autosave_manager,
             after_init_hooks,
+            servers,
             protocol,
         })))
     }
@@ -1707,6 +1797,7 @@ impl BuiltIoc {
             db,
             autosave_manager,
             after_init_hooks,
+            servers,
             protocol,
         } = self;
 
@@ -1767,6 +1858,7 @@ impl BuiltIoc {
             // Drained above. Handed over empty so a protocol runner that still
             // inspects the field cannot double-run the hooks.
             after_init_hooks: Vec::new(),
+            servers,
         };
         // C's `iocRun` does not return until every layer is up, because
         // `dbRunServers()` is a plain call: `rsrv_run` flips the control words
@@ -1837,6 +1929,8 @@ pub struct IocApplication {
     /// C softMain's own turn between the startup script and `iocInit`
     /// ([`Self::before_ioc_init`]). `None` is [`IocInitDecision::run`].
     ioc_init_gate: Option<Box<dyn FnOnce() -> IocInitDecision + Send>>,
+    /// [`Self::register_server_init`].
+    server_inits: Vec<(&'static str, ServerInit)>,
 }
 
 impl IocApplication {
@@ -1877,6 +1971,7 @@ impl IocApplication {
             json_link_types: Vec::new(),
             after_init_database_hooks: Vec::new(),
             ioc_init_gate: None,
+            server_inits: Vec::new(),
         }
     }
 
@@ -2030,6 +2125,36 @@ impl IocApplication {
         self.json_link_types.push(key.to_string());
         self.link_set_installers
             .push(Box::new(move |db| Box::pin(installer(db))));
+        self
+    }
+
+    /// Register a server's `dbServer.init`, run by `iocInit` at C's
+    /// `dbInitServers()` point; an `Err` fails `iocInit`. The runner takes
+    /// what it returned from [`IocRunConfig::servers`] under `name`.
+    ///
+    /// # Panics
+    ///
+    /// When `name` is already registered.
+    pub fn register_server_init<F, Fut, T>(mut self, name: &'static str, init: F) -> Self
+    where
+        F: FnOnce(ServerInitArgs) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = CaResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        assert!(
+            !self.server_inits.iter().any(|(n, _)| *n == name),
+            "server '{name}' already has its init"
+        );
+        self.server_inits.push((
+            name,
+            Box::new(move |args| {
+                Box::pin(async move {
+                    init(args)
+                        .await
+                        .map(|state| Box::new(state) as Box<dyn std::any::Any + Send>)
+                })
+            }),
+        ));
         self
     }
 
@@ -2273,6 +2398,7 @@ impl IocApplication {
             json_link_types,
             after_init_database_hooks,
             ioc_init_gate,
+            server_inits,
         } = self;
         for key in &json_link_types {
             db.declare_link_type(key);
@@ -2361,31 +2487,36 @@ impl IocApplication {
         // against an IOC that has device support, scan threads and PINI behind
         // it. When the script never spells `iocInit`, the turn after Phase 1
         // performs the same build instead.
-        arm_build(IocBuild {
-            db: db.clone(),
-            acf: acf.clone(),
-            autosave_config: autosave_config.clone(),
-            autosave_startup,
-            link_set_installers,
-            after_init_database_hooks,
-            after_init_hooks,
-            // C parity (`caservertask.c:492-500`): the server-side env var
-            // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and `ca_udp_port =
-            // ca_server_port` — so UDP and TCP bind the same value unless the
-            // Rust-extension `.tcp_port(...)` explicitly splits them. The
-            // `port` field already incorporates the CAS / CA / default
-            // precedence via `cas_server_port()` (see `IocApplication::new`);
-            // `tcp_port` stays `Some(...)` only when the caller explicitly
-            // invoked `.tcp_port(...)`.
-            protocol: ProtocolStart {
-                bridge: bridge.clone(),
-                port,
-                tcp_port,
+        let (cannot_proceed_tx, mut cannot_proceed_rx) = crate::runtime::sync::oneshot::channel();
+        arm_build(
+            IocBuild {
+                db: db.clone(),
                 acf: acf.clone(),
-                autosave_config,
-                runner: Box::new(move |config| Box::pin(protocol_runner(config))),
+                autosave_config: autosave_config.clone(),
+                autosave_startup,
+                link_set_installers,
+                after_init_database_hooks,
+                after_init_hooks,
+                server_inits,
+                // C parity (`caservertask.c:492-500`): the server-side env var
+                // EPICS_CAS_SERVER_PORT sets `ca_server_port`, and `ca_udp_port =
+                // ca_server_port` — so UDP and TCP bind the same value unless the
+                // Rust-extension `.tcp_port(...)` explicitly splits them. The
+                // `port` field already incorporates the CAS / CA / default
+                // precedence via `cas_server_port()` (see `IocApplication::new`);
+                // `tcp_port` stays `Some(...)` only when the caller explicitly
+                // invoked `.tcp_port(...)`.
+                protocol: ProtocolStart {
+                    bridge: bridge.clone(),
+                    port,
+                    tcp_port,
+                    acf: acf.clone(),
+                    autosave_config,
+                    runner: Box::new(move |config| Box::pin(protocol_runner(config))),
+                },
             },
-        });
+            cannot_proceed_tx,
+        );
         // From here the static can hold a running IOC, and a running IOC owns
         // a spawned protocol runner. Nothing may return past this line without
         // that value being dropped.
@@ -2437,8 +2568,14 @@ impl IocApplication {
                 CaError::InvalidValue(format!("could not start the iocsh-startup thread: {e}"))
             })?;
 
-            rx.await
-                .map_err(|_| CaError::InvalidValue("startup thread dropped".into()))??;
+            // A parked shell never answers; its error is in the lifecycle.
+            tokio::select! {
+                startup = rx => {
+                    let startup: Result<Result<(), IocRunFailure>, _> = startup;
+                    startup.map_err(|_| CaError::InvalidValue("startup thread dropped".into()))??;
+                }
+                () = cannot_proceed(&mut cannot_proceed_rx) => {}
+            }
         }
 
         // C softMain's turn between `iocsh(st.cmd)` and `iocInit()`
@@ -2458,14 +2595,21 @@ impl IocApplication {
         let outcome = match take_lifecycle() {
             // The script spelled neither `iocInit` nor `iocBuild`, so this is
             // the turn that decides whether the IOC is built at all.
-            Some(IocLifecycle::Armed(build)) => {
+            Some(IocLifecycle::Armed(build, signal)) => {
                 if let Some(decision) = decision
                     && !decision.run
                 {
                     // Still armed: an `iocInit` typed at the tail's prompt is
                     // C's same `iocInit()`, and starts RSRV through this build.
-                    put_lifecycle(IocLifecycle::Armed(build));
-                    return run_uninitialized_tail(db, bridge, acf, decision.interactive).await;
+                    put_lifecycle(IocLifecycle::Armed(build, signal));
+                    return run_uninitialized_tail(
+                        db,
+                        bridge,
+                        acf,
+                        decision.interactive,
+                        cannot_proceed_rx,
+                    )
+                    .await;
                 }
                 match build.perform_build().await? {
                     BuildOutcome::Built(built) => Ok(built.run().await),
@@ -2510,7 +2654,14 @@ impl IocApplication {
                 return match decision {
                     Some(decision) => {
                         eprintln!("{} during iocInit()", crate::runtime::log::ERL_ERROR);
-                        run_uninitialized_tail(db, bridge, acf, decision.interactive).await
+                        run_uninitialized_tail(
+                            db,
+                            bridge,
+                            acf,
+                            decision.interactive,
+                            cannot_proceed_rx,
+                        )
+                        .await
                     }
                     None => Err(IocRunFailure::Startup(CaError::InvalidValue(
                         "iocBuild: asInit Failed.".into(),

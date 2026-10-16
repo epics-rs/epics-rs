@@ -15,9 +15,9 @@
 //!
 //! Deliberately not ported, because nothing in this workspace calls them:
 //! `dbUnregisterServer`, `dbServerClient` and `dbServerStats` (C's iocStats
-//! hook), and the `initialized` phase with its `dbInitServers` transition —
-//! the port's servers are stood up by the protocol runner, which has no
-//! separate "built but not started" step for `dbInitServers` to mark. The
+//! hook), and the `initialized` phase. `dbInitServers`'s bind is
+//! [`crate::server::ioc_app::IocApplication::register_server_init`], run at
+//! the same point of `iocBuild`; nothing reads the phase it would mark. The
 //! `paused` phase IS ported: `iocPause` reaches it (see
 //! [`crate::server::ioc_app::ioc_pause`]), so a `Server state: paused` line
 //! now names a phase this IOC can be in.

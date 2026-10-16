@@ -976,14 +976,15 @@ async fn run_ioc_app(args: Args) -> Result<(), Failure> {
         }
     });
     app.run_phased(
-        move |config: epics_base_rs::server::ioc_app::IocRunConfig| async move {
+        move |mut config: epics_base_rs::server::ioc_app::IocRunConfig| async move {
             let mut builder = epics_ca_rs::server::CaServerBuilder::serving(
                 config.db,
                 config.acf,
                 config.autosave_config,
                 config.autosave_manager,
             )
-            .port(config.port);
+            .port(config.port)
+            .bound_at_init(&mut config.servers);
             if let Some(tcp_port) = config.tcp_port {
                 builder = builder.tcp_port(tcp_port);
             }

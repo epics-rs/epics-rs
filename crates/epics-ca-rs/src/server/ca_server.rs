@@ -71,6 +71,29 @@ pub struct CaServerBuilder {
     /// "trust the username string" behaviour.
     #[cfg(feature = "cap-tokens")]
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
+    /// Sockets `iocInit` already bound ([`Self::bound_at_init`]); `None`
+    /// binds in [`Self::build`].
+    bound: Option<RsrvSockets>,
+}
+
+/// The name RSRV's [`RsrvSockets`] are registered under — C's
+/// `dbServer.name` for RSRV (`caservertask.c:1562`).
+pub const RSRV_SERVER: &str = "rsrv";
+
+/// RSRV's sockets, bound by `iocInit` at C's `dbInitServers()` point
+/// (`rsrv_init`) and served by the runner from `iocRun`.
+pub struct RsrvSockets {
+    tcp: tcp::BoundTcp,
+    udp: udp::BoundUdp,
+}
+
+impl RsrvSockets {
+    /// C `rsrv_init`: what [`epics_base_rs::server::ioc_app::IocApplication::register_server_init`]
+    /// runs for RSRV.
+    pub async fn bind(args: epics_base_rs::server::ioc_app::ServerInitArgs) -> CaResult<Self> {
+        let (tcp, udp) = bind_sockets(args.port, args.tcp_port.unwrap_or(args.port)).await?;
+        Ok(Self { tcp, udp })
+    }
 }
 
 /// A database a lifecycle already loaded and carried through `iocInit`,
@@ -120,7 +143,18 @@ impl CaServerBuilder {
             drain_grace_secs: drain_grace_from_env(),
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: None,
+            bound: None,
         }
+    }
+
+    /// Serve on the sockets `iocInit` bound, when RSRV's init ran; the
+    /// port settings are then the ones it bound with.
+    pub fn bound_at_init(
+        mut self,
+        servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    ) -> Self {
+        self.bound = servers.take::<RsrvSockets>(RSRV_SERVER);
+        self
     }
 
     /// Bind an HTTP introspection endpoint exposing
@@ -355,8 +389,10 @@ impl CaServerBuilder {
         // `self.port` field already incorporates the
         // `EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT` precedence
         // via cas_server_port() at builder construction.
-        let tcp_port = self.tcp_port.unwrap_or(self.port);
-        let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
+        let (tcp, udp) = match self.bound {
+            Some(RsrvSockets { tcp, udp }) => (tcp, udp),
+            None => bind_sockets(self.port, self.tcp_port.unwrap_or(self.port)).await?,
+        };
         let server = CaServer {
             db,
             port: udp.port(),
@@ -489,8 +525,9 @@ async fn bind_sockets(
     // `tryBind` prints `CAS: <name> bind ERROR: <why>` and calls
     // `epicsThreadSuspendSelf()` (`:135-141`), and with no interface left
     // `rsrv_init` ends in `cantProceed("CAS: No TCP server started")` (`:752`):
-    // `iocInit` hangs on its own thread. Here those two cases return `Err`,
-    // and `run_ca_ioc` returns it.
+    // `iocInit` hangs on its own thread. Here those two cases return `Err`;
+    // under `iocInit` (`RsrvSockets::bind`) it fails the build at the same
+    // `dbInitServers()` point and the IOC returns it.
     let mut tcp = crate::server::tcp::bind_tcp_listeners(tcp_port).await?;
     // The TCP set owns the interface list: it has already dropped any address
     // that is no interface of this host (`caservertask.c:225-226`).

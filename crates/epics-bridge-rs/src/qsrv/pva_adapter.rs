@@ -1576,7 +1576,7 @@ where
 
 #[cfg(all(feature = "qsrv", tokio_backend))]
 async fn serve_ca_pva_qsrv(
-    config: epics_base_rs::server::ioc_app::IocRunConfig,
+    mut config: epics_base_rs::server::ioc_app::IocRunConfig,
     mount: QsrvMount,
 ) -> epics_base_rs::error::CaResult<()> {
     use epics_base_rs::error::CaError;
@@ -1655,14 +1655,15 @@ async fn serve_ca_pva_qsrv(
     ));
 
     // ── CA server (background) ──
-    let ca_server = epics_ca_rs::server::CaServer::from_parts(
+    let ca_server = epics_ca_rs::server::CaServerBuilder::serving(
         db.clone(),
-        ca_port,
-        None,
         config.acf.clone(),
         config.autosave_config.clone(),
         config.autosave_manager.clone(),
     )
+    .port(ca_port)
+    .bound_at_init(&mut config.servers)
+    .build()
     .await?;
     reactor.spawn(async move {
         if let Err(e) = ca_server.run().await {

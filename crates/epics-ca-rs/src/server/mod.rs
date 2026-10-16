@@ -103,22 +103,25 @@ pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication)
 /// on the script, because this function is dispatched after the script has
 /// already run.
 #[cfg(tokio_backend)]
-pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
+pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
     // For a caller that reaches the CA server only through this runner: C's
     // `registrar(rsrvRegistrar)` is there from the moment the binary links
     // RSRV, so it must not wait on `run_with_shell`. It is still too late for
     // the startup script, which has already run by the time this runner is
     // dispatched; `run_ca_ioc_app` is the entry point that is early enough.
     iocsh::declare_rsrv_registrar();
-    let server = CaServer::from_parts(
+    let mut builder = CaServerBuilder::serving(
         config.db,
-        config.port,
-        config.tcp_port,
         config.acf,
         config.autosave_config,
         config.autosave_manager,
     )
-    .await?;
+    .port(config.port)
+    .bound_at_init(&mut config.servers);
+    if let Some(tcp_port) = config.tcp_port {
+        builder = builder.tcp_port(tcp_port);
+    }
+    let server = builder.build().await?;
     // `config.after_init_hooks` is always handed over EMPTY —
     // `IocApplication::run` drains the hooks itself after PINI (H3) and
     // owns scanning via the core `ScanOwner`, so the CA server neither

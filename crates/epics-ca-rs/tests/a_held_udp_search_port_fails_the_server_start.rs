@@ -31,3 +31,31 @@ async fn a_held_udp_search_port_fails_from_parts_instead_of_hanging() {
     .await;
     assert!(started.is_err(), "the server started on a held UDP port");
 }
+
+/// Under `iocInit` the bind is RSRV's `dbInitServers()` init, so the held port
+/// fails the script's `iocInit` line and the runner is never started.
+#[tokio::test]
+async fn a_held_udp_search_port_fails_ioc_init() {
+    let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("take a UDP port");
+    let port = held.local_addr().unwrap().port();
+    // SAFETY: nextest runs this test alone in its process.
+    unsafe {
+        std::env::set_var("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1");
+    }
+    let script = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("held_port_ioc_init.cmd");
+    std::fs::write(&script, "iocInit\n").expect("write the script");
+    let app = epics_ca_rs::server::iocsh::register_rsrv_commands(
+        epics_base_rs::server::ioc_app::IocApplication::new()
+            .port(port)
+            .tcp_port(0)
+            .startup_script(&script.to_string_lossy()),
+    );
+    let err = app
+        .run(|_config| async { panic!("the runner must not be started") })
+        .await
+        .expect_err("iocInit fails on the held port");
+    assert!(
+        err.to_string().contains("Address already in use"),
+        "got: {err}"
+    );
+}

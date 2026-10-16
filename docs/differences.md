@@ -43,7 +43,9 @@ difference is either invisible to a client or is an improvement:
   `cantProceed("CAS: No TCP server started")` (`:752`), and on any other bind
   error `tryBind` prints and suspends the init thread (`:135-141`): `iocInit`
   hangs and the shell never starts. `CaServer::from_parts` and `build` return
-  the error and `run_ca_ioc` returns it. Signed off 2026-10-14. A dropped
+  the error; under `iocInit` the bind is at C's `dbInitServers()` point, so
+  no later `st.cmd` line runs and the IOC returns the error. Signed off
+  2026-10-14. A dropped
   interface loses its TCP listener with its UDP responder, as in C, and the
   whole-set restart on an OS-picked TCP port (`rsrv_grab_tcp`) is capped at 16
   tries where C loops without end, for the reason given for the PVA ephemeral

@@ -38,7 +38,13 @@ fn starting_ioc_init_precedes_the_init_record_report_as_in_soft_ioc() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    let first: Vec<&str> = stderr.lines().take(3).collect();
+    // `--port 0`'s port report has no C counterpart; it is written at the
+    // bind, which `iocInit` now does at `dbInitServers()`.
+    let first: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.starts_with("CA server: UDP search on port"))
+        .take(3)
+        .collect();
     assert_eq!(
         first,
         [

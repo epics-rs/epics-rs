@@ -9478,3 +9478,31 @@ fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
         "no stale target dispatches after the sync"
     );
 }
+
+#[test]
+fn every_field_default_is_the_dbd_initial() {
+    // A field with no `initial()` starts at zero (motorRecord.dbd TWV, which
+    // had defaulted to 1 here). VERS, LVIO and MRES are what init_record
+    // sets them to (608, 734, 3917), which lands the same after init.
+    let rec = MotorRecord::default();
+    let mut wrong = Vec::new();
+    for desc in rec.field_list() {
+        if matches!(desc.name, "VERS" | "LVIO" | "MRES") {
+            continue;
+        }
+        let Some(got) = rec.get_field(desc.name).and_then(|v| v.to_f64()) else {
+            continue;
+        };
+        let want = match (desc.initial, desc.menu) {
+            (None, _) => 0.0,
+            (Some(i), Some(menu)) if i.parse::<f64>().is_err() => {
+                menu.iter().position(|c| *c == i).expect("menu initial") as f64
+            }
+            (Some(i), _) => i.parse().expect("numeric initial"),
+        };
+        if got != want {
+            wrong.push((desc.name, got, want));
+        }
+    }
+    assert!(wrong.is_empty(), "(field, default, dbd initial): {wrong:?}");
+}

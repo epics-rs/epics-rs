@@ -261,7 +261,7 @@ impl Default for ControlFields {
             jogr: false,
             twf: false,
             twr: false,
-            twv: 1.0,
+            twv: 0.0,
             cnen: false,
         }
     }

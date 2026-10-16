@@ -1,0 +1,46 @@
+grecord(ao,"$(P)$(Q):timeRestore") {
+	field(DTYP,"Soft Channel")
+	field(OUT,"$(CT_TIME_PV) PP MS")
+	field(DOL,"$(P)$(Q):alignPre.B  NPP NMS")
+	field(OMSL,"closed_loop")
+}
+grecord(scanparm,"$(P)$(Q):alignParms") {
+	field(PREC,"6")
+	field(PRE,"4")
+	field(OPRE,"$(P)$(Q):alignPre.A  PP MS")
+	field(OSM,"$(SCANREC).P1SM  CA NMS")
+	field(AR,"RELATIVE")
+	field(OAR,"$(SCANREC).P1AR  CA NMS")
+	field(AFT,"$(AFTER)")
+	field(OAFT,"$(SCANREC).PASM  CA NMS")
+	field(PPV,"$(POS)")
+	field(RPV,"$(RDBK)")
+	field(DPV,"$(DET)")
+	field(TPV,"$(TRIG)")
+	field(OPPV,"$(SCANREC).P1PV  CA NMS")
+	field(ORPV,"$(SCANREC).R1PV  CA NMS")
+	field(ODPV,"$(SCANREC).D01PV  CA NMS")
+	field(OTPV,"$(SCANREC).T1PV  CA NMS")
+	field(SP,"-1")
+	field(OSP,"$(SCANREC).P1SP  CA NMS")
+	field(EP,"1")
+	field(OEP,"$(SCANREC).P1EP  CA NMS")
+	field(NP,"11")
+	field(ONP,"$(SCANREC).NPTS  CA NMS")
+	field(SC,"1")
+	field(OSC,"$(P)$(Q):do.A  PP MS")
+	field(AQT,"1")
+	field(OAQT,"$(CT_TIME_PV) PP MS")
+	field(IMP,"$(SCANREC).MPTS  NPP NMS")
+	field(IACT,"$(SCANREC).BUSY  NPP NMS")
+}
+grecord(transform,"$(P)$(Q):alignPre") {
+	field(INPB,"$(CT_TIME_PV) NPP NMS")
+	field(OUTA,"$(SCANREC).CMND  CA NMS")
+}
+grecord(swait,"$(P)$(Q):do") {
+	field(DTYP,"Soft Channel")
+	field(FLNK,"$(P)$(Q):timeRestore.VAL  PP MS")
+	field(OUTN,"$(SCANREC).EXSC")
+	field(CALC,"a")
+}

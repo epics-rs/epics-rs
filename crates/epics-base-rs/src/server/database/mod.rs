@@ -1,4 +1,5 @@
 pub(crate) mod breakpoint;
+mod ca_client;
 mod ca_link;
 pub mod channel_io;
 pub mod char_view;
@@ -21,6 +22,10 @@ pub(crate) mod scan_index;
 mod snapshot;
 mod subroutine_context;
 
+pub use ca_client::{
+    CaClientContext, CaClientService, ClientChannel, ClientFuture, ClientMonitor, Connection,
+    PutCompletion,
+};
 pub use ca_link::CA_LINK_EVENT_MASK;
 pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
 pub(crate) use field_io::{PutSrc, render_for_string_target};

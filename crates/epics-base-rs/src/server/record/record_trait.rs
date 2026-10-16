@@ -74,45 +74,88 @@ pub enum RawSoftEntry {
 /// element count come from the record's `cvt_dbaddr` rather than the `.dbd`, and
 /// `As` re-evaluates access security.
 ///
-/// The discriminants ARE C's `SPC_*` numbers (`special.h:26-39` @R7.0.10),
-/// so `special as i16` is the integer C prints and stores. They are written
-/// out rather than left implicit because the table is not contiguous — C has
-/// no code 4, and the record-specific half starts at 100 — so the obvious
-/// cast on an implicitly-numbered enum would have answered 4 for
-/// [`Self::AlarmAck`] and 7 for [`Self::Mod`]. Carrying the number on the
-/// type is what makes every future cast right by construction.
+/// [`Self::code`] is C's `SPC_*` number (`special.h:26-39` @R7.0.10), the
+/// integer C prints and stores. It is a table, not a cast, because the
+/// numbering is not contiguous — C has no code 4, and the record-specific half
+/// starts at 100 — and because a `.dbd` may also declare a code by number
+/// (`special(111)`, which `dbLexRoutines.c:631` reads with `%hd`), which
+/// [`Self::Record`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i16)]
 pub enum Special {
     /// No `special()` declared — C leaves `pdbFldDes->special` 0.
-    None = 0,
+    None,
     /// `SPC_NOMOD` — the field must not be modified. Mirrored into
     /// [`FieldDesc::read_only`], which is the bit the put gate reads.
-    NoMod = 1,
+    NoMod,
     /// `SPC_DBADDR` — the record's `cvt_dbaddr` supplies the field's type
     /// and element count. [`FieldDesc::dbf_type`] carries the type C serves at
     /// the selector field's default; a record whose type is state-dependent
     /// (`waveform.VAL` on `FTVL`, `mbbo.VAL` on `SDEF`) overrides it at runtime.
-    DbAddr = 2,
+    DbAddr,
     /// `SPC_SCAN` — a scan-related field; C re-registers the scan.
-    Scan = 3,
+    Scan,
     /// `SPC_ALARMACK` — an alarm acknowledgement. C skips 4.
-    AlarmAck = 5,
+    AlarmAck,
     /// `SPC_AS` — access security; C re-computes the record's ASG.
-    As = 6,
+    As,
     /// `SPC_ATTRIBUTE` — a pseudo (attribute) field. Set internally; it
     /// is the one code `pamapspcType` omits, so no `.dbd` declares it.
-    Attribute = 7,
+    Attribute,
     /// `SPC_MOD` — the record's own `special()` runs on the put. C's
     /// record-specific range starts here.
-    Mod = 100,
+    Mod,
     /// `SPC_RESET` — the `RES` field is being modified.
-    Reset = 101,
+    Reset,
     /// `SPC_LINCONV` — a linear-conversion field changed; C calls the
     /// device support's `special_linconv`.
-    LinConv = 102,
+    LinConv,
     /// `SPC_CALC` — the `CALC` expression changed; C recompiles it.
-    Calc = 103,
+    Calc,
+    /// A record-specific code declared by number, above the ones `special.h`
+    /// names — sscan's `special(111)` (`SPC_SC_S`) .. `special(120)`. C
+    /// routes it to the record's `special()` as it does `SPC_MOD`.
+    Record(i16),
+}
+
+impl Special {
+    /// The `.dbd` numeric form: a named code when C names it, else
+    /// [`Self::Record`]. `None` for a number below `SPC_MOD` that C does not
+    /// name, which no `.dbd` declares.
+    pub const fn from_code(code: i16) -> Option<Self> {
+        Some(match code {
+            0 => Self::None,
+            1 => Self::NoMod,
+            2 => Self::DbAddr,
+            3 => Self::Scan,
+            5 => Self::AlarmAck,
+            6 => Self::As,
+            7 => Self::Attribute,
+            100 => Self::Mod,
+            101 => Self::Reset,
+            102 => Self::LinConv,
+            103 => Self::Calc,
+            104.. => Self::Record(code),
+            _ => return None,
+        })
+    }
+
+    /// C's `pdbFldDes->special` for this code.
+    pub const fn code(self) -> i16 {
+        match self {
+            Self::None => 0,
+            Self::NoMod => 1,
+            Self::DbAddr => 2,
+            Self::Scan => 3,
+            Self::AlarmAck => 5,
+            Self::As => 6,
+            Self::Attribute => 7,
+            Self::Mod => 100,
+            Self::Reset => 101,
+            Self::LinConv => 102,
+            Self::Calc => 103,
+            Self::Record(code) => code,
+        }
+    }
 }
 
 /// A field's access-security level — C `.dbd` `asl(ASL0|ASL1)`.
@@ -4736,6 +4779,31 @@ pub trait Record: Send + Sync + 'static {
         CycleMarks::NONE
     }
 
+    /// Whether marks remain after the last [`Self::take_cycle_posted_fields`]:
+    /// a cycle owing more posts than one post table holds (sscan's
+    /// end-of-scan arrays). The `WRITE_POSTED` / `HAND_POSTED` drain takes
+    /// until this is false; the monitor walk takes once, so a
+    /// `CYCLE_POSTED` type leaves it false.
+    ///
+    /// Default: false.
+    fn cycle_posts_remain(&self) -> bool {
+        false
+    }
+
+    /// The next post whose value was read when it was made: C
+    /// `db_post_events` copies the field into the event at the call, so two
+    /// posts of one field in a cycle deliver both values (sscan's `CPT`,
+    /// `DATA` and `BUSY` transitions). The `WRITE_POSTED` / `HAND_POSTED`
+    /// drain takes these until `None`, after the marks, and posts each stored
+    /// value without reading the record.
+    ///
+    /// Default: `None`.
+    fn take_cycle_posted_value(
+        &mut self,
+    ) -> Option<(FieldIx, crate::server::recgbl::EventMask, EpicsValue)> {
+        None
+    }
+
     /// Posts the record's C `process()` makes itself, ahead of
     /// `recGblGetTimeStamp` and `monitor()` — aCalcout's `afterCalc` array
     /// posts (`aCalcoutRecord.c:294-298`). Drained as soon as `process()`
@@ -7877,24 +7945,26 @@ mod declaration_numbering_tests {
             | Special::Mod
             | Special::Reset
             | Special::LinConv
-            | Special::Calc => (),
+            | Special::Calc
+            | Special::Record(_) => (),
         }
     }
 
     #[test]
     fn every_special_carries_cs_spc_number() {
         for (spc, n, name) in C_SPECIAL {
-            assert_eq!(spc as i16, n, "{name}: wrong SPC_ number");
+            assert_eq!(spc.code(), n, "{name}: wrong SPC_ number");
+            assert_eq!(Special::from_code(n), Some(spc), "{name}: numeric form");
         }
         for (a, (x, ..)) in C_SPECIAL.iter().enumerate() {
             for (y, ..) in C_SPECIAL.iter().skip(a + 1) {
                 assert_ne!(x, y, "{x:?} listed twice");
             }
         }
-        // The gap is the reason the discriminants are written out: an
-        // implicitly-numbered enum would have answered 4 here and 7 for
-        // `Mod`, and `special as i16` is the integer C prints.
         assert!(!C_SPECIAL.iter().any(|(_, n, _)| *n == 4), "C has no SPC 4");
+        assert_eq!(Special::from_code(4), None);
+        assert_eq!(Special::from_code(111), Some(Special::Record(111)));
+        assert_eq!(Special::Record(111).code(), 111);
         // `pamapspcType[SPC_NTYPES]` (`special.h:42,51-61`) is the `.dbd`
         // parser's table: nine entries, omitting SPC_ATTRIBUTE — which C sets
         // internally — and the 0 that means no `special()` at all.

@@ -1,0 +1,19 @@
+[package]
+name = "sscan-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of the EPICS synApps sscan module (sscan and scanparm records)"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+epics-base-rs = { workspace = true }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[features]
+
+[dev-dependencies]
+epics-ca-rs = { workspace = true }
+tokio = { version = "1", features = ["full", "test-util"] }

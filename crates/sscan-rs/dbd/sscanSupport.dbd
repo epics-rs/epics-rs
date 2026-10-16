@@ -1,0 +1,35 @@
+################
+# RECORD SUPPORT
+################
+include "menuSscan.dbd"
+include "scanparmRecord.dbd"
+include "sscanRecord.dbd"
+
+################
+# DEVICE SUPPORT
+################
+
+
+################
+# DRIVER SUPPORT
+################
+
+################
+# OTHER SUPPORT
+################
+registrar(saveDataRegistrar)
+variable("recDynLinkDebug", int)
+variable("recDynLinkQsize", int)
+variable("debug_saveData", int)
+variable("debug_saveDataMsg", int)
+variable("saveData_MessagePolicy", int)
+variable("sscanRecordDebug", int)
+variable("sscanRecordViewPos", int)
+variable("sscanRecordDontCheckLimits", int)
+variable("sscanRecordLookupTime", int)
+variable("sscanRecordConnectWaitSeconds", int)
+variable("scanparmRecordDebug", int)
+# Don't put this here, because it would require all users
+# of sscan to use the sequencer.  Instead, Makefile will add
+# sscanProgressSupport.dbd to the .dbd file iff SNCSEQ is defined.
+#registrar(scanProgressRegistrar)

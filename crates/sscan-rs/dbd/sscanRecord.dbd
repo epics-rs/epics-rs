@@ -1,0 +1,6184 @@
+recordtype(sscan) {
+	include "dbCommon.dbd" 
+	field(VERS,DBF_DOUBLE) {
+		prompt("Code Version")
+		special(SPC_NOMOD)
+		initial("3")
+	}
+	field(VAL,DBF_DOUBLE) {
+		prompt("Value Field")
+	}
+	field(SMSG,DBF_STRING) {
+		prompt("Record State Msg")
+		interest(1)
+		size(40)
+	}
+	field(CMND,DBF_MENU) {
+		prompt("Command Field")
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		menu(sscanCMND)
+	}
+	field(ALRT,DBF_UCHAR) {
+		prompt("Operator Alert")
+		special(SPC_NOMOD)
+	}
+	field(RPVT,DBF_NOACCESS) {
+		prompt("Ptr to Pvt Struct")
+		special(SPC_NOMOD)
+		interest(4)
+		size(4)
+		extra("void *           rpvt")
+	}
+	field(MPTS,DBF_LONG) {
+		prompt("Max # of Points")
+		promptgroup(GUI_LINKS)
+		special(SPC_NOMOD)
+		interest(1)
+		initial("100")
+	}
+	field(EXSC,DBF_SHORT) {
+		prompt("Execute Scan")
+		asl(ASL0)
+		special(SPC_MOD)
+		pp(TRUE)
+		interest(1)
+	}
+	field(XSC,DBF_SHORT) {
+		prompt("Internal execScan")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(PXSC,DBF_UCHAR) {
+		prompt("Previous XScan")
+		special(SPC_NOMOD)
+	}
+	field(BUSY,DBF_UCHAR) {
+		prompt("Scan in progress")
+		special(SPC_NOMOD)
+	}
+	field(KILL,DBF_UCHAR) {
+		prompt("Abort right now")
+		special(SPC_NOMOD)
+	}
+	field(WAIT, DBF_SHORT) {
+		prompt("Wait for client(s)")
+		special(SPC_MOD)
+	}
+	field(WCNT,DBF_SHORT) {
+		prompt("Wait count)")
+		special(SPC_NOMOD)
+	}
+	field(AWCT,DBF_SHORT) {
+		prompt("Auto WCNT")
+		special(SPC_MOD)
+	}
+	field(WTNG,DBF_SHORT) {
+		prompt("Waiting for client(s)")
+		special(SPC_NOMOD)
+	}
+	field(AWAIT, DBF_SHORT) {
+		prompt("Waiting for data-storage client")
+		special(SPC_MOD)
+	}
+	field(AAWAIT, DBF_MENU) {
+		prompt("AutoWait for data-storage client")
+		promptgroup(GUI_INPUTS)
+		menu(sscanNOYES)
+	}
+	field(DATA,DBF_SHORT) {
+		prompt("Scan data ready")
+		special(SPC_NOMOD)
+	}
+	field(REFD,DBF_SHORT) {
+		prompt("Reference detector")
+		special(SPC_MOD)
+		initial("1")
+	}
+	field(NPTS,DBF_LONG) {
+		prompt("Number of Points")
+		promptgroup(GUI_LINKS)
+		asl(ASL0)
+		special(116)
+		interest(1)
+		initial("100")
+	}
+	field(FPTS,DBF_MENU) {
+		prompt("Freeze Num of Points")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+		initial("FREEZE")
+	}
+	field(FFO,DBF_MENU) {
+		prompt("Freeze Flag Override")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(117)
+		interest(1)
+		menu(sscanFFO)
+	}
+	field(CPT,DBF_LONG) {
+		prompt("Current Point")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(BCPT,DBF_LONG) {
+		prompt("Bufferred Current Point")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(DPT,DBF_LONG) {
+		prompt("Desired Point")
+		special(119)
+		interest(1)
+	}
+	field(PCPT,DBF_LONG) {
+		prompt("Point ofLast Posting")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(PASM,DBF_MENU) {
+		prompt("After Scan Mode")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		interest(1)
+		menu(sscanPASM)
+	}
+	field(TOLP,DBF_NOACCESS) {
+		prompt("Time of Last Posting")
+		special(SPC_NOMOD)
+		extra("epicsTimeStamp	tolp")
+		interest(2)
+	}
+	field(TLAP,DBF_NOACCESS) {
+		prompt("Time of Last Array Posting")
+		special(SPC_NOMOD)
+		extra("epicsTimeStamp	tlap")
+		interest(2)
+	}
+	field(ATIME,DBF_FLOAT) {
+		prompt("Array post time period")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(P1PV,DBF_STRING) {
+		prompt("Positioner 1 PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(P2PV,DBF_STRING) {
+		prompt("Positioner 2 PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(P3PV,DBF_STRING) {
+		prompt("Positioner 3 PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(P4PV,DBF_STRING) {
+		prompt("Positioner 4 PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(R1PV,DBF_STRING) {
+		prompt("P1 Readback  PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(R2PV,DBF_STRING) {
+		prompt("P2 Readback  PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(R3PV,DBF_STRING) {
+		prompt("P3 Readback  PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(R4PV,DBF_STRING) {
+		prompt("P4 Readback  PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D01PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D02PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D03PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D04PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D05PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D06PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D07PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D08PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D09PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D10PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D11PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D12PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D13PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D14PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D15PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D16PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D17PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D18PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D19PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D20PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D21PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D22PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D23PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D24PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D25PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D26PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D27PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D28PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D29PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D30PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D31PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D32PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D33PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D34PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D35PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D36PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D37PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D38PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D39PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D40PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D41PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D42PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D43PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D44PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D45PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D46PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D47PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D48PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D49PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D50PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D51PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D52PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D53PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D54PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D55PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D56PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D57PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D58PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D59PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D60PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D61PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D62PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D63PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D64PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D65PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D66PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D67PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D68PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D69PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(D70PV,DBF_STRING) {
+		prompt("Detector PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(T1PV,DBF_STRING) {
+		prompt("Trigger 1    PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(T2PV,DBF_STRING) {
+		prompt("Trigger 2    PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(T3PV,DBF_STRING) {
+		prompt("Trigger 3    PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(T4PV,DBF_STRING) {
+		prompt("Trigger 4    PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(A1PV,DBF_STRING) {
+		prompt("Array-read trigger 1 PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(BSPV,DBF_STRING) {
+		prompt("Before Scan  PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(ASPV,DBF_STRING) {
+		prompt("After Scan   PV Name")
+		promptgroup(GUI_CALC)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		size(40)
+	}
+	field(BSWAIT,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+		menu(sscanLINKWAIT)
+		initial("Wait")
+	}
+	field(ASWAIT,DBF_MENU) {
+		prompt("Wait for completion?")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+		menu(sscanLINKWAIT)
+		initial("Wait")
+	}
+	field(P1NV,DBF_MENU) {
+		prompt("P1  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(P2NV,DBF_MENU) {
+		prompt("P2  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(P3NV,DBF_MENU) {
+		prompt("P3  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(P4NV,DBF_MENU) {
+		prompt("P4  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(R1NV,DBF_MENU) {
+		prompt("R1  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(R2NV,DBF_MENU) {
+		prompt("R2  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(R3NV,DBF_MENU) {
+		prompt("R3  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(R4NV,DBF_MENU) {
+		prompt("R4  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D01NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D02NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D03NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D04NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D05NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D06NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D07NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D08NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D09NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D10NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D11NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D12NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D13NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D14NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D15NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D16NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D17NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D18NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D19NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D20NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D21NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D22NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D23NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D24NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D25NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D26NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D27NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D28NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D29NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D30NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D31NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D32NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D33NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D34NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D35NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D36NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D37NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D38NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D39NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D40NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D41NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D42NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D43NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D44NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D45NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D46NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D47NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D48NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D49NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D50NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D51NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D52NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D53NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D54NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D55NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D56NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D57NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D58NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D59NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D60NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D61NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D62NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D63NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D64NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D65NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D66NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D67NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D68NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D69NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(D70NV,DBF_MENU) {
+		prompt("PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(T1NV,DBF_MENU) {
+		prompt("T1  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(T2NV,DBF_MENU) {
+		prompt("T2  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(T3NV,DBF_MENU) {
+		prompt("T3  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(T4NV,DBF_MENU) {
+		prompt("T4  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(A1NV,DBF_MENU) {
+		prompt("A1  PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(BSNV,DBF_MENU) {
+		prompt("BeforeScan PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(ASNV,DBF_MENU) {
+		prompt("After Scan PV Status")
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanP1NV)
+	}
+	field(P1PP,DBF_DOUBLE) {
+		prompt("P1 Previous Position")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P1CV,DBF_DOUBLE) {
+		prompt("P1 Current Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P1DV,DBF_DOUBLE) {
+		prompt("P1 Desired Value")
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(P1LV,DBF_DOUBLE) {
+		prompt("P1 Last Value Posted")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P1SP,DBF_DOUBLE) {
+		prompt("P1 Start Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(111)
+		interest(1)
+	}
+	field(P1SI,DBF_DOUBLE) {
+		prompt("P1 Step Increment")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(112)
+		interest(1)
+	}
+	field(P1EP,DBF_DOUBLE) {
+		prompt("P1 End Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(113)
+		interest(1)
+	}
+	field(P1CP,DBF_DOUBLE) {
+		prompt("P1 Center Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(114)
+		interest(1)
+	}
+	field(P1WD,DBF_DOUBLE) {
+		prompt("P1 Scan Width")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(115)
+		interest(1)
+	}
+	field(R1CV,DBF_DOUBLE) {
+		prompt("P1 Readback Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R1LV,DBF_DOUBLE) {
+		prompt("P1 Rdbk Last Val Pst")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R1DL,DBF_DOUBLE) {
+		prompt("P1 Readback Delta")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P1HR,DBF_DOUBLE) {
+		prompt("P1 High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P1LR,DBF_DOUBLE) {
+		prompt("P1 Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P1PA,DBF_NOACCESS) {
+		prompt("P1 Step Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p1pa")
+	}
+	field(P1RA,DBF_NOACCESS) {
+		prompt("P1 Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p1ra")
+	}
+	field(P1CA,DBF_NOACCESS) {
+		prompt("P1 Current Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p1ca")
+	}
+	field(P1FS,DBF_MENU) {
+		prompt("P1 Freeze Start Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P1FI,DBF_MENU) {
+		prompt("P1 Freeze Step Inc")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P1FE,DBF_MENU) {
+		prompt("P1 Freeze End Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P1FC,DBF_MENU) {
+		prompt("P1 Freeze Center Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P1FW,DBF_MENU) {
+		prompt("P1 Freeze Width")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P1SM,DBF_MENU) {
+		prompt("P1 Step Mode")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(120)
+		interest(1)
+		menu(sscanP1SM)
+	}
+	field(P1AR,DBF_MENU) {
+		prompt("P1 Absolute/Relative")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		interest(1)
+		menu(sscanP1AR)
+	}
+	field(P1EU,DBF_STRING) {
+		prompt("P1 Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(P1PR,DBF_SHORT) {
+		prompt("P1 Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P2PP,DBF_DOUBLE) {
+		prompt("P2 Previous Position")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P2CV,DBF_DOUBLE) {
+		prompt("P2 Current Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P2DV,DBF_DOUBLE) {
+		prompt("P2 Desired Value")
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(P2LV,DBF_DOUBLE) {
+		prompt("P2 Last Value Posted")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P2SP,DBF_DOUBLE) {
+		prompt("P2 Start Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(111)
+		interest(1)
+	}
+	field(P2SI,DBF_DOUBLE) {
+		prompt("P2 Step Increment")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(112)
+		interest(1)
+	}
+	field(P2EP,DBF_DOUBLE) {
+		prompt("P2 End Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(113)
+		interest(1)
+	}
+	field(P2CP,DBF_DOUBLE) {
+		prompt("P2 Center Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(114)
+		interest(1)
+	}
+	field(P2WD,DBF_DOUBLE) {
+		prompt("P2 Scan Width")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(115)
+		interest(1)
+	}
+	field(R2CV,DBF_DOUBLE) {
+		prompt("P2 Readback Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R2LV,DBF_DOUBLE) {
+		prompt("P2 Rdbk Last Val Pst")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R2DL,DBF_DOUBLE) {
+		prompt("P2 Readback Delta")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P2HR,DBF_DOUBLE) {
+		prompt("P2 High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P2LR,DBF_DOUBLE) {
+		prompt("P2 Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P2PA,DBF_NOACCESS) {
+		prompt("P2 Step Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p2pa")
+	}
+	field(P2RA,DBF_NOACCESS) {
+		prompt("P2 Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p2ra")
+	}
+	field(P2CA,DBF_NOACCESS) {
+		prompt("P2 Current Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p2ca")
+	}
+	field(P2FS,DBF_MENU) {
+		prompt("P2 Freeze Start Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P2FI,DBF_MENU) {
+		prompt("P2 Freeze Step Inc")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P2FE,DBF_MENU) {
+		prompt("P2 Freeze End Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P2FC,DBF_MENU) {
+		prompt("P2 Freeze Center Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P2FW,DBF_MENU) {
+		prompt("P2 Freeze Width")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P2SM,DBF_MENU) {
+		prompt("P2 Step Mode")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(120)
+		interest(1)
+		menu(sscanP1SM)
+	}
+	field(P2AR,DBF_MENU) {
+		prompt("P2 Absolute/Relative")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		interest(1)
+		menu(sscanP1AR)
+	}
+	field(P2EU,DBF_STRING) {
+		prompt("P2 Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(P2PR,DBF_SHORT) {
+		prompt("P2 Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P3PP,DBF_DOUBLE) {
+		prompt("P3 Previous Position")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P3CV,DBF_DOUBLE) {
+		prompt("P3 Current Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P3DV,DBF_DOUBLE) {
+		prompt("P3 Desired Value")
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(P3LV,DBF_DOUBLE) {
+		prompt("P3 Last Value Posted")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P3SP,DBF_DOUBLE) {
+		prompt("P3 Start Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(111)
+		interest(1)
+	}
+	field(P3SI,DBF_DOUBLE) {
+		prompt("P3 Step Increment")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(112)
+		interest(1)
+	}
+	field(P3EP,DBF_DOUBLE) {
+		prompt("P3 End Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(113)
+		interest(1)
+	}
+	field(P3CP,DBF_DOUBLE) {
+		prompt("P3 Center Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(114)
+		interest(1)
+	}
+	field(P3WD,DBF_DOUBLE) {
+		prompt("P3 Scan Width")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(115)
+		interest(1)
+	}
+	field(R3CV,DBF_DOUBLE) {
+		prompt("P3 Readback Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R3LV,DBF_DOUBLE) {
+		prompt("P3 Rdbk Last Val Pst")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R3DL,DBF_DOUBLE) {
+		prompt("P3 Readback Delta")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P3HR,DBF_DOUBLE) {
+		prompt("P3 High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P3LR,DBF_DOUBLE) {
+		prompt("P3 Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P3PA,DBF_NOACCESS) {
+		prompt("P3 Step Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p3pa")
+	}
+	field(P3RA,DBF_NOACCESS) {
+		prompt("P3 Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p3ra")
+	}
+	field(P3CA,DBF_NOACCESS) {
+		prompt("P3 Current Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p3ca")
+	}
+	field(P3FS,DBF_MENU) {
+		prompt("P3 Freeze Start Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P3FI,DBF_MENU) {
+		prompt("P3 Freeze Step Inc")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P3FE,DBF_MENU) {
+		prompt("P3 Freeze End Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P3FC,DBF_MENU) {
+		prompt("P3 Freeze Center Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P3FW,DBF_MENU) {
+		prompt("P3 Freeze Width")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P3SM,DBF_MENU) {
+		prompt("P3 Step Mode")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(120)
+		interest(1)
+		menu(sscanP1SM)
+	}
+	field(P3AR,DBF_MENU) {
+		prompt("P3 Absolute/Relative")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		interest(1)
+		menu(sscanP1AR)
+	}
+	field(P3EU,DBF_STRING) {
+		prompt("P3 Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(P3PR,DBF_SHORT) {
+		prompt("P3 Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P4PP,DBF_DOUBLE) {
+		prompt("P4 Previous Position")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P4CV,DBF_DOUBLE) {
+		prompt("P4 Current Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P4DV,DBF_DOUBLE) {
+		prompt("P4 Desired Value")
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(P4LV,DBF_DOUBLE) {
+		prompt("P4 Last Value Posted")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(P4SP,DBF_DOUBLE) {
+		prompt("P4 Start Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(111)
+		interest(1)
+	}
+	field(P4SI,DBF_DOUBLE) {
+		prompt("P4 Step Increment")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(112)
+		interest(1)
+	}
+	field(P4EP,DBF_DOUBLE) {
+		prompt("P4 End Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(113)
+		interest(1)
+	}
+	field(P4CP,DBF_DOUBLE) {
+		prompt("P4 Center Position")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(114)
+		interest(1)
+	}
+	field(P4WD,DBF_DOUBLE) {
+		prompt("P4 Scan Width")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(115)
+		interest(1)
+	}
+	field(R4CV,DBF_DOUBLE) {
+		prompt("P4 Readback Value")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R4LV,DBF_DOUBLE) {
+		prompt("P4 Rdbk Last Val Pst")
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(R4DL,DBF_DOUBLE) {
+		prompt("P4 Readback Delta")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P4HR,DBF_DOUBLE) {
+		prompt("P4 High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P4LR,DBF_DOUBLE) {
+		prompt("P4 Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(P4PA,DBF_NOACCESS) {
+		prompt("P4 Step Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p4pa")
+	}
+	field(P4RA,DBF_NOACCESS) {
+		prompt("P4 Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p4ra")
+	}
+	field(P4CA,DBF_NOACCESS) {
+		prompt("P4 Current Readback Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("double *         p4ca")
+	}
+	field(P4FS,DBF_MENU) {
+		prompt("P4 Freeze Start Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P4FI,DBF_MENU) {
+		prompt("P4 Freeze Step Inc")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P4FE,DBF_MENU) {
+		prompt("P4 Freeze End Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P4FC,DBF_MENU) {
+		prompt("P4 Freeze Center Pos")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P4FW,DBF_MENU) {
+		prompt("P4 Freeze Width")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(118)
+		interest(1)
+		menu(sscanFPTS)
+	}
+	field(P4SM,DBF_MENU) {
+		prompt("P4 Step Mode")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		special(120)
+		interest(1)
+		menu(sscanP1SM)
+	}
+	field(P4AR,DBF_MENU) {
+		prompt("P4 Absolute/Relative")
+		promptgroup(GUI_OUTPUT)
+		asl(ASL0)
+		interest(1)
+		menu(sscanP1AR)
+	}
+	field(P4EU,DBF_STRING) {
+		prompt("P4 Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(P4PR,DBF_SHORT) {
+		prompt("P4 Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D01HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D01LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D01DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d01da")
+	}
+	field(D01CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d01ca")
+	}
+	field(D01CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D01LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D01NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D01EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D01PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D02HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D02LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D02DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d02da")
+	}
+	field(D02CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d02ca")
+	}
+	field(D02CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D02LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D02NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D02EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D02PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D03HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D03LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D03DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d03da")
+	}
+	field(D03CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d03ca")
+	}
+	field(D03CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D03LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D03NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D03EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D03PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D04HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D04LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D04DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d04da")
+	}
+	field(D04CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d04ca")
+	}
+	field(D04CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D04LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D04NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D04EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D04PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D05HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D05LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D05DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d05da")
+	}
+	field(D05CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d05ca")
+	}
+	field(D05CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D05LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D05NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D05EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D05PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D06HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D06LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D06DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d06da")
+	}
+	field(D06CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d06ca")
+	}
+	field(D06CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D06LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D06NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D06EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D06PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D07HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D07LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D07DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d07da")
+	}
+	field(D07CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d07ca")
+	}
+	field(D07CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D07LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D07NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D07EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D07PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D08HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D08LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D08DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d08da")
+	}
+	field(D08CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d08ca")
+	}
+	field(D08CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D08LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D08NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D08EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D08PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D09HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D09LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D09DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d09da")
+	}
+	field(D09CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d09ca")
+	}
+	field(D09CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D09LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D09NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D09EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D09PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D10HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D10LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D10DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d10da")
+	}
+	field(D10CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d10ca")
+	}
+	field(D10CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D10LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D10NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D10EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D10PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D11HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D11LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D11DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d11da")
+	}
+	field(D11CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d11ca")
+	}
+	field(D11CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D11LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D11NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D11EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D11PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D12HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D12LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D12DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d12da")
+	}
+	field(D12CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d12ca")
+	}
+	field(D12CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D12LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D12NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D12EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D12PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D13HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D13LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D13DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d13da")
+	}
+	field(D13CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d13ca")
+	}
+	field(D13CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D13LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D13NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D13EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D13PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D14HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D14LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D14DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d14da")
+	}
+	field(D14CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d14ca")
+	}
+	field(D14CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D14LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D14NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D14EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D14PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D15HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D15LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D15DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d15da")
+	}
+	field(D15CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d15ca")
+	}
+	field(D15CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D15LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D15NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D15EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D15PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D16HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D16LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D16DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d16da")
+	}
+	field(D16CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d16ca")
+	}
+	field(D16CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D16LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D16NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D16EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D16PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D17HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D17LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D17DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d17da")
+	}
+	field(D17CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d17ca")
+	}
+	field(D17CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D17LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D17NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D17EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D17PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D18HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D18LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D18DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d18da")
+	}
+	field(D18CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d18ca")
+	}
+	field(D18CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D18LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D18NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D18EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D18PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D19HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D19LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D19DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d19da")
+	}
+	field(D19CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d19ca")
+	}
+	field(D19CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D19LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D19NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D19EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D19PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D20HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D20LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D20DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d20da")
+	}
+	field(D20CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d20ca")
+	}
+	field(D20CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D20LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D20NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D20EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D20PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D21HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D21LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D21DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d21da")
+	}
+	field(D21CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d21ca")
+	}
+	field(D21CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D21LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D21NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D21EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D21PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D22HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D22LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D22DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d22da")
+	}
+	field(D22CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d22ca")
+	}
+	field(D22CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D22LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D22NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D22EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D22PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D23HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D23LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D23DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d23da")
+	}
+	field(D23CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d23ca")
+	}
+	field(D23CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D23LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D23NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D23EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D23PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D24HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D24LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D24DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d24da")
+	}
+	field(D24CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d24ca")
+	}
+	field(D24CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D24LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D24NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D24EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D24PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D25HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D25LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D25DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d25da")
+	}
+	field(D25CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d25ca")
+	}
+	field(D25CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D25LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D25NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D25EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D25PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D26HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D26LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D26DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d26da")
+	}
+	field(D26CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d26ca")
+	}
+	field(D26CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D26LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D26NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D26EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D26PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D27HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D27LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D27DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d27da")
+	}
+	field(D27CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d27ca")
+	}
+	field(D27CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D27LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D27NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D27EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D27PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D28HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D28LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D28DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d28da")
+	}
+	field(D28CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d28ca")
+	}
+	field(D28CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D28LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D28NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D28EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D28PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D29HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D29LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D29DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d29da")
+	}
+	field(D29CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d29ca")
+	}
+	field(D29CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D29LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D29NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D29EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D29PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D30HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D30LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D30DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d30da")
+	}
+	field(D30CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d30ca")
+	}
+	field(D30CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D30LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D30NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D30EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D30PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D31HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D31LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D31DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d31da")
+	}
+	field(D31CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d31ca")
+	}
+	field(D31CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D31LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D31NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D31EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D31PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D32HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D32LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D32DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d32da")
+	}
+	field(D32CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d32ca")
+	}
+	field(D32CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D32LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D32NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D32EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D32PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D33HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D33LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D33DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d33da")
+	}
+	field(D33CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d33ca")
+	}
+	field(D33CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D33LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D33NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D33EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D33PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D34HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D34LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D34DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d34da")
+	}
+	field(D34CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d34ca")
+	}
+	field(D34CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D34LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D34NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D34EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D34PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D35HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D35LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D35DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d35da")
+	}
+	field(D35CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d35ca")
+	}
+	field(D35CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D35LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D35NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D35EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D35PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D36HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D36LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D36DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d36da")
+	}
+	field(D36CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d36ca")
+	}
+	field(D36CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D36LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D36NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D36EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D36PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D37HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D37LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D37DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d37da")
+	}
+	field(D37CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d37ca")
+	}
+	field(D37CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D37LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D37NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D37EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D37PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D38HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D38LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D38DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d38da")
+	}
+	field(D38CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d38ca")
+	}
+	field(D38CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D38LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D38NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D38EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D38PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D39HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D39LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D39DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d39da")
+	}
+	field(D39CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d39ca")
+	}
+	field(D39CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D39LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D39NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D39EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D39PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D40HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D40LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D40DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d40da")
+	}
+	field(D40CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d40ca")
+	}
+	field(D40CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D40LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D40NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D40EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D40PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D41HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D41LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D41DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d41da")
+	}
+	field(D41CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d41ca")
+	}
+	field(D41CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D41LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D41NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D41EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D41PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D42HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D42LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D42DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d42da")
+	}
+	field(D42CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d42ca")
+	}
+	field(D42CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D42LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D42NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D42EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D42PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D43HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D43LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D43DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d43da")
+	}
+	field(D43CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d43ca")
+	}
+	field(D43CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D43LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D43NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D43EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D43PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D44HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D44LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D44DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d44da")
+	}
+	field(D44CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d44ca")
+	}
+	field(D44CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D44LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D44NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D44EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D44PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D45HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D45LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D45DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d45da")
+	}
+	field(D45CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d45ca")
+	}
+	field(D45CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D45LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D45NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D45EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D45PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D46HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D46LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D46DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d46da")
+	}
+	field(D46CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d46ca")
+	}
+	field(D46CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D46LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D46NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D46EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D46PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D47HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D47LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D47DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d47da")
+	}
+	field(D47CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d47ca")
+	}
+	field(D47CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D47LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D47NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D47EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D47PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D48HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D48LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D48DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d48da")
+	}
+	field(D48CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d48ca")
+	}
+	field(D48CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D48LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D48NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D48EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D48PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D49HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D49LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D49DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d49da")
+	}
+	field(D49CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d49ca")
+	}
+	field(D49CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D49LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D49NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D49EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D49PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D50HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D50LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D50DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d50da")
+	}
+	field(D50CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d50ca")
+	}
+	field(D50CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D50LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D50NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D50EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D50PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D51HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D51LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D51DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d51da")
+	}
+	field(D51CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d51ca")
+	}
+	field(D51CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D51LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D51NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D51EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D51PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D52HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D52LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D52DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d52da")
+	}
+	field(D52CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d52ca")
+	}
+	field(D52CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D52LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D52NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D52EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D52PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D53HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D53LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D53DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d53da")
+	}
+	field(D53CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d53ca")
+	}
+	field(D53CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D53LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D53NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D53EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D53PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D54HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D54LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D54DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d54da")
+	}
+	field(D54CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d54ca")
+	}
+	field(D54CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D54LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D54NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D54EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D54PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D55HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D55LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D55DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d55da")
+	}
+	field(D55CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d55ca")
+	}
+	field(D55CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D55LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D55NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D55EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D55PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D56HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D56LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D56DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d56da")
+	}
+	field(D56CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d56ca")
+	}
+	field(D56CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D56LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D56NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D56EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D56PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D57HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D57LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D57DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d57da")
+	}
+	field(D57CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d57ca")
+	}
+	field(D57CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D57LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D57NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D57EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D57PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D58HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D58LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D58DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d58da")
+	}
+	field(D58CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d58ca")
+	}
+	field(D58CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D58LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D58NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D58EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D58PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D59HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D59LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D59DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d59da")
+	}
+	field(D59CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d59ca")
+	}
+	field(D59CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D59LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D59NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D59EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D59PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D60HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D60LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D60DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d60da")
+	}
+	field(D60CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d60ca")
+	}
+	field(D60CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D60LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D60NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D60EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D60PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D61HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D61LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D61DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d61da")
+	}
+	field(D61CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d61ca")
+	}
+	field(D61CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D61LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D61NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D61EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D61PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D62HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D62LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D62DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d62da")
+	}
+	field(D62CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d62ca")
+	}
+	field(D62CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D62LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D62NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D62EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D62PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D63HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D63LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D63DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d63da")
+	}
+	field(D63CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d63ca")
+	}
+	field(D63CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D63LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D63NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D63EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D63PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D64HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D64LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D64DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d64da")
+	}
+	field(D64CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d64ca")
+	}
+	field(D64CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D64LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D64NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D64EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D64PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D65HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D65LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D65DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d65da")
+	}
+	field(D65CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d65ca")
+	}
+	field(D65CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D65LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D65NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D65EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D65PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D66HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D66LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D66DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d66da")
+	}
+	field(D66CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d66ca")
+	}
+	field(D66CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D66LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D66NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D66EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D66PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D67HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D67LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D67DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d67da")
+	}
+	field(D67CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d67ca")
+	}
+	field(D67CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D67LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D67NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D67EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D67PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D68HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D68LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D68DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d68da")
+	}
+	field(D68CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d68ca")
+	}
+	field(D68CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D68LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D68NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D68EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D68PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D69HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D69LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D69DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d69da")
+	}
+	field(D69CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d69ca")
+	}
+	field(D69CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D69LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D69NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D69EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D69PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D70HR,DBF_DOUBLE) {
+		prompt("High Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D70LR,DBF_DOUBLE) {
+		prompt("Low  Oper Range")
+		promptgroup(GUI_CONVERT)
+		asl(ASL0)
+		interest(1)
+	}
+	field(D70DA,DBF_NOACCESS) {
+		prompt("Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d70da")
+	}
+	field(D70CA,DBF_NOACCESS) {
+		prompt("Current Data Array")
+		asl(ASL0)
+		special(SPC_DBADDR)
+		size(4)
+		extra("float *          d70ca")
+	}
+	field(D70CV,DBF_FLOAT) {
+		prompt("Current Value")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D70LV,DBF_FLOAT) {
+		prompt("Last Value Posted")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D70NE,DBF_ULONG) {
+		prompt("# of Elements/Pt")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+	}
+	field(D70EU,DBF_STRING) {
+		prompt("Engineering Units")
+		promptgroup(GUI_COMPRESS)
+		asl(ASL0)
+		interest(1)
+		size(16)
+	}
+	field(D70PR,DBF_SHORT) {
+		prompt("Display Precision")
+		promptgroup(GUI_HIST)
+		asl(ASL0)
+		interest(1)
+	}
+	field(T1CD,DBF_FLOAT) {
+		prompt("T1 Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(T2CD,DBF_FLOAT) {
+		prompt("T2 Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(T3CD,DBF_FLOAT) {
+		prompt("T3 Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(T4CD,DBF_FLOAT) {
+		prompt("T4 Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(A1CD,DBF_FLOAT) {
+		prompt("A1 Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(BSCD,DBF_FLOAT) {
+		prompt("Before Scan Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(ASCD,DBF_FLOAT) {
+		prompt("After Scan Cmnd")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		initial(1.0)
+	}
+	field(PAUS,DBF_MENU) {
+		prompt("Go/Pause control")
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		menu(sscanPAUS)
+		initial("GO")
+	}
+	field(LPAU,DBF_MENU) {
+		prompt("Last value of Go/Pause")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		menu(sscanPAUS)
+		initial("GO")
+	}
+	field(PDLY,DBF_FLOAT) {
+		prompt("Positioner-settling delay")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(DDLY,DBF_FLOAT) {
+		prompt("Detector-settling delay")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(RDLY,DBF_FLOAT) {
+		prompt("Pause resume delay")
+		promptgroup(GUI_INPUTS)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+	}
+	field(FAZE,DBF_MENU) {
+		prompt("Scan phase")
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanFAZE)
+	}
+	field(ACQM,DBF_MENU) {
+		prompt("Acquisition mode")
+		promptgroup(GUI_COMMON)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		menu(sscanACQM)
+		initial("NORMAL")
+	}
+	field(ACQT,DBF_MENU) {
+		prompt("Acquisition type")
+		promptgroup(GUI_COMMON)
+		asl(ASL0)
+		special(SPC_MOD)
+		interest(1)
+		menu(sscanACQT)
+		initial("SCALAR")
+	}
+	field(DSTATE,DBF_MENU) {
+		prompt("Data state")
+		promptgroup(GUI_COMMON)
+		asl(ASL0)
+		special(SPC_NOMOD)
+		interest(1)
+		menu(sscanDSTATE)
+	}
+	field(COPYTO,DBF_LONG) {
+		prompt("Copy Last Pt Thru")
+		promptgroup(GUI_COMMON)
+		interest(1)
+	}
+}

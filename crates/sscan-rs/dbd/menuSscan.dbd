@@ -1,0 +1,95 @@
+menu(sscanNOYES) {
+	choice(sscanNOYES_NO,"NO")
+	choice(sscanNOYES_YES,"YES")
+}
+menu(sscanDSTATE) {
+	choice(sscanDSTATE_UNPACKED, "UNPACKED")
+	choice(sscanDSTATE_TRIG_ARRAY_READ, "TRIG_ARRAY_READ")
+	choice(sscanDSTATE_ARRAY_READ_WAIT, "ARRAY_READ_WAIT")
+	choice(sscanDSTATE_ARRAY_GET_CALLBACK_WAIT, "ARRAY_GET_CALLBACK_WAIT")
+	choice(sscanDSTATE_RECORD_ARRAY_DATA, "RECORD_ARRAY_DATA")
+	choice(sscanDSTATE_SAVE_DATA_WAIT, "SAVE_DATA_WAIT")
+	choice(sscanDSTATE_PACKED, "PACKED")
+	choice(sscanDSTATE_POSTED, "POSTED")
+}
+menu(sscanLINKWAIT) {
+	choice(sscanLINKWAIT_YES,"Wait")
+	choice(sscanLINKWAIT_NO,"NoWait")
+}
+menu(sscanP1SM) {
+	choice(sscanP1SM_Linear,"LINEAR")
+	choice(sscanP1SM_Table,"TABLE")
+	choice(sscanP1SM_On_The_Fly,"FLY")
+}
+menu(sscanFPTS) {
+	choice(sscanFPTS_No,"NO")
+	choice(sscanFPTS_Freeze,"FREEZE")
+}
+menu(sscanFFO) {
+	choice(sscanFFO_Use_F_Flags,"USE F-FLAGS")
+	choice(sscanFFO_Override,"OVERRIDE")
+}
+menu(sscanPASM) {
+	choice(sscanPASM_Stay,"STAY")
+	choice(sscanPASM_Start_Pos,"START POS")
+	choice(sscanPASM_Prior_Pos,"PRIOR POS")
+	choice(sscanPASM_Peak_Pos,"PEAK POS")
+	choice(sscanPASM_Valley_Pos,"VALLEY POS")
+	choice(sscanPASM_RisingEdge_Pos,"+EDGE POS")
+	choice(sscanPASM_FallingEdge_Pos,"-EDGE POS")
+	choice(sscanPASM_COM,"CNTR OF MASS")
+}
+menu(sscanP1AR) {
+	choice(sscanP1AR_Absolute,"ABSOLUTE")
+	choice(sscanP1AR_Relative,"RELATIVE")
+}
+menu(sscanP1NV) {
+	choice(sscanP1NV_PV_OK,"PV OK")
+	choice(sscanP1NV_No_PV,"No PV")
+	choice(sscanP1NV_PV_NoRead,"PV NoRead")
+	choice(sscanP1NV_PV_xxx,"PV illegal1")
+	choice(sscanP1NV_PV_NoWrite,"PV NoWrite")
+	choice(sscanP1NV_PV_yyy,"PV illegal2")
+	choice(sscanP1NV_PV_NC,"PV BAD")
+}
+menu(sscanPAUS) {
+	choice(sscanPAUS_Go,"GO")
+	choice(sscanPAUS_Pause,"PAUSE")
+}
+menu(sscanFAZE) {
+	choice(sscanFAZE_IDLE,"IDLE")
+	choice(sscanFAZE_INIT_SCAN,"INIT_SCAN")
+	choice(sscanFAZE_BEFORE_SCAN,"DO:BEFORE_SCAN")
+	choice(sscanFAZE_BEFORE_SCAN_WAIT,"WAIT:BEFORE_SCAN")
+	choice(sscanFAZE_MOVE_MOTORS,"MOVE_MOTORS")
+	choice(sscanFAZE_CHECK_MOTORS,"WAIT:MOTORS")
+	choice(sscanFAZE_TRIG_DETCTRS,"TRIG_DETCTRS")
+	choice(sscanFAZE_READ_DETCTRS,"WAIT:DETCTRS")
+	choice(sscanFAZE_RETRACE_MOVE,"RETRACE_MOVE")
+	choice(sscanFAZE_RETRACE_WAIT,"WAIT:RETRACE")
+	choice(sscanFAZE_AFTER_SCAN_DO,"DO:AFTER_SCAN")
+	choice(sscanFAZE_AFTER_SCAN_WAIT,"WAIT:AFTER_SCAN")
+	choice(sscanFAZE_SCAN_DONE,"SCAN_DONE")
+	choice(sscanFAZE_SCAN_PENDING,"SCAN_PENDING")
+	choice(sscanFAZE_PREVIEW,"PREVIEW")
+	choice(sscanFAZE_RECORD_SCALAR_DATA,"RECORD SCALAR DATA")
+}
+menu(sscanACQM) {
+	choice(sscanACQM_NORMAL,"NORMAL")
+	choice(sscanACQM_ACC,"ACCUMULATE")
+	choice(sscanACQM_ADD,"ADD TO PREV")
+}
+menu(sscanACQT) {
+	choice(sscanACQT_SCALAR,"SCALAR")
+	choice(sscanACQT_1D_ARRAY,"1D ARRAY")
+}
+menu(sscanCMND) {
+	choice(sscanCMND_CLEAR_MSG,"Clear msg")
+	choice(sscanCMND_CHECK_LIMITS,"Check limits")
+	choice(sscanCMND_PREVIEW_SCAN,"Preview scan")
+	choice(sscanCMND_CLEAR_ALL_PVS,"Clear all PV's")
+	choice(sscanCMND_CLEAR_POS_PVS_ETC,"Clear pos PV's, etc")
+	choice(sscanCMND_CLEAR_POS_PVS,"Clear pos PV's")
+	choice(sscanCMND_CLEAR_POS_RDBK_PVS_ETC,"Clear pos&rdbk PV's, etc")
+	choice(sscanCMND_CLEAR_POS_RDBK_PVS,"Clear pos&rdbk PV's")
+}

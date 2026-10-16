@@ -11183,7 +11183,12 @@ impl RecordInstance {
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why it may run only once per cycle.
         let cycle_marks = if marked || cycle_posted {
-            self.record.take_cycle_posted_fields()
+            let marks = self.record.take_cycle_posted_fields();
+            debug_assert!(
+                !self.record.cycle_posts_remain(),
+                "the monitor walk takes once"
+            );
+            marks
         } else {
             CycleMarks::NONE
         };
@@ -12732,6 +12737,25 @@ impl RecordInstance {
                 |inst: &Self| inst.resolve_field(field),
             ),
             None,
+        );
+    }
+
+    /// [`Self::notify_field_in`] posting `value`, read when the post was
+    /// made, instead of the field as it stands now.
+    pub(crate) fn notify_field_value_in(
+        &mut self,
+        burst: &mut PostBurst,
+        desc: &'static FieldDesc,
+        mask: crate::server::recgbl::EventMask,
+        value: EpicsValue,
+    ) {
+        self.post_put_field(
+            Some(burst),
+            desc.name,
+            mask,
+            0,
+            (|_: &Self| Some(desc), |_: &Self| Some(value)),
+            Some(desc),
         );
     }
 

@@ -485,8 +485,22 @@ fn emit_cycle_posts_in(instance: &mut RecordInstance, burst: &mut PostBurst) {
 
 #[inline(never)]
 fn drain_cycle_posts(instance: &mut RecordInstance, burst: &mut PostBurst) {
-    let marks = instance.record.take_cycle_posted_fields();
-    post_cycle_marks_in(instance, marks, burst);
+    loop {
+        let marks = instance.record.take_cycle_posted_fields();
+        post_cycle_marks_in(instance, marks, burst);
+        if !instance.record.cycle_posts_remain() {
+            break;
+        }
+    }
+    while let Some((sf, mask, value)) = instance.record.take_cycle_posted_value() {
+        let Some(desc) = crate::server::record::field_at(
+            crate::server::record::FieldDeclaration::field_list(&*instance.record),
+            sf,
+        ) else {
+            continue;
+        };
+        instance.notify_field_value_in(burst, desc, mask, value);
+    }
 }
 
 /// Post `marks` as [`drain_cycle_posts`] does, committing the alarm at the

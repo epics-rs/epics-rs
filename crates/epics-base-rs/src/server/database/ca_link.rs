@@ -108,6 +108,11 @@ impl CaLinks {
         self.network.read().clone()
     }
 
+    /// The network half's CA client, for a channel a record opens itself.
+    pub(super) fn client_service(&self) -> Option<Arc<dyn super::ca_client::CaClientService>> {
+        self.network.read().as_ref()?.ca_client_service()
+    }
+
     /// `local` over the name's local link, else `net` over the network half
     /// (`None` with none registered).
     fn answer<R>(
@@ -549,44 +554,45 @@ async fn run_monitor(mut monitor: LocalMonitor, state: Arc<LocalState>) {
 /// C `dbChannelIO`: an open database channel plus the put-notify blocker
 /// `dbContext` keeps for it. Holds the database weakly: the database owns
 /// its links.
-struct LocalChannel {
+pub(super) struct LocalChannel {
     db: Weak<PvDatabaseInner>,
     chan: DbAccessChannel,
-    /// C `dbPutNotifyBlocker`: one put callback at a time per channel.
-    blocker: tokio::sync::Mutex<()>,
+    /// C `dbPutNotifyBlocker`: one put callback at a time per channel,
+    /// held until the put completes.
+    blocker: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalChannel {
     /// `dbContext::createChannel`'s `dbChannel_create`: `None` when the
     /// database does not serve `name`.
-    async fn create(db: &PvDatabase, name: &[u8]) -> Option<Self> {
+    pub(super) async fn create(db: &PvDatabase, name: &[u8]) -> Option<Self> {
         let chan = channel_io::channel_create(db, name, None).await.ok()?;
         Some(Self {
             db: Arc::downgrade(&db.inner),
             chan,
-            blocker: tokio::sync::Mutex::new(()),
+            blocker: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
-    fn db(&self) -> Option<PvDatabase> {
+    pub(super) fn db(&self) -> Option<PvDatabase> {
         self.db.upgrade().map(|inner| PvDatabase { inner })
     }
 
     /// `dbChannelIO::nativeType` — `dbChannelExportCAType`.
-    fn native_type(&self) -> DbFieldType {
+    pub(super) fn native_type(&self) -> DbFieldType {
         DbFieldType::from_u16(self.chan.native_type.ca_wire_type())
             .expect("ca_wire_type is a CA DBF code")
     }
 
     /// `dbChannelIO::nativeElementCount` — `dbChannelElements`.
-    fn element_count(&self) -> u32 {
+    pub(super) fn element_count(&self) -> u32 {
         self.chan.final_element_count
     }
 
     /// `dbContextReadNotifyCache::callReadNotify`
     /// (`dbContextReadNotifyCache.cpp:60-110`): `dbChannel_get` of
     /// `dbr_type`, `count` elements, completed synchronously.
-    fn read(&self, dbr_type: u16, count: u32) -> Option<Snapshot> {
+    pub(super) fn read(&self, dbr_type: u16, count: u32) -> Option<Snapshot> {
         let snapshot = channel_io::get_full_snapshot(&self.db()?, &self.chan.target)?;
         let snapshot = prepare_read(
             &self.chan.target,
@@ -610,7 +616,7 @@ impl LocalChannel {
     /// `dbSubscriptionIO` (`dbSubscriptionIO.cpp:38-56`): `db_add_event`
     /// with `mask`, then `db_post_single_event`. Each link owns its event
     /// context, where C's `dbContext` shares one.
-    fn subscribe(
+    pub(super) fn subscribe(
         &self,
         db: &PvDatabase,
         dbr_type: u16,
@@ -653,22 +659,47 @@ impl LocalChannel {
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("db_put_field() completed unsuccessfully: {e}")),
-            LinkPutOp::Async => {
-                let _blocker =
-                    crate::runtime::task::timeout(PUT_NOTIFY_BLOCK_TIMEOUT, self.blocker.lock())
-                        .await
-                        .map_err(|_| "put callback request timed out".to_string())?;
-                let completion = self
-                    .put(value, true)
-                    .await
-                    .map_err(|e| format!("put notify unsuccessful: {e}"))?;
-                if let Some(done) = completion.into_handle() {
-                    done.await
-                        .map_err(|_| "put notify unsuccessful: canceled".to_string())?;
-                }
-                Ok(())
-            }
+            LinkPutOp::Async => match self.issue_put(value, true).await? {
+                Some(done) => done.await,
+                None => Ok(()),
+            },
         }
+    }
+
+    /// `dbChannelIO::write` issued: a plain put is done when this returns
+    /// (`None`); a put callback returns its completion, which holds the
+    /// channel's `dbPutNotifyBlocker` until the record's processing is
+    /// done.
+    pub(super) async fn issue_put(
+        &self,
+        value: EpicsValue,
+        callback: bool,
+    ) -> Result<Option<super::ca_client::PutCompletion>, String> {
+        if !callback {
+            return self
+                .put(value, false)
+                .await
+                .map(|_| None)
+                .map_err(|e| format!("db_put_field() completed unsuccessfully: {e}"));
+        }
+        let blocker = crate::runtime::task::timeout(
+            PUT_NOTIFY_BLOCK_TIMEOUT,
+            self.blocker.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| "put callback request timed out".to_string())?;
+        let completion = self
+            .put(value, true)
+            .await
+            .map_err(|e| format!("put notify unsuccessful: {e}"))?;
+        Ok(Some(Box::pin(async move {
+            let _blocker = blocker;
+            if let Some(done) = completion.into_handle() {
+                done.await
+                    .map_err(|_| "put notify unsuccessful: canceled".to_string())?;
+            }
+            Ok(())
+        })))
     }
 
     async fn put(
@@ -694,10 +725,10 @@ impl LocalChannel {
 /// C `dbSubscriptionIO`: one installed event plus what `callStateNotify`
 /// needs to hand each one over as a DBR value. Dropping it cancels the
 /// event (`db_cancel_event`).
-struct LocalMonitor {
+pub(super) struct LocalMonitor {
     /// The event context the reader's queue belongs to.
     _user: EventUser,
-    reader: EventReader,
+    pub(super) reader: EventReader,
     stage: DeliveryStage,
     dbr_type: u16,
     db: Weak<PvDatabaseInner>,
@@ -707,7 +738,7 @@ struct LocalMonitor {
 impl LocalMonitor {
     /// `dbContext::callStateNotify` (`dbContext.cpp:141-189`): the event as
     /// a `dbr_type` value of its current element count.
-    fn state_notify(&self, event: MonitorEvent) -> Option<Snapshot> {
+    pub(super) fn state_notify(&self, event: MonitorEvent) -> Option<Snapshot> {
         let mut read = None;
         let update = with_live_options(self.dbr_type, Cow::Owned(event), &mut read, || {
             let db = PvDatabase {

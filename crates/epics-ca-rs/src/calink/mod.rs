@@ -50,6 +50,7 @@
 //! `setup_cp_links`). The shared CA client is created lazily on the
 //! first CA link open, so an IOC with no CA links never spins one up.
 
+mod client_service;
 mod iocsh;
 mod resolver;
 

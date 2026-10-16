@@ -293,7 +293,7 @@ fn c_special_name(code: i16) -> Option<&'static str> {
 /// C's `pdbFldDes->special`, the `%hd` `dbDumpField` and `dbWriteRecordTypeFP`
 /// both print.
 fn c_special_code(special: Special) -> i16 {
-    special as i16
+    special.code()
 }
 
 /// The lines C's `dbDumpField` prints for one field descriptor

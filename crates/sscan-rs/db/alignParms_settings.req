@@ -1,0 +1,8 @@
+$(P)$(Q):alignParms.SP
+$(P)$(Q):alignParms.EP
+$(P)$(Q):alignParms.NP
+$(P)$(Q):alignParms.AR
+$(P)$(Q):alignParms.AFT
+$(P)$(Q):alignParms.AQT
+$(P)$(Q):alignParms.DPV
+$(P)$(Q):alignParms.TPV

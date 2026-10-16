@@ -556,6 +556,14 @@ pub trait LinkSet: Send + Sync {
         let _ = self.get_value(name).await;
     }
 
+    /// The CA client a `ca` network half runs its links on, for the
+    /// channels a record opens itself ([`super::CaClientContext`]).
+    ///
+    /// Default: none.
+    fn ca_client_service(&self) -> Option<Arc<dyn super::CaClientService>> {
+        None
+    }
+
     /// A CP/CPP link of `holder` was added after iocInit to `name`. C gives
     /// the new link its own `caLink`, whose first event processes `holder`
     /// (`dbCa.c:958-962`); an lset sharing one channel per name must

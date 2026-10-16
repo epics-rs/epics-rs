@@ -1355,7 +1355,7 @@ fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
     // them. It is read off the `.dbd`, not inferred.
     let special = addr
         .fld_des
-        .map_or(Special::NoMod as i16, |fd| fd.special as i16);
+        .map_or(Special::NoMod.code(), |fd| fd.special.code());
     ctx.println(&format!("       Special: {special}"));
     ctx.println(&format!(
         "DBR Field Type: {} = DBR_{}",

@@ -1,0 +1,8 @@
+# FILE... scanParms_settings.req
+# USAGE.. scanParms.db fields autosave'd.
+$(P)$(Q):scanParms.SP
+$(P)$(Q):scanParms.EP
+$(P)$(Q):scanParms.NP
+$(P)$(Q):scanParms.AR
+$(P)$(Q):scanParms.AFT
+

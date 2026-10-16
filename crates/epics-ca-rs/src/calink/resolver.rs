@@ -657,7 +657,7 @@ impl CaLinkResolver {
     /// `OnceCell` guarantees exactly one client even under concurrent
     /// first opens. A client-init failure is returned (not cached), so a
     /// later open retries — matching C `dbCa`'s deferred channel setup.
-    async fn client(&self) -> Result<&Arc<CaClient>, CaLinkError> {
+    pub(super) async fn client(&self) -> Result<&Arc<CaClient>, CaLinkError> {
         self.client
             .get_or_try_init(|| async {
                 CaClient::new()
@@ -1090,6 +1090,12 @@ async fn fetch_link_metadata(
 
 #[async_trait::async_trait]
 impl LinkSet for CaLinkResolver {
+    fn ca_client_service(
+        &self,
+    ) -> Option<Arc<dyn epics_base_rs::server::database::CaClientService>> {
+        Some(Arc::new(self.clone()))
+    }
+
     fn is_connected(&self, name: &[u8]) -> bool {
         let name = strip_ca_scheme(name);
         match self.links.read().get(name) {

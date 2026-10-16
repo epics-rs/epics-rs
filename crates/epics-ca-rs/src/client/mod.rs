@@ -2833,6 +2833,42 @@ impl CaChannel {
     }
 
     pub async fn put(&self, value: &EpicsValue) -> CaResult<()> {
+        self.put_with_timeout(value, put_timeout()).await
+    }
+
+    /// Write with completion callback and configurable timeout.
+    pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
+        let (ioid, reply_rx) = self.issue_write_notify(value)?;
+        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
+        self.in_flight.writes.remove(&ioid);
+        result
+            .map_err(|_| CaError::Timeout)?
+            .map_err(|_| CaError::Shutdown)?
+    }
+
+    /// `ca_array_put_callback`: the request is sent when this returns, and
+    /// the returned future resolves with the server's completion — with no
+    /// deadline, as libca has none; a disconnect resolves it with
+    /// `CaError::Disconnected`.
+    pub fn put_callback(
+        &self,
+        value: &EpicsValue,
+    ) -> CaResult<impl std::future::Future<Output = CaResult<()>> + Send + 'static> {
+        let (ioid, reply_rx) = self.issue_write_notify(value)?;
+        let writes = self.in_flight.writes.clone();
+        Ok(async move {
+            let result = reply_rx.await;
+            writes.remove(&ioid);
+            result.map_err(|_| CaError::Shutdown)?
+        })
+    }
+
+    /// Register a write waiter and send `value` as a native-typed
+    /// `CA_PROTO_WRITE_NOTIFY`; the caller owns the waiter's removal.
+    fn issue_write_notify(
+        &self,
+        value: &EpicsValue,
+    ) -> CaResult<(u32, oneshot::Receiver<CaResult<()>>)> {
         let snap = self.snapshot()?;
         // The frame is stamped with the channel's NATIVE type below, so
         // the payload must be the native encoding. A caller variant that
@@ -2846,9 +2882,7 @@ impl CaChannel {
         // `put_string`, which the server resolves against its menu.
         let value = value.convert_to(snap.native_type);
         // C `nciu::write` rejects countIn > channel count with
-        // ECA_BADCOUNT before queueing the request. Pre-fix Rust sent
-        // an oversized write that the server would either accept past
-        // its array bound or reject asynchronously. Validated on the
+        // ECA_BADCOUNT before queueing the request. Validated on the
         // converted value — the count of the actual wire request, which
         // conversion can change (String → CHAR-array on a CHAR field).
         validate_put_count(&snap, value.count())?;
@@ -2867,41 +2901,7 @@ impl CaChannel {
             self.in_flight.writes.remove(&ioid);
             return Err(e);
         }
-
-        let result = epics_base_rs::runtime::task::timeout(put_timeout(), reply_rx).await;
-        self.in_flight.writes.remove(&ioid);
-        result
-            .map_err(|_| CaError::Timeout)?
-            .map_err(|_| CaError::Shutdown)?
-    }
-
-    /// Write with completion callback and configurable timeout.
-    pub async fn put_with_timeout(&self, value: &EpicsValue, timeout: Duration) -> CaResult<()> {
-        let snap = self.snapshot()?;
-        // Native encoding to match the native-typed header; see `put`.
-        let value = value.convert_to(snap.native_type);
-        validate_put_count(&snap, value.count())?;
-        validate_put_strings(&value)?;
-
-        let ioid = self.in_flight.alloc_ioid();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        // Direct registry insert (Option C Phase A).
-        self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
-
-        let payload = value.to_bytes();
-        let count = value.count() as u32;
-        if let Err(e) =
-            self.send_write_notify_fast(&snap, snap.native_type as u16, count, ioid, payload)
-        {
-            self.in_flight.writes.remove(&ioid);
-            return Err(e);
-        }
-
-        let result = epics_base_rs::runtime::task::timeout(timeout, reply_rx).await;
-        self.in_flight.writes.remove(&ioid);
-        result
-            .map_err(|_| CaError::Timeout)?
-            .map_err(|_| CaError::Shutdown)?
+        Ok((ioid, reply_rx))
     }
 
     /// Fire-and-forget put (CA_PROTO_WRITE). Returns immediately without

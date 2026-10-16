@@ -3830,6 +3830,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sscan-rs"
+version = "0.32.0"
+dependencies = [
+ "epics-base-rs",
+ "epics-ca-rs",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

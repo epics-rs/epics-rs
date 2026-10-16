@@ -1193,6 +1193,29 @@ fn emit_field(
     let variant = |token: &str| -> Result<String, String> {
         Ok(if token.is_empty() {
             "Special::None".to_string()
+        } else if let Ok(code) = token.parse::<i16>() {
+            // `special(111)`: C reads the number with `%hd`
+            // (`dbLexRoutines.c:631`), so a named number is that name.
+            match code {
+                0 => "Special::None".to_string(),
+                1 => "Special::NoMod".to_string(),
+                2 => "Special::DbAddr".to_string(),
+                3 => "Special::Scan".to_string(),
+                5 => "Special::AlarmAck".to_string(),
+                6 => "Special::As".to_string(),
+                7 => "Special::Attribute".to_string(),
+                100 => "Special::Mod".to_string(),
+                101 => "Special::Reset".to_string(),
+                102 => "Special::LinConv".to_string(),
+                103 => "Special::Calc".to_string(),
+                104.. => format!("Special::Record({code})"),
+                _ => {
+                    return Err(format!(
+                        "{record}.{}: special({code}) names no code",
+                        f.name
+                    ));
+                }
+            }
         } else {
             format!("Special::{}", special_variant(token)?)
         })

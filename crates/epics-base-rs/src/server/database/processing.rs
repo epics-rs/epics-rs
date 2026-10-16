@@ -979,6 +979,20 @@ impl AsyncDbHandle {
         }
     }
 
+    /// C `scanOnce(prec)`: process `name` once, after the caller lets go of
+    /// it, with no Passive gate. No-op if the database is gone.
+    pub fn scan_once(&self, name: &str) {
+        if let Some(db) = self.db() {
+            db.scan_once(name);
+        }
+    }
+
+    /// The CA client context the record's own channels open on
+    /// ([`PvDatabase::ca_client`]).
+    pub fn ca_client(&self) -> super::CaClientContext {
+        super::CaClientContext::from_weak(self.inner.clone())
+    }
+
     /// C `dbScanLock`, the record's own code, `dbScanUnlock`, from a thread
     /// that holds no record: asynRecord's `exceptCallback` (asynRecord.c:911-916).
     /// The marks `f` leaves are posted under the same hold. A no-op if the
@@ -6611,6 +6625,12 @@ impl PvDatabase {
                     self.rec_gbl_get_time_stamp_in(rec, visited);
                     rec.write().hand_cycle_stamp();
                 }
+                // The `db_post_events` a C `process()` made before such a
+                // return (`sscanRecord.c:932-1257`); no FLNK, so not
+                // `drain_cycle_marks`.
+                if rec.process_plan().hooks.has(CycleHooks::HAND_POSTED) {
+                    super::field_io::emit_cycle_posts(&mut rec.write());
+                }
 
                 // `ReprocessAfter` for a delayed re-entry, and the record's own
                 // `dbPutLink`s made inside `process()`.
@@ -6667,6 +6687,9 @@ impl PvDatabase {
                     let inst = &mut *instance;
                     if tsel.stamp(&inst.name, &mut inst.common, || false) {
                         inst.hand_cycle_stamp();
+                    }
+                    if rec.process_plan().hooks.has(CycleHooks::HAND_POSTED) {
+                        super::field_io::emit_cycle_posts(&mut instance);
                     }
                     // The pass's posts, through the owner this path shares with
                     // `RecordInstance::process_local`.
@@ -7552,6 +7575,9 @@ impl PvDatabase {
             // chain cannot complete ahead of it.
             if dispatched.went_async {
                 guard.release();
+                if plan.hooks.has(CycleHooks::HAND_POSTED) {
+                    super::field_io::emit_cycle_posts(&mut rec.write());
+                }
                 self.execute_process_actions_in(name, rec, process_actions, visited);
                 self.apply_pact_exit(name, cycle_end.take());
                 return Ok(());
@@ -10013,6 +10039,9 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     // that mark standing for the first process cycle to emit — that would turn a
     // no-op C post into a real, late event. Drop the init-time marks.
     let _ = instance.record.take_cycle_posted_fields();
+    while instance.record.cycle_posts_remain() {
+        let _ = instance.record.take_cycle_posted_fields();
+    }
 }
 
 impl PvDatabase {

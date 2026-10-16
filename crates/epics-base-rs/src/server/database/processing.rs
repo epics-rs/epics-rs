@@ -5228,6 +5228,17 @@ impl PvDatabase {
         }
     }
 
+    /// The pass a [`ReadStart::Reentered`](crate::server::device_support::ReadStart::Reentered)
+    /// completion ran inline: C's `prset->process` from inside `queueRequest`,
+    /// under the recursive `dbScanLock` the outer pass holds — not
+    /// `dbProcess`, so no PACT test, breakpoint or cycle claim. Its status is
+    /// dropped, as devMcaAsyn's `asynCallback` drops it.
+    #[cold]
+    #[inline(never)]
+    fn run_reentered_pass(&self, name: &[u8], rec: InFrame<'_>, visited: &mut ProcStack) {
+        let _ = self.process_record_with_links_body(name, rec, visited, true, false);
+    }
+
     /// The record process cycle itself — C `dbProcess`'s body
     /// (`dbAccess.c:537-700`), entered with the record's advisory write gate
     /// already held (or deliberately not held, for the recursive /
@@ -5747,7 +5758,7 @@ impl PvDatabase {
             let mut pre_actions;
             let mut deferred_device_actions: Option<Vec<_>>;
             let (is_soft, device_did_compute, read_produced_no_value, device_read_computed) = {
-                let instance = guard.hold();
+                let mut instance = guard.hold();
                 // One discriminant for "this cycle sourced no value", set by
                 // either source: a failed soft-INP read, and a device support
                 // returning C's negative `read_ai()` status (-1, -2). Both miss
@@ -6073,11 +6084,25 @@ impl PvDatabase {
                             DeviceDoneSource::new(&instance.device_done)
                         };
                         let begun = dev.read_begin(&mut *instance.record, &done);
-                        if let Ok(crate::server::device_support::ReadStart::Pending) = begun {
-                            instance.enter_pact();
-                            instance.device = Some(dev);
-                            self.apply_pact_exit(name, cycle_end.take());
-                            return Ok(());
+                        match begun {
+                            Ok(crate::server::device_support::ReadStart::Pending) => {
+                                instance.enter_pact();
+                                instance.device = Some(dev);
+                                self.apply_pact_exit(name, cycle_end.take());
+                                return Ok(());
+                            }
+                            Ok(crate::server::device_support::ReadStart::Reentered) => {
+                                instance.enter_pact();
+                                instance.device = Some(dev);
+                                guard.release();
+                                self.run_reentered_pass(name, guard.rec, visited);
+                                instance = guard.hold();
+                                dev = instance
+                                    .device
+                                    .take()
+                                    .expect("the nested pass puts the device back");
+                            }
+                            _ => {}
                         }
                         let read = match begun {
                             Ok(_) => dev.read(&mut *instance.record),

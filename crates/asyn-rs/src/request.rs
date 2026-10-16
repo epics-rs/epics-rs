@@ -142,6 +142,21 @@ impl CellState {
         };
     }
 
+    /// A callback starts without the cell leaving a queue — C `queueRequest`
+    /// on a synchronous port, which tests no `isQueued` (asynManager.c:1555).
+    fn enter_inline(&mut self) {
+        *self = match *self {
+            Self::Idle => Self::Active { callbacks: 1 },
+            Self::Active { callbacks } => Self::Active {
+                callbacks: callbacks + 1,
+            },
+            Self::Queued => Self::ActiveQueued { callbacks: 1 },
+            Self::ActiveQueued { callbacks } => Self::ActiveQueued {
+                callbacks: callbacks + 1,
+            },
+        };
+    }
+
     /// A callback [`Self::dequeue`] started has returned.
     fn end_callback(&mut self) {
         *self = match *self {
@@ -288,6 +303,14 @@ impl RequestCell {
     pub(crate) fn run(&self, port: &mut dyn PortCalls) {
         self.body.process(port);
         self.token.finish();
+        self.end_callback();
+    }
+
+    /// C `processUser` run by `queueRequest` itself, on a port without
+    /// `ASYN_CANBLOCK` ([`crate::port_handle::PortHandle::queue_request`]).
+    pub(crate) fn run_inline(&self, port: &mut dyn PortCalls) {
+        self.lock().state.enter_inline();
+        self.body.process(port);
         self.end_callback();
     }
 

@@ -290,6 +290,25 @@ impl PortCalls for PortHandle {
     }
 }
 
+/// What [`PortHandle::queue_request`] did with the cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Linked on the port's queue; its body runs on the port thread.
+    Queued,
+    /// The port cannot block: the body already ran on this thread.
+    Ran,
+}
+
+/// The port as a body run by [`PortHandle::queue_request`] on the caller's
+/// thread sees it.
+struct InlineCalls<'a>(&'a PortHandle);
+
+impl PortCalls for InlineCalls<'_> {
+    fn call(&mut self, op: &RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.0.submit_blocking(op.clone(), user)
+    }
+}
+
 impl PortHandle {
     /// `actor` must be the link of the actor owning `tx`'s receiving end
     /// (`PortActor::link`), so that a blocking caller can recognise a
@@ -425,14 +444,22 @@ impl PortHandle {
     /// [`crate::request::RequestCell::queue`]. A dset whose `processUser` makes
     /// several calls under one queue entry (devDigitelPump, devVacSen) queues
     /// through this and ends its record's cycle from the cell's body.
+    ///
+    /// On a port without `ASYN_CANBLOCK` the body runs here, on the calling
+    /// thread, before this returns [`QueueOutcome::Ran`] (asynManager.c:1555-
+    /// 1584); each of its calls is a round trip to the port.
     pub fn queue_request(
         &self,
         cell: &Arc<crate::request::RequestCell>,
         user: &AsynUser,
-    ) -> AsynResult<()> {
+    ) -> AsynResult<QueueOutcome> {
         self.gate.check(user.connect_check(self.multi_device))?;
+        if !self.can_block {
+            cell.run_inline(&mut InlineCalls(self));
+            return Ok(QueueOutcome::Ran);
+        }
         cell.queue(user)?;
-        Ok(())
+        Ok(QueueOutcome::Queued)
     }
 
     /// Whether `cell` queues on this port.
@@ -1679,6 +1706,46 @@ mod tests {
         let cell = handle.new_cell(Arc::new(Ran(tx)));
         handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    /// C `queueRequest` runs `processUser` inline on a port without
+    /// `ASYN_CANBLOCK` (asynManager.c:1555-1584) and queues it on one with.
+    #[test]
+    fn queue_request_runs_the_cell_inline_only_on_a_port_that_cannot_block() {
+        use crate::request::{CellBody, Unrun};
+        use std::sync::mpsc as std_mpsc;
+
+        struct Where(std_mpsc::SyncSender<Option<String>>);
+        impl CellBody for Where {
+            fn process(&self, port: &mut dyn PortCalls) {
+                let _ = port.call(&RequestOp::Int32Read, AsynUser::new(0));
+                let name = std::thread::current().name().map(str::to_owned);
+                self.0.send(name).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the request did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
+        let mut handle = make_handle(TestDriver::new());
+        let (tx, rx) = std_mpsc::sync_channel(2);
+        let cell = handle.new_cell(Arc::new(Where(tx)));
+        let here = std::thread::current().name().map(str::to_owned);
+        let ran = handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(ran, QueueOutcome::Ran);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            here,
+            "ran before queue_request returned"
+        );
+        assert!(!cell.is_outstanding());
+
+        handle.set_can_block(true);
+        let queued = handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(queued, QueueOutcome::Queued);
+        let on = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(on.as_deref(), Some("test-handle-actor"));
     }
 
     /// C `connectDevice` runs on the caller's thread under `asynManagerLock`

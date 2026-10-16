@@ -435,6 +435,13 @@ pub enum ReadStart {
     /// [`DeviceDone::reprocess`](crate::server::database::DeviceDone::reprocess),
     /// and that pass's [`DeviceSupport::read`] applies what was read.
     Pending,
+    /// The completion already ran on this thread — C `queueRequest` on a port
+    /// without `ASYN_CANBLOCK` runs `processUser` inline (asynManager.c:1555-
+    /// 1584), and devMcaAsyn's callback calls `prset->process` from there
+    /// (devMcaAsyn.c:357-382). The record is PACT; its re-entered pass runs
+    /// nested now, monitors and FLNK included, and then this pass calls
+    /// [`DeviceSupport::read`] for the rest of its own.
+    Reentered,
 }
 
 /// What a device support `read()` produced.

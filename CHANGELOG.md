@@ -68,7 +68,13 @@ unlinks and reports as C's does. Every port gets its owner gate at
 converts RVAL and comes up defined, as C's status 0 does. modbus keeps
 its I/O statistics in the param library, set by each I/O and posted only
 through the generic write, and a data write sets no param, as
-drvModbusAsyn does.
+drvModbusAsyn does. A port with maxAddr above 1 is multi-device, as
+asynPortDriver forces it; `PortDriverBase::new_exact_flags` keeps the
+attributes a driver's own `registerPort` gives. mqtt moves to
+rumqttc-v5-next 0.34 and keeps paho's connect timeout, reconnect backoff
+and per-request success and failure lines. motorSim reports C's status
+bits, and the motor poller runs on its own thread with no ambient tokio
+runtime.
 
 ### SCHED_FIFO thread banding is on by default, under C's switch
 

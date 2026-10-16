@@ -11,6 +11,15 @@
 //! cargo run -p dbd-codegen -- --check    # fail on drift (CI)
 //! ```
 //!
+//! A crate outside this workspace that declares its own record types (an IOC
+//! driver repository) names its `.dbd` directory and output file, relative to
+//! the directory the tool is run from:
+//!
+//! ```text
+//! cargo run --manifest-path <epics-rs>/Cargo.toml -p dbd-codegen -- \
+//!     --write --external <dbd_dir> <out_file>
+//! ```
+//!
 //! The generator is offline: it reads the `.dbd` files **vendored into the
 //! repository**, and its output is checked in, so neither the build nor CI
 //! depends on an EPICS installation.
@@ -28,14 +37,26 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use targets::{BASE, TARGETS, Target};
+use targets::{BASE, EXTERNAL_BASE_PATH, TARGETS, Target};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let check = args.iter().any(|a| a == "--check");
     let write = args.iter().any(|a| a == "--write");
-    if check == write {
-        eprintln!("usage: dbd-codegen (--write | --check)");
+    let external = match args.iter().position(|a| a == "--external") {
+        None => None,
+        Some(i) => match (args.get(i + 1), args.get(i + 2)) {
+            (Some(dbd_dir), Some(out_file)) => Some(Target {
+                dbd_dir: String::leak(dbd_dir.clone()),
+                out_file: String::leak(out_file.clone()),
+                bpt_out_file: None,
+                base_path: EXTERNAL_BASE_PATH,
+            }),
+            _ => None,
+        },
+    };
+    if check == write || args.iter().any(|a| a == "--external") && external.is_none() {
+        eprintln!("usage: dbd-codegen (--write | --check) [--external <dbd_dir> <out_file>]");
         return ExitCode::from(2);
     }
 
@@ -47,7 +68,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let outputs = match generate_all(&root) {
+    let outputs = match external.map_or_else(
+        || generate_all(&root),
+        |target| generate_external(&root, &target),
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("dbd-codegen: {e}");
@@ -95,7 +119,7 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     // There is ONE `dbCommon` declaration in the port, and it is base's: a
     // downstream `.dbd` that says `include "dbCommon.dbd"` means base's.
     let common = parse::parse_db_common(&root.join(BASE.dbd_dir).join("dbCommon.dbd"))?;
-    let base_menus = base_menu_paths(root, &common)?;
+    let base_menus = base_menu_paths(root, &common, "epics_base_rs")?;
 
     let mut outputs = Vec::new();
     for target in TARGETS {
@@ -118,6 +142,19 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     Ok(outputs)
 }
 
+/// One out-of-workspace target, generated against this workspace's base
+/// exactly as an in-workspace downstream target is. Its paths are relative to
+/// the current directory, not the workspace root.
+fn generate_external(root: &Path, target: &Target) -> Result<Vec<(PathBuf, String)>, String> {
+    let common = parse::parse_db_common(&root.join(BASE.dbd_dir).join("dbCommon.dbd"))?;
+    let base_menus = base_menu_paths(root, &common, target.base_path)?;
+    let cwd = std::env::current_dir().map_err(|e| format!("current directory: {e}"))?;
+    Ok(vec![(
+        cwd.join(target.out_file),
+        generate(&cwd, target, &common, &base_menus)?,
+    )])
+}
+
 /// The shared menus, as the paths a *downstream* generated module names them by.
 ///
 /// `motorRecord.dbd` declares `menu(motorDIR)` itself but references
@@ -129,6 +166,7 @@ fn generate_all(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
 fn base_menu_paths(
     root: &Path,
     common: &[parse::Field],
+    base_path: &str,
 ) -> Result<BTreeMap<String, String>, String> {
     let base = parse_dir(&root.join(BASE.dbd_dir), common)?;
     Ok(base
@@ -138,10 +176,7 @@ fn base_menu_paths(
             (
                 name.clone(),
                 format!(
-                    "{}::server::record::dbd_generated::{}",
-                    // Every downstream target names base the same way; the
-                    // const path is the same for all of them.
-                    "epics_base_rs",
+                    "{base_path}::server::record::dbd_generated::{}",
                     emit::menu_const(name)
                 ),
             )
@@ -344,6 +379,7 @@ fn generate(
         common: if target.is_base() { common } else { &[] },
         cvt: &cvt,
         dbd_dir: target.dbd_dir,
+        out_file: target.out_file,
         base_path: target.base_path,
         external_menus,
     })?;

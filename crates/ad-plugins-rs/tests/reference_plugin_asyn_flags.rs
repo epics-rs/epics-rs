@@ -15,9 +15,10 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::iocsh::registry::{ArgType, CommandOutcome};
 
-/// The `asynFlags` argument of the file's `NDPluginDriver(` / `NDPluginFile(`
-/// constructor call: the argument two before `priority`, comments removed.
-fn c_asyn_flags(file: &str, source: &str) -> String {
+/// The argument `back` places before `priority` in the file's
+/// `NDPluginDriver(` / `NDPluginFile(` constructor call, comments removed:
+/// 2 is `asynFlags`, 7 `maxAddr`.
+fn c_ctor_arg(file: &str, source: &str, back: usize) -> String {
     let mut code = String::new();
     let mut rest = source;
     while !rest.is_empty() {
@@ -49,7 +50,7 @@ fn c_asyn_flags(file: &str, source: &str) -> String {
         .iter()
         .position(|a| *a == "priority")
         .unwrap_or_else(|| panic!("{file}: priority is not an argument of {call:?}"));
-    args[at - 2].to_string()
+    args[at - back].to_string()
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn each_plugin_s_asyn_flags_are_c_s() {
             ReferenceTree::Modules,
             &format!("ADCore/ADApp/pluginSrc/{file}"),
         );
-        let flags = c_asyn_flags(file, &std::fs::read_to_string(&path).unwrap());
+        let flags = c_ctor_arg(file, &std::fs::read_to_string(&path).unwrap(), 2);
         assert_eq!(flags, expr, "{name} ({file})");
     }
 }
@@ -157,6 +158,8 @@ fn port_flags(port: &str) -> (bool, bool, bool) {
 /// where its C `asynFlags` say, so only the six NDFile* get a port thread.
 /// Destructible is NDROIConfigure's own `ASYN_DESTRUCTIBLE`
 /// (NDPluginROI.cpp:363-364), the one `pluginSrc` file that names it.
+/// Multi-device also follows a `maxAddr` above 1, which asynPortDriver turns
+/// into `ASYN_MULTIDEVICE` (asynPortDriver.cpp:4013-4014): NDStats' 2.
 #[test]
 fn each_configure_command_s_port_has_c_s_asyn_flags() {
     let (ioc, shell) = ad_ioc_with_driver("AFUP");
@@ -168,9 +171,15 @@ fn each_configure_command_s_port_has_c_s_asyn_flags() {
             &format!("ADCore/ADApp/pluginSrc/{file}"),
         ))
         .unwrap();
+        let max_addr = c_ctor_arg(file, &source, 7);
+        let multi_device = expr.contains("ASYN_MULTIDEVICE")
+            || max_addr
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("{file}: maxAddr {max_addr} is not a literal"))
+                > 1;
         let want = (
             expr.contains("ASYN_CANBLOCK"),
-            expr.contains("ASYN_MULTIDEVICE"),
+            multi_device,
             source.contains("ASYN_DESTRUCTIBLE"),
         );
         assert_eq!(port_flags(&port), want, "{name} ({file}: {expr})");
@@ -222,5 +231,6 @@ fn a_negative_priority_on_a_synchronous_plugin_does_not_stop_the_ioc() {
         r#"NDStatsConfigure("NPST", 20, 0, "NPUP", 0, 0, 0, -1, 0)"#,
     );
     assert!(ioc.mgr().plugin("NPST").is_some());
-    assert_eq!(port_flags("NPST"), (false, false, false));
+    // Multi-device by NDStats' maxAddr 2 (NDPluginStats.cpp:777).
+    assert_eq!(port_flags("NPST"), (false, true, false));
 }

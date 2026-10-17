@@ -1550,6 +1550,11 @@ impl PortHandle {
         self.devices.connect_user(addr)
     }
 
+    /// The port's announcement owner, which its exception lists hang off.
+    pub(crate) fn announcer(&self) -> crate::port::ExceptionAnnouncer {
+        self.devices.announcer()
+    }
+
     /// C `exceptionCallbackAdd` (asynManager.c:1364-1382) for a user bound to
     /// `addr`; dropping the guard is `exceptionCallbackRemove`. The callback
     /// runs on the announcing thread — this port's actor, mid-transition — so

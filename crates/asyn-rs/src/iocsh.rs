@@ -957,7 +957,6 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     // rather than let the next line's I/O fail on a still-connecting port.
     {
         let mgr_r = mgr.clone();
-        let services_wait = services.clone();
         out.push(CommandDef::new(
             "asynWaitConnect",
             vec![
@@ -986,7 +985,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // Arm before the check: a connect landing between the two would
                 // be lost the other way round (C :3344-3347 registers the
                 // exception handler before it waits).
-                let waiter = crate::runtime::port::ConnectWaiter::arm(&services_wait, &port);
+                let waiter = crate::runtime::port::ConnectWaiter::arm(&handle.announcer());
                 // `-1`, the PORT's own slot, even on a multi-device port: C's
                 // `waitConnect` resolves `findDpCommon` only to reject an
                 // unbound user, then reads `pport->dpc.connected` explicitly

@@ -468,6 +468,24 @@ impl SendWithoutParking for TcpStream {
     }
 }
 
+/// How [`write_with_retry`] gave up. C `writeIt` either returns from inside
+/// its loop — a poll that failed or expired (drvAsynIPPort.c:686-701) — or
+/// breaks out of it — `send` gave 0, the retry bound ran out, a write error
+/// (:710-748) — and only a break reaches the `wrote N` end line (:750-753).
+#[derive(Debug)]
+pub(super) enum WriteFailure {
+    Returned(AsynError),
+    Broke(AsynError),
+}
+
+impl WriteFailure {
+    pub(super) fn into_error(self) -> AsynError {
+        match self {
+            Self::Returned(e) | Self::Broke(e) => e,
+        }
+    }
+}
+
 /// Write `data` to the stream, retrying short writes until the deadline.
 ///
 /// Returns the bytes the peer accepted. C parity
@@ -505,7 +523,7 @@ pub(super) fn write_with_retry(
     data: &[u8],
     poll: Option<Duration>,
     cap: Option<std::time::Instant>,
-) -> AsynResult<usize> {
+) -> Result<usize, WriteFailure> {
     let mut offset = 0;
     // C's `haveStartTime`/`startTime` (drvAsynIPPort.c:679, 711-723): stamped at
     // the FIRST retryable `send` and never re-armed, not even by a pass that
@@ -528,21 +546,29 @@ pub(super) fn write_with_retry(
         match stream.wait_writable(deadline) {
             Ok(true) => {}
             Ok(false) => {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "write timeout".into(),
-                }
-                .with_partial_write(offset));
+                return Err(WriteFailure::Returned(
+                    AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "write timeout".into(),
+                    }
+                    .with_partial_write(offset),
+                ));
             }
-            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
+            Err(e) => {
+                return Err(WriteFailure::Returned(
+                    AsynError::Io(e).with_partial_write(offset),
+                ));
+            }
         }
         match stream.send_without_parking(&data[offset..]) {
             Ok(0) => {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "write returned 0 bytes".into(),
-                }
-                .with_partial_write(offset));
+                return Err(WriteFailure::Broke(
+                    AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "write returned 0 bytes".into(),
+                    }
+                    .with_partial_write(offset),
+                ));
             }
             Ok(n) => offset += n,
             // C retries both of these against `pasynUser->timeout`
@@ -562,17 +588,25 @@ pub(super) fn write_with_retry(
                 match retry_since {
                     None => retry_since = Some(std::time::Instant::now()),
                     Some(since) => {
+                        // C's `thisWrite = 0; break;` (:719-721): the
+                        // `send() returned 0` exit.
                         if poll.is_some_and(|p| since.elapsed() > p) {
-                            return Err(AsynError::Status {
-                                status: AsynStatus::Timeout,
-                                message: "write timeout".into(),
-                            }
-                            .with_partial_write(offset));
+                            return Err(WriteFailure::Broke(
+                                AsynError::Status {
+                                    status: AsynStatus::Timeout,
+                                    message: "write timeout".into(),
+                                }
+                                .with_partial_write(offset),
+                            ));
                         }
                     }
                 }
             }
-            Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
+            Err(e) => {
+                return Err(WriteFailure::Broke(
+                    AsynError::Io(e).with_partial_write(offset),
+                ));
+            }
         }
     }
     Ok(offset)
@@ -769,11 +803,13 @@ impl IpIoState {
         }
     }
 
-    fn send(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn send(&mut self, user: &mut AsynUser, data: &[u8]) -> Result<usize, WriteFailure> {
         // C writeIt (drvAsynIPPort.c:645-657).
-        let inner = self.inner.as_mut().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("{} disconnected", self.host_info),
+        let inner = self.inner.as_mut().ok_or_else(|| {
+            WriteFailure::Returned(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{} disconnected", self.host_info),
+            })
         })?;
         // C drvAsynIPPort.c::writeIt (613-614): after the connection check,
         // a zero-length write returns success immediately and sends nothing —
@@ -810,17 +846,24 @@ impl IpIoState {
                 // C polls `POLLOUT` before the datagram too — `writeIt` shares
                 // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
                 // (`drvAsynIPPort.c:680-702`).
-                if !socket.wait_writable(poll.map(|p| std::time::Instant::now() + p))? {
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Timeout,
-                        message: "write timeout".into(),
-                    });
+                let deadline = poll.map(|p| std::time::Instant::now() + p);
+                match socket.wait_writable(deadline) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(WriteFailure::Returned(AsynError::Status {
+                            status: AsynStatus::Timeout,
+                            message: "write timeout".into(),
+                        }));
+                    }
+                    Err(e) => return Err(WriteFailure::Returned(e.into())),
                 }
                 // C drvAsynIPPort.c::writeIt (688): sendto the resolved
                 // remote on the unconnected socket. A datagram is all-or-
                 // nothing, so a failed sendto transferred zero bytes and needs
                 // no partial-write carrier.
-                Ok(socket.send_to(data, *peer)?)
+                socket
+                    .send_to(data, *peer)
+                    .map_err(|e| WriteFailure::Broke(e.into()))
             }
             #[cfg(asyn_af_unix)]
             IpIoInner::Unix(stream) => write_with_retry(stream, data, poll, None),
@@ -862,7 +905,15 @@ impl OctetNext for IpIoState {
         );
         let label = format!("{} write {}\n", self.host_info, data.len());
         user.print_io(TraceMask::IO_DRIVER, data, &label, file!(), line!());
-        let result = self.send(user, data);
+        let sent = self.send(user, data);
+        // C prints the outcome only on leaving the send loop (:750-753): not on
+        // the disconnected refusal or a zero-length write, which return before
+        // it.
+        let left_loop = match &sent {
+            Ok(_) => !data.is_empty(),
+            Err(f) => matches!(f, WriteFailure::Broke(_)),
+        };
+        let result = sent.map_err(WriteFailure::into_error);
         // C counts each partial `send` as it goes (:728), so a write that
         // fails part-way still counts what left.
         let sent = match &result {
@@ -870,13 +921,6 @@ impl OctetNext for IpIoState {
             Err(e) => e.partial_write().unwrap_or(0),
         };
         self.n_written += sent as u64;
-        // C prints the outcome only on leaving the send loop (:750-753): not on
-        // the disconnected refusal, a zero-length write or a poll timeout,
-        // which return before it.
-        let left_loop = match &result {
-            Ok(_) => !data.is_empty(),
-            Err(e) => e.is_fatal_transport() || e.message() == "write returned 0 bytes",
-        };
         if left_loop {
             let status = result
                 .as_ref()
@@ -3497,6 +3541,10 @@ mod tests {
         };
         let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(5)), None)
             .expect_err("a wait longer than the bound is C's asynTimeout");
+        // C returns from inside the loop (:697-701): no end line.
+        let WriteFailure::Returned(err) = err else {
+            panic!("a poll timeout is C's return, got {err:?}");
+        };
         assert_eq!(err.status(), AsynStatus::Timeout);
         assert_eq!(err.partial_write(), Some(0));
     }
@@ -3533,6 +3581,10 @@ mod tests {
             None,
         )
         .expect_err("a send that never accepts a byte is C's asynTimeout");
+        // C's `thisWrite = 0; break;` (:719-721), which prints the end line.
+        let WriteFailure::Broke(err) = err else {
+            panic!("the retry bound is C's break, got {err:?}");
+        };
         assert_eq!(err.status(), AsynStatus::Timeout);
         assert_eq!(err.partial_write(), Some(0));
         // The bound is cumulative from the first refusal, so it expires once
@@ -3554,7 +3606,8 @@ mod tests {
         };
         let cap = std::time::Instant::now() + Duration::from_millis(50);
         let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(50)), Some(cap))
-            .expect_err("the caller's budget bounds the whole call");
+            .expect_err("the caller's budget bounds the whole call")
+            .into_error();
         assert_eq!(err.status(), AsynStatus::Timeout);
         assert!(
             matches!(err.partial_write(), Some(n) if (1..6).contains(&n)),

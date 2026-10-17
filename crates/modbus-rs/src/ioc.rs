@@ -1323,6 +1323,20 @@ impl PortDriver for ModbusPortDriver {
                 }
             }
         }
+        // C prints through the caller's user once its reason is the data
+        // parameter's (drvModbusAsyn.cpp:420-427).
+        self.base.trace_print_at(
+            addr,
+            reason as i32,
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "drvModbusAsyn::drvUserCreate, port {} data type={}\n",
+                self.base.port_name,
+                datatype.as_str()
+            ),
+        );
         Ok(DrvUserInfo {
             reason,
             max_octet_len,
@@ -3330,6 +3344,59 @@ mod tests {
     /// misconfigured record fails init rather than alarming on every I/O. A
     /// non-data (statistics) drvInfo skips the check, as C falls through to the
     /// base class with no offset validation (:433).
+    /// C's data-type branch ends with a FLOW line through the caller's user,
+    /// its reason the data parameter's (drvModbusAsyn.cpp:420-427).
+    #[test]
+    fn drv_user_create_prints_the_data_type_through_the_callers_device() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::{TraceFile, TraceInfoMask};
+
+        let driver = ModbusPortDriver::new(
+            "MB_DU_TR",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        let path =
+            std::env::temp_dir().join(format!("modbus_MB_DU_TR_{}.trace", std::process::id()));
+        let services = PortServices::new();
+        let trace = services.trace().clone();
+        let (runtime, _jh) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect("the modbus port runtime must start");
+        // Device slots exist once the port has registered as multi-device.
+        trace.set_device_trace_mask("MB_DU_TR", 5, TraceMask::FLOW);
+        trace.set_device_trace_info_mask("MB_DU_TR", 5, TraceInfoMask::PORT);
+        trace.set_device_trace_file(
+            "MB_DU_TR",
+            5,
+            TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).expect("the trace sink must open"),
+            ))),
+        );
+        let info = runtime
+            .port_handle()
+            .drv_user_create_blocking(&DrvUserRequest::new("INT16", 5))
+            .unwrap();
+        runtime.shutdown();
+
+        let logged = std::fs::read_to_string(&path).expect("the trace sink must be readable");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            logged.contains(&format!(
+                "[MB_DU_TR,5,{}] drvModbusAsyn::drvUserCreate, port MB_DU_TR data type=INT16\n",
+                info.reason
+            )),
+            "{logged}"
+        );
+    }
+
     #[test]
     fn drv_user_create_rejects_out_of_range_offset_for_data_reason() {
         // Relative mode: valid offsets are 0..length (here 16).

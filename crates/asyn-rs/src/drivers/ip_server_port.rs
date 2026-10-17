@@ -564,7 +564,7 @@ impl ClientSlot {
         drop(guard);
         match res {
             Ok(n) => Ok(n),
-            Err(e) => Err(self.classify_write_failure(e, device)),
+            Err(f) => Err(self.classify_write_failure(f.into_error(), device)),
         }
     }
 
@@ -1402,10 +1402,8 @@ impl PortDriver for DrvAsynIPServerPort {
                 ),
             );
         }
-        // Each child port announces its own client's drop.
-        for slot in &self.slots {
-            slot.clear();
-        }
+        // C `closeConnection` (drvAsynIPServerPort.c:153-162) closes the
+        // listening socket alone: a served client keeps its child port.
         self.stop_accept_loop();
         self.stop_udp_worker();
         *self.udp_socket.lock() = None;
@@ -2660,6 +2658,55 @@ mod tests {
             [(AsynException::Connect, -1)],
             "the parent's listen, and nothing per client"
         );
+        drop(child_rt);
+    }
+
+    /// C's parent disconnect closes the listener alone (drvAsynIPServerPort.c:
+    /// 153-162): the served client keeps its slot and its child stays up.
+    #[test]
+    fn a_parent_disconnect_leaves_the_served_client_alone() {
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        use std::io::{Read, Write};
+
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("slot_keep", config).unwrap();
+        let child = srv.make_subport(0).unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let _g = child.base().announcer.add_user(-1, move |e| {
+            seen.lock().push(e.exception);
+        });
+        let (child_rt, _actor) =
+            create_port_runtime_unclaimed(child, RuntimeConfig::default()).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", srv.local_port())).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while events.lock().len() < 3 {
+            assert!(Instant::now() < until, "the child never connected");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        srv.disconnect(&AsynUser::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            srv.slots[0].is_occupied(),
+            "the parent disconnect cleared the slot"
+        );
+        assert_eq!(events.lock().len(), 3, "the child heard a drop");
+        let handle = child_rt.port_handle().clone();
+        handle
+            .submit_blocking(
+                crate::request::RequestOp::OctetWrite {
+                    data: b"hi".to_vec(),
+                },
+                AsynUser::new(0).with_timeout(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hi");
+        client.write_all(b"x").unwrap();
         drop(child_rt);
     }
 

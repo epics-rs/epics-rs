@@ -3494,6 +3494,29 @@ pub(crate) fn octet_flush_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `waitConnect` adds its handler on the port's own `dpCommon`
+    /// (asynManager.c:3347), so a waiter counts there and hears only that
+    /// port; the IOC-wide list carries nothing of it.
+    #[test]
+    fn a_connect_waiter_waits_on_the_ports_own_list() {
+        let ioc = Arc::new(ExceptionManager::new());
+        let announcer = ExceptionAnnouncer::new("cwait", true);
+        *announcer.shared.sink.lock() = Some(Arc::clone(&ioc));
+        let other = ExceptionAnnouncer::new("cwait_other", false);
+        *other.shared.sink.lock() = Some(Arc::clone(&ioc));
+
+        let waiter = crate::runtime::port::ConnectWaiter::arm(&announcer);
+        assert_eq!(announcer.user_count(-1), 1);
+        assert_eq!(ioc.callback_count(), 0);
+        other.announce(AsynException::Connect, -1);
+        announcer.announce(AsynException::Connect, 3);
+        let waiter2 = crate::runtime::port::ConnectWaiter::arm(&announcer);
+        assert!(!waiter.wait(std::time::Duration::from_millis(50)));
+        announcer.announce(AsynException::Connect, -1);
+        assert!(waiter2.wait(std::time::Duration::from_secs(1)));
+        assert_eq!(announcer.user_count(-1), 0);
+    }
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
     #[test]

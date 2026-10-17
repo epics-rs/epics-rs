@@ -77,6 +77,10 @@ impl PortServices {
     /// on every port, so no port can run without them.
     pub(crate) fn bind(&self, base: &mut PortDriverBase) {
         base.trace = self.trace.clone();
+        // C `dpCommonInit` keys device slots by the attributes `registerPort`
+        // was given; without them every device setting lands on the port.
+        self.trace
+            .register_port(&base.port_name, base.flags.multi_device);
         base.bind_exception_sink(self.exceptions.clone());
     }
 }
@@ -111,6 +115,25 @@ mod tests {
                 .expect("the trace is wired to a sink");
             assert!(Arc::ptr_eq(&sink, services.exceptions()));
         }
+    }
+
+    /// A bound multi-device port keeps a device-scoped trace mask on that
+    /// device alone, as C's per-device `dpCommon` does.
+    #[test]
+    fn a_bound_multi_device_port_keys_its_device_slots() {
+        use crate::trace::TraceMask;
+        let services = PortServices::new();
+        let flags = crate::port::PortFlags {
+            multi_device: true,
+            ..Default::default()
+        };
+        let mut base = PortDriverBase::new("SVC_MULTI", 4, flags);
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.set_device_trace_mask("SVC_MULTI", 2, TraceMask::FLOW);
+        assert!(trace.is_enabled_device("SVC_MULTI", 2, TraceMask::FLOW));
+        assert!(!trace.is_enabled("SVC_MULTI", TraceMask::FLOW));
+        assert!(!trace.is_enabled_device("SVC_MULTI", 1, TraceMask::FLOW));
     }
 
     /// A driver constructor's prints reach the console before the port is

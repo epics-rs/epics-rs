@@ -159,13 +159,13 @@ fn stop_port_actor(
 }
 
 /// The one way to wait for a port's connect — C `waitConnect`
-/// (asynManager.c:3323-3367), which arms an exception handler and only then
-/// blocks on the event.
+/// (asynManager.c:3323-3367), which adds an exception handler on the port's
+/// own `dpCommon` and only then blocks on the event.
 ///
 /// Arming first is the whole point: a connect that lands between "am I
 /// connected?" and "start waiting" would be missed by any caller that checked
 /// the flag first. C has that race — it reads `pport->dpc.connected` at
-/// :3339-3342 and only arms afterwards, at :3347 — so here [`Self::arm`]
+/// :3339-3342 and only arms afterwards, at :3347 — so here `arm`
 /// registers the callback first, the caller may then short-circuit on an
 /// already-connected port, and [`Self::wait`] blocks for the rest. That
 /// ordering is a deliberate deviation. Both waiters in the crate — port
@@ -173,27 +173,24 @@ fn stop_port_actor(
 /// grow its own race.
 pub struct ConnectWaiter {
     rx: std::sync::mpsc::Receiver<()>,
-    services: crate::services::PortServices,
-    callback: crate::exception::ExceptionCallbackId,
+    _callback: crate::exception::ExceptionCallbackGuard,
 }
 
 impl ConnectWaiter {
-    /// Register for `port_name`'s connect exception. From here on the connect
-    /// cannot be missed, only waited for.
-    pub fn arm(services: &crate::services::PortServices, port_name: &str) -> Self {
+    /// Register for the port's connect exception, on the port's own slot (-1):
+    /// C's waiting user is bound with `connectDevice(pasynUser, portName, -1)`
+    /// (asynShellCommands.c:563; `pconnectUser` for registration). From here
+    /// on the connect cannot be missed, only waited for.
+    pub(crate) fn arm(announcer: &crate::port::ExceptionAnnouncer) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let waited_on = port_name.to_string();
-        let callback = services.exceptions().add_callback(move |event| {
-            if event.exception == crate::exception::AsynException::Connect
-                && event.port_name == waited_on
-            {
+        let callback = announcer.add_user(-1, move |event| {
+            if event.exception == crate::exception::AsynException::Connect {
                 let _ = tx.send(());
             }
         });
         Self {
             rx,
-            services: services.clone(),
-            callback,
+            _callback: callback,
         }
     }
 
@@ -201,12 +198,6 @@ impl ConnectWaiter {
     /// `true` = connected.
     pub fn wait(self, timeout: std::time::Duration) -> bool {
         self.rx.recv_timeout(timeout).is_ok()
-    }
-}
-
-impl Drop for ConnectWaiter {
-    fn drop(&mut self) {
-        self.services.exceptions().remove_callback(self.callback);
     }
 }
 
@@ -254,9 +245,8 @@ pub fn create_port_runtime_unclaimed<D: PortDriver>(
 /// `ellAdd(&pasynBase->asynPortList, ...)` (:2096) — the port never enters the
 /// list. The unwind is this function's `Err` return: the `PortActor` (which
 /// owns the driver) is dropped along with the closure `Builder::spawn`
-/// rejected, and the one resource that is *not* local — the connect-exception
-/// callback registered with the shared [`crate::exception`] list — is removed
-/// by [`ConnectWaiter`]'s `Drop`.
+/// rejected, and with them the port's own exception lists and the
+/// [`ConnectWaiter`] armed on them.
 ///
 /// A caller that can report the failure returns it, as
 /// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1087-1089`: print,
@@ -325,6 +315,14 @@ pub fn create_port_runtime_boxed(
     let shared_intr_state = driver.base().interrupts.shared_state();
     let handle_interrupts = Arc::new(InterruptManager::from_shared_state(shared_intr_state));
 
+    // C's `waitConnect` (asynManager.c:2137, :3323-3368): registration waits on
+    // the port's *connect exception* for at most `autoConnectTimeout`, so the
+    // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
+    // The waiter is armed before the actor thread exists, so the connect it
+    // waits for cannot fire ahead of it.
+    let connect_wait =
+        connect_at_registration.then(|| ConnectWaiter::arm(&driver.base().announcer));
+
     // Actor channel
     let (tx, rx) = mpsc::unbounded_channel();
     let actor = PortActor::new(driver, rx);
@@ -332,14 +330,6 @@ pub fn create_port_runtime_boxed(
 
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
-
-    // C's `waitConnect` (asynManager.c:2137, :3323-3368): registration waits on
-    // the port's *connect exception* for at most `autoConnectTimeout`, so the
-    // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
-    // The waiter is armed before the actor thread exists, so the connect it
-    // waits for cannot fire ahead of it.
-    let connect_wait =
-        connect_at_registration.then(|| ConnectWaiter::arm(&config.services, &port_name));
 
     // C `epicsThreadCreate(portName, priority, stackSize, portThread, pport)`
     // (asynManager.c:2077-2082), stackSize 0 → `epicsThreadStackMedium`. As an

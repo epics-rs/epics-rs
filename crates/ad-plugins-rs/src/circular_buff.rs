@@ -564,7 +564,7 @@ impl NDPluginProcess for CircularBuffProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
 
@@ -909,13 +909,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -1519,13 +1526,19 @@ mod tests {
 
     fn cb_write(
         proc: &CircularBuffProcessor,
-        base: &asyn_rs::port::PortDriverBase,
+        base: &mut asyn_rs::port::PortDriverBase,
         name: &str,
         value: i32,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let reason = base.find_param(name).unwrap();
-        proc.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base)
+        proc.validate_int32(
+            reason,
+            0,
+            value,
+            WriteVerdict::Accept(value),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(base),
+        )
     }
 
     fn side_int(
@@ -1554,7 +1567,7 @@ mod tests {
         let (proc, mut base) = cb_port();
         // :257-260 `setIntegerParam(NDCircBuffCurrentImage, 0);
         // setStringParam(NDCircBuffStatus, "Acquisition Stopped");`
-        let out = cb_write(&proc, &base, "CIRC_BUFF_CONTROL", 0);
+        let out = cb_write(&proc, &mut base, "CIRC_BUFF_CONTROL", 0);
         assert_eq!(side_int(&out, &base, "CIRC_BUFF_CURRENT_IMAGE"), Some(0));
         assert_eq!(side_status(&out), Some("Acquisition Stopped"));
         assert!(!out.settled);
@@ -1562,18 +1575,18 @@ mod tests {
         // :252-253 `preCount ? "Buffer filling" : "Dropping frames"`
         let pre = base.find_param("CIRC_BUFF_PRE_TRIGGER").unwrap();
         base.set_int32_param(pre, 0, 0).unwrap();
-        let out = cb_write(&proc, &base, "CIRC_BUFF_CONTROL", 1);
+        let out = cb_write(&proc, &mut base, "CIRC_BUFF_CONTROL", 1);
         assert_eq!(
             side_int(&out, &base, "CIRC_BUFF_ACTUAL_TRIGGER_COUNT"),
             Some(0)
         );
         assert_eq!(side_status(&out), Some("Dropping frames"));
         base.set_int32_param(pre, 0, 3).unwrap();
-        let out = cb_write(&proc, &base, "CIRC_BUFF_CONTROL", 1);
+        let out = cb_write(&proc, &mut base, "CIRC_BUFF_CONTROL", 1);
         assert_eq!(side_status(&out), Some("Buffer filling"));
 
         // :271 `setIntegerParam(NDCircBuffTriggered, 1);`
-        let out = cb_write(&proc, &base, "CIRC_BUFF_SOFT_TRIGGER", 1);
+        let out = cb_write(&proc, &mut base, "CIRC_BUFF_SOFT_TRIGGER", 1);
         assert_eq!(side_int(&out, &base, "CIRC_BUFF_TRIGGERED"), Some(1));
     }
 
@@ -1623,22 +1636,22 @@ mod tests {
         };
         // :285-288 "Pre-count too high" above maxBuffers_-1, "Invalid pre-count value" below 0.
         refused(
-            cb_write(&proc, &base, "CIRC_BUFF_PRE_TRIGGER", 10),
+            cb_write(&proc, &mut base, "CIRC_BUFF_PRE_TRIGGER", 10),
             "Pre-count too high",
         );
         refused(
-            cb_write(&proc, &base, "CIRC_BUFF_PRE_TRIGGER", -1),
+            cb_write(&proc, &mut base, "CIRC_BUFF_PRE_TRIGGER", -1),
             "Invalid pre-count value",
         );
         // :291 `status = (asynStatus) setIntegerParam(function, value);`
-        let out = cb_write(&proc, &base, "CIRC_BUFF_PRE_TRIGGER", 9);
+        let out = cb_write(&proc, &mut base, "CIRC_BUFF_PRE_TRIGGER", 9);
         assert_eq!(out.verdict, WriteVerdict::Accept(9));
         assert_eq!(side_status(&out), None);
         // :282-283 `if (scopeControl) { setStringParam(NDCircBuffStatus,
         // "Stop acquisition to set pre-count");`
         base.set_int32_param(control, 0, 1).unwrap();
         refused(
-            cb_write(&proc, &base, "CIRC_BUFF_PRE_TRIGGER", 7),
+            cb_write(&proc, &mut base, "CIRC_BUFF_PRE_TRIGGER", 7),
             "Stop acquisition to set pre-count",
         );
     }
@@ -1907,14 +1920,20 @@ mod tests {
 
         // C latches Triggered inside the write (:271), so validate sets it.
         let latched = |p: &CircularBuffProcessor, value: i32| {
-            let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
-            p.validate_int32(20, 0, value, WriteVerdict::Accept(value), &base)
-                .side
-                .contains(&SideParam::Int32 {
-                    reason: 21,
-                    addr: 0,
-                    value: 1,
-                })
+            let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+            p.validate_int32(
+                20,
+                0,
+                value,
+                WriteVerdict::Accept(value),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+            )
+            .side
+            .contains(&SideParam::Int32 {
+                reason: 21,
+                addr: 0,
+                value: 1,
+            })
         };
 
         // Writing 0 with FlushOnSoftTrig = 1 — the disarm case, and the one C

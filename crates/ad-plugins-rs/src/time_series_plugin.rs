@@ -35,7 +35,7 @@ use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     ArrayCallbacks, NDPluginProcess, ParamUpdate, PluginAttributes, ProcessResult, WriteOutcome,
-    WriteVerdict,
+    WritePort, WriteVerdict,
 };
 use ad_core_rs::timestamp::EpicsTimestamp;
 use asyn_rs::param::ParamType;
@@ -538,7 +538,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
         _addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        params: &PortDriverBase,
+        params: &mut WritePort<'_>,
     ) -> WriteOutcome<i32> {
         let verdict = match verdict {
             WriteVerdict::Refuse { keep, .. } => WriteVerdict::Refuse {
@@ -768,21 +768,34 @@ mod tests {
     #[test]
     fn a_refused_base_write_carries_c_error_message() {
         let proc = TimeSeriesProcessor::new(1);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(71, 0, 99, clamp, &base).verdict,
+            proc.validate_int32(
+                71,
+                0,
+                99,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Refuse {
                 keep: 1,
                 message: "NDPluginTimeSeries::writeInt32: status=0, function=71, value=99".into(),
             }
         );
         assert_eq!(
-            proc.validate_int32(71, 0, 1, WriteVerdict::Accept(1), &base)
-                .verdict,
+            proc.validate_int32(
+                71,
+                0,
+                1,
+                WriteVerdict::Accept(1),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -939,12 +952,18 @@ mod tests {
     #[test]
     fn test_stop_write_posts_with_the_next_unique_id() {
         let (proc, _) = filled_fixed_u16("TST_TS_STOP");
-        let base = PortDriverBase::new("TST_TS_STOP_B", 3, PortFlags::default());
+        let mut base = PortDriverBase::new("TST_TS_STOP_B", 3, PortFlags::default());
         let (acquire, series) = {
             let st = proc.state.lock();
             (st.p.ts_acquire, st.p.ts_time_series)
         };
-        let out = proc.validate_int32(acquire, 0, 0, WriteVerdict::Accept(0), &base);
+        let out = proc.validate_int32(
+            acquire,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(out.settled);
         assert!(!proc.state.lock().acquiring);
         assert_eq!(side_array(&out, series, 0), Some(vec![1.0, 2.0, 3.0]));
@@ -958,10 +977,16 @@ mod tests {
     #[test]
     fn test_num_points_and_acquire_mode_writes_carry_the_axis() {
         let proc = make_proc(1, "TST_TS_NPTS");
-        let base = PortDriverBase::new("TST_TS_NPTS_B", 2, PortFlags::default());
+        let mut base = PortDriverBase::new("TST_TS_NPTS_B", 2, PortFlags::default());
         let p = proc.state.lock().p.clone();
         proc.state.lock().averaging_time_actual = 1.0;
-        let out = proc.validate_int32(p.ts_num_points, 0, 3, WriteVerdict::Accept(3), &base);
+        let out = proc.validate_int32(
+            p.ts_num_points,
+            0,
+            3,
+            WriteVerdict::Accept(3),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(out.settled);
         assert_eq!(
             side_array(&out, p.ts_time_axis, 0),
@@ -972,13 +997,25 @@ mod tests {
             addr: 0,
             value: 0,
         }));
-        let out = proc.validate_int32(p.ts_acquire_mode, 0, 1, WriteVerdict::Accept(1), &base);
+        let out = proc.validate_int32(
+            p.ts_acquire_mode,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(out.settled);
         assert_eq!(
             side_array(&out, p.ts_time_axis, 0),
             Some(vec![-2.0, -1.0, 0.0])
         );
-        let out = proc.validate_int32(p.ts_acquire, 0, 1, WriteVerdict::Accept(1), &base);
+        let out = proc.validate_int32(
+            p.ts_acquire,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(out.settled && proc.state.lock().acquiring);
         assert!(out.addressed.0.is_empty());
     }
@@ -1026,10 +1063,16 @@ mod tests {
     #[test]
     fn test_a_base_param_write_is_not_settled() {
         let proc = make_proc(1, "TST_TS_BASE");
-        let base = PortDriverBase::new("TST_TS_BASE_B", 2, PortFlags::default());
+        let mut base = PortDriverBase::new("TST_TS_BASE_B", 2, PortFlags::default());
         // make_proc numbers the TS params from 0; this is none of them.
         const BASE: usize = 1000;
-        let out = proc.validate_int32(BASE, 0, 1, WriteVerdict::Accept(1), &base);
+        let out = proc.validate_int32(
+            BASE,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(!out.settled && out.side.is_empty() && out.addressed.0.is_empty());
         let out = proc.validate_float64(BASE, 0, 1.0, WriteVerdict::Accept(1.0), &base);
         assert!(!out.settled && out.side.is_empty());

@@ -1808,7 +1808,7 @@ impl NDPluginProcess for StatsProcessor {
         _addr: i32,
         _value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         verdict.succeed().into()
     }
@@ -2168,13 +2168,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = StatsProcessor::new();
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }

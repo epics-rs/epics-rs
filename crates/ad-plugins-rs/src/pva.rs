@@ -150,7 +150,7 @@ fn ndarray_to_pv_field(array: &Arc<NDArray>) -> PvField {
         Some(c) => (
             NdArrayBuffer::UByte(PvArray::from_owner(Arc::new(FrameBytes(Arc::clone(array))))),
             c.compressed_size as i64,
-            codec_name_to_string(c.name),
+            codec_name_to_string(&c.name),
         ),
         None => (
             frame_pixels(array),
@@ -321,7 +321,7 @@ fn double_ts_to_nt(t: f64) -> NdTimeStamp {
     }
 }
 
-fn codec_name_to_string(name: ad_core_rs::codec::CodecName) -> String {
+fn codec_name_to_string(name: &ad_core_rs::codec::CodecName) -> String {
     name.as_str().to_string()
 }
 

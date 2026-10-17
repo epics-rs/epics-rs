@@ -5,6 +5,7 @@ use ad_core_rs::attributes::{
     NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList,
 };
 use ad_core_rs::codec::{Codec, CodecName};
+use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
@@ -15,14 +16,14 @@ use ad_core_rs::plugin::file_controller::{
 };
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginAttributes,
-    PluginParamSnapshot, ProcessResult, WriteOutcome, WriteVerdict,
+    PluginParamSnapshot, PortPost, ProcessResult, WriteOutcome, WritePort, WriteVerdict,
 };
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
 
 use rust_hdf5::H5File;
-use rust_hdf5::format::messages::datatype::{ByteOrder, DatatypeMessage};
+use rust_hdf5::format::messages::datatype::DatatypeMessage;
 use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, FILTER_BSHUF, FILTER_JPEG, FILTER_SZIP, Filter, FilterPipeline,
 };
@@ -39,18 +40,16 @@ const COMPRESS_BLOSC: i32 = 4;
 const COMPRESS_BSHUF: i32 = 5;
 const COMPRESS_LZ4: i32 = 6;
 const COMPRESS_JPEG: i32 = 7;
+/// C's enum has LZ4HDF5 = 7 and JPEG = 8 (NDFileHDF5.cpp:36-44), but the
+/// Compression menu writes 7 for "JPEG" (NDFileHDF5.template:604-605), so in C
+/// that menu entry selects LZ4HDF5. This port keeps the menu's meaning; lz4hdf5
+/// is reached only through a frame's codec (`Hdf5Settings::codec_override`),
+/// and the 8 it posts to Compression_RBV has no menu state, as C's JPEG = 8.
+const COMPRESS_LZ4HDF5: i32 = 8;
 
 /// SZIP nearest-neighbor coding option mask (`H5_SZIP_NN_OPTION_MASK`,
 /// H5Zpublic.h); C passes this to `H5Pset_szip` (NDFileHDF5.cpp:3372).
 const SZIP_NN_OPTION_MASK: u32 = 32;
-
-/// C ADCore BLOSC compressor sub-types.
-const BLOSC_LZ: i32 = 0;
-const BLOSC_LZ4: i32 = 1;
-const BLOSC_LZ4HC: i32 = 2;
-const BLOSC_SNAPPY: i32 = 3;
-const BLOSC_ZLIB: i32 = 4;
-const BLOSC_ZSTD: i32 = 5;
 
 /// Maximum number of extra dimensions (C `MAXEXTRADIMS`).
 const MAX_EXTRA_DIMS: usize = 10;
@@ -326,7 +325,7 @@ enum Hdf5Handle {
         /// pipeline could be built for it; false when compression is applied.
         compression_dropped: bool,
         /// `Some` when the streaming dataset is a fixed multi-extra-dimension
-        /// grid (`HDF5_nExtraDims >= 1`, uncompressed): frames are placed at
+        /// grid (`HDF5_nExtraDims >= 1`): frames are placed at
         /// odometer positions via `write_chunk_at`. `None` for the common
         /// single frame-axis case, which streams via `append_frame`.
         grid: Option<SwmrGridLayout>,
@@ -337,8 +336,7 @@ enum Hdf5Handle {
 /// streaming dataset is a `create_grid_dataset` of full shape
 /// `[eds[N], …, eds[0], Y, X]`; each frame is written at its odometer chunk
 /// position with `SwmrFileWriter::write_chunk_at`, mirroring the standard
-/// path's [`Hdf5Writer::flush_band`]. Compressed multi-extra-dim stays
-/// collapsed (no compressed grid constructor; backend-blocked).
+/// path's [`Hdf5Writer::flush_band`].
 struct SwmrGridLayout {
     /// Fixed leading axes, outermost-first (`extra_dim_axes`).
     leading: Vec<usize>,
@@ -356,14 +354,14 @@ struct SwmrGridLayout {
 #[derive(Clone)]
 pub struct Hdf5Settings {
     compression_type: i32,
-    z_compress_level: u32,
+    z_compress_level: i32,
     szip_num_pixels: u32,
     nbit_precision: u32,
     nbit_offset: u32,
     jpeg_quality: u32,
     blosc_shuffle_type: i32,
     blosc_compressor: i32,
-    blosc_compress_level: u32,
+    blosc_compress_level: i32,
     chunk: ChunkConfig,
     n_extra_dims: usize,
     extra_dims: [ExtraDim; MAX_EXTRA_DIMS],
@@ -407,11 +405,268 @@ impl Default for Hdf5Settings {
 }
 
 impl Hdf5Settings {
+    /// Build a FilterPipeline from the current compression settings.
+    fn build_pipeline(&self, element_size: usize, frame: &NDArray) -> Option<FilterPipeline> {
+        match self.compression_type {
+            COMPRESS_NONE => None,
+            // H5Pset_deflate refuses a level past 9, -1 included as unsigned
+            // (H5Pocpl.c:1229), and C sets no filter but keeps the zlib codec.
+            COMPRESS_ZLIB => u32::try_from(self.z_compress_level)
+                .ok()
+                .filter(|&level| level <= 9)
+                .map(FilterPipeline::deflate),
+            COMPRESS_SZIP => Some(FilterPipeline {
+                filters: vec![Filter {
+                    id: FILTER_SZIP,
+                    flags: 0,
+                    // C calls H5Pset_szip(cparms, H5_SZIP_NN_OPTION_MASK, szipNumPixels)
+                    // (NDFileHDF5.cpp:3372): nearest-neighbor coding (mask 32), not
+                    // entropy coding (mask 4). cd_values[1] is pixels_per_block; the
+                    // rust-hdf5 SZIP filter defaults bits_per_pixel/pixels_per_scanline.
+                    cd_values: vec![SZIP_NN_OPTION_MASK, self.szip_num_pixels],
+                }],
+            }),
+            // C sets FILTER_LZ4 for both (NDFileHDF5.cpp:3422-3438).
+            COMPRESS_LZ4 | COMPRESS_LZ4HDF5 => Some(FilterPipeline::lz4()),
+            COMPRESS_BSHUF => Some(FilterPipeline {
+                // Bitshuffle (HDF5 filter 32008): cd_values are
+                // [major_ver, minor_ver, elem_size, block_size, comp_type].
+                // comp_type 2 == LZ4, matching ADCore's default bitshuffle.
+                filters: vec![Filter {
+                    id: FILTER_BSHUF,
+                    flags: 0,
+                    cd_values: vec![0, 0, element_size as u32, 0, 2],
+                }],
+            }),
+            // C passes level, shuffle and compressor through as unsigned
+            // (NDFileHDF5.cpp:3395-3397), so a -1 is 0xFFFFFFFF.
+            COMPRESS_BLOSC => Some(FilterPipeline {
+                filters: vec![Filter {
+                    id: FILTER_BLOSC,
+                    flags: 0,
+                    cd_values: vec![
+                        2,
+                        2,
+                        element_size as u32,
+                        0,
+                        self.blosc_compress_level as u32,
+                        self.blosc_shuffle_type as u32,
+                        self.blosc_compressor as u32,
+                    ],
+                }],
+            }),
+            // The nbit filter travels with its narrowed datatype
+            // (NDFileHDF5.cpp:3362-3364), so `nbit_packing` builds both.
+            COMPRESS_NBIT => None,
+            COMPRESS_JPEG => {
+                let [ncols, nrows, rgb] = Self::jpeg_geometry(frame)?;
+                Some(FilterPipeline {
+                    filters: vec![Filter {
+                        id: FILTER_JPEG,
+                        flags: 0,
+                        cd_values: vec![self.jpeg_quality, ncols, nrows, rgb],
+                    }],
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// C's JPEG `cds[1..4]`, `[ncols, nrows, rgb]`, for the frame
+    /// `configureCompression` is handed (NDFileHDF5.cpp:3439-3457): only a 2-D
+    /// Mono or 3-D RGB1 frame has them, and C sets no filter and no codec for
+    /// any other.
+    fn jpeg_geometry(frame: &NDArray) -> Option<[u32; 3]> {
+        // C `getValue(NDAttrInt32, &colorMode)`, Mono when absent or a string.
+        let mode = frame
+            .attributes
+            .get("ColorMode")
+            .and_then(|a| a.value.as_i64())
+            .map_or(NDColorMode::Mono as i32, |v| v as i32);
+        let size = |i: usize| frame.dims[i].size as u32;
+        match frame.dims.len() {
+            2 if mode == NDColorMode::Mono as i32 => Some([size(0), size(1), 0]),
+            3 if mode == NDColorMode::RGB1 as i32 => Some([size(1), size(2), 1]),
+            _ => None,
+        }
+    }
+
+    /// N-bit packing for the standard write path: the on-disk datatype
+    /// override and the matching nbit filter, derived together.
+    ///
+    /// C narrows `this->datatype` via `H5Tset_precision`/`H5Tset_offset` and
+    /// then registers a parameterless `H5Pset_nbit` (NDFileHDF5.cpp:3362-3364)
+    /// whatever the setters refused; libhdf5's `set_local` callback reads the
+    /// datatype to build the filter `cd_values`. Here `DatasetBuilder::datatype`
+    /// supplies [`nbit_datatype`](Self::nbit_datatype) and `FilterPipeline::nbit`
+    /// builds the matching `cd_values` tree `[nparms, need_not_compress,
+    /// d_nelmts, NBIT_ATOMIC, size, order, precision, offset]`, so the dataset
+    /// is byte-readable by h5py / libhdf5.
+    ///
+    /// Returns `None` unless the scheme is `COMPRESS_NBIT`.
+    ///
+    /// `chunk_nelmts` is the element count of one on-disk chunk (= `d_nelmts`);
+    /// `flush_band` always writes a full, zero-padded chunk, so every filtered
+    /// write supplies exactly `chunk_nelmts * element_size` bytes — the size
+    /// `apply_nbit` requires.
+    fn nbit_packing(
+        &self,
+        data_type: NDDataType,
+        chunk_nelmts: usize,
+    ) -> Option<(DatatypeMessage, FilterPipeline)> {
+        let dt = self.nbit_datatype(data_type)?;
+        let pipeline = FilterPipeline::nbit(&dt, chunk_nelmts);
+        Some((dt, pipeline))
+    }
+
+    /// The datatype C's `H5Tset_precision` then `H5Tset_offset` leave on a
+    /// copy of the native one (NDFileHDF5.cpp:3362-3363, :3887). HDF5 refuses
+    /// precision 0 and a float precision that cuts its sign bit, leaving the
+    /// native precision; a precision past the element drops the offset and
+    /// grows the size (H5Tprecis.c `H5T_set_precision`). The offset always
+    /// holds, growing the size if it must (H5Toffset.c `H5T_set_offset`).
+    fn nbit_datatype(&self, data_type: NDDataType) -> Option<DatatypeMessage> {
+        if self.compression_type != COMPRESS_NBIT {
+            return None;
+        }
+        let mut dt = native_datatype(data_type);
+        let float = matches!(data_type, NDDataType::Float32 | NDDataType::Float64);
+        let (DatatypeMessage::FixedPoint {
+            size,
+            bit_offset,
+            bit_precision,
+            ..
+        }
+        | DatatypeMessage::FloatingPoint {
+            size,
+            bit_offset,
+            bit_precision,
+            ..
+        }) = &mut dt
+        else {
+            unreachable!("native numeric types are atomic")
+        };
+        let p = self.nbit_precision;
+        if p != 0 && !(float && p < *size * 8) {
+            if p > *size * 8 {
+                *size = p.div_ceil(8);
+            }
+            *bit_precision = p as u16;
+        }
+        let offset = self.nbit_offset;
+        if offset + u32::from(*bit_precision) > *size * 8 {
+            *size = (offset + u32::from(*bit_precision)).div_ceil(8);
+        }
+        *bit_offset = offset as u16;
+        Some(dt)
+    }
+
+    /// The params C `configureCompression` sets from a pre-compressed frame
+    /// whose codec it names (NDFileHDF5.cpp:3316-3337), before it reads them
+    /// back to build the dataset.
+    fn codec_override(codec: Option<&Codec>) -> Vec<(CompressionParam, i32)> {
+        use CompressionParam::*;
+        let Some(c) = codec else {
+            return Vec::new();
+        };
+        match c.name {
+            CodecName::Blosc => vec![
+                (Type, COMPRESS_BLOSC),
+                (BloscLevel, c.level),
+                (BloscShuffle, c.shuffle),
+                (BloscCompressor, c.compressor),
+            ],
+            CodecName::Zlib => vec![(Type, COMPRESS_ZLIB), (ZLevel, c.level)],
+            CodecName::BSLZ4 => vec![(Type, COMPRESS_BSHUF)],
+            CodecName::LZ4 => vec![(Type, COMPRESS_LZ4)],
+            CodecName::LZ4HDF5 => vec![(Type, COMPRESS_LZ4HDF5)],
+            CodecName::JPEG => vec![(Type, COMPRESS_JPEG)],
+            CodecName::None | CodecName::Other(_) => Vec::new(),
+        }
+    }
+
+    fn overridden(&self, params: &[(CompressionParam, i32)]) -> Self {
+        let mut s = self.clone();
+        s.apply(params);
+        s
+    }
+
+    /// The nbit offset and precision C reads back after setting them
+    /// (NDFileHDF5.cpp:3366-3371).
+    fn nbit_readback(&self, data_type: NDDataType) -> Vec<(CompressionParam, i32)> {
+        let Some(
+            DatatypeMessage::FixedPoint {
+                bit_offset,
+                bit_precision,
+                ..
+            }
+            | DatatypeMessage::FloatingPoint {
+                bit_offset,
+                bit_precision,
+                ..
+            },
+        ) = self.nbit_datatype(data_type)
+        else {
+            return Vec::new();
+        };
+        vec![
+            (CompressionParam::NbitOffset, i32::from(bit_offset)),
+            (CompressionParam::NbitPrecision, i32::from(bit_precision)),
+        ]
+    }
+
+    fn apply(&mut self, params: &[(CompressionParam, i32)]) {
+        for &(param, v) in params {
+            match param {
+                CompressionParam::Type => self.compression_type = v,
+                CompressionParam::ZLevel => self.z_compress_level = v,
+                CompressionParam::BloscLevel => self.blosc_compress_level = v,
+                CompressionParam::BloscShuffle => self.blosc_shuffle_type = v,
+                CompressionParam::BloscCompressor => self.blosc_compressor = v,
+                CompressionParam::NbitOffset => self.nbit_offset = v as u32,
+                CompressionParam::NbitPrecision => self.nbit_precision = v as u32,
+            }
+        }
+    }
+
+    /// C `this->codec` for this scheme (NDFileHDF5.cpp:3352-3469): what
+    /// `verifyChunking` holds every frame to.
+    fn dataset_codec(&self, data_type: NDDataType, frame: &NDArray) -> Option<Codec> {
+        let unset = Codec::UNSET;
+        let (name, level, shuffle, compressor) = match self.compression_type {
+            COMPRESS_NBIT => (CodecName::from_name("nbit"), unset, unset, unset),
+            COMPRESS_SZIP => (CodecName::from_name("szip"), unset, unset, unset),
+            COMPRESS_ZLIB => (CodecName::Zlib, self.z_compress_level, unset, unset),
+            COMPRESS_BLOSC => (
+                CodecName::Blosc,
+                self.blosc_compress_level,
+                self.blosc_shuffle_type,
+                self.blosc_compressor,
+            ),
+            COMPRESS_BSHUF => (CodecName::BSLZ4, unset, unset, unset),
+            COMPRESS_LZ4 => (CodecName::LZ4, unset, unset, unset),
+            COMPRESS_LZ4HDF5 => (CodecName::LZ4HDF5, unset, unset, unset),
+            COMPRESS_JPEG => {
+                Self::jpeg_geometry(frame)?;
+                (CodecName::JPEG, unset, unset, unset)
+            }
+            _ => return None,
+        };
+        Some(Codec {
+            name,
+            compressed_size: 0,
+            level,
+            shuffle,
+            compressor,
+            original_data_type: data_type,
+        })
+    }
+
     pub fn set_compression_type(&mut self, v: i32) {
         self.compression_type = v;
     }
 
-    pub fn set_z_compress_level(&mut self, v: u32) {
+    pub fn set_z_compress_level(&mut self, v: i32) {
         self.z_compress_level = v;
     }
 
@@ -427,7 +682,7 @@ impl Hdf5Settings {
         self.blosc_compressor = v;
     }
 
-    pub fn set_blosc_compress_level(&mut self, v: u32) {
+    pub fn set_blosc_compress_level(&mut self, v: i32) {
         self.blosc_compress_level = v;
     }
 
@@ -529,13 +784,19 @@ pub struct Hdf5Writer {
     dataset_name: String,
     /// Cached data type of the open primary dataset.
     open_data_type: Option<NDDataType>,
+    /// Bytes per element on disk: an nbit datatype HDF5 widened is larger
+    /// than `open_data_type` (see [`widen_le`]).
+    stored_elem_size: usize,
     /// Cached spatial (per-frame) dimensions, fastest-varying last.
     open_frame_dims: Option<Vec<usize>>,
-    /// Codec of the open detector dataset(s) when they were created from a
-    /// pre-compressed first frame (direct chunk write path). `None` for an
-    /// uncompressed file. Mirrors C `NDFileHDF5Dataset::codec`, used by
-    /// `verifyChunking` to reject a mid-file codec change.
-    open_codec: Option<Codec>,
+    /// C `NDFileHDF5Dataset::codec`: the codec of the open file's scheme,
+    /// which `verifyChunking` requires of a frame to direct-chunk-write it.
+    dataset_codec: Option<Codec>,
+    /// Chunk geometry of the open detector dataset(s), leading axes first.
+    open_chunk: Vec<usize>,
+    /// What `configure_compression` left for the port to post and print;
+    /// shared so the port drains it without the writer's lock.
+    compression_posts: Arc<Mutex<Configured>>,
     /// The settings store the port writes into, and the copy of it this
     /// writer last read (C reads its params at open, per frame and at close).
     cfg: WriterSettings<Hdf5Settings>,
@@ -599,8 +860,11 @@ impl Hdf5Writer {
             frame_count: 0,
             dataset_name: "data".to_string(),
             open_data_type: None,
+            stored_elem_size: 0,
             open_frame_dims: None,
-            open_codec: None,
+            dataset_codec: None,
+            open_chunk: Vec::new(),
+            compression_posts: Arc::default(),
             cfg: WriterSettings::new(Hdf5Settings::default()),
             open_mode: NDFileMode::Single,
             num_capture: 1,
@@ -649,6 +913,36 @@ impl Hdf5Writer {
         self.cfg.store()
     }
 
+    /// The params C `configureCompression` sets, which `openFile` runs for
+    /// every file, SWMR included (NDFileHDF5.cpp:279, :3890): a frame's codec
+    /// overrides the scheme, the settings read after it are the result, and
+    /// an nbit scheme posts the datatype HDF5 reads back.
+    fn configure_compression(&mut self, array: &NDArray) {
+        let mut posts = Hdf5Settings::codec_override(array.codec.as_ref());
+        let data_type = array
+            .codec
+            .as_ref()
+            .map_or(array.data.data_type(), |c| c.original_data_type);
+        posts.extend(self.cfg.overridden(&posts).nbit_readback(data_type));
+        if !posts.is_empty() {
+            self.cfg.store().update(|s| s.apply(&posts));
+            self.read_settings();
+        }
+        let mut configured = self.compression_posts.lock();
+        configured.posts.extend(posts);
+        if self.cfg.compression_type == COMPRESS_JPEG
+            && Hdf5Settings::jpeg_geometry(array).is_none()
+        {
+            configured
+                .lines
+                .push("JPEG compression only supports 2-D mono and 3-D RGB1 modes\n".to_owned());
+        }
+    }
+
+    fn compression_posts(&self) -> Arc<Mutex<Configured>> {
+        Arc::clone(&self.compression_posts)
+    }
+
     /// Read the settings where C reads its params: open, each frame, close.
     fn read_settings(&mut self) {
         self.cfg.refresh();
@@ -662,7 +956,7 @@ impl Hdf5Writer {
         self.cfg.store().update(|s| s.set_compression_type(v));
     }
 
-    pub fn set_z_compress_level(&mut self, v: u32) {
+    pub fn set_z_compress_level(&mut self, v: i32) {
         self.cfg.store().update(|s| s.set_z_compress_level(v));
     }
 
@@ -678,7 +972,7 @@ impl Hdf5Writer {
         self.cfg.store().update(|s| s.set_blosc_compressor(v));
     }
 
-    pub fn set_blosc_compress_level(&mut self, v: u32) {
+    pub fn set_blosc_compress_level(&mut self, v: i32) {
         self.cfg.store().update(|s| s.set_blosc_compress_level(v));
     }
 
@@ -844,206 +1138,6 @@ impl Hdf5Writer {
         )
     }
 
-    /// Build a FilterPipeline from the current compression settings.
-    fn build_pipeline(&self, element_size: usize) -> Option<FilterPipeline> {
-        match self.cfg.compression_type {
-            COMPRESS_NONE => None,
-            COMPRESS_ZLIB => Some(FilterPipeline::deflate(self.cfg.z_compress_level)),
-            COMPRESS_SZIP => Some(FilterPipeline {
-                filters: vec![Filter {
-                    id: FILTER_SZIP,
-                    flags: 0,
-                    // C calls H5Pset_szip(cparms, H5_SZIP_NN_OPTION_MASK, szipNumPixels)
-                    // (NDFileHDF5.cpp:3372): nearest-neighbor coding (mask 32), not
-                    // entropy coding (mask 4). cd_values[1] is pixels_per_block; the
-                    // rust-hdf5 SZIP filter defaults bits_per_pixel/pixels_per_scanline.
-                    cd_values: vec![SZIP_NN_OPTION_MASK, self.cfg.szip_num_pixels],
-                }],
-            }),
-            COMPRESS_LZ4 => Some(FilterPipeline::lz4()),
-            COMPRESS_BSHUF => Some(FilterPipeline {
-                // Bitshuffle (HDF5 filter 32008): cd_values are
-                // [major_ver, minor_ver, elem_size, block_size, comp_type].
-                // comp_type 2 == LZ4, matching ADCore's default bitshuffle.
-                filters: vec![Filter {
-                    id: FILTER_BSHUF,
-                    flags: 0,
-                    cd_values: vec![0, 0, element_size as u32, 0, 2],
-                }],
-            }),
-            COMPRESS_BLOSC => {
-                let compressor_code = match self.cfg.blosc_compressor {
-                    BLOSC_LZ => 0,
-                    BLOSC_LZ4 => 1,
-                    BLOSC_LZ4HC => 2,
-                    BLOSC_SNAPPY => 3,
-                    BLOSC_ZLIB => 4,
-                    BLOSC_ZSTD => 5,
-                    _ => 0,
-                };
-                Some(FilterPipeline {
-                    filters: vec![Filter {
-                        id: FILTER_BLOSC,
-                        flags: 0,
-                        cd_values: vec![
-                            2,
-                            2,
-                            element_size as u32,
-                            0,
-                            self.cfg.blosc_compress_level,
-                            self.cfg.blosc_shuffle_type as u32,
-                            compressor_code,
-                        ],
-                    }],
-                })
-            }
-            COMPRESS_NBIT => {
-                // C (NDFileHDF5.cpp:3355-3357) applies N-bit compression by
-                // narrowing the dataset DATATYPE — H5Tset_precision /
-                // H5Tset_offset — and then registering a parameterless
-                // H5Pset_nbit filter; libhdf5's set_local callback derives the
-                // nbit `cd_values` parameter tree from that reduced-precision
-                // datatype. The filter therefore cannot be expressed by a
-                // pipeline alone: it must travel together with a reduced
-                // datatype override on the dataset builder. `build_pipeline` is
-                // shared with the SWMR streaming path, whose
-                // `create_streaming_dataset_chunked_compressed` hardcodes
-                // `T::hdf5_type()` and has no datatype-override hook — so N-bit
-                // is handled out of band by `nbit_packing` on the standard
-                // write path (which CAN override the datatype) and returns
-                // `None` here so SWMR keeps degrading N-bit to uncompressed
-                // instead of writing an nbit filter over a full-width datatype.
-                None
-            }
-            COMPRESS_JPEG => Some(FilterPipeline {
-                filters: vec![Filter {
-                    id: FILTER_JPEG,
-                    flags: 0,
-                    cd_values: vec![self.cfg.jpeg_quality],
-                }],
-            }),
-            _ => None,
-        }
-    }
-
-    /// N-bit packing for the standard write path: the reduced-precision on-disk
-    /// datatype override and the matching nbit filter, derived together.
-    ///
-    /// C narrows `this->datatype` via `H5Tset_precision`/`H5Tset_offset` and
-    /// then registers a parameterless `H5Pset_nbit` (NDFileHDF5.cpp:3355-3357);
-    /// libhdf5's `set_local` callback reads the reduced datatype to build the
-    /// filter `cd_values`. Here `DatasetBuilder::datatype` supplies the reduced
-    /// `FixedPoint` datatype and `FilterPipeline::nbit` builds the matching
-    /// `cd_values` tree `[nparms, need_not_compress, d_nelmts, NBIT_ATOMIC,
-    /// size, order, precision, offset]`, so the dataset is byte-readable by
-    /// h5py / libhdf5.
-    ///
-    /// Returns `Some((datatype, pipeline))` only for `COMPRESS_NBIT` over an
-    /// integer (FixedPoint) element type. Float element types do not map to a
-    /// reduced-precision fixed-point datatype (N-bit over floats is not an
-    /// areaDetector use case), and an out-of-range precision (0, which HDF5's
-    /// `H5Tset_precision` rejects) cannot pack — both return `None`, leaving the
-    /// frame on the lossless uncompressed path.
-    ///
-    /// `chunk_nelmts` is the element count of one on-disk chunk (= `d_nelmts`);
-    /// `flush_band` always writes a full, zero-padded chunk, so every filtered
-    /// write supplies exactly `chunk_nelmts * element_size` bytes — the size
-    /// `apply_nbit` requires.
-    fn nbit_packing(
-        &self,
-        data_type: NDDataType,
-        chunk_nelmts: usize,
-    ) -> Option<(DatatypeMessage, FilterPipeline)> {
-        if self.cfg.compression_type != COMPRESS_NBIT {
-            return None;
-        }
-        let (size, signed) = match data_type {
-            NDDataType::Int8 => (1u32, true),
-            NDDataType::UInt8 => (1, false),
-            NDDataType::Int16 => (2, true),
-            NDDataType::UInt16 => (2, false),
-            NDDataType::Int32 => (4, true),
-            NDDataType::UInt32 => (4, false),
-            NDDataType::Int64 => (8, true),
-            NDDataType::UInt64 => (8, false),
-            NDDataType::Float32 | NDDataType::Float64 => return None,
-        };
-        if self.cfg.nbit_precision == 0 || self.cfg.nbit_precision > size * 8 {
-            return None;
-        }
-        let dt = DatatypeMessage::FixedPoint {
-            size,
-            byte_order: ByteOrder::LittleEndian,
-            signed,
-            bit_offset: self.cfg.nbit_offset as u16,
-            bit_precision: self.cfg.nbit_precision as u16,
-        };
-        let pipeline = FilterPipeline::nbit(&dt, chunk_nelmts);
-        Some((dt, pipeline))
-    }
-
-    /// Build the HDF5 filter pipeline that matches a **pre-compressed** input
-    /// array's codec, so direct chunk write records the filter the compressed
-    /// bytes were produced with. Mirrors C `NDFileHDF5::configureCompression`
-    /// (NDFileHDF5.cpp:3314-3331), which overrides the writer's own compression
-    /// settings from `pArray->codec`. Returns `None` (caller rejects the frame,
-    /// as C `verifyChunking` does) for any codec C does not direct-chunk-write:
-    /// the only `NDCODEC` values C handles are JPEG, BLOSC, LZ4 and BSLZ4
-    /// (Codec.h:12-18); the Rust-only `Zlib`/`LZ4HDF5`/`None` have no C analog.
-    ///
-    /// `element_size` is the size of one **uncompressed** element (the codec's
-    /// `original_data_type`), which the BLOSC/bitshuffle filters record as the
-    /// type size.
-    fn codec_filter_pipeline(&self, codec: &Codec) -> Option<FilterPipeline> {
-        let element_size = codec.original_data_type.element_size() as u32;
-        match codec.name {
-            CodecName::LZ4 => Some(FilterPipeline::lz4()),
-            CodecName::BSLZ4 => Some(FilterPipeline {
-                // Bitshuffle (HDF5 filter 32008), matching `build_pipeline`'s
-                // BSHUF arm: [major, minor, elem_size, block_size(0=auto),
-                // comp_type=2 (LZ4)].
-                filters: vec![Filter {
-                    id: FILTER_BSHUF,
-                    flags: 0,
-                    cd_values: vec![0, 0, element_size, 0, 2],
-                }],
-            }),
-            CodecName::Blosc => {
-                // C copies the array's own blosc params (level/shuffle/
-                // compressor) into the dataset filter (configureCompression
-                // NDFileHDF5.cpp:3320-3323), not the writer's defaults.
-                Some(FilterPipeline {
-                    filters: vec![Filter {
-                        id: FILTER_BLOSC,
-                        flags: 0,
-                        cd_values: vec![
-                            2,
-                            2,
-                            element_size,
-                            0,
-                            codec.level.max(0) as u32,
-                            codec.shuffle.max(0) as u32,
-                            codec.compressor.max(0) as u32,
-                        ],
-                    }],
-                })
-            }
-            // C `configureCompression` does not copy a JPEG quality from the
-            // array; the dataset's JPEG filter carries the writer's configured
-            // `HDF5_jpegQuality`. Quality is a compression-side parameter, unused
-            // when the reader reverses the filter, so direct-chunk-write parity
-            // is unaffected by its exact value.
-            CodecName::JPEG => Some(FilterPipeline {
-                filters: vec![Filter {
-                    id: FILTER_JPEG,
-                    flags: 0,
-                    cd_values: vec![self.cfg.jpeg_quality],
-                }],
-            }),
-            CodecName::None | CodecName::Zlib | CodecName::LZ4HDF5 => None,
-        }
-    }
-
     /// Chunk dims for the frame (image) axes only — no leading dims.
     ///
     /// For a 2-D frame these are the row/column chunk sizes
@@ -1117,76 +1211,18 @@ impl Hdf5Writer {
             None => {
                 let mut shape = vec![1usize];
                 shape.extend_from_slice(frame_dims);
-                let mut chunk = vec![self.cfg.chunk.n_frames_chunks.max(1)];
+                // C chunks the frame axis only in a multi-frame file
+                // (NDFileHDF5.cpp:3262-3271); a Single file has none.
+                let frames = if self.open_mode == NDFileMode::Single {
+                    1
+                } else {
+                    self.cfg.chunk.n_frames_chunks.max(1)
+                };
+                let mut chunk = vec![frames];
                 chunk.extend_from_slice(&frame_chunk);
                 (shape, chunk, None)
             }
         }
-    }
-
-    /// Dataset shape and chunk geometry for a pre-compressed (direct chunk
-    /// write) detector dataset. Identical leading-axis structure to
-    /// `standard_layout`, but every chunk holds exactly **one whole frame**:
-    /// the codec compressed each frame as a single unit, so C
-    /// `NDFileHDF5Dataset::verifyChunking` (NDFileHDF5Dataset.cpp:191-233)
-    /// requires the leading frame-axis chunk == 1 and every frame-axis chunk ==
-    /// the full frame dimension (no row/column sub-tiling). A pre-compressed
-    /// chunk cannot be split, so `HDF5_nRowChunks`/`nColChunks`/`nFramesChunks`
-    /// do not apply here.
-    fn compressed_layout(
-        &self,
-        frame_dims: &[usize],
-    ) -> (Vec<usize>, Vec<usize>, Option<Vec<usize>>) {
-        let frame_chunk: Vec<usize> = frame_dims.iter().map(|&d| d.max(1)).collect();
-        match self.extra_dim_axes() {
-            Some(leading) => {
-                let mut shape = leading.clone();
-                shape.extend_from_slice(frame_dims);
-                let mut chunk = vec![1usize; leading.len()];
-                chunk.extend_from_slice(&frame_chunk);
-                (shape, chunk, Some(leading))
-            }
-            None => {
-                let mut shape = vec![1usize];
-                shape.extend_from_slice(frame_dims);
-                let mut chunk = vec![1usize];
-                chunk.extend_from_slice(&frame_chunk);
-                (shape, chunk, None)
-            }
-        }
-    }
-
-    /// Collapsed single-leading-axis layout used by the SWMR streaming path,
-    /// whose backend (`SwmrFileWriter`) supports only one extensible frame
-    /// axis. With extra dims the leading axis is fixed at the product of the
-    /// extra-dim sizes (the N-dimensional structure is recorded as HDF5
-    /// attributes); the non-SWMR path uses `standard_layout`, which builds
-    /// C's full multi-extra-dimension dataspace.
-    ///
-    /// Returns `(shape, chunk, extra_dim_extent)` where `extra_dim_extent` is
-    /// `Some(total_frames)` when extra dims fix the dataset size up front, or
-    /// `None` when the leading frame axis is extended per write.
-    fn primary_layout(&self, frame_dims: &[usize]) -> (Vec<usize>, Vec<usize>, Option<usize>) {
-        let extra_extent = if self.cfg.n_extra_dims > 0 {
-            Some(
-                (0..self.cfg.n_extra_dims)
-                    .map(|i| self.cfg.extra_dims[i].size.max(1))
-                    .product::<usize>(),
-            )
-        } else {
-            None
-        };
-
-        let mut shape: Vec<usize> = vec![extra_extent.unwrap_or(1)];
-        shape.extend_from_slice(frame_dims);
-
-        let mut chunk = vec![if extra_extent.is_some() {
-            1
-        } else {
-            self.cfg.chunk.n_frames_chunks.max(1)
-        }];
-        chunk.extend_from_slice(&self.frame_chunk_dims(frame_dims));
-        (shape, chunk, extra_extent)
     }
 
     /// Row-major unravel of a flat frame index into per-axis coordinates over
@@ -1328,7 +1364,7 @@ impl Hdf5Writer {
             return Ok(());
         };
         let (_, chunk, leading) = self.standard_layout(&frame_dims);
-        let elem_size = self.open_data_type.map(|t| t.element_size()).unwrap_or(1);
+        let elem_size = self.stored_elem_size;
         let fc = chunk[0];
         let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
             return Ok(());
@@ -1387,34 +1423,45 @@ impl Hdf5Writer {
     /// group the path names is therefore also the dataset's single placement
     /// owner — nothing re-parents it afterwards.
     fn open_swmr(&mut self, path: &Path, array: &NDArray) -> ADResult<()> {
+        self.configure_compression(array);
         let mut swmr = SwmrFileWriter::create(path).map_err(|e| Self::create_failed(path, e))?;
         self.build_swmr_layout_groups(&mut swmr)?;
 
         let usize_frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
         let frame_dims: Vec<u64> = usize_frame_dims.iter().map(|&d| d as u64).collect();
+        // A pre-compressed first frame gives the dataset its original type,
+        // as on the standard path.
+        let ds_data_type = array
+            .codec
+            .as_ref()
+            .map_or(array.data.data_type(), |c| c.original_data_type);
 
         // Full chunk geometry, `[fc, rc, cc]`: HDF5_nFramesChunks deep and
         // the row/column tile sizes. rust-hdf5 0.2.15
         // `create_streaming_dataset_chunked` band-buffers whole frames and
         // zero-pads the final partial band at close, keeping the logical
         // frame count exact.
-        let element_size = array.data.data_type().element_size();
-        let pipeline = self.build_pipeline(element_size);
-        let chunk: Vec<u64> = {
-            let (_, c, _) = self.primary_layout(&usize_frame_dims);
-            c.iter().map(|&v| v as u64).collect()
-        };
-
-        // With `HDF5_nExtraDims >= 1` and no compression, mirror the standard
-        // path's full multi-extra-dimension dataspace: a fixed grid of shape
-        // `[eds[N], …, eds[0], Y, X]` filled at odometer positions via
-        // `write_chunk_at`. Compressed multi-extra-dim has no grid constructor
-        // and stays collapsed to the single-axis streaming layout above.
+        // The standard path's dataspace (C's, compressed or not): with
+        // `HDF5_nExtraDims >= 1` a fixed grid of shape `[eds[N], …, eds[0],
+        // Y, X]` filled at odometer positions via `write_chunk_at`, otherwise
+        // one extensible frame axis.
         let (grid_shape_usize, grid_chunk_usize, grid_leading) =
             self.standard_layout(&usize_frame_dims);
-        let use_grid = grid_leading.is_some() && pipeline.is_none();
+        let use_grid = grid_leading.is_some();
         let grid_shape: Vec<u64> = grid_shape_usize.iter().map(|&v| v as u64).collect();
         let grid_chunk: Vec<u64> = grid_chunk_usize.iter().map(|&v| v as u64).collect();
+        // The nbit filter travels with its datatype, as on the standard path.
+        let (datatype, pipeline) = match self
+            .cfg
+            .nbit_packing(ds_data_type, grid_chunk_usize.iter().product())
+        {
+            Some((dt, pl)) => (dt, Some(pl)),
+            None => (
+                native_datatype(ds_data_type),
+                self.cfg.build_pipeline(ds_data_type.element_size(), array),
+            ),
+        };
+        let element_size = datatype.element_size() as usize;
 
         // The streaming dataset is created with its full nested layout path
         // as the dataset name (default flat `data` without a layout). The
@@ -1424,56 +1471,60 @@ impl Hdf5Writer {
         // resolves against it.
         let ds_name = self.resolved_dataset_path.clone();
 
-        macro_rules! create_ds {
-            ($t:ty) => {
-                if use_grid {
-                    swmr.create_grid_dataset::<$t>(&ds_name, &grid_shape, &grid_chunk)
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "SWMR create grid dataset error: {}",
-                                e
-                            ))
-                        })
-                } else {
-                    match pipeline.clone() {
-                        Some(pl) => swmr
-                            .create_streaming_dataset_chunked_compressed::<$t>(
-                                &ds_name,
-                                &frame_dims,
-                                &chunk,
-                                pl,
-                            )
-                            .map_err(|e| {
-                                ADError::UnsupportedConversion(format!(
-                                    "SWMR create compressed dataset error: {}",
-                                    e
-                                ))
-                            }),
-                        None => swmr
-                            .create_streaming_dataset_chunked::<$t>(&ds_name, &frame_dims, &chunk)
-                            .map_err(|e| {
-                                ADError::UnsupportedConversion(format!(
-                                    "SWMR create dataset error: {}",
-                                    e
-                                ))
-                            }),
-                    }
+        let created = match (use_grid, pipeline.clone()) {
+            (true, Some(pl)) => swmr.create_grid_dataset_compressed_with_datatype(
+                &ds_name,
+                datatype,
+                &grid_shape,
+                &grid_chunk,
+                pl,
+            ),
+            (true, None) => {
+                swmr.create_grid_dataset_with_datatype(&ds_name, datatype, &grid_shape, &grid_chunk)
+            }
+            (false, Some(pl)) => swmr.create_streaming_dataset_chunked_compressed_with_datatype(
+                &ds_name,
+                datatype,
+                &frame_dims,
+                &grid_chunk,
+                pl,
+            ),
+            // Never nbit, which always has its filter; rust-hdf5 has no
+            // `_with_datatype` form of this one.
+            (false, None) => {
+                macro_rules! chunked {
+                    ($t:ty) => {
+                        swmr.create_streaming_dataset_chunked::<$t>(
+                            &ds_name,
+                            &frame_dims,
+                            &grid_chunk,
+                        )
+                    };
                 }
-            };
-        }
-
-        let ds_index = match array.data.data_type() {
-            NDDataType::Int8 => create_ds!(i8)?,
-            NDDataType::UInt8 => create_ds!(u8)?,
-            NDDataType::Int16 => create_ds!(i16)?,
-            NDDataType::UInt16 => create_ds!(u16)?,
-            NDDataType::Int32 => create_ds!(i32)?,
-            NDDataType::UInt32 => create_ds!(u32)?,
-            NDDataType::Int64 => create_ds!(i64)?,
-            NDDataType::UInt64 => create_ds!(u64)?,
-            NDDataType::Float32 => create_ds!(f32)?,
-            NDDataType::Float64 => create_ds!(f64)?,
+                match ds_data_type {
+                    NDDataType::Int8 => chunked!(i8),
+                    NDDataType::UInt8 => chunked!(u8),
+                    NDDataType::Int16 => chunked!(i16),
+                    NDDataType::UInt16 => chunked!(u16),
+                    NDDataType::Int32 => chunked!(i32),
+                    NDDataType::UInt32 => chunked!(u32),
+                    NDDataType::Int64 => chunked!(i64),
+                    NDDataType::UInt64 => chunked!(u64),
+                    NDDataType::Float32 => chunked!(f32),
+                    NDDataType::Float64 => chunked!(f64),
+                }
+            }
         };
+        let ds_index = created.map_err(|e| {
+            ADError::UnsupportedConversion(format!("SWMR create dataset error: {}", e))
+        })?;
+        // C's SWMR dataset shares the dcpl H5Pset_fill_value set
+        // (NDFileHDF5.cpp:3895).
+        swmr.set_dataset_fill_value_bytes(
+            ds_index,
+            &stored_fill(self.cfg.fill_value, ds_data_type, element_size),
+        )
+        .map_err(|e| ADError::UnsupportedConversion(format!("SWMR fill value error: {}", e)))?;
 
         // Materialise the image dataset's constant attributes and the layout
         // `<hardlink>` elements — all BEFORE `start_swmr()` so SWMR readers
@@ -1521,8 +1572,11 @@ impl Hdf5Writer {
             compression_dropped,
             grid,
         });
-        self.open_data_type = Some(array.data.data_type());
-        self.open_frame_dims = Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
+        self.open_data_type = Some(ds_data_type);
+        self.stored_elem_size = element_size;
+        self.open_frame_dims = Some(usize_frame_dims);
+        self.dataset_codec = self.cfg.dataset_codec(ds_data_type, array);
+        self.open_chunk = grid_chunk_usize;
         Ok(())
     }
 
@@ -1859,52 +1913,31 @@ impl Hdf5Writer {
     /// datasets share the datatype/dataspace/frame shape taken from this frame.
     fn create_detector_datasets(&mut self, array: &NDArray) -> ADResult<()> {
         let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
-        // A pre-compressed input array (codec set) is written verbatim through a
-        // matching HDF5 filter via direct chunk write (C
-        // `NDFileHDF5Dataset::writeFile`, the `compressionAware` path). Its
-        // dataset carries the ORIGINAL element type (`codec.original_data_type`),
-        // a whole-frame chunk (`compressed_layout`), and a filter pipeline
-        // mirroring the codec rather than the writer's configured compression.
-        // An uncompressed array takes the standard tiled-write path unchanged.
-        let (ds_data_type, shape, chunk, leading, pipeline) = match array.codec.as_ref() {
-            Some(codec) => {
-                let pl = self.codec_filter_pipeline(codec).ok_or_else(|| {
-                    ADError::UnsupportedConversion(format!(
-                        "HDF5 cannot direct-chunk-write codec '{}' \
-                         (only jpeg/blosc/lz4/bslz4 are supported)",
-                        codec.name.as_str()
-                    ))
-                })?;
-                let (shape, chunk, leading) = self.compressed_layout(&frame_dims);
-                (codec.original_data_type, shape, chunk, leading, Some(pl))
-            }
-            None => {
-                let dt = array.data.data_type();
-                let (shape, chunk, leading) = self.standard_layout(&frame_dims);
-                (
-                    dt,
-                    shape,
-                    chunk,
-                    leading,
-                    self.build_pipeline(dt.element_size()),
-                )
-            }
-        };
+        // A pre-compressed first frame gives the dataset its ORIGINAL element
+        // type. The chunk is the user's as for any frame (NDFileHDF5.cpp:
+        // 3234-3271), so a compressed frame that is not exactly one chunk is
+        // refused in `write_frame` as `verifyChunking` refuses it. The filter is
+        // the scheme's, after the frame's codec has overridden it in the params.
+        self.configure_compression(array);
+        let ds_data_type = array
+            .codec
+            .as_ref()
+            .map_or(array.data.data_type(), |c| c.original_data_type);
+        let (shape, chunk, leading) = self.standard_layout(&frame_dims);
         // N-bit packing couples a reduced-precision datatype override with the
-        // nbit filter (C narrows `this->datatype` then `H5Pset_nbit`); only this
-        // standard, non-codec path can override the dataset datatype. For a
-        // pre-compressed array the codec pipeline already governs the dataset,
-        // so N-bit does not apply. `d_nelmts` is the per-chunk element count.
-        let (nbit_dt, pipeline): (Option<DatatypeMessage>, Option<FilterPipeline>) =
-            if array.codec.is_none() {
-                let chunk_nelmts: usize = chunk.iter().product();
-                match self.nbit_packing(ds_data_type, chunk_nelmts) {
-                    Some((dt, pl)) => (Some(dt), Some(pl)),
-                    None => (None, pipeline),
-                }
-            } else {
-                (None, pipeline)
-            };
+        // nbit filter (C narrows `this->datatype` then `H5Pset_nbit`).
+        // `d_nelmts` is the per-chunk element count.
+        let chunk_nelmts: usize = chunk.iter().product();
+        let (nbit_dt, pipeline) = match self.cfg.nbit_packing(ds_data_type, chunk_nelmts) {
+            Some((dt, pl)) => (Some(dt), Some(pl)),
+            None => (
+                None,
+                self.cfg.build_pipeline(ds_data_type.element_size(), array),
+            ),
+        };
+        let stored_elem_size = nbit_dt
+            .as_ref()
+            .map_or(ds_data_type.element_size(), |dt| dt.element_size() as usize);
         // Max shape: with extra dims the dataset is created at its full fixed
         // multi-dimensional size (every leading axis chunked at 1, so its
         // ceiling equals its size). Without extra dims the single leading frame
@@ -2015,19 +2048,17 @@ impl Hdf5Writer {
                 }
                 .shape(&shape[..])
                 .chunk(&chunk[..])
-                .max_shape(&max_shape[..])
+                .max_shape(&max_shape[..]);
                 // C parity: NDFileHDF5 sets HDF5_fillValue on the dataset
-                // creation property list (H5Pset_fill_value). rust-hdf5 0.2.15
-                // exposes `DatasetBuilder::fill_value`, which writes it into the
-                // DCPL fill-value message so unwritten chunks read back as
-                // `fill` rather than zero.
-                .fill_value(fill as $t);
-                // N-bit: store the reduced-precision datatype (C narrows
-                // `this->datatype`). The byte footprint stays `size_of::<$t>()`;
-                // the nbit filter packs the significant bits within it.
+                // creation property list (H5Pset_fill_value), so unwritten
+                // chunks read back as `fill` rather than zero. An nbit
+                // datatype (C narrows `this->datatype`) takes the fill in its
+                // stored width, widened as the data is.
                 if let Some(ref dt) = nbit_dt {
                     builder = builder.datatype(dt.clone());
                 }
+                builder =
+                    builder.fill_value_bytes(&stored_fill(fill, ds_data_type, stored_elem_size));
                 if let Some(ref pl) = pipeline {
                     builder = builder.filter_pipeline(pl.clone());
                 }
@@ -2191,8 +2222,10 @@ impl Hdf5Writer {
             *d = detectors;
         }
         self.open_data_type = Some(ds_data_type);
+        self.stored_elem_size = stored_elem_size;
         self.open_frame_dims = Some(frame_dims);
-        self.open_codec = array.codec.clone();
+        self.dataset_codec = self.cfg.dataset_codec(ds_data_type, array);
+        self.open_chunk = chunk;
         Ok(())
     }
 
@@ -2241,7 +2274,7 @@ impl Hdf5Writer {
     /// dataset (C `detector_data_destination`) and extending that dataset's
     /// leading dimension. Each detector dataset keeps its own frame counter and
     /// band; the file-wide `frame_count` is the total across all of them.
-    fn write_standard(&mut self, array: &NDArray) -> ADResult<()> {
+    fn write_standard(&mut self, array: &NDArray) -> Result<(), FrameError> {
         if self.frame_count == 0 {
             self.create_detector_datasets(array)?;
             self.create_attribute_datasets();
@@ -2256,47 +2289,38 @@ impl Hdf5Writer {
             return Err(ADError::UnsupportedConversion(format!(
                 "HDF5 frame shape changed mid-stream: {:?} != {:?}",
                 cur_dims, frame_dims
-            )));
+            ))
+            .into());
         }
 
-        // verifyChunking codec-match (C `NDFileHDF5Dataset.cpp:194-200`): the
-        // file's codec is fixed when the dataset is created from the first frame.
-        // A later frame whose codec differs (including compressed↔uncompressed)
-        // cannot be written into it.
-        if !codecs_match(self.open_codec.as_ref(), array.codec.as_ref()) {
-            return Err(ADError::UnsupportedConversion(format!(
-                "HDF5 codec changed mid-stream: dataset codec {:?} != frame codec {:?}",
-                self.open_codec.as_ref().map(|c| c.name),
-                array.codec.as_ref().map(|c| c.name),
-            )));
-        }
+        // C resolves the destination first; its error returns without the
+        // abort (NDFileHDF5.cpp:1467-1473).
+        let dest_key = self.resolve_destination_key(array)?;
+        let chunk = self.open_chunk.clone();
+        let chunk_bytes = self.direct_chunk(array, &frame_dims)?;
 
-        let (_shape, chunk, leading) = self.standard_layout(&frame_dims);
+        let (_shape, _, leading) = self.standard_layout(&frame_dims);
         let fc = chunk[0];
 
-        // Resolve the destination dataset (C `detDataMap` routing) and serialize
-        // the per-frame payload before borrowing the detector map mutably. A
-        // pre-compressed frame becomes one direct-chunk-write byte stream (C
-        // `NDFileHDF5Dataset::writeFile`, compressionAware path); an uncompressed
-        // frame becomes little-endian pixel bytes for band tiling.
-        let dest_key = self.resolve_destination_key(array)?;
-        let chunk_bytes = array.codec.as_ref().map(|codec| {
-            let total_bytes =
-                frame_dims.iter().product::<usize>() * codec.original_data_type.element_size();
-            codec_chunk_bytes(codec, total_bytes, array.data.as_u8_slice())
-        });
+        // An uncompressed frame becomes little-endian pixel bytes for band
+        // tiling, before the detector map is borrowed mutably.
+        let elem_size = self.stored_elem_size;
         let frame_le = if chunk_bytes.is_none() {
-            Some(nd_buffer_to_le_bytes(&array.data))
+            Some(widen_le(
+                nd_buffer_to_le_bytes(&array.data),
+                array.data.data_type(),
+                elem_size,
+            ))
         } else {
             None
         };
-        let elem_size = array.data.data_type().element_size();
 
         {
             let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
                 return Err(ADError::UnsupportedConversion(
                     "HDF5 detector datasets not initialised".into(),
-                ));
+                )
+                .into());
             };
             let det = detectors.get_mut(&dest_key).ok_or_else(|| {
                 ADError::UnsupportedConversion(format!(
@@ -2311,21 +2335,26 @@ impl Hdf5Writer {
             if let Some(ref lead) = leading {
                 let total: usize = lead.iter().product();
                 if frame_idx >= total {
-                    return Err(ADError::UnsupportedConversion(format!(
-                        "HDF5 extra-dimension capacity exceeded: frame {} >= {}",
-                        frame_idx, total
+                    return Err(FrameError::Dataset(ADError::UnsupportedConversion(
+                        format!(
+                            "HDF5 extra-dimension capacity exceeded: frame {} >= {}",
+                            frame_idx, total
+                        ),
                     )));
                 }
             }
 
             if let Some(cb) = &chunk_bytes {
-                // Direct chunk write. The dataset was created with a whole-frame
-                // chunk (`compressed_layout`), so each frame is exactly one chunk
-                // and its linear chunk index equals the per-dataset frame index
-                // (every leading chunk is 1, whether single-axis or extra-dim).
+                // Direct chunk write. The frame passed the one-frame chunk check
+                // above, so each frame is exactly one chunk and its linear chunk
+                // index equals the per-dataset frame index (every leading chunk
+                // is 1, whether single-axis or extra-dim).
                 // filter_mask = 0: the codec already applied the full pipeline.
                 det.ds.write_chunk_raw(frame_idx, cb, 0).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("HDF5 direct chunk write error: {}", e))
+                    FrameError::Dataset(ADError::UnsupportedConversion(format!(
+                        "HDF5 direct chunk write error: {}",
+                        e
+                    )))
                 })?;
             } else {
                 // Uncompressed: frames accumulate in this dataset's band and a
@@ -2347,7 +2376,8 @@ impl Hdf5Writer {
                         &frame_dims,
                         &chunk,
                         elem_size,
-                    )?;
+                    )
+                    .map_err(FrameError::Dataset)?;
                     det.frame_band.clear();
                 }
             }
@@ -2766,28 +2796,56 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Write a frame in SWMR mode.
-    fn write_swmr(&mut self, array: &NDArray) -> ADResult<()> {
-        // A pre-compressed frame cannot be direct-chunk-written in SWMR mode:
-        // `SwmrFileWriter` exposes only `append_frame`, which runs the supplied
-        // bytes through the dataset's filter pipeline. Feeding already-compressed
-        // bytes through it would re-compress them into garbage, so the frame is
-        // rejected (faithful to C returning `asynError` when it cannot write
-        // pre-compressed data). The standard (non-SWMR) write path direct-chunk-
-        // writes such frames; SWMR + pre-compressed needs a raw-chunk append API
-        // the SWMR backend does not yet provide.
-        if array.codec.is_some() {
-            return Err(ADError::UnsupportedConversion(
-                "HDF5 SWMR mode cannot write a pre-compressed array (no raw-chunk \
-                 append in the SWMR backend); use standard capture mode for \
-                 direct chunk write"
-                    .into(),
-            ));
+    /// C `verifyChunking` (NDFileHDF5Dataset.cpp:191-230) and the chunk C's
+    /// `H5Dwrite_chunk` stores (:291-329): a compressed frame is
+    /// direct-chunk-written only when its codec equals the dataset's and one
+    /// chunk is exactly one frame; any other compressed frame is refused
+    /// (:343-348). `None` for an uncompressed frame, which goes through the
+    /// dataset's filter as C's H5Dwrite does.
+    fn direct_chunk(
+        &self,
+        array: &NDArray,
+        frame_dims: &[usize],
+    ) -> Result<Option<Vec<u8>>, FrameError> {
+        let Some(codec) = array.codec.as_ref() else {
+            return Ok(None);
+        };
+        let chunk = &self.open_chunk;
+        let lead_n = chunk.len() - frame_dims.len();
+        let one_frame = chunk[..lead_n].iter().all(|&c| c == 1)
+            && chunk[lead_n..]
+                .iter()
+                .zip(frame_dims)
+                .all(|(&c, &d)| c == d.max(1));
+        if !(one_frame && codecs_match(self.dataset_codec.as_ref(), Some(codec))) {
+            return Err(FrameError::Dataset(ADError::Reported {
+                lines: vec![
+                    "NDFileHDF5Dataset::writeFile ERROR Unable to write pre-compressed \
+                     data - mismatched chunk definition\n"
+                        .to_owned(),
+                ],
+                message: "Unable to write pre-compressed data - mismatched chunk definition"
+                    .to_owned(),
+            }));
         }
+        let total_bytes =
+            frame_dims.iter().product::<usize>() * codec.original_data_type.element_size();
+        Ok(Some(codec_chunk_bytes(
+            codec,
+            total_bytes,
+            array.data.as_u8_slice(),
+        )))
+    }
+
+    /// Write a frame in SWMR mode.
+    fn write_swmr(&mut self, array: &NDArray) -> Result<(), FrameError> {
+        let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
+        let chunk_bytes = self.direct_chunk(array, &frame_dims)?;
 
         // This frame's 0-based odometer index (`frame_count` increments only
         // after `write_swmr` returns); read before the mutable handle borrow.
         let frame_idx = self.frame_count;
+        let stored_elem_size = self.stored_elem_size;
 
         let (writer, ds_index, grid) = match self.handle {
             Some(Hdf5Handle::Swmr {
@@ -2796,51 +2854,137 @@ impl Hdf5Writer {
                 ref grid,
                 ..
             }) => (writer, ds_index, grid),
-            _ => return Err(ADError::UnsupportedConversion("no SWMR writer open".into())),
+            _ => {
+                return Err(FrameError::Before(ADError::UnsupportedConversion(
+                    "no SWMR writer open".into(),
+                )));
+            }
         };
 
-        // The SWMR streaming dataset declares a little-endian element type and
-        // both `append_frame` and `write_chunk_at` copy the supplied `&[u8]`
-        // verbatim; serialize to LE explicitly (see `nd_buffer_to_le_bytes`) so
-        // the file is portable.
-        let frame_bytes = nd_buffer_to_le_bytes(&array.data);
-        match grid {
-            // Fixed multi-extra-dimension grid: place this frame at its odometer
-            // chunk position(s) via `write_chunk_at`, mirroring the standard
-            // path's `flush_band` (one frame per leading position, `fc == 1`).
-            Some(g) => {
-                let leading_coords = Self::unravel(frame_idx, &g.leading);
-                for (coords, tile) in Self::band_chunk_writes(
-                    &leading_coords,
-                    std::slice::from_ref(&frame_bytes),
-                    &g.frame_dims,
-                    &g.chunk,
-                    g.elem_size,
-                ) {
-                    let coords_u64: Vec<u64> = coords.iter().map(|&c| c as u64).collect();
-                    writer
-                        .write_chunk_at(ds_index, &coords_u64, &tile)
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "SWMR write_chunk_at error: {}",
-                                e
-                            ))
-                        })?;
+        // A pre-compressed frame is one chunk, stored verbatim; filter_mask 0
+        // because the codec applied the whole pipeline.
+        if let Some(cb) = chunk_bytes {
+            let stored = match grid {
+                Some(g) => {
+                    let mut coords: Vec<u64> = Self::unravel(frame_idx, &g.leading)
+                        .into_iter()
+                        .map(|c| c as u64)
+                        .collect();
+                    coords.resize(g.chunk.len(), 0);
+                    writer.write_chunk_raw_at(ds_index, &coords, &cb, 0)
                 }
-            }
-            None => {
-                writer.append_frame(ds_index, &frame_bytes).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("SWMR append error: {}", e))
-                })?;
+                None => writer.append_frame_raw(ds_index, &cb, 0),
+            };
+            stored.map_err(|e| {
+                FrameError::Dataset(ADError::UnsupportedConversion(format!(
+                    "SWMR direct chunk write error: {}",
+                    e
+                )))
+            })?;
+        } else {
+            // The SWMR streaming dataset declares a little-endian element type and
+            // both `append_frame` and `write_chunk_at` copy the supplied `&[u8]`
+            // verbatim; serialize to LE explicitly (see `nd_buffer_to_le_bytes`) so
+            // the file is portable.
+            let frame_bytes = widen_le(
+                nd_buffer_to_le_bytes(&array.data),
+                array.data.data_type(),
+                stored_elem_size,
+            );
+            match grid {
+                // Fixed multi-extra-dimension grid: place this frame at its odometer
+                // chunk position(s) via `write_chunk_at`, mirroring the standard
+                // path's `flush_band` (one frame per leading position, `fc == 1`).
+                Some(g) => {
+                    let leading_coords = Self::unravel(frame_idx, &g.leading);
+                    for (coords, tile) in Self::band_chunk_writes(
+                        &leading_coords,
+                        std::slice::from_ref(&frame_bytes),
+                        &g.frame_dims,
+                        &g.chunk,
+                        g.elem_size,
+                    ) {
+                        let coords_u64: Vec<u64> = coords.iter().map(|&c| c as u64).collect();
+                        writer
+                            .write_chunk_at(ds_index, &coords_u64, &tile)
+                            .map_err(|e| {
+                                FrameError::Dataset(ADError::UnsupportedConversion(format!(
+                                    "SWMR write_chunk_at error: {}",
+                                    e
+                                )))
+                            })?;
+                    }
+                }
+                None => {
+                    writer.append_frame(ds_index, &frame_bytes).map_err(|e| {
+                        FrameError::Dataset(ADError::UnsupportedConversion(format!(
+                            "SWMR append error: {}",
+                            e
+                        )))
+                    })?;
+                }
             }
         }
 
         // Periodic flush
         let count = self.frame_count + 1; // will be incremented after return
         if self.cfg.flush_nth_frame > 0 && count % self.cfg.flush_nth_frame == 0 {
-            writer
-                .flush()
-                .map_err(|e| ADError::UnsupportedConversion(format!("SWMR flush error: {}", e)))?;
+            writer.flush().map_err(|e| {
+                FrameError::Before(ADError::UnsupportedConversion(format!(
+                    "SWMR flush error: {}",
+                    e
+                )))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// C `writeFile`'s abort (NDFileHDF5.cpp:1519-1557): every later write to
+    /// the dataset would fail as well, so the file is closed and the failure
+    /// becomes [`ADError::Aborted`]. C has written each earlier frame and its
+    /// OnFrame attributes already, so the bands and attribute values this port
+    /// holds are written before the close; what C writes only in `closeFile`
+    /// (performance, OnFileClose values) is not.
+    fn abort(&mut self, failure: ADError) -> ADError {
+        let mut lines = failure.lines().to_vec();
+        lines.push("NDFileHDF5::writeFile ERROR: could not write to dataset. Aborting\n".into());
+        if self.close_aborted().is_err() {
+            lines.push("NDFileHDF5::writeFile ERROR: File did not close cleanly.\n".into());
+        }
+        self.handle = None;
+        self.current_path = None;
+        ADError::Aborted(Box::new(ADError::Reported {
+            lines,
+            message: failure.to_string(),
+        }))
+    }
+
+    fn close_aborted(&mut self) -> Result<(), String> {
+        let e = |e: &dyn std::fmt::Display| e.to_string();
+        match self.handle {
+            Some(Hdf5Handle::Standard { .. }) => {
+                self.finalize_standard_datasets().map_err(|x| e(&x))?;
+                self.flush_attribute_datasets().map_err(|x| e(&x))?;
+                if let Some(Hdf5Handle::Standard { ref file, .. }) = self.handle {
+                    self.build_layout_hardlinks(file).map_err(|x| e(&x))?;
+                }
+                if let Some(Hdf5Handle::Standard { file, detectors }) = self.handle.take() {
+                    let closed = if self.fsync_on_close {
+                        file.close()
+                    } else {
+                        file.close_no_sync()
+                    };
+                    drop(detectors);
+                    closed.map_err(|x| e(&x))?;
+                }
+            }
+            Some(Hdf5Handle::Swmr { .. }) => {
+                if let Some(Hdf5Handle::Swmr { mut writer, .. }) = self.handle.take() {
+                    writer.flush().map_err(|x| e(&x))?;
+                    writer.close().map_err(|x| e(&x))?;
+                }
+            }
+            None => {}
         }
         Ok(())
     }
@@ -2864,6 +3008,32 @@ impl Hdf5Writer {
         };
         self.perf_rows
             .push([write_duration, period, runtime, inst_speed, avg_speed]);
+    }
+}
+
+/// A compression param C `configureCompression` sets from a frame's codec.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CompressionParam {
+    Type,
+    ZLevel,
+    BloscLevel,
+    BloscShuffle,
+    BloscCompressor,
+    NbitOffset,
+    NbitPrecision,
+}
+
+/// How a frame write failed: `Dataset` is C's dataset step
+/// (`extendDataSet` or the dataset's `writeFile`), which aborts the file;
+/// `Before` is anything that returns ahead of it.
+enum FrameError {
+    Before(ADError),
+    Dataset(ADError),
+}
+
+impl From<ADError> for FrameError {
+    fn from(e: ADError) -> Self {
+        Self::Before(e)
     }
 }
 
@@ -2954,6 +3124,65 @@ fn nd_buffer_to_le_bytes(buf: &NDDataBuffer) -> Vec<u8> {
         NDDataBuffer::F32(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
         NDDataBuffer::F64(v) => v.iter().flat_map(|&x| x.to_le_bytes()).collect(),
     }
+}
+
+/// The HDF5 datatype of an `NDDataType` element.
+fn native_datatype(data_type: NDDataType) -> DatatypeMessage {
+    use rust_hdf5::types::H5Type;
+    match data_type {
+        NDDataType::Int8 => i8::hdf5_type(),
+        NDDataType::UInt8 => u8::hdf5_type(),
+        NDDataType::Int16 => i16::hdf5_type(),
+        NDDataType::UInt16 => u16::hdf5_type(),
+        NDDataType::Int32 => i32::hdf5_type(),
+        NDDataType::UInt32 => u32::hdf5_type(),
+        NDDataType::Int64 => i64::hdf5_type(),
+        NDDataType::UInt64 => u64::hdf5_type(),
+        NDDataType::Float32 => f32::hdf5_type(),
+        NDDataType::Float64 => f64::hdf5_type(),
+    }
+}
+
+/// `le` (elements of `data_type`) with each element extended to `stored`
+/// bytes: sign-extended for a signed integer, zero-filled otherwise.
+///
+/// C defect, not copied: for an nbit datatype HDF5 widened, C hands that
+/// datatype to H5Dwrite and H5Pset_fill_value as the memory type
+/// (NDFileHDF5.cpp:1520, :3895) and reads past each native element. Here the
+/// value is widened, and the nbit filter keeps bits [offset, offset+precision)
+/// of it as it does of the raw element when nothing widens.
+fn widen_le(le: Vec<u8>, data_type: NDDataType, stored: usize) -> Vec<u8> {
+    let native = data_type.element_size();
+    if stored == native {
+        return le;
+    }
+    let signed = matches!(
+        data_type,
+        NDDataType::Int8 | NDDataType::Int16 | NDDataType::Int32 | NDDataType::Int64
+    );
+    let mut out = Vec::with_capacity(le.len() / native * stored);
+    for e in le.chunks_exact(native) {
+        out.extend_from_slice(e);
+        let pad = if signed && e[native - 1] & 0x80 != 0 {
+            0xFF
+        } else {
+            0
+        };
+        out.resize(out.len() + stored - native, pad);
+    }
+    out
+}
+
+/// C's `HDF5_fillValue` cast to the element type (`typeNd2Hdf`,
+/// NDFileHDF5.cpp:3491-3538), widened to `stored` bytes, in host order as
+/// `fill_value_bytes` takes it.
+fn stored_fill(fill: f64, data_type: NDDataType, stored: usize) -> Vec<u8> {
+    let le = ad_core_rs::convert::c_cast_f64_le(fill, data_type);
+    let mut bytes = widen_le(le, data_type, stored);
+    if cfg!(target_endian = "big") {
+        bytes.reverse();
+    }
+    bytes
 }
 
 /// Write `buffer` into a chunked dataset, one `chunk_bytes`-sized chunk at a
@@ -3253,8 +3482,10 @@ impl NDFileWriter for Hdf5Writer {
         self.total_bytes = 0;
         self.swmr_cb_counter = 0;
         self.open_data_type = None;
+        self.stored_elem_size = 0;
         self.open_frame_dims = None;
-        self.open_codec = None;
+        self.dataset_codec = None;
+        self.open_chunk.clear();
         self.perf_rows.clear();
         self.perf_prev = None;
         self.perf_first = None;
@@ -3311,10 +3542,15 @@ impl NDFileWriter for Hdf5Writer {
         self.file_attributes.frame(&set, array);
 
         let is_swmr = matches!(self.handle, Some(Hdf5Handle::Swmr { .. }));
-        if is_swmr {
-            self.write_swmr(array)?;
+        let written = if is_swmr {
+            self.write_swmr(array)
         } else {
-            self.write_standard(array)?;
+            self.write_standard(array)
+        };
+        match written {
+            Ok(()) => {}
+            Err(FrameError::Before(e)) => return Err(e),
+            Err(FrameError::Dataset(e)) => return Err(self.abort(e)),
         }
         // Track the latest NDAttribute values for `when="OnFileClose"`
         // element-attrs (ADP-79); no-op unless the layout declares any.
@@ -3535,20 +3771,59 @@ struct Hdf5ParamIndices {
     layout_error_msg: Option<usize>,
 }
 
+/// What C `configureCompression` sets and prints for one open, held for the
+/// port: the params it posts and its `asynPrint` lines.
+#[derive(Debug, Default)]
+struct Configured {
+    posts: Vec<(CompressionParam, i32)>,
+    lines: Vec<String>,
+}
+
 /// HDF5 file processor wrapping `FilePluginController<Hdf5Writer>`.
 pub struct Hdf5FileProcessor {
     ctrl: Mutex<FilePluginController<Hdf5Writer>>,
     /// The writer's settings store, written without the writer's lock.
     settings: SettingsStore<Hdf5Settings>,
+    /// The writer's `compression_posts`, drained without the writer's lock.
+    compression_posts: Arc<Mutex<Configured>>,
     hdf5_params: Hdf5ParamIndices,
     attributes: Option<PluginAttributes>,
 }
 
 impl Hdf5FileProcessor {
+    /// The params a frame's codec set in the writer, posted as C's
+    /// `setIntegerParam` in `configureCompression` posts them.
+    fn compression_updates(&self) -> Vec<ParamUpdate> {
+        let p = &self.hdf5_params;
+        let posts = std::mem::take(&mut self.compression_posts.lock().posts);
+        posts
+            .into_iter()
+            .filter_map(|(param, v)| {
+                let idx = match param {
+                    CompressionParam::Type => p.compression_type,
+                    CompressionParam::ZLevel => p.z_compress_level,
+                    CompressionParam::BloscLevel => p.blosc_compress_level,
+                    CompressionParam::BloscShuffle => p.blosc_shuffle_type,
+                    CompressionParam::BloscCompressor => p.blosc_compressor,
+                    CompressionParam::NbitOffset => p.nbit_offset,
+                    CompressionParam::NbitPrecision => p.nbit_precision,
+                }?;
+                Some(ParamUpdate::int32(idx, v))
+            })
+            .collect()
+    }
+
+    /// The lines `configure_compression` printed, as C's `asynPrint`.
+    fn compression_trace(&self) -> Vec<(TraceMask, String)> {
+        let lines = std::mem::take(&mut self.compression_posts.lock().lines);
+        lines.into_iter().map(|l| (TraceMask::ERROR, l)).collect()
+    }
+
     pub fn new() -> Self {
         let writer = Hdf5Writer::new();
         Self {
             settings: writer.settings(),
+            compression_posts: writer.compression_posts(),
             ctrl: Mutex::new(FilePluginController::new(writer)),
             hdf5_params: Hdf5ParamIndices::default(),
             attributes: None,
@@ -3582,19 +3857,11 @@ impl Hdf5FileProcessor {
         reason: usize,
         addr: i32,
         value: i32,
-        verdict: WriteVerdict<i32>,
         params: &asyn_rs::port::PortDriverBase,
-    ) -> WriteOutcome<i32> {
+    ) -> Option<WriteOutcome<i32>> {
         // C hands every write it has no branch for to NDPluginFile::writeInt32
-        // (NDFileHDF5.cpp:2059).
-        let file = || {
-            self.ctrl
-                .lock()
-                .validate_int32(reason, value, verdict.clone())
-        };
-        let Some(name) = params.params.param_name(reason) else {
-            return file();
-        };
+        // (NDFileHDF5.cpp:2059): `None`.
+        let name = params.params.param_name(reason)?;
         // C's `this->file != 0`.
         let open = self.ctrl.lock().file_base.is_open();
         let int = |n: &str| {
@@ -3628,7 +3895,7 @@ impl Hdf5FileProcessor {
                     let frames = (0..=n as usize)
                         .map(|i| int(EXTRA_DIM_SIZE_PARAMS[i]))
                         .product::<i32>();
-                    return WriteVerdict::Accept(value.min(frames)).into();
+                    return Some(WriteVerdict::Accept(value.min(frames)).into());
                 } else {
                     false
                 }
@@ -3645,15 +3912,17 @@ impl Hdf5FileProcessor {
             "HDF5_szipNumPixels" => open || !(0..=32).contains(&value),
             "HDF5_zCompressLevel" => open || !(0..=9).contains(&value),
             // Read-only: the write fails and the param shows the support.
-            "HDF5_SWMRSupported" => return refuse(1),
+            "HDF5_SWMRSupported" => return Some(refuse(1)),
             // :2042 stores 1; the flush clears it (:398).
-            "HDF5_SWMRFlushNow" if open && value > 0 => return WriteVerdict::Accept(1).into(),
+            "HDF5_SWMRFlushNow" if open && value > 0 => {
+                return Some(WriteVerdict::Accept(1).into());
+            }
             "HDF5_SWMRFlushNow" => true,
             "HDF5_posRunning" => false,
-            _ => return file(),
+            _ => return None,
         };
         if refused {
-            return refuse(old);
+            return Some(refuse(old));
         }
         // calcNumFrames (NDFileHDF5.cpp:2438-2459) over the params as they
         // stand once this write is stored.
@@ -3671,7 +3940,7 @@ impl Hdf5FileProcessor {
         };
         let out = WriteOutcome::from(WriteVerdict::Accept(value));
         let size = EXTRA_DIM_SIZE_PARAMS.iter().position(|p| *p == name);
-        match name {
+        Some(match name {
             "HDF5_nExtraDims" if value > 0 => set(out, "NUM_CAPTURE", grid(value, None)),
             _ if size.is_some() && int("HDF5_nExtraDims") > 0 => set(
                 out,
@@ -3687,7 +3956,7 @@ impl Hdf5FileProcessor {
                 set(out, "HDF5_nExtraDims", 0)
             }
             _ => out,
-        }
+        })
     }
 
     /// C `NDFileHDF5::writeOctet` (NDFileHDF5.cpp:2086-2119) keeps an
@@ -3758,7 +4027,7 @@ impl Hdf5FileProcessor {
         }
         if Some(reason) == self.hdf5_params.z_compress_level {
             self.settings
-                .update(|s| s.set_z_compress_level(value.as_i32() as u32));
+                .update(|s| s.set_z_compress_level(value.as_i32()));
             return;
         }
         if Some(reason) == self.hdf5_params.szip_num_pixels {
@@ -3778,7 +4047,7 @@ impl Hdf5FileProcessor {
         }
         if Some(reason) == self.hdf5_params.blosc_compress_level {
             self.settings
-                .update(|s| s.set_blosc_compress_level(value.as_i32() as u32));
+                .update(|s| s.set_blosc_compress_level(value.as_i32()));
             return;
         }
         if Some(reason) == self.hdf5_params.nbit_precision {
@@ -4091,16 +4360,20 @@ const POS_INDEX_PARAMS: [&str; MAX_EXTRA_DIMS] = [
 impl NDPluginProcess for Hdf5FileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        // Read before the controller lock: the read waits on the actor,
+        // Made before the controller lock: its reads wait on the actor,
         // which takes that lock in its writes.
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut post = PortPost::of(self.attributes.as_ref());
         let mut ctrl = self.ctrl.lock();
-        ctrl.set_attribute_reads(attributes);
         let was_swmr = ctrl.writer.lock().is_swmr_active();
-        let mut result = ctrl.process_array(array);
+        let mut result = ctrl.process_array(array, &mut post);
+        result.param_updates.extend(self.compression_updates());
+        // Printed in openFile, ahead of anything its write reports.
+        result.trace.splice(0..0, self.compression_trace());
         let is_swmr = ctrl.writer.lock().is_swmr_active();
 
-        // SWMR running status changed
+        // SWMR running status changed. A writeFile abort clears it too; C
+        // leaves SWMRRunning at 1 on the file it closed (NDFileHDF5.cpp:1549-1552
+        // sets only Capture and WriteFile), a stale readback not copied.
         if was_swmr != is_swmr {
             if let Some(idx) = self.hdf5_params.swmr_running {
                 result
@@ -4283,17 +4556,27 @@ impl NDPluginProcess for Hdf5FileProcessor {
         self.ctrl.lock().posts_before_write(reason, value)
     }
 
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
     fn validate_int32(
         &self,
         reason: usize,
         addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        params: &PortDriverBase,
+        params: &mut WritePort<'_>,
     ) -> WriteOutcome<i32> {
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
-        self.ctrl.lock().set_attribute_reads(attributes);
-        let out = self.check_int32(reason, addr, value, verdict, params);
+        let out = match self.check_int32(reason, addr, value, params) {
+            Some(out) => out,
+            None => self
+                .ctrl
+                .lock()
+                .validate_int32(reason, value, verdict, params),
+        };
+        let mut out = out.set_updates(self.compression_updates());
+        out.trace.splice(0..0, self.compression_trace());
         if out.settled {
             return out;
         }
@@ -4501,7 +4784,7 @@ mod tests {
     /// rule (C seeds extraDimSize = 1; a 0 here is refused at boot).
     #[test]
     fn every_pini_output_accepts_its_seeded_default() {
-        let (proc, base) = hdf5_port();
+        let (proc, mut base) = hdf5_port();
         let template = include_str!("../../ad-core-rs/db/NDFileHDF5.template");
         let mut refused = Vec::new();
         for record in template.split("\nrecord(").skip(1) {
@@ -4522,7 +4805,13 @@ mod tests {
             let idx = idx(&base, name);
             let value = base.get_int32_param(idx, 0).unwrap();
             let verdict = proc
-                .validate_int32(idx, 0, value, WriteVerdict::Accept(value), &base)
+                .validate_int32(
+                    idx,
+                    0,
+                    value,
+                    WriteVerdict::Accept(value),
+                    &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+                )
                 .verdict;
             if verdict != WriteVerdict::Accept(value) {
                 refused.push(format!("{name}={value}"));
@@ -4534,16 +4823,16 @@ mod tests {
     #[test]
     fn writes_are_refused_and_reverted_as_c_write_int32_does() {
         let (proc, mut base) = hdf5_port();
-        let (zlevel, extra, chunks, flush) = (
+        let (zlevel, chunks) = (
             idx(&base, "HDF5_zCompressLevel"),
-            idx(&base, "HDF5_nExtraDims"),
             idx(&base, "HDF5_nFramesChunks"),
-            idx(&base, "HDF5_flushNthFrame"),
         );
         base.set_int32_param(zlevel, 0, 6).unwrap();
         base.set_int32_param(chunks, 0, 4).unwrap();
-        let v = |r, value| {
-            proc.validate_int32(r, 0, value, WriteVerdict::Accept(value), &base)
+        let mut v = |name: &str, value| {
+            let mut port = ad_core_rs::plugin::runtime::WritePort::new(&mut base);
+            let r = idx(&port, name);
+            proc.validate_int32(r, 0, value, WriteVerdict::Accept(value), &mut port)
                 .verdict
         };
         let refused = |keep| WriteVerdict::Refuse {
@@ -4551,19 +4840,19 @@ mod tests {
             message: String::new(),
         };
 
-        assert_eq!(v(zlevel, 9), WriteVerdict::Accept(9));
-        assert_eq!(v(zlevel, 10), refused(6));
-        assert_eq!(v(idx(&base, "HDF5_szipNumPixels"), 33), refused(16));
-        assert_eq!(v(extra, 9), WriteVerdict::Accept(9));
-        assert_eq!(v(extra, 10), refused(0));
-        assert_eq!(v(idx(&base, "HDF5_compressionType"), 9), refused(0));
-        assert_eq!(v(flush, 3), refused(0));
-        assert_eq!(v(flush, 4), WriteVerdict::Accept(4));
-        assert_eq!(v(idx(&base, "HDF5_extraDimSizeX"), 0), refused(1));
-        assert_eq!(v(idx(&base, "HDF5_chunkSize3"), -1), refused(0));
-        assert_eq!(v(idx(&base, "NUM_CAPTURE"), -1), refused(0));
-        assert_eq!(v(idx(&base, "HDF5_SWMRSupported"), 0), refused(1));
-        assert_eq!(v(idx(&base, "HDF5_SWMRFlushNow"), 1), refused(0));
+        assert_eq!(v("HDF5_zCompressLevel", 9), WriteVerdict::Accept(9));
+        assert_eq!(v("HDF5_zCompressLevel", 10), refused(6));
+        assert_eq!(v("HDF5_szipNumPixels", 33), refused(16));
+        assert_eq!(v("HDF5_nExtraDims", 9), WriteVerdict::Accept(9));
+        assert_eq!(v("HDF5_nExtraDims", 10), refused(0));
+        assert_eq!(v("HDF5_compressionType", 9), refused(0));
+        assert_eq!(v("HDF5_flushNthFrame", 3), refused(0));
+        assert_eq!(v("HDF5_flushNthFrame", 4), WriteVerdict::Accept(4));
+        assert_eq!(v("HDF5_extraDimSizeX", 0), refused(1));
+        assert_eq!(v("HDF5_chunkSize3", -1), refused(0));
+        assert_eq!(v("NUM_CAPTURE", -1), refused(0));
+        assert_eq!(v("HDF5_SWMRSupported", 0), refused(1));
+        assert_eq!(v("HDF5_SWMRFlushNow", 1), refused(0));
 
         // An open file freezes the layout settings.
         let path = temp_path("hdf5_open_freezes");
@@ -4582,14 +4871,11 @@ mod tests {
                 .open_stream(&mut *c.writer.lock(), &arr)
                 .unwrap();
         }
-        assert_eq!(v(zlevel, 3), refused(6));
-        assert_eq!(v(chunks, 8), refused(4));
-        assert_eq!(v(idx(&base, "HDF5_storeAttributes"), 0), refused(1));
-        assert_eq!(
-            v(idx(&base, "HDF5_SWMRFlushNow"), 1),
-            WriteVerdict::Accept(1)
-        );
-        assert_eq!(v(flush, 4), WriteVerdict::Accept(4));
+        assert_eq!(v("HDF5_zCompressLevel", 3), refused(6));
+        assert_eq!(v("HDF5_nFramesChunks", 8), refused(4));
+        assert_eq!(v("HDF5_storeAttributes", 0), refused(1));
+        assert_eq!(v("HDF5_SWMRFlushNow", 1), WriteVerdict::Accept(1));
+        assert_eq!(v("HDF5_flushNthFrame", 4), WriteVerdict::Accept(4));
         {
             let mut c = proc.ctrl.lock();
             let c = &mut *c;
@@ -4605,6 +4891,154 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// C `configureCompression` writes the codec it takes from a
+    /// pre-compressed frame into the params (NDFileHDF5.cpp:3319-3337), so
+    /// the readbacks show it and the next file is built with it.
+    #[test]
+    fn a_frame_codec_override_is_posted_and_kept() {
+        let (proc, mut base) = hdf5_port();
+        let dir = std::env::temp_dir().join(format!("h5override_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let octet = |name: &str, v: &str| {
+            proc.validate_octet(
+                idx(&base, name),
+                0,
+                v,
+                WriteVerdict::Accept(v.to_owned()),
+                &base,
+            )
+        };
+        octet("FILE_PATH", &format!("{}/", dir.display()));
+        octet("FILE_NAME", "o");
+        octet("FILE_TEMPLATE", "%s%s_%d.h5");
+        let names = [
+            "HDF5_compressionType",
+            "HDF5_zCompressLevel",
+            "HDF5_bloscCompressLevel",
+            "HDF5_bloscShuffleType",
+            "HDF5_bloscCompressor",
+        ]
+        .map(|n| (n, idx(&base, n)));
+        let mut int = |name: &str, v: i32| {
+            let mut port = ad_core_rs::plugin::runtime::WritePort::new(&mut base);
+            let reason = idx(&port, name);
+            proc.validate_int32(reason, 0, v, WriteVerdict::Accept(v), &mut port)
+        };
+        int("WRITE_MODE", 0);
+        int("AUTO_SAVE", 1);
+        int("AUTO_INCREMENT", 1);
+        let r = |name: &str| names.iter().find(|(n, _)| *n == name).unwrap().1;
+        let posted = |updates: &[ParamUpdate], name| {
+            updates.iter().rev().find_map(|u| match u {
+                ParamUpdate::Int32 { reason, value, .. } if *reason == r(name) => Some(*value),
+                _ => None,
+            })
+        };
+
+        let zlib = crate::codec::compress_zlib(&ramp_u16(4, 5), 4).unwrap();
+        let out = proc.process_array(&Arc::new(zlib), &NDArrayPool::new(0));
+        assert_eq!(posted(&out.param_updates, "HDF5_compressionType"), Some(3));
+        assert_eq!(posted(&out.param_updates, "HDF5_zCompressLevel"), Some(4));
+        assert_eq!(
+            proc.settings
+                .get(|s| (s.compression_type, s.z_compress_level)),
+            (3, 4),
+            "the next file is built with the frame's codec"
+        );
+
+        let cfg = crate::codec::BloscConfig {
+            compressor: 1,
+            clevel: 7,
+            shuffle: 2,
+        };
+        let blosc = crate::codec::compress_blosc(&ramp_u16(4, 5), &cfg).unwrap();
+        proc.ctrl.lock().latest_array = Some(Arc::new(blosc));
+        let out = int("WRITE_FILE", 1);
+        let side = |name| {
+            out.side.iter().rev().find_map(|p| match p {
+                ad_core_rs::plugin::runtime::SideParam::Int32 { reason, value, .. }
+                    if *reason == r(name) =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(side("HDF5_compressionType"), Some(4));
+        assert_eq!(side("HDF5_bloscCompressLevel"), Some(7));
+        assert_eq!(side("HDF5_bloscShuffleType"), Some(2));
+        assert_eq!(side("HDF5_bloscCompressor"), Some(1));
+
+        // C prints the JPEG gate line in openFile, before the refusal.
+        let src = NDArray::with_data(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataBuffer::U8(vec![7; 64]),
+        );
+        let jpeg = crate::codec::compress_jpeg(&src, 90).unwrap();
+        let jpeg = with_color_mode(jpeg, NDColorMode::RGB1);
+        let out = proc.process_array(&Arc::new(jpeg), &NDArrayPool::new(0));
+        assert_eq!(
+            out.trace.first().map(|(_, l)| l.as_str()),
+            Some("JPEG compression only supports 2-D mono and 3-D RGB1 modes\n")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C `openFile` runs `configureCompression` for a SWMR file as well
+    /// (NDFileHDF5.cpp:279, :3890), so the frame's codec reaches the params.
+    #[test]
+    fn a_swmr_open_takes_the_frame_codec_override() {
+        let path = temp_path("hdf5_swmr_override");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        let zlib = crate::codec::compress_zlib(&ramp_u16(4, 5), 4).unwrap();
+        writer.open_file(&path, NDFileMode::Stream, &zlib).unwrap();
+        assert_eq!(
+            writer.compression_posts.lock().posts,
+            [(CompressionParam::Type, 3), (CompressionParam::ZLevel, 4)]
+        );
+        assert_eq!(
+            writer
+                .settings()
+                .get(|s| (s.compression_type, s.z_compress_level)),
+            (3, 4)
+        );
+        writer.close_file().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C posts the nbit datatype HDF5 reads back (NDFileHDF5.cpp:3362-3371):
+    /// H5Tset_precision refuses 0 and a float narrower than its type
+    /// (H5Tprecis.c), leaving the native precision; the offset always holds.
+    #[test]
+    fn an_nbit_scheme_posts_the_hdf5_readback() {
+        let cases = [
+            (NDDataType::UInt16, 10, 3, (3, 10)),
+            (NDDataType::UInt16, 0, 0, (0, 16)),
+            (NDDataType::Float32, 10, 0, (0, 32)),
+        ];
+        for (dt, precision, offset, want) in cases {
+            let path = temp_path("hdf5_nbit_readback");
+            let mut writer = Hdf5Writer::new();
+            writer.set_compression_type(COMPRESS_NBIT);
+            writer.set_nbit_precision(precision);
+            writer.set_nbit_offset(offset);
+            let arr = NDArray::new(vec![NDDimension::new(4), NDDimension::new(4)], dt);
+            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer.write_file(&Arc::new(arr)).unwrap();
+            writer.close_file().unwrap();
+            assert_eq!(
+                writer.compression_posts.lock().posts,
+                [
+                    (CompressionParam::NbitOffset, want.0),
+                    (CompressionParam::NbitPrecision, want.1)
+                ],
+                "{dt:?} precision {precision} offset {offset}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
     /// C stores a writer setting inside the write, so a Capture written
     /// right after it opens the file with it.
     #[test]
@@ -4612,8 +5046,20 @@ mod tests {
         let (proc, mut base) = hdf5_port();
         let compression = idx(&base, "HDF5_compressionType");
         let extra = idx(&base, "HDF5_nExtraDims");
-        proc.validate_int32(compression, 0, 3, WriteVerdict::Accept(3), &base);
-        proc.validate_int32(extra, 0, 2, WriteVerdict::Accept(2), &base);
+        proc.validate_int32(
+            compression,
+            0,
+            3,
+            WriteVerdict::Accept(3),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
+        proc.validate_int32(
+            extra,
+            0,
+            2,
+            WriteVerdict::Accept(2),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert_eq!(proc.settings.get(|s| s.compression_type), 3);
         assert_eq!(proc.settings.get(|s| s.n_extra_dims), 2);
 
@@ -4622,11 +5068,23 @@ mod tests {
         let num_capture = idx(&base, "NUM_CAPTURE");
         base.set_int32_param(idx(&base, "HDF5_posRunning"), 0, 1)
             .unwrap();
-        proc.validate_int32(num_capture, 0, 0, WriteVerdict::Accept(0), &base);
+        proc.validate_int32(
+            num_capture,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert_eq!(proc.settings.get(|s| s.n_extra_dims), 2);
         base.set_int32_param(idx(&base, "HDF5_posRunning"), 0, 0)
             .unwrap();
-        proc.validate_int32(num_capture, 0, 0, WriteVerdict::Accept(0), &base);
+        proc.validate_int32(
+            num_capture,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert_eq!(proc.settings.get(|s| s.n_extra_dims), 0);
     }
 
@@ -4635,12 +5093,18 @@ mod tests {
     /// once instead of waiting for the write.
     #[test]
     fn a_setting_write_during_a_busy_write_returns_at_once() {
-        let (proc, base) = hdf5_port();
+        let (proc, mut base) = hdf5_port();
         let compression = idx(&base, "HDF5_compressionType");
         let writer = Arc::clone(&proc.ctrl.lock().writer);
         assert!(
             crate::test_util::returns_while_busy(&writer, || {
-                proc.validate_int32(compression, 0, 3, WriteVerdict::Accept(3), &base);
+                proc.validate_int32(
+                    compression,
+                    0,
+                    3,
+                    WriteVerdict::Accept(3),
+                    &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+                );
             }),
             "the setting write waited for the file write"
         );
@@ -4714,7 +5178,7 @@ mod tests {
     /// before the layout load (:271).
     #[test]
     fn a_stream_capture_with_a_malformed_layout_fails_to_open() {
-        let (proc, base) = hdf5_port();
+        let (proc, mut base) = hdf5_port();
         let dir = std::env::temp_dir().join(format!("hdf5-badlayout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("bad.xml");
@@ -4733,8 +5197,14 @@ mod tests {
         octet("FILE_TEMPLATE", "%s%s_%d.h5");
         let out = octet("HDF5_layoutFilename", bad.to_str().unwrap());
         assert!(matches!(out.verdict, WriteVerdict::Refuse { .. }));
-        let int = |name: &str, v: i32| {
-            proc.validate_int32(idx(&base, name), 0, v, WriteVerdict::Accept(v), &base)
+        let mut int = |name: &str, v: i32| {
+            proc.validate_int32(
+                idx(&base, name),
+                0,
+                v,
+                WriteVerdict::Accept(v),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+            )
         };
         int("WRITE_MODE", 2);
         proc.ctrl.lock().latest_array = Some(Arc::new(NDArray::new(
@@ -4840,8 +5310,14 @@ mod tests {
             idx(&base, "HDF5_extraDimSizeX"),
             idx(&base, "HDF5_posRunning"),
         );
-        let write = |base: &asyn_rs::port::PortDriverBase, reason, value| {
-            proc.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base)
+        let write = |base: &mut asyn_rs::port::PortDriverBase, reason, value| {
+            proc.validate_int32(
+                reason,
+                0,
+                value,
+                WriteVerdict::Accept(value),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(base),
+            )
         };
         let side = |out: WriteOutcome<i32>, target| {
             out.side.iter().find_map(|p| match p {
@@ -4856,31 +5332,31 @@ mod tests {
         base.set_int32_param(size_n, 0, 3).unwrap();
         base.set_int32_param(size_x, 0, 4).unwrap();
         // :1797 "if (value > 0) this->calcNumFrames();"
-        assert_eq!(side(write(&base, extra, 1), num_capture), Some(12));
+        assert_eq!(side(write(&mut base, extra, 1), num_capture), Some(12));
         // calcNumFrames :2448 "if (numExtraDims == 0) return;"
-        assert_eq!(side(write(&base, size_x, 5), num_capture), None);
+        assert_eq!(side(write(&mut base, size_x, 5), num_capture), None);
         base.set_int32_param(extra, 0, 1).unwrap();
         // :1888 "this->calcNumFrames();" reads the size just written.
-        assert_eq!(side(write(&base, size_x, 5), num_capture), Some(15));
+        assert_eq!(side(write(&mut base, size_x, 5), num_capture), Some(15));
 
         // :1822-1825: NumCapture above the grid keeps the grid; below it keeps the write.
         assert_eq!(
-            write(&base, num_capture, 20).verdict,
+            write(&mut base, num_capture, 20).verdict,
             WriteVerdict::Accept(12)
         );
         assert_eq!(
-            write(&base, num_capture, 5).verdict,
+            write(&mut base, num_capture, 5).verdict,
             WriteVerdict::Accept(5)
         );
 
         // :1814 and :1834: an unbounded capture drops the grid
         // unless positions place the frames.
         base.set_int32_param(pos, 0, 1).unwrap();
-        assert_eq!(side(write(&base, num_capture, 0), extra), None);
+        assert_eq!(side(write(&mut base, num_capture, 0), extra), None);
         base.set_int32_param(num_capture, 0, 0).unwrap();
-        assert_eq!(side(write(&base, pos, 0), extra), Some(0));
+        assert_eq!(side(write(&mut base, pos, 0), extra), Some(0));
         base.set_int32_param(pos, 0, 0).unwrap();
-        assert_eq!(side(write(&base, num_capture, 0), extra), Some(0));
+        assert_eq!(side(write(&mut base, num_capture, 0), extra), Some(0));
     }
 
     #[test]
@@ -6373,7 +6849,10 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_SZIP);
         writer.read_settings(); // as open_file does
-        let pipeline = writer.build_pipeline(1).expect("szip pipeline");
+        let pipeline = writer
+            .cfg
+            .build_pipeline(1, &mono_frame())
+            .expect("szip pipeline");
         assert_eq!(pipeline.filters[0].cd_values[0], SZIP_NN_OPTION_MASK);
 
         let path = temp_path("hdf5_szip_nn");
@@ -6405,7 +6884,10 @@ mod tests {
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_BLOSC);
         writer.read_settings(); // as open_file does
-        let pipeline = writer.build_pipeline(2).expect("blosc pipeline");
+        let pipeline = writer
+            .cfg
+            .build_pipeline(2, &mono_frame())
+            .expect("blosc pipeline");
         assert_eq!(pipeline.filters[0].cd_values[5], 1);
     }
 
@@ -6426,7 +6908,7 @@ mod tests {
         writer.set_nbit_offset(0);
         writer.read_settings(); // as open_file does
         assert!(
-            writer.build_pipeline(2).is_none(),
+            writer.cfg.build_pipeline(2, &mono_frame()).is_none(),
             "N-bit packing is applied via a datatype override, not build_pipeline"
         );
 
@@ -6478,6 +6960,269 @@ mod tests {
             );
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A precision or offset past the element widens the nbit datatype
+    /// (H5Tprecis.c, H5Toffset.c); the frame is stored in that width, each
+    /// value extended, and the fill with it (see `widen_le`).
+    #[test]
+    fn a_widened_nbit_datatype_stores_the_extended_values() {
+        use rust_hdf5::format::messages::filter::FILTER_NBIT;
+        let cases = [
+            (
+                NDDataType::UInt16,
+                20,
+                0,
+                NDDataBuffer::U16(vec![0xFFFF, 1, 0x8000, 0]),
+                513.0,
+                [1, 2, 0],
+            ),
+            (
+                NDDataType::Int16,
+                16,
+                4,
+                NDDataBuffer::I16(vec![-3, 1, i16::MIN, 0]),
+                -2.0,
+                [0xFE, 0xFF, 0xFF],
+            ),
+        ];
+        for (data_type, precision, offset, data, fill, fill_bytes) in cases {
+            let what = format!("{data_type:?} precision {precision} offset {offset}");
+            let path = temp_path("hdf5_nbit_widened");
+            let mut writer = Hdf5Writer::new();
+            writer.set_compression_type(COMPRESS_NBIT);
+            writer.set_nbit_precision(precision);
+            writer.set_nbit_offset(offset);
+            writer.set_fill_value(fill);
+            let arr =
+                NDArray::with_data(vec![NDDimension::new(2), NDDimension::new(2)], data.clone());
+            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer.write_file(&Arc::new(arr)).unwrap();
+            writer.close_file().unwrap();
+
+            let h5file = H5File::open(&path).unwrap();
+            let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+            assert_eq!(ds.datatype().unwrap().element_size(), 3, "{what}");
+            assert_eq!(
+                ds.filters()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                [FILTER_NBIT],
+                "{what}"
+            );
+            // The filter stores bits [offset, offset+precision) of each
+            // widened element; the chunk is decoded here because a read
+            // converts the field to its value.
+            let keep = ((1u32 << precision) - 1) << offset;
+            let (chunk, _) = ds.read_chunk_raw_at(&[0, 0, 0]).unwrap();
+            let cd_values = &ds.filters().unwrap()[0].cd_values;
+            let decoded =
+                rust_hdf5::format::nbit_scaleoffset::apply_nbit(&chunk, cd_values, false).unwrap();
+            let widened = widen_le(nd_buffer_to_le_bytes(&data), data_type, 3);
+            let want: Vec<u8> = widened
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[a, b, c]| {
+                    let v = u32::from_le_bytes([a, b, c, 0]) & keep;
+                    v.to_le_bytes()[..3].to_vec()
+                })
+                .collect();
+            assert_eq!(decoded, want, "{what}");
+            assert_eq!(
+                ds.fill_value().unwrap(),
+                rust_hdf5::FillValue::UserDefined(fill_bytes.to_vec()),
+                "{what}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// C casts HDF5_fillValue to the element type, `(epicsUInt16)-1.0` is
+    /// 0xFFFF, where Rust's `as` saturates to 0 (NDFileHDF5.cpp:3500-3537).
+    #[test]
+    fn the_fill_value_takes_the_c_cast() {
+        for swmr in [false, true] {
+            for (data_type, fill, want) in [
+                (NDDataType::UInt16, -1.0, vec![0xFF, 0xFF]),
+                (NDDataType::UInt8, 300.0, vec![44]),
+                (NDDataType::Int8, 200.0, vec![0xC8]),
+                (NDDataType::UInt16, 70000.5, vec![0x70, 0x11]),
+            ] {
+                let what = format!("swmr {swmr} {data_type:?} fill {fill}");
+                let path = temp_path("hdf5_fill_cast");
+                let mut writer = Hdf5Writer::new();
+                writer.set_swmr_mode(swmr);
+                writer.set_fill_value(fill);
+                let arr = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], data_type);
+                let mode = if swmr {
+                    NDFileMode::Stream
+                } else {
+                    NDFileMode::Single
+                };
+                writer.open_file(&path, mode, &arr).unwrap();
+                writer.write_file(&Arc::new(arr)).unwrap();
+                writer.close_file().unwrap();
+                let h5file = H5File::open(&path).unwrap();
+                let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+                assert_eq!(
+                    ds.fill_value().unwrap(),
+                    rust_hdf5::FillValue::UserDefined(want),
+                    "{what}"
+                );
+                std::fs::remove_file(&path).ok();
+            }
+        }
+    }
+
+    /// C's SWMR dataset takes the fill value from the dcpl every dataset
+    /// shares (NDFileHDF5.cpp:3895), in the stored width.
+    #[test]
+    fn a_swmr_dataset_carries_the_fill_value() {
+        for (compression, precision, fill) in [
+            (COMPRESS_NONE, 0, vec![7, 0]),
+            (COMPRESS_NBIT, 20, vec![7, 0, 0]),
+        ] {
+            let path = temp_path("hdf5_swmr_fill");
+            let mut writer = Hdf5Writer::new();
+            writer.set_swmr_mode(true);
+            writer.set_compression_type(compression);
+            writer.set_nbit_precision(precision);
+            writer.set_fill_value(7.0);
+            let arr = NDArray::new(
+                vec![NDDimension::new(2), NDDimension::new(2)],
+                NDDataType::UInt16,
+            );
+            writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            writer.write_file(&Arc::new(arr)).unwrap();
+            writer.close_file().unwrap();
+            let h5file = H5File::open(&path).unwrap();
+            let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+            assert_eq!(
+                ds.fill_value().unwrap(),
+                rust_hdf5::FillValue::UserDefined(fill),
+                "compression {compression}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A SWMR file stores the nbit datatype under its filter as a standard
+    /// one does (NDFileHDF5.cpp:3362-3364), narrowed or widened.
+    #[test]
+    fn a_swmr_file_stores_the_nbit_datatype_under_its_filter() {
+        use rust_hdf5::format::messages::filter::FILTER_NBIT;
+        let data = NDDataBuffer::U16(vec![0xFFFF, 1, 0x8008, 0x3FF]);
+        for (precision, offset, size) in [(10, 3, 2), (20, 0, 3)] {
+            let what = format!("precision {precision} offset {offset}");
+            let path = temp_path("hdf5_swmr_nbit");
+            let mut writer = Hdf5Writer::new();
+            writer.set_swmr_mode(true);
+            writer.set_compression_type(COMPRESS_NBIT);
+            writer.set_nbit_precision(precision);
+            writer.set_nbit_offset(offset);
+            let arr =
+                NDArray::with_data(vec![NDDimension::new(2), NDDimension::new(2)], data.clone());
+            writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            writer.write_file(&Arc::new(arr)).unwrap();
+            writer.close_file().unwrap();
+
+            let h5file = H5File::open(&path).unwrap();
+            let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+            assert_eq!(ds.datatype().unwrap().element_size(), size, "{what}");
+            let filters = ds.filters().unwrap();
+            assert_eq!(
+                filters.iter().map(|f| f.id).collect::<Vec<_>>(),
+                [FILTER_NBIT],
+                "{what}"
+            );
+            let (chunk, _) = ds.read_chunk_raw_at(&[0, 0, 0]).unwrap();
+            let decoded = rust_hdf5::format::nbit_scaleoffset::apply_nbit(
+                &chunk,
+                &filters[0].cd_values,
+                false,
+            )
+            .unwrap();
+            let keep = ((1u64 << precision) - 1) << offset;
+            let want: Vec<u8> = widen_le(
+                nd_buffer_to_le_bytes(&data),
+                NDDataType::UInt16,
+                size as usize,
+            )
+            .chunks(size as usize)
+            .flat_map(|e| {
+                let mut b = [0u8; 8];
+                b[..e.len()].copy_from_slice(e);
+                (u64::from_le_bytes(b) & keep).to_le_bytes()[..e.len()].to_vec()
+            })
+            .collect();
+            assert_eq!(decoded, want, "{what}");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// C registers `H5Pset_nbit` whatever `H5Tset_precision` refused
+    /// (NDFileHDF5.cpp:3362-3364): precision 0, or a float narrower than its
+    /// type, leaves the native datatype under a full-width nbit filter.
+    #[test]
+    fn a_refused_nbit_precision_keeps_the_filter_at_full_width() {
+        use rust_hdf5::format::messages::filter::FILTER_NBIT;
+        let cases = [
+            (NDDataType::UInt16, 0),
+            (NDDataType::Float32, 0),
+            (NDDataType::Float32, 16),
+            (NDDataType::Float64, 40),
+        ];
+        for (data_type, precision) in cases {
+            let path = temp_path("hdf5_nbit_full_width");
+            let mut writer = Hdf5Writer::new();
+            writer.set_compression_type(COMPRESS_NBIT);
+            writer.set_nbit_precision(precision);
+            writer.set_nbit_offset(0);
+            let mut arr = NDArray::new(vec![NDDimension::new(4), NDDimension::new(4)], data_type);
+            let want: Vec<f64> = (0..16).map(|i| -1.5e3 + i as f64 * 777.25).collect();
+            match arr.data {
+                NDDataBuffer::U16(ref mut v) => {
+                    v.iter_mut().zip(0u16..).for_each(|(x, i)| *x = 0xFFFF - i)
+                }
+                NDDataBuffer::F32(ref mut v) => {
+                    v.iter_mut().zip(&want).for_each(|(x, w)| *x = *w as f32)
+                }
+                NDDataBuffer::F64(ref mut v) => v.copy_from_slice(&want),
+                _ => unreachable!(),
+            }
+            let written = arr.data.clone();
+            writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+            writer.write_file(&Arc::new(arr)).unwrap();
+            writer.close_file().unwrap();
+
+            let what = format!("{data_type:?} precision {precision}");
+            let h5file = H5File::open(&path).unwrap();
+            let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+            let native = match data_type {
+                NDDataType::UInt16 => <u16 as rust_hdf5::types::H5Type>::hdf5_type(),
+                NDDataType::Float32 => <f32 as rust_hdf5::types::H5Type>::hdf5_type(),
+                _ => <f64 as rust_hdf5::types::H5Type>::hdf5_type(),
+            };
+            assert_eq!(ds.datatype().unwrap(), native, "{what}");
+            let filters = ds.filters().unwrap();
+            assert_eq!(
+                filters.iter().map(|f| f.id).collect::<Vec<_>>(),
+                [FILTER_NBIT],
+                "{what}"
+            );
+            assert_eq!(filters[0].cd_values[1], 1, "{what}: need_not_compress");
+            let back = match written {
+                NDDataBuffer::U16(v) => ds.read_raw::<u16>().unwrap() == v,
+                NDDataBuffer::F32(v) => ds.read_raw::<f32>().unwrap() == v,
+                NDDataBuffer::F64(v) => ds.read_raw::<f64>().unwrap() == v,
+                _ => unreachable!(),
+            };
+            assert!(back, "{what}: values round-trip");
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -6889,6 +7634,53 @@ mod tests {
             .unwrap();
         assert_eq!(data.len(), 2 * 8 * 8);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C's dataspace does not depend on compression, so a compressed SWMR
+    /// file with extra dims is the same fixed grid, filtered.
+    #[test]
+    fn a_compressed_swmr_file_keeps_the_extra_dimension_grid() {
+        let path = temp_path("hdf5_swmr_comp_grid");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        writer.set_compression_type(COMPRESS_ZLIB);
+        writer.set_n_extra_dims(1);
+        writer.set_extra_dim_size(0, 2);
+        writer.set_extra_dim_size(1, 3);
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        for f in 0..6u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                v.fill(f);
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&Arc::new(arr.clone())).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5file = H5File::open(&path).unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(ds.shape(), vec![3, 2, 4, 4]);
+        assert_eq!(
+            ds.filters()
+                .unwrap()
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            [rust_hdf5::format::messages::filter::FILTER_DEFLATE]
+        );
+        let data = ds.read_raw::<u16>().unwrap();
+        for f in 0..6usize {
+            assert!(
+                data[f * 16..][..16].iter().all(|&v| v == f as u16),
+                "frame {f}"
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -7688,9 +8480,52 @@ mod tests {
         assert!(codecs_match(Some(&a), Some(&other_type)));
     }
 
+    /// An override's -1 blosc params reach the filter as C's unsigned cds.
     #[test]
-    fn test_codec_filter_pipeline_ids() {
-        let w = Hdf5Writer::new();
+    fn blosc_cds_take_the_params_as_unsigned() {
+        let mut s = Hdf5Settings::default();
+        s.set_compression_type(COMPRESS_BLOSC);
+        s.set_blosc_compress_level(-1);
+        s.set_blosc_shuffle_type(-1);
+        s.set_blosc_compressor(-1);
+        let p = s.build_pipeline(2, &mono_frame()).unwrap();
+        assert_eq!(p.filters[0].cd_values[4..], [u32::MAX; 3]);
+    }
+
+    /// C's zlib out of range: `H5Pset_deflate` fails, so the dataset has no
+    /// filter while its codec is still zlib at that level (NDFileHDF5.cpp:
+    /// 3378-3384).
+    #[test]
+    fn a_zlib_level_hdf5_refuses_sets_no_filter() {
+        let mut s = Hdf5Settings::default();
+        s.set_compression_type(COMPRESS_ZLIB);
+        for level in [-1, 10] {
+            s.set_z_compress_level(level);
+            assert!(s.build_pipeline(2, &mono_frame()).is_none(), "{level}");
+            let c = s.dataset_codec(NDDataType::UInt16, &mono_frame()).unwrap();
+            assert_eq!((c.name, c.level), (CodecName::Zlib, level));
+        }
+        for level in [0, 9] {
+            s.set_z_compress_level(level);
+            let p = s.build_pipeline(2, &mono_frame()).unwrap();
+            assert_eq!(p.filters[0].cd_values, [level as u32], "{level}");
+        }
+    }
+
+    /// A 2-D frame with no ColorMode, which C's JPEG takes as Mono.
+    fn mono_frame() -> NDArray {
+        NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(5)],
+            NDDataType::UInt16,
+        )
+    }
+
+    #[test]
+    fn test_frame_codec_overrides_the_scheme() {
+        // C configureCompression's override (NDFileHDF5.cpp:3316-3337), the
+        // filter each scheme sets and the codec it records (:3352-3469).
+        use rust_hdf5::format::messages::filter::FILTER_DEFLATE;
+        let s = Hdf5Settings::default();
         let mk = |name| Codec {
             name,
             compressed_size: 0,
@@ -7699,38 +8534,38 @@ mod tests {
             compressor: 2,
             original_data_type: NDDataType::UInt16,
         };
+        let over = |name| {
+            let mut o = s.clone();
+            o.apply(&Hdf5Settings::codec_override(Some(&mk(name))));
+            o
+        };
+        let id = |name| {
+            over(name)
+                .build_pipeline(2, &mono_frame())
+                .map(|p| p.filters[0].id)
+        };
+        assert_eq!(id(CodecName::LZ4), Some(FILTER_LZ4));
+        assert_eq!(id(CodecName::LZ4HDF5), Some(FILTER_LZ4));
+        assert_eq!(id(CodecName::BSLZ4), Some(FILTER_BSHUF));
+        assert_eq!(id(CodecName::JPEG), Some(FILTER_JPEG));
+        assert_eq!(id(CodecName::Zlib), Some(FILTER_DEFLATE));
+        // No override for a name C does not list: the scheme (None) stays.
+        assert_eq!(id(CodecName::from_name("szip")), None);
+        let blosc = over(CodecName::Blosc);
         assert_eq!(
-            w.codec_filter_pipeline(&mk(CodecName::LZ4))
-                .unwrap()
-                .filters[0]
-                .id,
-            FILTER_LZ4
+            blosc.build_pipeline(2, &mono_frame()).unwrap().filters[0].cd_values[4..],
+            [5, 1, 2]
         );
-        assert_eq!(
-            w.codec_filter_pipeline(&mk(CodecName::BSLZ4))
-                .unwrap()
-                .filters[0]
-                .id,
-            FILTER_BSHUF
-        );
-        let blosc = w.codec_filter_pipeline(&mk(CodecName::Blosc)).unwrap();
-        assert_eq!(blosc.filters[0].id, FILTER_BLOSC);
-        // C copies the array's own blosc level/shuffle/compressor into the
-        // dataset filter (configureCompression NDFileHDF5.cpp:3320-3323).
-        assert_eq!(blosc.filters[0].cd_values[4], 5, "level");
-        assert_eq!(blosc.filters[0].cd_values[5], 1, "shuffle");
-        assert_eq!(blosc.filters[0].cd_values[6], 2, "compressor");
-        assert_eq!(
-            w.codec_filter_pipeline(&mk(CodecName::JPEG))
-                .unwrap()
-                .filters[0]
-                .id,
-            FILTER_JPEG
-        );
-        // Codecs C does not direct-chunk-write are rejected (None pipeline).
-        assert!(w.codec_filter_pipeline(&mk(CodecName::None)).is_none());
-        assert!(w.codec_filter_pipeline(&mk(CodecName::Zlib)).is_none());
-        assert!(w.codec_filter_pipeline(&mk(CodecName::LZ4HDF5)).is_none());
+        let codec = |s: Hdf5Settings| {
+            let c = s.dataset_codec(NDDataType::UInt16, &mono_frame()).unwrap();
+            (c.name, c.level, c.shuffle, c.compressor)
+        };
+        assert_eq!(codec(blosc), (CodecName::Blosc, 5, 1, 2));
+        let zlib = over(CodecName::Zlib);
+        assert_eq!(codec(zlib), (CodecName::Zlib, 5, -1, -1));
+        let lz4 = over(CodecName::LZ4);
+        assert_eq!(codec(lz4), (CodecName::LZ4, -1, -1, -1));
+        assert!(s.dataset_codec(NDDataType::UInt16, &mono_frame()).is_none());
     }
 
     #[test]
@@ -7884,7 +8719,7 @@ mod tests {
         // JPEG is lossy and the rust-hdf5 reader has no JPEG reverse filter, so
         // pixels cannot round-trip; verify the dataset is created with the right
         // original type/shape and chunked (one whole frame per chunk). The JPEG
-        // filter id is covered by test_codec_filter_pipeline_ids.
+        // filter id is covered by test_frame_codec_overrides_the_scheme.
         let path = temp_path("hdf5_dcw_jpeg");
         let mut writer = Hdf5Writer::new();
         let mono: Vec<u8> = (0..64u16).map(|i| (i * 3) as u8).collect();
@@ -7905,56 +8740,291 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn with_color_mode(mut frame: NDArray, mode: NDColorMode) -> NDArray {
+        frame.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(mode as i32),
+        ));
+        frame
+    }
+
+    /// C's JPEG filter (NDFileHDF5.cpp:3439-3465): `[quality, ncols, nrows,
+    /// rgb]` for a 2-D Mono or 3-D RGB1 frame, and no filter or codec for any
+    /// other.
+    #[test]
+    fn jpeg_takes_its_geometry_from_a_mono_or_rgb1_frame() {
+        let mut s = Hdf5Settings::default();
+        s.set_compression_type(COMPRESS_JPEG);
+        let dims = |d: &[usize]| d.iter().map(|&n| NDDimension::new(n)).collect::<Vec<_>>();
+        let frame = |d: &[usize]| NDArray::new(dims(d), NDDataType::UInt8);
+        let cds = |f: &NDArray| {
+            s.build_pipeline(1, f)
+                .map(|p| p.filters[0].cd_values.clone())
+        };
+        let codec = |f: &NDArray| s.dataset_codec(NDDataType::UInt8, f).map(|c| c.name);
+
+        let mono = frame(&[4, 5]);
+        assert_eq!(cds(&mono), Some(vec![90, 4, 5, 0]));
+        assert_eq!(codec(&mono), Some(CodecName::JPEG));
+        let rgb1 = with_color_mode(frame(&[3, 4, 5]), NDColorMode::RGB1);
+        assert_eq!(cds(&rgb1), Some(vec![90, 4, 5, 1]));
+        assert_eq!(codec(&rgb1), Some(CodecName::JPEG));
+        for other in [
+            frame(&[3, 4, 5]),
+            with_color_mode(frame(&[4, 5]), NDColorMode::RGB1),
+            with_color_mode(frame(&[4, 3, 5]), NDColorMode::RGB2),
+            frame(&[20]),
+        ] {
+            assert_eq!(cds(&other), None, "{:?}", other.dims);
+            assert_eq!(codec(&other), None, "{:?}", other.dims);
+        }
+    }
+
+    /// A pre-compressed JPEG frame outside the gate: C prints the line, sets
+    /// no codec, and `verifyChunking` refuses the frame (NDFileHDF5.cpp:3455,
+    /// NDFileHDF5Dataset.cpp:343-348).
+    #[test]
+    fn a_jpeg_frame_outside_the_color_mode_gate_is_refused() {
+        let path = temp_path("hdf5_jpeg_gate");
+        let mut writer = Hdf5Writer::new();
+        let src = NDArray::with_data(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataBuffer::U8(vec![7; 64]),
+        );
+        let comp = crate::codec::compress_jpeg(&src, 90).expect("jpeg encode");
+        let comp = with_color_mode(comp, NDColorMode::RGB1);
+        writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
+        let err = writer.write_file(&Arc::new(comp)).unwrap_err();
+        assert_eq!(
+            writer.compression_posts.lock().lines,
+            ["JPEG compression only supports 2-D mono and 3-D RGB1 modes\n"]
+        );
+        assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
+        writer.close_file().ok();
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn test_codec_change_mid_stream_errors() {
-        // C verifyChunking rejects a frame whose codec differs from the dataset's
-        // (NDFileHDF5Dataset.cpp:194-200). Here the file is opened compressed and
-        // a later uncompressed frame must be refused.
+        // C verifyChunking refuses a compressed frame whose codec differs from
+        // the dataset's (NDFileHDF5Dataset.cpp:194-200, :343-348).
         let path = temp_path("hdf5_codec_change");
         let mut writer = Hdf5Writer::new();
         let f0 = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
-        let f1_plain = ramp_u16(4, 5); // no codec
+        let f1 = crate::codec::compress_bslz4(&ramp_u16(4, 5)).unwrap();
         writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
         writer.write_file(&Arc::new(f0)).unwrap();
-        assert!(
-            writer.write_file(&Arc::new(f1_plain)).is_err(),
-            "an uncompressed frame must be rejected for a compressed dataset"
-        );
+        let err = writer.write_file(&Arc::new(f1)).unwrap_err();
+        assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
         writer.close_file().ok();
         std::fs::remove_file(&path).ok();
     }
 
+    /// C's `writeFile` direct-chunk-writes a pre-compressed frame whatever
+    /// the file's SWMR mode (NDFileHDF5Dataset.cpp:291-331), on one frame
+    /// axis or an extra-dimension grid.
     #[test]
-    fn test_swmr_rejects_compressed_array() {
-        // SWMR mode has no raw-chunk append API, so a pre-compressed frame is
-        // rejected rather than re-compressed into garbage (documented residual).
-        let path = temp_path("hdf5_swmr_compressed");
+    fn a_swmr_file_direct_chunk_writes_a_compressed_frame() {
+        let frames = [
+            crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap(),
+            crate::codec::compress_bslz4(&ramp_u16(4, 5)).unwrap(),
+            crate::codec::compress_zlib(&ramp_u16(4, 5), 4).unwrap(),
+        ];
+        for (comp, extra_dims) in frames.iter().flat_map(|c| [(c.clone(), 0), (c.clone(), 1)]) {
+            let what = format!(
+                "{:?} extra dims {extra_dims}",
+                comp.codec.as_ref().unwrap().name
+            );
+            let path = temp_path("hdf5_swmr_direct_chunk");
+            let mut writer = Hdf5Writer::new();
+            writer.set_swmr_mode(true);
+            writer.set_n_extra_dims(extra_dims);
+            writer.set_extra_dim_size(0, 3);
+            writer.open_file(&path, NDFileMode::Stream, &comp).unwrap();
+            for _ in 0..3 {
+                writer.write_file(&Arc::new(comp.clone())).unwrap();
+            }
+            writer.close_file().unwrap();
+            let h5 = H5File::open(&path).unwrap();
+            let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+            let leading: &[usize] = if extra_dims == 0 { &[3] } else { &[1, 3] };
+            assert_eq!(ds.shape(), [leading, &[5, 4]].concat(), "{what}");
+            assert_eq!(
+                ds.read_raw::<u16>().unwrap(),
+                u16_pixels(&ramp_u16(4, 5)).repeat(3),
+                "{what}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// `verifyChunking` holds a SWMR file too (NDFileHDF5Dataset.cpp:343-348).
+    #[test]
+    fn a_swmr_file_refuses_a_compressed_frame_that_is_not_one_chunk() {
+        let path = temp_path("hdf5_swmr_comp_mismatch");
         let mut writer = Hdf5Writer::new();
         writer.set_swmr_mode(true);
+        writer.set_chunk_size_auto(false);
+        writer.set_n_row_chunks(2);
         let comp = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
         writer.open_file(&path, NDFileMode::Stream, &comp).unwrap();
-        assert!(
-            writer.write_file(&Arc::new(comp)).is_err(),
-            "SWMR mode cannot direct-chunk-write a pre-compressed array"
-        );
+        let err = writer.write_file(&Arc::new(comp)).unwrap_err();
+        assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
         writer.close_file().ok();
         std::fs::remove_file(&path).ok();
     }
 
+    /// C's line for a compressed frame `verifyChunking` refuses
+    /// (NDFileHDF5Dataset.cpp:343-348).
+    const MISMATCHED: &str = "NDFileHDF5Dataset::writeFile ERROR Unable to write \
+                              pre-compressed data - mismatched chunk definition\n";
+
+    /// C `writeFile`'s line when the dataset refuses a frame
+    /// (NDFileHDF5.cpp:1521-1523).
+    const ABORTING: &str = "NDFileHDF5::writeFile ERROR: could not write to dataset. Aborting\n";
+
     #[test]
-    fn test_unsupported_codec_rejected_on_open() {
-        // A Zlib-compressed array has no C direct-chunk-write analog; dataset
-        // creation rejects it rather than writing an unreadable file.
-        let path = temp_path("hdf5_dcw_zlib");
+    fn a_refused_frame_aborts_and_closes_with_the_earlier_frames_on_disk() {
+        // C writes each frame as it comes, so the file the abort closes
+        // (NDFileHDF5.cpp:1519-1557) holds every frame before the refused one.
+        let path = temp_path("hdf5_abort");
         let mut writer = Hdf5Writer::new();
-        let comp = crate::codec::compress_zlib(&ramp_u16(4, 5), 6).unwrap();
-        assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::Zlib);
-        writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
-        assert!(
-            writer.write_file(&Arc::new(comp)).is_err(),
-            "an unsupported (zlib) codec must be rejected, not silently mis-written"
+        writer.set_chunk_size_auto(false);
+        writer.set_n_row_chunks(8);
+        writer.set_n_col_chunks(8);
+        writer.set_n_frames_chunks(4);
+        let plain = ramp_u16(8, 8);
+        writer.open_file(&path, NDFileMode::Stream, &plain).unwrap();
+        writer.write_file(&Arc::new(plain.clone())).unwrap();
+        writer.write_file(&Arc::new(plain.clone())).unwrap();
+        let comp = crate::codec::compress_lz4(&plain).unwrap();
+        let err = writer.write_file(&Arc::new(comp)).unwrap_err();
+        assert!(err.is_aborted());
+        assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
+        assert!(writer.handle.is_none() && writer.current_path.is_none());
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(ds.shape(), vec![2, 8, 8]);
+        let one = u16_pixels(&plain);
+        assert_eq!(ds.read_raw::<u16>().unwrap(), [one.clone(), one].concat());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C keeps the user's chunk params for a pre-compressed first frame
+    /// (NDFileHDF5.cpp:3234-3271), so `verifyChunking` refuses a frame that is
+    /// not exactly one chunk (NDFileHDF5Dataset.cpp:204-222, :343-348); a
+    /// Single file has no frame-axis chunk to refuse on.
+    #[test]
+    fn a_compressed_first_frame_keeps_the_user_chunking() {
+        let path = temp_path("hdf5_comp_chunking");
+        let comp = crate::codec::compress_lz4(&ramp_u16(8, 8)).unwrap();
+        let write = |mode, set: &dyn Fn(&mut Hdf5Writer)| {
+            let mut writer = Hdf5Writer::new();
+            set(&mut writer);
+            writer.open_file(&path, mode, &comp).unwrap();
+            let r = writer.write_file(&Arc::new(comp.clone()));
+            writer.close_file().ok();
+            std::fs::remove_file(&path).ok();
+            r.map_err(|e| e.lines().to_vec())
+        };
+        let refused = Err(vec![MISMATCHED.to_owned(), ABORTING.to_owned()]);
+        assert_eq!(
+            write(NDFileMode::Stream, &|w| w.set_n_frames_chunks(2)),
+            refused
         );
-        writer.close_file().ok();
+        assert_eq!(
+            write(NDFileMode::Stream, &|w| {
+                w.set_chunk_size_auto(false);
+                w.set_n_row_chunks(4);
+            }),
+            refused
+        );
+        assert_eq!(
+            write(NDFileMode::Single, &|w| w.set_n_frames_chunks(4)),
+            Ok(())
+        );
+        assert_eq!(write(NDFileMode::Stream, &|_| {}), Ok(()));
+    }
+
+    fn renamed(mut a: NDArray, name: &str) -> NDArray {
+        a.codec.as_mut().unwrap().name = CodecName::from_name(name);
+        a
+    }
+
+    #[test]
+    fn zlib_and_lz4hdf5_frames_override_the_scheme() {
+        // C configureCompression switches the scheme to the frame's codec
+        // (NDFileHDF5.cpp:3326-3334), so the frame matches and is written.
+        let frames = [
+            crate::codec::compress_zlib(&ramp_u16(4, 5), 4).unwrap(),
+            crate::codec::compress_lz4hdf5(&ramp_u16(4, 5), 0).unwrap(),
+        ];
+        for comp in frames {
+            let name = comp.codec.as_ref().unwrap().name.as_str().to_owned();
+            let path = temp_path(&format!("hdf5_override_{name}"));
+            let mut writer = Hdf5Writer::new();
+            writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
+            writer.write_file(&Arc::new(comp)).unwrap();
+            writer.close_file().unwrap();
+            let h5 = H5File::open(&path).unwrap();
+            let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+            let read = ds.read_raw::<u16>().unwrap();
+            assert_eq!(read, u16_pixels(&ramp_u16(4, 5)), "{name}");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn szip_and_nbit_frames_direct_chunk_write_when_the_codec_matches() {
+        // C's szip and nbit schemes leave the dataset codec at the bare name
+        // (NDFileHDF5.cpp:3365, :3380); an equal frame is written verbatim.
+        for (scheme, name) in [(2, "szip"), (1, "nbit")] {
+            let path = temp_path(&format!("hdf5_dcw_{name}"));
+            let mut writer = Hdf5Writer::new();
+            writer.set_compression_type(scheme);
+            let frame = renamed(crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap(), name);
+            let mut off = frame.clone();
+            off.codec.as_mut().unwrap().level = 1;
+            writer.open_file(&path, NDFileMode::Stream, &frame).unwrap();
+            writer.write_file(&Arc::new(frame)).unwrap();
+            let err = writer.write_file(&Arc::new(off)).unwrap_err();
+            assert_eq!(err.lines(), [MISMATCHED, ABORTING], "{name}");
+            writer.close_file().unwrap();
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn an_unknown_codec_opens_and_the_frame_gets_the_mismatched_line() {
+        let path = temp_path("hdf5_dcw_unknown");
+        let mut writer = Hdf5Writer::new();
+        let frame = renamed(crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap(), "foo");
+        writer.open_file(&path, NDFileMode::Stream, &frame).unwrap();
+        let err = writer.write_file(&Arc::new(frame)).unwrap_err();
+        assert_eq!(err.lines(), [MISMATCHED, ABORTING]);
+        writer.close_file().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_uncompressed_frame_goes_through_the_dataset_filter() {
+        // verifyChunking fails on the codec and an uncompressed frame takes
+        // H5Dwrite through the dataset's filter (NDFileHDF5Dataset.cpp:350).
+        let path = temp_path("hdf5_codec_then_plain");
+        let mut writer = Hdf5Writer::new();
+        let f0 = crate::codec::compress_lz4(&ramp_u16(4, 5)).unwrap();
+        writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
+        writer.write_file(&Arc::new(f0)).unwrap();
+        writer.write_file(&Arc::new(ramp_u16(4, 5))).unwrap();
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(ds.shape(), vec![2, 5, 4]);
+        let one = u16_pixels(&ramp_u16(4, 5));
+        assert_eq!(ds.read_raw::<u16>().unwrap(), [one.clone(), one].concat());
         std::fs::remove_file(&path).ok();
     }
 

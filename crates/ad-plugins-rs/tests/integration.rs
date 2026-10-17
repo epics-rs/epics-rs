@@ -835,8 +835,7 @@ fn test_pos_plugin_position_attachment() {
 }
 
 #[test]
-fn test_process_and_publish_writes_array_size_params() {
-    // Verify that process_and_publish writes ArraySizeX/Y/Z params correctly.
+fn test_std_arrays_leaves_the_array_sizes_unset() {
     let pool = NDArrayPool::new(1_000_000);
     let wiring = Arc::new(WiringRegistry::new());
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
@@ -916,15 +915,9 @@ fn test_process_and_publish_writes_array_size_params() {
         .read_int32_blocking(image_handle.ndarray_params.unique_id, 0)
         .unwrap();
 
-    assert_eq!(size_x, 64, "ArraySizeX should be 64");
-    assert_eq!(size_y, 48, "ArraySizeY should be 48");
-    // C parity: NDArray::getInfo leaves colorSize at 0 for a 2-D array (no
-    // color dimension), so ArraySizeZ_RBV is 0 for 2D mono.
-    assert_eq!(
-        size_z, 0,
-        "ArraySizeZ should be 0 for 2D mono (no color dim)"
-    );
-    assert_eq!(array_size, 64 * 48, "ArraySize should be total bytes");
+    // C StdArrays never sets the sizes; they keep the constructor's 0
+    // (asynNDArrayDriver.cpp:967-970). Only ROI, ROIStat and Transform do.
+    assert_eq!([size_x, size_y, size_z, array_size], [0; 4]);
     assert_eq!(counter, 1, "ArrayCounter should be 1");
     assert_eq!(unique_id, 42, "UniqueId should be 42");
 }

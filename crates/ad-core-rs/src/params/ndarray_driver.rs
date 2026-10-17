@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use asyn_rs::error::AsynResult;
+use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 
@@ -106,6 +106,21 @@ impl NDArrayDriverParams {
         crate::driver::ndarray_driver::acquire_busy_rules(base, &params, owner.queued());
         crate::driver::ndarray_driver::write_octet_rules(base, &params, owner.attributes());
         Ok((params, owner))
+    }
+
+    /// The `NDArraySizeX/Y/Z` reasons of a port that already created these
+    /// params. Only ROI, ROIStat and Transform set them in C; a plugin port
+    /// otherwise keeps the constructor's 0 (asynNDArrayDriver.cpp:967-970).
+    pub fn array_size_reasons(base: &PortDriverBase) -> AsynResult<[usize; 3]> {
+        let find = |name: &str| {
+            base.find_param(name)
+                .ok_or_else(|| AsynError::ParamNotFound(name.to_string()))
+        };
+        Ok([
+            find("ARRAY_SIZE_X")?,
+            find("ARRAY_SIZE_Y")?,
+            find("ARRAY_SIZE_Z")?,
+        ])
     }
 
     fn create_params(base: &mut PortDriverBase) -> AsynResult<Self> {

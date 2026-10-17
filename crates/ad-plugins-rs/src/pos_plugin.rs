@@ -497,7 +497,7 @@ impl NDPluginProcess for PosPluginProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         use ad_core_rs::plugin::runtime::WriteOutcome;
         let out = WriteOutcome::from(verdict.succeed());
@@ -748,6 +748,7 @@ impl NDPluginProcess for PosPluginProcessor {
             scatter: false,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 
@@ -850,13 +851,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = PosPluginProcessor::new(PosMode::Discard);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -1315,13 +1323,19 @@ mod tests {
 
     fn pos_write(
         proc: &PosPluginProcessor,
-        base: &asyn_rs::port::PortDriverBase,
+        base: &mut asyn_rs::port::PortDriverBase,
         name: &str,
         value: i32,
     ) -> Vec<ad_core_rs::plugin::runtime::SideParam> {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let reason = base.find_param(name).unwrap();
-        let out = proc.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base);
+        let out = proc.validate_int32(
+            reason,
+            0,
+            value,
+            WriteVerdict::Accept(value),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(base),
+        );
         assert!(out.settled);
         out.side
     }
@@ -1331,8 +1345,15 @@ mod tests {
     #[test]
     fn writes_set_their_params_inside_the_write_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::SideParam;
-        let (proc, base) = pos_port();
-        let id = |n: &str| base.find_param(n).unwrap();
+        let (proc, mut base) = pos_port();
+        let ids = [
+            "NDPos_CurrentPos",
+            "NDPos_CurrentIndex",
+            "NDPos_CurrentQty",
+            "NDPos_ExpectedID",
+        ]
+        .map(|n| (n, base.find_param(n).unwrap()));
+        let id = |n: &str| ids.iter().find(|(m, _)| *m == n).unwrap().1;
         let int = |n: &str, value| SideParam::Int32 {
             reason: id(n),
             addr: 0,
@@ -1343,30 +1364,30 @@ mod tests {
             addr: 0,
             value: String::new(),
         };
-        assert!(pos_write(&proc, &base, "NDPos_IDStart", 7).is_empty());
+        assert!(pos_write(&proc, &mut base, "NDPos_IDStart", 7).is_empty());
         assert_eq!(
-            pos_write(&proc, &base, "NDPos_Running", 1),
+            pos_write(&proc, &mut base, "NDPos_Running", 1),
             [int("NDPos_ExpectedID", 7)]
         );
         assert!(proc.state.lock().running);
         assert_eq!(
-            pos_write(&proc, &base, "NDPos_Running", 0),
+            pos_write(&proc, &mut base, "NDPos_Running", 0),
             [int("NDPos_ExpectedID", 7)]
         );
         assert!(!proc.state.lock().running);
-        pos_write(&proc, &base, "NDPos_Running", 2);
+        pos_write(&proc, &mut base, "NDPos_Running", 2);
         assert!(!proc.state.lock().running, ":54 runs only on NDPOS_RUNNING");
         assert_eq!(
-            pos_write(&proc, &base, "NDPos_Mode", 1),
+            pos_write(&proc, &mut base, "NDPos_Mode", 1),
             [int("NDPos_CurrentIndex", 0)]
         );
         assert_eq!(
-            pos_write(&proc, &base, "NDPos_Restart", 1),
+            pos_write(&proc, &mut base, "NDPos_Restart", 1),
             [int("NDPos_CurrentIndex", 0), pos.clone()]
         );
         proc.load_positions(vec![HashMap::new()]);
         assert_eq!(
-            pos_write(&proc, &base, "NDPos_Delete", 1),
+            pos_write(&proc, &mut base, "NDPos_Delete", 1),
             [
                 int("NDPos_CurrentIndex", 0),
                 pos,
@@ -1374,7 +1395,7 @@ mod tests {
             ]
         );
         assert_eq!(proc.remaining_positions(), 0);
-        pos_write(&proc, &base, "NDPos_MissingFrames", 0);
+        pos_write(&proc, &mut base, "NDPos_MissingFrames", 0);
         assert_eq!(proc.missing_frames(), 0);
     }
 

@@ -968,7 +968,7 @@ impl NDPluginProcess for ProcessProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         use ad_core_rs::plugin::runtime::{WriteOutcome, WriteVerdict};
         let p = &self.params;
@@ -1297,13 +1297,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = ProcessProcessor::new(ProcessConfig::default());
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -1895,7 +1902,13 @@ mod tests {
 
         let reason = proc.params.save_background.unwrap();
         let valid = proc.params.valid_background.unwrap();
-        let out = proc.validate_int32(reason, 0, 0, WriteVerdict::Accept(0), &base);
+        let out = proc.validate_int32(
+            reason,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
 
         assert_eq!(
             proc.state.lock().background.as_ref().unwrap().as_slice(),
@@ -1936,15 +1949,33 @@ mod tests {
             )
         };
 
-        let out = proc.validate_int32(reason, 0, 1, WriteVerdict::Accept(1), &base);
+        let out = proc.validate_int32(
+            reason,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert_eq!(out.verdict, WriteVerdict::Accept(1));
         assert!(out.side.is_empty());
-        proc.validate_int32(reason, 0, 0, WriteVerdict::Accept(0), &base);
+        proc.validate_int32(
+            reason,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         let r = proc.process_array(&Arc::new(make_array(&[1, 9])), &pool);
         assert!(!cleared(&r), "a written 0 cancels the request");
         assert!(!proc.state.lock().config.enable_offset_scale);
 
-        proc.validate_int32(reason, 0, 1, WriteVerdict::Accept(1), &base);
+        proc.validate_int32(
+            reason,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         let r = proc.process_array(&Arc::new(make_array(&[1, 9])), &pool);
         assert!(cleared(&r));
         assert!(proc.state.lock().config.enable_offset_scale);

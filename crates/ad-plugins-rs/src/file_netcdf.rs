@@ -613,6 +613,10 @@ impl NDPluginProcess for NetcdfFileProcessor {
         self.ctrl.lock().posts_before_write(reason, value)
     }
 
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
     /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
     fn validate_int32(
         &self,
@@ -620,12 +624,10 @@ impl NDPluginProcess for NetcdfFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
         let mut ctrl = self.ctrl.lock();
-        ctrl.set_attribute_reads(attributes);
-        ctrl.write_int32(reason, value, verdict)
+        ctrl.write_int32(reason, value, verdict, params)
     }
 
     /// C NDPluginFile::writeOctet: the setting is stored inside the write.
@@ -640,12 +642,11 @@ impl NDPluginProcess for NetcdfFileProcessor {
         self.ctrl.lock().write_octet(reason, verdict)
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        // Read before the controller lock: the read waits on the actor,
+        // Made before the controller lock: its reads wait on the actor,
         // which takes that lock in its writes.
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
         let mut ctrl = self.ctrl.lock();
-        ctrl.set_attribute_reads(attributes);
-        ctrl.process_array(array)
+        ctrl.process_array(array, &mut post)
     }
 
     fn bind_attributes(&mut self, attributes: PluginAttributes) {
@@ -918,6 +919,66 @@ mod tests {
             "Single must be a fixed frame axis"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// C evaluates a flushed frame's attributes on the flushing thread
+    /// (NDPluginFile.cpp:301), so its hand-on never waits on the port: a
+    /// Single-mode WriteFile arriving mid-flush waits for the capture file
+    /// to close, then writes its own.
+    #[test]
+    fn a_single_write_file_during_a_capture_flush_returns() {
+        use crate::test_util::{frame, gated, publish, wait_saved, write_file_returns};
+        use std::time::Duration;
+        let path = temp_path("flush_write_file");
+        let (keep, handle, gate, entered) = gated("NC_FLUSH_WF", NetcdfFileProcessor::new(), &path);
+        let up = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        up.submit_blocking(
+            asyn_rs::request::RequestOp::OctetWrite {
+                data: b"%s%s_%d".to_vec(),
+            },
+            asyn_rs::user::AsynUser::new(p.file_template),
+        )
+        .unwrap();
+        up.write_int32_blocking(p.auto_increment, 0, 1).unwrap();
+        publish(&handle, &frame(0));
+        wait_saved(&handle, 1);
+        assert_eq!(entered.recv_timeout(Duration::from_secs(10)), Ok(0));
+        up.write_int32_blocking(p.file_write_mode, 0, NDFileMode::Capture as i32)
+            .unwrap();
+        up.write_int32_blocking(p.num_capture, 0, 2).unwrap();
+        up.write_int32_blocking(p.capture, 0, 1).unwrap();
+        assert!(handle.wait_params_applied(Duration::from_secs(10)));
+
+        let held = gate.lock();
+        publish(&handle, &frame(1));
+        publish(&handle, &frame(2));
+        assert_eq!(entered.recv_timeout(Duration::from_secs(10)), Ok(1));
+        up.write_int32_blocking(p.file_write_mode, 0, NDFileMode::Single as i32)
+            .unwrap();
+        let returned = write_file_returns(&handle, || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        if !returned {
+            // The port is deadlocked; its threads cannot be joined.
+            std::mem::forget((keep, handle));
+            panic!("WriteFile during a capture flush never returned");
+        }
+        let ids = |n: i32| -> Vec<i32> {
+            let name = format!("{}_{n}", path.display());
+            let ids = H5File::open(&name)
+                .unwrap()
+                .dataset("uniqueId")
+                .unwrap()
+                .read_raw()
+                .unwrap();
+            std::fs::remove_file(&name).ok();
+            ids
+        };
+        assert_eq!(ids(0), vec![0]);
+        assert_eq!(ids(1), vec![1, 2], "the capture file keeps both frames");
+        assert_eq!(ids(2), vec![2], "WriteFile wrote after the flush closed");
     }
 
     /// C `openFile`/`writeFile` fill `pFileAttributes` from `getAttributes`

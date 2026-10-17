@@ -4,7 +4,7 @@ use ad_core_rs::color::NDColorMode;
 use ad_core_rs::error::ADResult;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use ad_core_rs::plugin::runtime::{NDPluginProcess, ParamUpdate, ProcessResult};
 use parking_lot::Mutex;
 
 /// Transform types matching C++ `NDPluginTransformType_t`.
@@ -475,6 +475,8 @@ mod simd_kernels {
 pub struct TransformProcessor {
     transform: Mutex<TransformType>,
     transform_type_idx: Option<usize>,
+    /// The base `NDArraySizeX/Y/Z`, which Transform sets from its output.
+    array_size: [usize; 3],
 }
 
 impl TransformProcessor {
@@ -482,6 +484,7 @@ impl TransformProcessor {
         Self {
             transform: Mutex::new(transform),
             transform_type_idx: None,
+            array_size: [0; 3],
         }
     }
 }
@@ -495,7 +498,22 @@ impl NDPluginProcess for TransformProcessor {
         // hold across the whole rotation.
         let transform = *self.transform.lock();
         match apply_transform(pool, array, transform) {
-            Ok(out) => ProcessResult::arrays(vec![Arc::new(out)]),
+            Ok(out) => {
+                // NDPluginTransform.cpp:509-513: X/Y index the output by the
+                // input's xDim/yDim, and Z is 3 for any 3-D output.
+                let info = array.info();
+                let size = |axis: usize| out.dims.get(axis).map_or(0, |d| d.size) as i32;
+                let [x, y, z] = self.array_size;
+                let updates = vec![
+                    ParamUpdate::int32(x, size(info.x_dim)),
+                    ParamUpdate::int32(y, size(info.y_dim)),
+                    ParamUpdate::int32(z, if out.dims.len() < 3 { 0 } else { 3 }),
+                ];
+                ProcessResult {
+                    param_updates: updates,
+                    ..ProcessResult::arrays(vec![Arc::new(out)])
+                }
+            }
             Err(e) => {
                 // C's copy() returning NULL ends the frame without output.
                 tracing::warn!(error = %e, "transform output allocation failed; dropping frame");
@@ -521,6 +539,8 @@ impl NDPluginProcess for TransformProcessor {
         let transform_type = base.create_param("TRANSFORM_TYPE", ParamType::Int32)?;
         base.set_int32_param(transform_type, 0, *self.transform.lock() as i32)?;
         self.transform_type_idx = Some(transform_type);
+        self.array_size =
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::array_size_reasons(base)?;
         Ok(())
     }
 
@@ -540,19 +560,43 @@ impl NDPluginProcess for TransformProcessor {
 mod tests {
     use super::*;
 
+    /// NDPluginTransform.cpp:509-513 sets X/Y from the rotated output and
+    /// Z as 0 or 3, never the total ArraySize.
+    #[test]
+    fn the_array_sizes_describe_the_output() {
+        use ad_core_rs::ndarray::{NDDataType, NDDimension};
+        let mono = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(6)],
+            NDDataType::UInt8,
+        );
+        let sizes = crate::test_util::array_sizes(
+            "TRANS_SIZES",
+            TransformProcessor::new(TransformType::Rot90CW),
+            &[mono],
+        );
+        assert_eq!(sizes, [[6, 8, 0, 0]]);
+    }
+
     /// C NDPluginTransform has no writeInt32 override, so NDPluginDriver's
     /// failure reaches the record.
     #[test]
     fn a_refused_base_write_stays_refused() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = TransformProcessor::new(TransformType::None);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp.clone(), &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp.clone(),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             clamp
         );
     }
@@ -566,6 +610,7 @@ mod tests {
         for t in [TransformType::None, TransformType::Rot90CW] {
             let mut base = PortDriverBase::new("TRANS_INIT", 1, PortFlags::default());
             let mut proc = TransformProcessor::new(t);
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
             proc.register_params(&mut base).unwrap();
             let reason = base.find_param("TRANSFORM_TYPE").unwrap();
             assert_eq!(base.get_int32_param(reason, 0).unwrap(), t as i32);

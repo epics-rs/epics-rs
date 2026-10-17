@@ -453,6 +453,8 @@ pub struct MagickFileProcessor {
     quality_idx: Option<usize>,
     bit_depth_idx: Option<usize>,
     compress_type_idx: Option<usize>,
+    /// The plugin's driver, for the posts a capture flush makes.
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl MagickFileProcessor {
@@ -464,6 +466,7 @@ impl MagickFileProcessor {
             quality_idx: None,
             bit_depth_idx: None,
             compress_type_idx: None,
+            attributes: None,
         }
     }
 }
@@ -473,6 +476,10 @@ impl NDPluginProcess for MagickFileProcessor {
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
+    }
+
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
     }
 
     /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870). C reads the
@@ -485,10 +492,10 @@ impl NDPluginProcess for MagickFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         let mut ctrl = self.ctrl.lock();
-        let out = ctrl.write_int32(reason, value, verdict);
+        let out = ctrl.write_int32(reason, value, verdict, params);
         let kept = out.verdict.kept();
         if Some(reason) == self.quality_idx {
             let q = kept.clamp(1, 100) as u8;
@@ -514,7 +521,14 @@ impl NDPluginProcess for MagickFileProcessor {
         self.ctrl.lock().write_octet(reason, verdict)
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        self.ctrl.lock().process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -638,8 +652,14 @@ mod tests {
         let mut base = PortDriverBase::new("magick_settings_write", 1, PortFlags::default());
         let mut proc = MagickFileProcessor::new();
         proc.register_params(&mut base).unwrap();
-        let w = |idx: Option<usize>, v| {
-            proc.validate_int32(idx.unwrap(), 0, v, WriteVerdict::Accept(v), &base);
+        let mut w = |idx: Option<usize>, v| {
+            proc.validate_int32(
+                idx.unwrap(),
+                0,
+                v,
+                WriteVerdict::Accept(v),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+            );
         };
         let writer = Arc::clone(&proc.ctrl.lock().writer);
         assert!(

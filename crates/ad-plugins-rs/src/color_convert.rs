@@ -1205,6 +1205,24 @@ mod tests {
         NDArrayPool::new(0)
     }
 
+    /// NDPluginDriver.cpp:217-227 posts the input's ColorMode and NDimensions,
+    /// not the converted output's.
+    #[test]
+    fn the_rbvs_describe_the_input_not_the_conversion() {
+        let input = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        let processor = ColorConvertProcessor::new(ColorConvertConfig {
+            target_mode: NDColorMode::RGB1,
+            bayer_pattern: NDBayerPattern::RGGB,
+            false_color: 0,
+        });
+        let got = crate::test_util::begin_params("CC_BEGIN", processor, &input);
+        assert_eq!(got.color_mode, NDColorMode::Mono as i32);
+        assert_eq!(got.n_dimensions, 2);
+    }
+
     /// Both halves of the timestamp pair travel to the output.
     ///
     /// The two are independent in C — a hardware clock feeds `timeStamp` while

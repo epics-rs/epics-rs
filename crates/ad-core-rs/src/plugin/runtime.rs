@@ -50,6 +50,9 @@ use super::channel::{
 use super::params::PluginBaseParams;
 use super::wiring::WiringRegistry;
 
+mod delivery;
+use delivery::Delivery;
+
 /// Message sent through the param channel from control plane to data plane.
 ///
 /// The channel is FIFO, which is what gives [`PluginParamMsg::Barrier`] its
@@ -60,10 +63,9 @@ use super::wiring::WiringRegistry;
 enum PluginParamMsg {
     /// A param write to apply.
     Change(usize, i32, ParamChangeValue),
-    /// Arrays a write handed downstream (C `readFileBase` ->
-    /// `endProcessCallbacks`, NDPluginFile.cpp:189-193), then the arrays it
+    /// Arrays a write handed to `endProcessCallbacks`, then the arrays it
     /// posted at an address (`doCallbacksGenericPointer`).
-    Publish(Vec<Arc<NDArray>>, Vec<(usize, Arc<NDArray>)>),
+    Publish(Published, Vec<(usize, Arc<NDArray>)>),
     /// Sync barrier — acknowledged (best-effort send of `()`) at full
     /// quiescence: every `Change` enqueued before it has been applied (FIFO
     /// channel) AND the array queue has drained. The second condition exists
@@ -277,45 +279,61 @@ impl PluginAttributes {
     /// The store reads of [`Self::evaluate`], taken now, for a caller whose
     /// `getAttributes` comes after sets it cannot make here (a file plugin's
     /// `openFile`). `None` when the set is empty.
-    pub fn reads(&self) -> Option<AttributeReads> {
+    fn view(&self) -> Option<AttributeView> {
         let begin = BEGIN.with(|b| b.borrow().clone());
         let reads = self.0.param_reads_blocking(begin.clone())?;
-        Some(AttributeReads {
-            owner: Arc::clone(&self.0),
-            reads,
-            begin,
-        })
+        Some(AttributeView::new(Arc::clone(&self.0), reads, begin))
     }
 
-    /// [`Self::reads`] from inside a write, on the port's actor.
-    pub fn reads_on(&self, base: &PortDriverBase) -> Option<AttributeReads> {
+    /// [`Self::view`] from inside a write, on the port's actor.
+    fn view_on(&self, base: &PortDriverBase) -> Option<AttributeView> {
         let attributes = self.0.attributes().lock();
-        (!attributes.list.is_empty()).then(|| AttributeReads {
-            owner: Arc::clone(&self.0),
-            reads: attributes.param_reads(base, &[]),
-            begin: Vec::new(),
+        (!attributes.list.is_empty()).then(|| {
+            let reads = attributes.param_reads(base, &[]);
+            let begin = BEGIN.with(|b| b.borrow().clone());
+            AttributeView::new(Arc::clone(&self.0), reads, begin)
         })
     }
 }
 
-/// A plugin's `PARAM` reads from [`PluginAttributes::reads`], evaluated by
-/// [`Self::evaluate`] against the sets made since.
-pub struct AttributeReads {
+/// What a plugin's `getAttributes` reads inside one frame callback or write:
+/// the store read once, overlaid with every set made since, posted or not,
+/// so it is evaluated on any thread without waiting on the port's actor.
+/// Clones share the sets, so the poster, the writer and the hand-on read
+/// one view.
+#[derive(Clone)]
+pub struct AttributeView {
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
-    reads: crate::driver::ndarray_driver::ParamReads,
-    begin: Vec<PendingParam>,
+    reads: Arc<crate::driver::ndarray_driver::ParamReads>,
+    /// The frame's `beginProcessCallbacks` sets, then each set as made.
+    made: Arc<parking_lot::Mutex<Vec<PendingParam>>>,
 }
 
-impl AttributeReads {
-    /// The set, with `set` — values set after the reads — read in place of
-    /// the store.
-    pub fn evaluate(&self, set: &[PendingParam]) -> NDAttributeList {
-        let mut pending = self.begin.clone();
-        pending.extend_from_slice(set);
+impl AttributeView {
+    fn new(
+        owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
+        reads: crate::driver::ndarray_driver::ParamReads,
+        begin: Vec<PendingParam>,
+    ) -> Self {
+        Self {
+            owner,
+            reads: Arc::new(reads),
+            made: Arc::new(parking_lot::Mutex::new(begin)),
+        }
+    }
+
+    /// C `setXxxParam`: `sets` are read from now on, whenever they post.
+    pub fn record(&self, sets: impl IntoIterator<Item = PendingParam>) {
+        self.made.lock().extend(sets);
+    }
+
+    /// The set as C `getAttributes` reads the parameter library now.
+    pub fn evaluate(&self) -> NDAttributeList {
+        let made = self.made.lock().clone();
         self.owner
             .attributes()
             .lock()
-            .update_with(&self.reads, &pending)
+            .update_with(&self.reads, &made)
     }
 }
 
@@ -338,6 +356,11 @@ pub struct ProcessResult {
     pub addressed: Vec<(usize, Arc<NDArray>)>,
     /// Lines C's `processCallbacks` prints, in order.
     pub trace: Vec<(TraceMask, String)>,
+    /// `false` where C's `processCallbacks` sets ArrayCounter back to the
+    /// value it read before `beginProcessCallbacks` counted the frame, as
+    /// NDPluginFile does for a frame it does not save (NDPluginFile.cpp:
+    /// 727-731, :789).
+    pub counted: bool,
 }
 
 impl ProcessResult {
@@ -349,6 +372,7 @@ impl ProcessResult {
             scatter: false,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 
@@ -360,6 +384,7 @@ impl ProcessResult {
             scatter: false,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 
@@ -373,6 +398,7 @@ impl ProcessResult {
             scatter: false,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 
@@ -384,6 +410,7 @@ impl ProcessResult {
             scatter: false,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 
@@ -397,6 +424,7 @@ impl ProcessResult {
             scatter: true,
             addressed: vec![],
             trace: vec![],
+            counted: true,
         }
     }
 }
@@ -409,8 +437,9 @@ fn run_processor<P: NDPluginProcess + ?Sized>(
     array: &Arc<NDArray>,
     pool: &NDArrayPool,
     begin: &[PendingParam],
+    hand_on: Option<&HandOn>,
 ) -> ProcessResult {
-    let result = with_begin(begin, || processor.process_array(array, pool));
+    let result = with_frame(begin, hand_on, || processor.process_array(array, pool));
     if let Some(served) = processor.array_data_handle() {
         *served.lock() = result.output_arrays.first().cloned();
     }
@@ -422,16 +451,22 @@ thread_local! {
     /// runs, for the processor's own `getAttributes` calls, which come before
     /// the batch that stores them.
     static BEGIN: std::cell::RefCell<Vec<PendingParam>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Where [`PortPost`] hands a frame on while `process_array` runs.
+    static HAND_ON: std::cell::RefCell<Option<HandOn>> = const { std::cell::RefCell::new(None) };
 }
 
-fn with_begin<R>(begin: &[PendingParam], f: impl FnOnce() -> R) -> R {
-    struct Restore(Vec<PendingParam>);
+fn with_frame<R>(begin: &[PendingParam], hand_on: Option<&HandOn>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Vec<PendingParam>, Option<HandOn>);
     impl Drop for Restore {
         fn drop(&mut self) {
             BEGIN.with(|b| *b.borrow_mut() = std::mem::take(&mut self.0));
+            HAND_ON.with(|h| *h.borrow_mut() = self.1.take());
         }
     }
-    let _restore = Restore(BEGIN.with(|b| b.replace(begin.to_vec())));
+    let _restore = Restore(
+        BEGIN.with(|b| b.replace(begin.to_vec())),
+        HAND_ON.with(|h| h.replace(hand_on.cloned())),
+    );
     f()
 }
 
@@ -602,13 +637,34 @@ pub struct WriteOutcome<T> {
     pub addressed: Addressed,
 }
 
-/// Arrays a write hands downstream, compared by identity.
+/// C `endProcessCallbacks`' `copyArray`.
+#[derive(Clone, Copy)]
+enum CopyArray<'a> {
+    /// Copy an output that is this input, as every C plugin handing on its
+    /// input asks (e.g. NDPluginStats.cpp:651, NDPluginCodec.cpp:987), and
+    /// not one of the plugin's own (e.g. NDPluginROI.cpp:226).
+    IfInput(&'a NDArray),
+    Always,
+    Never,
+}
+
+/// Arrays a write hands to `endProcessCallbacks`, compared by identity.
 #[derive(Debug, Clone, Default)]
-pub struct Published(pub Vec<Arc<NDArray>>);
+pub enum Published {
+    #[default]
+    Nothing,
+    /// ReadFile's array: `beginProcessCallbacks` counts it, and it goes out
+    /// uncopied (NDPluginFile.cpp:190-193).
+    Read(Arc<NDArray>),
+}
 
 impl PartialEq for Published {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len() && self.0.iter().zip(&other.0).all(|(a, b)| Arc::ptr_eq(a, b))
+        match (self, other) {
+            (Self::Nothing, Self::Nothing) => true,
+            (Self::Read(a), Self::Read(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
 }
 
@@ -685,8 +741,8 @@ impl<T> WriteOutcome<T> {
         self
     }
 
-    pub fn publish(mut self, array: Arc<NDArray>) -> Self {
-        self.publish.0.push(array);
+    pub fn publish_read(mut self, array: Arc<NDArray>) -> Self {
+        self.publish = Published::Read(array);
         self
     }
 
@@ -694,6 +750,267 @@ impl<T> WriteOutcome<T> {
         self.addressed.0.extend(posts);
         self
     }
+}
+
+/// Store one param a write override set; an array posts at once, as
+/// `doCallbacksFloat64Array` does.
+fn set_side(base: &mut PortDriverBase, p: SideParam) -> AsynResult<()> {
+    match p {
+        SideParam::Int32 {
+            reason,
+            addr,
+            value,
+        } => base.set_int32_param(reason, addr, value),
+        SideParam::Float64 {
+            reason,
+            addr,
+            value,
+        } => base.set_float64_param(reason, addr, value),
+        SideParam::Octet {
+            reason,
+            addr,
+            value,
+        } => base.set_string_param(reason, addr, &value),
+        SideParam::Float64Array {
+            reason,
+            addr,
+            value,
+        } => {
+            base.params.set_float64_array(reason, addr, value)?;
+            base.call_param_callbacks(addr)
+        }
+    }
+}
+
+/// C `set*Param` + `callParamCallbacks()` in the middle of a plugin's work,
+/// posted at once rather than with the rest of the frame callback or write:
+/// NDPluginFile's capture flush posts NumCaptured per frame
+/// (NDPluginFile.cpp:278-279, :315-321).
+pub trait ParamPost {
+    fn post(&mut self, updates: Vec<ParamUpdate>);
+
+    /// C `endProcessCallbacks(array, true, true)` from inside the work
+    /// (NDPluginFile.cpp:252, :301, :349): `array` is delivered downstream
+    /// before this returns, and the counters C sets there go out with the
+    /// next post.
+    fn hand_on(&mut self, array: &Arc<NDArray>);
+
+    /// The view the hand-on's `getAttributes` reads, which records each
+    /// post; a caller records its own sets into it as C makes them.
+    fn attribute_view(&mut self) -> Option<AttributeView> {
+        None
+    }
+
+    /// C `getIntegerParam(reason)` at address 0 now, where the poster can
+    /// read it.
+    fn int32(&self, _reason: usize) -> Option<i32> {
+        None
+    }
+}
+
+/// C `endProcessCallbacks(pArray, true, true)` called from inside the
+/// work, as NDPluginFile's `writeFileBase` calls it for each frame it wrote
+/// (NDPluginFile.cpp:252, :301, :349): no `beginProcessCallbacks` counts the
+/// frame, and it is delivered before the next `callParamCallbacks`.
+#[derive(Clone)]
+pub struct HandOn {
+    delivery: Arc<Delivery>,
+    attributes: PluginAttributes,
+    plugin_params: PluginBaseParams,
+}
+
+impl HandOn {
+    /// Deliver `array` with what `attributes` reads when NDArrayCallbacks
+    /// is on (NDPluginDriver.cpp:289); returns the counters C sets there.
+    fn frame(
+        &self,
+        array: &Arc<NDArray>,
+        attributes: impl FnOnce(&PluginAttributes) -> Option<NDAttributeList>,
+    ) -> Vec<ParamUpdate> {
+        let attributes = self
+            .delivery
+            .delivers()
+            .then(|| attributes(&self.attributes))
+            .flatten();
+        self.delivery.hand_on(array, attributes.as_ref());
+        let counters = self.delivery.sort_counters();
+        let p = &self.plugin_params;
+        let mut sets = vec![
+            ParamUpdate::int32(p.disordered_arrays, counters.disordered_arrays),
+            ParamUpdate::int32(p.dropped_output_arrays, counters.dropped_output_arrays),
+        ];
+        sets.extend(
+            counters
+                .sort_free
+                .map(|free| ParamUpdate::int32(p.sort_free, free)),
+        );
+        sets
+    }
+}
+
+/// [`ParamPost`] from a frame callback, through the port's queue, ahead of
+/// the callback's own updates, which the same queue carries after it.
+///
+/// The first post carries the frame's `beginProcessCallbacks` sets, which C
+/// has made by then and its `callParamCallbacks` posts with it.
+///
+/// A hand-on's `getAttributes` is evaluated on the calling thread, as C's
+/// is, from its [`AttributeView`], so a caller may hand on while holding a
+/// lock the actor's writes wait for.
+pub struct PortPost {
+    port: Option<PortHandle>,
+    begin: Vec<PendingParam>,
+    /// The begin sets, kept to read after they are posted.
+    read: Vec<PendingParam>,
+    hand_on: Option<HandOn>,
+    /// What a hand-on set, for the next post.
+    set: Vec<ParamUpdate>,
+    view: Option<AttributeView>,
+}
+
+impl PortPost {
+    /// The port of `attributes`' driver; with none, posts go nowhere.
+    ///
+    /// Reads the store on the port's actor, so it must be made before
+    /// taking a lock the actor's writes take.
+    pub fn of(attributes: Option<&PluginAttributes>) -> Self {
+        let begin = BEGIN.with(|b| b.borrow().clone());
+        Self {
+            port: attributes.and_then(|a| a.0.port()),
+            read: begin.clone(),
+            begin,
+            hand_on: HAND_ON.with(|h| h.borrow().clone()),
+            set: Vec::new(),
+            view: attributes.and_then(PluginAttributes::view),
+        }
+    }
+}
+
+impl ParamPost for PortPost {
+    fn post(&mut self, updates: Vec<ParamUpdate>) {
+        let Some(port) = &self.port else { return };
+        let stored: Vec<PendingParam> = std::mem::take(&mut self.begin)
+            .into_iter()
+            .chain(
+                std::mem::take(&mut self.set)
+                    .iter()
+                    .map(ParamUpdate::stored),
+            )
+            .chain(updates.iter().map(ParamUpdate::stored))
+            .collect();
+        if let Some(view) = &self.view {
+            view.record(stored.iter().cloned());
+        }
+        let sets = stored
+            .into_iter()
+            .map(|(reason, addr, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
+            .collect();
+        if let Err(e) = port.set_params_and_notify_blocking(0, sets) {
+            eprintln!("plugin param post error: {e}");
+        }
+    }
+
+    fn hand_on(&mut self, array: &Arc<NDArray>) {
+        let Some(hand_on) = &self.hand_on else { return };
+        let view = &self.view;
+        let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        if let Some(view) = view {
+            view.record(sets.iter().map(ParamUpdate::stored));
+        }
+        self.set.extend(sets);
+    }
+
+    fn attribute_view(&mut self) -> Option<AttributeView> {
+        self.view.clone()
+    }
+
+    /// Only the frame's `beginProcessCallbacks` sets, ArrayCounter among
+    /// them, are known here.
+    fn int32(&self, reason: usize) -> Option<i32> {
+        self.read.iter().find_map(|(r, addr, value)| match value {
+            ParamValue::Int32(v) if *r == reason && *addr == 0 => Some(*v),
+            _ => None,
+        })
+    }
+}
+
+/// The port an int32 write override runs against, on its actor: the
+/// parameter library before the store, and [`ParamPost`] into it.
+pub struct WritePort<'a> {
+    base: &'a mut PortDriverBase,
+    hand_on: Option<&'a HandOn>,
+    /// Read from the store when first asked for, then given each post.
+    view: Option<AttributeView>,
+}
+
+impl<'a> WritePort<'a> {
+    /// A port with nothing downstream.
+    pub fn new(base: &'a mut PortDriverBase) -> Self {
+        Self {
+            base,
+            hand_on: None,
+            view: None,
+        }
+    }
+}
+
+impl std::ops::Deref for WritePort<'_> {
+    type Target = PortDriverBase;
+
+    fn deref(&self) -> &PortDriverBase {
+        self.base
+    }
+}
+
+impl ParamPost for WritePort<'_> {
+    fn post(&mut self, updates: Vec<ParamUpdate>) {
+        if let Some(view) = &self.view {
+            view.record(updates.iter().map(ParamUpdate::stored));
+        }
+        for update in updates {
+            let _ = set_side(self.base, update.into());
+        }
+        let _ = self.base.call_param_callbacks(0);
+    }
+
+    /// The actor waits for a blocking downstream, as C's port thread runs
+    /// it inline under the port lock.
+    fn hand_on(&mut self, array: &Arc<NDArray>) {
+        let Some(hand_on) = self.hand_on else { return };
+        let view = self.attribute_view();
+        let sets = hand_on.frame(array, |_| view.as_ref().map(AttributeView::evaluate));
+        if let Some(view) = &view {
+            view.record(sets.iter().map(ParamUpdate::stored));
+        }
+        for set in sets {
+            let _ = set_side(self.base, set.into());
+        }
+    }
+
+    fn attribute_view(&mut self) -> Option<AttributeView> {
+        if self.view.is_none() {
+            self.view = self.hand_on.and_then(|h| h.attributes.view_on(self.base));
+        }
+        self.view.clone()
+    }
+
+    fn int32(&self, reason: usize) -> Option<i32> {
+        self.base.get_int32_param(reason, 0).ok()
+    }
+}
+
+/// Posts nowhere and has nothing downstream, for a caller with no port.
+impl ParamPost for () {
+    fn post(&mut self, _updates: Vec<ParamUpdate>) {}
+    fn hand_on(&mut self, _array: &Arc<NDArray>) {}
+}
+
+/// Keeps each post, for a caller with no port and nothing downstream.
+impl ParamPost for Vec<Vec<ParamUpdate>> {
+    fn post(&mut self, updates: Vec<ParamUpdate>) {
+        self.push(updates);
+    }
+    fn hand_on(&mut self, _array: &Arc<NDArray>) {}
 }
 
 /// The `validate_*` half of an `NDPluginProcess`, callable through the port
@@ -705,7 +1022,8 @@ trait ValidateWrite: Send + Sync {
         addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        base: &PortDriverBase,
+        base: &mut PortDriverBase,
+        hand_on: Option<&HandOn>,
     ) -> WriteOutcome<i32>;
     fn float64(
         &self,
@@ -733,9 +1051,20 @@ impl<P: NDPluginProcess> ValidateWrite for P {
         addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        base: &PortDriverBase,
+        base: &mut PortDriverBase,
+        hand_on: Option<&HandOn>,
     ) -> WriteOutcome<i32> {
-        self.validate_int32(reason, addr, value, verdict, base)
+        self.validate_int32(
+            reason,
+            addr,
+            value,
+            verdict,
+            &mut WritePort {
+                base,
+                hand_on,
+                view: None,
+            },
+        )
     }
     fn float64(
         &self,
@@ -784,6 +1113,14 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// A codec/file plugin that understands compressed data overrides this.
     fn compression_aware(&self) -> bool {
         false
+    }
+
+    /// Whether the frame is for this plugin at all. C `NDPluginFile`'s
+    /// `attrIsProcessingRequired` returns before `beginProcessCallbacks`
+    /// (NDPluginFile.cpp:724-725), so a frame refused here counts nothing,
+    /// sets nothing but ExecutionTime, and is never cached or handed on.
+    fn processing_required(&self, _array: &NDArray) -> bool {
+        true
     }
 
     /// The `NDArrayCallbacks` value this plugin's C constructor sets: 0 in
@@ -835,7 +1172,8 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// what C `NDPluginDriver::writeInt32` leaves for the base class params
     /// (`Accept(value)` for every other param), as the override that calls
     /// it sees the status. `params` is the parameter library before the
-    /// store. `on_param_change` then sees the kept value. The default keeps
+    /// store, which the override posts into only where C calls back in the
+    /// middle of the write. `on_param_change` then sees the kept value. The default keeps
     /// the base verdict, as a plugin with no override does.
     fn validate_int32(
         &self,
@@ -843,7 +1181,7 @@ pub trait NDPluginProcess: Send + Sync + 'static {
         _addr: i32,
         _value: i32,
         verdict: WriteVerdict<i32>,
-        _params: &PortDriverBase,
+        _params: &mut WritePort<'_>,
     ) -> WriteOutcome<i32> {
         verdict.into()
     }
@@ -1048,10 +1386,9 @@ impl SortBuffer {
 /// Shared processor state protected by a mutex, accessible from both
 /// the data thread (non-blocking mode) and the caller thread (blocking mode).
 struct SharedProcessorInner {
-    /// One output per port address: what C's asynGenericPointer interrupt
-    /// list is per address. Index 0 is the `endProcessCallbacks` output.
-    outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    pool: DriverPool,
+    /// The outputs, pool, throttle and sort buffer `endProcessCallbacks`
+    /// works on, behind their own leaf lock.
+    delivery: Arc<Delivery>,
     /// The plugin's own attribute set, and whether `endProcessCallbacks`
     /// reads it ([`NDPluginProcess::READ_ATTRIBUTES`]).
     attributes: PluginAttributes,
@@ -1072,36 +1409,14 @@ struct SharedProcessorInner {
     /// path. Distinct from `enabled` (`EnableCallbacks`), which gates whether
     /// the plugin processes the input at all.
     array_callbacks: ArrayCallbacks,
-    /// Sort mode: 0 = disabled, 1 = sorted output.
-    sort_mode: i32,
-    /// C `sortingThreadId_ != 0`: SortMode has been Sorted at least once.
-    /// Only the sort path writes SortFree (NDPluginDriver.cpp:301, :667), so
-    /// until then it stays undefined.
-    sorting_started: bool,
-    /// Sort time: seconds — per-element staleness deadline for the sort buffer.
-    sort_time: f64,
-    /// Sort size: maximum number of uniqueId entries in the sort buffer.
-    sort_size: i32,
-    /// Sort buffer for reordering output arrays by uniqueId.
-    sort_buffer: SortBuffer,
     /// Cumulative count of dropped *input* arrays: a full queue or a
     /// compressed array on a non-aware plugin. NOT a MinCallbackTime throttle,
     /// which C counts nowhere. Shared with every upstream sender and with the
     /// admission gate, which is where both drops are decided.
     dropped_arrays: Arc<std::sync::atomic::AtomicI32>,
-    /// Output byte-rate limit (C++ `MaxByteRate`); 0 disables throttling.
-    max_byte_rate: f64,
-    /// Token-bucket throttler enforcing `max_byte_rate` on the output path (G7).
-    throttler: super::throttler::Throttler,
     /// Last *input* array, cached for ProcessPlugin re-injection
     /// (C++ `pPrevInputArray_`, G5). Released on `EnableCallbacks=0` (B6).
     prev_input_array: Option<PublishedArray>,
-    /// Last array the plugin handed to `endProcessCallbacks` (C++
-    /// `pArrays[0]`), cached whatever NDArrayCallbacks, the MaxByteRate
-    /// throttle or the sort buffer then decide about it
-    /// (NDPluginDriver.cpp:259-264, :275-278). It is the dimensions template
-    /// `NDPoolPreAllocBuffers` allocates from.
-    last_output_array: Option<Arc<NDArray>>,
     /// Shadow of `POOL_NUM_PRE_ALLOC_BUFFERS`, the count C reads back inside
     /// `preAllocateBuffers` (asynNDArrayDriver.cpp:723).
     num_pre_alloc_buffers: usize,
@@ -1117,66 +1432,6 @@ struct SharedProcessorInner {
 }
 
 impl SharedProcessorInner {
-    /// Byte cost of an array for throttling (C++ `NDPluginDriver::throttled`):
-    /// compressed size when a codec is present, else total raw bytes.
-    fn array_byte_cost(array: &NDArray) -> f64 {
-        match &array.codec {
-            Some(c) => c.compressed_size as f64,
-            None => array.info().total_bytes as f64,
-        }
-    }
-
-    /// Apply the output throttle to one array. Returns `true` if the array
-    /// should be emitted, `false` if it was dropped (and counts the drop).
-    fn throttle_ok(&mut self, array: &NDArray) -> bool {
-        if self.max_byte_rate == 0.0 {
-            return true;
-        }
-        let cost = Self::array_byte_cost(array);
-        if self.throttler.try_take(cost) {
-            true
-        } else {
-            self.sort_buffer.dropped_output_arrays += 1;
-            false
-        }
-    }
-
-    /// Route output arrays through the throttle, the in-order fast path, and
-    /// the sort buffer. Returns arrays ready to emit *now*, in order.
-    ///
-    /// Port of C++ `endProcessCallbacks` (NDPluginDriver.cpp:295-328): an
-    /// array whose uniqueId is contiguous with `prevUniqueId_` is emitted
-    /// immediately (B2); only out-of-order arrays enter the sort buffer.
-    /// Disordered arrays are counted at emission time in both modes (B4).
-    fn route_output_arrays(&mut self, arrays: Vec<PublishedArray>) -> Vec<PublishedArray> {
-        let mut ready = Vec::new();
-        for arr in arrays {
-            if !self.throttle_ok(&arr) {
-                continue; // G7: dropped by MaxByteRate throttle
-            }
-            let uid = arr.unique_id;
-            if self.sort_mode != 0 && !self.sort_buffer.order_ok(uid) {
-                // Out of order with sort mode on: buffer it (B2/B3).
-                self.sort_buffer.insert(uid, vec![arr], self.sort_size);
-            } else {
-                // In order (or sort mode off): emit immediately, count disorder.
-                self.sort_buffer.note_emitted(uid);
-                ready.push(arr);
-            }
-        }
-        // After emitting in-order arrays, the sort buffer head may now be
-        // contiguous — release any newly-ready run (C++ sortingTask).
-        if self.sort_mode != 0 {
-            for (_id, mut bucket) in self
-                .sort_buffer
-                .drain_ready(self.sort_time, std::time::Instant::now())
-            {
-                ready.append(&mut bucket);
-            }
-        }
-        ready
-    }
-
     /// C `pPrevInputArray_`, set in `beginProcessCallbacks`
     /// (NDPluginDriver.cpp:231-234) — so only an array that got past the
     /// admission gate and is about to be processed is ever cached, and
@@ -1202,27 +1457,88 @@ impl SharedProcessorInner {
         array: &PublishedArray,
     ) -> (Arc<NDArrayPool>, Vec<PendingParam>) {
         self.prev_input_array = Some(array.clone());
-        self.pool = array.pool().clone();
+        let pool = self.delivery.adopt_pool(array.pool());
         self.array_counter += 1;
         let begin = self.begin_sets(array);
-        (Arc::clone(self.pool.pool()), begin)
+        (pool, begin)
     }
 
     /// C `readFileBase`'s `beginProcessCallbacks` and `endProcessCallbacks
-    /// (pArray, false, true)` for an array a write publishes
+    /// (pArray, false, true)` for the array ReadFile publishes
     /// (NDPluginFile.cpp:187-193): count it and, when callbacks are on, the
     /// set it gets.
     fn begin_published(
         &mut self,
-        arrays: &[Arc<NDArray>],
+        array: &NDArray,
         callbacks: bool,
-    ) -> Option<NDAttributeList> {
-        let first = arrays.first()?;
+    ) -> (Vec<PendingParam>, Option<NDAttributeList>) {
         self.array_counter += 1;
-        let begin = self.begin_sets(first);
-        callbacks
+        let begin = self.begin_sets(array);
+        let attributes = callbacks
             .then(|| self.attributes.evaluate_after(&begin, &[]))
-            .flatten()
+            .flatten();
+        (begin, attributes)
+    }
+
+    /// `beginProcessCallbacks` and `endProcessCallbacks` for what a write
+    /// publishes.
+    fn end_published(&mut self, published: Published) -> ProcessOutput {
+        let deliver = self.array_callbacks.get();
+        let (arrays, begin, attributes) = match published {
+            Published::Nothing => (Vec::new(), None, None),
+            Published::Read(array) => {
+                let (begin, attributes) = self.begin_published(&array, deliver);
+                (vec![Arc::clone(&array)], Some((array, begin)), attributes)
+            }
+        };
+        let ready = self
+            .delivery
+            .end_process(arrays, attributes.as_ref(), CopyArray::Never);
+        let mut output = self.build_publish_batch(
+            ready,
+            Vec::new(),
+            false,
+            begin
+                .as_ref()
+                .map(|(array, sets)| (&**array, sets.as_slice())),
+            None,
+            deliver,
+        );
+        output.batch.merge(self.build_status_params_batch());
+        output
+    }
+
+    /// The NDDimensions interrupt of `beginProcessCallbacks`, fired when
+    /// `array`'s dims differ from the previous input's.
+    fn post_dimensions(&mut self, array: &NDArray) {
+        // G8: fire an int32-array callback on NDDimensions when the array
+        // dimensions change (C++ beginProcessCallbacks dimsPrev_). C++ keeps
+        // a fixed `dimsPrev_[ND_ARRAY_MAX_DIMS]` zero-filled beyond `ndims`,
+        // compares element-wise over all 10 slots, and posts the full
+        // 10-element array (NDPluginDriver.cpp:220-231) — so a caget reads
+        // NORD=10 with trailing zeros, not `ndims`.
+        let mut cur_dims = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
+        for (slot, d) in cur_dims
+            .iter_mut()
+            .zip(array.dims.iter().take(crate::ndarray::ND_ARRAY_MAX_DIMS))
+        {
+            *slot = d.size as i32;
+        }
+        if cur_dims != self.dims_prev {
+            self.dims_prev = cur_dims.clone();
+            self.port_handle
+                .interrupts()
+                .notify(asyn_rs::interrupt::InterruptValue {
+                    reason: self.ndarray_params.array_dimensions,
+                    addr: 0,
+                    value: asyn_rs::param::ParamValue::Int32Array(std::sync::Arc::from(
+                        cur_dims.as_slice(),
+                    )),
+                    timestamp: array.timestamp.to_system_time(),
+                    uint32_changed_mask: 0,
+                    ..Default::default()
+                });
+        }
     }
 
     /// C `beginProcessCallbacks`' sets from `array` (NDPluginDriver.cpp:
@@ -1284,19 +1600,16 @@ impl SharedProcessorInner {
         ]
     }
 
-    fn senders_for(&self, output: &ProcessOutput) -> OutputSenders {
-        let by_addr = if output.addressed.is_empty() {
-            Vec::new()
-        } else {
-            self.outputs
-                .iter()
-                .map(|o| o.lock().senders_clone())
-                .collect()
-        };
-        OutputSenders {
-            main: self.outputs[0].lock().senders_clone(),
-            by_addr,
+    fn hand_on(&self) -> HandOn {
+        HandOn {
+            delivery: Arc::clone(&self.delivery),
+            attributes: self.attributes.clone(),
+            plugin_params: self.plugin_params,
         }
+    }
+
+    fn senders_for(&self, output: &ProcessOutput) -> OutputSenders {
+        self.delivery.senders(!output.addressed.is_empty())
     }
 
     /// Process array and return a `ProcessOutput`. Does NOT send to actor.
@@ -1307,17 +1620,29 @@ impl SharedProcessorInner {
         processor: &P,
         array: &PublishedArray,
     ) -> ProcessOutput {
+        let t0 = std::time::Instant::now();
+        if !processor.processing_required(array) {
+            return self.unprocessed(t0.elapsed().as_secs_f64() * 1000.0);
+        }
         let (pool, begin) = self.cache_input_array(array);
         let t0 = std::time::Instant::now();
-        let result = run_processor(processor, array.array(), &pool, &begin);
+        let hand_on = self.hand_on();
+        let result = run_processor(processor, array.array(), &pool, &begin, Some(&hand_on));
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.post_process(array, result, &begin, elapsed_ms)
     }
 
+    /// A frame [`NDPluginProcess::processing_required`] refused: only the
+    /// ExecutionTime C sets after `processCallbacks` (NDPluginDriver.cpp:
+    /// 438, :537).
+    fn unprocessed(&mut self, elapsed_ms: f64) -> ProcessOutput {
+        self.build_publish_batch(Vec::new(), Vec::new(), false, None, Some(elapsed_ms), false)
+    }
+
     /// The completion half: route the produced arrays and build the param
     /// batch. Runs on the data loop, never on a callback worker, so the
-    /// counters and the sort buffer keep a single owner however many workers
-    /// are running.
+    /// counters keep a single owner however many workers are running; the
+    /// sort buffer is [`Delivery`]'s, which a WriteFile hand-on also reaches.
     fn post_process(
         &mut self,
         array: &NDArray,
@@ -1343,28 +1668,17 @@ impl SharedProcessorInner {
         // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`). So
         // route whenever we deliver downstream OR serve the StdArray waveforms.
         let produced = result.output_arrays.len();
-        // C caches `pArrays[0]` before it consults the throttle or the sort
-        // buffer: the array itself with NDArrayCallbacks 0
-        // (NDPluginDriver.cpp:273-280), otherwise its copy, and only once the
-        // copy succeeded (:285-299).
-        let callbacks = self.array_callbacks.get();
-        if !callbacks && let Some(last) = result.output_arrays.last() {
-            self.last_output_array = Some(Arc::clone(last));
-        }
-        let ready = if callbacks || self.std_array_data_param.is_some() {
-            // `getAttributes` only past the NDArrayCallbacks return (:289).
-            let attributes =
-                (callbacks && self.read_attributes && !result.output_arrays.is_empty())
-                    .then(|| self.attributes.evaluate_after(begin, &result.param_updates))
-                    .flatten();
-            let arrays = self.publishable(result.output_arrays, attributes.as_ref());
-            if callbacks && let Some(last) = arrays.last() {
-                self.last_output_array = Some(Arc::clone(last.array()));
-            }
-            self.route_output_arrays(arrays)
-        } else {
-            Vec::new()
-        };
+        // `getAttributes` only past the NDArrayCallbacks return (:289).
+        let attributes = (self.array_callbacks.get()
+            && self.read_attributes
+            && !result.output_arrays.is_empty())
+        .then(|| self.attributes.evaluate_after(begin, &result.param_updates))
+        .flatten();
+        let ready = self.delivery.end_process(
+            result.output_arrays,
+            attributes.as_ref(),
+            CopyArray::IfInput(array),
+        );
         // A StdArrays frame that produced a waveform which the MaxByteRate
         // throttle then dropped (`produced > 0` but `ready` empty) must not
         // advance ArrayCounter — C nets it back out
@@ -1372,59 +1686,24 @@ impl SharedProcessorInner {
         if self.std_array_data_param.is_some() && produced > 0 && ready.is_empty() {
             self.array_counter -= 1;
         }
-        // Counted at begin.
+        if !result.counted {
+            self.array_counter -= 1;
+        }
         let mut output = self.build_publish_batch(
             ready,
             result.param_updates,
             result.scatter,
-            Some(array),
+            Some((array, begin)),
             Some(elapsed_ms),
             self.array_callbacks.get(),
-            false,
         );
         output.batch.merge(self.build_status_params_batch());
         // C `beginProcessCallbacks` `setTimeStamp(&pArray->epicsTS)`
         // (NDPluginDriver.cpp:232): the input's, for every callback until
         // the next frame.
         output.batch.time_stamp = Some(array.timestamp.to_system_time());
-        output.addressed = self.publishable_addressed(result.addressed);
+        output.addressed = self.delivery.publishable_addressed(result.addressed);
         output
-    }
-
-    /// C `endProcessCallbacks` copies an output into the pool when it must;
-    /// a refused copy prints its line and ends the frame's output there with
-    /// `return asynError` (NDPluginDriver.cpp:285-299).
-    fn publishable(
-        &self,
-        arrays: Vec<Arc<NDArray>>,
-        attributes: Option<&NDAttributeList>,
-    ) -> Vec<PublishedArray> {
-        let mut published = Vec::with_capacity(arrays.len());
-        for array in arrays {
-            let Ok(array) = self.pool.publishable(array, attributes) else {
-                self.port_handle.trace().output(
-                    self.port_handle.port_name(),
-                    TraceMask::ERROR,
-                    "NDPluginDriver::endProcessCallbacks: Couldn't allocate output array. Further processing terminated.\n",
-                );
-                break;
-            };
-            published.push(array);
-        }
-        published
-    }
-
-    /// An addressed post is C's own `pNDArrayPool->alloc` (e.g.
-    /// NDPluginTimeSeries.cpp:374), not `endProcessCallbacks`: a refusal
-    /// prints only the pool's line and skips that post.
-    fn publishable_addressed(
-        &self,
-        arrays: Vec<(usize, Arc<NDArray>)>,
-    ) -> Vec<(usize, PublishedArray)> {
-        arrays
-            .into_iter()
-            .filter_map(|(addr, arr)| Some((addr, self.pool.publishable(arr, None).ok()?)))
-            .collect()
     }
 
     /// The pool branch of C `asynNDArrayDriver::writeInt32`
@@ -1451,16 +1730,10 @@ impl SharedProcessorInner {
             self.num_pre_alloc_buffers = value.max(0) as usize;
             return None;
         } else if reason == empty {
-            self.pool.empty_free_list();
+            self.delivery.empty_free_list();
         } else if reason == pre_alloc {
-            // C refuses with asynError when no array has been produced yet —
-            // there are no dimensions to allocate against
-            // (asynNDArrayDriver.cpp:715-721).
-            if let Some(template) = self.last_output_array.clone() {
-                let _ = self
-                    .pool
-                    .pre_allocate_buffers(&template, self.num_pre_alloc_buffers);
-            }
+            self.delivery
+                .pre_allocate_buffers(self.num_pre_alloc_buffers);
             // C clears the command PV once it has run (`:688`).
             batch.addr0.push(asyn_rs::request::ParamSetValue::new(
                 pre_alloc,
@@ -1472,10 +1745,7 @@ impl SharedProcessorInner {
         }
         batch
             .addr0
-            .extend(crate::driver::ndarray_driver::pool_stats_values(
-                &self.ndarray_params,
-                &self.pool,
-            ));
+            .extend(self.delivery.pool_stats(&self.ndarray_params));
         Some(ProcessOutput {
             arrays: vec![],
             scatter: false,
@@ -1498,15 +1768,13 @@ impl SharedProcessorInner {
     /// Flush the sort buffer head-first while contiguous or stale (C++
     /// sortingTask periodic tick). Does NOT drain non-contiguous fresh arrays.
     fn tick_sort_buffer(&mut self) -> ProcessOutput {
-        let entries = self
-            .sort_buffer
-            .drain_ready(self.sort_time, std::time::Instant::now());
+        let entries = self.delivery.drain_ready();
         self.emit_drained(entries)
     }
 
     /// Drain the entire sort buffer in uniqueId order (sort mode turned off).
     fn flush_sort_buffer(&mut self) -> ProcessOutput {
-        let entries = self.sort_buffer.drain_all();
+        let entries = self.delivery.drain_all();
         self.emit_drained(entries)
     }
 
@@ -1518,7 +1786,7 @@ impl SharedProcessorInner {
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(arrays, vec![], false, None, None, true, true);
+            let output = self.build_publish_batch(arrays, vec![], false, None, None, true);
             all_arrays.extend(output.arrays);
             combined.merge(output.batch);
         }
@@ -1533,27 +1801,28 @@ impl SharedProcessorInner {
 
     fn build_sort_params_batch(&self) -> ParamBatch {
         use asyn_rs::request::ParamSetValue;
+        let counters = self.delivery.sort_counters();
         let mut batch = ParamBatch {
             time_stamp: None,
             addr0: vec![
                 ParamSetValue::new(
                     self.plugin_params.disordered_arrays,
                     0,
-                    ParamValue::Int32(self.sort_buffer.disordered_arrays),
+                    ParamValue::Int32(counters.disordered_arrays),
                 ),
                 ParamSetValue::new(
                     self.plugin_params.dropped_output_arrays,
                     0,
-                    ParamValue::Int32(self.sort_buffer.dropped_output_arrays),
+                    ParamValue::Int32(counters.dropped_output_arrays),
                 ),
             ],
             extra: std::collections::HashMap::new(),
         };
-        if self.sorting_started {
+        if let Some(free) = counters.sort_free {
             batch.addr0.push(ParamSetValue::new(
                 self.plugin_params.sort_free,
                 0,
-                ParamValue::Int32(self.sort_size - self.sort_buffer.len()),
+                ParamValue::Int32(free),
             ));
         }
         batch
@@ -1589,9 +1858,9 @@ impl SharedProcessorInner {
             self.dropped_arrays
                 .store(value, std::sync::atomic::Ordering::Release);
         } else if reason == self.plugin_params.dropped_output_arrays {
-            self.sort_buffer.dropped_output_arrays = value;
+            self.delivery.resync_dropped_output_arrays(value);
         } else if reason == self.plugin_params.disordered_arrays {
-            self.sort_buffer.disordered_arrays = value;
+            self.delivery.resync_disordered_arrays(value);
         } else {
             return false;
         }
@@ -1619,20 +1888,24 @@ impl SharedProcessorInner {
     /// `deliver` is the NDArrayCallbacks gate (C++ `endProcessCallbacks`,
     /// NDPluginDriver.cpp:257-265): when `false`, the downstream array
     /// delivery — the STD_ARRAY_DATA generic-pointer interrupt and the returned
-    /// `ProcessOutput.arrays` — is suppressed, while the metadata params from
-    /// `beginProcessCallbacks` (counter, dims, datatype, …) are still set.
+    /// `ProcessOutput.arrays` — is suppressed, while the `begin` params are
+    /// still set.
     ///
     /// `elapsed_ms` is `None` off the input-array path: C sets ExecutionTime
     /// only around `processCallbacks` (NDPluginDriver.cpp:422, :521).
+    ///
+    /// `begin` is the array a `beginProcessCallbacks` ran on, with its sets
+    /// (NDPluginDriver.cpp:207-252): those fields come from it, never from an
+    /// output, and only a path that ran it sets them; ArrayCounter takes its
+    /// value now, after any frame the plugin did not count.
     fn build_publish_batch(
         &mut self,
         output_arrays: Vec<PublishedArray>,
         param_updates: Vec<ParamUpdate>,
         scatter: bool,
-        fallback_array: Option<&NDArray>,
+        begin: Option<(&NDArray, &[PendingParam])>,
         elapsed_ms: Option<f64>,
         deliver: bool,
-        count_frame: bool,
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
@@ -1640,228 +1913,81 @@ impl SharedProcessorInner {
         let mut extra: std::collections::HashMap<i32, Vec<ParamSetValue>> =
             std::collections::HashMap::new();
 
-        if let Some(report_arr) = output_arrays.first().map(|a| &**a).or(fallback_array) {
-            // A StdArrays frame whose waveform output the MaxByteRate throttle
-            // dropped (`count_frame == false`) must not bump ArrayCounter — C
-            // decrements it back so clients monitoring ArrayCounter see no new
-            // data (NDPluginStdArrays.cpp:202-211).
-            if count_frame {
-                self.array_counter += 1;
-            }
+        if let Some((input, sets)) = begin {
+            self.post_dimensions(input);
+            let counter = self.ndarray_params.array_counter;
+            addr0.extend(
+                sets.iter()
+                    .filter(|(reason, ..)| *reason != counter)
+                    .map(|(reason, addr, value)| ParamSetValue::new(*reason, *addr, value.clone())),
+            );
+            addr0.push(ParamSetValue::new(
+                counter,
+                0,
+                ParamValue::Int32(self.array_counter),
+            ));
+        }
 
-            // Fire the StdArray waveform interrupt directly (C EPICS pattern).
-            // This is NDPluginStdArrays' typed-array callback
-            // (NDPluginStdArrays.cpp:71-73 `arrayInterruptCallback`), NOT the
-            // `doCallbacksGenericPointer` downstream path: C fires it whether or
-            // not NDArrayCallbacks is set (StdArrays defaults NDArrayCallbacks=0),
-            // so it must NOT be gated by `deliver`. It fires only with the
-            // routed/served output (`output_arrays.first()`), never the
-            // `fallback_array`: C skips the interface callback on throttle
-            // (NDPluginStdArrays.cpp:58), so a throttled frame leaves
-            // `output_arrays` empty and serves nothing.
-            if let (Some(param), Some(served)) = (
-                self.std_array_data_param,
-                output_arrays.first().map(|a| &**a),
-            ) {
-                use crate::ndarray::NDDataBuffer;
-                use asyn_rs::param::ParamValue;
-                let value = match &served.data {
-                    NDDataBuffer::I8(v) => {
-                        Some(ParamValue::Int8Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                    NDDataBuffer::U8(v) => Some(ParamValue::Int8Array(std::sync::Arc::from(
-                        v.iter().map(|&x| x as i8).collect::<Vec<_>>().as_slice(),
-                    ))),
-                    NDDataBuffer::I16(v) => {
-                        Some(ParamValue::Int16Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                    NDDataBuffer::U16(v) => Some(ParamValue::Int16Array(std::sync::Arc::from(
-                        v.iter().map(|&x| x as i16).collect::<Vec<_>>().as_slice(),
-                    ))),
-                    NDDataBuffer::I32(v) => {
-                        Some(ParamValue::Int32Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                    NDDataBuffer::U32(v) => Some(ParamValue::Int32Array(std::sync::Arc::from(
-                        v.iter().map(|&x| x as i32).collect::<Vec<_>>().as_slice(),
-                    ))),
-                    NDDataBuffer::I64(v) => {
-                        Some(ParamValue::Int64Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                    NDDataBuffer::U64(v) => Some(ParamValue::Int64Array(std::sync::Arc::from(
-                        v.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
-                    ))),
-                    NDDataBuffer::F32(v) => {
-                        Some(ParamValue::Float32Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                    NDDataBuffer::F64(v) => {
-                        Some(ParamValue::Float64Array(std::sync::Arc::from(v.as_slice())))
-                    }
-                };
-                if let Some(value) = value {
-                    let ts = served.timestamp.to_system_time();
-                    self.port_handle
-                        .interrupts()
-                        .notify(asyn_rs::interrupt::InterruptValue {
-                            reason: param,
-                            addr: 0,
-                            value,
-                            timestamp: ts,
-                            uint32_changed_mask: 0,
-                            ..Default::default()
-                        });
+        // Fire the StdArray waveform interrupt directly (C EPICS pattern).
+        // This is NDPluginStdArrays' typed-array callback
+        // (NDPluginStdArrays.cpp:71-73 `arrayInterruptCallback`), NOT the
+        // `doCallbacksGenericPointer` downstream path: C fires it whether or
+        // not NDArrayCallbacks is set (StdArrays defaults NDArrayCallbacks=0),
+        // so it must NOT be gated by `deliver`. It fires only with the
+        // routed/served output (`output_arrays.first()`), never the
+        // input: C skips the interface callback on throttle
+        // (NDPluginStdArrays.cpp:58), so a throttled frame leaves
+        // `output_arrays` empty and serves nothing.
+        if let (Some(param), Some(served)) = (
+            self.std_array_data_param,
+            output_arrays.first().map(|a| &**a),
+        ) {
+            use crate::ndarray::NDDataBuffer;
+            use asyn_rs::param::ParamValue;
+            let value = match &served.data {
+                NDDataBuffer::I8(v) => {
+                    Some(ParamValue::Int8Array(std::sync::Arc::from(v.as_slice())))
                 }
-            }
-
-            let info = report_arr.info();
-            // B11: read ColorMode / BayerPattern from the NDArray attributes
-            // (C++ beginProcessCallbacks). `info()` already resolves the
-            // ColorMode attribute when present; fall back to it for the param.
-            let color_mode = report_arr
-                .attributes
-                .get("ColorMode")
-                .and_then(|a| a.value.as_i64())
-                .map(|v| v as i32)
-                .unwrap_or(info.color_mode as i32);
-            let bayer_pattern = report_arr
-                .attributes
-                .get("BayerPattern")
-                .and_then(|a| a.value.as_i64())
-                .map(|v| v as i32)
-                .unwrap_or(0);
-
-            // G8: fire an int32-array callback on NDDimensions when the array
-            // dimensions change (C++ beginProcessCallbacks dimsPrev_). C++ keeps
-            // a fixed `dimsPrev_[ND_ARRAY_MAX_DIMS]` zero-filled beyond `ndims`,
-            // compares element-wise over all 10 slots, and posts the full
-            // 10-element array (NDPluginDriver.cpp:220-231) — so a caget reads
-            // NORD=10 with trailing zeros, not `ndims`.
-            let mut cur_dims = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
-            for (slot, d) in cur_dims.iter_mut().zip(
-                report_arr
-                    .dims
-                    .iter()
-                    .take(crate::ndarray::ND_ARRAY_MAX_DIMS),
-            ) {
-                *slot = d.size as i32;
-            }
-            if cur_dims != self.dims_prev {
-                self.dims_prev = cur_dims.clone();
+                NDDataBuffer::U8(v) => Some(ParamValue::Int8Array(std::sync::Arc::from(
+                    v.iter().map(|&x| x as i8).collect::<Vec<_>>().as_slice(),
+                ))),
+                NDDataBuffer::I16(v) => {
+                    Some(ParamValue::Int16Array(std::sync::Arc::from(v.as_slice())))
+                }
+                NDDataBuffer::U16(v) => Some(ParamValue::Int16Array(std::sync::Arc::from(
+                    v.iter().map(|&x| x as i16).collect::<Vec<_>>().as_slice(),
+                ))),
+                NDDataBuffer::I32(v) => {
+                    Some(ParamValue::Int32Array(std::sync::Arc::from(v.as_slice())))
+                }
+                NDDataBuffer::U32(v) => Some(ParamValue::Int32Array(std::sync::Arc::from(
+                    v.iter().map(|&x| x as i32).collect::<Vec<_>>().as_slice(),
+                ))),
+                NDDataBuffer::I64(v) => {
+                    Some(ParamValue::Int64Array(std::sync::Arc::from(v.as_slice())))
+                }
+                NDDataBuffer::U64(v) => Some(ParamValue::Int64Array(std::sync::Arc::from(
+                    v.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
+                ))),
+                NDDataBuffer::F32(v) => {
+                    Some(ParamValue::Float32Array(std::sync::Arc::from(v.as_slice())))
+                }
+                NDDataBuffer::F64(v) => {
+                    Some(ParamValue::Float64Array(std::sync::Arc::from(v.as_slice())))
+                }
+            };
+            if let Some(value) = value {
+                let ts = served.timestamp.to_system_time();
                 self.port_handle
                     .interrupts()
                     .notify(asyn_rs::interrupt::InterruptValue {
-                        reason: self.ndarray_params.array_dimensions,
+                        reason: param,
                         addr: 0,
-                        value: asyn_rs::param::ParamValue::Int32Array(std::sync::Arc::from(
-                            cur_dims.as_slice(),
-                        )),
-                        timestamp: report_arr.timestamp.to_system_time(),
+                        value,
+                        timestamp: ts,
                         uint32_changed_mask: 0,
                         ..Default::default()
                     });
-            }
-
-            addr0.extend([
-                ParamSetValue::new(
-                    self.ndarray_params.array_counter,
-                    0,
-                    ParamValue::Int32(self.array_counter),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.unique_id,
-                    0,
-                    ParamValue::Int32(report_arr.unique_id),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.n_dimensions,
-                    0,
-                    ParamValue::Int32(report_arr.dims.len() as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.array_size_x,
-                    0,
-                    ParamValue::Int32(info.x_size as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.array_size_y,
-                    0,
-                    ParamValue::Int32(info.y_size as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.array_size_z,
-                    0,
-                    ParamValue::Int32(info.color_size as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.array_size,
-                    0,
-                    ParamValue::Int32(info.total_bytes as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.data_type,
-                    0,
-                    ParamValue::Int32(report_arr.data.data_type() as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.color_mode,
-                    0,
-                    ParamValue::Int32(color_mode),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.bayer_pattern,
-                    0,
-                    ParamValue::Int32(bayer_pattern),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.timestamp_rbv,
-                    0,
-                    // C `setDoubleParam(NDTimeStamp, pArray->timeStamp)`
-                    // (NDPluginDriver.cpp:217) — the standalone double, which a
-                    // driver may set from its own clock; NDEpicsTSSec/nSec below
-                    // carry epicsTS (`:218-219`).
-                    ParamValue::Float64(report_arr.time_stamp),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.epics_ts_sec,
-                    0,
-                    ParamValue::Int32(report_arr.timestamp.sec as i32),
-                ),
-                ParamSetValue::new(
-                    self.ndarray_params.epics_ts_nsec,
-                    0,
-                    ParamValue::Int32(report_arr.timestamp.nsec as i32),
-                ),
-            ]);
-
-            // NDCodec / NDCompressedSize — C++ beginProcessCallbacks
-            // (NDPluginDriver.cpp:213-214) sets these on every array. An
-            // uncompressed array carries an empty codec name and a
-            // compressedSize equal to the raw byte count (matching the
-            // driver-base path in ndarray_driver::prepare_array).
-            match &report_arr.codec {
-                Some(codec) => {
-                    addr0.push(ParamSetValue::new(
-                        self.ndarray_params.codec,
-                        0,
-                        ParamValue::Octet(codec.name.as_str().as_bytes().into()),
-                    ));
-                    addr0.push(ParamSetValue::new(
-                        self.ndarray_params.compressed_size,
-                        0,
-                        ParamValue::Int32(codec.compressed_size as i32),
-                    ));
-                }
-                None => {
-                    addr0.push(ParamSetValue::new(
-                        self.ndarray_params.codec,
-                        0,
-                        ParamValue::Octet(std::sync::Arc::from([])),
-                    ));
-                    addr0.push(ParamSetValue::new(
-                        self.ndarray_params.compressed_size,
-                        0,
-                        ParamValue::Int32(info.total_bytes as i32),
-                    ));
-                }
             }
         }
 
@@ -2135,6 +2261,8 @@ pub struct PluginPortDriver {
     /// The plugin, for the checks its C `writeInt32`/`writeFloat64` override
     /// makes before the store.
     validator: Arc<dyn ValidateWrite>,
+    /// Where a write hands a frame on, set once the runtime is built.
+    hand_on: Arc<std::sync::OnceLock<HandOn>>,
     /// What the plugin's own pool and queued count lead back to.
     owner: Arc<crate::driver::ndarray_driver::ArrayOwner>,
 }
@@ -2222,6 +2350,7 @@ impl PluginPortDriver {
             std_array_data_param,
             wiring,
             validator: processor.clone(),
+            hand_on: Arc::default(),
             owner,
         };
         Ok((driver, processor, pool))
@@ -2327,31 +2456,7 @@ impl PluginPortDriver {
         trace: Vec<(TraceMask, String)>,
     ) -> AsynResult<()> {
         for p in side {
-            match p {
-                SideParam::Int32 {
-                    reason,
-                    addr,
-                    value,
-                } => self.base.set_int32_param(reason, addr, value)?,
-                SideParam::Float64 {
-                    reason,
-                    addr,
-                    value,
-                } => self.base.set_float64_param(reason, addr, value)?,
-                SideParam::Octet {
-                    reason,
-                    addr,
-                    value,
-                } => self.base.set_string_param(reason, addr, &value)?,
-                SideParam::Float64Array {
-                    reason,
-                    addr,
-                    value,
-                } => {
-                    self.base.params.set_float64_array(reason, addr, value)?;
-                    self.base.call_param_callbacks(addr)?;
-                }
-            }
+            set_side(&mut self.base, p)?;
         }
         for (mask, line) in trace {
             self.base.trace_print(mask, format_args!("{line}"));
@@ -2360,10 +2465,10 @@ impl PluginPortDriver {
     }
 
     fn send_published(&self, publish: Published, addressed: Addressed) {
-        if !publish.0.is_empty() || !addressed.0.is_empty() {
+        if !matches!(publish, Published::Nothing) || !addressed.0.is_empty() {
             let _ = self
                 .param_change_tx
-                .send(PluginParamMsg::Publish(publish.0, addressed.0));
+                .send(PluginParamMsg::Publish(publish, addressed.0));
         }
     }
 
@@ -2639,9 +2744,14 @@ impl PortDriver for PluginPortDriver {
             settled,
             publish,
             addressed,
-        } = self
-            .validator
-            .int32(reason, addr, value, base.verdict, &self.base);
+        } = self.validator.int32(
+            reason,
+            addr,
+            value,
+            base.verdict,
+            &mut self.base,
+            self.hand_on.get(),
+        );
         let value = verdict.kept();
         self.base.set_int32_param(reason, addr, value)?;
         let p = &self.plugin_params;
@@ -3071,6 +3181,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // (iocsh.cpp:1269-1279) and the script continues by default
     // (iocsh.cpp:995, :1123), leaving the C IOC serving without the port. We
     // deviate on purpose: see `port_runtime_unavailable`.
+    let hand_on_cell = Arc::clone(&driver.hand_on);
     let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
@@ -3106,9 +3217,15 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // The processor is shared with the callback threads rather than owned by
     // `SharedProcessorInner`: the whole point of `&self` on `process_array` is
     // that it runs off the data loop, outside this mutex.
+    let delivery = Arc::new(Delivery::new(
+        array_outputs.clone(),
+        own_pool.clone(),
+        array_callbacks.clone(),
+        std_array_data_param.is_some(),
+        port_handle.clone(),
+    ));
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
-        outputs: array_outputs.clone(),
-        pool: own_pool.clone(),
+        delivery,
         attributes: PluginAttributes(Arc::clone(own_pool.owner())),
         read_attributes: P::READ_ATTRIBUTES,
         ndarray_params,
@@ -3117,22 +3234,15 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         array_counter: 0,
         std_array_data_param,
         array_callbacks,
-        sort_mode: 0,
-        sorting_started: false,
-        sort_time: 0.0,
-        sort_size: 10,
-        sort_buffer: SortBuffer::new(),
         dropped_arrays: dropped_arrays_counter,
-        max_byte_rate: 0.0,
-        throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
-        last_output_array: None,
         num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
     }));
+    let _ = hand_on_cell.set(shared.lock().hand_on());
 
     let data_enabled = enabled.clone();
     let data_blocking = blocking_mode.clone();
@@ -3225,8 +3335,8 @@ struct WorkItem {
 /// A processed frame on its way back to the data loop.
 struct DoneItem {
     msg: ArrayMessage,
-    result: ProcessResult,
-    begin: Vec<PendingParam>,
+    /// The result and begin sets, `None` for a frame the plugin refused.
+    processed: Option<(ProcessResult, Vec<PendingParam>)>,
     elapsed_ms: f64,
 }
 
@@ -3363,16 +3473,27 @@ fn spawn_worker_pool<P: NDPluginProcess>(
                 // thread at the top of `processCallbacks` — so the cached
                 // input names the frame being worked on, not the newest one
                 // queued behind it.
-                let (array_pool, begin) = shared.lock().cache_input_array(&item.msg.array);
                 let t0 = std::time::Instant::now();
-                let result =
-                    run_processor(&*processor, item.msg.array.array(), &array_pool, &begin);
+                let processed = processor.processing_required(&item.msg.array).then(|| {
+                    let (array_pool, begin, hand_on) = {
+                        let mut guard = shared.lock();
+                        let (pool, begin) = guard.cache_input_array(&item.msg.array);
+                        (pool, begin, guard.hand_on())
+                    };
+                    let result = run_processor(
+                        &*processor,
+                        item.msg.array.array(),
+                        &array_pool,
+                        &begin,
+                        Some(&hand_on),
+                    );
+                    (result, begin)
+                });
                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 if done_tx
                     .send(DoneItem {
                         msg: item.msg,
-                        result,
-                        begin,
+                        processed,
                         elapsed_ms,
                     })
                     .is_err()
@@ -3396,11 +3517,11 @@ fn spawn_worker_pool<P: NDPluginProcess>(
 /// Finish a frame a callback thread has processed: fold the result into the
 /// shared state and publish it.
 ///
-/// Everything here runs on the data loop, so the counters, the sort buffer and
-/// the output senders keep a single owner however many workers are running —
-/// which is what C gets from taking the port lock around `processCallbacks`
-/// while the plugin releases it for the time-consuming part
-/// (NDPluginDriver.cpp:516-517).
+/// Everything here runs on the data loop, so the counters keep a single owner
+/// however many workers are running — which is what C gets from taking the
+/// port lock around `processCallbacks` while the plugin releases it for the
+/// time-consuming part (NDPluginDriver.cpp:516-517). The sort buffer and the
+/// output senders are [`Delivery`]'s.
 async fn complete_frame(
     shared: &Arc<parking_lot::Mutex<SharedProcessorInner>>,
     item: DoneItem,
@@ -3408,13 +3529,15 @@ async fn complete_frame(
 ) {
     let DoneItem {
         msg,
-        result,
-        begin,
+        processed,
         elapsed_ms,
     } = item;
     let (output, senders, port) = {
         let mut guard = shared.lock();
-        let output = guard.post_process(&msg.array, result, &begin, elapsed_ms);
+        let output = match processed {
+            Some((result, begin)) => guard.post_process(&msg.array, result, &begin, elapsed_ms),
+            None => guard.unprocessed(elapsed_ms),
+        };
         let senders = guard.senders_for(&output);
         let port = guard.port_handle.clone();
         (output, senders, port)
@@ -3626,23 +3749,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         Some(PluginParamMsg::Fence(ack)) => {
                             let _ = ack.send(());
                         }
-                        Some(PluginParamMsg::Publish(arrays, addressed)) => {
+                        Some(PluginParamMsg::Publish(published, addressed)) => {
                             let (po, senders, port) = {
                                 let mut guard = shared.lock();
-                                let deliver = guard.array_callbacks.get();
-                                let attributes = guard.begin_published(&arrays, deliver);
-                                let arrays = guard.publishable(arrays, attributes.as_ref());
-                                // Counted by `begin_published`.
-                                let mut po = guard.build_publish_batch(
-                                    arrays,
-                                    Vec::new(),
-                                    false,
-                                    None,
-                                    None,
-                                    deliver,
-                                    false,
-                                );
-                                po.addressed = guard.publishable_addressed(addressed);
+                                let mut po = guard.end_published(published);
+                                po.addressed = guard.delivery.publishable_addressed(addressed);
                                 let senders = guard.senders_for(&po);
                                 (po, senders, guard.port_handle.clone())
                             };
@@ -3689,10 +3800,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // G7: MaxByteRate change resets the output throttler
                             // (C++ writeFloat64 NDPluginDriver.cpp:788-790).
                             if reason == max_byte_rate_reason {
-                                let rate = value.as_f64();
-                                let mut guard = shared.lock();
-                                guard.max_byte_rate = rate;
-                                guard.throttler.reset(rate);
+                                shared.lock().delivery.set_max_byte_rate(value.as_f64());
                             }
                             if reason == num_threads_reason {
                                 shared.lock().num_threads = value.as_i32();
@@ -3936,8 +4044,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 // is released before any await.
                                 let flush_work = {
                                     let mut guard = shared.lock();
-                                    guard.sort_mode = mode;
-                                    guard.sorting_started |= mode == 1;
+                                    let sort_time = guard.delivery.set_sort_mode(mode);
                                     if mode == 0 {
                                         let output = guard.flush_sort_buffer();
                                         let senders = guard.senders_for(&output);
@@ -3945,10 +4052,10 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                         sort_flush_active = false;
                                         Some((output, senders, port))
                                     } else {
-                                        sort_flush_active = guard.sort_time > 0.0;
+                                        sort_flush_active = sort_time > 0.0;
                                         if sort_flush_active {
                                             let dur = epics_libcom_rs::runtime::time::duration_from_secs(
-                                                guard.sort_time,
+                                                sort_time,
                                             );
                                             sort_flush_interval = tokio::time::interval(dur);
                                         }
@@ -3962,19 +4069,17 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             }
                             if reason == sort_time_reason {
                                 let t = value.as_f64();
-                                let mut guard = shared.lock();
-                                guard.sort_time = t;
-                                if guard.sort_mode != 0 && t > 0.0 {
+                                let sort_mode = shared.lock().delivery.set_sort_time(t);
+                                if sort_mode != 0 && t > 0.0 {
                                     sort_flush_active = true;
                                     let dur = epics_libcom_rs::runtime::time::duration_from_secs(t);
                                     sort_flush_interval = tokio::time::interval(dur);
                                 } else {
                                     sort_flush_active = false;
                                 }
-                                drop(guard);
                             }
                             if reason == sort_size_reason {
-                                shared.lock().sort_size = value.as_i32();
+                                shared.lock().delivery.set_sort_size(value.as_i32());
                             }
                             // NDArrayPort at address `a` moves source slot `a`
                             // (NDPluginDriver.cpp:834-836).
@@ -4007,9 +4112,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     || !result.addressed.is_empty()
                                 {
                                     let deliver = guard.array_callbacks.get();
-                                    let arrays = guard.publishable(result.output_arrays, None);
-                                    let mut output = guard.build_publish_batch(arrays, result.param_updates, false, None, None, deliver, true);
-                                    output.addressed = guard.publishable_addressed(result.addressed);
+                                    let arrays = guard.delivery.publishable(result.output_arrays, None, CopyArray::Never);
+                                    let mut output = guard.build_publish_batch(arrays, result.param_updates, false, None, None, deliver);
+                                    output.addressed = guard.delivery.publishable_addressed(result.addressed);
                                     Some(output)
                                 } else {
                                     None
@@ -4101,6 +4206,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // Fatal for the same reason as `create_plugin_runtime_multi_addr` above:
     // a constructor-shaped creator has nowhere to report to, and the only
     // alternative is a handle to a port that does not exist.
+    let hand_on_cell = Arc::clone(&driver.hand_on);
     let (port_runtime, _actor_jh) = create_port_runtime(claim, driver, threads.port_config())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
@@ -4125,9 +4231,15 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // The processor is shared with the callback threads rather than owned by
     // `SharedProcessorInner`: the whole point of `&self` on `process_array` is
     // that it runs off the data loop, outside this mutex.
+    let delivery = Arc::new(Delivery::new(
+        array_outputs.clone(),
+        own_pool.clone(),
+        array_callbacks.clone(),
+        std_array_data_param.is_some(),
+        port_handle.clone(),
+    ));
     let shared = Arc::new(parking_lot::Mutex::new(SharedProcessorInner {
-        outputs: array_outputs.clone(),
-        pool: own_pool.clone(),
+        delivery,
         attributes: PluginAttributes(Arc::clone(own_pool.owner())),
         read_attributes: P::READ_ATTRIBUTES,
         ndarray_params,
@@ -4136,22 +4248,15 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         array_counter: 0,
         std_array_data_param,
         array_callbacks,
-        sort_mode: 0,
-        sorting_started: false,
-        sort_time: 0.0,
-        sort_size: 10,
-        sort_buffer: SortBuffer::new(),
         dropped_arrays: dropped_arrays_counter,
-        max_byte_rate: 0.0,
-        throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
-        last_output_array: None,
         num_pre_alloc_buffers: 0,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: source.addr,
         num_threads: PLUGIN_NUM_THREADS,
         threads,
     }));
+    let _ = hand_on_cell.set(shared.lock().hand_on());
 
     let data_enabled = enabled.clone();
     let data_blocking = blocking_mode.clone();
@@ -4319,7 +4424,7 @@ mod tests {
             addr: i32,
             value: i32,
             verdict: WriteVerdict<i32>,
-            _params: &PortDriverBase,
+            _params: &mut WritePort<'_>,
         ) -> WriteOutcome<i32> {
             // Busy, as WriteFile is: the work is done inside the write.
             if reason == self.limit && value == 6 {
@@ -4349,7 +4454,7 @@ mod tests {
                 // sets every channel.
                 7 => out.set_int32(self.twice, addr + 1, 2 * kept),
                 // Hands an array downstream, as ReadFile does.
-                5 => out.publish(raw_test_array(5)),
+                5 => out.publish_read(raw_test_array(5)),
                 _ => out,
             }
         }
@@ -4542,7 +4647,7 @@ mod tests {
         let proc = ServingProcessor {
             served: Arc::new(parking_lot::Mutex::new(None)),
         };
-        let result = run_processor(&proc, input.array(), &pool, &[]);
+        let result = run_processor(&proc, input.array(), &pool, &[], None);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(Arc::ptr_eq(&result.output_arrays[0], input.array()));
         assert!(Arc::ptr_eq(
@@ -4688,6 +4793,84 @@ mod tests {
         // Should come out the other side
         let received = downstream_rx.blocking_recv().unwrap();
         assert_eq!(received.unique_id, 42);
+    }
+
+    /// A compression-aware plugin that hands on its input, or a fresh copy
+    /// of it with its codec's level set.
+    struct CodecPlugin {
+        produce: bool,
+    }
+
+    impl NDPluginProcess for CodecPlugin {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
+            if !self.produce {
+                return ProcessResult::forward(array, vec![]);
+            }
+            let mut out = pool.alloc_copy(array).unwrap();
+            out.codec = Some(level_five_lz4());
+            ProcessResult::arrays(vec![Arc::new(out)])
+        }
+        fn plugin_type(&self) -> &str {
+            "CodecPlugin"
+        }
+        fn compression_aware(&self) -> bool {
+            true
+        }
+    }
+
+    fn level_five_lz4() -> crate::codec::Codec {
+        crate::codec::Codec {
+            name: crate::codec::CodecName::LZ4,
+            compressed_size: 4,
+            level: 5,
+            shuffle: 1,
+            compressor: 2,
+            original_data_type: NDDataType::UInt8,
+        }
+    }
+
+    /// C copies an input a plugin hands on, and the copy keeps only the
+    /// codec's name (NDPluginDriver.cpp:285-286, NDArrayPool.cpp:293); an
+    /// output the plugin made goes out uncopied (NDPluginCodec.cpp:987).
+    #[test]
+    fn a_handed_on_input_keeps_only_its_codec_name() {
+        for (name, produce) in [("CODECIN", false), ("CODECOUT", true)] {
+            let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+            downstream_sender.admission().set_compression_aware(true);
+            let mut output = NDArrayOutput::new();
+            output.add(downstream_sender);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                &asyn_rs::asyn_record::claim_port(name).unwrap(),
+                CodecPlugin { produce },
+                1_000_000,
+                10,
+                output,
+                "",
+                test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
+            );
+            enable_callbacks(&handle);
+            let mut frame = DriverPool::standalone(0)
+                .alloc_copy(&raw_test_array(7))
+                .unwrap();
+            frame.codec = Some(level_five_lz4());
+            send_array(handle.array_sender(), frame.share());
+
+            let received = downstream_rx.blocking_recv().unwrap();
+            let codec = received.codec.as_ref().unwrap();
+            assert!(matches!(codec.name, crate::codec::CodecName::LZ4), "{name}");
+            let expected = if produce {
+                [5, 1, 2]
+            } else {
+                [crate::codec::Codec::UNSET; 3]
+            };
+            assert_eq!(
+                [codec.level, codec.shuffle, codec.compressor],
+                expected,
+                "{name}"
+            );
+        }
     }
 
     /// Sets its own STAMP to ten times the frame's id and forwards the frame.
@@ -5283,6 +5466,321 @@ mod tests {
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 5);
     }
 
+    /// A written array meets the MaxByteRate throttle as a processed one
+    /// does: NDPluginFile hands it to endProcessCallbacks
+    /// (NDPluginFile.cpp:193, :252).
+    #[test]
+    fn an_array_a_write_publishes_is_throttled() {
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("PUBLISH_THROTTLE").unwrap(),
+            processor,
+            1_000_000,
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        // A 1 byte/s bucket cannot pass the 4-byte array.
+        port.write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 1.0)
+            .unwrap();
+        let (limit, ..) = *ids.lock();
+        port.write_int32_blocking(limit, 0, 5).unwrap();
+        params_applied(&handle);
+        wait_until("the drop to post", || {
+            port.read_int32_blocking(handle.plugin_params.dropped_output_arrays, 0)
+                .is_ok_and(|v| v == 1)
+        });
+        // The drop posts after the publish, so a delivery would be queued.
+        assert!(downstream_rx.try_recv_msg().is_none());
+    }
+
+    /// A written array out of uniqueId order waits in the sort buffer
+    /// (NDPluginDriver.cpp:305-325) until sorting stops.
+    #[test]
+    fn an_array_a_write_publishes_is_sorted() {
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("PUBLISH_SORT").unwrap(),
+            processor,
+            1_000_000,
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = handle.plugin_params;
+        port.write_float64_blocking(p.sort_time, 0, 30.0).unwrap();
+        port.write_int32_blocking(p.sort_mode, 0, 1).unwrap();
+        let (limit, ..) = *ids.lock();
+        // uniqueId 5 does not follow 0.
+        port.write_int32_blocking(limit, 0, 5).unwrap();
+        params_applied(&handle);
+        assert!(downstream_rx.try_recv_msg().is_none());
+        port.write_int32_blocking(p.sort_mode, 0, 0).unwrap();
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 5);
+    }
+
+    /// A written array is `pArrays[0]` with NDArrayCallbacks 0
+    /// (NDPluginDriver.cpp:273-280), so PoolPreAllocBuffers has dimensions
+    /// to allocate from.
+    #[test]
+    fn an_array_a_write_publishes_is_the_pre_alloc_template() {
+        let processor = ValidatingProcessor::default();
+        let ids = processor.ids.clone();
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("PUBLISH_CACHE").unwrap(),
+            processor,
+            1_000_000,
+            10,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = handle.ndarray_params;
+        port.write_int32_blocking(p.array_callbacks, 0, 0).unwrap();
+        let (limit, ..) = *ids.lock();
+        port.write_int32_blocking(limit, 0, 5).unwrap();
+        port.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        port.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        params_applied(&handle);
+        assert_eq!(port.read_int32_blocking(p.pool_free_buffers, 0).unwrap(), 2);
+    }
+
+    /// Counts a param down from inside a GO write, as NDPluginFile's capture
+    /// flush counts NumCaptured (NDPluginFile.cpp:315-321), noting how many
+    /// callbacks had fired after each post.
+    #[derive(Default)]
+    struct Countdown {
+        ids: Arc<parking_lot::Mutex<(usize, usize)>>,
+        seen: Arc<parking_lot::Mutex<Vec<i32>>>,
+        fired: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl NDPluginProcess for Countdown {
+        const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+            ProcessResult::forward(array, vec![])
+        }
+        fn plugin_type(&self) -> &str {
+            "Countdown"
+        }
+        fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+            let go = base.create_param("GO", asyn_rs::param::ParamType::Int32)?;
+            let count = base.create_param("COUNT", asyn_rs::param::ParamType::Int32)?;
+            *self.ids.lock() = (go, count);
+            Ok(())
+        }
+        fn validate_int32(
+            &self,
+            reason: usize,
+            _addr: i32,
+            _value: i32,
+            verdict: WriteVerdict<i32>,
+            params: &mut WritePort<'_>,
+        ) -> WriteOutcome<i32> {
+            let (go, count) = *self.ids.lock();
+            if reason != go {
+                return verdict.into();
+            }
+            for n in (0..3).rev() {
+                params.post(vec![ParamUpdate::int32(count, n)]);
+                self.fired.lock().push(self.seen.lock().len());
+            }
+            WriteOutcome::from(verdict).set_int32(count, 0, 0)
+        }
+    }
+
+    #[test]
+    fn a_write_posts_each_value_inside_the_write() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let processor = Countdown::default();
+        let (ids, seen, fired) = (
+            processor.ids.clone(),
+            processor.seen.clone(),
+            processor.fired.clone(),
+        );
+        let (mut drv, _, _) = PluginPortDriver::new(
+            "COUNTDOWN",
+            "Countdown",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            processor,
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        let (go, count) = *ids.lock();
+        drv.base.set_int32_param(count, 0, 3).unwrap();
+        drv.base.call_param_callbacks(0).unwrap();
+        let log = seen.clone();
+        let _sync = drv.base.interrupts.register_sync_callback(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(count),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Int32(v) = iv.value {
+                    log.lock().push(v)
+                }
+            },
+        );
+        drv.io_write_int32(&mut AsynUser::new(go), 1).unwrap();
+        assert_eq!(*fired.lock(), [1, 2, 3], "each post fires before the next");
+        assert_eq!(
+            *seen.lock(),
+            [2, 1, 0],
+            "the write's own 0 posts nothing new"
+        );
+    }
+
+    /// A frame callback's post reaches the port through its queue.
+    #[test]
+    fn a_frame_callback_post_reaches_the_port() {
+        #[derive(Default)]
+        struct Poster {
+            count: Arc<parking_lot::Mutex<usize>>,
+            attributes: Option<PluginAttributes>,
+            /// UniqueId, and its value just after the post.
+            unique_id: Arc<parking_lot::Mutex<Option<usize>>>,
+            seen: Arc<parking_lot::Mutex<Option<i32>>>,
+            /// UniqueId as the post reads it.
+            read: Arc<parking_lot::Mutex<Option<i32>>>,
+        }
+        impl NDPluginProcess for Poster {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let count = *self.count.lock();
+                let mut post = PortPost::of(self.attributes.as_ref());
+                post.post(vec![ParamUpdate::int32(count, 7)]);
+                *self.read.lock() = self.unique_id.lock().and_then(|r| post.int32(r));
+                if let (Some(reason), Some(port)) = (
+                    *self.unique_id.lock(),
+                    self.attributes.as_ref().and_then(|a| a.0.port()),
+                ) {
+                    *self.seen.lock() = port.read_int32_blocking(reason, 0).ok();
+                }
+                ProcessResult::arrays(vec![Arc::clone(array)])
+            }
+            fn plugin_type(&self) -> &str {
+                "Poster"
+            }
+            fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
+                *self.count.lock() =
+                    base.create_param("COUNT", asyn_rs::param::ParamType::Int32)?;
+                Ok(())
+            }
+            fn bind_attributes(&mut self, attributes: PluginAttributes) {
+                self.attributes = Some(attributes);
+            }
+        }
+
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("POSTED", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let poster = Poster::default();
+        let count = poster.count.clone();
+        let (unique_id, seen, read) = (
+            poster.unique_id.clone(),
+            poster.seen.clone(),
+            poster.read.clone(),
+        );
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("POSTER").unwrap(),
+            poster,
+            1_000_000,
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        let port = handle.port_runtime().port_handle();
+        let count = *count.lock();
+        *unique_id.lock() = Some(handle.ndarray_params.unique_id);
+        send_array(handle.array_sender(), make_test_array(41));
+        downstream_rx.blocking_recv().unwrap();
+        assert_eq!(port.read_int32_blocking(count, 0).unwrap(), 7);
+        // C's beginProcessCallbacks has set UniqueId when the callback
+        // posts, so the post carries it (NDPluginDriver.cpp:216-232).
+        assert_eq!(*seen.lock(), Some(41));
+        assert_eq!(
+            *read.lock(),
+            Some(41),
+            "C getIntegerParam reads the begin sets"
+        );
+    }
+
+    /// A frame the processor leaves uncounted sets ArrayCounter back to what
+    /// it was, as NDPluginFile's processCallbacks does (NDPluginFile.cpp:
+    /// 727-731, :789).
+    #[test]
+    fn an_uncounted_frame_leaves_array_counter_alone() {
+        struct EvenOnly;
+        impl NDPluginProcess for EvenOnly {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                let mut result = ProcessResult::forward(array, vec![]);
+                result.counted = array.unique_id % 2 == 0;
+                result
+            }
+            fn plugin_type(&self) -> &str {
+                "EvenOnly"
+            }
+        }
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("EVEN_DOWN", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("EVENONLY").unwrap(),
+            EvenOnly,
+            1_000_000,
+            10,
+            output,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&handle);
+        for id in 1..=4 {
+            send_array(handle.array_sender(), make_test_array(id));
+            downstream_rx.blocking_recv().unwrap();
+        }
+        params_applied(&handle);
+        let port = handle.port_runtime().port_handle();
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .unwrap(),
+            2
+        );
+    }
+
     /// NDPluginTimeSeries writeInt32 posts its waveforms and arrays from the
     /// write (C `doCallbacksFloat64Array`, `doCallbacksGenericPointer`).
     #[derive(Default)]
@@ -5310,7 +5808,7 @@ mod tests {
             _addr: i32,
             _value: i32,
             verdict: WriteVerdict<i32>,
-            _params: &PortDriverBase,
+            _params: &mut WritePort<'_>,
         ) -> WriteOutcome<i32> {
             let (go, series) = *self.ids.lock();
             if reason != go {
@@ -5372,8 +5870,8 @@ mod tests {
         assert_eq!(*seen.lock(), vec![(1, vec![1.0, 2.0])]);
         // A settled write sends only its addressed post to the data task.
         match rx.try_recv() {
-            Ok(PluginParamMsg::Publish(arrays, addressed)) => {
-                assert!(arrays.is_empty());
+            Ok(PluginParamMsg::Publish(published, addressed)) => {
+                assert!(matches!(published, Published::Nothing));
                 assert_eq!(addressed.len(), 1);
                 assert_eq!((addressed[0].0, addressed[0].1.unique_id), (1, 42));
             }
@@ -6158,6 +6656,59 @@ mod tests {
         send_array(handle.array_sender(), make_test_array(2));
         let received = downstream_rx.blocking_recv().unwrap();
         assert_eq!(received.unique_id, 2);
+    }
+
+    /// A frame `processing_required` refuses is neither counted, posted nor
+    /// handed on, on the callback thread or the caller's
+    /// (NDPluginFile.cpp:724-725).
+    #[test]
+    fn a_refused_frame_never_reaches_begin() {
+        struct OddOnly;
+        impl NDPluginProcess for OddOnly {
+            const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+                ProcessResult::arrays(vec![Arc::clone(array)])
+            }
+            fn plugin_type(&self) -> &str {
+                "OddOnly"
+            }
+            fn processing_required(&self, array: &NDArray) -> bool {
+                array.unique_id % 2 == 1
+            }
+        }
+        for (blocking, name) in [(0, "REFUSE_THREAD"), (1, "REFUSE_BLOCKING")] {
+            let (ds, mut rx) = ndarray_channel("DS", 10);
+            let mut output = NDArrayOutput::new();
+            output.add(ds);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                &asyn_rs::asyn_record::claim_port(name).unwrap(),
+                OddOnly,
+                1_000_000,
+                10,
+                output,
+                "",
+                test_wiring(),
+                DEFAULT_PLUGIN_THREADS,
+            );
+            enable_callbacks(&handle);
+            let port = handle.port_runtime().port_handle().clone();
+            port.write_int32_blocking(handle.plugin_params.blocking_callbacks, 0, blocking)
+                .unwrap();
+            params_applied(&handle);
+            send_array(handle.array_sender(), make_test_array(2));
+            send_array(handle.array_sender(), make_test_array(3));
+            assert_eq!(rx.blocking_recv().unwrap().unique_id, 3, "{name}");
+            wait_until("the processed frame's post", || {
+                port.read_int32_blocking(handle.ndarray_params.unique_id, 0)
+                    .is_ok_and(|v| v == 3)
+            });
+            assert_eq!(
+                port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                    .unwrap(),
+                1,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -7490,6 +8041,19 @@ mod tests {
         );
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 2);
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 3);
+        // C sortingTask only delivers (NDPluginDriver.cpp:635-690): the
+        // drain's batch, SortFree back to full, leaves ArrayCounter as the
+        // three beginProcessCallbacks set it.
+        let port = handle.port_runtime().port_handle().clone();
+        wait_until("the drain to post SortFree", || {
+            port.read_int32_blocking(handle.plugin_params.sort_free, 0)
+                .is_ok_and(|v| v == 10)
+        });
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .unwrap(),
+            3
+        );
 
         // B3: now send out of order (5 before 4). prev=3, so 4 is in-order
         // and emitted immediately; 5 arrives first, is buffered, then 4
@@ -7832,10 +8396,9 @@ mod tests {
     #[test]
     fn test_plugin_output_publishes_compressed_size() {
         // ADC-3: every processed array publishes NDCodec / NDCompressedSize
-        // (C++ beginProcessCallbacks NDPluginDriver.cpp:213-214). An
-        // uncompressed output carries an empty codec name and compressedSize ==
-        // raw bytes; a compressed output carries the codec name and its
-        // compressed size. CompressedSize_RBV (Int32) exercises both arms.
+        // (C++ beginProcessCallbacks NDPluginDriver.cpp:213-214) from the
+        // INPUT: an uncompressed input carries an empty codec name and
+        // compressedSize == raw bytes, whatever the plugin outputs.
         struct CompressProcessor;
         impl NDPluginProcess for CompressProcessor {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
@@ -7885,7 +8448,7 @@ mod tests {
             );
         }
 
-        // Compressed output: compressedSize == codec.compressed_size (7).
+        // Compressed output of an uncompressed input: still the input's.
         {
             let (ds, _rx) = ndarray_channel("DS_CMP", 10);
             let mut output = NDArrayOutput::new();
@@ -7903,12 +8466,23 @@ mod tests {
             enable_callbacks(&handle);
             let port = handle.port_runtime().port_handle().clone();
             send_array(handle.array_sender(), make_test_array(1));
-            wait_until(
-                "compressed output to publish CompressedSize == codec.compressed_size",
-                || {
-                    port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
-                        .is_ok_and(|v| v == 7)
-                },
+            wait_until("the frame to publish ArrayCounter", || {
+                port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                    .is_ok_and(|v| v == 1)
+            });
+            assert_eq!(
+                port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
+                    .unwrap(),
+                4
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert_eq!(
+                rt.block_on(port.read_octet(handle.ndarray_params.codec, 0, 16))
+                    .unwrap(),
+                b"\0"
             );
         }
     }

@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use crate::attributes::NDAttributeList;
+use crate::codec::Codec;
 use crate::driver::ndarray_driver::ArrayOwner;
 use crate::error::{ADError, ADResult};
 use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension, PoolTie};
@@ -292,7 +293,8 @@ impl NDArrayPool {
     }
 
     /// Allocate a copy of an existing NDArray: data, both stamps, attributes,
-    /// codec and `unique_id` all carry across (C++ NDArrayPool.cpp:283-302).
+    /// the codec as [`Codec::copied`] and `unique_id` carry across (C++
+    /// NDArrayPool.cpp:283-302).
     /// Tries the free list first (via alloc()), then copies data from source.
     pub fn alloc_copy(&self, source: &NDArray) -> ADResult<NDArray> {
         let dims = source.dims.clone();
@@ -302,7 +304,7 @@ impl NDArrayPool {
         copy.unique_id = source.unique_id;
         copy.copy_time_stamps_from(source);
         copy.attributes = source.attributes.clone();
-        copy.codec = source.codec.clone();
+        copy.codec = source.codec.as_ref().map(Codec::copied);
         Ok(copy)
     }
 
@@ -382,7 +384,7 @@ impl NDArrayPool {
         if copy_dimensions {
             out.dims = src.dims.clone();
         }
-        out.codec = src.codec.clone();
+        out.codec = src.codec.as_ref().map(Codec::copied);
 
         if copy_data {
             if copy_data_type || out.data.data_type() == src.data.data_type() {
@@ -615,19 +617,29 @@ impl DriverPool {
     /// pool first, so it is counted on this pool's driver. `attributes` are
     /// what `getAttributes` merges onto it; an array someone else still holds
     /// is copied first, as C sets them on its copy.
+    ///
+    /// `copied` is C's `copyArray`: that copy keeps only the codec's name
+    /// (NDArrayPool.cpp:293), so an array whose codec has more goes out with
+    /// [`Codec::copied`].
     pub(crate) fn publishable(
         &self,
         mut array: Arc<NDArray>,
         attributes: Option<&NDAttributeList>,
+        copied: bool,
     ) -> ADResult<PublishedArray> {
         if let Some(pool) = array.pool().and_then(Self::of) {
-            match (attributes, Arc::get_mut(&mut array)) {
-                (None, _) => return Ok(PublishedArray { array, pool }),
-                (Some(attributes), Some(own)) => {
+            let rename = copied && array.codec.as_ref().is_some_and(|c| !c.is_copied());
+            if attributes.is_none() && !rename {
+                return Ok(PublishedArray { array, pool });
+            }
+            if let Some(own) = Arc::get_mut(&mut array) {
+                if let Some(attributes) = attributes {
                     own.attributes.copy_from(attributes);
-                    return Ok(PublishedArray { array, pool });
                 }
-                (Some(_), None) => {}
+                if rename {
+                    own.codec = own.codec.as_ref().map(Codec::copied);
+                }
+                return Ok(PublishedArray { array, pool });
             }
         }
         let mut copy = self.alloc_copy(&array)?;
@@ -1974,6 +1986,44 @@ mod tests {
         pool.release(out);
         assert_eq!(pool.num_free_buffers(), 1);
         assert_eq!(pool.allocated_bytes(), 16);
+    }
+
+    /// C `NDArrayPool::copy` assigns only `codec.name` (NDArrayPool.cpp:293),
+    /// so a blosc frame's level, shuffle and compressor read back -1 on the
+    /// copy, through `alloc_copy` and `copy` alike.
+    #[test]
+    fn a_copy_keeps_only_the_codec_name() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = make_4x4_u8();
+        src.codec = Some(Codec {
+            name: crate::codec::CodecName::Blosc,
+            compressed_size: 4,
+            level: 5,
+            shuffle: 1,
+            compressor: 2,
+            original_data_type: NDDataType::UInt16,
+        });
+        let fields = |a: NDArray| {
+            let c = a.codec.clone().unwrap();
+            let kept = (c.name, c.compressed_size, c.original_data_type);
+            (kept, c.level, c.shuffle, c.compressor)
+        };
+        let unset = Codec::UNSET;
+        let want = (
+            (crate::codec::CodecName::Blosc, 4, NDDataType::UInt16),
+            unset,
+            unset,
+            unset,
+        );
+        assert_eq!(fields(pool.alloc_copy(&src).unwrap()), want);
+        assert_eq!(
+            fields(pool.copy(&src, None, true, true, true).unwrap()),
+            want
+        );
+        assert_eq!(
+            fields(pool.copy(&src, None, false, true, true).unwrap()),
+            want
+        );
     }
 
     /// B8: `convert` / `convert_type` reject compressed input.

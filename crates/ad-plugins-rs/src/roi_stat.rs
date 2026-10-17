@@ -91,6 +91,8 @@ pub struct ROIStatParams {
     pub ts_min_value: usize,
     pub ts_max_value: usize,
     pub ts_timestamp: usize,
+    /// The base `NDArraySizeX/Y/Z`; ROIStat sets X and Y from its input.
+    pub array_size: [usize; 3],
 }
 
 /// Processor that computes ROI statistics on 2D arrays.
@@ -337,7 +339,7 @@ impl NDPluginProcess for ROIStatProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         match verdict {
             ad_core_rs::plugin::runtime::WriteVerdict::Refuse { keep, .. } => {
@@ -487,6 +489,11 @@ impl NDPluginProcess for ROIStatProcessor {
         // Build per-ROI param updates (only for enabled ROIs)
         let p = &self.params;
         let mut updates = Vec::new();
+        // NDPluginROIStat.cpp:222-224: an axis the input lacks keeps its
+        // previous value.
+        for (reason, dim) in p.array_size.into_iter().zip(&array.dims).take(2) {
+            updates.push(ParamUpdate::int32(reason, dim.size as i32));
+        }
         for (i, roi) in rois.iter().enumerate() {
             if !roi.enabled || i >= state.results.len() {
                 continue;
@@ -655,6 +662,8 @@ impl NDPluginProcess for ROIStatProcessor {
         }
 
         // Export params
+        self.params.array_size =
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::array_size_reasons(base)?;
         *self.params_out.lock() = self.params;
 
         Ok(())
@@ -766,21 +775,34 @@ mod tests {
     fn a_refused_base_write_carries_c_error_message() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = ROIStatProcessor::new(vec![], 0);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(71, 0, 99, clamp, &base).verdict,
+            proc.validate_int32(
+                71,
+                0,
+                99,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Refuse {
                 keep: 1,
                 message: "NDPluginROIStat::writeInt32: status=0, function=71, value=99".into(),
             }
         );
         assert_eq!(
-            proc.validate_int32(71, 0, 1, WriteVerdict::Accept(1), &base)
-                .verdict,
+            proc.validate_int32(
+                71,
+                0,
+                1,
+                WriteVerdict::Accept(1),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -831,6 +853,7 @@ mod tests {
         use asyn_rs::port::{PortDriverBase, PortFlags};
         let mut base = PortDriverBase::new("RS_NAME", 2, PortFlags::default());
         let mut proc = ROIStatProcessor::new(vec![ROIStatROI::default(); 2], 2048);
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         for addr in 0..2 {
             assert_eq!(base.get_string_param(proc.params.name, addr).unwrap(), b"");
@@ -1103,6 +1126,18 @@ mod tests {
         assert!((r.max - 16.0).abs() < 1e-10);
     }
 
+    /// NDPluginROIStat.cpp:222-224 sets X and Y from the input, leaves an
+    /// axis a 1-D frame lacks as it was, and never touches Z or ArraySize.
+    #[test]
+    fn the_array_sizes_describe_the_input() {
+        let sizes = crate::test_util::array_sizes(
+            "RS_SIZES",
+            ROIStatProcessor::new(vec![], 0),
+            &[make_2d_array(8, 6, |_, _| 0.0), make_1d_array(5, |_| 0.0)],
+        );
+        assert_eq!(sizes, [[8, 6, 0, 0], [5, 6, 0, 0]]);
+    }
+
     fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
         let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
@@ -1154,6 +1189,7 @@ mod tests {
         }];
         let mut proc = ROIStatProcessor::new(rois, 0);
         let mut base = PortDriverBase::new("roistat_adp16", 1, PortFlags::default());
+        ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         let p = *proc.params_handle().lock();
 

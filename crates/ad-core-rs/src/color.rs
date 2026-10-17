@@ -73,7 +73,8 @@ fn output(
     arr.unique_id = src.unique_id;
     arr.copy_time_stamps_from(src);
     arr.attributes = src.attributes.clone();
-    arr.codec = src.codec.clone();
+    // C copies the frame onto it with `copy(pArray, pArrayOut, 0, 0)`.
+    arr.codec = src.codec.as_ref().map(crate::codec::Codec::copied);
     Ok(arr)
 }
 
@@ -1809,6 +1810,34 @@ mod tests {
             .unwrap();
         assert_eq!(result.data.len(), 5);
         assert_eq!(result.data.data_type(), NDDataType::UInt8);
+    }
+
+    /// C copies the frame onto a conversion output with
+    /// `copy(pArray, pArrayOut, 0, 0)`, which carries only `codec.name`.
+    #[test]
+    fn a_conversion_output_keeps_only_the_codec_name() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut src = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        src.codec = Some(crate::codec::Codec {
+            name: crate::codec::CodecName::Blosc,
+            compressed_size: 12,
+            level: 5,
+            shuffle: 1,
+            compressor: 2,
+            original_data_type: NDDataType::UInt8,
+        });
+        let out = convert_rgb_layout(&pool, &src, NDColorMode::RGB1, NDColorMode::RGB3).unwrap();
+        let c = out.codec.clone().unwrap();
+        let unset = crate::codec::Codec::UNSET;
+        assert_eq!(c.name, crate::codec::CodecName::Blosc);
+        assert_eq!((c.level, c.shuffle, c.compressor), (unset, unset, unset));
     }
 
     #[test]

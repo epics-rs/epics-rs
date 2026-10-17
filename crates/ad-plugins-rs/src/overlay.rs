@@ -698,7 +698,7 @@ impl NDPluginProcess for OverlayProcessor {
         addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         let outcome = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
         let p = &self.params;
@@ -876,13 +876,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = OverlayProcessor::new(8, vec![]);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -1646,7 +1653,13 @@ mod tests {
         value: i32,
     ) -> Vec<(usize, i32)> {
         use ad_core_rs::plugin::runtime::WriteVerdict;
-        let out = p.validate_int32(reason, 0, value, WriteVerdict::Accept(value), base);
+        let out = p.validate_int32(
+            reason,
+            0,
+            value,
+            WriteVerdict::Accept(value),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(base),
+        );
         assert!(out.settled);
         base.set_int32_param(reason, 0, out.verdict.kept()).unwrap();
         out.side

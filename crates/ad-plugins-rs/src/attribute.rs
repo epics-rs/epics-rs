@@ -190,7 +190,7 @@ impl NDPluginProcess for AttributeProcessor {
         _addr: i32,
         _value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        _params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         let out = ad_core_rs::plugin::runtime::WriteOutcome::from(verdict.succeed());
         if reason != self.params.reset {
@@ -262,13 +262,20 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = AttributeProcessor::new(8);
-        let base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
         };
         assert_eq!(
-            proc.validate_int32(0, 0, 98, clamp, &base).verdict,
+            proc.validate_int32(
+                0,
+                0,
+                98,
+                clamp,
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(1)
         );
     }
@@ -348,7 +355,13 @@ mod tests {
         proc.process_array(&Arc::new(make_array_with_attr("Count", 100.0, 1)), &pool);
 
         let p = proc.params;
-        let out = proc.validate_int32(p.reset, 0, 0, WriteVerdict::Accept(0), &base);
+        let out = proc.validate_int32(
+            p.reset,
+            0,
+            0,
+            WriteVerdict::Accept(0),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
         assert!(out.settled);
         let zero = |reason, addr| SideParam::Float64 {
             reason,

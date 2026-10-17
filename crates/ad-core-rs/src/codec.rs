@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use crate::ndarray::NDDataType;
 
 /// Codec names for compressed NDArray data (matching C++ `NDCodecName`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodecName {
     None,
     JPEG,
@@ -12,12 +14,15 @@ pub enum CodecName {
     BSLZ4,
     /// LZ4 in the HDF5 framing variant (C++ `NDCODEC_LZ4HDF5`).
     LZ4HDF5,
+    /// Any other name, kept as given: C `NDCodec_t::name` is a free string
+    /// (NDCodec.h:35) that consumers match by name.
+    Other(Arc<str>),
 }
 
 impl CodecName {
     /// Codec name string as published in the EPICS `CODEC` parameter and the
     /// `NDArray.codec.name` field (matching C++ `NDCodecName`).
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::None => "",
             Self::JPEG => "jpeg",
@@ -26,6 +31,21 @@ impl CodecName {
             Self::Blosc => "blosc",
             Self::BSLZ4 => "bslz4",
             Self::LZ4HDF5 => "lz4hdf5",
+            Self::Other(name) => name,
+        }
+    }
+
+    /// Inverse of [`CodecName::as_str`]: C's `codec.name` string.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "" => Self::None,
+            "jpeg" => Self::JPEG,
+            "zlib" => Self::Zlib,
+            "lz4" => Self::LZ4,
+            "blosc" => Self::Blosc,
+            "bslz4" => Self::BSLZ4,
+            "lz4hdf5" => Self::LZ4HDF5,
+            other => Self::Other(other.into()),
         }
     }
 
@@ -37,15 +57,17 @@ impl CodecName {
     /// codec, used both when the operator writes the parameter and when the
     /// Codec plugin reports the codec it found on a decompressed array
     /// (C `setIntegerParam(NDCodecCompressor, ...)`, NDPluginCodec.cpp:734-757).
-    pub fn ordinal(self) -> i32 {
+    /// An `Other` name has none; C leaves the parameter as it was (:967-970).
+    pub fn ordinal(&self) -> Option<i32> {
         match self {
-            Self::None => 0,
-            Self::JPEG => 1,
-            Self::Zlib => 2,
-            Self::Blosc => 3,
-            Self::LZ4 => 4,
-            Self::LZ4HDF5 => 5,
-            Self::BSLZ4 => 6,
+            Self::None => Some(0),
+            Self::JPEG => Some(1),
+            Self::Zlib => Some(2),
+            Self::Blosc => Some(3),
+            Self::LZ4 => Some(4),
+            Self::LZ4HDF5 => Some(5),
+            Self::BSLZ4 => Some(6),
+            Self::Other(_) => None,
         }
     }
 
@@ -136,6 +158,30 @@ pub struct Codec {
     pub original_data_type: NDDataType,
 }
 
+impl Codec {
+    /// A level, shuffle or compressor the codec does not set: C
+    /// `NDCodec_t::clear` (NDCodec.h:44-49), which every pool allocation runs.
+    pub const UNSET: i32 = -1;
+
+    /// The codec C `NDArrayPool::copy` leaves on a copy: only `codec.name`
+    /// is assigned (NDArrayPool.cpp:293) over the cleared codec of the
+    /// allocation, so level, shuffle and compressor read back UNSET. The
+    /// compressed size and the uncompressed type travel with the data.
+    pub fn copied(&self) -> Codec {
+        Codec {
+            level: Self::UNSET,
+            shuffle: Self::UNSET,
+            compressor: Self::UNSET,
+            ..self.clone()
+        }
+    }
+
+    /// Whether [`copied`](Self::copied) would leave this codec as it is.
+    pub fn is_copied(&self) -> bool {
+        [self.level, self.shuffle, self.compressor] == [Self::UNSET; 3]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +200,22 @@ mod tests {
         assert_eq!(c2.name, CodecName::LZ4);
         assert_eq!(c2.compressed_size, 1024);
         assert_eq!(c2.original_data_type, NDDataType::UInt16);
+    }
+
+    /// C's codec name is a free string (NDCodec.h:35): a name the port does
+    /// not implement is kept and given back as received.
+    #[test]
+    fn from_name_keeps_any_name() {
+        for name in [
+            "", "jpeg", "zlib", "lz4", "blosc", "bslz4", "lz4hdf5", "szip",
+        ] {
+            assert_eq!(CodecName::from_name(name).as_str(), name);
+        }
+        assert_eq!(
+            CodecName::from_name("szip"),
+            CodecName::Other("szip".into())
+        );
+        assert_eq!(CodecName::from_name("szip").ordinal(), None);
     }
 
     #[test]

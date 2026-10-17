@@ -23,7 +23,7 @@
 //! [`crate::ndarray_pool::NDArrayPool::convert_type`] instead.
 
 use crate::error::{ADError, ADResult};
-use crate::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use crate::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 
 /// Accumulator for [`convert_dims_into`]'s binning sum. C `convertDim`
 /// (`NDArrayPool.cpp:465`) does `*pDOut += (dataTypeOut)*pDIn` — each source
@@ -426,6 +426,29 @@ pub fn convert_type_into(src: &NDArray, out: &mut NDDataBuffer) -> ADResult<()> 
 
     crate::with_buffer!(&src.data, |v| cast_into!(v, out));
     Ok(())
+}
+
+/// The C cast `(D)value` of one `f64` to the element type of `data_type`,
+/// in little-endian bytes: the `CCast` [`convert_type_into`] applies to
+/// every element.
+pub fn c_cast_f64_le(value: f64, data_type: NDDataType) -> Vec<u8> {
+    macro_rules! le {
+        ($t:ty) => {
+            <f64 as CCast<$t>>::c_cast(value).to_le_bytes().to_vec()
+        };
+    }
+    match data_type {
+        NDDataType::Int8 => le!(i8),
+        NDDataType::UInt8 => le!(u8),
+        NDDataType::Int16 => le!(i16),
+        NDDataType::UInt16 => le!(u16),
+        NDDataType::Int32 => le!(i32),
+        NDDataType::UInt32 => le!(u32),
+        NDDataType::Int64 => le!(i64),
+        NDDataType::UInt64 => le!(u64),
+        NDDataType::Float32 => le!(f32),
+        NDDataType::Float64 => le!(f64),
+    }
 }
 
 /// The dimensions [`convert_dims_into`] produces for `dims_out`, after the checks

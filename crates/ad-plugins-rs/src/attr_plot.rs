@@ -37,7 +37,7 @@ use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
-    WriteOutcome, WriteVerdict,
+    WriteOutcome, WritePort, WriteVerdict,
 };
 use parking_lot::Mutex;
 
@@ -485,7 +485,7 @@ impl NDPluginProcess for AttrPlotProcessor {
         addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
-        params: &asyn_rs::port::PortDriverBase,
+        params: &mut WritePort<'_>,
     ) -> WriteOutcome<i32> {
         let state = self.state.lock();
         if Some(reason) == state.params.data_select
@@ -649,23 +649,47 @@ mod tests {
         };
 
         assert_eq!(
-            proc.validate_int32(select, 1, 0, WriteVerdict::Accept(0), &base)
-                .verdict,
+            proc.validate_int32(
+                select,
+                1,
+                0,
+                WriteVerdict::Accept(0),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(0)
         );
         assert_eq!(
-            proc.validate_int32(select, 1, -1, WriteVerdict::Accept(-1), &base)
-                .verdict,
+            proc.validate_int32(
+                select,
+                1,
+                -1,
+                WriteVerdict::Accept(-1),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             WriteVerdict::Accept(-1)
         );
         assert_eq!(
-            proc.validate_int32(select, 1, 9, WriteVerdict::Accept(9), &base)
-                .verdict,
+            proc.validate_int32(
+                select,
+                1,
+                9,
+                WriteVerdict::Accept(9),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             refused
         );
         assert_eq!(
-            proc.validate_int32(select, 5, 0, WriteVerdict::Accept(0), &base)
-                .verdict,
+            proc.validate_int32(
+                select,
+                5,
+                0,
+                WriteVerdict::Accept(0),
+                &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base)
+            )
+            .verdict,
             refused
         );
     }

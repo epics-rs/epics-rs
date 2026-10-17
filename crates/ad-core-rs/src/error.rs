@@ -31,6 +31,11 @@ pub enum ADError {
     /// `message` is what it leaves in `NDFileWriteMessage`.
     #[error("{message}")]
     Reported { lines: Vec<String>, message: String },
+
+    /// A write after which the writer closed its own file and C drops the
+    /// capture with no `closeFileBase` (NDFileHDF5.cpp:1519-1557).
+    #[error("{0}")]
+    Aborted(Box<ADError>),
 }
 
 impl ADError {
@@ -38,7 +43,24 @@ impl ADError {
     pub fn lines(&self) -> &[String] {
         match self {
             Self::Reported { lines, .. } => lines,
+            Self::Aborted(e) => e.lines(),
             _ => &[],
+        }
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted(_))
+    }
+
+    /// The same failure with its lines dropped, once they have been printed.
+    pub fn without_lines(self) -> Self {
+        match self {
+            Self::Reported { message, .. } => Self::Reported {
+                lines: Vec::new(),
+                message,
+            },
+            Self::Aborted(e) => Self::Aborted(Box::new(e.without_lines())),
+            e => e,
         }
     }
 }

@@ -176,6 +176,8 @@ pub struct JpegFileProcessor {
     ctrl: Mutex<FilePluginController<JpegWriter>>,
     quality: SettingsStore<u8>,
     jpeg_quality_idx: Option<usize>,
+    /// The plugin's driver, for the posts a capture flush makes.
+    attributes: Option<ad_core_rs::plugin::runtime::PluginAttributes>,
 }
 
 impl JpegFileProcessor {
@@ -185,6 +187,7 @@ impl JpegFileProcessor {
             quality: writer.quality.store(),
             ctrl: Mutex::new(FilePluginController::new(writer)),
             jpeg_quality_idx: None,
+            attributes: None,
         }
     }
 }
@@ -202,6 +205,10 @@ impl NDPluginProcess for JpegFileProcessor {
         self.ctrl.lock().posts_before_write(reason, value)
     }
 
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
     /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870). C reads
     /// NDFileJPEGQuality from the param library at open (NDFileJPEG.cpp:98),
     /// so the write stores it without waiting on a file write in progress.
@@ -211,10 +218,10 @@ impl NDPluginProcess for JpegFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        _params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
         let mut ctrl = self.ctrl.lock();
-        let out = ctrl.write_int32(reason, value, verdict);
+        let out = ctrl.write_int32(reason, value, verdict, params);
         if Some(reason) == self.jpeg_quality_idx {
             let q = out.verdict.kept().clamp(1, 100) as u8;
             self.quality.update(|v| *v = q);
@@ -234,7 +241,14 @@ impl NDPluginProcess for JpegFileProcessor {
         self.ctrl.lock().write_octet(reason, verdict)
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.lock().process_array(array)
+        // Made before the controller lock: its reads wait on the actor,
+        // which takes that lock in its writes.
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
+        self.ctrl.lock().process_array(array, &mut post)
+    }
+
+    fn bind_attributes(&mut self, attributes: ad_core_rs::plugin::runtime::PluginAttributes) {
+        self.attributes = Some(attributes);
     }
 
     fn plugin_type(&self) -> &str {
@@ -469,7 +483,13 @@ mod tests {
         let writer = Arc::clone(&proc.ctrl.lock().writer);
         assert!(
             crate::test_util::returns_while_busy(&writer, || {
-                proc.validate_int32(idx, 0, 80, WriteVerdict::Accept(80), &base);
+                proc.validate_int32(
+                    idx,
+                    0,
+                    80,
+                    WriteVerdict::Accept(80),
+                    &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+                );
             }),
             "the quality write waited for the file write"
         );

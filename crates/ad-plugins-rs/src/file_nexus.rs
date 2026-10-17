@@ -1003,6 +1003,10 @@ impl NDPluginProcess for NexusFileProcessor {
         self.ctrl.lock().posts_before_write(reason, value)
     }
 
+    fn processing_required(&self, array: &NDArray) -> bool {
+        self.ctrl.lock().processing_required(array)
+    }
+
     /// C NDPluginFile::writeInt32 (NDPluginFile.cpp:799-870).
     fn validate_int32(
         &self,
@@ -1010,12 +1014,10 @@ impl NDPluginProcess for NexusFileProcessor {
         _addr: i32,
         value: i32,
         verdict: ad_core_rs::plugin::runtime::WriteVerdict<i32>,
-        params: &asyn_rs::port::PortDriverBase,
+        params: &mut ad_core_rs::plugin::runtime::WritePort<'_>,
     ) -> ad_core_rs::plugin::runtime::WriteOutcome<i32> {
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads_on(params));
         let mut ctrl = self.ctrl.lock();
-        ctrl.set_attribute_reads(attributes);
-        ctrl.write_int32(reason, value, verdict)
+        ctrl.write_int32(reason, value, verdict, params)
     }
 
     /// C `NDFileNexus::writeOctet` (NDFileNexus.cpp:776-813) loads the
@@ -1062,12 +1064,11 @@ impl NDPluginProcess for NexusFileProcessor {
         )
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
-        // Read before the controller lock: the read waits on the actor,
+        // Made before the controller lock: its reads wait on the actor,
         // which takes that lock in its writes.
-        let attributes = self.attributes.as_ref().and_then(|a| a.reads());
+        let mut post = ad_core_rs::plugin::runtime::PortPost::of(self.attributes.as_ref());
         let mut ctrl = self.ctrl.lock();
-        ctrl.set_attribute_reads(attributes);
-        ctrl.process_array(array)
+        ctrl.process_array(array, &mut post)
     }
 
     fn bind_attributes(&mut self, attributes: PluginAttributes) {

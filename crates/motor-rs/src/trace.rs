@@ -24,6 +24,17 @@ pub enum TraceUser {
         card: i32,
         signal: i32,
     },
+    /// A `motor_interface.h` axis reached through devMotorSim (devMotorSim.c):
+    /// card `card`, axis `signal` of the `drvet` named `driver`, which a
+    /// record's VME_IO parm names, under DTYP `device`. The driver's own task
+    /// calls the dset back with what it changed; there is no asyn user and no
+    /// motordevCom, so nothing prints.
+    MotorInterface {
+        device: &'static str,
+        driver: &'static str,
+        card: i32,
+        signal: i32,
+    },
 }
 
 /// The device support and the poller share one [`TraceUser`], so every line
@@ -78,7 +89,7 @@ impl MotorTrace {
     pub fn port(&self) -> &str {
         match &self.user {
             TraceUser::Asyn { port, .. } | TraceUser::Model2 { port, .. } => port,
-            TraceUser::Model1 { .. } => "",
+            TraceUser::Model1 { .. } | TraceUser::MotorInterface { .. } => "",
         }
     }
 
@@ -86,7 +97,7 @@ impl MotorTrace {
     pub fn addr(&self) -> i32 {
         match self.user {
             TraceUser::Asyn { addr, .. } | TraceUser::Model2 { addr, .. } => addr,
-            TraceUser::Model1 { .. } => 0,
+            TraceUser::Model1 { .. } | TraceUser::MotorInterface { .. } => 0,
         }
     }
 
@@ -99,6 +110,12 @@ impl MotorTrace {
     /// Whether the axis is a model-1 card signal, with no asyn driver layer.
     pub fn is_model1(&self) -> bool {
         matches!(self.user, TraceUser::Model1 { .. })
+    }
+
+    /// Whether the axis is a `motor_interface.h` driver's, bound through
+    /// devMotorSim.
+    pub fn is_motor_interface(&self) -> bool {
+        matches!(self.user, TraceUser::MotorInterface { .. })
     }
 
     /// Whether the driver layer is `drvMotorAsyn.c` (model 2) rather than

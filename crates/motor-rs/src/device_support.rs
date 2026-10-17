@@ -65,6 +65,20 @@ impl MotorAxis {
         self
     }
 
+    /// This axis reached at `user` as well, on the same poller: a second
+    /// open of one driver axis returns the same handle (drvMotorSim.c:205-214).
+    pub(crate) fn at(&self, user: TraceUser) -> Self {
+        Self {
+            user,
+            timeout: self.timeout,
+            poll_cmd_tx: self.poll_cmd_tx.clone(),
+            motor_cmd_tx: self.motor_cmd_tx.clone(),
+            subscribers: self.subscribers.clone(),
+            report: self.report.clone(),
+            disables_ntm: self.disables_ntm,
+        }
+    }
+
     /// The driver's [`AxisReport`], C's `asynMotorAxis::report` override.
     pub fn with_report(mut self, report: Arc<dyn AxisReport>) -> Self {
         self.report = Some(report);
@@ -110,7 +124,7 @@ impl MotorAxis {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
         let trace = Arc::new(MotorTrace::with_user(self.user.clone()));
-        if trace.is_model1()
+        if (trace.is_model1() || trace.is_motor_interface())
             && let Ok(mut ds) = device_state.lock()
         {
             ds.set_motordevcom();
@@ -513,7 +527,7 @@ impl DeviceSupport for MotorDeviceSupport {
             TraceUser::Asyn { .. } | TraceUser::Model2 { .. } => {
                 crate::devices::DEV_MOTOR_ASYN.choice
             }
-            TraceUser::Model1 { device, .. } => device,
+            TraceUser::Model1 { device, .. } | TraceUser::MotorInterface { device, .. } => device,
         }
     }
 

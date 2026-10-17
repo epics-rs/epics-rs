@@ -20,13 +20,24 @@ use motor_rs::builder::{AxisSetup, MotorBuilder};
 use motor_rs::device_state::{AxisSubscribers, StampedStatus};
 use motor_rs::device_support::MotorAxis;
 use motor_rs::devices::{
-    device_support_factory, devices, model1_device, register_axis, register_controller_port,
-    register_drv_motor_asyn_port, register_model1_device,
+    device_support_factory, devices, model1_device, motor_interface_device, register_axis,
+    register_controller_port, register_drv_motor_asyn_port, register_model1_device,
+    register_motor_interface_device, register_motor_interface_driver,
 };
 use motor_rs::trace::TraceUser;
 use tokio::sync::mpsc;
 
 static MODEL1: DevSup = model1_device("devTestModel1", "TestModel1");
+static SIM: DevSup = motor_interface_device("devTestSim", "TestSim");
+
+fn sim(card: i32, signal: i32) -> TraceUser {
+    TraceUser::MotorInterface {
+        device: SIM.choice,
+        driver: "testSim",
+        card,
+        signal,
+    }
+}
 
 /// An axis at `user` whose status cache reads `position`; no poller runs, as
 /// `init_record` only reads that cache.
@@ -99,6 +110,9 @@ fn asyn(port: &str, addr: i32) -> TraceUser {
 
 async fn boot(db: &str) -> Arc<PvDatabase> {
     register_model1_device(&MODEL1);
+    register_motor_interface_device(&SIM);
+    // The tests register testSim's axes themselves.
+    register_motor_interface_driver("testSim", |_, _| false);
     let (name, factory) = motor_rs::motor_record_factory();
     let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
@@ -165,6 +179,100 @@ record(motor, "B:m") { field(DTYP, "TestModel1") field(OUT, "#C1 S2 @") field(MR
     .await;
     assert_eq!(field(&db, "B:m.DRBV"), EpicsValue::Double(30.0));
     assert_eq!(field(&db, "B:m.CARD"), EpicsValue::Short(1));
+}
+
+/// devMotorSim.c:131-200: the drvet the parm names, at the OUT's card and
+/// signal; it has no in-use check, so two records open one axis.
+#[tokio::test]
+async fn a_motor_interface_out_reaches_the_axis_of_the_driver_its_parm_names() {
+    axis(sim(4, 1), 50.0);
+    let (db, lines) = errlog_of(boot(
+        r##"
+record(motor, "H:m0") { field(DTYP, "TestSim") field(OUT, "#C4 S1 @testSim") field(MRES, "1") }
+record(motor, "H:m1") { field(DTYP, "TestSim") field(OUT, "#C4 S1 @testSim") field(MRES, "1") }
+"##,
+    ))
+    .await;
+    assert!(!lines.iter().any(|l| l.contains("PV: H:m")), "{lines:?}");
+    for pv in ["H:m0", "H:m1"] {
+        assert_eq!(field(&db, &format!("{pv}.DRBV")), EpicsValue::Double(50.0));
+        assert_eq!(field(&db, &format!("{pv}.CARD")), EpicsValue::Short(4));
+    }
+}
+
+/// devMotorSim's init_record calls the drvet's `open` (devMotorSim.c:143):
+/// the first record to name an axis opens it, later ones bind the same one,
+/// and an axis the driver lacks fails init.
+#[tokio::test]
+async fn a_motor_interface_record_opens_its_axis_at_init() {
+    let opens = Arc::new(Mutex::new(Vec::new()));
+    let log = opens.clone();
+    register_motor_interface_driver("testOpen", move |card, signal| {
+        log.lock().unwrap().push((card, signal));
+        if signal != 0 {
+            return false;
+        }
+        let user = TraceUser::MotorInterface {
+            device: SIM.choice,
+            driver: "testOpen",
+            card,
+            signal,
+        };
+        let subscribers = AxisSubscribers::new();
+        subscribers.store(StampedStatus {
+            seq: 1,
+            status: MotorStatus {
+                position: 70.0,
+                done: true,
+                ..MotorStatus::default()
+            },
+        });
+        register_axis(unpolled(user, subscribers)).is_ok()
+    });
+    let (db, lines) = errlog_of(boot(
+        r##"
+record(motor, "O:m0") { field(DTYP, "TestSim") field(OUT, "#C6 S0 @testOpen") field(MRES, "1") }
+record(motor, "O:m1") { field(DTYP, "TestSim") field(OUT, "#C6 S0 @testOpen") field(MRES, "1") }
+record(motor, "O:m2") { field(DTYP, "TestSim") field(OUT, "#C6 S4 @testOpen") }
+"##,
+    ))
+    .await;
+    assert_eq!(*opens.lock().unwrap(), [(6, 0), (6, 4)]);
+    for pv in ["O:m0", "O:m1"] {
+        assert_eq!(field(&db, &format!("{pv}.DRBV")), EpicsValue::Double(70.0));
+    }
+    let want = "recGblRecordError: devMotor (init_record) cannot open device support Error (513,1) PV: O:m2";
+    assert!(lines.iter().any(|l| l == want), "{lines:?}");
+}
+
+/// devMotorSim.c:136-196 then motorRecord.cc:648-651: each refusal is a
+/// recGblRecordError and CARD -1. M_drvSup has no symbol table.
+#[tokio::test]
+async fn a_motor_interface_record_reports_each_devmotorsim_refusal() {
+    axis(sim(5, 0), 0.0);
+    let (db, lines) = errlog_of(boot(
+        r##"
+record(motor, "I:m0") { field(DTYP, "TestSim") field(OUT, "#C5 S0 @noSuchDriver") }
+record(motor, "I:m1") { field(DTYP, "TestSim") field(OUT, "#C5 S3 @testSim") }
+record(motor, "I:m2") { field(DTYP, "TestSim") field(OUT, "@asyn(X,0)") }
+"##,
+    ))
+    .await;
+    for (pv, why) in [
+        (
+            "I:m0",
+            "cannot find device support entry table Error (513,3)",
+        ),
+        ("I:m1", "cannot open device support Error (513,1)"),
+        ("I:m2", "Illegal INP field Illegal field value"),
+    ] {
+        let want = format!("recGblRecordError: devMotor (init_record) {why} PV: {pv}");
+        assert!(
+            lines.iter().any(|l| l == &want),
+            "{want:?} not in {lines:?}"
+        );
+        assert_eq!(field(&db, &format!("{pv}.CARD")), EpicsValue::Short(-1));
+    }
 }
 
 /// devMotorAsyn.c:285-291 then `bad:` — the record loads, prints on the

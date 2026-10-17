@@ -75,10 +75,45 @@ pub struct MotorPollLoop {
     controller_poll: Option<ControllerPoll>,
 }
 
-/// An axis joining a running poller, and the reply once it has.
+/// An add to a running poller, and the reply once it has taken it.
 pub(crate) struct Joining {
-    pub(crate) axis: Axis,
+    pub(crate) join: Join,
     pub(crate) joined: std::sync::mpsc::SyncSender<()>,
+}
+
+/// What an add puts in a controller's axis list.
+pub(crate) enum Join {
+    /// A driver axis not added before.
+    Axis(Box<Axis>),
+    /// A controller port address for the axis of `motor`, added before
+    /// with none: its status is mirrored there.
+    Mirror {
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        port: String,
+        addr: i32,
+    },
+}
+
+impl Join {
+    /// Apply the add to `axes`, kept in address order.
+    pub(crate) fn place(self, axes: &mut Vec<Axis>) {
+        let axis = match self {
+            Self::Axis(axis) => *axis,
+            Self::Mirror { motor, port, addr } => {
+                let Some(at) = axes
+                    .iter()
+                    .position(|a| std::ptr::addr_eq(Arc::as_ptr(&a.motor), Arc::as_ptr(&motor)))
+                else {
+                    return;
+                };
+                let mut axis = axes.remove(at);
+                axis.mirror_to(&port, addr);
+                axis
+            }
+        };
+        let at = axes.partition_point(|a| a.order() <= axis.order());
+        axes.insert(at, axis);
+    }
 }
 
 /// C `asynMotorController::poll`, run before the axes on every pass.
@@ -370,6 +405,14 @@ impl Axis {
                 cdir = Some(forward);
                 continue;
             }
+            // devMotorSim's GET_INFO only sets needUpdate (devMotorSim.c
+            // build_trans): no driver call, no process.
+            if let (MotorCommand::Poll, Some(record)) = (command, batch.record)
+                && batch.trace.is_motor_interface()
+            {
+                self.subscribers.get_info(record);
+                continue;
+            }
             if batch.record.is_some() {
                 async_callback_flow(&batch.trace, command);
             }
@@ -414,7 +457,9 @@ impl Axis {
             }
             if !matches!(command, MotorCommand::SetPosition { .. }) {
                 match &mut self.pacing {
-                    Pacing::Poller => self.woken = true,
+                    // drvMotorSim's motorProcTask keeps its period: nothing
+                    // wakes it (drvMotorSim.c:660-690).
+                    Pacing::Poller => self.woken = !batch.trace.is_motor_interface(),
                     // A MOTION or VELOCITY message replaces the held move
                     // and clears its count (motordrvCom.cc:415-437).
                     Pacing::MotorTask { held, .. } => {
@@ -857,12 +902,13 @@ impl MotorPollLoop {
         }
     }
 
-    /// An axis added to the running controller: its first poll follows a
+    /// An add to the running controller. A new axis's first poll follows a
     /// controller poll, as on the pass C's poller first finds it.
-    fn join(&mut self, Joining { mut axis, joined }: Joining) {
-        axis.prime_cache(&polled::after(&mut self.controller_poll));
-        let at = self.axes.partition_point(|a| a.order() <= axis.order());
-        self.axes.insert(at, axis);
+    fn join(&mut self, Joining { mut join, joined }: Joining) {
+        if let Join::Axis(axis) = &mut join {
+            axis.prime_cache(&polled::after(&mut self.controller_poll));
+        }
+        join.place(&mut self.axes);
         let _ = joined.send(());
     }
 
@@ -1474,6 +1520,8 @@ fn execute_commands_after(
     let axis = trace.addr();
     let model2 = trace.is_model2();
     let controller = trace.is_controller();
+    // A motorAxisDrvSET_t driver, behind drvMotorAsyn or devMotorSim.
+    let drvset = model2 || trace.is_motor_interface();
     // The C subclass write around asynMotorController's.
     let hook = controller
         .then(|| crate::devices::write_hook(port))
@@ -1485,7 +1533,7 @@ fn execute_commands_after(
         .then(|| crate::devices::param_store(port))
         .flatten();
     for cmd in commands {
-        let c = if model2 {
+        let c = if drvset {
             c_write(cmd).and_then(|(_, value)| Some((drv_motor_asyn_reason(cmd)?, value)))
         } else {
             c_write(cmd)
@@ -1725,7 +1773,7 @@ fn execute_commands_after(
             writes.extend(position);
             writes.extend(motor.take_status_writes());
             writes.extend(moved);
-        } else if model2 {
+        } else if drvset {
             writes.extend(motor.take_status_writes());
             if result.is_ok() {
                 writes.extend(position.or(moved));
@@ -1738,7 +1786,7 @@ fn execute_commands_after(
         }
         // A model-2 driver stores a parameter only once the write succeeded
         // (drvMotorSim.c:364-368, 424-428).
-        let param = c.filter(|&(reason, _)| model2 && result.is_ok() && is_driver_param(reason));
+        let param = c.filter(|&(reason, _)| drvset && result.is_ok() && is_driver_param(reason));
         on_write(AxisWrite {
             fields: writes,
             param,
@@ -2871,5 +2919,198 @@ mod tests {
         send_move(&mut poll_loop);
         assert_eq!(poll_loop.timed_pass(), None);
         assert_eq!(held(&poll_loop), None);
+    }
+
+    // devMotorSim on a motor_interface.h driver: drvMotorSim's motorProcTask
+    // (drvMotorSim.c:660-690) calls back what changed every period, moving
+    // or idle, and motor_callback copies the raw status and scanOnce's the
+    // record (devMotorSim.c:73-126).
+
+    fn interface_user() -> TraceUser {
+        TraceUser::MotorInterface {
+            device: "Motor Simulation",
+            driver: "motorSim",
+            card: 0,
+            signal: 0,
+        }
+    }
+
+    /// A devMotorSim axis whose startup poll reads `rest` and whose later
+    /// polls answer from `script`, with one record bound past its gate.
+    fn interface_task(
+        rest: MotorStatus,
+        script: Vec<Option<MotorStatus>>,
+    ) -> (
+        MotorPollLoop,
+        Arc<Mutex<Script>>,
+        crate::device_support::MotorDeviceSupport,
+    ) {
+        let script = std::iter::once(Some(rest)).chain(script);
+        let script = Arc::new(Mutex::new(Script(script.collect())));
+        let motor: Arc<Mutex<dyn AsynMotor>> = script.clone();
+        let setup = crate::builder::MotorBuilder::new(motor)
+            .trace_user(interface_user())
+            .poll_interval(SCAN)
+            .build_axis();
+        let support = setup.axis.attach();
+        support.device_state().lock().unwrap().accept();
+        (setup.poll_loop, script, support)
+    }
+
+    /// Record 0's build_trans.
+    fn interface_batch(commands: Vec<MotorCommand>) -> CommandBatch {
+        CommandBatch {
+            trace: Arc::new(MotorTrace::with_user(interface_user())),
+            record: Some(0),
+            commands,
+        }
+    }
+
+    fn msta(status: &MotorStatus) -> u32 {
+        crate::flags::MstaFlags::from_status(status).bits()
+    }
+
+    /// The sim reflecting off its high limit still moves: each raw status
+    /// is posted as the driver set it, DONE clear, and the task polls on.
+    #[test]
+    fn a_limit_is_posted_raw_while_the_driver_moves() {
+        // drvMotorSim raises motorAxisMoving with !done (drvMotorSim.c:652).
+        let hit = MotorStatus {
+            high_limit: true,
+            msta_moving: true,
+            ..at(5.0)
+        };
+        let back = MotorStatus {
+            direction: false,
+            position: 4.9,
+            ..hit.clone()
+        };
+        let (mut poll_loop, _, _record) = interface_task(
+            MotorStatus::default(),
+            vec![Some(hit.clone()), Some(back.clone())],
+        );
+        poll_loop.execute(
+            0,
+            &interface_batch(vec![MotorCommand::MoveAbsolute {
+                position: 9.0,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            }]),
+        );
+        for (want, word) in [(hit, 1029), (back, 1028)] {
+            assert!(poll_loop.timed_pass().is_some());
+            assert_eq!(poll_loop.axes[0].last_status.as_ref(), Some(&want));
+            assert_eq!(msta(&want), word);
+        }
+    }
+
+    /// No move is needed for a pass: an idle axis is polled every period,
+    /// and a change posts.
+    #[test]
+    fn an_idle_axis_is_polled_every_period_and_posts_a_change() {
+        let rest = MotorStatus::default();
+        let nudged = MotorStatus {
+            position: 1.0,
+            ..rest.clone()
+        };
+        let (mut poll_loop, script, _record) =
+            interface_task(rest.clone(), vec![Some(rest), Some(nudged.clone())]);
+        let seq = poll_loop.axes[0].status_seq;
+        let tick = Instant::now();
+        assert!(poll_loop.timed_pass().is_some_and(|due| due >= tick + SCAN));
+        assert_eq!(poll_loop.axes[0].status_seq, seq, "unchanged: no post");
+        assert!(poll_loop.timed_pass().is_some());
+        assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
+        assert_eq!(poll_loop.axes[0].last_status, Some(nudged));
+        assert_eq!(poll_loop.axes[0].pulses.len(), 1);
+        assert!(script.lock().unwrap().0.is_empty());
+    }
+
+    /// HOMR from rest on the high limit: motorAxisHome's done=0 callback
+    /// posts at once with the other bits as they were; the finished write
+    /// processes nothing more (no asynCallback), and the task keeps its
+    /// period.
+    #[test]
+    fn a_home_off_the_limit_posts_done_clear_at_once() {
+        let parked = MotorStatus {
+            position: 5.0,
+            high_limit: true,
+            direction: true,
+            done: true,
+            moving: false,
+            ..MotorStatus::default()
+        };
+        let (mut poll_loop, _, _record) = interface_task(parked.clone(), vec![]);
+        let seq = poll_loop.axes[0].status_seq;
+        poll_loop.execute(
+            0,
+            &interface_batch(vec![MotorCommand::Home {
+                forward: false,
+                min_velocity: 0.0,
+                velocity: 1.0,
+                acceleration: 1.0,
+            }]),
+        );
+        assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
+        assert_eq!(
+            poll_loop.axes[0].last_status,
+            Some(MotorStatus {
+                done: false,
+                ..parked
+            })
+        );
+        assert_eq!(poll_loop.axes[0].pulses.len(), 1);
+        assert!(!poll_loop.axes[0].woken);
+    }
+
+    /// GET_INFO is `needUpdate = 1` on the status last called back: no
+    /// driver call and no process.
+    #[test]
+    fn a_get_info_marks_need_update_and_neither_polls_nor_processes() {
+        let rest = MotorStatus::default();
+        let (mut poll_loop, script, record) = interface_task(rest.clone(), vec![Some(at(9.0))]);
+        let state = record.device_state().clone();
+        state.lock().unwrap().init_status();
+        let seq = poll_loop.axes[0].status_seq;
+        poll_loop.execute(0, &interface_batch(vec![MotorCommand::Poll]));
+        assert_eq!(
+            script.lock().unwrap().0.len(),
+            1,
+            "the driver was not polled"
+        );
+        assert_eq!(poll_loop.axes[0].status_seq, seq);
+        assert!(poll_loop.axes[0].pulses.is_empty());
+        assert_eq!(state.lock().unwrap().update_values(), Some(rest));
+    }
+
+    /// A controller port address for an axis added with none mirrors its
+    /// status there; a different second one is refused, as one
+    /// asynMotorAxis has one address.
+    #[test]
+    fn a_later_asyn_address_of_an_added_axis_is_mirrored() {
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(crate::sim_motor::SimMotor::default()));
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let axes = controller.axes();
+        let model2 = TraceUser::Model2 {
+            port: "PLM2".into(),
+            addr: 0,
+        };
+        let _first = controller.axis(motor.clone(), model2);
+        let at = |addr| TraceUser::Asyn {
+            port: "PLMIRROR".into(),
+            addr,
+        };
+        let _second = axes.add(motor.clone(), at(3)).unwrap();
+        assert!(axes.add(motor.clone(), at(3)).is_ok());
+        assert!(axes.add(motor, at(4)).is_err());
+        let idle = Duration::from_secs(60);
+        let poll_loop = controller.build(idle, idle, 0);
+        assert_eq!(poll_loop.axes.len(), 1);
+        assert_eq!(
+            poll_loop.axes[0].controller,
+            Some(("PLMIRROR".to_owned(), 3))
+        );
     }
 }

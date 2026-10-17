@@ -100,8 +100,9 @@ pub struct Callbacks {
     accepting: bool,
     /// `pmr->stat == COMM_ALARM` as the record's last pass committed it.
     comm_alarm: bool,
-    /// The record's device support is model-1 motordevCom, whose
-    /// `build_trans` has no COMM_ALARM check and no pending-move count.
+    /// The record's device support is model-1 motordevCom, or devMotorSim,
+    /// whose `build_trans` has no COMM_ALARM check and no pending-move
+    /// count either: only the driver's callback processes the record.
     motordevcom: bool,
     queued: std::collections::VecDeque<Callback>,
 }
@@ -155,6 +156,19 @@ impl MotorDeviceState {
         let status = callbacks.status.clone();
         self.queue(Callback::Status(status));
         true
+    }
+
+    /// devMotorSim's GET_INFO (devMotorSim.c build_trans): `needUpdate` on
+    /// the status last called back, with no process asked for.
+    ///
+    /// C defect, not copied: on an idle axis nothing processes the record
+    /// for this, so C's next put (after a no-op pass armed motorRecord's
+    /// implicit GET_INFO, e.g. SPMG Go) reads it as CALLBACK_DATA with STUP
+    /// BUSY, skips do_work (motorRecord.cc:1345, 1487) and the move is
+    /// lost with DMOV 0. A put pass here never consumes the mailbox
+    /// (`determine_event`), so the move dispatches.
+    pub fn get_info(&mut self) {
+        self.set_need_update(self.callbacks.status.clone());
     }
 
     /// The settle delay expired. True when the caller must pulse io_intr;
@@ -364,6 +378,18 @@ impl AxisSubscribers {
             .and_then(|bound| bound.device_state.lock().ok())
         {
             ds.driver_cdir = Some(cdir);
+        }
+    }
+
+    /// `record`'s GET_INFO on a devMotorSim axis ([`MotorDeviceState::get_info`]).
+    pub(crate) fn get_info(&self, record: RecordId) {
+        let subscribed = self.lock();
+        if let Some(mut ds) = subscribed
+            .records
+            .get(record)
+            .and_then(|bound| bound.device_state.lock().ok())
+        {
+            ds.get_info();
         }
     }
 

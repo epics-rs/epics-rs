@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 
 use crate::device_state::AxisSubscribers;
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
-use crate::poll_loop::{Axis, ControllerPoll, Joining, MotorPollLoop, PollCommand, PollerInbox};
+use crate::poll_loop::{
+    Axis, ControllerPoll, Join, Joining, MotorPollLoop, PollCommand, PollerInbox,
+};
 use crate::record::MotorRecord;
 use crate::trace::TraceUser;
 
@@ -213,7 +215,22 @@ pub struct ControllerBuilder {
 /// (asynMotorController.cpp:655-661): an axis added once the poller runs
 /// joins it, polled in address order with the rest.
 #[derive(Clone)]
-pub struct ControllerAxes(Arc<Mutex<AxisList>>);
+pub struct ControllerAxes(Arc<Mutex<Axes>>);
+
+struct Axes {
+    list: AxisList,
+    /// Each driver axis added, once: a later add of the same one is another
+    /// address of the axis already polled.
+    opened: Vec<Opened>,
+}
+
+struct Opened {
+    motor: Arc<Mutex<dyn AsynMotor>>,
+    axis: MotorAxis,
+    poll_cmd_tx: mpsc::Sender<PollCommand>,
+    /// The controller port address the status is mirrored to.
+    mirror: Option<(String, i32)>,
+}
 
 enum AxisList {
     /// Before the poller starts.
@@ -224,13 +241,17 @@ enum AxisList {
 
 impl Default for ControllerAxes {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(AxisList::Pending(Vec::new()))))
+        Self(Arc::new(Mutex::new(Axes {
+            list: AxisList::Pending(Vec::new()),
+            opened: Vec::new(),
+        })))
     }
 }
 
 impl ControllerAxes {
     /// Add an axis; on a running poller, return once the poller has taken
-    /// it, so its status is cached before any record binds it.
+    /// it, so its status is cached before any record binds it. A `motor`
+    /// added before is not polled twice: `user` reaches the same axis.
     pub fn add(
         &self,
         motor: Arc<Mutex<dyn AsynMotor>>,
@@ -246,42 +267,79 @@ impl ControllerAxes {
         timeout: Duration,
         capacity: usize,
     ) -> Result<ControllerAxis, String> {
-        let controller = match &user {
+        let mirror = match &user {
             TraceUser::Asyn { port, addr } => Some((port.clone(), *addr)),
             _ => None,
         };
-        let (axis, inbox, subscribers, poll_cmd_tx) = axis_parts(&motor, user, timeout, capacity);
-        let mut polled = Axis::polled(inbox, motor, subscribers);
-        if let Some((port, addr)) = controller {
-            polled.mirror_to(&port, addr);
-        }
-        let joined = match &mut *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        let same = |o: &Opened| std::ptr::addr_eq(Arc::as_ptr(&o.motor), Arc::as_ptr(&motor));
+        let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Recorded before the poller confirms, so a concurrent add of the
+        // same motor finds it.
+        let (join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
+            let added = ControllerAxis {
+                axis: opened.axis.at(user),
+                poll_cmd_tx: opened.poll_cmd_tx.clone(),
+            };
+            match (mirror, &opened.mirror) {
+                (None, _) => return Ok(added),
+                (Some(to), Some(had)) if &to == had => return Ok(added),
+                (Some((port, addr)), Some((had_port, had_addr))) => {
+                    return Err(format!(
+                        "the axis is at port {had_port} address {had_addr}, not {port} {addr}"
+                    ));
+                }
+                (Some((port, addr)), None) => {
+                    opened.mirror = Some((port.clone(), addr));
+                    let motor = motor.clone();
+                    (Join::Mirror { motor, port, addr }, added)
+                }
+            }
+        } else {
+            let (axis, inbox, subscribers, poll_cmd_tx) =
+                axis_parts(&motor, user, timeout, capacity);
+            axes.opened.push(Opened {
+                motor: motor.clone(),
+                axis: axis.at(axis.address().clone()),
+                poll_cmd_tx: poll_cmd_tx.clone(),
+                mirror: mirror.clone(),
+            });
+            let mut polled = Axis::polled(inbox, motor.clone(), subscribers);
+            if let Some((port, addr)) = mirror {
+                polled.mirror_to(&port, addr);
+            }
+            (
+                Join::Axis(Box::new(polled)),
+                ControllerAxis { axis, poll_cmd_tx },
+            )
+        };
+        let joined = match &mut axes.list {
             AxisList::Pending(axes) => {
-                axes.push(polled);
+                join.place(axes);
                 None
             }
             AxisList::Running(poller) => {
                 let (joined, taken) = std::sync::mpsc::sync_channel(1);
-                let _ = poller.send(Joining {
-                    axis: polled,
-                    joined,
-                });
+                let _ = poller.send(Joining { join, joined });
                 Some(taken)
             }
         };
-        if let Some(taken) = joined {
-            taken
-                .recv()
-                .map_err(|_| "the controller's poller has ended".to_string())?;
+        drop(axes);
+        if let Some(taken) = joined
+            && taken.recv().is_err()
+        {
+            // No poller took it: a later add must not get its senders.
+            let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            axes.opened.retain(|o| !same(o));
+            return Err("the controller's poller has ended".to_string());
         }
-        Ok(ControllerAxis { axis, poll_cmd_tx })
+        Ok(added)
     }
 
     /// The axes so far, and the channel later ones join the poller by.
     fn start(&self) -> (Vec<Axis>, mpsc::UnboundedReceiver<Joining>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut list = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match std::mem::replace(&mut *list, AxisList::Running(tx)) {
+        let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut axes.list, AxisList::Running(tx)) {
             AxisList::Pending(axes) => (axes, rx),
             // The builder is consumed by the one start.
             AxisList::Running(_) => unreachable!("a controller's poller starts once"),
@@ -577,5 +635,81 @@ mod tests {
         });
         assert_eq!(forced, ["C", "A"], "ForcePoll");
         assert_eq!(info, ["C", "A"], "GET_INFO");
+    }
+
+    /// drvMotorAsyn and devMotorSim both open a drvMotorSim axis, and
+    /// motorProcTask still processes it once a pass (drvMotorSim.c:657-680).
+    #[test]
+    fn a_driver_axis_added_at_two_addresses_is_polled_once() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let shared: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Named("A", log.clone())));
+        let mut controller = ControllerBuilder::new();
+        let model2 = TraceUser::Model2 {
+            port: "P".into(),
+            addr: 0,
+        };
+        let interface = TraceUser::MotorInterface {
+            device: "Sim",
+            driver: "sim",
+            card: 0,
+            signal: 0,
+        };
+        let first = controller.axis(shared.clone(), model2.clone());
+        let second = controller.axis(shared, interface.clone());
+        let _b = controller.axis(Arc::new(Mutex::new(Named("B", log.clone()))), model2);
+        assert_eq!(second.axis.address(), &interface);
+        let idle = Duration::from_secs(60);
+        let poller = controller.build(idle, idle, 0);
+        assert_eq!(std::mem::take(&mut *log.lock().unwrap()), ["A", "B"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let polled = rt.block_on(async {
+            let running = tokio::spawn(poller.run());
+            second
+                .poll_cmd_tx
+                .send(PollCommand::ForcePoll)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let polled = std::mem::take(&mut *log.lock().unwrap());
+            first.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+            running.await.unwrap();
+            polled
+        });
+        assert_eq!(polled, ["A"], "the second address reaches the one axis");
+    }
+
+    /// An add the poller never took fails, and a later add of the same motor
+    /// fails too rather than reach no poller.
+    #[test]
+    fn an_add_to_an_ended_poller_fails_every_time() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = ControllerBuilder::new();
+        let user = TraceUser::Model2 {
+            port: "P".into(),
+            addr: 0,
+        };
+        let first = controller.axis(Arc::new(Mutex::new(Named("A", log.clone()))), user.clone());
+        let axes = controller.axes();
+        let idle = Duration::from_secs(60);
+        let poller = controller.build(idle, idle, 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let running = tokio::spawn(poller.run());
+            first.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+            running.await.unwrap();
+        });
+        let late: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Named("B", log)));
+        for attempt in 0..2 {
+            assert!(
+                axes.add(late.clone(), user.clone()).is_err(),
+                "add {attempt}"
+            );
+        }
     }
 }

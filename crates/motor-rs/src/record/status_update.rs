@@ -377,6 +377,10 @@ impl MotorRecord {
             });
         }
 
+        // devMotorSim has no init_controller (devMotorSim.c init_record):
+        // no ratio download and no position restore.
+        let init_controller = !self.trace().is_motor_interface();
+
         // C init_controller (devMotorAsyn.c:183-198) downloads the encoder
         // ratio before anything else, parked write or not.
         let ratio = if self.conv.eres == 0.0 {
@@ -384,9 +388,11 @@ impl MotorRecord {
         } else {
             self.conv.mres / self.conv.eres
         };
-        effects
-            .commands
-            .push(MotorCommand::InitEncoderRatio { ratio });
+        if init_controller {
+            effects
+                .commands
+                .push(MotorCommand::InitEncoderRatio { ratio });
+        }
 
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when
@@ -399,10 +405,11 @@ impl MotorRecord {
         let motor_dial = status.position * self.conv.mres;
         let dval_non_zero_pos_near_zero =
             autosaved_dval.abs() > rdbd && self.conv.mres != 0.0 && motor_dial.abs() < rdbd;
-        let mut restore = self
-            .conv
-            .rstm
-            .should_restore(self.use_relative_moves(), dval_non_zero_pos_near_zero);
+        let mut restore = init_controller
+            && self
+                .conv
+                .rstm
+                .should_restore(self.use_relative_moves(), dval_non_zero_pos_near_zero);
 
         // epics-modules/motor #231 — if LOAD_POS is blocked for this axis
         // (absolute encoder), never push a SetPosition; adopt driver readback.

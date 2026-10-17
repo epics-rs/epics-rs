@@ -4,8 +4,10 @@
 //! created. The axis is found at `init_record`, from OUT: `devMotorAsyn` by
 //! `@asyn(PORT,ADDR)` through asynManager (devMotorAsyn.c:276-291), a model-1
 //! dset by `#C card S signal` through its driver's card table
-//! (motordevCom.cc:217-258). A record whose axis is missing still loads and
-//! fails at init as those do.
+//! (motordevCom.cc:217-258), devMotorSim by `#C card S signal @drvet`
+//! through the `motor_interface.h` driver its parm names (devMotorSim.c:
+//! 131-200). A record whose axis is missing still loads and fails at init
+//! as those do.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -63,12 +65,54 @@ pub fn register_model1_device(row: &'static DevSup) {
     lock(model1_choices()).insert(row.choice);
 }
 
+/// devMotorSim's `device(motor,VME_IO,devMotorSim,"Motor Simulation")`
+/// (motorSimSupport.dbd:1): records on it bind a `motor_interface.h` driver.
+pub const fn motor_interface_device(dset: &'static str, choice: &'static str) -> DevSup {
+    DevSup {
+        name: dset,
+        choice,
+        link_type: DbLinkType::VmeIo,
+        dset: MOTOR_DSET,
+    }
+}
+
+/// Add devMotorSim's row to the motor device menu and let
+/// [`device_support_factory`] serve its DTYP.
+pub fn register_motor_interface_device(row: &'static DevSup) {
+    epics_base_rs::server::record::register_device_row("motor", row);
+    lock(interface_choices()).insert(row.choice);
+}
+
+/// A drvet's `open(card, signal)`: register the axis there as a
+/// [`TraceUser::MotorInterface`] ([`register_axis`]), installing it into the
+/// driver's poller, and say whether the driver has it.
+type Open = Arc<dyn Fn(i32, i32) -> bool + Send + Sync>;
+
+/// C `driver(<name>)` for a `motor_interface.h` drvet, which a devMotorSim
+/// record finds by its OUT parm (`registryDriverSupportFind`,
+/// devMotorSim.c:135). The first record to name an axis calls `open`, as
+/// devMotorSim's init_record calls the drvet's (devMotorSim.c:143).
+pub fn register_motor_interface_driver(
+    name: &'static str,
+    open: impl Fn(i32, i32) -> bool + Send + Sync + 'static,
+) {
+    lock(interface_drivers()).insert(name, Arc::new(open));
+}
+
 /// The controller an axis belongs to: an asyn port, or one card of a model-1
 /// driver's table.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Controller {
     Port(String),
-    Card { device: &'static str, card: i32 },
+    Card {
+        device: &'static str,
+        card: i32,
+    },
+    /// One card of a `motor_interface.h` driver, by its `drvet` name.
+    Driver {
+        driver: &'static str,
+        card: i32,
+    },
 }
 
 /// A controller's axes, each with whether a record has bound it.
@@ -168,6 +212,16 @@ pub(crate) fn axis_at(port: &str, addr: i32) -> Option<MotorAxis> {
     Some(axis.clone())
 }
 
+fn interface_choices() -> &'static Mutex<HashSet<&'static str>> {
+    static CHOICES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    CHOICES.get_or_init(Default::default)
+}
+
+fn interface_drivers() -> &'static Mutex<HashMap<&'static str, Open>> {
+    static DRIVERS: OnceLock<Mutex<HashMap<&'static str, Open>>> = OnceLock::new();
+    DRIVERS.get_or_init(Default::default)
+}
+
 fn model1_choices() -> &'static Mutex<HashSet<&'static str>> {
     static CHOICES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     CHOICES.get_or_init(Default::default)
@@ -189,6 +243,18 @@ fn split(user: &TraceUser) -> (Controller, i32) {
         } => (
             Controller::Card {
                 device,
+                card: *card,
+            },
+            *signal,
+        ),
+        TraceUser::MotorInterface {
+            driver,
+            card,
+            signal,
+            ..
+        } => (
+            Controller::Driver {
+                driver,
                 card: *card,
             },
             *signal,
@@ -258,8 +324,11 @@ pub fn device_support_factory()
         if ctx.record_type != "motor" {
             return None;
         }
+        let interface = lock(interface_choices()).get(ctx.dtyp).copied();
         let (dtyp, bound) = if ctx.dtyp == DEV_MOTOR_ASYN.choice {
             (DEV_MOTOR_ASYN.choice, bind_asyn(ctx.out))
+        } else if let Some(device) = interface {
+            (device, bind_motor_interface(ctx.out))
         } else {
             let device = lock(model1_choices()).get(ctx.dtyp).copied()?;
             (device, bind_model1(device, ctx.out))
@@ -294,6 +363,11 @@ enum Failure {
     NoCard,
     NoSignal,
     InUse,
+    /// devMotorSim's three refusals: OUT not VME_IO, no drvet by the parm's
+    /// name, and the driver's `open` returning NULL.
+    IllegalInp,
+    NoDrvet,
+    NoOpen,
 }
 
 /// Bind a record to the axis. An asyn axis serves every record that names
@@ -371,6 +445,32 @@ fn bind_model1(device: &'static str, out: &str) -> Result<MotorDeviceSupport, Fa
         )?;
     support.send_out_parm(parm);
     Ok(support)
+}
+
+/// devMotorSim's init_record (devMotorSim.c:131-200): the drvet the parm
+/// names, then its `open(card, signal)`. Any number of records may open one
+/// axis; the first one's open registers it.
+fn bind_motor_interface(out: &str) -> Result<MotorDeviceSupport, Failure> {
+    let ParsedLink::Hw(HwLink::VmeIo { card, signal, parm }) = parse_link_v2(out) else {
+        return Err(Failure::IllegalInp);
+    };
+    let Some((driver, open)) = lock(interface_drivers())
+        .get_key_value(parm.as_str())
+        .map(|(name, open)| (*name, open.clone()))
+    else {
+        return Err(Failure::NoDrvet);
+    };
+    let (card, signal) = (i32::from(card), i32::from(signal));
+    let controller = Controller::Driver { driver, card };
+    take(controller.clone(), signal)
+        .or_else(|_| {
+            if open(card, signal) {
+                take(controller, signal)
+            } else {
+                Err(Taken::NoAxis)
+            }
+        })
+        .map_err(|_| Failure::NoOpen)
 }
 
 /// `pasynEpicsUtils->parseLink` (asynEpicsUtils.c:56-148): the port and
@@ -585,6 +685,26 @@ impl DeviceSupport for Unbound {
                 );
                 failed_init(record, false);
                 return Err(CaError::InvalidValue("Illegal OUT Bus Type".into()));
+            }
+            Failure::IllegalInp | Failure::NoDrvet | Failure::NoOpen => {
+                // M_drvSup has no symbol table either.
+                let (status, message) = match self.failure {
+                    Failure::IllegalInp => (
+                        "Illegal field value",
+                        "devMotor (init_record) Illegal INP field",
+                    ),
+                    Failure::NoDrvet => (
+                        "Error (513,3)",
+                        "devMotor (init_record) cannot find device support entry table",
+                    ),
+                    _ => (
+                        "Error (513,1)",
+                        "devMotor (init_record) cannot open device support",
+                    ),
+                };
+                rec_gbl_record_error(status, name, message);
+                failed_init(record, false);
+                return Err(CaError::InvalidValue(message.into()));
             }
             Failure::NoCard => "motor_init_record_com(): card does not exist!",
             Failure::NoSignal => "motor_init_record_com(): signal does not exist!",

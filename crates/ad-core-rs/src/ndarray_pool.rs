@@ -143,15 +143,17 @@ impl NDArrayPool {
     /// C++ `NDArrayPool::alloc` with `pData = NULL` followed by the caller's
     /// copy into `pArray->pData`, which is how every C driver builds a frame:
     /// the frame is charged and refused under the same `max_memory` rule as
-    /// [`alloc`](Self::alloc), and takes `data` as its buffer.
-    pub fn wrap(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<NDArray> {
+    /// [`alloc`](Self::alloc), and takes `data` as its buffer. C's unchecked
+    /// caller-supplied `pData` branch has no caller in ADCore or the drivers
+    /// and is not offered.
+    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<NDArray> {
         let data_type = data.data_type();
         let data_size = data.len() * data_type.element_size();
         self.alloc_buffer(dims, data_type, data_size, Some(data))
     }
 
     /// The allocation of [`alloc_sized`](Self::alloc_sized); `data`, when
-    /// given, replaces the buffer the slot would have been filled with.
+    /// given, is the buffer the slot is filled with instead of its own.
     fn alloc_buffer(
         &self,
         dims: Vec<NDDimension>,
@@ -169,30 +171,20 @@ impl NDArrayPool {
         let needed_bytes = data_size;
 
         // C++ NDArrayPool::alloc (NDArrayPool.cpp:161-183): the smallest free
-        // buffer whose tracked `dataSize` holds the request, or, for a
-        // caller-supplied buffer, the smallest free one, whose buffer is
-        // replaced. A buffer over THRESHOLD_SIZE_RATIO of the request is
-        // freed and allocated afresh. A reused buffer keeps its `dataSize`,
+        // buffer whose tracked `dataSize` holds the request. A buffer over
+        // THRESHOLD_SIZE_RATIO of the request is freed and allocated afresh. A reused buffer keeps its `dataSize`,
         // which is never below the request, so reuse charges nothing.
         let reused = {
             let mut free = self.free_list.lock();
-            let found = if data.is_some() {
-                free.iter()
-                    .enumerate()
-                    .min_by_key(|(_, b)| b.data_size)
-                    .map(|(i, _)| i)
-            } else {
-                free.iter()
-                    .enumerate()
-                    .filter(|(_, b)| b.data_size >= needed_bytes)
-                    .min_by_key(|(_, b)| b.data_size)
-                    .map(|(i, _)| i)
-            };
+            let found = free
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.data_size >= needed_bytes)
+                .min_by_key(|(_, b)| b.data_size)
+                .map(|(i, _)| i);
             match found {
                 Some(idx)
-                    if data.is_some()
-                        || free[idx].data_size as f64
-                            > needed_bytes as f64 * THRESHOLD_SIZE_RATIO =>
+                    if free[idx].data_size as f64 > needed_bytes as f64 * THRESHOLD_SIZE_RATIO =>
                 {
                     // Its buffer is freed; the fresh allocation below
                     // stands in for the C array object kept.
@@ -212,7 +204,9 @@ impl NDArrayPool {
         };
 
         if let Some(mut reused) = reused {
-            if reused.data.data_type() != data_type {
+            if let Some(data) = data {
+                reused.data = data;
+            } else if reused.data.data_type() != data_type {
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
             } else {
                 reused.data.resize(num_elements);
@@ -222,9 +216,7 @@ impl NDArrayPool {
 
         // Fresh allocation with CAS loop to avoid TOCTOU race. The reserved
         // amount is exactly `needed_bytes`; no capacity slack is ever added.
-        // A caller-supplied buffer already exists: C++ charges it with no
-        // limit check (NDArrayPool.cpp:203-206).
-        if self.max_memory > 0 && data.is_none() {
+        if self.max_memory > 0 {
             loop {
                 let current = self.allocated_bytes.load(Ordering::Relaxed);
                 if current + needed_bytes as u64 > self.max_memory as u64 {
@@ -576,9 +568,9 @@ impl DriverPool {
         self.own(self.pool.alloc_sized(dims, data_type, data_size))
     }
 
-    /// [`NDArrayPool::wrap`].
-    pub fn wrap(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<DriverArray> {
-        self.own(self.pool.wrap(dims, data))
+    /// [`NDArrayPool::alloc_with`].
+    pub fn alloc_with(&self, dims: Vec<NDDimension>, data: NDDataBuffer) -> ADResult<DriverArray> {
+        self.own(self.pool.alloc_with(dims, data))
     }
 
     /// [`NDArrayPool::alloc_copy`].
@@ -817,10 +809,10 @@ mod tests {
         assert_eq!(counts(&pool), (1, 1, 8));
     }
 
-    /// C's `pData` branch: no `max_memory` check, the size is charged, and
-    /// the smallest free buffer's slot is taken instead of a new one.
+    /// A frame takes a free buffer that holds it, as an alloc does, and is
+    /// filled with the caller's data.
     #[test]
-    fn a_wrapped_frame_is_charged_like_an_alloc() {
+    fn a_frame_with_data_reuses_a_free_buffer_like_an_alloc() {
         let owner = ArrayOwner::new();
         let pool = NDArrayPool::for_driver(64, &owner);
         drop(
@@ -830,7 +822,7 @@ mod tests {
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
 
         let frame = pool
-            .wrap(vec![NDDimension::new(8)], NDDataBuffer::U8(vec![7; 8]))
+            .alloc_with(vec![NDDimension::new(8)], NDDataBuffer::U8(vec![7; 8]))
             .unwrap();
         assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
         assert_eq!(pool.allocated_bytes(), 8);
@@ -840,37 +832,26 @@ mod tests {
         drop(frame);
     }
 
-    /// A wrapped frame is charged past `max_memory`; the next pool alloc
-    /// evicts the largest free buffers and then refuses
-    /// (NDArrayPool.cpp:203-206, :207-233).
+    /// A frame over `max_memory` is refused as C's `alloc(..., NULL)` is
+    /// before the driver's copy (NDArrayPool.cpp:207-233), after evicting the
+    /// free buffers.
     #[test]
-    fn a_wrapped_frame_over_max_memory_is_charged_and_the_next_alloc_refused() {
+    fn a_frame_with_data_over_max_memory_is_refused() {
         let pool = NDArrayPool::new(64);
-        let big = pool
-            .wrap(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]))
-            .unwrap();
-        let small = pool
-            .wrap(vec![NDDimension::new(50)], NDDataBuffer::U8(vec![0; 50]))
-            .unwrap();
-        assert_eq!(pool.allocated_bytes(), 150);
-        drop(small);
-        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (2, 1));
-        assert_eq!(pool.allocated_bytes(), 150);
+        drop(
+            pool.alloc(vec![NDDimension::new(50)], NDDataType::UInt8)
+                .unwrap(),
+        );
+        let refused = pool.alloc_with(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]));
+        assert!(matches!(refused, Err(ADError::PoolExhausted(100, 64))));
+        assert_eq!(pool.allocated_bytes(), 0);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (0, 0));
 
-        let refused = pool.alloc(vec![NDDimension::new(60)], NDDataType::UInt8);
-        assert!(matches!(refused, Err(ADError::PoolExhausted(60, 64))));
-        assert_eq!(pool.allocated_bytes(), 100);
-        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
-
-        // Released, the oversized 100-byte buffer is freed for an 8-byte one.
-        drop(big);
-        assert_eq!(pool.allocated_bytes(), 100);
-        let a = pool
-            .alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
+        let frame = pool
+            .alloc_with(vec![NDDimension::new(60)], NDDataBuffer::U8(vec![0; 60]))
             .unwrap();
-        assert_eq!(a.data_size, 8);
-        assert_eq!(pool.allocated_bytes(), 8);
-        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
+        assert_eq!(frame.data_size, 60);
+        assert_eq!(pool.allocated_bytes(), 60);
     }
 
     #[test]
@@ -1099,10 +1080,10 @@ mod tests {
         assert_eq!(pool.allocated_bytes(), 250);
     }
 
-    /// A caller-supplied buffer replaces the smallest free one and is charged
-    /// its own size (NDArrayPool.cpp:166-168, :178-182, :203-206).
+    /// A frame takes the smallest free buffer that holds it and keeps that
+    /// buffer's `dataSize` (NDArrayPool.cpp:166-183).
     #[test]
-    fn a_wrapped_frame_replaces_the_smallest_free_buffer() {
+    fn a_frame_with_data_takes_the_smallest_free_buffer_that_holds_it() {
         let pool = NDArrayPool::new(1_000_000);
         let big = pool
             .alloc(vec![NDDimension::new(4000)], NDDataType::UInt8)
@@ -1113,12 +1094,13 @@ mod tests {
         pool.release(big);
         pool.release(small);
         let w = pool
-            .wrap(vec![NDDimension::new(800)], NDDataBuffer::U8(vec![0; 800]))
+            .alloc_with(vec![NDDimension::new(800)], NDDataBuffer::U8(vec![0; 800]))
             .unwrap();
-        assert_eq!(w.data_size, 800);
+        assert_eq!(w.data_size, 1000);
+        assert_eq!(w.data.len(), 800);
         assert_eq!(pool.num_alloc_buffers(), 2);
         assert_eq!(pool.num_free_buffers(), 1);
-        assert_eq!(pool.allocated_bytes(), 4800);
+        assert_eq!(pool.allocated_bytes(), 5000);
     }
 
     #[test]

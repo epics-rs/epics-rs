@@ -270,7 +270,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             let dims = vec![NDDimension::new(nx), NDDimension::new(nz)];
             // A refused wrap has printed the pool's limit line.
-            let Ok(mut frame) = ctx.pool.wrap(dims, NDDataBuffer::U16(u16_data)) else {
+            let Ok(mut frame) = ctx.pool.alloc_with(dims, NDDataBuffer::U16(u16_data)) else {
                 continue;
             };
 

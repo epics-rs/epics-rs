@@ -53,7 +53,7 @@ pub fn crop_roi(
 
     // Fast path: full-frame copy (no actual crop needed)
     if min_x == 0 && min_y == 0 && size_x == src_layout.size_x && size_y == src_layout.size_y {
-        return pool.wrap(dims, source_data.clone());
+        return pool.alloc_with(dims, source_data.clone());
     }
 
     let num_elements = dst_layout.num_elements();
@@ -74,7 +74,7 @@ pub fn crop_roi(
             }
         });
     });
-    let mut result = pool.wrap(dims, dst_data)?;
+    let mut result = pool.alloc_with(dims, dst_data)?;
 
     // Update output dims to track cumulative offset from source
     let (x_dim, y_dim) = match src_layout.color_mode {

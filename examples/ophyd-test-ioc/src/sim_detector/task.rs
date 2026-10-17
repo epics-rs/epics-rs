@@ -189,7 +189,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // Build NDArray from f64 data
             let dims = vec![NDDimension::new(height), NDDimension::new(width)];
             // A refused wrap has printed the pool's limit line.
-            let Ok(mut frame) = ctx.pool.wrap(dims, NDDataBuffer::F64(img_data)) else {
+            let Ok(mut frame) = ctx.pool.alloc_with(dims, NDDataBuffer::F64(img_data)) else {
                 continue;
             };
 

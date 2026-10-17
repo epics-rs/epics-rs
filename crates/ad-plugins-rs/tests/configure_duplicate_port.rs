@@ -83,7 +83,7 @@ fn a_refused_configure_leaves_the_wiring_output_alone() {
     let wired = ioc
         .mgr()
         .wiring()
-        .lookup_output("WIRE_STATS")
+        .output_at("WIRE_STATS", 0)
         .expect("the port's output");
     assert!(Arc::ptr_eq(&wired, real.array_output()));
 }
@@ -110,11 +110,9 @@ fn a_refused_duplicate_keeps_the_time_series_routing() {
         ));
     }
     let wiring = ioc.mgr().wiring();
-    let at1 = wiring
-        .lookup_output(&wiring.key("TSR_STATS", 1))
-        .expect("TSR_STATS:1");
+    let at1 = wiring.output_at("TSR_STATS", 1).expect("TSR_STATS:1");
     assert_eq!(at1.lock().num_senders(), 1);
-    let at0 = wiring.lookup_output("TSR_STATS").expect("TSR_STATS");
+    let at0 = wiring.output_at("TSR_STATS", 0).expect("TSR_STATS");
     assert!(Arc::ptr_eq(&at0, real.array_output()));
     assert_eq!(at0.lock().num_senders(), 0);
 }

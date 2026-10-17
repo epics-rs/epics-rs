@@ -239,7 +239,7 @@ fn test_rewire_ndarray_port_at_runtime() {
     );
 
     // Wire STATS1 → SIM1
-    wiring.rewire(handle.array_sender(), "", "SIM1").unwrap();
+    wiring.subscribe(handle.array_sender(), "SIM1", 0).unwrap();
 
     // Enable callbacks
     handle
@@ -359,7 +359,7 @@ fn test_rewire_through_real_roi_plugin() {
     );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
-        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .subscribe(roi_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable ROI1
@@ -405,7 +405,7 @@ fn test_rewire_through_real_roi_plugin() {
     );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
-        .rewire(stats_handle.array_sender(), "", "SIM1")
+        .subscribe(stats_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable STATS1
@@ -495,7 +495,7 @@ fn test_roi_param_change_enables_output() {
     );
     wiring.register_output("ROI1", roi_handle.array_output().clone());
     wiring
-        .rewire(roi_handle.array_sender(), "", "SIM1")
+        .subscribe(roi_handle.array_sender(), "SIM1", 0)
         .unwrap();
 
     // Enable ROI1
@@ -540,7 +540,7 @@ fn test_roi_param_change_enables_output() {
     );
     wiring.register_output("STATS1", stats_handle.array_output().clone());
     wiring
-        .rewire(stats_handle.array_sender(), "", "ROI1")
+        .subscribe(stats_handle.array_sender(), "ROI1", 0)
         .unwrap();
     stats_handle
         .port_runtime()

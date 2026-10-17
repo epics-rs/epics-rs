@@ -54,8 +54,6 @@ fn configure_ndarray_addr_is_seeded_and_connected() {
         .reason;
     assert_eq!(port.read_int32_blocking(reason, 0).unwrap(), 1);
     let wiring = ioc.mgr().wiring();
-    let at_addr1 = wiring
-        .lookup_output(&wiring.key("CSRS", 1))
-        .expect("CSRS:1");
+    let at_addr1 = wiring.output_at("CSRS", 1).expect("CSRS:1");
     assert_eq!(at_addr1.lock().num_senders(), 1);
 }

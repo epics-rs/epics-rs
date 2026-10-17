@@ -2519,18 +2519,26 @@ impl PluginPortDriver {
     }
 
     fn unresolved(&self, port: &str, addr: i32) -> Option<String> {
-        let key = self.wiring.key(port, addr);
-        (!port.is_empty() && self.wiring.lookup_output(&key).is_none())
-            .then(|| connect_device_error(port, addr))
+        connect_refusal(&self.wiring, port, addr)
     }
 }
 
-/// C `connectToArrayPort`'s line when `connectDevice` finds no such port
-/// (NDPluginDriver.cpp:605-610).
-fn connect_device_error(port: &str, addr: i32) -> String {
-    format!(
-        "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found\n"
-    )
+/// The line C `connectToArrayPort` prints when it fails: `connectDevice`
+/// finds no such port, or the port has no asynGenericPointer interface
+/// (NDPluginDriver.cpp:605-619). Any address of a port that publishes
+/// connects, as `locateDevice` allocates one (asynManager.c:571-589).
+fn connect_refusal(wiring: &WiringRegistry, port: &str, addr: i32) -> Option<String> {
+    if port.is_empty() || wiring.publishes(port) {
+        None
+    } else if asyn_rs::registry::get_port(port).is_some() {
+        Some(format!(
+            "NDPluginDriver::connectToPort ERROR: Can't find asynGenericPointer interface on array port {port} address {addr}\n"
+        ))
+    } else {
+        Some(format!(
+            "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found\n"
+        ))
+    }
 }
 
 fn write_refused(message: String) -> AsynError {
@@ -2976,17 +2984,14 @@ impl PluginRuntimeHandle {
         if port.is_empty() {
             return Ok(());
         }
-        let key = wiring.key(port, addr);
-        if wiring.lookup_output(&key).is_none() {
+        if let Some(line) = connect_refusal(wiring, port, addr) {
             let handle = self.port_runtime.port_handle();
-            handle.trace().output(
-                handle.port_name(),
-                TraceMask::ERROR,
-                &connect_device_error(port, addr),
-            );
+            handle
+                .trace()
+                .output(handle.port_name(), TraceMask::ERROR, &line);
             return Ok(());
         }
-        wiring.rewire(&self.array_sender, "", &key)
+        wiring.subscribe(&self.array_sender, port, addr)
     }
 
     /// The pool the plugin was built with, which it allocates from until an
@@ -3603,11 +3608,13 @@ fn rewire_source(
     new_port: &str,
     new_addr: i32,
 ) -> Result<(), String> {
-    let old_key = wiring.key(&slot.0, slot.1);
-    let new_key = wiring.key(new_port, new_addr);
-    *slot = (new_port.to_string(), new_addr);
+    let (old_port, old_addr) = std::mem::replace(slot, (new_port.to_string(), new_addr));
     let sender = sender.upgrade().ok_or("input queue closed")?;
-    wiring.rewire(&sender, &old_key, &new_key)
+    wiring.unsubscribe(sender.port_name(), &old_port, old_addr);
+    if new_port.is_empty() {
+        return Ok(());
+    }
+    wiring.subscribe(&sender, new_port, new_addr)
 }
 
 /// The source slot an `NDArrayPort`/`NDArrayAddr` write at `addr` moves, with
@@ -5941,12 +5948,8 @@ mod tests {
         );
         let (down0, rx0) = ndarray_channel("ARRSIDE_DOWN0", 10);
         let (down1, mut rx1) = ndarray_channel("ARRSIDE_DOWN1", 10);
-        wiring
-            .rewire(&down0, "", &wiring.key("ARRSIDE_MULTI", 0))
-            .unwrap();
-        wiring
-            .rewire(&down1, "", &wiring.key("ARRSIDE_MULTI", 1))
-            .unwrap();
+        wiring.subscribe(&down0, "ARRSIDE_MULTI", 0).unwrap();
+        wiring.subscribe(&down1, "ARRSIDE_MULTI", 1).unwrap();
         let (go, _) = *ids.lock();
         up.port_runtime()
             .port_handle()
@@ -6224,7 +6227,7 @@ mod tests {
             1_000_000,
             10,
             "UP",
-            wiring,
+            wiring.clone(),
             DEFAULT_PLUGIN_THREADS,
         );
         let port = handle.port_runtime().port_handle();
@@ -6275,13 +6278,37 @@ mod tests {
                 .unwrap(),
             b"NOPE\0"
         );
+        // A multi-device upstream takes an address it publishes nothing at,
+        // as `locateDevice` allocates one (asynManager.c:571-589).
+        for addr in 0..3 {
+            let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+            wiring.register_output_at("UPM", addr, output);
+        }
+        assert!(
+            rt.block_on(port.write_octet(p.nd_array_port, 0, b"UPM".to_vec()))
+                .is_ok()
+        );
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, 5).is_ok());
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, -1).is_ok());
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, 0).is_ok());
+        // An asyn port without NDArrays connects but has no interface.
+        asyn_rs::registry::claim_port("REFUSE_NOGP")
+            .unwrap()
+            .publish(port.clone(), &asyn_rs::registry::open_owner())
+            .unwrap();
+        assert!(
+            rt.block_on(port.write_octet(p.nd_array_port, 0, b"REFUSE_NOGP".to_vec()))
+                .is_ok()
+        );
+        assert!(port.write_int32_blocking(p.nd_array_addr, 0, 2).is_err());
+        asyn_rs::registry::unregister_port("REFUSE_NOGP");
         assert!(
             rt.block_on(port.write_octet(p.nd_array_port, 0, b"UP".to_vec()))
                 .is_ok()
         );
 
         // The lines C prints for the same writes (NDPluginDriver.cpp:606,
-        // :973-990, :769-771).
+        // :614-618, :973-990, :769-771).
         let trace = std::fs::read_to_string(&log).unwrap();
         let _ = std::fs::remove_file(&log);
         for line in [
@@ -6293,8 +6320,13 @@ mod tests {
             "NDPluginDriver::createCallbackThreads error, numThreads=0 must be >= 1, setting to 1".to_string(),
             "NDPluginDriver::createCallbackThreads error, queueSize=0 must be >= 1, setting to 1".to_string(),
             "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port NOPE address 0, status=3, error=asynManager:connectDevice port NOPE not found".to_string(),
+            "NDPluginDriver::connectToPort ERROR: Can't find asynGenericPointer interface on array port REFUSE_NOGP address 0".to_string(),
+            "NDPluginDriver::connectToPort ERROR: Can't find asynGenericPointer interface on array port REFUSE_NOGP address 2".to_string(),
         ] {
             assert!(trace.contains(&line), "missing {line:?} in\n{trace}");
+        }
+        for absent in ["UPM", "address 5", "address -1"] {
+            assert!(!trace.contains(absent), "{absent:?} refused in\n{trace}");
         }
     }
 
@@ -6332,12 +6364,8 @@ mod tests {
         enable_callbacks(&up);
         let (down0, mut rx0) = ndarray_channel("DOWN0", 10);
         let (down1, mut rx1) = ndarray_channel("DOWN1", 10);
-        wiring
-            .rewire(&down0, "", &wiring.key("UP_MULTI", 0))
-            .unwrap();
-        wiring
-            .rewire(&down1, "", &wiring.key("UP_MULTI", 1))
-            .unwrap();
+        wiring.subscribe(&down0, "UP_MULTI", 0).unwrap();
+        wiring.subscribe(&down1, "UP_MULTI", 1).unwrap();
 
         // Each consumer's next array proves the previous one never crossed.
         for id in [99, 100] {
@@ -6393,9 +6421,7 @@ mod tests {
         );
         enable_callbacks(&plugin);
         let (down, mut rx) = ndarray_channel("ADOPT_DOWN", 10);
-        wiring
-            .rewire(&down, "", &wiring.key("ADOPT_POOL", 0))
-            .unwrap();
+        wiring.subscribe(&down, "ADOPT_POOL", 0).unwrap();
 
         let frame = detector_pool
             .alloc(vec![NDDimension::new(4)], NDDataType::UInt8)
@@ -6470,9 +6496,7 @@ mod tests {
         );
         enable_callbacks(&up);
         let (down1, mut rx1) = ndarray_channel("DOWN_GATED", 10);
-        wiring
-            .rewire(&down1, "", &wiring.key("UP_GATED", 1))
-            .unwrap();
+        wiring.subscribe(&down1, "UP_GATED", 1).unwrap();
         let port = up.port_runtime().port_handle();
         let mut next = || rx1.blocking_recv().unwrap().unique_id;
 
@@ -6528,10 +6552,53 @@ mod tests {
             1
         );
         down.connect_to_array_port(&wiring).unwrap();
-        let at_addr1 = wiring
-            .lookup_output(&wiring.key("UP_SEED", 1))
-            .expect("UP_SEED:1");
+        let at_addr1 = wiring.output_at("UP_SEED", 1).expect("UP_SEED:1");
         assert_eq!(at_addr1.lock().num_senders(), 1);
+    }
+
+    #[test]
+    fn a_plugin_receives_from_an_address_published_after_it_connects() {
+        // C's interrupt user is per (port, addr) and needs no callback there
+        // yet: a driver's later doCallbacksGenericPointer at that address
+        // reaches the plugin.
+        let wiring = test_wiring();
+        let drv0 = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        wiring.register_output("LATE_DRV", drv0.clone());
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("LATE_SINK", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+        let (down, _down_jh) = create_plugin_runtime_with_output(
+            &asyn_rs::asyn_record::claim_port("LATE_DOWN").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            output,
+            ("LATE_DRV", 2),
+            wiring.clone(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        enable_callbacks(&down);
+        down.connect_to_array_port(&wiring).unwrap();
+
+        let drv2 = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+        wiring.register_output_at("LATE_DRV", 2, drv2.clone());
+        assert_eq!(
+            drv2.lock().num_senders(),
+            1,
+            "the publisher adopts the plugin"
+        );
+        let publisher = crate::plugin::channel::ArrayPublisher::new(drv2);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(publisher.publish(make_test_array(7)));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 7);
+        assert_eq!(drv0.lock().num_senders(), 0);
     }
 
     #[test]
@@ -6579,9 +6646,9 @@ mod tests {
             2,
             DEFAULT_PLUGIN_THREADS,
         );
-        wiring.rewire(handle.array_sender(), "", "UP_A").unwrap();
+        wiring.subscribe(handle.array_sender(), "UP_A", 0).unwrap();
         let (down, mut down_rx) = ndarray_channel("DOWN", 10);
-        wiring.rewire(&down, "", "GATHERING").unwrap();
+        wiring.subscribe(&down, "GATHERING", 0).unwrap();
         enable_callbacks(&handle);
 
         let port_reason = handle.plugin_params.nd_array_port;
@@ -6621,7 +6688,7 @@ mod tests {
         // (NDPluginDriver.cpp:600-611): a port that does not resolve leaves
         // the slot receiving nothing, and the next good write reconnects it.
         let (probe, mut probe_rx) = ndarray_channel("PROBE", 10);
-        wiring.rewire(&probe, "", "UP_A").unwrap();
+        wiring.subscribe(&probe, "UP_A", 0).unwrap();
         write_port(0, "NOPE");
         send_array(ups[0].0.array_sender(), make_test_array(5));
         assert_eq!(probe_rx.blocking_recv().unwrap().unique_id, 5);
@@ -6941,9 +7008,7 @@ mod tests {
         );
         enable_callbacks(&handle);
         let (down, mut rx) = ndarray_channel("POOLLESS_DOWN", 4);
-        wiring
-            .rewire(&down, "", &wiring.key("POOLLESS", 0))
-            .unwrap();
+        wiring.subscribe(&down, "POOLLESS", 0).unwrap();
 
         let detector = DriverPool::standalone(1_000_000);
         let frame = detector
@@ -6979,9 +7044,7 @@ mod tests {
         );
         enable_callbacks(&handle);
         let (down, rx) = ndarray_channel("COPYREFUSE_DOWN", 4);
-        wiring
-            .rewire(&down, "", &wiring.key("COPYREFUSE", 0))
-            .unwrap();
+        wiring.subscribe(&down, "COPYREFUSE", 0).unwrap();
 
         let detector = DriverPool::standalone(64);
         let frame = detector
@@ -7034,9 +7097,7 @@ mod tests {
         );
         enable_callbacks(&handle);
         let (down, mut rx) = ndarray_channel("COPYKEEP_DOWN", 4);
-        wiring
-            .rewire(&down, "", &wiring.key("COPYKEEP", 0))
-            .unwrap();
+        wiring.subscribe(&down, "COPYKEEP", 0).unwrap();
         let port = handle.port_runtime().port_handle();
         let p = handle.ndarray_params;
         let frames = |n| {
@@ -7101,9 +7162,7 @@ mod tests {
         );
         enable_callbacks(&handle);
         let (down, rx) = ndarray_channel("COPYSTOP_DOWN", 4);
-        wiring
-            .rewire(&down, "", &wiring.key("COPYSTOP", 0))
-            .unwrap();
+        wiring.subscribe(&down, "COPYSTOP", 0).unwrap();
         let port = handle.port_runtime().port_handle();
         let counter = handle.ndarray_params.array_counter;
 

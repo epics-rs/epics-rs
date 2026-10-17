@@ -32,7 +32,7 @@ fn a_tsread_without_array_callbacks_takes_no_unique_id() {
     );
     let (down, mut rx) = ndarray_channel("TSAC_DOWN", 10);
     // numSignals_ is 1, so the 2-D series posts at address 1.
-    wiring.rewire(&down, "", &wiring.key("TSAC", 1)).unwrap();
+    wiring.subscribe(&down, "TSAC", 1).unwrap();
     let port = ts.port_runtime().port_handle();
     let reason = |name: &str| {
         port.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
@@ -105,7 +105,7 @@ fn a_tsread_allocates_from_the_pool_the_last_frame_brought() {
         DEFAULT_PLUGIN_THREADS,
     );
     let (down, mut rx) = ndarray_channel("TSPOOL_DOWN", 10);
-    wiring.rewire(&down, "", &wiring.key("TSPOOL", 1)).unwrap();
+    wiring.subscribe(&down, "TSPOOL", 1).unwrap();
     let port = ts.port_runtime().port_handle();
     let applied = || assert!(ts.wait_params_applied(std::time::Duration::from_secs(10)));
     let ts_read = port

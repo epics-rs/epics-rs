@@ -2204,14 +2204,19 @@ mod tests {
         assert!(text.starts_with("asynReport gone_port: "), "{text:?}");
     }
 
+    /// Keeps its options, as a real driver does; the base keeps none.
     struct DummyDriver {
         base: PortDriverBase,
+        options: std::collections::HashMap<String, String>,
     }
     impl DummyDriver {
         fn new(name: &str) -> Self {
             let mut base = PortDriverBase::new(name, 1, PortFlags::default());
             base.create_param("VAL", ParamType::Int32).unwrap();
-            Self { base }
+            Self {
+                base,
+                options: Default::default(),
+            }
         }
     }
     impl PortDriver for DummyDriver {
@@ -2220,6 +2225,16 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
+        }
+        fn get_option(&self, user: &AsynUser, key: &str) -> AsynResult<String> {
+            match self.options.get(key) {
+                Some(value) => Ok(value.clone()),
+                None => self.base.read_option(user, key),
+            }
+        }
+        fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+            self.options.insert(key.to_owned(), value.to_owned());
+            Ok(())
         }
     }
 
@@ -2253,7 +2268,10 @@ mod tests {
                 },
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
-            Self { base }
+            Self {
+                base,
+                options: Default::default(),
+            }
         }
     }
 

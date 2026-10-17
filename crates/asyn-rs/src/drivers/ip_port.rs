@@ -2222,11 +2222,8 @@ impl PortDriver for DrvAsynIPPort {
     /// Read an IP-driver option. Mirrors C `drvAsynIPPort.c::getOption`
     /// (lines 888-913): `disconnectOnReadTimeout` -> `"Y"`/`"N"`,
     /// `hostInfo` -> the live device spec, both matched case-insensitively
-    /// (`epicsStrCaseCmp`). Without this override the base default reads
-    /// the generic option map, which the real `set_option` handlers above
-    /// never populate, so the asynRecord could never read back the live
-    /// `HOSTINFO`/`DRTO`. Unknown keys fall through to the generic map.
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    /// (`epicsStrCaseCmp`); any other key is C's "Unsupported key" error.
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         // Same interposed order as `set_option`. C's COM `getOption` (:671-739)
         // answers from cached state and touches the wire not at all, so this
         // needs no `&mut self` — the settings it reports are what the *server*
@@ -2246,11 +2243,7 @@ impl PortDriver for DrvAsynIPPort {
         } else if key.eq_ignore_ascii_case("hostInfo") {
             Ok(self.io.host_info.clone())
         } else {
-            self.base
-                .options
-                .get(key)
-                .cloned()
-                .ok_or_else(|| AsynError::OptionNotFound(key.to_string()))
+            Err(AsynError::OptionNotFound(key.to_string()))
         }
     }
 }
@@ -2367,8 +2360,15 @@ mod tests {
         assert!(!drv.base().is_auto_connect());
 
         // (3) The IP options the asyn record renders as HOSTINFO / DRTO.
-        assert_eq!(drv.get_option("hostinfo").unwrap(), "localhost:1");
-        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "hostinfo").unwrap(),
+            "localhost:1"
+        );
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "N"
+        );
     }
 
     // --- Integration tests with mock TCP server ---
@@ -2778,10 +2778,16 @@ mod tests {
         drv.connect(&user).unwrap();
 
         // The handshake ran and the server's echoes landed in the cached state.
-        assert_eq!(drv.get_option("baud").unwrap(), "9600");
-        assert_eq!(drv.get_option("bits").unwrap(), "8");
-        assert_eq!(drv.get_option("parity").unwrap(), "none");
-        assert_eq!(drv.get_option("stop").unwrap(), "1");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "baud").unwrap(),
+            "9600"
+        );
+        assert_eq!(drv.get_option(&AsynUser::default(), "bits").unwrap(), "8");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "none"
+        );
+        assert_eq!(drv.get_option(&AsynUser::default(), "stop").unwrap(), "1");
 
         // Data path out: 3 caller bytes, one of them an IAC. The interpose
         // reports the caller's count, not the 4 bytes it put on the wire.
@@ -2903,7 +2909,10 @@ mod tests {
 
         drv.set_option(&mut AsynUser::default(), "baud", "115200")
             .unwrap();
-        assert_eq!(drv.get_option("baud").unwrap(), "115200");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "baud").unwrap(),
+            "115200"
+        );
 
         server.join().unwrap();
     }
@@ -3792,10 +3801,18 @@ mod tests {
 
         drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
             .unwrap();
-        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "Y"
+        );
         drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "n")
             .unwrap();
-        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "N"
+        );
 
         // Values C never accepts must now error instead of mapping to "off".
         for bad in ["1", "yes", "true", "", "maybe"] {
@@ -3806,7 +3823,11 @@ mod tests {
             );
         }
         // The last accepted value (N) is unchanged by the rejected sets.
-        assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "N"
+        );
     }
 
     #[test]
@@ -4152,14 +4173,24 @@ mod tests {
 
         // get must echo the live endpoint for either key case
         // (C getOption returns tty->IPDeviceName verbatim).
-        assert_eq!(drv.get_option("hostinfo").unwrap(), "10.0.0.5:1234 udp");
-        assert_eq!(drv.get_option("hostInfo").unwrap(), "10.0.0.5:1234 udp");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "hostinfo").unwrap(),
+            "10.0.0.5:1234 udp"
+        );
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "hostInfo").unwrap(),
+            "10.0.0.5:1234 udp"
+        );
 
         // disconnectOnReadTimeout shares the same case-insensitive key
         // contract for set and get (C getOption -> "Y"/"N").
         drv.set_option(&mut AsynUser::default(), "DISCONNECTONREADTIMEOUT", "Y")
             .unwrap();
-        assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "disconnectonreadtimeout")
+                .unwrap(),
+            "Y"
+        );
     }
 
     #[test]
@@ -4176,7 +4207,7 @@ mod tests {
         assert!(matches!(err, AsynError::OptionNotFound(_)));
         // R11-49: reported in C's words (drvAsynIPPort.c:996-997).
         assert_eq!(err.message(), "Unsupported key \"bogusKey\"");
-        assert!(drv.get_option("bogusKey").is_err());
+        assert!(drv.get_option(&AsynUser::default(), "bogusKey").is_err());
 
         // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
         drv.set_option(&mut AsynUser::default(), "", "ignored")
@@ -4461,17 +4492,33 @@ mod tests {
     fn com_option_interface_is_layered_over_the_ip_drivers() {
         let com = DrvAsynIPPort::new("comport", "1.2.3.4:5000 COM").unwrap();
         // Answered by the interpose, from the defaults C installs (:851-855).
-        assert_eq!(com.get_option("baud").unwrap(), "9600");
-        assert_eq!(com.get_option("parity").unwrap(), "none");
-        assert_eq!(com.get_option("crtscts").unwrap(), "N");
+        assert_eq!(
+            com.get_option(&AsynUser::default(), "baud").unwrap(),
+            "9600"
+        );
+        assert_eq!(
+            com.get_option(&AsynUser::default(), "parity").unwrap(),
+            "none"
+        );
+        assert_eq!(
+            com.get_option(&AsynUser::default(), "crtscts").unwrap(),
+            "N"
+        );
         // Not the interpose's key: falls through to the IP driver.
-        assert_eq!(com.get_option("hostInfo").unwrap(), "1.2.3.4:5000 COM");
-        assert_eq!(com.get_option("disconnectOnReadTimeout").unwrap(), "N");
+        assert_eq!(
+            com.get_option(&AsynUser::default(), "hostInfo").unwrap(),
+            "1.2.3.4:5000 COM"
+        );
+        assert_eq!(
+            com.get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "N"
+        );
 
         // A plain TCP port has no COM layer, so the serial keys are unknown to it
         // — the same asynError C's IP driver returns for an unsupported key.
         let tcp = DrvAsynIPPort::new("tcpport", "1.2.3.4:5000 TCP").unwrap();
-        assert!(tcp.get_option("baud").is_err());
+        assert!(tcp.get_option(&AsynUser::default(), "baud").is_err());
     }
 
     /// R8-50: the token classification is exhaustive, so an unknown protocol is

@@ -2377,7 +2377,8 @@ impl PortActor {
                 }
             }
             RequestOp::GetOption { key } => {
-                let val = self.driver.get_option(key)?;
+                // The request's own AsynUser, as `SetOption` below.
+                let val = self.driver.get_option(user, key)?;
                 Ok(RequestResult::option_read(val))
             }
             RequestOp::SetOption { key, value } => {
@@ -4870,11 +4871,12 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Disconnected);
 
         // With the waiver the put reaches the driver on the dead line — the
-        // operator's only route to repoint a wrong or moved host.
+        // operator's only route to repoint a wrong or moved host. The base
+        // driver keeps no options, so its own error is the proof it ran.
         let user = AsynUser::new(0)
             .with_timeout(Duration::from_secs(1))
             .queue_even_if_not_connected();
-        queue_and_wait(
+        let err = queue_and_wait(
             &tx,
             RequestOp::SetOption {
                 key: "hostinfo".into(),
@@ -4882,21 +4884,30 @@ mod tests {
             },
             user,
         )
-        .expect("QUEUE_EVEN_IF_NOT_CONNECTED must reach the driver on a down port");
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "asyn: Error - asynPortDriver:writeOption not implemented",
+            "QUEUE_EVEN_IF_NOT_CONNECTED must reach the driver on a down port"
+        );
 
-        // And the readback comes back off the same dead line.
+        // And the readback reaches it off the same dead line.
         let user = AsynUser::new(0)
             .with_timeout(Duration::from_secs(1))
             .queue_even_if_not_connected();
-        let r = queue_and_wait(
+        let err = queue_and_wait(
             &tx,
             RequestOp::GetOption {
                 key: "hostinfo".into(),
             },
             user,
         )
-        .expect("the connect-time option readback is queued with the same waiver");
-        assert_eq!(r.option_value.as_deref(), Some("newhost:5000"));
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "asyn: Error - asynPortDriver:readOption not implemented",
+            "the connect-time option readback is queued with the same waiver"
+        );
     }
 
     /// C `queueRequest`'s waiver as a production [`PortHandle`] applies it

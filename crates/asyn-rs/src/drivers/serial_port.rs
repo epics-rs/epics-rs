@@ -1725,7 +1725,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         // C `getOption` dispatches with `epicsStrCaseCmp` exactly as `setOption`
         // does (:143-230), so both halves enter through the same normalisation
         // and a key set under any spelling reads back.
@@ -1810,12 +1810,7 @@ impl PortDriver for DrvAsynSerialPort {
             | "rs485_rts_after_send"
             | "rs485_delay_rts_before_send"
             | "rs485_delay_rts_after_send" => self.get_rs485_option(&key),
-            _ => self
-                .base
-                .options
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| AsynError::OptionNotFound(key.clone())),
+            _ => Err(AsynError::OptionNotFound(key.clone())),
         }
     }
 }
@@ -2076,7 +2071,10 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "baud", "115200")
             .unwrap();
         assert_eq!(drv.baud, 115200);
-        assert_eq!(drv.get_option("baud").unwrap(), "115200");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "baud").unwrap(),
+            "115200"
+        );
     }
 
     #[test]
@@ -2085,7 +2083,7 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "bits", "7")
             .unwrap();
         assert_eq!(drv.termios.c_cflag & libc::CSIZE, libc::CS7);
-        assert_eq!(drv.get_option("bits").unwrap(), "7");
+        assert_eq!(drv.get_option(&AsynUser::default(), "bits").unwrap(), "7");
     }
 
     #[test]
@@ -2095,10 +2093,16 @@ mod tests {
             .unwrap();
         assert_ne!(drv.termios.c_cflag & libc::PARENB, 0);
         assert_eq!(drv.termios.c_cflag & libc::PARODD, 0);
-        assert_eq!(drv.get_option("parity").unwrap(), "even");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "even"
+        );
         drv.set_option(&mut AsynUser::default(), "parity", "odd")
             .unwrap();
-        assert_eq!(drv.get_option("parity").unwrap(), "odd");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "odd"
+        );
     }
 
     #[test]
@@ -2107,7 +2111,7 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "stop", "2")
             .unwrap();
         assert_ne!(drv.termios.c_cflag & libc::CSTOPB, 0);
-        assert_eq!(drv.get_option("stop").unwrap(), "2");
+        assert_eq!(drv.get_option(&AsynUser::default(), "stop").unwrap(), "2");
     }
 
     #[test]
@@ -2154,7 +2158,10 @@ mod tests {
             drv.set_option(&mut AsynUser::default(), "baud", "12345")
                 .unwrap();
             assert_eq!(drv.baud, 12345);
-            assert_eq!(drv.get_option("baud").unwrap(), "12345");
+            assert_eq!(
+                drv.get_option(&AsynUser::default(), "baud").unwrap(),
+                "12345"
+            );
         }
     }
 
@@ -2245,7 +2252,10 @@ mod tests {
         assert_eq!(drv.baud, 115200);
         drv.set_option(&mut AsynUser::default(), "Parity", "Even")
             .unwrap();
-        assert_eq!(drv.get_option("parity").unwrap(), "even");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "even"
+        );
     }
 
     #[test]
@@ -2261,10 +2271,16 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
         drv.set_option(&mut AsynUser::default(), "parity", "EVEN")
             .unwrap();
-        assert_eq!(drv.get_option("parity").unwrap(), "even");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "even"
+        );
         drv.set_option(&mut AsynUser::default(), "parity", "None")
             .unwrap();
-        assert_eq!(drv.get_option("parity").unwrap(), "none");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "none"
+        );
         // Single-char aliases (n/e/o) are no longer accepted (C parity).
         assert!(
             drv.set_option(&mut AsynUser::default(), "parity", "n")
@@ -2306,7 +2322,10 @@ mod tests {
         // DRV-39: C getOption (drvAsynSerialPort.c:204-207) reports "break" as
         // "off" (a momentary line action), not an error.
         let drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        assert_eq!(drv.get_option("break").unwrap(), "off");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "break").unwrap(),
+            "off"
+        );
     }
 
     #[test]
@@ -2406,7 +2425,7 @@ mod tests {
         assert!(matches!(err, AsynError::OptionNotFound(_)));
         // R11-49: and it says so in C's words (drvAsynSerialPort.c:595-596).
         assert_eq!(err.message(), "Unsupported key \"custom\"");
-        assert!(drv.get_option("custom").is_err());
+        assert!(drv.get_option(&AsynUser::default(), "custom").is_err());
 
         // The empty key is not an error. With no open fd there is nothing to
         // re-apply, so it is a no-op here; the connected re-apply path is
@@ -2418,7 +2437,7 @@ mod tests {
     #[test]
     fn test_get_option_not_found() {
         let drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        assert!(drv.get_option("nonexistent").is_err());
+        assert!(drv.get_option(&AsynUser::default(), "nonexistent").is_err());
     }
 
     #[test]
@@ -2847,7 +2866,7 @@ mod tests {
         // C's seed has CLOCAL on, and getOption answers from the cache even
         // while the port has never been opened — "Y", not "N".
         assert_eq!(
-            drv.get_option("clocal").unwrap(),
+            drv.get_option(&AsynUser::default(), "clocal").unwrap(),
             "Y",
             "C seeds CS8|CLOCAL|CREAD (:1077) and getOption reads the cache"
         );
@@ -2856,7 +2875,7 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "clocal", "N")
             .unwrap();
         assert_eq!(
-            drv.get_option("clocal").unwrap(),
+            drv.get_option(&AsynUser::default(), "clocal").unwrap(),
             "N",
             "an option set while the line is down is held, not dropped"
         );
@@ -2879,7 +2898,7 @@ mod tests {
         // Disconnect/reconnect (the actor's auto-reconnect path): the cache is
         // the only source, so the setting must survive.
         drv.disconnect(&AsynUser::default()).unwrap();
-        assert_eq!(drv.get_option("clocal").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "clocal").unwrap(), "N");
         drv.connect(&AsynUser::default()).unwrap();
         let live = drv.get_current_termios().unwrap();
         assert_eq!(
@@ -2893,7 +2912,7 @@ mod tests {
             .unwrap();
         let live = drv.get_current_termios().unwrap();
         assert_ne!(live.c_cflag & libc::CLOCAL, 0);
-        assert_eq!(drv.get_option("clocal").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "clocal").unwrap(), "Y");
     }
 
     /// R7-49: the `ixon`/`ixoff`/`ixany` iflags read back from the cache, per
@@ -2915,9 +2934,9 @@ mod tests {
         let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
 
         // Default (no flow control in the configure string): all three off.
-        assert_eq!(drv.get_option("ixon").unwrap(), "N");
-        assert_eq!(drv.get_option("ixoff").unwrap(), "N");
-        assert_eq!(drv.get_option("ixany").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixon").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixoff").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixany").unwrap(), "N");
 
         // Set two of the three while the line is DOWN. Each flag is
         // independent — ixon on, ixoff still off, ixany on.
@@ -2926,13 +2945,13 @@ mod tests {
         drv.set_option(&mut AsynUser::default(), "ixany", "Y")
             .unwrap();
         assert_eq!(
-            drv.get_option("ixon").unwrap(),
+            drv.get_option(&AsynUser::default(), "ixon").unwrap(),
             "Y",
             "a disconnected readback must report the cache, not a flat N"
         );
-        assert_eq!(drv.get_option("ixoff").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixoff").unwrap(), "N");
         assert_eq!(
-            drv.get_option("ixany").unwrap(),
+            drv.get_option(&AsynUser::default(), "ixany").unwrap(),
             "Y",
             "ixany is a real cached flag on POSIX (C hard-codes N only on vxWorks)"
         );
@@ -2948,10 +2967,10 @@ mod tests {
         // the cache is the owner, so the readback and the device both hold.
         drv.set_option(&mut AsynUser::default(), "ixoff", "Y")
             .unwrap();
-        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixoff").unwrap(), "Y");
         drv.disconnect(&AsynUser::default()).unwrap();
-        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
-        assert_eq!(drv.get_option("ixon").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixoff").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixon").unwrap(), "Y");
         drv.connect(&AsynUser::default()).unwrap();
         let live = drv.get_current_termios().unwrap();
         assert_ne!(live.c_iflag & libc::IXOFF, 0);
@@ -2960,9 +2979,9 @@ mod tests {
         // And clearing one clears only that one.
         drv.set_option(&mut AsynUser::default(), "ixon", "N")
             .unwrap();
-        assert_eq!(drv.get_option("ixon").unwrap(), "N");
-        assert_eq!(drv.get_option("ixoff").unwrap(), "Y");
-        assert_eq!(drv.get_option("ixany").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixon").unwrap(), "N");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixoff").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "ixany").unwrap(), "Y");
         let live = drv.get_current_termios().unwrap();
         assert_eq!(live.c_iflag & libc::IXON, 0);
         assert_ne!(live.c_iflag & libc::IXOFF, 0);
@@ -2992,10 +3011,16 @@ mod tests {
             .unwrap();
 
         // Readback comes from the cache, not the (still absent) device.
-        assert_eq!(drv.get_option("bits").unwrap(), "7");
-        assert_eq!(drv.get_option("parity").unwrap(), "odd");
-        assert_eq!(drv.get_option("stop").unwrap(), "2");
-        assert_eq!(drv.get_option("crtscts").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "bits").unwrap(), "7");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "odd"
+        );
+        assert_eq!(drv.get_option(&AsynUser::default(), "stop").unwrap(), "2");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "crtscts").unwrap(),
+            "Y"
+        );
 
         drv.connect(&AsynUser::default()).unwrap();
         let live = drv.get_current_termios().unwrap();
@@ -3355,7 +3380,10 @@ mod tests {
         drv.io.fd = Some(badfd);
 
         // Default cached baud is 9600.
-        assert_eq!(drv.get_option("baud").unwrap(), "9600");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "baud").unwrap(),
+            "9600"
+        );
 
         // The apply path fails (tcgetattr ENOTTY on /dev/null) ...
         let r = drv.set_option(&mut AsynUser::default(), "baud", "115200");
@@ -3363,7 +3391,7 @@ mod tests {
 
         // ... and the cached config must not have been mutated.
         assert_eq!(
-            drv.get_option("baud").unwrap(),
+            drv.get_option(&AsynUser::default(), "baud").unwrap(),
             "9600",
             "cached baud must stay 9600 when apply fails (C restores baudPrev)"
         );
@@ -3768,15 +3796,18 @@ mod tests {
 
         for spelling in ["baud", "BAUD", "Baud", " baud "] {
             assert_eq!(
-                drv.get_option(spelling).unwrap(),
+                drv.get_option(&AsynUser::default(), spelling).unwrap(),
                 "19200",
                 "{spelling} must reach the same handler set_option did"
             );
         }
-        assert_eq!(drv.get_option("Break").unwrap(), "off");
         assert_eq!(
-            drv.get_option("CLOCAL").unwrap(),
-            drv.get_option("clocal").unwrap()
+            drv.get_option(&AsynUser::default(), "Break").unwrap(),
+            "off"
+        );
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "CLOCAL").unwrap(),
+            drv.get_option(&AsynUser::default(), "clocal").unwrap()
         );
     }
 
@@ -3790,7 +3821,7 @@ mod tests {
         let drv = DrvAsynSerialPort::new("s_rs485_case", "/dev/ttyS0").unwrap();
         for spelling in ["rs485_enable", "RS485_ENABLE", "RS485_Delay_Rts_After_Send"] {
             let err = drv
-                .get_option(spelling)
+                .get_option(&AsynUser::default(), spelling)
                 .expect_err("the port is down, so the helper cannot read the line");
             assert_eq!(
                 err.status(),
@@ -3838,8 +3869,11 @@ mod tests {
         // The parity arm kept the case-insensitivity it used to hold locally,
         // now that the fold lives at the entry.
         drv.set_option(&mut user, "parity", "EVEN").unwrap();
-        assert_eq!(drv.get_option("parity").unwrap(), "even");
+        assert_eq!(
+            drv.get_option(&AsynUser::default(), "parity").unwrap(),
+            "even"
+        );
         drv.set_option(&mut user, "CLOCAL", "y").unwrap();
-        assert_eq!(drv.get_option("clocal").unwrap(), "Y");
+        assert_eq!(drv.get_option(&AsynUser::default(), "clocal").unwrap(), "Y");
     }
 }

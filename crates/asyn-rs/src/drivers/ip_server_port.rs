@@ -1889,7 +1889,7 @@ impl PortDriver for DrvAsynIPSubport {
         Err(AsynError::OptionNotFound(key.to_string()))
     }
 
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
             // C prints the flag as "Y"/"N" (drvAsynIPPort.c:950-952).
             return Ok(if self.slot.disconnect_on_read_timeout() {
@@ -2514,7 +2514,12 @@ mod tests {
         child
             .set_option(&mut opt_user, "disconnectOnReadTimeout", "Y")
             .unwrap();
-        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+        assert_eq!(
+            child
+                .get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "Y"
+        );
 
         // A zero-timeout poll is exempt (C's `pasynUser->timeout > 0`).
         let poll_user = AsynUser::default().with_timeout(Duration::ZERO);
@@ -2549,7 +2554,12 @@ mod tests {
         wait_for_slot(&srv, 0);
         assert!(child.base().is_connected());
         // …and the option survives the slot reuse, as C's child port does.
-        assert_eq!(child.get_option("disconnectOnReadTimeout").unwrap(), "Y");
+        assert_eq!(
+            child
+                .get_option(&AsynUser::default(), "disconnectOnReadTimeout")
+                .unwrap(),
+            "Y"
+        );
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

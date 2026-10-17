@@ -1515,8 +1515,7 @@ impl PortHandle {
         Ok(result.data.unwrap_or_default())
     }
 
-    pub async fn get_option(&self, key: &str) -> AsynResult<String> {
-        let user = AsynUser::default();
+    pub async fn get_option(&self, user: AsynUser, key: &str) -> AsynResult<String> {
         let result = self
             .submit_async(
                 RequestOp::GetOption {

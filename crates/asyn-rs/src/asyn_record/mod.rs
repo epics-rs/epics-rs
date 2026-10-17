@@ -6453,7 +6453,11 @@ mod tests {
                 }
                 Ok(())
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 let key = option_key(key);
                 match key.as_str() {
                     // A serial/IP driver answers its configured line settings from
@@ -6650,7 +6654,11 @@ mod tests {
                 }
                 Ok(())
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 match key {
                     "baud" => Ok("9600".to_string()),
                     "parity" => Ok("even".to_string()),
@@ -8293,7 +8301,11 @@ mod tests {
             ) -> crate::error::AsynResult<()> {
                 Ok(())
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 match key {
                     "baud" => Ok("9600".to_string()),
                     "parity" => Ok("even".to_string()),
@@ -8893,7 +8905,11 @@ mod tests {
                 }
                 Ok(())
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 match key {
                     "baud" => Ok("9600".to_string()),
                     _ => Err(AsynError::Status {
@@ -12144,7 +12160,11 @@ A.OEOS
             fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
                 crate::interfaces::octet_transport_capabilities()
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 match key {
                     "baud" => Ok("19200".to_string()),
                     _ => Err(crate::error::AsynError::Status {
@@ -13263,7 +13283,11 @@ A.OEOS
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.0
             }
-            fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+            fn get_option(
+                &self,
+                _user: &crate::user::AsynUser,
+                key: &str,
+            ) -> crate::error::AsynResult<String> {
                 let key = option_key(key);
                 if key == "baud" {
                     Ok(self.1.to_string())

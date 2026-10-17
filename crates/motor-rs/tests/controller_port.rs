@@ -2,6 +2,7 @@
 //! `writeFloat64` and a subclass's own parameters at the controller and
 //! axis addresses.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,6 +93,104 @@ fn a_driver_param_at_the_controller_axis_reaches_the_driver_and_reads_back() {
         *seen.lock().unwrap(),
         [(feed_rate as i32, 75), (index::DEFER_MOVES as i32, 2)]
     );
+}
+
+/// omsBaseController's shape: a string parameter its `writeOctet` sends
+/// and does not store.
+#[derive(Default)]
+struct Sends {
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    send: usize,
+}
+
+impl ControllerParams for Sends {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.send = base.create_param("SEND", ParamType::Octet)?;
+        Ok(())
+    }
+
+    fn write_octet(&mut self, _: &mut PortDriverBase, user: &AsynUser, data: &[u8]) -> ParamWrite {
+        if user.reason != self.send {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        self.sent.lock().unwrap().push(data.to_vec());
+        ParamWrite::Handled(Ok(()))
+    }
+}
+
+#[test]
+fn a_driver_write_octet_override_runs_in_place_of_the_base() {
+    let params = Sends::default();
+    let sent = params.sent.clone();
+    let port = register_controller_port(&open_owner(), "CPOCTET", 1, params).unwrap();
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+    let send = BASE_PARAMS.len();
+    assert_eq!(io.write_octet(send, b"AX RP").unwrap(), 5);
+    assert_eq!(*sent.lock().unwrap(), [b"AX RP".to_vec()]);
+    // Never stored, so still undefined.
+    assert!(io.read_octet(send, 16).is_err());
+    // The base still stores what the override passes on.
+    let message = index::PROFILE_BUILD_MESSAGE;
+    io.write_octet(message, b"built").unwrap();
+    assert_eq!(io.read_octet(message, 16).unwrap(), b"built\0");
+}
+
+/// phytronController's shape: a per-axis option it answers itself, the
+/// rest the base's.
+#[derive(Default)]
+struct Options {
+    methods: Arc<Mutex<HashMap<i32, String>>>,
+}
+
+impl ControllerParams for Options {
+    fn read_option(
+        &self,
+        _: &PortDriverBase,
+        user: &AsynUser,
+        key: &str,
+    ) -> Option<AsynResult<String>> {
+        (key == "pollMethod").then(|| {
+            let methods = self.methods.lock().unwrap();
+            Ok(methods.get(&user.addr).cloned().unwrap_or_default())
+        })
+    }
+
+    fn write_option(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: &AsynUser,
+        key: &str,
+        value: &str,
+    ) -> Option<AsynResult<()>> {
+        (key == "pollMethod").then(|| {
+            self.methods
+                .lock()
+                .unwrap()
+                .insert(user.addr, value.to_owned());
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn a_driver_option_override_runs_in_place_of_the_base() {
+    let params = Options::default();
+    let methods = params.methods.clone();
+    let port = register_controller_port(&open_owner(), "CPOPTION", 2, params).unwrap();
+    let user = |addr| AsynUser::default().with_addr(addr);
+    port.set_option_blocking(user(1), "pollMethod", "serial")
+        .unwrap();
+    assert_eq!(methods.lock().unwrap()[&1], "serial");
+    // The read resolves the axis from its user, as phytronController's
+    // readOption does (phytronAxisMotor.cpp:596).
+    assert_eq!(
+        port.get_option_blocking(user(1), "pollMethod").unwrap(),
+        "serial"
+    );
+    assert_eq!(port.get_option_blocking(user(0), "pollMethod").unwrap(), "");
+    // Any other key is the base's, which keeps none (asynPortDriver.cpp:3402).
+    assert!(port.set_option_blocking(user(1), "other", "x").is_err());
+    assert!(port.get_option_blocking(user(1), "other").is_err());
 }
 
 #[test]

@@ -379,6 +379,40 @@ pub trait ControllerParams: Send + Sync + 'static {
         base.read_float64_param(user)
     }
 
+    /// The subclass `writeOctet`, as omsBaseController's string commands;
+    /// see [`Self::write_int32`]. asynMotorController has none, so the
+    /// base is asynPortDriver's. A handled write reports every byte taken.
+    fn write_octet(
+        &mut self,
+        _base: &mut PortDriverBase,
+        _user: &AsynUser,
+        _data: &[u8],
+    ) -> ParamWrite {
+        ParamWrite::PassToBase(Ok(()))
+    }
+
+    /// The subclass `readOption`, as phytronController's poll and homing
+    /// options; `None` reads the base's. asynMotorController has none.
+    fn read_option(
+        &self,
+        _base: &PortDriverBase,
+        _user: &AsynUser,
+        _key: &str,
+    ) -> Option<AsynResult<String>> {
+        None
+    }
+
+    /// The subclass `writeOption`; `None` passes the option to the base.
+    fn write_option(
+        &mut self,
+        _base: &mut PortDriverBase,
+        _user: &AsynUser,
+        _key: &str,
+        _value: &str,
+    ) -> Option<AsynResult<()>> {
+        None
+    }
+
     /// The subclass `writeUInt32Digital`; see [`Self::write_int32`].
     /// asynMotorController has none, so the base is asynPortDriver's.
     fn write_uint32_digital(
@@ -1155,6 +1189,29 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
                 own.and(status)
             }
         }
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        match self.params.write_octet(&mut self.base, user, data) {
+            ParamWrite::Handled(status) => status.map(|()| data.len()),
+            ParamWrite::PassToBase(own) => {
+                let written = self.base.write_octet(user, data);
+                own.and(written)
+            }
+        }
+    }
+
+    fn get_option(&self, user: &AsynUser, key: &str) -> AsynResult<String> {
+        self.params
+            .read_option(&self.base, user, key)
+            .unwrap_or_else(|| self.base.read_option(user, key))
+    }
+
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        if let Some(written) = self.params.write_option(&mut self.base, user, key, value) {
+            return written;
+        }
+        self.base.write_option(user, key, value)
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {

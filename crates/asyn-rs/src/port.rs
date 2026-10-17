@@ -598,7 +598,6 @@ pub struct PortDriverBase {
     /// through the same counter and the same list as the actor does, instead of
     /// reaching around them.
     pub(crate) announcer: Arc<ExceptionAnnouncer>,
-    pub options: HashMap<String, String>,
     /// The EOS terminators, keyed per device the way C keys them: an `eosPvt`
     /// is created per `asynInterposeEosConfig(portName, addr, ...)`
     /// (asynInterposeEos.c:84-120), and every EOS hook takes the `asynUser`
@@ -798,7 +797,6 @@ impl PortDriverBase {
             auto_connect: Arc::new(AtomicBool::new(true)),
             shared: Arc::default(),
             announcer: Arc::new(ExceptionAnnouncer::new(port_name, flags.multi_device)),
-            options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
             trace: crate::services::PortServices::global().trace().clone(),
@@ -2006,6 +2004,25 @@ impl PortDriverBase {
         self.octet_writer
     }
 
+    /// C `asynPortDriver::readOption` (asynPortDriver.cpp:3402-3407): the base
+    /// class keeps no options, so every key is an error. The
+    /// [`PortDriver::get_option`] default, and what an override chains to.
+    pub fn read_option(&self, _user: &AsynUser, _key: &str) -> AsynResult<String> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:readOption not implemented".into(),
+        })
+    }
+
+    /// C `asynPortDriver::writeOption` (asynPortDriver.cpp:3430-3435); see
+    /// [`Self::read_option`].
+    pub fn write_option(&mut self, _user: &AsynUser, _key: &str, _value: &str) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynPortDriver:writeOption not implemented".into(),
+        })
+    }
+
     /// C `asynPortDriver::writeOctet` with the base class's rules applied: the
     /// [`PortDriver::write_octet`] default, and what an override calls to chain
     /// to it as a C override calls its base class.
@@ -2729,12 +2746,11 @@ pub trait PortDriver: Any + Send + Sync {
         Ok(())
     }
 
-    fn get_option(&self, key: &str) -> AsynResult<String> {
-        self.base()
-            .options
-            .get(key)
-            .cloned()
-            .ok_or_else(|| AsynError::OptionNotFound(key.to_string()))
+    /// C `asynOption::getOption(void *drvPvt, asynUser *pasynUser, key, val,
+    /// maxChars)`: the caller's user, so a driver resolves the address from it
+    /// as `setOption` does (phytronAxisMotor.cpp:596, :612).
+    fn get_option(&self, user: &AsynUser, key: &str) -> AsynResult<String> {
+        self.base().read_option(user, key)
     }
 
     /// C `asynOption::setOption(void *drvPvt, asynUser *pasynUser, key, val)`.
@@ -2744,11 +2760,8 @@ pub trait PortDriver: Any + Send + Sync {
     /// runs under it (`asynInterposeCom.c:488,508`). The option layer has no
     /// timeout of its own: an asynRecord option put negotiates under TMOT, an
     /// iocsh `asynSetOption` under its own 2 s (`asynShellCommands.c:119`).
-    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
-        self.base_mut()
-            .options
-            .insert(key.to_string(), value.to_string());
-        Ok(())
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        self.base_mut().write_option(user, key, value)
     }
 
     /// The driver's own report — C `asynCommon::report`, which the manager calls
@@ -4034,29 +4047,28 @@ mod tests {
         assert!(drv.write_float64_array(&user, &[1.0]).is_err());
     }
 
+    /// C asynPortDriver keeps no options: readOption and writeOption fail
+    /// for every key (asynPortDriver.cpp:3402-3407, 3430-3435).
     #[test]
-    fn test_option_set_get() {
+    fn the_base_reads_and_writes_no_option() {
         let mut drv = TestDriver::new();
-        drv.set_option(&mut AsynUser::default(), "baud", "9600")
-            .unwrap();
-        assert_eq!(drv.get_option("baud").unwrap(), "9600");
-        drv.set_option(&mut AsynUser::default(), "baud", "115200")
-            .unwrap();
-        assert_eq!(drv.get_option("baud").unwrap(), "115200");
-    }
-
-    #[test]
-    fn test_option_not_found() {
-        let drv = TestDriver::new();
-        let err = drv.get_option("nonexistent").unwrap_err();
-        assert!(matches!(err, AsynError::OptionNotFound(_)));
+        let err = drv
+            .set_option(&mut AsynUser::default(), "baud", "9600")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "asyn: Error - asynPortDriver:writeOption not implemented"
+        );
+        let err = drv.get_option(&AsynUser::default(), "baud").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "asyn: Error - asynPortDriver:readOption not implemented"
+        );
     }
 
     #[test]
     fn test_report_no_panic() {
         let mut drv = TestDriver::new();
-        drv.set_option(&mut AsynUser::default(), "testkey", "testval")
-            .unwrap();
         drv.base_mut().set_int32_param(0, 0, 42).unwrap();
         for level in 0..=3 {
             let mut out = String::new();
@@ -5829,7 +5841,7 @@ mod tests {
             base: PortDriverBase::new("opt_rep", 1, PortFlags::default()),
         };
         drv.set_option(&mut AsynUser::default(), "baud", "9600")
-            .unwrap();
+            .unwrap_err();
 
         for level in 0..=4 {
             let mut out = String::new();

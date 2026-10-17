@@ -1057,7 +1057,7 @@ impl PortDriver for DrvAsynSerialPort {
         Ok(())
     }
 
-    fn get_option(&self, key: &str) -> AsynResult<String> {
+    fn get_option(&self, _user: &AsynUser, key: &str) -> AsynResult<String> {
         use dcb_bits::*;
 
         // C-Win32 getOption's opening guard (drvAsynSerialPortWin32.c:96-101):
@@ -1103,12 +1103,7 @@ impl PortDriver for DrvAsynSerialPort {
             // `tty->break_active ? "on" : "off"`
             // (drvAsynSerialPortWin32.c:147-150).
             "break" => Ok(if self.io.break_active { "on" } else { "off" }.to_string()),
-            _ => self
-                .base
-                .options
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| AsynError::OptionNotFound(key.clone())),
+            _ => Err(AsynError::OptionNotFound(key.clone())),
         }
     }
 }
@@ -1241,7 +1236,7 @@ mod tests {
             "baud", "bits", "parity", "stop", "clocal", "crtscts", "ixon", "ixoff", "ixany",
             "break",
         ] {
-            match drv.get_option(key) {
+            match drv.get_option(&AsynUser::default(), key) {
                 Err(AsynError::Status { status, message }) => {
                     assert_eq!(status, AsynStatus::Error, "get_option({key}) status");
                     assert!(

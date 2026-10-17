@@ -938,37 +938,52 @@ impl<P: ControllerParams> ControllerPort<P> {
         true
     }
 
-    /// The base `writeFloat64`'s driver call for `function`; a move takes
-    /// its speeds from the parameters, as C reads them.
+    /// The base `writeFloat64`'s driver call for `function`; a move reads
+    /// its speeds from the parameters in its own arm, as C does
+    /// (asynMotorController.cpp:291-350), so no other write reports them
+    /// undefined.
     fn float64_command(&self, axis: &MotorAxis, addr: i32, function: usize, value: f64) -> bool {
-        let min_velocity = self.float(index::VEL_BASE, addr);
-        let velocity = self.float(index::VELOCITY, addr);
-        let acceleration = self.float(index::ACCEL, addr);
+        let speeds = || {
+            (
+                self.float(index::VEL_BASE, addr),
+                self.float(index::VELOCITY, addr),
+                self.float(index::ACCEL, addr),
+            )
+        };
         let gain = |kind| MotorCommand::SetPidGain { kind, gain: value };
         let command = match function {
-            index::MOVE_REL => MotorCommand::MoveRelative {
-                distance: value,
-                min_velocity,
-                velocity,
-                acceleration,
-            },
-            index::MOVE_ABS => MotorCommand::MoveAbsolute {
-                position: value,
-                min_velocity,
-                velocity,
-                acceleration,
-            },
+            index::MOVE_REL => {
+                let (min_velocity, velocity, acceleration) = speeds();
+                MotorCommand::MoveRelative {
+                    distance: value,
+                    min_velocity,
+                    velocity,
+                    acceleration,
+                }
+            }
+            index::MOVE_ABS => {
+                let (min_velocity, velocity, acceleration) = speeds();
+                MotorCommand::MoveAbsolute {
+                    position: value,
+                    min_velocity,
+                    velocity,
+                    acceleration,
+                }
+            }
             index::MOVE_VEL => MotorCommand::MoveVelocity {
-                min_velocity,
+                min_velocity: self.float(index::VEL_BASE, addr),
                 velocity: value,
-                acceleration,
+                acceleration: self.float(index::ACCEL, addr),
             },
-            index::HOME => MotorCommand::Home {
-                forward: value != 0.0,
-                min_velocity,
-                velocity,
-                acceleration,
-            },
+            index::HOME => {
+                let (min_velocity, velocity, acceleration) = speeds();
+                MotorCommand::Home {
+                    forward: value != 0.0,
+                    min_velocity,
+                    velocity,
+                    acceleration,
+                }
+            }
             index::POSITION => MotorCommand::SetPosition { position: value },
             index::ENCODER_POSITION => MotorCommand::SetEncoderPosition { position: value },
             index::HIGH_LIMIT => MotorCommand::SetHighLimit { position: value },
@@ -1309,6 +1324,30 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
 /// [`ControllerPort::store`] on the port's actor.
 pub(crate) type ParamStore = Arc<dyn Fn(i32, ParamDelta) + Send + Sync>;
 
+/// What an axis's poller reads the port's parameters through: C's
+/// getIntegerParam / getDoubleParam in one call on the port's actor, so a
+/// read prints the parameter library's report and no readInt32/readFloat64
+/// interface line.
+#[derive(Clone)]
+pub(crate) struct ParamRead(Arc<dyn Fn(ParamCall) -> AsynResult<()> + Send + Sync>);
+
+type ParamCall = Box<dyn FnOnce(&PortDriverBase) + Send>;
+
+impl ParamRead {
+    /// `read` on the parameter library; `None` once the port is gone.
+    pub fn read<R: Send + 'static>(
+        &self,
+        read: impl FnOnce(&PortDriverBase) -> R + Send + 'static,
+    ) -> Option<R> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (self.0)(Box::new(move |base| {
+            let _ = tx.send(read(base));
+        }))
+        .ok()?;
+        rx.try_recv().ok()
+    }
+}
+
 /// A published controller port, as the axes' pollers reach it.
 pub(crate) struct Published {
     /// The driver's, for posting the values its poll reads; the parameter
@@ -1316,6 +1355,7 @@ pub(crate) struct Published {
     pub handle: PortHandle,
     pub hook: Option<Arc<dyn WriteHook>>,
     pub store: ParamStore,
+    pub params: ParamRead,
 }
 
 /// Publish controller port `port` with axes `0..num_axes` and the driver's
@@ -1346,9 +1386,14 @@ pub(crate) fn publish<P: ControllerParams>(
         let _ = port
             .with_driver_blocking::<ControllerPort<P>, _>(move |driver| driver.store(addr, delta));
     });
+    let port = handle.clone();
+    let params = ParamRead(Arc::new(move |read: ParamCall| {
+        port.with_driver_blocking::<ControllerPort<P>, _>(move |driver| read(&driver.base))
+    }));
     Ok(Published {
         handle,
         hook,
         store,
+        params,
     })
 }

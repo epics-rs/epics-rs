@@ -764,6 +764,124 @@ record(calc, "P:n") { field(CALC, "A+1") field(INPA, "P:n NPP") }
         .await;
 }
 
+/// C's STOP reads ACCEL alone (asynMotorController.cpp:207-208): a record
+/// stop with no move before it reads no VEL_BASE or VELOCITY, which no
+/// speed write has defined.
+#[tokio::test]
+async fn a_record_stop_reads_no_move_speeds() {
+    register_controller_port(&open_owner(), "STOPRD", 1, ()).unwrap();
+    let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
+        Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
+    let AxisSetup {
+        axis,
+        poll_loop,
+        poll_cmd_tx,
+    } = MotorBuilder::new(motor)
+        .trace_user(asyn("STOPRD", 0))
+        .poll_interval(Duration::from_millis(10))
+        .build_axis();
+    register_axis(axis).unwrap();
+    tokio::spawn(poll_loop.run());
+    let path = std::env::temp_dir().join(format!("motor-out-STOPRD0-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let manager = PortManager::global();
+    let traces = manager.trace_manager();
+    traces.set_trace_mask(Some("STOPRD"), asyn_rs::trace::TraceMask::FLOW);
+    traces.set_device_trace_file("STOPRD", 0, TraceFile::File(Arc::new(Mutex::new(file))));
+    let db = boot(
+        r##"
+record(motor, "SR:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(STOPRD,0)") field(MRES, "0.001") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    db.put_record_field_from_ca("SR:m", "STOP", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains("getDoubleParam"))
+        .collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("MOTOR_VEL_BASE") || l.contains("MOTOR_VELOCITY")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("MOTOR_ACCEL")),
+        "{lines:#?}"
+    );
+    let _ = poll_cmd_tx
+        .send(motor_rs::poll_loop::PollCommand::Shutdown)
+        .await;
+}
+
+/// C's controller reads its speeds and auto-power parameters with
+/// getDoubleParam / getIntegerParam (asynMotorController.cpp:207, :655-656):
+/// a record stop and the poller's passes print no readFloat64/readInt32
+/// interface line for them.
+#[tokio::test]
+async fn the_poller_reads_params_through_the_param_library() {
+    use asyn_rs::trace::TraceMask;
+    register_controller_port(&open_owner(), "PARAMRD", 1, ()).unwrap();
+    let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
+        Arc::new(Mutex::new(motor_rs::sim_motor::SimMotor::new()));
+    let AxisSetup {
+        axis,
+        poll_loop,
+        poll_cmd_tx,
+    } = MotorBuilder::new(motor)
+        .trace_user(asyn("PARAMRD", 0))
+        .poll_interval(Duration::from_millis(10))
+        .build_axis();
+    register_axis(axis).unwrap();
+    tokio::spawn(poll_loop.run());
+    let path = std::env::temp_dir().join(format!("motor-out-PARAMRD0-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let manager = PortManager::global();
+    let traces = manager.trace_manager();
+    traces.set_trace_mask(
+        Some("PARAMRD"),
+        TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER,
+    );
+    traces.set_device_trace_file("PARAMRD", 0, TraceFile::File(Arc::new(Mutex::new(file))));
+    let db = boot(
+        r##"
+record(motor, "PR:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(PARAMRD,0)") field(MRES, "0.001") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    db.put_record_field_from_ca("PR:m", "STOP", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let reads: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains(":readFloat64") || l.contains(":readInt32"))
+        .filter(|l| {
+            ["MOTOR_ACCEL", "MOTOR_VEL", "MOTOR_POWER"]
+                .iter()
+                .any(|name| l.contains(name))
+        })
+        .collect();
+    assert!(reads.is_empty(), "{reads:#?}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("getDoubleParam") && l.contains("MOTOR_ACCEL")),
+        "{text}"
+    );
+    let _ = poll_cmd_tx
+        .send(motor_rs::poll_loop::PollCommand::Shutdown)
+        .await;
+}
+
 /// devMotorAsyn.c:159-162: `dbScanLockOK` is set at `finishDevSup`, so a
 /// put before `scanRun` finishes through its callbacks and leaves no move
 /// pending to swallow the ones after `scanRun`.

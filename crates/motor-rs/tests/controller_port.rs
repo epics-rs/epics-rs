@@ -896,6 +896,49 @@ impl ControllerParams for UndefinedBuild {
     }
 }
 
+/// C writeFloat64 reads the speeds inside the move branches alone, and a
+/// velocity move reads no VELOCITY (asynMotorController.cpp:291-344):
+/// another write prints no undefined-parameter line for them.
+#[test]
+fn only_a_move_write_reads_the_speeds() {
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::trace::{TraceFile, TraceMask};
+    let port = register_controller_port(&open_owner(), "CPSPEEDREAD", 2, ()).unwrap();
+    let _a0 = axis("CPSPEEDREAD", 0);
+    let _a1 = axis("CPSPEEDREAD", 1);
+    let path = std::env::temp_dir().join(format!("cp-speed-read-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let manager = PortManager::global();
+    let traces = manager.trace_manager();
+    traces.set_trace_mask(Some("CPSPEEDREAD"), TraceMask::FLOW);
+    traces.set_device_trace_file(
+        "CPSPEEDREAD",
+        0,
+        TraceFile::File(Arc::new(Mutex::new(file))),
+    );
+    let undefined = |name: &str| {
+        let text = std::fs::read_to_string(&path).unwrap();
+        text.lines()
+            .any(|l| l.contains("getDoubleParam") && l.contains(&format!(" {name},")))
+    };
+    port.write_float64_blocking(index::VELOCITY, 0, 2.0)
+        .unwrap();
+    for name in ["MOTOR_VEL_BASE", "MOTOR_ACCEL"] {
+        assert!(!undefined(name), "a VELOCITY write read {name}");
+    }
+    port.write_float64_blocking(index::MOVE_VEL, 1, 2.0)
+        .unwrap();
+    assert!(
+        undefined("MOTOR_VEL_BASE"),
+        "the velocity move reads VEL_BASE"
+    );
+    assert!(
+        !undefined("MOTOR_VELOCITY"),
+        "the velocity move read VELOCITY"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn a_param_library_refusal_prints_its_own_status_code() {
     use asyn_rs::manager::PortManager;

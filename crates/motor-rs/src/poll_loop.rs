@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::controller_port::{FinishedWrite, WriteValue};
 use crate::device_state::*;
-use crate::flags::{MotorCommand, PidGainKind, StoredSpeeds};
+use crate::flags::{MotorCommand, PidGainKind, Speed, StoredSpeeds};
 use crate::trace::MotorTrace;
 
 /// Queue of driver commands from the device support to the poller thread.
@@ -242,20 +242,22 @@ fn write_controller_speed(trace: &MotorTrace, command: &MotorCommand) {
     }
 }
 
-/// The speeds an asynMotorController axis moves on: its port's
-/// parameters. asyn's paramList::getDouble zeroes an unset one before it
-/// fails.
-fn controller_speeds(trace: &MotorTrace) -> Option<StoredSpeeds> {
+/// `command` on the speeds an asynMotorController axis moves on: its
+/// port's parameters, only those the command runs on. asyn's
+/// paramList::getDouble zeroes an unset one before it fails.
+fn on_controller_speeds(trace: &MotorTrace, command: &MotorCommand) -> Option<MotorCommand> {
     use crate::controller_port::index;
-    let port = crate::devices::controller_port_handle(trace.port())?;
-    let read = |function| {
-        port.read_float64_blocking(function, trace.addr())
-            .unwrap_or(0.0)
-    };
-    Some(StoredSpeeds {
-        min_velocity: read(index::VEL_BASE),
-        velocity: read(index::VELOCITY),
-        acceleration: read(index::ACCEL),
+    let params = crate::devices::controller_params(trace.port())?;
+    let (command, addr) = (command.clone(), trace.addr());
+    params.read(move |base| {
+        command.on_speeds(|speed| {
+            let function = match speed {
+                Speed::MinVelocity => index::VEL_BASE,
+                Speed::Velocity => index::VELOCITY,
+                Speed::Acceleration => index::ACCEL,
+            };
+            base.get_float64_param(function, addr).unwrap_or(0.0)
+        })
     })
 }
 
@@ -355,12 +357,12 @@ impl Axis {
     fn auto_power(&self, delay: usize) -> Option<Duration> {
         use crate::controller_port::index;
         let (port, addr) = self.controller.as_ref()?;
-        let handle = crate::devices::controller_port_handle(port)?;
-        let on = handle.read_int32_blocking(index::POWER_AUTO_ONOFF, *addr);
-        (on.unwrap_or(0) == 1).then(|| {
-            let secs = handle.read_float64_blocking(delay, *addr).unwrap_or(0.0);
-            Duration::try_from_secs_f64(secs).unwrap_or_default()
-        })
+        let addr = *addr;
+        let secs = crate::devices::controller_params(port)?.read(move |base| {
+            let on = base.get_int32_param(index::POWER_AUTO_ONOFF, addr);
+            (on.unwrap_or(0) == 1).then(|| base.get_float64_param(delay, addr).unwrap_or(0.0))
+        })??;
+        Some(Duration::try_from_secs_f64(secs).unwrap_or_default())
     }
 
     /// One axis of C `asynMotorPoller`'s pass (asynMotorController.cpp:
@@ -561,10 +563,11 @@ impl Axis {
                 return Some(Speeds::Stored);
             }
             return command.runs_on_speeds().then(|| {
-                Speeds::Resolved(command.on_speeds(StoredSpeeds {
+                let speeds = StoredSpeeds {
                     acceleration: accel.take().unwrap_or(0.0),
                     ..self.speeds
-                }))
+                };
+                Speeds::Resolved(command.on_speeds(|speed| speeds.get(speed)))
             });
         }
         if trace.is_controller() {
@@ -575,8 +578,7 @@ impl Axis {
             if !command.runs_on_speeds() {
                 return None;
             }
-            return controller_speeds(trace)
-                .map(|speeds| Speeds::Resolved(command.on_speeds(speeds)));
+            return on_controller_speeds(trace, command).map(Speeds::Resolved);
         }
         if !trace.is_motor_interface() {
             return None;
@@ -586,7 +588,7 @@ impl Axis {
         }
         command
             .runs_on_speeds()
-            .then(|| Speeds::Resolved(command.on_speeds(self.speeds)))
+            .then(|| Speeds::Resolved(command.on_speeds(|speed| self.speeds.get(speed))))
     }
 
     /// C `asynMotorAxis::callParamCallbacks` after a write (asynMotorAxis.cpp:

@@ -536,6 +536,24 @@ pub struct StoredSpeeds {
     pub acceleration: f64,
 }
 
+/// One of the speeds a move runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    MinVelocity,
+    Velocity,
+    Acceleration,
+}
+
+impl StoredSpeeds {
+    pub fn get(&self, speed: Speed) -> f64 {
+        match speed {
+            Speed::MinVelocity => self.min_velocity,
+            Speed::Velocity => self.velocity,
+            Speed::Acceleration => self.acceleration,
+        }
+    }
+}
+
 impl MotorCommand {
     /// devMotorAsyn's `commandIsMove` (devMotorAsyn.c:686-691): a command
     /// whose completion processes the record, counted in
@@ -621,9 +639,11 @@ impl MotorCommand {
         commands
     }
 
-    /// This move or stop on `speeds` in place of its own; a jog keeps its
-    /// velocity, which is its message's value.
-    pub fn on_speeds(&self, speeds: StoredSpeeds) -> Self {
+    /// This move or stop on the speeds `speed` reads in place of its own;
+    /// a jog keeps its velocity, which is its message's value. Only the
+    /// speeds the command runs on are read, in C's VEL_BASE, VELOCITY,
+    /// ACCEL order (asynMotorController.cpp:207, :297-299, :329-330).
+    pub fn on_speeds(&self, mut speed: impl FnMut(Speed) -> f64) -> Self {
         let mut command = self.clone();
         match &mut command {
             Self::MoveAbsolute {
@@ -644,9 +664,9 @@ impl MotorCommand {
                 acceleration,
                 ..
             } => {
-                *min_velocity = speeds.min_velocity;
-                *velocity = speeds.velocity;
-                *acceleration = speeds.acceleration;
+                *min_velocity = speed(Speed::MinVelocity);
+                *velocity = speed(Speed::Velocity);
+                *acceleration = speed(Speed::Acceleration);
             }
             Self::MoveVelocity {
                 min_velocity,
@@ -658,10 +678,10 @@ impl MotorCommand {
                 acceleration,
                 ..
             } => {
-                *min_velocity = speeds.min_velocity;
-                *acceleration = speeds.acceleration;
+                *min_velocity = speed(Speed::MinVelocity);
+                *acceleration = speed(Speed::Acceleration);
             }
-            Self::Stop { acceleration } => *acceleration = speeds.acceleration,
+            Self::Stop { acceleration } => *acceleration = speed(Speed::Acceleration),
             _ => {}
         }
         command

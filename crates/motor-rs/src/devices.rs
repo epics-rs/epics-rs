@@ -190,6 +190,13 @@ pub(crate) fn param_store(port: &str) -> Option<crate::controller_port::ParamSto
         .map(|entry| entry.store.clone())
 }
 
+/// Controller port `port`'s parameter library, as its poller reads it.
+pub(crate) fn controller_params(port: &str) -> Option<crate::controller_port::ParamRead> {
+    lock(controller_ports())
+        .get(port)
+        .map(|entry| entry.params.clone())
+}
+
 /// Controller port `port` itself.
 pub(crate) fn controller_port_handle(port: &str) -> Option<PortHandle> {
     lock(controller_ports())

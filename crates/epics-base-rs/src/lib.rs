@@ -109,7 +109,7 @@ pub mod calc;
 pub mod error;
 pub mod json5;
 pub mod reference;
-// The async UDP net stack (`tokio::net` + `socket2` + `if-addrs`) is host-only:
+// The async UDP net stack (`tokio::net` + `socket2`) is host-only:
 // its deps do not build for RTEMS, and the RTEMS CA server uses the separate
 // S1 raw-libc socket driver, not those modules. The gate now sits on the
 // socket-bearing submodules rather than on `net` itself, so the wire constants

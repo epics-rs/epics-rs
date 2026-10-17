@@ -3,6 +3,8 @@
 //! skipping an adapter whose `OperStatus` is not up as C's
 //! `osdNetIntf.c:90` skips one without `IFF_UP`. `if-addrs` walks the same
 //! list but reports no status, so it handed out a down adapter's address.
+//! An adapter is named by its `AdapterName` (the GUID) as pvxs names it, so
+//! an `@iface` matches what it matches there.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -20,7 +22,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 /// One unicast address of an up adapter.
 pub(crate) struct AdapterAddr {
-    /// `FriendlyName`, the name `if-addrs` reported.
+    /// `AdapterName`, pvxs's `ifName` (`osdSockExt.cpp:241-243`).
     pub name: String,
     /// `IfIndex` for an IPv4 address, `Ipv6IfIndex` for an IPv6 one.
     pub index: u32,
@@ -97,7 +99,15 @@ pub(crate) fn up_adapter_addrs() -> io::Result<Vec<AdapterAddr>> {
             if a.OperStatus != IfOperStatusUp {
                 continue;
             }
-            let name = wide_str(a.FriendlyName);
+            let name = if a.AdapterName.is_null() {
+                "<AdapterName==NULL>".to_string()
+            } else {
+                // SAFETY: a non-null `AdapterName` is a NUL-terminated ANSI
+                // string inside `buf`.
+                std::ffi::CStr::from_ptr(a.AdapterName.cast())
+                    .to_string_lossy()
+                    .into_owned()
+            };
             let loopback = a.IfType == IF_TYPE_SOFTWARE_LOOPBACK;
             let mut uni = a.FirstUnicastAddress;
             while !uni.is_null() {
@@ -133,23 +143,6 @@ pub(crate) fn up_adapter_addrs() -> io::Result<Vec<AdapterAddr>> {
         }
     }
     Ok(out)
-}
-
-/// A NUL-terminated UTF-16 string.
-///
-/// # Safety
-/// `p` is null or points at a NUL-terminated UTF-16 string.
-unsafe fn wide_str(p: *const u16) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    let mut len = 0;
-    // SAFETY: the caller guarantees a terminator.
-    while unsafe { *p.add(len) } != 0 {
-        len += 1;
-    }
-    // SAFETY: `len` units before the terminator are readable.
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
 #[cfg(test)]

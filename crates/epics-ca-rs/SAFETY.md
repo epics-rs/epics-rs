@@ -88,7 +88,7 @@ These crates contain `unsafe` we trust without re-auditing:
   audited by their maintainers, in lockstep with the Rust async
   ecosystem
 - `hickory-resolver` / `hickory-client` — DNS plumbing
-- `mdns-sd`, `if-addrs` — discovery primitives
+- `mdns-sd` — discovery primitives
 - `ed25519-dalek` — Ed25519 crypto for cap_tokens / signed beacons
 - `ring` (transitive via `rustls`) — cryptographic primitives
 

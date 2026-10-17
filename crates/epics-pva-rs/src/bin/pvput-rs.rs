@@ -119,13 +119,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // pvxs `-v` prints the effective client config once, before the PUT
-    // (tools/put.cpp:109-110). It is a diagnostic, not an output-format
-    // switch — the readback echo formatter stays under `-M`.
-    if args.verbose > 0 {
-        cli::print_effective_config();
-    }
-
     // C's own two argument checks, in C's order and wording
     // (pvput.cpp:363-377). Both return 1; clap would have exited 2.
     let Some(pv_name) = args.pv_name else {
@@ -149,6 +142,14 @@ async fn main() {
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
+
+    // pvxs `-v` prints the context's effective config once, after the
+    // argument checks and before the PUT (tools/put.cpp:115-118). It is a
+    // diagnostic, not an output-format switch — the readback echo
+    // formatter stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config(&client);
+    }
 
     // Parse the optional pvRequest once (shared by both put forms) with
     // the strict pvxs grammar, so acceptance matches pvxs's own `pvput`:
@@ -190,9 +191,17 @@ async fn main() {
     let put_result = client
         .pvput_args(&pv_name, &args.values, request.as_ref())
         .await;
-    if let Err(e) = put_result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match put_result {
+        Ok(_) => {}
+        // tools/put.cpp:167-169.
+        Err(epics_pva_rs::error::PvaError::Timeout) => {
+            eprintln!("Timeout");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 
     // pvxs-faithful default: the PUT is the whole command. Without

@@ -317,10 +317,10 @@ Honoured environment variables:
 | `EPICS_CAS_BEACON_PERIOD` | Steady-state beacon period (sec, default 15) |
 | `EPICS_CA_REPEATER_PORT` | Beacon destination port (default 5065) |
 
-`discover_broadcast_addrs()` uses the `if-addrs` crate and returns
-every IPv4 broadcast on every up, non-loopback interface. When the
-crate fails (unsupported OS) the result is `vec![]` and we fall back
-to `255.255.255.255` only.
+`discover_broadcast_addrs()` walks `epics_base_rs::net::iface_v4` and
+returns every IPv4 broadcast on every up, non-loopback interface. When
+the walk fails the result is `vec![]` and we fall back to
+`255.255.255.255` only.
 
 ## Monitor sender (`monitor.rs`)
 

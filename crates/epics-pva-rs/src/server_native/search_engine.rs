@@ -10,7 +10,7 @@
 //! **Why it is its own module.** `aa1af842` already made
 //! `process_search_datagram` socket-free, but left it inside
 //! `super::udp`, which is gated out of RTEMS (`mod.rs`) because of the
-//! `tokio::net` / `socket2` / `if-addrs` stack around it. A blocking RTEMS
+//! `tokio::net` / `socket2` stack around it. A blocking RTEMS
 //! driver could therefore not reach the decode even though the decode itself
 //! needs no reactor. Lifting it here — un-gated, exactly as the SEARCH
 //! protocol was lifted into [`super::search`] (`4da1e04a`) and the accept loop

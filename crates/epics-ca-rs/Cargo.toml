@@ -72,17 +72,15 @@ tracing-opentelemetry = { version = "0.25", optional = true }
 # there (the blocking driver drives via the runtime::task seam) but must
 # still type-check for `--lib`.
 #
-# `socket2` (async TCP keepalive + UDP shared-port setup) and `if-addrs`
-# (interface enumeration for beacons / mDNS / addr-list) back only the async
-# front-end; the blocking driver sets socket options via raw `libc`. Both go
-# host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
+# `socket2` (async TCP keepalive + UDP shared-port setup) backs only the
+# async front-end; the blocking driver sets socket options via raw `libc`. It
+# goes host-only. The module gates (`server/mod.rs`, `server/udp.rs`, etc.) match
 # this table via the `build.rs`-emitted `epics_embedded_target` cfg, which
 # `Cargo.toml` target tables cannot reference directly (only built-in `cfg()`
 # predicates), hence spelling the target-OS pair out here.
 [target.'cfg(not(any(target_os = "rtems", target_os = "vxworks")))'.dependencies]
 tokio = { version = "1", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
-if-addrs = "0.13"
 
 [target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [

@@ -638,11 +638,12 @@ mod tests {
             while rx.try_recv().is_ok() {}
             assert!(sent < 200, "the stranger never drew a datagram");
         }
+        // Counted at delivery, not after the wait: a stranger that took the
+        // datagram and closed within `wait` is gone by then.
+        let co_holders = udp_sockets_on(port).saturating_sub(1);
         match tokio::time::timeout(wait, rx.recv()).await {
             Ok(got) => Attempt::Got(got.expect("channel open")),
-            Err(_) => Attempt::TimedOut {
-                co_holders: udp_sockets_on(port).saturating_sub(1),
-            },
+            Err(_) => Attempt::TimedOut { co_holders },
         }
     }
 

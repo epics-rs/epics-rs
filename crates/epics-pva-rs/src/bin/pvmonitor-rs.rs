@@ -117,14 +117,6 @@ async fn main() {
         }
     };
 
-    // pvxs `-v` prints the effective client config once, before any
-    // subscription is started (tools/monitor.cpp:97-98). It is a
-    // diagnostic, not an output-format switch — the value formatter
-    // stays under `-M`.
-    if args.verbose > 0 {
-        cli::print_effective_config();
-    }
-
     // One client for the whole command, shared by every monitor task —
     // not one PvaClient per PV. pvxs builds a single client::Context and
     // starts every subscription from it (tools/monitor.cpp:95-122), so PVs
@@ -135,6 +127,14 @@ async fn main() {
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
         .build();
+
+    // pvxs `-v` prints the context's effective config once, before any
+    // subscription is started (tools/monitor.cpp:111-114). It is a
+    // diagnostic, not an output-format switch — the value formatter
+    // stays under `-M`.
+    if args.verbose > 0 {
+        cli::print_effective_config(&client);
+    }
 
     let mut handles = Vec::new();
 

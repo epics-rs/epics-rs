@@ -143,12 +143,6 @@ async fn main() {
         }
     };
 
-    // pvxs `-v` prints the effective client config once, before the
-    // RPC is issued (tools/call.cpp:122-123).
-    if args.verbose > 0 {
-        epics_pva_rs::cli::print_effective_config();
-    }
-
     let (desc, value) = build_nturi(&pv_name, &parsed_args);
 
     // pvxs `pvxcall -w 0` is an immediate completion poll (epicsEvent
@@ -159,6 +153,12 @@ async fn main() {
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
+
+    // pvxs `-v` prints the context's effective config once, before the
+    // RPC is issued (tools/call.cpp:123-126).
+    if args.verbose > 0 {
+        epics_pva_rs::cli::print_effective_config(&client);
+    }
 
     match client.pvrpc(&pv_name, &desc, &value).await {
         // pvxs `pvxcall` prints the reply only when it carries a Value
@@ -186,6 +186,11 @@ async fn main() {
                     }
                 }
             }
+        }
+        // tools/call.cpp:151-153.
+        Err(epics_pva_rs::error::PvaError::Timeout) => {
+            eprintln!("Timeout");
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("pvcall-rs: RPC failed: {e}");

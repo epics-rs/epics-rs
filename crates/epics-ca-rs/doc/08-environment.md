@@ -138,7 +138,7 @@ When unset and `EPICS_CAS_AUTO_BEACON_ADDR_LIST=YES` (the default),
 the beacon emitter falls back to:
 
 1. `EPICS_CA_ADDR_LIST` (if set)
-2. Auto-discovered per-NIC broadcasts via `if-addrs`
+2. Auto-discovered per-NIC broadcasts via `iface_v4`
 3. `255.255.255.255` as last resort
 
 ### `EPICS_CAS_AUTO_BEACON_ADDR_LIST` (libca)

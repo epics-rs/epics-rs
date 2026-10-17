@@ -10,7 +10,7 @@
 //! the TCP-circuit SEARCH handler needs exactly these three entry points
 //! (`parse_search_request`, `matched_cids_for_requester`,
 //! `build_search_response_proto`) while `udp` itself is host-only —
-//! `tokio::net::UdpSocket`, `socket2`, `if-addrs`. Keeping the protocol
+//! `tokio::net::UdpSocket`, `socket2`. Keeping the protocol
 //! here is what lets `tcp` compile for `armv7-rtems-eabihf`; `udp`
 //! re-exports every item so its own call sites are unchanged.
 //!

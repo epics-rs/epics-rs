@@ -132,6 +132,21 @@ fn local_account_db(unix: bool, os: &str) -> bool {
     unix && LOCAL_ACCOUNT_DB_TARGETS.contains(&os)
 }
 
+/// `rustc -V` of the compiler building this crate, for `pvinfo -D`'s
+/// `Toolchain` block where pvxs prints its compiler (`describe.cpp:44-49`).
+fn stamp_rustc_version() {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let version = std::process::Command::new(rustc)
+        .arg("-V")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "rustc".to_string());
+    println!("cargo::rustc-env=EPICS_PVA_RUSTC_VERSION={version}");
+}
+
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(local_account_db)");
     // Declared, never emitted here. See the note above `PVA_BLOCKING_CLIENT`.
@@ -139,6 +154,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(exec_backend)");
     println!("cargo::rustc-check-cfg=cfg(tokio_backend)");
     println!("cargo::rustc-check-cfg=cfg(epics_embedded_target)");
+    stamp_rustc_version();
 
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let embedded_target = matches!(os.as_str(), "rtems" | "vxworks");

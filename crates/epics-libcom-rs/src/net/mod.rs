@@ -18,7 +18,7 @@
 //!   cosmetic: `async_udp_v4` awaits on `tokio::net`, so it is
 //!   `tokio_backend` — absent from a host `exec_backend` build too, whose
 //!   workers have no reactor to await on. `iface_map` and `loopback_mcast`
-//!   own no socket they await: `if-addrs` and `socket2` are *target* facts,
+//!   own no socket they await: `socket2` is a *target* fact,
 //!   so they stay `not(epics_embedded_target)` and a host `exec_backend`
 //!   build keeps them (`loopback_mcast` there as its socket-option setup
 //!   only; the tokio-wrapped bind is `tokio_backend`). Named in code spans rather than linked for exactly that

@@ -8,7 +8,7 @@
 //!   [`crate::decode`] / [`crate::proto`]. Compiles for every target, RTEMS
 //!   included.
 //! * **Async I/O layer** — `accept`, `udp`, `runtime`. Built on
-//!   `tokio::net` (and, underneath it, mio) plus `socket2` / `if-addrs`.
+//!   `tokio::net` (and, underneath it, mio) plus `socket2`.
 //!   None of those cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*`
 //!   triples (§8.1), so this layer is host-only; each embedded target gets a
 //!   blocking thread-per-client driver instead (design doc §4, §9 phase 6

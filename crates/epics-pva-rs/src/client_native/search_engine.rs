@@ -85,8 +85,8 @@ use crate::proto::{
 use super::beacon_throttle::{BeaconAction, BeaconTracker};
 use super::decode::{PeerRole, decode_search_response, try_parse_frame_role};
 use super::server_conn::{
-    build_client_connection_validation, heartbeat_interval, heartbeat_timeout, read_handshake_init,
-    select_client_auth, wait_for_validated,
+    build_client_connection_validation, heartbeat_timeout, read_handshake_init, select_client_auth,
+    wait_for_validated,
 };
 
 /// Search retry intervals in seconds.
@@ -124,13 +124,6 @@ const NS_TX_MAX_QUEUED_BYTES: usize = 64 * 1024;
 /// datagram per channel. Mirrors `ContextImpl::scheduleInitialSearch`
 /// (`src/client.cpp:761-771`).
 const INITIAL_SEARCH_DELAY: Duration = Duration::from_millis(10);
-
-/// Per-frame read deadline for a TCP name-server CONNECTION_VALIDATION
-/// handshake when no client timeout is threaded in (the credential-less
-/// [`SearchEngine::spawn`] path). Bounds a name server that accepts the TCP
-/// connection but never completes the PVA handshake; [`SearchEngine::spawn_with_auth`]
-/// supplies the client's own connection timeout instead.
-const NS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Command sent into the engine.
 /// Why a search is being initiated — controls bucket placement and
@@ -341,16 +334,17 @@ impl ClientSearchConfig {
     /// [`crate::client_native::context::PvaClientBuilder`] starts from. The address list is parsed against
     /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
     pub fn from_env() -> Self {
-        let (broadcast_port, server_port) = crate::config::env::client_ports_logged();
-        let addr_list = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST")
-            .map(|s| crate::config::env::split_addr_list("EPICS_PVA_ADDR_LIST", &s, broadcast_port))
-            .unwrap_or_default();
+        Self::from_config(&crate::config::env::Config::from_client_env())
+    }
+
+    /// The UDP-search half of a client `cfg`.
+    pub fn from_config(cfg: &crate::config::env::Config) -> Self {
         Self {
-            addr_list,
-            auto_addr_list: crate::config::env::auto_addr_list_enabled(),
-            broadcast_port,
-            server_port,
-            interfaces: crate::config::env::client_intf_endpoints(),
+            addr_list: cfg.address_list.clone(),
+            auto_addr_list: cfg.auto_addr_list,
+            broadcast_port: cfg.udp_port,
+            server_port: cfg.tcp_port,
+            interfaces: cfg.interfaces.clone(),
         }
     }
 }
@@ -722,7 +716,7 @@ impl SearchEngine {
             name_servers,
             Default::default(),
             Default::default(),
-            NS_HANDSHAKE_TIMEOUT,
+            heartbeat_timeout(),
         )
         .await
     }
@@ -748,7 +742,7 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
         ns_user: epics_base_rs::types::PvString,
         ns_host: epics_base_rs::types::PvString,
-        ns_handshake_timeout: Duration,
+        ns_tcp_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
             reactor,
@@ -756,7 +750,7 @@ impl SearchEngine {
             name_servers,
             ns_user,
             ns_host,
-            ns_handshake_timeout,
+            ns_tcp_timeout,
         )
         .await
     }
@@ -783,7 +777,7 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
         ns_user: epics_base_rs::types::PvString,
         ns_host: epics_base_rs::types::PvString,
-        ns_handshake_timeout: Duration,
+        ns_tcp_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
             reactor,
@@ -791,7 +785,7 @@ impl SearchEngine {
             name_servers,
             ns_user,
             ns_host,
-            ns_handshake_timeout,
+            ns_tcp_timeout,
         )
         .await
     }
@@ -814,7 +808,7 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
         ns_user: epics_base_rs::types::PvString,
         ns_host: epics_base_rs::types::PvString,
-        ns_handshake_timeout: Duration,
+        ns_tcp_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
             reactor,
@@ -822,7 +816,7 @@ impl SearchEngine {
             name_servers,
             ns_user,
             ns_host,
-            ns_handshake_timeout,
+            ns_tcp_timeout,
         )
         .await
     }
@@ -833,7 +827,7 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
         ns_user: epics_base_rs::types::PvString,
         ns_host: epics_base_rs::types::PvString,
-        ns_handshake_timeout: Duration,
+        ns_tcp_timeout: Duration,
     ) -> PvaResult<Self> {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
@@ -869,7 +863,7 @@ impl SearchEngine {
             name_servers,
             ns_user,
             ns_host,
-            ns_handshake_timeout,
+            ns_tcp_timeout,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -1373,8 +1367,8 @@ fn rearm_after_send(
 /// canonical address, then `std::sort`s and `std::unique`s the list — so a
 /// duplicate token (`"host:5075 host:5075"`) collapses to ONE entry and
 /// `startNS` (src/client.cpp:651-667) opens exactly one persistent TCP
-/// connection per unique target. Our `name_servers()` returned the parsed
-/// vector unchanged, so a duplicate token spawned two `ns_task`s and
+/// connection per unique target. The parsed env list keeps a duplicate,
+/// so without this a duplicate token spawned two `ns_task`s and
 /// double-forwarded every SEARCH. Dedup at the spawn gate — the single
 /// owner of the list→connections transition — restores one-connection-per-
 /// unique-target for both env-derived and programmatic
@@ -1401,7 +1395,7 @@ async fn run_engine(
     name_servers: Vec<SocketAddr>,
     ns_user: epics_base_rs::types::PvString,
     ns_host: epics_base_rs::types::PvString,
-    ns_handshake_timeout: Duration,
+    ns_tcp_timeout: Duration,
 ) {
     // pvxs has no separate search counter: it reuses each channel's CID as
     // its searchID (`clientimpl.h:181`). The port keeps searchInstanceID a
@@ -1493,7 +1487,7 @@ async fn run_engine(
             NsConnParams {
                 user: ns_user.clone(),
                 host: ns_host.clone(),
-                handshake_timeout: ns_handshake_timeout,
+                tcp_timeout: ns_tcp_timeout,
             },
         ));
     }
@@ -2879,12 +2873,12 @@ fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
     }
 }
 
-/// Client identity and handshake deadline for one name-server connection,
+/// Client identity and TCP timeout for one name-server connection,
 /// grouped so the long-lived connect/handshake task signatures stay readable.
 struct NsConnParams {
     user: epics_base_rs::types::PvString,
     host: epics_base_rs::types::PvString,
-    handshake_timeout: Duration,
+    tcp_timeout: Duration,
 }
 
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
@@ -2997,9 +2991,9 @@ async fn ns_run_once(
     let NsConnParams {
         user,
         host,
-        handshake_timeout,
+        tcp_timeout,
     } = params;
-    let handshake_timeout = *handshake_timeout;
+    let tcp_timeout = *tcp_timeout;
     // The same dial `ServerConn::connect` uses — one seam, two callers. A
     // name-server connection is an ordinary PVA TCP circuit (pvxs only flips
     // `nameserver = true` after `Connection::build()`), so it has no business
@@ -3007,15 +3001,11 @@ async fn ns_run_once(
     // second `TcpStream::connect` here would be a second place to remember
     // that.
     //
-    // `handshake_timeout` serves as both bounds because it is the only one an
-    // NS circuit is configured with: it has no `ConnConfig`, no heartbeat and
-    // no `tcp_timeout`. Note this adds a connect deadline the previous bare
-    // `TcpStream::connect(ns_addr).await` did not have — an unreachable name
-    // server used to park this future on the OS's connect timeout.
-    let (mut reader, mut writer) =
-        super::server_conn::dial_pva(ns_addr, handshake_timeout, handshake_timeout)
-            .await
-            .map_err(std::io::Error::other)?;
+    // `tcp_timeout` bounds the dial, the handshake and the idle circuit, as
+    // pvxs's one `tcpTimeout` does for every connection.
+    let (mut reader, mut writer) = super::server_conn::dial_pva(ns_addr, tcp_timeout, tcp_timeout)
+        .await
+        .map_err(std::io::Error::other)?;
 
     let mut rx_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
@@ -3027,9 +3017,9 @@ async fn ns_run_once(
     // client handshake helpers so the NS sees the same "ca"-preferred user/host
     // identity a regular server connection presents, instead of forced anonymous.
     // `None` message cap = pvxs-parity unbounded; the read is deadlined by
-    // `handshake_timeout`.
+    // `tcp_timeout`.
     let (byte_order, _server_buf, _server_reg, auth_methods) =
-        read_handshake_init(&mut reader, &mut rx_buf, handshake_timeout, None)
+        read_handshake_init(&mut reader, &mut rx_buf, tcp_timeout, None)
             .await
             .map_err(std::io::Error::other)?;
     let negotiated_auth = select_client_auth(&auth_methods);
@@ -3040,8 +3030,8 @@ async fn ns_run_once(
         host.as_bytes(),
         &super::server_conn::auth_groups(negotiated_auth),
     );
-    ns_write_all(&mut writer, &reply, handshake_timeout).await?;
-    wait_for_validated(ns_addr, &mut reader, &mut rx_buf, handshake_timeout, None)
+    ns_write_all(&mut writer, &reply, tcp_timeout).await?;
+    wait_for_validated(ns_addr, &mut reader, &mut rx_buf, tcp_timeout, None)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -3079,8 +3069,9 @@ async fn ns_run_once(
     // bookkeeping — and leaves a ≥10 s window in which no PV can be resolved
     // at all. The host never showed it: a tokio-side NS circuit is just as
     // silent, but the churn only costs a reconnect there.
-    let echo_interval = heartbeat_interval();
-    let ns_idle_timeout = heartbeat_timeout();
+    let echo_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
+        tcp_timeout.as_secs_f64(),
+    ));
     let mut echo_tick = interval(echo_interval);
     echo_tick.tick().await; // `interval` fires immediately; skip that one
     let mut last_rx = Instant::now();
@@ -3094,7 +3085,7 @@ async fn ns_run_once(
                 // gone, and `ns_task` re-dials. Without this, adding the echo
                 // would trade a 40 s churn for a circuit that can wedge
                 // forever against a black-holed peer.
-                if last_rx.elapsed() > ns_idle_timeout {
+                if last_rx.elapsed() > tcp_timeout {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "NS idle",
@@ -3109,13 +3100,13 @@ async fn ns_run_once(
                 let h = PvaHeader::application(false, byte_order, Command::Echo.code(), 0);
                 let mut bytes = Vec::with_capacity(PvaHeader::SIZE);
                 h.write_into(&mut bytes);
-                ns_write_all(&mut writer, &bytes, ns_idle_timeout).await?;
+                ns_write_all(&mut writer, &bytes, tcp_timeout).await?;
             }
             pkt = search_rx.recv() => {
                 match pkt {
                     Some(bytes) => {
                         let len = bytes.len();
-                        ns_write_all(&mut writer, &bytes, ns_idle_timeout).await?;
+                        ns_write_all(&mut writer, &bytes, tcp_timeout).await?;
                         // Frame is now on the socket: release its share of the
                         // queued-byte backlog so the engine's tick gate frees up.
                         queued_bytes.fetch_sub(len, Ordering::SeqCst);
@@ -5703,7 +5694,7 @@ mod tests {
             vec![ns_addr],
             Default::default(),
             Default::default(),
-            NS_HANDSHAKE_TIMEOUT,
+            heartbeat_timeout(),
         )
         .await
         .expect("spawn name-servers-only engine");
@@ -5763,7 +5754,7 @@ mod tests {
             NsConnParams {
                 user: Default::default(),
                 host: Default::default(),
-                handshake_timeout: Duration::from_secs(5),
+                tcp_timeout: Duration::from_secs(5),
             },
         ));
 
@@ -5820,7 +5811,7 @@ mod tests {
             vec![ns_addr],
             Default::default(),
             Default::default(),
-            NS_HANDSHAKE_TIMEOUT,
+            heartbeat_timeout(),
         )
         .await
         .expect("spawn name-servers-only engine");
@@ -5967,7 +5958,7 @@ mod tests {
             vec![ns_addr],
             Default::default(),
             Default::default(),
-            NS_HANDSHAKE_TIMEOUT,
+            heartbeat_timeout(),
         )
         .await
         .expect("spawn name-servers-only engine");
@@ -6160,11 +6151,8 @@ mod tests {
         // The defect can only manifest where the host actually has a
         // non-loopback IPv4 NIC; on a loopback-only host the bundle is
         // loopback-only on either code path, so the boundary is absent.
-        let host_has_non_loopback = if_addrs::get_if_addrs()
-            .map(|v| {
-                v.iter()
-                    .any(|i| matches!(i.addr, if_addrs::IfAddr::V4(_)) && !i.is_loopback())
-            })
+        let host_has_non_loopback = epics_base_rs::net::iface_v4::enumerate()
+            .map(|v| v.iter().any(|i| i.is_eligible()))
             .unwrap_or(false);
         if !host_has_non_loopback {
             return;
@@ -6342,6 +6330,37 @@ mod tests {
             server,
             "ERR pvxs.server.setup\n     EPICS_PVA_SERVER_PORT invalid integer : \
              Invalid input : \"[::1\"\n"
+        );
+    }
+
+    /// A client builder reads the environment once, in pvxs `_fromDefs` order
+    /// (`config.cpp:552-599`): ports, lists, the bool, then `CONN_TMO`.
+    #[test]
+    #[serial(epics_env)]
+    fn a_builder_logs_the_client_env_once_in_from_defs_order() {
+        use epics_base_rs::runtime::log;
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = heard.clone();
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_BROADCAST_PORT", "0x"),
+            ("EPICS_PVA_AUTO_ADDR_LIST", "maybe"),
+            ("EPICS_PVA_CONN_TMO", "abc"),
+        ]);
+        let id = log::errlog_add_listener(move |m| {
+            if let Some((_time, line)) = m.split_once(' ') {
+                sink.lock().unwrap().push_str(line);
+            }
+        });
+        let client = crate::client_native::context::PvaClient::builder().build();
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        assert_eq!(client.config().udp_port, 5076);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            "WARN pvxs.client.setup\n     EPICS_PVA_BROADCAST_PORT invalid integer : \
+             Extraneous characters after integer: \"0x\"\n\
+             ERR pvxs.config EPICS_PVA_AUTO_ADDR_LIST invalid bool value (YES/NO) : 'maybe'\n\
+             ERR pvxs.server.setup\n     EPICS_PVA_CONN_TMO invalid double value : 'abc'\n"
         );
     }
 

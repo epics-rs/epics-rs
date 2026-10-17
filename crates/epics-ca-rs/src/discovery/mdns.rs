@@ -194,14 +194,11 @@ impl MdnsAnnouncer {
 
         // Discover routable IPv4 addresses on every up, non-loopback
         // interface so multi-homed IOCs announce all paths.
-        let ips: Vec<IpAddr> = if_addrs::get_if_addrs()
+        let ips: Vec<IpAddr> = epics_base_rs::net::iface_v4::enumerate()
             .unwrap_or_default()
             .into_iter()
-            .filter(|iface| !iface.is_loopback())
-            .filter_map(|iface| match iface.ip() {
-                IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
-                _ => None,
-            })
+            .filter(|iface| iface.is_eligible())
+            .map(|iface| IpAddr::V4(iface.ip))
             .collect();
 
         let info = ServiceInfo::new(MDNS_TYPE, instance, &host_target, &ips[..], port, &txt[..])?;

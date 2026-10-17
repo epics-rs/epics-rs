@@ -27,7 +27,7 @@ pub mod ops_v2;
 // The UDP SEARCH modules are compiled out on every embedded target: RTEMS
 // newlib lacks the `recvmsg`/`IP_PKTINFO` receive path and `local_addr()`
 // readback a UDP search needs, and VxWorks is excluded for the same reason
-// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2`/`if-addrs` stack builds for
+// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2` stack builds for
 // neither), so an embedded build resolves PVs over TCP name servers alone
 // through `search_engine`'s `SearchTransport::NameServersOnly` seam. `search`
 // is the legacy standalone search path and `udp` is the client UDP manager.

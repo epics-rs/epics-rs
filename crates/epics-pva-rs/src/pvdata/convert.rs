@@ -360,10 +360,12 @@ fn parse_base0<T>(
         }
         _ => false,
     };
-    // base 0 radix selection, exactly as strtoull does it.
-    let (radix, start) = match (b.get(i), b.get(i + 1)) {
-        (Some(b'0'), Some(b'x' | b'X')) => (16u32, i + 2),
-        (Some(b'0'), _) => (8u32, i),
+    // base 0 radix selection, exactly as strtoull does it: `0x` is a prefix
+    // only with a hex digit after it, else the `0` is the number and the
+    // scan stops at the `x`.
+    let (radix, start) = match (b.get(i), b.get(i + 1), b.get(i + 2)) {
+        (Some(b'0'), Some(b'x' | b'X'), Some(h)) if h.is_ascii_hexdigit() => (16u32, i + 2),
+        (Some(b'0'), _, _) => (8u32, i),
         _ => (10u32, i),
     };
     let mut end = start;
@@ -372,8 +374,7 @@ fn parse_base0<T>(
     }
     if end == start {
         // No digit sequence at all — `std::stoull` raises `invalid_argument`,
-        // which `parseTo` re-raises as NoConvert. (A bare `"0x"` differs in
-        // wording only: strtoull consumes the `0` and leaves `x` extraneous.)
+        // which `parseTo` re-raises as NoConvert.
         return Err(NoConvert::new(format!("Invalid input : \"{s}\"")));
     }
     let v = u64::from_str_radix(&s[start..end], radix)
@@ -556,6 +557,14 @@ mod tests {
         }
         // Octal radix rejects 8/9 as digits — they become extraneous.
         assert!(parse_to_u64("08").is_err());
+        // `0x` with no hex digit after it is no prefix: stoull takes the `0`.
+        for s in ["0x", "0xg", "-0x", " 0X "] {
+            assert_eq!(
+                parse_to_u64(s).unwrap_err().message(),
+                format!("Extraneous characters after integer: \"{s}\"")
+            );
+        }
+        assert_eq!(parse_to_u64("0x1"), Ok(1));
         // Overflow is `std::out_of_range` → NoConvert.
         assert!(parse_to_u64("18446744073709551616").is_err());
     }

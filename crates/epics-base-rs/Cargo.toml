@@ -50,8 +50,7 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # covers non-interactive use, and embedded-target iocsh wiring is a later
 # increment.
 #
-# `socket2` + `if-addrs` back the async UDP net stack (`net::async_udp_v4` /
-# `net::iface_map`); the whole `net` module is gated out on `epics_embedded_target`
+# `socket2` backs the async UDP net stack (`net::async_udp_v4`); the whole `net` module is gated out on `epics_embedded_target`
 # (S1 raw-libc CA driver), so its deps go host-only too.
 #
 # tokio: the hosted build uses the full runtime; the embedded build drops the
@@ -69,7 +68,6 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 rustyline = "18"
 socket2 = { version = "0.5", features = ["all"] }
-if-addrs = "0.13"
 
 [target.'cfg(any(target_os = "rtems", target_os = "vxworks"))'.dependencies]
 tokio = { version = "1", default-features = false, features = [

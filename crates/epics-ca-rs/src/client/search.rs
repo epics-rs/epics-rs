@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 // reasons that were both about `AsyncUdpV4` rather than about UDP:
 //
 //   * `AsyncUdpV4` does not compile for either embedded target — it is built
-//     on `tokio::net`, `socket2` and `if-addrs`, and none of the three cross
+//     on `tokio::net` and `socket2`, and neither crosses
 //     to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
 //   * On any backend-free build the engine runs on a callback-pool worker
 //     (`runtime::task::spawn`), where `tokio::net::UdpSocket` panics — "there

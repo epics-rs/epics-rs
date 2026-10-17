@@ -157,6 +157,8 @@ pub struct PvaClientBuilder {
 
 impl PvaClientBuilder {
     pub fn new() -> Self {
+        // pvxs `Config::fromEnv`: one read, so its warnings print once.
+        let env = crate::config::env::Config::from_client_env();
         Self {
             timeout: Duration::from_secs(5),
             server_addr: None,
@@ -167,15 +169,13 @@ impl PvaClientBuilder {
             // a pvRequest `record._options.pipeline`. See the field doc.
             pipeline_size: 0,
             tls: None,
-            name_servers: crate::config::env::name_servers(),
+            name_servers: env.name_servers.clone(),
             priority: 0,
-            // pvxs config.cpp:222,373-391: parse_timeout scales CONN_TMO by
-            // 4/3; enforceTimeout clamps below 2 s and defaults to 40 s.
-            tcp_timeout: super::server_conn::heartbeat_timeout(),
+            tcp_timeout: env.enforced_tcp_timeout(),
             share_udp: false,
             asserted_identity: None,
             max_message_size: None,
-            search_config: ClientSearchConfig::from_env(),
+            search_config: ClientSearchConfig::from_config(&env),
             search_config_overridden: false,
         }
     }
@@ -664,6 +664,28 @@ impl PvaClient {
         Self::builder().server_addr(server_addr).build()
     }
 
+    /// This client's effective configuration, pvxs `Context::config()`
+    /// (`client.cpp:418-421`): the values it was built with, `expand()`ed as
+    /// `ContextImpl::effective` is (`client.cpp:543-547`). Built from the
+    /// client's own fields, so a readback never re-reads the environment.
+    pub fn config(&self) -> crate::config::env::Config {
+        let search = &self.inner.search_config;
+        let mut cfg = crate::config::env::Config {
+            udp_port: search.broadcast_port,
+            tcp_port: search.server_port,
+            auto_addr_list: search.auto_addr_list,
+            auto_beacon: false,
+            interfaces: search.interfaces.clone(),
+            address_list: search.addr_list.clone(),
+            name_servers: self.inner.name_servers.clone(),
+            beacon_destinations: Vec::new(),
+            ignore_addrs: Vec::new(),
+            tcp_timeout: self.inner.tcp_timeout.as_secs_f64(),
+        };
+        cfg.expand_client();
+        cfg
+    }
+
     /// True when [`Self::search_engine`] resolves to the process-wide
     /// `SHARED_SEARCH_ENGINE` instead of spawning a per-client engine.
     ///
@@ -693,8 +715,18 @@ impl PvaClient {
             .expect("the search engine is built on the client's executor");
         if self.uses_shared_search_engine() {
             let engine = SHARED_SEARCH_ENGINE
-                .get_or_try_init(|| async {
-                    SearchEngine::spawn(&reactor, Vec::new(), Vec::new()).await
+                // The first sharing client's config is the environment's
+                // (an overridden one never shares), so it is not read again.
+                .get_or_try_init(|| {
+                    SearchEngine::spawn_with_config(
+                        &reactor,
+                        self.inner.search_config.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Default::default(),
+                        Default::default(),
+                        self.inner.tcp_timeout,
+                    )
                 })
                 .await?;
             return Ok(engine);

@@ -1,6 +1,6 @@
 use clap::Parser;
 use epics_pva_rs::client::PvaClient;
-use epics_pva_rs::{cli, config, format};
+use epics_pva_rs::{cli, format};
 
 #[derive(Parser)]
 #[command(
@@ -71,83 +71,105 @@ fn show_credentials_for(verbose: bool, show_credentials: bool) -> bool {
 /// `tools/info.cpp:62-64`. Returned as a string so the section layout is
 /// unit-testable without capturing process stdout.
 ///
-/// pvxs's report is Host/Target → Toolchain → Versions → Runtime →
-/// Effective Client config → Effective Server config. The C++
-/// toolchain/ABI block (`describe.cpp:36-75`: `__cplusplus`, libstdc++
-/// ABI, compiler build) has no Rust counterpart and is omitted; every
-/// other section has a Rust-side equivalent and is reproduced:
-///   - Host: the single-binary arch/OS (no host≠target cross split as in
-///     the C build system, so the `EPICS_HOST_ARCH`/`T_A` pair collapses),
-///   - Versions: the shared `version_information` stack (pvxs/EPICS
-///     Base/protocol — `describe.cpp:77-83`),
-///   - Runtime: CPU count (`epicsThreadGetCPUs`), the bound interface
-///     addresses (`osiLocalAddr`), and the per-NIC broadcast targets
-///     (`osiSockDiscoverBroadcastAddresses` — `describe.cpp:85-113`),
-///   - the effective client AND server config blocks
-///     (`describe.cpp:115-129`); the server block is the `EPICS_PVAS_*`
-///     set an operator needs to debug why a server does or does not
-///     advertise, and it never appears in the client-only `-v` output.
+/// pvxs's layout, one `indent{}` level being four spaces (`util.cpp:128-139`):
+/// Host, Target, Toolchain, Versions, Runtime, then the client and server
+/// configs read fresh from the environment. Toolchain carries the compiler
+/// and the C library (`describe.cpp:36-75`); `__cplusplus` and the libstdc++
+/// macros have no Rust counterpart. Versions is this port's stack.
 ///
 /// An invalid server interface or ignore entry ends the report after the
 /// server block's header, as pvxs's `Config::fromEnv` throw does, with that
 /// partial report and the throw's `what()`.
 fn target_information_string() -> Result<String, (String, String)> {
+    use epics_base_rs::runtime::build_info;
     use std::fmt::Write;
+    const I1: &str = "    ";
+    const I2: &str = "        ";
     let mut s = String::new();
 
-    // Host arch/OS — pvxs `Host:`/`Target:` (describe.cpp:29-34). One
-    // Rust binary has no host≠target split, so it is a single line.
+    // One binary has no host/target split, so Host is the target too.
+    let _ = writeln!(s, "Host: {}", build_info::TARGET_ARCH);
     let _ = writeln!(
         s,
-        "Host: {}-{}",
-        std::env::consts::ARCH,
-        std::env::consts::OS
+        "Target: {} {} {}",
+        build_info::TARGET_ARCH,
+        build_info::OS_CLASS,
+        build_info::COMPILER_CLASS
     );
 
-    // Versions — pvxs prints pvxs/EPICS Base/libevent (describe.cpp:77-83);
-    // the Rust analogue is the same `-V` stack (lib/EPICS Base/protocol).
-    let _ = writeln!(s, "Versions");
-    for line in cli::version_information().lines() {
-        let _ = writeln!(s, "  {line}");
+    let _ = writeln!(s, "Toolchain");
+    let _ = writeln!(s, "{I1}{}", env!("EPICS_PVA_RUSTC_VERSION"));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: glibc returns a static NUL-terminated string.
+        let glibc = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+        let _ = writeln!(s, "{I1}GLIBC {}", glibc.to_string_lossy());
     }
 
-    // Runtime — pvxs prints epicsThreadGetCPUs()/osiLocalAddr()/
-    // osiSockDiscoverBroadcastAddresses() (describe.cpp:85-113). The Rust
-    // analogues: available parallelism, the bound interface addresses, and
-    // the per-NIC broadcast targets. (pvxs's `uname()` line has no
-    // allocation-free std analogue without libc FFI; the Host line already
-    // carries arch/OS.)
+    let _ = writeln!(s, "Versions");
+    for line in cli::version_information().lines() {
+        let _ = writeln!(s, "{I1}{line}");
+    }
+
     let _ = writeln!(s, "Runtime");
     // `SockAttach attach;` (`describe.cpp:89`).
     epics_pva_rs::sock_attach::can_ipv6();
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    let _ = writeln!(s, "  available_parallelism() -> {cpus}");
-    let _ = writeln!(s, "  local interfaces:");
-    for addr in config::list_intf_addresses() {
-        let _ = writeln!(s, "    {addr}");
+    #[cfg(unix)]
+    {
+        let _ = writeln!(s, "{I1}{}", uname_line());
     }
-    let bport = config::broadcast_port();
-    let _ = writeln!(s, "  broadcast addresses (port {bport}):");
-    for addr in config::list_broadcast_addresses(bport) {
-        let _ = writeln!(s, "    {addr}");
+    let _ = writeln!(
+        s,
+        "{I1}epicsThreadGetCPUs() -> {}",
+        epics_base_rs::runtime::background::callback_executor::cpu_count()
+    );
+    let _ = writeln!(
+        s,
+        "{I1}osiLocalAddr() -> {}",
+        epics_base_rs::net::iface_v4::osi_local_addr()
+    );
+    let _ = writeln!(s, "{I1}osiSockDiscoverBroadcastAddresses() ->");
+    for addr in epics_base_rs::net::iface_v4::broadcast_addrs() {
+        let _ = writeln!(s, "{I2}{addr}");
     }
 
-    // Effective client + server config — pvxs prints BOTH under -D
-    // (describe.cpp:115-129). The client block is the same one `-v` shows;
-    // the server (`EPICS_PVAS_*`) block is `-D`-only.
-    let _ = write!(s, "{}", cli::effective_config_string());
-    match cli::effective_server_config_string() {
+    let _ = writeln!(s, "Effective Client config from environment");
+    let _ = write!(s, "{}", cli::env_client_config_lines(I1));
+    let _ = writeln!(s, "Effective Server config from environment");
+    match cli::env_server_config_lines(I1) {
         Ok(server) => {
             let _ = write!(s, "{server}");
             Ok(s)
         }
-        Err(what) => {
-            let _ = writeln!(s, "Effective server config");
-            Err((s, what))
-        }
+        Err(what) => Err((s, what)),
     }
+}
+
+/// pvxs's `uname()` line (`describe.cpp:92-98`).
+#[cfg(unix)]
+fn uname_line() -> String {
+    // SAFETY: `utsname` is plain C data and `uname` only writes it.
+    let mut info: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut info) } != 0 {
+        return format!(
+            "uname() error {}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
+    }
+    let field = |f: &[libc::c_char]| {
+        // SAFETY: `uname` NUL-terminates every field.
+        unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    format!(
+        "uname() -> {} {} {} {} {}",
+        field(&info.sysname),
+        field(&info.nodename),
+        field(&info.release),
+        field(&info.version),
+        field(&info.machine)
+    )
 }
 
 /// Print the `-D` host-troubleshooting report and return (`tools/info.cpp:
@@ -200,12 +222,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // pvxs `pvxinfo -v` prints the effective client config once, before
-    // the per-PV type output (`tools/info.cpp:78-79`), not per channel.
-    if args.verbose {
-        cli::print_effective_config();
-    }
-
     // Build the client with the parsed `-w` as the operation timeout,
     // applied once at construction so every describe op uses the same
     // owner. pvxs `pvxinfo` waits for completion with `done.wait(timeout)`
@@ -216,6 +232,12 @@ async fn main() {
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
+
+    // pvxs `pvxinfo -v` prints the context's effective config once, before
+    // the per-PV type output (`tools/info.cpp:79-82`), not per channel.
+    if args.verbose {
+        cli::print_effective_config(&client);
+    }
 
     // Start a describe op for every PV before awaiting any, then print
     // each PV's result the instant its task completes — completion order,
@@ -230,6 +252,7 @@ async fn main() {
     // stays self-identifying.
     let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
     let mut failed = false;
+    let mut timed_out = false;
     client
         .pvinfo_many_full_streaming(&names, |idx, result| {
             let pv_name = &args.pv_names[idx];
@@ -265,6 +288,8 @@ async fn main() {
                     // diagnostic kept ahead of the pvxs-format block.
                     print!("{}", format::format_info_value(pv_name, server_addr, &desc));
                 }
+                // One Timeout line for the batch (tools/info.cpp:113-115).
+                Err(epics_pva_rs::error::PvaError::Timeout) => timed_out = true,
                 Err(e) => {
                     eprintln!("{pv_name}: {e}");
                     failed = true;
@@ -272,6 +297,10 @@ async fn main() {
             }
         })
         .await;
+    if timed_out {
+        eprintln!("Timeout");
+        std::process::exit(1);
+    }
     if failed {
         std::process::exit(1);
     }
@@ -384,21 +413,51 @@ mod tests {
             "Versions",
             // version stack (pvxs/EPICS Base/protocol analogue)
             "epics-pva-rs ",
-            "EPICS Base ",
             "PVA protocol version ",
+            "Target: ",
             "Runtime",
-            "available_parallelism() ->",
-            "local interfaces:",
-            "broadcast addresses (port ",
-            // both config sections present
-            "Effective config",
-            "Effective server config",
+            "    epicsThreadGetCPUs() -> ",
+            "    osiLocalAddr() -> ",
+            "    osiSockDiscoverBroadcastAddresses() ->\n",
+            // both config sections present, in pvxs's words
+            "\nEffective Client config from environment\n    EPICS_PVA_ADDR_LIST=",
+            "\nEffective Server config from environment\n    EPICS_PVAS_",
             // a representative key from each config block
             "EPICS_PVA_BROADCAST_PORT=",
             "EPICS_PVAS_SERVER_PORT=",
         ] {
             assert!(s.contains(needle), "missing {needle:?} in:\n{s}");
         }
+    }
+
+    /// pvxs's section order and its `Toolchain` block (`describe.cpp:29-83`):
+    /// the compiler, then the C library, then `Versions` with Base as
+    /// `EPICS_VERSION_STRING` prints it.
+    #[test]
+    fn target_information_has_pvxs_toolchain_and_versions() {
+        let s = target_information_string().unwrap();
+        let heads: Vec<&str> = s
+            .lines()
+            .filter(|l| !l.starts_with(' '))
+            .take(5)
+            .map(|l| l.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            heads,
+            ["Host", "Target", "Toolchain", "Versions", "Runtime"],
+            "{s}"
+        );
+        assert!(s.contains("\nToolchain\n    rustc 1."), "{s}");
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            assert!(s.contains("\n    GLIBC 2."), "{s}");
+        }
+        assert!(
+            s.contains(&format!(
+                "\n    EPICS {}\n",
+                epics_base_rs::EPICS_BASE_VERSION
+            )),
+            "{s}"
+        );
     }
 
     /// `-D` shows the effective *server* config from `EPICS_PVAS_*`, while
@@ -427,7 +486,7 @@ mod tests {
 
         // The shared `-v` client block must stay client-only — no server
         // keys leak into it.
-        let v = cli::effective_config_string();
+        let v = cli::env_client_config_lines("");
         assert!(
             !v.contains("EPICS_PVAS_"),
             "the `-v` client block must not carry server keys: {v}"

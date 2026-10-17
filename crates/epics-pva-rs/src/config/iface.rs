@@ -116,6 +116,11 @@ impl IfaceMap {
         }
     }
 
+    /// `all_external()`'s names, in name order.
+    pub fn names(&self) -> Vec<String> {
+        self.ifaces.iter().map(|i| i.name.clone()).collect()
+    }
+
     /// `index_of(name)`: 0 when there is none.
     pub fn index_of(&self, name: &str) -> u32 {
         self.by_name(name).map_or(0, |i| i.index)

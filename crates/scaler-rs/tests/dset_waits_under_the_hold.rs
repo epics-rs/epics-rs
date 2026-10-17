@@ -15,6 +15,11 @@ use scaler_rs::device_support::scaler_asyn::{
     DoneInterrupt, ScalerAsynDeviceSupport, ScalerDriver,
 };
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — both ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// scaler-rs --test dset_waits_under_the_hold`). No CA server is built; the
+// reactor comes from `#[tokio::test]`, which the backend does not remove.
+
 static ASYN_SCALER: DevSup = DevSup {
     name: "devScalerAsyn",
     choice: "Asyn Scaler",

@@ -1,3 +1,8 @@
+use std::sync::Arc;
+
+use asyn_rs::error::AsynResult;
+use asyn_rs::interfaces::motor::AsynMotor;
+use asyn_rs::user::AsynUser;
 use bitflags::bitflags;
 use epics_base_rs::types::PvString;
 
@@ -448,6 +453,38 @@ pub enum MotorCommand {
     SetAccel {
         acceleration: f64,
     },
+    /// A driver's own call on its axis, which its parameter write queues
+    /// through [`AxisUser::queue`](crate::controller_port::AxisUser::queue).
+    Driver(DriverCall),
+}
+
+/// The call a [`MotorCommand::Driver`] runs on the axis's poller, with the
+/// axis locked.
+#[derive(Clone)]
+pub struct DriverCall(Arc<dyn Fn(&mut dyn AsynMotor, &AsynUser) -> AsynResult<()> + Send + Sync>);
+
+impl DriverCall {
+    pub fn new(
+        call: impl Fn(&mut dyn AsynMotor, &AsynUser) -> AsynResult<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(call))
+    }
+
+    pub(crate) fn run(&self, motor: &mut dyn AsynMotor, user: &AsynUser) -> AsynResult<()> {
+        (self.0)(motor, user)
+    }
+}
+
+impl std::fmt::Debug for DriverCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DriverCall")
+    }
+}
+
+impl PartialEq for DriverCall {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Which of SET_VELOCITY, SET_VEL_BASE and SET_ACCEL a motorRecord call site

@@ -16,7 +16,7 @@ use asyn_rs::port::PortDriverBase;
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::open_owner;
 use asyn_rs::user::AsynUser;
-use motor_rs::controller_port::{ControllerParams, ParamWrite, index};
+use motor_rs::controller_port::{AxisUser, ControllerParams, ParamWrite, index};
 use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::MotorAxis;
 use motor_rs::devices::{register_axis, register_controller_port};
@@ -199,7 +199,12 @@ fn a_skipped_acceleration_runs_on_one_the_port_wrote() {
 struct SlowOnly;
 
 impl ControllerParams for SlowOnly {
-    fn write_float64(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: f64) -> ParamWrite {
+    fn write_float64(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: f64,
+    ) -> ParamWrite {
         if user.reason == index::ACCEL && value > 5.0 {
             return ParamWrite::Handled(Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -256,7 +261,7 @@ fn a_record_stop_runs_on_the_last_stored_acceleration() {
 struct AccelWrites(Arc<Mutex<u32>>);
 
 impl ControllerParams for AccelWrites {
-    fn write_float64(&mut self, _: &mut PortDriverBase, user: &AsynUser, _: f64) -> ParamWrite {
+    fn write_float64(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: f64) -> ParamWrite {
         if user.reason == index::ACCEL {
             *self.0.lock().unwrap() += 1;
         }

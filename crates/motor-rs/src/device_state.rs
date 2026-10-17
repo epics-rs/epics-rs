@@ -240,7 +240,7 @@ impl MotorDeviceState {
 
     /// The status init_record reads, then takes with motorRecord's
     /// init-time `update_values` (motorRecord.cc:690): the axis' cache, or
-    /// C's calloc-zeroed status when the poller never filled it.
+    /// C's calloc-zeroed status for a record bound to no axis.
     pub fn init_status(&mut self) -> MotorStatus {
         let stamped = self.latest_status.get_or_insert_with(|| StampedStatus {
             seq: 1,

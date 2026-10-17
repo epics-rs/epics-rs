@@ -310,8 +310,7 @@ impl ControllerAxes {
                 poll_cmd_tx: poll_cmd_tx.clone(),
                 mirror: mirror.clone(),
             });
-            let mut polled =
-                Axis::polled(inbox, motor.clone(), subscribers).with_params(axis.params().clone());
+            let mut polled = Axis::polled(inbox, motor.clone(), subscribers, axis.params().clone());
             if let Some((port, addr)) = mirror {
                 polled.mirror_to(&port, addr);
             }

@@ -13,9 +13,9 @@ use asyn_rs::port::PortDriverBase;
 use asyn_rs::registry::open_owner;
 use asyn_rs::user::AsynUser;
 use motor_rs::controller_port::{
-    BASE_PARAMS, ControllerCtx, ControllerParams, ControllerPort, ControllerReport, FinishedWrite,
-    PROFILE_EXECUTE_DONE, PROFILE_TIME_MODE_FIXED, ParamDelta, ParamWrite, WriteHook, WriteOutcome,
-    WriteValue, has_motor_axis, index,
+    AxisUser, BASE_PARAMS, ControllerCtx, ControllerParams, ControllerPort, ControllerReport,
+    FinishedWrite, PROFILE_EXECUTE_DONE, PROFILE_TIME_MODE_FIXED, ParamDelta, ParamWrite,
+    WriteHook, WriteOutcome, WriteValue, has_motor_axis, index,
 };
 use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::{AxisReport, MotorAxis};
@@ -42,7 +42,12 @@ impl ControllerParams for Pmacish {
         addr == 0
     }
 
-    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, value: i32) -> ParamWrite {
+    fn write_int32(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
         self.seen.lock().unwrap().push((user.reason as i32, value));
         ParamWrite::PassToBase(Ok(()))
     }
@@ -109,7 +114,12 @@ impl ControllerParams for Sends {
         Ok(())
     }
 
-    fn write_octet(&mut self, _: &mut PortDriverBase, user: &AsynUser, data: &[u8]) -> ParamWrite {
+    fn write_octet(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        data: &[u8],
+    ) -> ParamWrite {
         if user.reason != self.send {
             return ParamWrite::PassToBase(Ok(()));
         }
@@ -146,7 +156,7 @@ impl ControllerParams for Options {
     fn read_option(
         &self,
         _: &PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         key: &str,
     ) -> Option<AsynResult<String>> {
         (key == "pollMethod").then(|| {
@@ -158,7 +168,7 @@ impl ControllerParams for Options {
     fn write_option(
         &mut self,
         _: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         key: &str,
         value: &str,
     ) -> Option<AsynResult<()>> {
@@ -214,6 +224,67 @@ fn base_int32_functions_reach_the_axis() {
         .unwrap();
     assert!(matches!(ax.polls.try_recv(), Ok(PollCommand::ForcePoll)));
     assert!(ax.commands.try_recv().is_err());
+}
+
+/// C's base write posts with the callParamCallbacks after the driver call
+/// (asynMotorController.cpp:203-245, :277-460); a write handed to the axis
+/// is posted by the axis's poller once the call ran, not by the port.
+#[test]
+fn a_write_handed_to_the_axis_is_posted_after_the_driver_call() {
+    use asyn_rs::interrupt::InterruptFilter;
+    let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+    let port = register_controller_port(&gate, "CPPOSTW", 2, ()).unwrap();
+    let mut ax = axis("CPPOSTW", 1);
+    let subscribe = |reason| {
+        port.interrupts().register_interrupt_user(
+            InterruptFilter {
+                reason: Some(reason),
+                addr: Some(1),
+                ..Default::default()
+            },
+            16,
+        )
+    };
+    let (_c, mut closed_loop) = subscribe(index::CLOSED_LOOP);
+    let (_m, mut move_abs) = subscribe(index::MOVE_ABS);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    // Past the asyn-boot-flush the gate starts, which would post the writes.
+    // A STATUS post can be register_axis's own notify, queued before the
+    // gate opened; a param set without a callback is posted by the flush.
+    let marker = asyn_rs::request::ParamSetValue::new(
+        index::MOVE_REL,
+        1,
+        asyn_rs::param::ParamValue::Float64(-1.0),
+    );
+    port.set_params_blocking(1, vec![marker]).unwrap();
+    let (_r, mut move_rel) = subscribe(index::MOVE_REL);
+    gate.set(true);
+    let flushed =
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), move_rel.recv()).await });
+    assert!(
+        matches!(flushed, Ok(Some(_))),
+        "the boot flush: {flushed:?}"
+    );
+    port.write_int32_blocking(index::CLOSED_LOOP, 1, 1).unwrap();
+    port.write_float64_blocking(index::MOVE_ABS, 1, 10.0)
+        .unwrap();
+    assert_eq!(next(&mut ax), MotorCommand::SetClosedLoop { enable: true });
+    assert!(matches!(next(&mut ax), MotorCommand::MoveAbsolute { .. }));
+    let posted = |rx: &mut asyn_rs::interrupt::InterruptReceiver| {
+        rt.block_on(async { tokio::time::timeout(Duration::from_millis(200), rx.recv()).await })
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    assert!(!posted(&mut closed_loop), "posted ahead of setClosedLoop");
+    assert!(!posted(&mut move_abs), "posted ahead of move");
+    // The poller's callParamCallbacks after the call posts both.
+    port.set_params_and_notify_blocking(1, Vec::new()).unwrap();
+    assert!(posted(&mut closed_loop));
+    assert!(posted(&mut move_abs));
 }
 
 #[test]
@@ -712,7 +783,7 @@ impl ControllerParams for Registers {
         Ok(())
     }
 
-    fn write_int32(&mut self, _: &mut PortDriverBase, user: &AsynUser, _: i32) -> ParamWrite {
+    fn write_int32(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: i32) -> ParamWrite {
         if user.reason != self.servo {
             return ParamWrite::PassToBase(Ok(()));
         }
@@ -932,7 +1003,7 @@ impl ControllerParams for Hooked {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
         self.registers.write_int32(base, user, value)
@@ -1185,7 +1256,7 @@ impl ControllerParams for BinaryOut {
     fn write_uint32_digital(
         &mut self,
         _: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: u32,
         mask: u32,
     ) -> ParamWrite {
@@ -1234,16 +1305,16 @@ impl ControllerParams for Queried {
         Ok(())
     }
 
-    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
-        let stored = base.read_int32_param(user);
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
+        let stored = base.read_int32_param(user.asyn());
         if user.reason == self.current {
             return Ok(10 * (user.addr + 1));
         }
         stored
     }
 
-    fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
-        let stored = base.read_float64_param(user);
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<f64> {
+        let stored = base.read_float64_param(user.asyn());
         if user.reason == self.temp {
             return Ok(21.5);
         }
@@ -1288,7 +1359,7 @@ impl ControllerParams for ControllerWrites {
     fn write_int32(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         _value: i32,
     ) -> ParamWrite {
         let found = has_motor_axis(base, user);
@@ -1311,7 +1382,7 @@ impl ControllerParams for ControllerWrites {
     fn write_float64(
         &mut self,
         base: &mut PortDriverBase,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         _value: f64,
     ) -> ParamWrite {
         let found = has_motor_axis(base, user);
@@ -1368,14 +1439,17 @@ fn a_write_at_an_address_with_no_axis_runs_the_driver_s_code_first() {
     );
 }
 
-/// Each `getAxis` C runs at an out-of-range address prints getAddress's
-/// line once: the driver's own, then the base's if the driver calls it.
+/// C never runs a subclass's code at an out-of-range address: its connect
+/// refuses the device with getAddress's line (asynPortDriver.cpp:3772) and
+/// asynManager queues nothing for it (asynManager.c:1570-1577). The write
+/// is refused with that one line.
 #[test]
-fn an_out_of_range_write_prints_once_per_c_get_axis() {
+fn an_out_of_range_write_prints_getaddress_once_and_runs_no_driver_code() {
     use asyn_rs::manager::PortManager;
     use asyn_rs::trace::TraceFile;
-    let port =
-        register_controller_port(&open_owner(), "CPRANGE", 2, ControllerWrites::default()).unwrap();
+    let params = ControllerWrites::default();
+    let seen = params.seen.clone();
+    let port = register_controller_port(&open_owner(), "CPRANGE", 2, params).unwrap();
     let _ax = axis("CPRANGE", 0);
     let path = std::env::temp_dir().join(format!("cp-range-{}", std::process::id()));
     let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
@@ -1390,9 +1464,228 @@ fn an_out_of_range_write_prints_once_per_c_get_axis() {
             .count()
     };
     let reset = BASE_PARAMS.len();
-    port.write_int32_blocking(reset, 5, 1).unwrap();
-    assert_eq!(lines(), 1, "the driver's getAxis only");
+    assert!(port.write_int32_blocking(reset, 5, 1).is_err());
+    assert_eq!(lines(), 1);
     assert!(port.write_int32_blocking(index::DEFER_MOVES, 5, 1).is_err());
-    assert_eq!(lines(), 3, "the driver's and the base's");
+    assert_eq!(lines(), 2);
+    assert!(seen.lock().unwrap().is_empty());
     let _ = std::fs::remove_file(&path);
+}
+
+/// Records the address every subclass entry is handed.
+#[derive(Default)]
+struct Addrs {
+    seen: Arc<Mutex<Vec<i32>>>,
+}
+
+impl Addrs {
+    fn saw(&self, addr: i32) {
+        self.seen.lock().unwrap().push(addr);
+    }
+}
+
+impl ControllerParams for Addrs {
+    fn write_int32(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: i32) -> ParamWrite {
+        self.saw(user.addr);
+        ParamWrite::Handled(Ok(()))
+    }
+    fn write_float64(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: f64) -> ParamWrite {
+        self.saw(user.addr);
+        ParamWrite::Handled(Ok(()))
+    }
+    fn read_int32(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
+        self.saw(user.addr);
+        Ok(0)
+    }
+    fn read_float64(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<f64> {
+        self.saw(user.addr);
+        Ok(0.0)
+    }
+    fn write_octet(&mut self, _: &mut PortDriverBase, user: AxisUser<'_>, _: &[u8]) -> ParamWrite {
+        self.saw(user.addr);
+        ParamWrite::Handled(Ok(()))
+    }
+    fn write_uint32_digital(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        _: u32,
+        _: u32,
+    ) -> ParamWrite {
+        self.saw(user.addr);
+        ParamWrite::Handled(Ok(()))
+    }
+    fn read_option(
+        &self,
+        _: &PortDriverBase,
+        user: AxisUser<'_>,
+        _: &str,
+    ) -> Option<AsynResult<String>> {
+        self.saw(user.addr);
+        Some(Ok(String::new()))
+    }
+    fn write_option(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        _: &str,
+        _: &str,
+    ) -> Option<AsynResult<()>> {
+        self.saw(user.addr);
+        Some(Ok(()))
+    }
+}
+
+/// A user at address -1 reaches the subclass at the axis C's getAxis
+/// finds there, getAddress's 0 (asynPortDriver.cpp:1901-1914).
+#[test]
+fn every_subclass_entry_is_handed_getaddress_s_axis() {
+    let params = Addrs::default();
+    let seen = params.seen.clone();
+    let port = register_controller_port(&open_owner(), "CPADDRM1", 2, params).unwrap();
+    let _ax = axis("CPADDRM1", 0);
+    port.write_int32_blocking(index::STOP, -1, 1).unwrap();
+    port.write_float64_blocking(index::VELOCITY, -1, 1.0)
+        .unwrap();
+    port.read_int32_blocking(index::STOP, -1).unwrap();
+    port.read_float64_blocking(index::VELOCITY, -1).unwrap();
+    let io = asyn_rs::sync_io::SyncIOHandle::from_handle(port.clone(), -1, Duration::from_secs(1));
+    io.write_octet(index::PROFILE_BUILD_MESSAGE, b"x").unwrap();
+    io.write_uint32_digital(index::STOP, 1, 1).unwrap();
+    let user = || AsynUser::default().with_addr(-1);
+    port.get_option_blocking(user(), "k").unwrap();
+    port.set_option_blocking(user(), "k", "v").unwrap();
+    assert_eq!(*seen.lock().unwrap(), [0; 8]);
+}
+
+/// Records the closed-loop calls and moves the poller runs.
+struct Servoed(Arc<Mutex<Vec<String>>>);
+
+impl asyn_rs::interfaces::motor::AsynMotor for Servoed {
+    fn move_absolute(&mut self, _: &AsynUser, p: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        self.0.lock().unwrap().push(format!("move {p}"));
+        Ok(())
+    }
+    fn move_relative(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_closed_loop(&mut self, _: &AsynUser, enable: bool) -> AsynResult<()> {
+        self.0.lock().unwrap().push(format!("servo {enable}"));
+        Ok(())
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+        Ok(asyn_rs::interfaces::motor::MotorStatus::default())
+    }
+}
+
+/// pi-gcs2's PI_SUP_SERVO shape: a parameter of the driver's whose write
+/// switches the axis's closed loop, after the port has been busy long
+/// enough for a record move to take the axis and wait on the port.
+#[derive(Default)]
+struct Servo {
+    reason: usize,
+}
+
+impl ControllerParams for Servo {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.reason = base.create_param("SERVO", ParamType::Int32)?;
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        if user.reason != self.reason {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        ParamWrite::Handled(user.queue(base, MotorCommand::SetClosedLoop { enable: value != 0 }))
+    }
+}
+
+/// A driver's write queued on the axis runs on its poller, and does not
+/// wait on a record move that holds the axis while it waits on the port.
+#[test]
+fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
+    use motor_rs::poll_loop::{MotorPollLoop, PollerInbox};
+    use motor_rs::trace::MotorTrace;
+    let name = "CPQUEUE";
+    let port = register_controller_port(&open_owner(), name, 1, Servo::default()).unwrap();
+    let reason = BASE_PARAMS.len();
+    let (poll_tx, poll) = mpsc::channel(4);
+    let (motor_tx, commands) = mpsc::unbounded_channel();
+    let user = TraceUser::Asyn {
+        port: name.into(),
+        addr: 0,
+    };
+    register_axis(MotorAxis::new(
+        user.clone(),
+        Duration::from_secs(1),
+        poll_tx,
+        motor_tx.clone(),
+        AxisSubscribers::new(),
+    ))
+    .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
+        Arc::new(Mutex::new(Servoed(seen.clone())));
+    let mut poll_loop = MotorPollLoop::new(
+        PollerInbox { poll, commands },
+        motor,
+        AxisSubscribers::new(),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        0,
+    );
+    let write = {
+        let port = port.clone();
+        std::thread::spawn(move || port.write_int32_blocking(reason, 0, 1))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    motor_tx
+        .send(CommandBatch {
+            trace: Arc::new(MotorTrace::with_user(user)),
+            record: Some(0),
+            commands: vec![
+                MotorCommand::SetVelocity { velocity: 1.0 },
+                MotorCommand::MoveAbsolute {
+                    position: 5.0,
+                    min_velocity: 0.0,
+                    velocity: 1.0,
+                    acceleration: 1.0,
+                },
+            ],
+        })
+        .unwrap();
+    let poller = std::thread::spawn(move || {
+        poll_loop.run_queued_commands();
+        poll_loop
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !(write.is_finished() && poller.is_finished()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write and the move deadlocked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    write.join().unwrap().unwrap();
+    let mut poll_loop = poller.join().unwrap();
+    poll_loop.run_queued_commands();
+    assert_eq!(*seen.lock().unwrap(), ["move 5", "servo true"]);
 }

@@ -137,25 +137,45 @@ impl Default for MotorStatus {
 pub struct PollFailure {
     pub problem: bool,
     pub comms_error: bool,
+    /// C's poll still returns asynSuccess, so a GET_INFO write does too
+    /// (phytronAxisMotor.cpp:1842-1872).
+    pub succeeds: bool,
 }
 
 impl PollFailure {
     pub const NONE: Self = Self {
         problem: false,
         comms_error: false,
+        succeeds: false,
     };
     pub const PROBLEM: Self = Self {
         problem: true,
         comms_error: false,
+        succeeds: false,
     };
     pub const COMMS_ERROR: Self = Self {
         problem: false,
         comms_error: true,
+        succeeds: false,
     };
     pub const PROBLEM_AND_COMMS_ERROR: Self = Self {
         problem: true,
         comms_error: true,
+        succeeds: false,
     };
+
+    /// Whether the failed poll sets any status bit.
+    pub const fn raises(self) -> bool {
+        self.problem || self.comms_error
+    }
+
+    /// These bits, raised by a poll that C returns asynSuccess from.
+    pub const fn succeeding(self) -> Self {
+        Self {
+            succeeds: true,
+            ..self
+        }
+    }
 }
 
 /// Which closed-loop gain a [`AsynMotor::set_pid_gain`] call addresses.

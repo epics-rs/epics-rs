@@ -127,6 +127,7 @@ pub mod index {
     pub const ENCODER_POSITION: usize = 10;
     pub const DEFER_MOVES: usize = 11;
     pub const MOVE_TO_HOME: usize = 12;
+    pub const RESOLUTION: usize = 13;
     pub const ENCODER_RATIO: usize = 14;
     pub const PGAIN: usize = 15;
     pub const IGAIN: usize = 16;
@@ -307,6 +308,46 @@ pub struct WriteOutcome {
     pub status: Option<AsynResult<()>>,
 }
 
+/// The user a subclass's code runs for, at the address C `getAddress`
+/// gives its `getAxis`: the parameter list, `-1` read as 0. C refuses an
+/// address out of range at connect (asynPortDriver.cpp:3772), so no
+/// subclass code runs there.
+#[derive(Clone, Copy)]
+pub struct AxisUser<'a> {
+    pub reason: usize,
+    /// The axis, never `-1`.
+    pub addr: i32,
+    asyn: &'a AsynUser,
+}
+
+impl<'a> AxisUser<'a> {
+    /// `getAddress(pasynUser, &addr)`, printing a refused address.
+    pub fn new(base: &PortDriverBase, asyn: &'a AsynUser) -> AsynResult<Self> {
+        Ok(Self {
+            reason: asyn.reason,
+            addr: base.get_address(asyn.addr, asyn.reason)?,
+            asyn,
+        })
+    }
+
+    /// The asyn user itself, for asynPortDriver's own calls and
+    /// `asynPrint`, which take the user's address as it is.
+    pub fn asyn(&self) -> &'a AsynUser {
+        self.asyn
+    }
+
+    /// Run `command` on the axis's poller, as the base's own axis writes
+    /// run. A driver's write runs on the port thread, where locking the
+    /// axis would wait on a poller that holds it while it waits on this
+    /// port.
+    pub fn queue(&self, base: &PortDriverBase, command: MotorCommand) -> AsynResult<()> {
+        let axis = crate::devices::axis_at(&base.port_name, self.addr)
+            .ok_or_else(|| no_axis(&base.port_name, self.addr))?;
+        axis.send(command);
+        Ok(())
+    }
+}
+
 /// What a C subclass `writeInt32` / `writeFloat64` does around
 /// `asynMotorController`'s, on every write the base runs: the controller
 /// port's and a motor record's, whose base call runs on the axis's poller.
@@ -323,6 +364,14 @@ pub trait WriteHook: Send + Sync + 'static {
     /// write returns, for a base call an axis runs once the driver has.
     fn after_write(&self, _write: &FinishedWrite<'_>) -> WriteOutcome {
         WriteOutcome::default()
+    }
+
+    /// Whether the subclass's write takes `function` itself and returns
+    /// without calling the base, as omsBaseController's gains do
+    /// (omsBaseController.cpp:361-406). The driver call stands for its
+    /// branch, and the base prints none of its lines.
+    fn handles(&self, _function: usize) -> bool {
+        false
     }
 }
 
@@ -351,7 +400,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_int32(
         &mut self,
         _base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _value: i32,
     ) -> ParamWrite {
         ParamWrite::PassToBase(Ok(()))
@@ -361,7 +410,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_float64(
         &mut self,
         _base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _value: f64,
     ) -> ParamWrite {
         ParamWrite::PassToBase(Ok(()))
@@ -370,13 +419,13 @@ pub trait ControllerParams: Send + Sync + 'static {
     /// The subclass `readInt32`; an override calls
     /// [`PortDriverBase::read_int32_param`] as C calls the base.
     /// asynMotorController has none, so the base is asynPortDriver's.
-    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
-        base.read_int32_param(user)
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
+        base.read_int32_param(user.asyn())
     }
 
     /// The subclass `readFloat64`; see [`Self::read_int32`].
-    fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
-        base.read_float64_param(user)
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<f64> {
+        base.read_float64_param(user.asyn())
     }
 
     /// The subclass `writeOctet`, as omsBaseController's string commands;
@@ -385,7 +434,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_octet(
         &mut self,
         _base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _data: &[u8],
     ) -> ParamWrite {
         ParamWrite::PassToBase(Ok(()))
@@ -396,7 +445,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn read_option(
         &self,
         _base: &PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _key: &str,
     ) -> Option<AsynResult<String>> {
         None
@@ -406,7 +455,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_option(
         &mut self,
         _base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _key: &str,
         _value: &str,
     ) -> Option<AsynResult<()>> {
@@ -418,7 +467,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_uint32_digital(
         &mut self,
         _base: &mut PortDriverBase,
-        _user: &AsynUser,
+        _user: AxisUser<'_>,
         _value: u32,
         _mask: u32,
     ) -> ParamWrite {
@@ -455,7 +504,7 @@ pub trait ControllerParams: Send + Sync + 'static {
     fn write_float64_array(
         &mut self,
         ctx: &mut ControllerCtx<'_>,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: &[f64],
     ) -> AsynResult<()> {
         ctx.write_float64_array(self, user, value)
@@ -634,10 +683,10 @@ impl ControllerCtx<'_> {
     pub fn write_float64_array<P: ControllerParams + ?Sized>(
         &mut self,
         params: &mut P,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         value: &[f64],
     ) -> AsynResult<()> {
-        let addr = self.base.get_address(user.addr, user.reason)?;
+        let addr = user.addr;
         if !self.axes().any(|a| a == addr) {
             return Err(no_axis(&self.base.port_name, addr));
         }
@@ -778,9 +827,8 @@ fn no_axis(port: &str, addr: i32) -> AsynError {
 /// C `getAxis(pasynUser)` for a driver's own write code, which now runs
 /// at any address: whether a motor axis sits at the user's. A
 /// [`ControllerParams::is_controller_axis`] is the driver's to add.
-pub fn has_motor_axis(base: &PortDriverBase, user: &AsynUser) -> bool {
-    base.get_address(user.addr, user.reason)
-        .is_ok_and(|addr| crate::devices::axis_at(&base.port_name, addr).is_some())
+pub fn has_motor_axis(base: &PortDriverBase, user: AxisUser<'_>) -> bool {
+    crate::devices::axis_at(&base.port_name, user.addr).is_some()
 }
 
 /// The asyn driver behind a controller port.
@@ -842,18 +890,11 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// C `getAxis(pasynUser)`: the motor axis at the user's address, `None`
     /// at a controller axis, an error where the controller has no axis.
     fn axis(&self, user: &AsynUser) -> AsynResult<(i32, Option<MotorAxis>)> {
-        self.base.get_address(user.addr, user.reason)?;
-        self.find_axis(user)
+        self.find_axis(self.base.get_address(user.addr, user.reason)?)
     }
 
-    /// [`Self::axis`] without `getAddress`'s print, which a write leaves to
-    /// the `getAxis` calls its C code makes: the driver's own, then the
-    /// base's in [`Self::no_axis_write`].
-    fn find_axis(&self, user: &AsynUser) -> AsynResult<(i32, Option<MotorAxis>)> {
-        let addr = self
-            .base
-            .resolve_address(user.addr)
-            .map_err(AsynError::AddressOutOfRange)?;
+    /// [`Self::axis`] at `getAddress`'s address.
+    fn find_axis(&self, addr: i32) -> AsynResult<(i32, Option<MotorAxis>)> {
         if let Some(axis) = crate::devices::axis_at(&self.base.port_name, addr) {
             return Ok((addr, Some(axis)));
         }
@@ -866,19 +907,10 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// A C subclass write at an address with no axis: its own code has run,
     /// and the base it calls returns asynError from `getAxis` before
     /// storing anything.
-    fn no_axis_write(
-        &self,
-        own: ParamWrite,
-        user: &AsynUser,
-        refused: AsynError,
-    ) -> AsynResult<()> {
+    fn no_axis_write(&self, own: ParamWrite, refused: AsynError) -> AsynResult<()> {
         match own {
             ParamWrite::Handled(status) => status,
-            ParamWrite::PassToBase(own) => {
-                // The base's getAxis prints an out-of-range address.
-                let _ = self.base.get_address(user.addr, user.reason);
-                own.and(Err(refused))
-            }
+            ParamWrite::PassToBase(own) => own.and(Err(refused)),
         }
     }
 
@@ -954,7 +986,8 @@ impl<P: ControllerParams> ControllerPort<P> {
     }
 
     /// C's closing `asynPrint` of a base write (asynMotorController.cpp:
-    /// 247-254, :419-426), through the writer's user.
+    /// 247-254, :419-426), through the writer's user; none for one the
+    /// subclass [`WriteHook::handles`].
     fn print_write(
         &self,
         addr: i32,
@@ -963,6 +996,13 @@ impl<P: ControllerParams> ControllerPort<P> {
         status: &AsynResult<()>,
         value: std::fmt::Arguments<'_>,
     ) {
+        if self
+            .hook
+            .as_ref()
+            .is_some_and(|hook| hook.handles(function))
+        {
+            return;
+        }
         let print = |mask, args: std::fmt::Arguments<'_>| {
             PortManager::global().trace_manager().print(
                 Some(&self.base.port_name),
@@ -1003,7 +1043,7 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// The driver's own code, its hook's check, then the base `writeInt32`.
     fn write_int32_base(
         &mut self,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         addr: i32,
         axis: Option<MotorAxis>,
         value: i32,
@@ -1025,8 +1065,9 @@ impl<P: ControllerParams> ControllerPort<P> {
                 let sent = axis
                     .as_ref()
                     .is_some_and(|axis| self.int32_command(axis, addr, user.reason, value));
+                // The axis's poller posts it after the driver call, as
+                // C's closing callParamCallbacks does.
                 if sent {
-                    let _ = self.base.call_param_callbacks(addr);
                     return BaseWrite::OnAxis(own);
                 }
                 Ok(())
@@ -1047,7 +1088,7 @@ impl<P: ControllerParams> ControllerPort<P> {
     /// `writeFloat64`.
     fn write_float64_base(
         &mut self,
-        user: &AsynUser,
+        user: AxisUser<'_>,
         addr: i32,
         axis: Option<MotorAxis>,
         value: f64,
@@ -1063,10 +1104,10 @@ impl<P: ControllerParams> ControllerPort<P> {
         let sent = axis
             .as_ref()
             .is_some_and(|axis| self.float64_command(axis, addr, user.reason, value));
-        let _ = self.base.call_param_callbacks(addr);
         if sent {
             return BaseWrite::OnAxis(own);
         }
+        let _ = self.base.call_param_callbacks(addr);
         self.print_write(
             addr,
             user.reason,
@@ -1142,19 +1183,22 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        let user = AxisUser::new(&self.base, user)?;
         self.params.read_int32(&mut self.base, user)
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        let user = AxisUser::new(&self.base, user)?;
         self.params.read_float64(&mut self.base, user)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let (addr, axis) = match self.find_axis(user) {
+        let user = AxisUser::new(&self.base, user)?;
+        let (addr, axis) = match self.find_axis(user.addr) {
             Ok(found) => found,
             Err(refused) => {
                 let own = self.params.write_int32(&mut self.base, user, value);
-                return self.no_axis_write(own, user, refused);
+                return self.no_axis_write(own, refused);
             }
         };
         let status = self.write_int32_base(user, addr, axis, value);
@@ -1162,11 +1206,12 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let (addr, axis) = match self.find_axis(user) {
+        let user = AxisUser::new(&self.base, user)?;
+        let (addr, axis) = match self.find_axis(user.addr) {
             Ok(found) => found,
             Err(refused) => {
                 let own = self.params.write_float64(&mut self.base, user, value);
-                return self.no_axis_write(own, user, refused);
+                return self.no_axis_write(own, refused);
             }
         };
         let status = self.write_float64_base(user, addr, axis, value);
@@ -1179,9 +1224,10 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        let axis_user = AxisUser::new(&self.base, user)?;
         match self
             .params
-            .write_uint32_digital(&mut self.base, user, value, mask)
+            .write_uint32_digital(&mut self.base, axis_user, value, mask)
         {
             ParamWrite::Handled(status) => status,
             ParamWrite::PassToBase(own) => {
@@ -1192,7 +1238,8 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        match self.params.write_octet(&mut self.base, user, data) {
+        let axis_user = AxisUser::new(&self.base, user)?;
+        match self.params.write_octet(&mut self.base, axis_user, data) {
             ParamWrite::Handled(status) => status.map(|()| data.len()),
             ParamWrite::PassToBase(own) => {
                 let written = self.base.write_octet(user, data);
@@ -1202,19 +1249,25 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
     }
 
     fn get_option(&self, user: &AsynUser, key: &str) -> AsynResult<String> {
+        let axis_user = AxisUser::new(&self.base, user)?;
         self.params
-            .read_option(&self.base, user, key)
+            .read_option(&self.base, axis_user, key)
             .unwrap_or_else(|| self.base.read_option(user, key))
     }
 
     fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
-        if let Some(written) = self.params.write_option(&mut self.base, user, key, value) {
+        let axis_user = AxisUser::new(&self.base, user)?;
+        if let Some(written) = self
+            .params
+            .write_option(&mut self.base, axis_user, key, value)
+        {
             return written;
         }
         self.base.write_option(user, key, value)
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
+        let user = AxisUser::new(&self.base, user)?;
         self.with_params(|params, ctx| params.write_float64_array(ctx, user, data))
     }
 

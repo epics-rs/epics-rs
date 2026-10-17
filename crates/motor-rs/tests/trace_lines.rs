@@ -790,3 +790,132 @@ fn a_record_prints_build_trans_flow_lines_with_its_pact() {
         ]
     );
 }
+
+/// A subclass taking the proportional gain and the resolution itself, as
+/// omsBaseController's writeFloat64 does without calling the base
+/// (omsBaseController.cpp:358-372).
+struct OwnGain;
+
+impl motor_rs::controller_port::WriteHook for OwnGain {
+    fn handles(&self, function: usize) -> bool {
+        use motor_rs::controller_port::index;
+        matches!(function, index::PGAIN | index::RESOLUTION)
+    }
+}
+
+struct OwnGainParams;
+
+impl motor_rs::controller_port::ControllerParams for OwnGainParams {
+    fn write_hook(&self) -> Option<Arc<dyn motor_rs::controller_port::WriteHook>> {
+        Some(Arc::new(OwnGain))
+    }
+}
+
+/// The base prints nothing for a write the subclass takes itself, whether
+/// an axis or the port finishes it; a write it passes on still prints the
+/// base's lines.
+#[test]
+fn a_write_the_subclass_takes_itself_prints_no_base_line() {
+    use asyn_rs::interfaces::motor::PidGainKind;
+    use asyn_rs::registry::open_owner;
+    use asyn_rs::trace::TraceMask;
+
+    let port = "traceLinesOwnGain";
+    let handle =
+        motor_rs::devices::register_controller_port(&open_owner(), port, 1, OwnGainParams).unwrap();
+    let (motor_tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+    let (poll_tx, _polls) = tokio::sync::mpsc::channel(1);
+    motor_rs::devices::register_axis(motor_rs::device_support::MotorAxis::new(
+        TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        },
+        std::time::Duration::from_secs(1),
+        poll_tx,
+        motor_tx,
+        motor_rs::device_state::AxisSubscribers::new(),
+    ))
+    .unwrap();
+    PortManager::global().trace_manager().set_trace_mask(
+        Some(port),
+        TraceMask::ERROR | TraceMask::FLOW | TraceMask::IO_DRIVER,
+    );
+    // The port's own user connected device 0, whose trace file is its own.
+    let lines = |write: &dyn Fn()| {
+        let path = std::env::temp_dir().join(format!("motor-trace-{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        PortManager::global().trace_manager().set_device_trace_file(
+            port,
+            0,
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
+        write();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text.lines()
+            .filter(|l| l.contains("asynMotorController"))
+            .count()
+    };
+    let base = |commands: &[MotorCommand]| {
+        lines(&|| {
+            let trace = MotorTrace::new(port, 0);
+            execute_commands(&mut Disconnected, &trace, commands, &mut |_| {});
+        })
+    };
+    let gain = MotorCommand::SetPidGain {
+        kind: PidGainKind::Proportional,
+        gain: 2.0,
+    };
+    assert_eq!(base(&[gain]), 0);
+    assert_eq!(base(&[MotorCommand::SetHighLimit { position: 1.0 }]), 2);
+    // Neither maps to an axis command, so the port finishes both.
+    let on_port = |function| {
+        lines(&|| {
+            handle.write_float64_blocking(function, 0, 0.5).unwrap();
+        })
+    };
+    use motor_rs::controller_port::index;
+    assert_eq!(on_port(index::RESOLUTION), 0);
+    assert_eq!(on_port(index::ACCEL), 1);
+}
+
+/// phytron's poll: a failed exchange raises the problem bit and returns
+/// asynSuccess (phytronAxisMotor.cpp:1842-1872).
+struct FailsQuietly;
+
+impl AsynMotor for FailsQuietly {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM.succeeding()
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        refused().map(|()| MotorStatus::default())
+    }
+}
+
+#[test]
+fn a_get_info_whose_poll_c_returns_success_from_prints_no_error() {
+    let port = "traceLinesQuietPoll";
+    let lines = traced_by(port, || {
+        let trace = MotorTrace::new(port, 0);
+        trace.set_record("PH:m1");
+        execute_commands(
+            &mut FailsQuietly,
+            &trace,
+            &[MotorCommand::Poll],
+            &mut |_| {},
+        );
+    });
+    assert!(lines.is_empty(), "{lines:#?}");
+}

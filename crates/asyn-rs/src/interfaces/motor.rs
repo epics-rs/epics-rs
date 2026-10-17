@@ -255,7 +255,10 @@ pub struct RecordFields {
 /// Units are C `asynMotorAxis`'s: positions in steps, velocities in
 /// steps/s, accelerations in steps/s². The motor record owns the MRES/ERES
 /// conversion, as motorRecord.cc does; a driver does no scaling.
-pub trait AsynMotor: Send + Sync {
+///
+/// `Any`, so a driver's call queued on its axis (motor-rs `DriverCall`)
+/// can reach its own axis type from the `&mut dyn AsynMotor` it is given.
+pub trait AsynMotor: std::any::Any + Send + Sync {
     /// Move to an absolute position.
     ///
     /// `min_velocity` is the base/start velocity (motor record VBAS):
@@ -529,3 +532,48 @@ pub trait AsynMotor: Send + Sync {
 // PCO-capable drivers (Aerotech, Newport XPS, Galil, ACSMotion) expose it
 // driver-privately (e.g. iocsh commands) until upstream actually merges a base
 // interface to mirror.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Axis(f64);
+
+    impl AsynMotor for Axis {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            p: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            self.0 = p;
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+    }
+
+    #[test]
+    fn a_motor_downcasts_to_its_own_type() {
+        let mut axis = Axis(0.0);
+        let motor: &mut dyn AsynMotor = &mut axis;
+        let any: &mut dyn std::any::Any = motor;
+        any.downcast_mut::<Axis>().unwrap().0 = 5.0;
+        assert_eq!(axis.0, 5.0);
+    }
+}

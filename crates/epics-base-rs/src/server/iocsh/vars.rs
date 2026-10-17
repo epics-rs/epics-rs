@@ -284,16 +284,14 @@ fn strtol_base0(s: &str) -> Option<i64> {
 
 /// C `varHandler(v, NULL)` — `int %s = %d` / `double %s = %g` on stdout
 /// (`iocsh.cpp:1400-1408`). The `%g` is a bare one, so six significant
-/// digits, and [`crate::server::records::printf::format_g`] is the port's glibc-differenced printer for
-/// it rather than a Rust float format that would spell `100000` as
-/// `100000.0`.
+/// digits.
 fn show(ctx: &CommandContext, def: &VarDef) {
     match &def.access {
         VarAccess::Int { get, .. } => ctx.println(&format!("int {} = {}", def.name, get())),
         VarAccess::Double { get, .. } => ctx.println(&format!(
             "double {} = {}",
             def.name,
-            crate::server::records::printf::format_g(get(), 6)
+            epics_libcom_rs::cfmt::CFloat(get()).g()
         )),
     }
 }

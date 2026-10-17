@@ -18,6 +18,8 @@
 //! * [`net`] — the EPICS protocols' shared socket layer: per-NIC async UDP,
 //!   interface enumeration, loopback multicast. Host-only; the wire constants
 //!   beside it compile for every target, RTEMS included.
+//! * [`cfmt`] — [`CFloat`](cfmt::CFloat), C `printf`'s `%f` / `%e` / `%g`
+//!   over a double, glibc's `nan` / `-nan` / `inf` spellings included.
 //! * [`walltime`] — [`WallTime`](walltime::WallTime), the wall-clock instant
 //!   `runtime::time` returns. It lived in `epics_base_rs::types` and moved down
 //!   with its producer; `epics-base-rs` re-exports it at `types::WallTime`.
@@ -108,6 +110,7 @@ compile_error!(
 // `epics-base-rs`'s alias for the same macro.
 extern crate self as epics_libcom_rs;
 
+pub mod cfmt;
 pub mod net;
 pub mod runtime;
 pub mod shared_array;

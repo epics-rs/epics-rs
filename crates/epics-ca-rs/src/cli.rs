@@ -4,9 +4,9 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): the test's subject is arming a *tokio* timer with
 // INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run
 // and pass in the exec-backend suite on the tokio driver.
-use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::client::{CaChannel, CaClient, ConnectionEvent};
 use epics_base_rs::runtime::sync::broadcast;
@@ -1095,31 +1095,9 @@ const C_DEFAULT_PRECISION: usize = 6;
 /// (`tool_lib.c:138,150`), so they never reach a limit: `caget -d
 /// DBR_CTRL_DOUBLE -f 9` still prints every limit at 6 significant digits.
 ///
-/// Non-finite limits fall through to `format_non_finite`, the same escape
-/// `format_float` takes.
+/// [`CFloat`] owns the conversion, glibc's `nan` / `-nan` / `inf` included.
 pub fn format_c_g(x: f64) -> String {
-    if !x.is_finite() {
-        return format_non_finite(x);
-    }
-    format_g(x, C_DEFAULT_PRECISION)
-}
-
-/// C `printf`'s spelling of a non-finite double, shared by EVERY conversion —
-/// `%g`, `%f` and `%e` all print the same three words (verified against glibc,
-/// R13-20).
-///
-/// Rust's `{}` agrees on `inf` and `-inf` but prints `NaN` where C prints
-/// `nan`, so `caget` on a NaN-valued `ao` printed `NaN` against C's `nan`.
-/// glibc also carries the SIGN BIT through, printing `-nan` for a negative
-/// NaN; `f64::is_sign_negative` reports exactly that bit.
-///
-/// Every float the tools print — value, array element, and each graphic /
-/// control limit — reaches C's `printf` through one of the two callers here,
-/// so this is the only place the spelling is decided.
-fn format_non_finite(x: f64) -> String {
-    let sign = if x.is_sign_negative() { "-" } else { "" };
-    let word = if x.is_nan() { "nan" } else { "inf" };
-    format!("{sign}{word}")
+    format!("{:.C_DEFAULT_PRECISION$}", CFloat(x).g())
 }
 
 fn format_float(x: f64, fmt: &ValueFormat) -> String {
@@ -1140,56 +1118,25 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         let rounded = i64::from(x.round() as i32);
         return format_int_i64(rounded, fmt.float_style);
     }
-    if !x.is_finite() {
-        return format_non_finite(x);
-    }
     let p = fmt.float.precision as usize;
     match fmt.float.style {
-        FloatStyle::F => format!("{x:.p$}"),
-        FloatStyle::E => format_e(x, p),
-        FloatStyle::G => format_g(x, p.max(1)),
+        FloatStyle::F => format!("{:.p$}", CFloat(x)),
+        FloatStyle::E => format!("{:.p$e}", CFloat(x)),
+        FloatStyle::G => format!("{:.p$}", CFloat(x).g()),
     }
-}
-
-/// Pure `%e`: precision is digits AFTER the decimal point.
-fn format_e(x: f64, precision: usize) -> String {
-    let s = format!("{x:.precision$e}");
-    rewrite_rust_e_as_c(&s, false)
-}
-
-/// Rust formats scientific as `1.23e2`; C as `1.23e+02` (signed,
-/// 2-digit exponent minimum). Optionally also strips the trailing
-/// zeros from the mantissa (the `%g` post-trim behaviour).
-fn rewrite_rust_e_as_c(s: &str, trim_mantissa: bool) -> String {
-    let Some(e_pos) = s.find('e') else {
-        return s.to_string();
-    };
-    let mantissa = &s[..e_pos];
-    let exp_part = &s[e_pos + 1..];
-    let mantissa_out = if trim_mantissa && mantissa.contains('.') {
-        let t = mantissa.trim_end_matches('0').trim_end_matches('.');
-        t.to_string()
-    } else {
-        mantissa.to_string()
-    };
-    let (sign, digits) = if let Some(d) = exp_part.strip_prefix('-') {
-        ('-', d)
-    } else if let Some(d) = exp_part.strip_prefix('+') {
-        ('+', d)
-    } else {
-        ('+', exp_part)
-    };
-    let exp_padded = if digits.len() < 2 {
-        format!("{sign}0{digits}")
-    } else {
-        format!("{sign}{digits}")
-    };
-    format!("{mantissa_out}e{exp_padded}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_g(x: f64, p: usize) -> String {
+        format!("{:.p$}", CFloat(x).g())
+    }
+
+    fn format_e(x: f64, p: usize) -> String {
+        format!("{:.p$e}", CFloat(x))
+    }
 
     fn fmt_default() -> ValueFormat {
         ValueFormat::default()

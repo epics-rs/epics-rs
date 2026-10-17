@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use epics_libcom_rs::cfmt::CFloat;
 
 /// A single entry in an enumeration parameter's choice list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1364,8 +1365,9 @@ impl ParamEntry {
             ParamValue::Float64(v) => {
                 let _ = writeln!(
                     out,
+                    // paramVal::report prints a Float64 with `%g` (paramVal.cpp:322).
                     "Parameter {id} type={type_name}, name={name}, value={}, status={status}",
-                    format_g(*v)
+                    CFloat(*v).g()
                 );
             }
             ParamValue::Octet(v) => {
@@ -1451,48 +1453,6 @@ fn c_param_type_name(t: ParamType) -> &'static str {
     }
 }
 
-/// C `printf("%g")` over a double, which is what `paramVal::report` prints a
-/// `Float64` with (paramVal.cpp:322): six significant digits, `%e` form when the
-/// exponent is below -4 or at least 6, and trailing zeros stripped either way.
-/// Rust's `{}` prints the shortest round-trip form instead — `1e-7` as
-/// `0.0000001`, `0.1+0.2` as `0.30000000000000004` — so the line has to be built.
-fn format_g(v: f64) -> String {
-    if v.is_nan() {
-        // glibc carries the NaN sign bit into the text, so C's
-        // `printf("%g", -nan)` is `-nan`. Pinned by
-        // [`libc_g_differential`].
-        return if v.is_sign_negative() { "-nan" } else { "nan" }.to_string();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    const PRECISION: i32 = 6;
-    // Round to six significant digits first, and read the decimal exponent back
-    // off the result: it is the rounded exponent that picks the form (9.999995
-    // rounds to 1e+01, and C prints `10`, not `9.99999`).
-    let sci = format!("{:.*e}", (PRECISION - 1) as usize, v);
-    let (mantissa, exp) = sci.split_once('e').expect("Rust {:e} always emits one");
-    let exp: i32 = exp.parse().expect("…followed by a decimal exponent");
-    let strip = |s: &str| -> String {
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s.to_string()
-        }
-    };
-    if exp < -4 || exp >= PRECISION {
-        // C's `%e` exponent is signed and at least two digits: `1.5e+10`, `1e-05`.
-        format!(
-            "{}e{}{:02}",
-            strip(mantissa),
-            if exp < 0 { '-' } else { '+' },
-            exp.abs()
-        )
-    } else {
-        strip(&format!("{:.*}", (PRECISION - 1 - exp).max(0) as usize, v))
-    }
-}
-
 /// Flat parameter-group helper — C++ `asynParamSet` equivalent.
 ///
 /// C asyn (`asynPortDriver/asynParamSet.h`) defines:
@@ -1573,22 +1533,14 @@ impl AsynParamSet {
     }
 }
 
-/// The differential that makes three transcriptions of `%g` safe.
-///
-/// `epics-base-rs` (`printf` record), `epics-pva-rs` (`pvget`/`pvinfo`/
-/// `pvmonitor`) and `asyn-rs` (`paramVal::report`) each carry their own
-/// `format_g`, because sharing one would force a crate dependency none of
-/// the three otherwise needs. What keeps them equal is not review but this
-/// test: each crate runs the SAME sample through its own `format_g` and
-/// through glibc's `snprintf("%.*g")` and requires byte equality. A
-/// transcription that drifts fails here, in its own crate, on the sample
-/// that caught the drift.
+/// `paramVal::report`'s `%g` against glibc's `snprintf("%.*g")`, byte for
+/// byte, over raw bit patterns, a full decade sweep and the style boundaries.
 ///
 /// Gated on `target_env = "gnu"`: the assertion is glibc's exact output,
 /// and newlib (RTEMS) / musl are not that reference.
 #[cfg(all(test, unix, target_env = "gnu"))]
 mod libc_g_differential {
-    use super::format_g;
+    use epics_libcom_rs::cfmt::CFloat;
 
     /// glibc `printf("%.*g", prec, v)`.
     pub(super) fn libc_g(v: f64, prec: usize) -> String {
@@ -1666,14 +1618,14 @@ mod libc_g_differential {
     }
 
     #[test]
-    fn format_g_is_byte_identical_to_glibc() {
+    fn cfloat_g_is_byte_identical_to_glibc() {
         let values = sample();
         let mut checked = 0usize;
         let mut mismatches: Vec<String> = Vec::new();
         // `paramVal::report` prints with plain `%g`, i.e. precision 6.
         for prec in [6usize] {
             for &v in &values {
-                let ours = format_g(v);
+                let ours = CFloat(v).g().to_string();
                 let theirs = libc_g(v, prec);
                 checked += 1;
                 if ours != theirs && mismatches.len() < 20 {
@@ -1720,7 +1672,7 @@ mod tests {
             (f64::INFINITY, "inf"),
             (f64::NAN, "nan"),
         ] {
-            assert_eq!(format_g(v), expect, "%g of {v}");
+            assert_eq!(CFloat(v).g().to_string(), expect, "%g of {v}");
         }
     }
 

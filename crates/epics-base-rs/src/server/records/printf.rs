@@ -4,6 +4,7 @@ use crate::server::record::{
     FieldDeclaration, InputLinkRequest, LinkReadAs, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
+use epics_libcom_rs::cfmt::CFloat;
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
@@ -685,205 +686,23 @@ fn pad_tail(out: &mut Vec<u8>, start: usize, width: usize, left_align: bool, zer
     }
 }
 
+/// C `%e %E %f %F %g %G`, `#` included, through `cfmt::CFloat`. The
+/// upper-case conversions differ from the lower only in letter case
+/// (`E`, `INF`, `NAN`), and CFloat's output has no other letters.
 fn format_float_conv(conv: u8, val: f64, prec: usize, alt_form: bool) -> String {
-    let upper = conv.is_ascii_uppercase();
-    if !val.is_finite() {
-        // C spells the non-finites in the case of the conversion letter —
-        // C99 added `%F` for exactly that — and carries the sign bit of
-        // both the infinities and NaN. Hoisted above the dispatch so all
-        // six conversions answer identically, which is what
-        // `epicsSnprintf` -> `vsnprintf` does (`osdStdio.c:29`).
-        let sign = if val.is_sign_negative() { "-" } else { "" };
-        let word = if val.is_nan() { "nan" } else { "inf" };
-        return if upper {
-            format!("{sign}{}", word.to_ascii_uppercase())
-        } else {
-            format!("{sign}{word}")
-        };
-    }
-    match conv {
-        b'e' | b'E' => format_e_val(val, prec, upper, alt_form),
-        b'g' => format_g_val(val, prec, false, alt_form),
-        b'G' => format_g_val(val, prec, true, alt_form),
-        // `%f`/`%F`, and the fallback for a conversion the caller's own
-        // match already excludes.
-        _ => format_f_val(val, prec, alt_form),
-    }
-}
-
-/// C `%e` / `%E` of a finite value: Rust writes a bare exponent (`1.5e6`)
-/// where C writes it signed and at least two digits (`1.500000e+06`).
-///
-/// The single owner of that exponent form — `%g`'s style-`e` branch and
-/// [`format_g`] both emit through here, so the record and the
-/// command-line tools cannot disagree about it.
-fn format_e_val(val: f64, prec: usize, upper: bool, alt_form: bool) -> String {
-    let sep = if upper { 'E' } else { 'e' };
-    let raw = if upper {
-        format!("{val:.prec$E}")
-    } else {
-        format!("{val:.prec$e}")
+    let x = CFloat(val);
+    let s = match (conv.to_ascii_lowercase(), alt_form) {
+        (b'e', false) => format!("{x:.prec$e}"),
+        (b'e', true) => format!("{x:#.prec$e}"),
+        (b'g', false) => format!("{:.prec$}", x.g()),
+        (b'g', true) => format!("{:#.prec$}", x.g()),
+        (_, false) => format!("{x:.prec$}"),
+        (_, true) => format!("{x:#.prec$}"),
     };
-    let (mantissa, exp_digits) = raw
-        .split_once(sep)
-        .expect("Rust's LowerExp/UpperExp always writes an exponent");
-    let e: i32 = exp_digits
-        .parse()
-        .expect("...followed by a decimal exponent");
-    // `%#e` keeps the decimal point even when precision leaves no digits
-    // after it.
-    let point = if alt_form && !mantissa.contains('.') {
-        "."
-    } else {
-        ""
-    };
-    format!(
-        "{mantissa}{point}{sep}{}{:02}",
-        if e < 0 { '-' } else { '+' },
-        e.abs()
-    )
-}
-
-/// C `%f` / `%F` of a finite value. Identical to Rust's fixed-point
-/// formatting except that `%#f` keeps the decimal point at precision 0.
-fn format_f_val(val: f64, prec: usize, alt_form: bool) -> String {
-    let s = format!("{val:.prec$}");
-    if alt_form && !s.contains('.') {
-        format!("{s}.")
+    if conv.is_ascii_uppercase() {
+        s.to_ascii_uppercase()
     } else {
         s
-    }
-}
-
-/// The exponent C `%g` uses to choose between `%e` and `%f` style: the
-/// exponent of the value AFTER rounding to `precision` significant
-/// digits, not of the raw value. C99 7.19.6.1p8 defines the decision
-/// value X as the exponent of the style-`e` conversion, and that
-/// conversion rounds first, so at a rounding boundary the rounded
-/// magnitude can carry into the next decade (999999.5 at precision 6
-/// rounds to 1000000, exponent 5 -> 6) and flip the style.
-pub fn g_decision_exponent(abs: f64, precision: usize) -> i32 {
-    let raw_exp = abs.log10().floor() as i32;
-    // Scale so the value has `precision` digits before the decimal
-    // point, round half-to-even, and read the magnitude back: a carry
-    // into a new decade shows up as an incremented exponent.
-    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
-    // For magnitudes near the f64 range limits the scale factor
-    // overflows to +/-inf (or underflows to 0) and the product's
-    // `log10` saturates to a garbage exponent. The rounded magnitude
-    // cannot meaningfully differ from the raw one at those scales, so
-    // fall back to `raw_exp`.
-    if !scale.is_finite() || scale == 0.0 {
-        return raw_exp;
-    }
-    let rounded_scaled = (abs * scale).round();
-    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
-        return raw_exp;
-    }
-    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
-}
-
-/// C `printf("%.*g", precision, x)`: `%f` or `%e` style per
-/// [`g_decision_exponent`], trailing zeros and a bare decimal point
-/// stripped, exponent signed and padded to two digits.
-///
-/// This is NOT the workspace's only `%g`. Three transcriptions of the
-/// rule exist and are meant to: `epics-pva-rs` (`pvdata::fmt::format_g`,
-/// for `pvget`/`pvinfo`/`pvmonitor`) and `asyn-rs` (`param::format_g`,
-/// for `paramVal::report`) each carry their own, because sharing one
-/// would force a crate dependency none of the three otherwise needs.
-/// What holds them equal is `libc_differential` — the same test
-/// exists in all three crates and requires byte equality with glibc's
-/// `snprintf("%.*g")` over 56,300 values including NaN, the infinities
-/// and subnormals. It is what caught this copy printing `NaN` where
-/// glibc prints `nan`, and `asyn-rs` dropping the sign of `-nan`.
-pub fn format_g(x: f64, precision: usize) -> String {
-    if x == 0.0 {
-        // -0.0 == 0.0 in Rust and C alike, and C prints the sign:
-        // `printf("%g", -0.0)` is "-0".
-        return if x.is_sign_negative() { "-0" } else { "0" }.to_string();
-    }
-    if x.is_nan() {
-        // glibc carries the NaN sign bit into the text and spells it
-        // lowercase for a lowercase conversion; Rust's `{}` writes `NaN`
-        // and drops the sign. `libc_differential` pins the difference.
-        return if x.is_sign_negative() { "-nan" } else { "nan" }.to_string();
-    }
-    if x.is_infinite() {
-        return if x < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    let p = precision.max(1);
-    let exp = g_decision_exponent(x.abs(), p);
-    // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
-    // i32 so a negative exponent does not wrap through usize.
-    if exp >= -4 && exp < p as i32 {
-        let digits = (p as i32 - 1 - exp).max(0) as usize;
-        let s = format!("{x:.digits$}");
-        if !s.contains('.') {
-            return s;
-        }
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        // Rust `{:e}` precision counts mantissa decimals, so N
-        // significant digits is precision N-1. `format_e_val` owns the
-        // rest — C's exponent is signed and at least two digits (`e+06`)
-        // where Rust writes it bare (`e6`).
-        strip_trailing_zeros_sci(&format_e_val(x, p - 1, false, false), false)
-    }
-}
-
-fn format_g_val(val: f64, prec: usize, upper: bool, alt_form: bool) -> String {
-    if val == 0.0 {
-        // `-0.0 == 0.0` in Rust and C alike, and C prints the sign, so the
-        // zero shortcut has to carry it explicitly. libc `%g` of 0.0 is
-        // "0"; `%#g` keeps the trailing zeros and the point.
-        let sign = if val.is_sign_negative() { "-" } else { "" };
-        if alt_form {
-            let p = if prec == 0 { 1 } else { prec };
-            let decimals = p.saturating_sub(1);
-            return format!("{sign}{}", format_f_val(0.0, decimals, true));
-        }
-        return format!("{sign}0");
-    }
-    let p = if prec == 0 { 1 } else { prec };
-    // Same style decision as `format_g`; `%G`/`%#g` differ only in how
-    // the chosen style is emitted.
-    let exp = g_decision_exponent(val.abs(), p);
-
-    if exp < -4 || exp >= p as i32 {
-        let sig_prec = p.saturating_sub(1);
-        let raw = format_e_val(val, sig_prec, upper, alt_form);
-        if alt_form {
-            raw
-        } else {
-            strip_trailing_zeros_sci(&raw, upper)
-        }
-    } else {
-        let decimal_places = (p as i32 - 1 - exp).max(0) as usize;
-        let raw = format_f_val(val, decimal_places, alt_form);
-        if alt_form {
-            raw
-        } else if raw.contains('.') {
-            raw.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            raw
-        }
-    }
-}
-
-fn strip_trailing_zeros_sci(s: &str, upper: bool) -> String {
-    let sep = if upper { 'E' } else { 'e' };
-    if let Some(pos) = s.find(sep) {
-        let mantissa = &s[..pos];
-        let exp_part = &s[pos..];
-        let trimmed = if mantissa.contains('.') {
-            mantissa.trim_end_matches('0').trim_end_matches('.')
-        } else {
-            mantissa
-        };
-        format!("{trimmed}{exp_part}")
-    } else {
-        s.to_string()
     }
 }
 
@@ -1215,42 +1034,10 @@ impl Record for PrintfRecord {
 /// crate, so a glibc differential written anywhere else in the file
 /// fails to build on Windows.
 ///
-/// The `%g` half makes three transcriptions of `format_g` safe.
-///
-/// `epics-base-rs` (`printf` record), `epics-pva-rs` (`pvget`/`pvinfo`/
-/// `pvmonitor`) and `asyn-rs` (`paramVal::report`) each carry their own
-/// `format_g`, because sharing one would force a crate dependency none of
-/// the three otherwise needs. What keeps them equal is not review but this
-/// test: each crate runs the SAME sample through its own `format_g` and
-/// through glibc's `snprintf("%.*g")` and requires byte equality. A
-/// transcription that drifts fails here, in its own crate, on the sample
-/// that caught the drift.
-///
 /// Gated on `target_env = "gnu"`: the assertion is glibc's exact output,
 /// and newlib (RTEMS) / musl are not that reference.
 #[cfg(all(test, unix, target_env = "gnu"))]
 mod libc_differential {
-    use super::format_g;
-
-    /// glibc `printf("%.*g", prec, v)`.
-    pub(super) fn libc_g(v: f64, prec: usize) -> String {
-        let mut buf = [0u8; 512];
-        // SAFETY: `buf` is 512 bytes and `snprintf` is given that length,
-        // so it always NUL-terminates within bounds. `%.*g` of an f64 with
-        // precision <= 17 never needs more than ~330 bytes.
-        let n = unsafe {
-            libc::snprintf(
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                c"%.*g".as_ptr(),
-                prec as libc::c_int,
-                v,
-            )
-        };
-        assert!(n >= 0 && (n as usize) < buf.len(), "snprintf overflow");
-        String::from_utf8(buf[..n as usize].to_vec()).expect("glibc writes ASCII")
-    }
-
     /// xorshift64*, so the sample is identical on every run and every host
     /// without pulling in a PRNG crate.
     pub(super) struct XorShift64(u64);
@@ -1388,7 +1175,7 @@ mod libc_differential {
     /// Reproducing it would be wrong beyond this host: the record's text
     /// is whatever `epicsSnprintf` -> `vsnprintf` gives (`osdStdio.c:29`),
     /// which on the RTEMS and VxWorks targets is newlib, not glibc. So
-    /// `format_g_val` emits the C99 form and the differential skips these
+    /// `cfmt::CFloat` emits the C99 form and the differential skips these
     /// samples rather than pinning one libc's bug into the port.
     fn is_glibc_alt_g_carry_quirk(conv: u8, alt: bool, ours: &str, theirs: &str) -> bool {
         if !alt || !matches!(conv, b'g' | b'G') {
@@ -1419,32 +1206,6 @@ mod libc_differential {
             unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), spec.as_ptr().cast(), v) };
         assert!(n >= 0 && (n as usize) < buf.len(), "snprintf overflow");
         String::from_utf8(buf[..n as usize].to_vec()).expect("glibc writes ASCII")
-    }
-
-    #[test]
-    fn format_g_is_byte_identical_to_glibc() {
-        let values = sample();
-        let mut checked = 0usize;
-        let mut mismatches: Vec<String> = Vec::new();
-        for prec in [1usize, 3, 6, 17] {
-            for &v in &values {
-                let ours = format_g(v, prec);
-                let theirs = libc_g(v, prec);
-                checked += 1;
-                if ours != theirs && mismatches.len() < 20 {
-                    mismatches.push(format!(
-                        "%.{prec}g of {v:?} (bits {:#018x}): ours {ours:?} != glibc {theirs:?}",
-                        v.to_bits()
-                    ));
-                }
-            }
-        }
-        assert!(
-            mismatches.is_empty(),
-            "{} of {checked} samples disagree with glibc:\n{}",
-            mismatches.len(),
-            mismatches.join("\n")
-        );
     }
 
     /// glibc `printf("%u", (unsigned)v)`.

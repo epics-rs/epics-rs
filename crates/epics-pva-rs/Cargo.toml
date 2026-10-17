@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# `pvdata::fmt::format_g` is `cfmt::CFloat`'s `%g`.
+epics-libcom-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
 # No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
 # is a dependency of whichever package owns one, and `realtime-pva-ioc` moved

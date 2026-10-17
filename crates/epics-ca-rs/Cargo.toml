@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 epics-base-rs = { workspace = true }
+# `cli` prints every float through `cfmt::CFloat`.
+epics-libcom-rs = { workspace = true }
 # The RTEMS boot shim for `realtime-ca-ioc`. Empty on every non-RTEMS target, so
 # this is an unconditional dependency rather than a `cfg(target_os = "rtems")`
 # one: that keeps `epics_rtems_boot::link_anchor()` a single uncfg'd call in

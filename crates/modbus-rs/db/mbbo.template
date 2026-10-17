@@ -1,0 +1,16 @@
+# mbbi record template for register outputs
+record(mbbo,"$(P)$(R)") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT) $(OFFSET))")
+    field(ZRST, "$(ZRST=)")
+    field(ZRVL, "$(ZRVL=0)")
+    field(ONST, "$(ONST=)")
+    field(ONVL, "$(ONVL=0)")
+    field(TWST, "$(TWST=)")
+    field(TWVL, "$(TWVL=0)")
+    field(THST, "$(THST=)")
+    field(THVL, "$(THVL=0)")
+    field(FRST, "$(FRST=)")
+    field(FRVL, "$(FRVL=0)")
+    field(PINI, "$(PINI=NO)")
+}

@@ -1,6 +1,7 @@
 record(asyn,"$(P)$(R)")
 {
     field(DTYP,"asynRecordDevice")
+    field(DESC, "$(DESC=)")
     field(PORT,"$(PORT)")
     field(ADDR,"$(ADDR)")
     field(TMOD,"$(TMOD)")

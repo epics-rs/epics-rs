@@ -1,6 +1,7 @@
 # int64in record template for register inputs
 record(int64in,"$(P)$(R)") {
     field(DTYP,"asynInt64")
+    field(DESC, "$(DESC=)")
     field(INP,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
     field(SCAN, "$(SCAN)")
 }

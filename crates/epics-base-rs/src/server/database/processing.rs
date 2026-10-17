@@ -10842,41 +10842,46 @@ fn invalid_output_action(instance: &mut RecordInstance, first_pass: bool) -> boo
     }
 }
 
-/// The alarm C's `writeValue` raises through the device's `processXxx`:
-/// the write's failure (a PENDING raise that this cycle's `monitor()`
-/// commits), then the device's own. Only a cycle whose IVOA test let the
-/// output through reaches it.
+/// The alarm C's `writeValue` raises through the device's `processXxx`
+/// (a PENDING raise that this cycle's `monitor()` commits). Only a cycle
+/// whose IVOA test let the output through reaches it.
+///
+/// C's record raises nothing on a failed `write_ao` (aoRecord.c:565): the
+/// device's own alarm is the failure's, so devAsyn's COMM for an
+/// asynDisconnected write survives. WRITE/INVALID stands in only for a
+/// device that failed and reported none.
 #[cfg_attr(not(debug_assertions), inline(always))]
 fn raise_write_value_alarm(instance: &mut RecordInstance, write_failed: bool, is_soft: bool) {
-    if write_failed {
+    let reported = apply_device_alarm(instance, is_soft);
+    if write_failed && !reported {
         crate::server::recgbl::rec_gbl_set_sevr(
             &mut instance.common,
             crate::server::recgbl::alarm_status::WRITE_ALARM,
             crate::server::record::AlarmSeverity::Invalid,
         );
     }
-    apply_device_alarm(instance, is_soft);
 }
 
-/// The alarm a device support's last transfer left, raised into the record.
+/// The alarm a device support's last transfer left, raised into the record;
+/// whether there was one.
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) {
-    if !is_soft {
-        apply_hard_device_alarm(instance);
-    }
+fn apply_device_alarm(instance: &mut RecordInstance, is_soft: bool) -> bool {
+    !is_soft && apply_hard_device_alarm(instance)
 }
 
 /// [`apply_device_alarm`] for a device that is not soft, out of line so a
 /// soft record pays a branch and not this frame.
-fn apply_hard_device_alarm(instance: &mut RecordInstance) {
-    if let Some(alarm) = instance.device.as_ref().and_then(|d| d.last_alarm()) {
-        crate::server::recgbl::rec_gbl_set_sevr_msg(
-            &mut instance.common,
-            alarm.stat,
-            crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
-            alarm.msg,
-        );
-    }
+fn apply_hard_device_alarm(instance: &mut RecordInstance) -> bool {
+    let Some(alarm) = instance.device.as_ref().and_then(|d| d.last_alarm()) else {
+        return false;
+    };
+    crate::server::recgbl::rec_gbl_set_sevr_msg(
+        &mut instance.common,
+        alarm.stat,
+        crate::server::record::AlarmSeverity::from_u16(alarm.sevr),
+        alarm.msg,
+    );
+    true
 }
 
 /// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of

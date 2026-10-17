@@ -1126,21 +1126,17 @@ impl InterruptManager {
             .collect()
     }
 
-    /// True if any active mailbox subscription would receive a value fired for
+    /// True if any active record binding — mailbox or sync callback, the two
+    /// [`subscribed_bindings`] enumerates — would receive a value fired for
     /// `(reason, addr, iface)`.
     ///
     /// A polling driver (e.g. Modbus `readPoller`) uses this to skip the cost of
     /// decoding+firing an interface that no record is bound to — mirroring C,
     /// where an empty interrupt list means the per-element `readPlcInt32` /
-    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1825-1854). This gates
-    /// only the expensive whole-block ARRAY decode, and array interfaces are
-    /// bound exclusively through coalescing mailbox subscriptions — so only
-    /// `mailboxes` are consulted. Sync-callback bindings (averaging /
-    /// time-series) are scalar-only and never bind an array interface, and
-    /// broadcast subscribers (`subscribe_async`, transports/tests) are
-    /// observers, not bindings; neither needs to gate an array decode. (For
-    /// *which offsets to poll at all*, both mailbox and sync-callback bindings
-    /// matter — see [`subscribed_bindings`].)
+    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1825-1854). A device
+    /// support record binds through a sync callback, so a mailbox-only answer
+    /// is false for every record. Broadcast subscribers (`subscribe_async`)
+    /// are observers, not bindings.
     ///
     /// [`subscribed_bindings`]: Self::subscribed_bindings
     pub fn has_subscriber(&self, reason: usize, addr: i32, iface: InterfaceType) -> bool {
@@ -1149,6 +1145,12 @@ impl InterruptManager {
             .lock()
             .iter()
             .any(|s| s.active.load(Ordering::Relaxed) && s.filter.accepts(reason, addr, iface))
+            || self
+                .state
+                .sync_callbacks
+                .lock()
+                .iter()
+                .any(|c| c.active.load(Ordering::Relaxed) && c.filter.accepts(reason, addr, iface))
     }
 
     /// The distinct `(reason, addr)` pairs of every active record binding —
@@ -1854,6 +1856,28 @@ mod tests {
         assert!(!im.has_subscriber(0, 0, InterfaceType::Int32Array));
         drop(sub2);
         assert!(!im.has_subscriber(5, 99, InterfaceType::Float64Array));
+    }
+
+    /// A record's I/O Intr binding is a sync callback (adapter
+    /// `register_sync_callback`), so presence must see it: a mailbox-only
+    /// test left every Modbus array and decode-failure fire unsent.
+    #[test]
+    fn has_subscriber_sees_a_sync_callback_binding() {
+        use crate::interfaces::InterfaceType;
+        let im = InterruptManager::new();
+        let sub = im.register_sync_callback(
+            InterruptFilter {
+                reason: Some(2),
+                addr: Some(41),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(im.has_subscriber(2, 41, InterfaceType::Int32));
+        assert!(!im.has_subscriber(2, 41, InterfaceType::Int32Array));
+        drop(sub);
+        assert!(!im.has_subscriber(2, 41, InterfaceType::Int32));
     }
 
     #[tokio::test]

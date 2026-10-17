@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
 use asyn_rs::param::{ParamType, ParamValue};
@@ -54,9 +54,10 @@ use epics_base_rs::server::iocsh::registry::*;
 
 use crate::datatype::{self, ALL_DATA_TYPES, ModbusDataType};
 use crate::driver::{
-    ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
+    IoTrace, ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
+    TransportFailure,
 };
-use crate::error::ModbusError;
+use crate::error::{IoStatus, ModbusError, ModbusResult};
 use crate::interpose::{LinkType, MbapAccumulator, TransactionIdCounter};
 
 /// `drvInfo` used by records that want the port's *default* data type — the C
@@ -85,9 +86,21 @@ const PARAM_HISTOGRAM_TIME_AXIS: &str = "HISTOGRAM_TIME_AXIS";
 /// TIMEOUT_ALARM (adapter.rs:866) and a plain error into READ_ALARM (:870), so
 /// flattening it into a message string told every record the wrong reason.
 fn from_asyn(e: AsynError) -> ModbusError {
-    match e.status() {
-        AsynStatus::Timeout => ModbusError::Timeout,
-        _ => ModbusError::Io(e.to_string()),
+    let status = match e.status() {
+        AsynStatus::Timeout => return ModbusError::Timeout,
+        AsynStatus::Overflow => IoStatus::Overflow,
+        AsynStatus::Disconnected => IoStatus::Disconnected,
+        AsynStatus::Disabled => IoStatus::Disabled,
+        _ => IoStatus::Error,
+    };
+    ModbusError::Io(status, e.to_string())
+}
+
+/// The octet port's `errorMessage` a [`ModbusError`] carries.
+fn error_message(e: &ModbusError) -> String {
+    match e {
+        ModbusError::Io(_, message) => message.clone(),
+        e => e.to_string(),
     }
 }
 
@@ -95,6 +108,9 @@ fn from_asyn(e: AsynError) -> ModbusError {
 fn to_asyn(e: ModbusError) -> AsynError {
     let status = match e {
         ModbusError::Timeout => AsynStatus::Timeout,
+        ModbusError::Io(IoStatus::Overflow, _) => AsynStatus::Overflow,
+        ModbusError::Io(IoStatus::Disconnected, _) => AsynStatus::Disconnected,
+        ModbusError::Io(IoStatus::Disabled, _) => AsynStatus::Disabled,
         _ => AsynStatus::Error,
     };
     AsynError::Status {
@@ -172,6 +188,8 @@ pub struct SyncIoTransport {
     /// message per read: UDP datagrams, and the serial links whose framing the
     /// port's EOS or inter-character gap already resolves.
     mbap: Option<MbapAccumulator>,
+    /// What failed in the exchange the last `write_read` began.
+    failure: Option<TransportFailure>,
 }
 
 impl SyncIoTransport {
@@ -192,6 +210,7 @@ impl SyncIoTransport {
             handle,
             write_delay,
             mbap: matches!(link, LinkType::Tcp).then(MbapAccumulator::new),
+            failure: None,
         }
     }
 
@@ -216,10 +235,13 @@ impl SyncIoTransport {
         first: Option<Vec<u8>>,
     ) -> crate::error::ModbusResult<Vec<u8>> {
         let handle = &self.handle;
+        let failure = &mut self.failure;
         let mut first = first;
         let mut read_chunk = move |need: usize| match first.take() {
             Some(buf) => Ok(buf),
-            None => handle.read_octet(0, need).or_else(partial_bytes),
+            None => handle
+                .read_octet(0, need)
+                .or_else(|e| rescue(e, true, failure)),
         };
         match self.mbap.as_mut() {
             // Modbus/TCP: one read is a slice of the stream, not a frame.
@@ -253,6 +275,35 @@ fn partial_bytes(e: AsynError) -> crate::error::ModbusResult<Vec<u8>> {
     }
 }
 
+/// [`from_asyn`], keeping the port's `errorMessage` as the message.
+fn octet_failure(e: AsynError) -> ModbusError {
+    let message = e.message();
+    match from_asyn(e) {
+        ModbusError::Io(status, _) => ModbusError::Io(status, message),
+        other => other,
+    }
+}
+
+/// [`partial_bytes`], keeping in `failure` what C `writeRead` would report
+/// beside the status when nothing is rescued. `wrote` is whether an earlier
+/// step already sent the request.
+fn rescue(
+    e: AsynError,
+    wrote: bool,
+    failure: &mut Option<TransportFailure>,
+) -> crate::error::ModbusResult<Vec<u8>> {
+    let noted = TransportFailure {
+        wrote: wrote || e.octet_step() == Some(OctetStep::Read),
+        nread: e.partial_read().map_or(0, |p| p.data.len()),
+        message: e.message(),
+    };
+    let rescued = partial_bytes(e);
+    if rescued.is_err() {
+        *failure = Some(noted);
+    }
+    rescued
+}
+
 impl OctetTransport for SyncIoTransport {
     fn write_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
         // C sleeps before every write (modbusInterpose.c:246); the modbus
@@ -284,6 +335,35 @@ impl OctetTransport for SyncIoTransport {
         }
     }
 
+    fn transport_failure(&self) -> Option<TransportFailure> {
+        self.failure.clone()
+    }
+
+    /// The octet user is connected at address 0, as C's
+    /// `pasynOctetSyncIO->connect(octetPortName, 0, ...)`. A query that fails
+    /// reads as autoConnect: C ignores both statuses.
+    fn manual_connection(&self) -> Option<bool> {
+        let port = self.handle.port().ok()?;
+        match port.is_auto_connect_blocking(0) {
+            Ok(false) => port.is_connected_blocking(0).ok(),
+            _ => None,
+        }
+    }
+
+    fn disconnect_device(&mut self) -> crate::error::ModbusResult<()> {
+        self.handle
+            .port()
+            .and_then(|port| port.disconnect_blocking())
+            .map_err(octet_failure)
+    }
+
+    fn connect_device(&mut self) -> crate::error::ModbusResult<()> {
+        self.handle
+            .port()
+            .and_then(|port| port.connect_blocking())
+            .map_err(octet_failure)
+    }
+
     fn read_frame(
         &mut self,
         expected: usize,
@@ -311,10 +391,11 @@ impl OctetTransport for SyncIoTransport {
         if !self.write_delay.is_zero() {
             std::thread::sleep(self.write_delay);
         }
+        self.failure = None;
         let first = self
             .handle
             .write_read(0, data, expected)
-            .or_else(partial_bytes)?;
+            .or_else(|e| rescue(e, false, &mut self.failure))?;
         if first.is_empty() {
             return Err(ModbusError::Timeout);
         }
@@ -346,25 +427,10 @@ struct ModbusParams {
 
 impl ModbusParams {
     fn create(base: &mut PortDriverBase, default_dt: ModbusDataType) -> AsynResult<Self> {
-        // One parameter per data type. The reason index recovers the type;
-        // numeric types use a Float64 cache value (covers the int16/int32
-        // ranges exactly), string types an Octet value.
         let mut reason_to_datatype: Vec<Option<ModbusDataType>> = Vec::new();
-        for dt in ALL_DATA_TYPES {
-            let ptype = if dt.is_string() {
-                ParamType::Octet
-            } else {
-                ParamType::Float64
-            };
-            let idx = base.create_param(dt.as_str(), ptype)?;
-            if reason_to_datatype.len() <= idx {
-                reason_to_datatype.resize(idx + 1, None);
-            }
-            reason_to_datatype[idx] = Some(dt);
-        }
-
-        // MODBUS_DATA — an alias selecting the port's default data type.
-
+        // MODBUS_DATA — an alias selecting the port's default data type —
+        // is created first, as drvModbusAsyn.cpp:213 does: a link with no
+        // drvInfo binds reason 0 and must read the default type.
         let data_reason = base.create_param(
             PARAM_DATA,
             if default_dt.is_string() {
@@ -377,6 +443,22 @@ impl ModbusParams {
             reason_to_datatype.resize(data_reason + 1, None);
         }
         reason_to_datatype[data_reason] = Some(default_dt);
+
+        // One parameter per data type. The reason index recovers the type;
+        // numeric types use a Float64 cache value (covers the int16/int32
+        // ranges exactly), string types an Octet value.
+        for dt in ALL_DATA_TYPES {
+            let ptype = if dt.is_string() {
+                ParamType::Octet
+            } else {
+                ParamType::Float64
+            };
+            let idx = base.create_param(dt.as_str(), ptype)?;
+            if reason_to_datatype.len() <= idx {
+                reason_to_datatype.resize(idx + 1, None);
+            }
+            reason_to_datatype[idx] = Some(dt);
+        }
 
         // Control / statistics parameters.
         let read_reason = base.create_param(PARAM_READ, ParamType::Int32)?;
@@ -525,6 +607,11 @@ pub struct ModbusPortDriver {
     /// error backoff before the next cycle (`epicsThreadSleep(1.0)`, :1649).
     /// The poller task is the sole reader and clears it by swapping.
     poll_backoff: Arc<AtomicBool>,
+    /// A poll ran while `interruptAccept` was closed and its callbacks are
+    /// held for the gate: C's poller sits between its I/O and its callbacks
+    /// until the gate opens (drvModbusAsyn.cpp:1663-1667). The next cycle
+    /// delivers it with no I/O; the poller task waits for the gate first.
+    fanout_pending: Arc<AtomicBool>,
 }
 
 impl ModbusPortDriver {
@@ -554,8 +641,9 @@ impl ModbusPortDriver {
         transport: Box<dyn OctetTransport>,
         counter: TransactionIdCounter,
     ) -> AsynResult<Self> {
-        let engine =
+        let mut engine =
             ModbusEngine::with_transaction_counter(config, link_type, counter).map_err(to_asyn)?;
+        engine.record_traces();
         let flags = PortFlags {
             multi_device: true,
             can_block: true,
@@ -613,6 +701,7 @@ impl ModbusPortDriver {
             io_status: AsynStatus::Error,
             prev_io_status: AsynStatus::Success,
             poll_backoff: Arc::new(AtomicBool::new(false)),
+            fanout_pending: Arc::new(AtomicBool::new(false)),
         };
         driver.read_once();
         Ok(driver)
@@ -722,8 +811,15 @@ impl ModbusPortDriver {
     /// `absoluteAddressing_` read branch shared by every read accessor.
     fn read_absolute_words(&mut self, addr: i32, count: usize) -> AsynResult<Vec<u16>> {
         let function = self.absolute_read_function()?;
-        self.modbus_io(|e, t| e.read_absolute(t, function, addr, count))
-            .map_err(to_asyn)
+        let words = self
+            .modbus_io(|e, t| e.read_absolute(t, function, addr, count))
+            .map_err(to_asyn);
+        // C keeps every absolute read's status in `ioStatus_`
+        // (drvModbusAsyn.cpp:525-1464), which `manage_connection` reads.
+        self.io_status = words
+            .as_ref()
+            .map_or_else(|e| e.status(), |_| AsynStatus::Success);
+        words
     }
 
     /// Absolute-mode per-record write: issue one Modbus request carrying
@@ -744,6 +840,13 @@ impl ModbusPortDriver {
             return Ok(());
         }
         if !self.engine.config().function.is_read() {
+            return Ok(());
+        }
+        if self.fanout_pending.load(Ordering::Relaxed) {
+            if self.base.interrupts.accepting() {
+                self.fanout_pending.store(false, Ordering::Relaxed);
+                self.run_poll_cycle();
+            }
             return Ok(());
         }
 
@@ -783,6 +886,14 @@ impl ModbusPortDriver {
         // fresh value.
         if self.io_status != self.prev_io_status {
             self.force_callback = true;
+        }
+
+        // Callbacks fanned out into a closed gate are lost to the records,
+        // yet would advance `prev_io_status`, so a failure would never be
+        // delivered at all.
+        if !self.base.interrupts.accepting() {
+            self.fanout_pending.store(true, Ordering::Relaxed);
+            return Ok(());
         }
 
         // The cycle always runs to the end of the interrupt list — a binding
@@ -848,7 +959,7 @@ impl ModbusPortDriver {
             // only a PV that never changes.
             if let Err(e) = self.fire_binding(reason, addr, force, port_gate, io_status) {
                 self.trace_binding_error(&format!("offset {addr} data type does not fit: {e}"));
-                self.fire_binding_failure(reason, addr);
+                self.fire_binding_failure(reason, addr, io_status);
             }
         }
 
@@ -889,20 +1000,25 @@ impl ModbusPortDriver {
     /// UDF=1 / SEVR=INVALID with no indication of why, while the port reports
     /// `asynSuccess` and IO_ERRORS reads 0 because the wire transaction
     /// succeeded. Every interface the binding has a subscriber for is fired
-    /// with `asynError`, so the record processes and takes its alarm from the
-    /// callback status.
+    /// with the failed poll's status, or `asynError` after a good one, so the
+    /// record processes and takes its alarm from the callback status.
     ///
     /// The value delivered is a zero rather than a reading, because there is
     /// no reading: the alarm is what carries the meaning. C's nearest arm
     /// delivers the over-read instead and stamps `pasynUser->auxStatus =
-    /// ioStatus_` (drvModbusAsyn.cpp:1736-1738) — which on this path is
+    /// ioStatus_` (drvModbusAsyn.cpp:1736-1738). After a good poll that is
     /// `asynSuccess`, so C's record shows a garbage value with no alarm at
-    /// all. Alarming is the deliberate deviation.
+    /// all, and alarming is the deliberate deviation. After a failed poll it
+    /// is the failure, which `io_status` carries here as in C.
     ///
     /// The UInt32Digital mask is `!0` so the fire is not filtered out by a
     /// subscriber's `@asynMask`: an alarm the record's mask can veto is no
     /// signal.
-    fn fire_binding_failure(&mut self, reason: usize, addr: i32) {
+    fn fire_binding_failure(&mut self, reason: usize, addr: i32, io_status: AsynStatus) {
+        let status = match io_status {
+            AsynStatus::Success => AsynStatus::Error,
+            failed => failed,
+        };
         for (iface, value) in [
             (InterfaceType::Int32, ParamValue::Int32(0)),
             (InterfaceType::Int64, ParamValue::Int64(0)),
@@ -920,7 +1036,7 @@ impl ModbusPortDriver {
         ] {
             if self.base.interrupts.has_subscriber(reason, addr, iface) {
                 self.base
-                    .notify_interface_value(reason, addr, iface, value, !0, AsynStatus::Error);
+                    .notify_interface_value(reason, addr, iface, value, !0, status);
             }
         }
     }
@@ -957,7 +1073,7 @@ impl ModbusPortDriver {
         if addr < 0 || addr as usize >= data.len() {
             let max = data.len();
             self.trace_binding_error(&format!("invalid memory request {addr}, max={max}"));
-            self.fire_binding_failure(reason, addr);
+            self.fire_binding_failure(reason, addr, io_status);
             return Ok(());
         }
         let regs = &data[addr as usize..];
@@ -1122,9 +1238,14 @@ impl ModbusPortDriver {
     /// does.
     fn modbus_io<T>(
         &mut self,
-        io: impl FnOnce(&mut ModbusEngine, &mut dyn OctetTransport) -> T,
-    ) -> T {
-        let result = io(&mut self.engine, self.transport.as_mut());
+        io: impl FnOnce(&mut ModbusEngine, &mut dyn OctetTransport) -> ModbusResult<T>,
+    ) -> ModbusResult<T> {
+        let result = self
+            .manage_connection()
+            .and_then(|()| io(&mut self.engine, self.transport.as_mut()));
+        for line in self.engine.take_traces() {
+            self.trace_io(&line);
+        }
         let s = &self.engine.stats;
         for (reason, v) in [
             (self.read_ok_reason, s.read_ok),
@@ -1138,6 +1259,107 @@ impl ModbusPortDriver {
                 .expect("statistics params are created in new");
         }
         result
+    }
+
+    /// The head of C `doModbusIO` (drvModbusAsyn.cpp:1968-2003): an octet port
+    /// that leaves its connection to the driver is disconnected and
+    /// reconnected after an I/O error or a dropped link, and a failed connect
+    /// ends the transaction before any request goes out.
+    ///
+    /// C prints the disconnect/connect failure with the octet user's
+    /// `errorMessage`, which those calls never set, so it repeats the last
+    /// `writeRead` error; this prints the failing call's own message.
+    fn manage_connection(&mut self) -> ModbusResult<()> {
+        let Some(connected) = self.transport.manual_connection() else {
+            return Ok(());
+        };
+        if self.io_status == AsynStatus::Success && connected {
+            return Ok(());
+        }
+        let port = &self.base.port_name;
+        let p = "drvModbusAsyn::doModbusIO port";
+        if self.io_status != AsynStatus::Success {
+            self.base
+                .trace_print(TraceMask::ERROR, format_args!("{p} {port} has I/O error\n"));
+        }
+        if !connected {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{p} {port} is disconnected\n"),
+            );
+        }
+        match self.transport.disconnect_device() {
+            Ok(()) => self.base.trace_print(
+                TraceMask::FLOW,
+                format_args!("{p} {port} disconnect device OK\n"),
+            ),
+            Err(e) => self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{p} {port} disconnect error={}\n", error_message(&e)),
+            ),
+        }
+        match self.transport.connect_device() {
+            Ok(()) => {
+                self.base.trace_print(
+                    TraceMask::FLOW,
+                    format_args!("{p} {port} connect device OK\n"),
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("{p} {port} connect device error={}\n", error_message(&e)),
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// C prints these through `pasynUserSelf` (drvModbusAsyn.cpp:2187-2312).
+    fn trace_io(&self, line: &IoTrace) {
+        let port = &self.base.port_name;
+        match line {
+            IoTrace::WriteReadFailed {
+                error,
+                nwrite,
+                request_size,
+                nread,
+            } => self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "drvModbusAsyn::doModbusIO port {port} error calling writeRead, \
+                     error={error}, nwrite={nwrite}/{request_size}, nread={nread}\n"
+                ),
+            ),
+            IoTrace::WriteReadRecovered {
+                errors,
+                nwrite,
+                request_size,
+                nread,
+            } => self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "drvModbusAsyn::doModbusIO port {port} writeRead status back to normal \
+                     having had {errors} errors, nwrite={nwrite}/{request_size}, nread={nread}\n"
+                ),
+            ),
+            IoTrace::Exception(code) => self.base.trace_print(
+                if *code == 5 {
+                    TraceMask::WARNING
+                } else {
+                    TraceMask::ERROR
+                },
+                format_args!("drvModbusAsyn::doModbusIO port {port} Modbus exception={code}\n"),
+            ),
+            IoTrace::WordCount { expected, received } => self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "drvModbusAsyn::doModbusIO, port {port} expected {expected} words, \
+                     actually received {received}\n"
+                ),
+            ),
+        }
     }
 
     /// Flush a freshly-converted set of registers to the slave with the
@@ -2312,6 +2534,7 @@ impl CommandHandler for ModbusConfigHandler {
         let poll_delay = driver.poll_delay.clone();
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
+        let fanout_pending = driver.fanout_pending.clone();
 
         let (runtime, port_handle) = match start_port(claim, driver, ctx) {
             Ok(started) => started,
@@ -2336,6 +2559,7 @@ impl CommandHandler for ModbusConfigHandler {
                 poll_delay,
                 poll_wake,
                 poll_backoff,
+                fanout_pending,
             ));
         }
 
@@ -2348,6 +2572,10 @@ impl CommandHandler for ModbusConfigHandler {
 /// stops hammering the unreachable slave at the poll period and retries once a
 /// second until it answers.
 const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// C's `interruptAccept` re-check period in `readPoller`
+/// (`epicsThreadSleep(0.1)`, drvModbusAsyn.cpp:1665).
+const INTERRUPT_ACCEPT_RECHECK: Duration = Duration::from_millis(100);
 
 /// The read-poller task — port of the C `readPoller` thread's loop control
 /// (drvModbusAsyn.cpp:1627-1935). It waits the live poll period, then triggers
@@ -2382,7 +2610,9 @@ async fn read_poller(
     poll_delay: Arc<AtomicU64>,
     poll_wake: Arc<Notify>,
     poll_backoff: Arc<AtomicBool>,
+    fanout_pending: Arc<AtomicBool>,
 ) {
+    let mut deliver = false;
     loop {
         // Read the live period each cycle so a runtime POLL_DELAY write retunes
         // it. A wake (POLL_DELAY changed) ends the wait early — C signals
@@ -2391,11 +2621,13 @@ async fn read_poller(
         // C `readPoller` (drvModbusAsyn.cpp:1631-1635): a positive delay is a
         // timed wait, anything else blocks until the poller is signalled. A
         // zero-delay port is C's on-demand mode, not a max-rate loop.
-        match poll_period(f64::from_bits(poll_delay.load(Ordering::Relaxed))) {
-            Some(period) => {
-                let _ = tokio::time::timeout(period, poll_wake.notified()).await;
+        if !std::mem::take(&mut deliver) {
+            match poll_period(f64::from_bits(poll_delay.load(Ordering::Relaxed))) {
+                Some(period) => {
+                    let _ = tokio::time::timeout(period, poll_wake.notified()).await;
+                }
+                None => poll_wake.notified().await,
             }
-            None => poll_wake.notified().await,
         }
         if handle.is_closed() {
             break;
@@ -2410,6 +2642,13 @@ async fn read_poller(
         let _ = handle.write_int32(read_reason, 0, 1).await;
         if poll_backoff.swap(false, Ordering::Relaxed) {
             tokio::time::sleep(POLL_ERROR_BACKOFF).await;
+        }
+        // C re-reads `interruptAccept` every 0.1 s (drvModbusAsyn.cpp:1665).
+        if fanout_pending.load(Ordering::Relaxed) {
+            while !handle.interrupts().accepting() && !handle.is_closed() {
+                tokio::time::sleep(INTERRUPT_ACCEPT_RECHECK).await;
+            }
+            deliver = true;
         }
     }
 }
@@ -2462,6 +2701,21 @@ mod tests {
     struct ReplayTransport {
         responses: std::collections::VecDeque<crate::error::ModbusResult<Vec<u8>>>,
         written: WriteLog,
+    }
+
+    /// A driver built by hand reads `interruptAccept` open, as one past
+    /// `iocInit` does; a test of the closed gate replaces the manager.
+    fn test_driver(
+        port_name: &str,
+        config: ModbusConfig,
+        link_type: LinkType,
+        transport: Box<dyn OctetTransport>,
+    ) -> AsynResult<ModbusPortDriver> {
+        let mut driver = ModbusPortDriver::new(port_name, config, link_type, transport)?;
+        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_base_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        Ok(driver)
     }
 
     impl ReplayTransport {
@@ -2722,7 +2976,7 @@ mod tests {
             0,
             crate::driver::READ_TIMEOUT,
         );
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_SILENT",
             test_config(0, 4),
             LinkType::Rtu,
@@ -2741,7 +2995,7 @@ mod tests {
 
         // The same status on the absolute-addressing path, where the record's
         // own read is the I/O rather than a poller's.
-        let mut absolute = ModbusPortDriver::new(
+        let mut absolute = test_driver(
             "MB_SILENT_ABS",
             test_config(-1, 4),
             LinkType::Rtu,
@@ -2916,7 +3170,7 @@ mod tests {
             RuntimeConfig::default(),
         )
         .expect("port runtime must start");
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_SPLIT",
             test_config(0, 125),
             LinkType::Tcp,
@@ -2940,6 +3194,66 @@ mod tests {
         assert_eq!(driver.engine.data()[124], 124);
 
         runtime.shutdown();
+    }
+
+    /// An octet port whose every write fails with `status`.
+    struct RefusingPort {
+        base: PortDriverBase,
+        status: AsynStatus,
+    }
+
+    impl PortDriver for RefusingPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: self.status,
+                message: "refused".into(),
+            })
+        }
+    }
+
+    /// C `doModbusIO` returns `writeRead`'s own status (drvModbusAsyn.cpp:
+    /// 2177-2208), so an octet port that is disconnected reaches the records
+    /// as asynDisconnected (COMM), not asynError (READ).
+    #[test]
+    fn a_poll_keeps_the_octet_ports_failure_status() {
+        for status in [
+            AsynStatus::Disconnected,
+            AsynStatus::Disabled,
+            AsynStatus::Overflow,
+            AsynStatus::Error,
+        ] {
+            let (runtime, _jh) = create_port_runtime_unclaimed(
+                RefusingPort {
+                    base: PortDriverBase::new("MB_OCTET_REFUSING", 1, PortFlags::default()),
+                    status,
+                },
+                RuntimeConfig::default(),
+            )
+            .expect("port runtime must start");
+            let mut driver = test_driver(
+                "MB_REFUSING",
+                test_config(0, 4),
+                LinkType::Tcp,
+                Box::new(SyncIoTransport::new(
+                    SyncIOHandle::from_handle(
+                        runtime.port_handle().clone(),
+                        0,
+                        crate::driver::READ_TIMEOUT,
+                    ),
+                    LinkType::Tcp,
+                )),
+            )
+            .expect("a TCP read config must build");
+            driver.poll_cycle().expect("the cycle must complete");
+            assert_eq!(driver.io_status, status);
+            runtime.shutdown();
+        }
     }
 
     /// An octet port that answers like a socket: each read takes the next
@@ -3011,7 +3325,7 @@ mod tests {
             .port_handle()
             .push_eos_interpose_blocking(asyn_rs::interpose::PORT_CHAIN, true, true)
             .expect("the default EOS layer must install");
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             name,
             test_config(0, length),
             LinkType::Tcp,
@@ -3136,11 +3450,29 @@ mod tests {
         }
     }
 
+    /// C creates `MODBUS_DATA` first (drvModbusAsyn.cpp:213), so a record
+    /// with no drvInfo — `@asyn(PORT OFFSET)` skips drvUserCreate and binds
+    /// reason 0 — reads the port's default data type, not INT16.
+    #[test]
+    fn reason_zero_is_modbus_data_at_the_port_default_type() {
+        let mut config = test_config(0, 4);
+        config.data_type = ModbusDataType::Float32Be;
+        let driver = test_driver(
+            "MB_REASON0",
+            config,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![])),
+        )
+        .expect("config must build");
+        assert_eq!(driver.base.find_param(PARAM_DATA), Some(0));
+        assert_eq!(driver.datatype_of(0).unwrap(), ModbusDataType::Float32Be);
+    }
+
     /// A read port configured with absolute addressing builds successfully —
     /// absolute mode is supported, not rejected.
     #[test]
     fn absolute_addressing_driver_builds() {
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_ABS",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -3158,7 +3490,7 @@ mod tests {
     /// :387-412).
     #[test]
     fn drv_user_create_validates_string_length_suffix() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_DRVUSER",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3240,7 +3572,7 @@ mod tests {
         use asyn_rs::services::PortServices;
         use asyn_rs::trace::TraceFile;
 
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_DU_TRACE",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3297,7 +3629,7 @@ mod tests {
     #[test]
     fn connect_addr_rejects_out_of_range_offset() {
         // Relative mode: valid offsets are 0..length (here 16).
-        let mut relative = ModbusPortDriver::new(
+        let mut relative = test_driver(
             "MB_CONN_REL",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3322,7 +3654,7 @@ mod tests {
         );
 
         // Absolute mode: the full 16-bit wire range 0..=0xFFFF is valid.
-        let mut absolute = ModbusPortDriver::new(
+        let mut absolute = test_driver(
             "MB_CONN_ABS",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -3358,7 +3690,7 @@ mod tests {
         use asyn_rs::services::PortServices;
         use asyn_rs::trace::{TraceFile, TraceInfoMask};
 
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_DU_TR",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3407,7 +3739,7 @@ mod tests {
     #[test]
     fn drv_user_create_rejects_out_of_range_offset_for_data_reason() {
         // Relative mode: valid offsets are 0..length (here 16).
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_DU_OFF",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3452,7 +3784,7 @@ mod tests {
     /// carries a cap.
     #[test]
     fn drv_user_create_returns_octet_len_cap() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_DU_CAP",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3525,7 +3857,7 @@ mod tests {
         // 2-register request (C `readInt32`, drvModbusAsyn.cpp:675-676), so the
         // response carries two words; the UINT16 value decodes from the first.
         let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_RD",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -3553,7 +3885,7 @@ mod tests {
     #[test]
     fn absolute_read_publishes_statistics() {
         let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_STATS",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -3589,7 +3921,7 @@ mod tests {
     /// 2206), so a failed absolute read must still publish IO_ERRORS = 1.
     #[test]
     fn absolute_read_failure_publishes_io_errors() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_STATS_ERR",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -3624,7 +3956,7 @@ mod tests {
     /// already on, must NOT clear.
     #[test]
     fn enable_histogram_rising_edge_clears_counts() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_HIST_EN",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3654,7 +3986,7 @@ mod tests {
     /// (C drvModbusAsyn.cpp:794-803).
     #[test]
     fn histogram_bin_time_change_clears_counts() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_HIST_BIN",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3681,7 +4013,7 @@ mod tests {
     /// `readFloat64Array` serves both (drvModbusAsyn.cpp:1181-1191).
     #[test]
     fn read_float64_array_serves_histogram() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_HIST_F64",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3724,7 +4056,7 @@ mod tests {
     /// then meant free-run rather than C's block-until-signalled.
     #[test]
     fn poll_delay_write_keeps_the_value_the_poller_tests() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_POLL_DELAY",
             test_config(0, 16),
             LinkType::Tcp,
@@ -3774,7 +4106,7 @@ mod tests {
             (1..=64u16).map(|t| Ok(tcp_response(t, &good))).collect();
         let transport = ReplayTransport::new(responses);
         let written = transport.written_handle();
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_ONDEMAND",
             test_config(0, 4),
             LinkType::Tcp,
@@ -3785,6 +4117,7 @@ mod tests {
         let poll_delay = driver.poll_delay.clone();
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
+        let fanout_pending = driver.fanout_pending.clone();
         // The on-demand configuration: `drvModbusAsynConfigure(... pollMsec=0)`.
         poll_delay.store(0.0f64.to_bits(), Ordering::Relaxed);
 
@@ -3797,6 +4130,7 @@ mod tests {
             poll_delay,
             poll_wake.clone(),
             poll_backoff,
+            fanout_pending,
         ));
 
         // An hour of virtual time with nothing to wake the poller. A free-run
@@ -4169,9 +4503,8 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 64);
         cfg.data_type = ModbusDataType::StringHigh;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_STR", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute config must build");
+        let mut driver = test_driver("MB_ABS_STR", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::StringHigh.as_str())
@@ -4217,9 +4550,8 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
         let mut cfg = test_config(-1, 64);
         cfg.data_type = ModbusDataType::StringHigh;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_STR_EOM", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute config must build");
+        let mut driver = test_driver("MB_ABS_STR_EOM", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::StringHigh.as_str())
@@ -4250,7 +4582,7 @@ mod tests {
         let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
         let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
         let written = transport.written_handle();
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_I32_LEN",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -4286,9 +4618,8 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 16);
         cfg.data_type = ModbusDataType::Float64Le;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_F64_LEN", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute config must build");
+        let mut driver = test_driver("MB_ABS_F64_LEN", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::Float64Le.as_str())
@@ -4323,7 +4654,7 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
         let written = transport.written_handle();
         // `config.length` 16 is larger than the 4-element record buffer.
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_I32ARR_LEN",
             test_config(-1, 16),
             LinkType::Tcp,
@@ -4363,7 +4694,7 @@ mod tests {
         let pdu = [0x01u8, 0x06, 0x27, 0x10, 0x12, 0x34];
         let mut cfg = test_config(-1, 4);
         cfg.function = ModbusFunctionCode::WriteSingleRegister;
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_WR",
             cfg,
             LinkType::Tcp,
@@ -4400,7 +4731,7 @@ mod tests {
         let recovered = [
             0x01u8, 0x03, 0x08, 0x55, 0x55, 0x66, 0x66, 0x77, 0x77, 0x88, 0x88,
         ];
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_IOSTATUS",
             test_config(0, 4),
             LinkType::Tcp,
@@ -4516,7 +4847,7 @@ mod tests {
         // the PLC's value, not 0.
         let mut cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 4);
         cfg.poll_delay = Duration::from_millis(100);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_READONCE",
             cfg,
             LinkType::Tcp,
@@ -4532,7 +4863,7 @@ mod tests {
 
         // Boundary B — pollMsec == 0: C runs no readOnce and every read stays
         // in error rather than handing out the zeroed buffer.
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_NO_READONCE",
             write_config(ModbusFunctionCode::WriteMultipleRegisters, 4),
             LinkType::Tcp,
@@ -4548,7 +4879,7 @@ mod tests {
 
         // Boundary C — a read port before its first poll is the same rule:
         // C `ioStatus_` starts asynError, so nothing serves the zeros.
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_UNPOLLED",
             test_config(0, 4),
             LinkType::Tcp,
@@ -4566,7 +4897,7 @@ mod tests {
     /// In absolute mode `poll_cycle` is a no-op: there is no polled block.
     #[test]
     fn absolute_poll_cycle_is_noop() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_POLL",
             test_config(-1, 8),
             LinkType::Tcp,
@@ -4597,7 +4928,7 @@ mod tests {
         // record array (12 registers).
         let mut cfg = test_config(-1, 4);
         cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_WI32ARR_LEN",
             cfg,
             LinkType::Tcp,
@@ -4648,7 +4979,7 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 6);
         cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ABS_WF64ARR_LEN",
             cfg,
             LinkType::Tcp,
@@ -4700,7 +5031,7 @@ mod tests {
         let written = transport.written_handle();
         // Relative mode (start_address >= 0), config.length 6 registers.
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 6);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_REL_WI32ARR_LEN",
             cfg,
             LinkType::Tcp,
@@ -4749,7 +5080,7 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 6);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_REL_WF64ARR_LEN",
             cfg,
             LinkType::Tcp,
@@ -4794,9 +5125,8 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(echo_hi), Ok(echo_lo)]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
-        let mut driver =
-            ModbusPortDriver::new("MB_REL_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("relative config must build");
+        let mut driver = test_driver("MB_REL_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::Int32Be.as_str())
@@ -4837,9 +5167,8 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 4);
         cfg.function = ModbusFunctionCode::WriteSingleRegister;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute config must build");
+        let mut driver = test_driver("MB_ABS_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::Int32Be.as_str())
@@ -4874,9 +5203,8 @@ mod tests {
     #[test]
     fn array_write_rejects_non_multiple_write_function() {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 8);
-        let mut driver =
-            ModbusPortDriver::new("MB_WSR_ARR", cfg, LinkType::Tcp, Box::new(NullTransport))
-                .expect("config must build");
+        let mut driver = test_driver("MB_WSR_ARR", cfg, LinkType::Tcp, Box::new(NullTransport))
+            .expect("config must build");
         let i32_reason = driver
             .base
             .find_param(ModbusDataType::Int32Be.as_str())
@@ -4910,9 +5238,8 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 4);
         cfg.function = ModbusFunctionCode::WriteSingleRegister;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute config must build");
+        let mut driver = test_driver("MB_ABS_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
@@ -4948,9 +5275,8 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(read_echo), Ok(write_echo)]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
-        let mut driver =
-            ModbusPortDriver::new("MB_REL_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("relative config must build");
+        let mut driver = test_driver("MB_REL_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
@@ -4998,9 +5324,8 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(ack), Ok(write_echo)]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
-        let mut driver =
-            ModbusPortDriver::new("MB_REL_WSR_ACK", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("relative config must build");
+        let mut driver = test_driver("MB_REL_WSR_ACK", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
@@ -5032,9 +5357,8 @@ mod tests {
         let written = transport.written_handle();
         let mut cfg = test_config(-1, 16);
         cfg.function = ModbusFunctionCode::WriteSingleCoil;
-        let mut driver =
-            ModbusPortDriver::new("MB_ABS_WSC_DIG", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("absolute coil config must build");
+        let mut driver = test_driver("MB_ABS_WSC_DIG", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("absolute coil config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::UInt16.as_str())
@@ -5061,7 +5385,7 @@ mod tests {
     #[test]
     fn uint32_digital_rejects_invalid_function() {
         // test_config defaults to ReadHoldingRegisters.
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_DIG_RDFN",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5091,9 +5415,8 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(echo)]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 8);
-        let mut driver =
-            ModbusPortDriver::new("MB_ZSTR_W", cfg, LinkType::Tcp, Box::new(transport))
-                .expect("relative string config must build");
+        let mut driver = test_driver("MB_ZSTR_W", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative string config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::ZStringHigh.as_str())
@@ -5128,7 +5451,7 @@ mod tests {
         let transport = ReplayTransport::new(vec![Ok(echo)]);
         let written = transport.written_handle();
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 8);
-        let mut driver = ModbusPortDriver::new("MB_STR_W", cfg, LinkType::Tcp, Box::new(transport))
+        let mut driver = test_driver("MB_STR_W", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative string config must build");
         let reason = driver
             .base
@@ -5159,9 +5482,8 @@ mod tests {
     #[test]
     fn octet_write_rejects_non_multiple_register_function() {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 8);
-        let mut driver =
-            ModbusPortDriver::new("MB_STR_BADFN", cfg, LinkType::Tcp, Box::new(NullTransport))
-                .expect("config must build");
+        let mut driver = test_driver("MB_STR_BADFN", cfg, LinkType::Tcp, Box::new(NullTransport))
+            .expect("config must build");
         let reason = driver
             .base
             .find_param(ModbusDataType::StringHigh.as_str())
@@ -5178,7 +5500,7 @@ mod tests {
     /// read/write accessors, not an out-of-bounds panic on the engine buffer.
     #[test]
     fn out_of_range_addr_returns_error_not_panic() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_OOR",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5220,7 +5542,7 @@ mod tests {
         // byte_count 8, four zero registers. The engine's first poll expects
         // TCP transaction id 1.
         let pdu = [0x01u8, 0x03, 0x08, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_POLL_OOR",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5269,7 +5591,7 @@ mod tests {
     #[test]
     fn a_binding_too_narrow_for_its_datatype_alarms_only_its_own_record() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_NARROW_BINDING",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5337,6 +5659,48 @@ mod tests {
         );
     }
 
+    /// On a failed poll C still fires the too-narrow binding, with
+    /// `auxStatus = ioStatus_` (drvModbusAsyn.cpp:1736-1738): a disconnected
+    /// port's record reads COMM there, so the refusal carries the poll's
+    /// status and keeps `asynError` only for a decode of good data.
+    #[test]
+    fn a_too_narrow_binding_on_a_failed_poll_carries_the_poll_s_status() {
+        let mut driver = test_driver(
+            "MB_NARROW_FAILED",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Err(ModbusError::Io(
+                crate::error::IoStatus::Disconnected,
+                "port not connected".into(),
+            ))])),
+        )
+        .expect("non-absolute config must build");
+        let narrow = driver
+            .base
+            .find_param(ModbusDataType::Int32Le.as_str())
+            .expect("INT32_LE parameter must exist");
+        let (_narrow_sub, _narrow_rx) = driver.base.interrupts.register_interrupt_user(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(narrow),
+                addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+            4096,
+        );
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+
+        driver.poll_cycle().unwrap();
+
+        let mut narrow_status = None;
+        while let Ok(iv) = rx.try_recv() {
+            if iv.reason == narrow && iv.addr == 3 {
+                narrow_status = Some(iv.aux_status);
+            }
+        }
+        assert_eq!(narrow_status, Some(AsynStatus::Disconnected));
+    }
+
     /// Negative control for the alarm: a cycle in which every binding decodes
     /// must raise nothing at all — no `asynError` callback and no trace line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5345,7 +5709,7 @@ mod tests {
         use asyn_rs::trace::TraceFile;
 
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_TRACE_CLEAN",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5423,7 +5787,7 @@ mod tests {
     #[test]
     fn a_cycle_whose_bindings_all_fail_alarms_them_all_and_still_completes() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ALL_NARROW",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5487,7 +5851,7 @@ mod tests {
         use asyn_rs::trace::TraceFile;
 
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_TRACE_NARROW",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5572,7 +5936,7 @@ mod tests {
         use asyn_rs::trace::TraceFile;
 
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_TRACE_C_TEXT",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5652,7 +6016,7 @@ mod tests {
     #[test]
     fn read_int32_returns_cached_value_for_statistics_reason() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_STATS_READ",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5714,7 +6078,7 @@ mod tests {
     fn poll_cycle_posts_no_statistics_monitor() {
         // ReadHoldingRegisters response for the 4-word buffer.
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_STATS_MON",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5741,7 +6105,7 @@ mod tests {
     #[test]
     fn generic_int32_write_posts_the_statistics() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_STATS_WRITE",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5779,7 +6143,7 @@ mod tests {
     fn poll_cycle_fires_per_interface_typed_values() {
         // 4 holding registers: 0x0001, 0x0002, 0x0003, 0x0004.
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_PER_IFACE",
             test_config(0, 4),
             LinkType::Tcp,
@@ -5875,7 +6239,7 @@ mod tests {
     fn poll_cycle_fires_array_interfaces_only_when_a_record_is_bound() {
         // 4 holding registers 0x0001..0x0004, replayed for two polls.
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ARRAY_IOINTR",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6003,7 +6367,7 @@ mod tests {
     /// interrupt filter.
     #[test]
     fn poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_U32D_ONCHANGE",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6076,7 +6440,7 @@ mod tests {
     /// unconditional fires; a changed third poll fires int32Array again.
     #[test]
     fn poll_cycle_int32_array_gated_on_change_scalars_unconditional() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_ARR_ONCHANGE",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6183,7 +6547,7 @@ mod tests {
         };
         let mut cfg = test_config(0, 4);
         cfg.data_type = ModbusDataType::StringHigh;
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_OCTET_ONCHANGE",
             cfg,
             LinkType::Tcp,
@@ -6238,9 +6602,187 @@ mod tests {
     /// the last good data with the failing status, R8-69) and once on the way
     /// back up, so the recovered cycle re-fires uInt32Digital with `!0` despite
     /// the word being identical.
+    /// An octet port with autoConnect off: what `ManualLink` does and sees.
+    #[derive(Default)]
+    struct LinkState {
+        connected: bool,
+        refuse_connect: bool,
+        writes: usize,
+    }
+
+    /// [`ReplayTransport`] over a port whose connection C `doModbusIO`
+    /// manages itself.
+    struct ManualLink {
+        replies: ReplayTransport,
+        state: Arc<Mutex<LinkState>>,
+    }
+
+    impl OctetTransport for ManualLink {
+        fn write_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+            self.state.lock().unwrap().writes += 1;
+            self.replies.write_frame(data)
+        }
+        fn read_frame(
+            &mut self,
+            expected: usize,
+            timeout: Duration,
+        ) -> crate::error::ModbusResult<Vec<u8>> {
+            self.replies.read_frame(expected, timeout)
+        }
+        fn manual_connection(&self) -> Option<bool> {
+            Some(self.state.lock().unwrap().connected)
+        }
+        fn disconnect_device(&mut self) -> crate::error::ModbusResult<()> {
+            self.state.lock().unwrap().connected = false;
+            Ok(())
+        }
+        fn connect_device(&mut self) -> crate::error::ModbusResult<()> {
+            let mut state = self.state.lock().unwrap();
+            if state.refuse_connect {
+                return Err(ModbusError::Io(
+                    crate::error::IoStatus::Error,
+                    "connect refused".into(),
+                ));
+            }
+            state.connected = true;
+            Ok(())
+        }
+    }
+
+    /// drvModbusAsyn.cpp:1968-2003: with autoConnect off, an I/O error or a
+    /// dropped link makes `doModbusIO` disconnect and reconnect the device
+    /// first, and a failed connect ends it before any request goes out.
+    #[test]
+    fn do_modbus_io_reconnects_a_manual_link_as_c() {
+        use asyn_rs::trace::{TraceFile, TraceInfoMask};
+        let port = "MB_RECONNECT";
+        let state = Arc::new(Mutex::new(LinkState::default()));
+        let mut driver = test_driver(
+            port,
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ManualLink {
+                replies: ReplayTransport::new(vec![
+                    Ok(tcp_response(1, &regs_pdu([1, 2, 3, 4]))),
+                    Ok(tcp_response(2, &regs_pdu([1, 2, 3, 4]))),
+                ]),
+                state: Arc::clone(&state),
+            }),
+        )
+        .expect("non-absolute config must build");
+        let path = std::env::temp_dir().join(format!("{port}_{}.trace", std::process::id()));
+        let trace = asyn_rs::services::PortServices::global().trace().clone();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+        trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
+        trace.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        let p = "drvModbusAsyn::doModbusIO port MB_RECONNECT";
+        let seen = std::cell::Cell::new(0);
+        let take = || {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let new = text[seen.replace(text.len())..].to_owned();
+            new.lines()
+                .filter_map(|l| l.strip_prefix(p).map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+
+        // ioStatus_ starts as asynError, so the first transaction reconnects.
+        let _ = driver.poll_cycle();
+        assert_eq!(
+            take(),
+            [
+                " has I/O error",
+                " is disconnected",
+                " disconnect device OK",
+                " connect device OK"
+            ]
+        );
+        assert_eq!(driver.io_status, AsynStatus::Success);
+
+        let _ = driver.poll_cycle();
+        assert_eq!(
+            take(),
+            Vec::<String>::new(),
+            "a good, connected link is left alone"
+        );
+
+        {
+            let mut s = state.lock().unwrap();
+            s.connected = false;
+            s.refuse_connect = true;
+        }
+        let writes = state.lock().unwrap().writes;
+        let _ = driver.poll_cycle();
+        assert_eq!(
+            take(),
+            [
+                " is disconnected",
+                " disconnect device OK",
+                " connect device error=connect refused"
+            ]
+        );
+        assert_eq!(state.lock().unwrap().writes, writes, "C skips the request");
+        assert_eq!(driver.io_status, AsynStatus::Error);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C `doModbusIO` prints the writeRead status edge, not every failure
+    /// (drvModbusAsyn.cpp:2187-2203), and a Modbus exception at ERROR, or at
+    /// WARNING for exception 5 (:2229-2246); all go through `pasynUserSelf`.
+    #[test]
+    fn do_modbus_io_traces_as_c() {
+        use asyn_rs::trace::{TraceFile, TraceInfoMask};
+        let port = "MB_IO_TRACE";
+        let mut driver = test_driver(
+            port,
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Err(ModbusError::Io(
+                    crate::error::IoStatus::Disconnected,
+                    "port SP1 not connected".into(),
+                )),
+                Err(ModbusError::Io(
+                    crate::error::IoStatus::Disconnected,
+                    "port SP1 not connected".into(),
+                )),
+                Ok(tcp_response(3, &regs_pdu([1, 2, 3, 4]))),
+                Ok(tcp_response(4, &[0x01, 0x83, 0x02])),
+                Ok(tcp_response(5, &[0x01, 0x83, 0x05])),
+                Ok(tcp_response(6, &[0x01, 0x03, 0x04, 0, 1, 0, 2])),
+            ])),
+        )
+        .expect("non-absolute config must build");
+        let path = std::env::temp_dir().join(format!("{port}_{}.trace", std::process::id()));
+        let trace = asyn_rs::services::PortServices::global().trace().clone();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::WARNING);
+        trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
+        trace.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        for _ in 0..6 {
+            let _ = driver.poll_cycle();
+        }
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            logged,
+            "drvModbusAsyn::doModbusIO port MB_IO_TRACE error calling writeRead, \
+             error=port SP1 not connected, nwrite=6/6, nread=0\n\
+             drvModbusAsyn::doModbusIO port MB_IO_TRACE writeRead status back to normal \
+             having had 2 errors, nwrite=6/6, nread=10\n\
+             drvModbusAsyn::doModbusIO port MB_IO_TRACE Modbus exception=2\n\
+             drvModbusAsyn::doModbusIO port MB_IO_TRACE Modbus exception=5\n\
+             drvModbusAsyn::doModbusIO, port MB_IO_TRACE expected 4 words, actually received 2\n"
+        );
+    }
+
     #[test]
     fn poll_cycle_io_error_forces_next_unchanged_cycle() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_FORCE_RECOVER",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6322,7 +6864,7 @@ mod tests {
     /// on-change-gated interfaces instead of re-firing unchanged data.
     #[test]
     fn a_skipped_binding_does_not_freeze_the_on_change_baseline() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_MIDLOOP_ABORT",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6582,7 +7124,7 @@ mod tests {
         // ack is then the port's SECOND transaction.
         let mut cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 4);
         cfg.poll_delay = Duration::from_millis(100);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_WR_NOSTAGE",
             cfg,
             LinkType::Tcp,
@@ -6625,7 +7167,7 @@ mod tests {
     /// so neither the written value nor the statistics the write moved post.
     #[test]
     fn relative_data_write_posts_nothing() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_WR_NOPOST",
             write_config(ModbusFunctionCode::WriteMultipleRegisters, 4),
             LinkType::Tcp,
@@ -6656,7 +7198,7 @@ mod tests {
     /// touches the wire.
     #[test]
     fn non_data_writes_take_the_asyn_port_driver_path() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_WR_NONDATA",
             write_config(ModbusFunctionCode::WriteMultipleRegisters, 4),
             LinkType::Tcp,
@@ -6707,7 +7249,7 @@ mod tests {
     fn relative_uint32_digital_write_leaves_the_register_cache_untouched() {
         let pdu = [0x01u8, 0x06, 0x00, 0x00, 0x00, 0x0f];
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_WR_DIG_NOSTAGE",
             cfg,
             LinkType::Tcp,
@@ -6738,7 +7280,7 @@ mod tests {
     fn relative_array_write_stages_into_the_register_cache() {
         let pdu = [0x01u8, 0x10, 0x00, 0x00, 0x00, 0x02];
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 4);
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_WR_ARR_STAGE",
             cfg,
             LinkType::Tcp,
@@ -6780,7 +7322,7 @@ mod tests {
         let good2 = [0x01u8, 0x03, 0x08, 0, 9, 0, 8, 0, 7, 0, 6];
         // Cycle 1 succeeds, cycles 2 and 3 time out, cycle 4 succeeds. The
         // transaction id advances on every request, failed ones included.
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_IO_ERR",
             test_config(0, 4),
             LinkType::Tcp,
@@ -6877,6 +7419,62 @@ mod tests {
         );
     }
 
+    /// C `readPoller` does its I/O, then waits for `interruptAccept` before
+    /// the callbacks (drvModbusAsyn.cpp:1663-1667). A poll that fails before
+    /// `iocInit` must reach the records once the gate opens: fanned out into
+    /// the closed gate, it set `prev_io_status` and every later failure read
+    /// as persistent, so a 100 ms port's records stayed UDF.
+    #[test]
+    fn a_poll_before_interrupt_accept_fans_out_once_the_gate_opens() {
+        use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+        // One response: the delivery after the gate opens does no I/O.
+        let mut driver = test_driver(
+            "MB_PRE_INIT",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Err(ModbusError::Timeout)])),
+        )
+        .expect("non-absolute config must build");
+        let gate = InterruptGate::new();
+        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(gate.clone());
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+            4096,
+        );
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let int32_fires = |rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver| {
+            let mut out = Vec::new();
+            while let Ok(iv) = rx.try_recv() {
+                if iv.reason == reason && iv.iface == Some(InterfaceType::Int32) {
+                    out.push(iv.aux_status);
+                }
+            }
+            out
+        };
+
+        driver.poll_cycle().unwrap();
+        assert!(
+            int32_fires(&mut rx).is_empty(),
+            "no fan-out into a closed gate"
+        );
+        assert!(driver.fanout_pending.load(Ordering::Relaxed));
+
+        gate.set(true);
+        driver.poll_cycle().unwrap();
+        assert_eq!(int32_fires(&mut rx), vec![AsynStatus::Timeout]);
+        assert_eq!(driver.engine.stats.io_errors, 1, "the delivery did no I/O");
+        assert!(!driver.fanout_pending.load(Ordering::Relaxed));
+    }
+
     /// R8-69: the read-poller task survives Modbus I/O errors. On the unfixed
     /// tree the first failing poll broke the loop and the port never polled
     /// again (every I/O-Intr record frozen until an IOC restart). C `readPoller`
@@ -6894,7 +7492,7 @@ mod tests {
         }
         let mut config = test_config(0, 4);
         config.poll_delay = Duration::from_millis(20);
-        let driver = ModbusPortDriver::new(
+        let driver = test_driver(
             "MB_POLLER_LIVE",
             config,
             LinkType::Tcp,
@@ -6906,6 +7504,7 @@ mod tests {
         let poll_delay = driver.poll_delay.clone();
         let poll_wake = driver.poll_wake.clone();
         let poll_backoff = driver.poll_backoff.clone();
+        let fanout_pending = driver.fanout_pending.clone();
 
         let (runtime, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
             .expect("the port runtime thread must start");
@@ -6916,6 +7515,7 @@ mod tests {
             poll_delay,
             poll_wake,
             poll_backoff,
+            fanout_pending,
         ));
 
         // The two failures cost the 1.0 s persistent-error backoff; after it the
@@ -6943,6 +7543,70 @@ mod tests {
             .expect("the poller task must not panic");
     }
 
+    /// The poller holds a pre-`iocInit` poll's callbacks for the gate and
+    /// polls no further meanwhile, as C's `readPoller` does
+    /// (drvModbusAsyn.cpp:1663-1667); the open delivers the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_poller_waits_for_interrupt_accept_before_its_callbacks() {
+        use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+        let mut config = test_config(0, 4);
+        config.poll_delay = Duration::from_millis(20);
+        let transport = ReplayTransport::new(vec![Err(ModbusError::Timeout)]);
+        let written = transport.written_handle();
+        let mut driver = test_driver("MB_POLLER_GATE", config, LinkType::Tcp, Box::new(transport))
+            .expect("non-absolute config must build");
+        let gate = InterruptGate::new();
+        driver.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(gate.clone());
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let (_sub, _rx_sub) = driver.base.interrupts.register_interrupt_user(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+            4096,
+        );
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let read_reason = driver.read_reason;
+        let poll_delay = driver.poll_delay.clone();
+        let poll_wake = driver.poll_wake.clone();
+        let poll_backoff = driver.poll_backoff.clone();
+        let fanout_pending = driver.fanout_pending.clone();
+
+        let (runtime, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let poller = tokio::spawn(read_poller(
+            runtime.port_handle().clone(),
+            read_reason,
+            poll_delay,
+            poll_wake,
+            poll_backoff,
+            fanout_pending,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(written.lock().unwrap().len(), 1, "one poll, then the wait");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing fanned out into the closed gate"
+        );
+
+        gate.set(true);
+        let fire = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the open must deliver the held callbacks")
+            .expect("the ring must stay open");
+        assert_eq!(fire.aux_status, AsynStatus::Timeout);
+        assert_eq!(written.lock().unwrap().len(), 1, "the delivery did no I/O");
+
+        runtime.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), poller).await;
+    }
+
     /// MB-2 regression: no relative-addressing reader may serve the register
     /// cache after a failed poll. C gates every one of them on `ioStatus_`
     /// (drvModbusAsyn.cpp:531/681/842/988/1130/1299/1469); without that gate a
@@ -6951,7 +7615,7 @@ mod tests {
     /// each crossed by all seven readers.
     #[test]
     fn no_reader_serves_the_cache_after_a_failed_poll() {
-        let mut driver = ModbusPortDriver::new(
+        let mut driver = test_driver(
             "MB_IOSTATUS_GATE",
             test_config(0, 4),
             LinkType::Tcp,

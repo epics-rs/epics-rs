@@ -1405,7 +1405,7 @@ impl SharedProcessorInner {
                 self.port_handle.trace().output(
                     self.port_handle.port_name(),
                     TraceMask::ERROR,
-                    "NDPluginDriver::endProcessCallbacks: Couldn't allocate output array. Further processing terminated.",
+                    "NDPluginDriver::endProcessCallbacks: Couldn't allocate output array. Further processing terminated.\n",
                 );
                 break;
             };
@@ -2246,13 +2246,13 @@ impl PluginPortDriver {
                 (
                     max,
                     format!(
-                        "{threads}, numThreads={value} must be <= maxThreads={max}, setting to {max}"
+                        "{threads}, numThreads={value} must be <= maxThreads={max}, setting to {max}\n"
                     ),
                 )
             } else if value < 1 {
                 (
                     1,
-                    format!("{threads}, numThreads={value} must be >= 1, setting to 1"),
+                    format!("{threads}, numThreads={value} must be >= 1, setting to 1\n"),
                 )
             } else {
                 return Ok(WriteVerdict::Accept(value).into());
@@ -2260,7 +2260,7 @@ impl PluginPortDriver {
         } else if reason == p.queue_size && value < 1 {
             (
                 1,
-                format!("{threads}, queueSize={value} must be >= 1, setting to 1"),
+                format!("{threads}, queueSize={value} must be >= 1, setting to 1\n"),
             )
         } else if reason == p.nd_array_addr {
             match self.unresolved(&port, value) {
@@ -2284,7 +2284,7 @@ impl PluginPortDriver {
         .print(
             TraceMask::ERROR,
             format!(
-                "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}",
+                "NDPluginDriver::writeInt32 ERROR, status=3, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}\n",
                 connected as i32
             ),
         ))
@@ -2389,7 +2389,7 @@ impl PluginPortDriver {
         let key = self.wiring.key(port, addr);
         (!port.is_empty() && self.wiring.lookup_output(&key).is_none()).then(|| {
             format!(
-                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found"
+                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found\n"
             )
         })
     }
@@ -3918,7 +3918,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                                 asyn_rs::trace::TraceMask::WARNING,
                                                 format_args!(
                                                     "NDPluginDriver::writeInt32 cannot do \
-                                                     ProcessPlugin, no input array cached"
+                                                     ProcessPlugin, no input array cached\n"
                                                 ),
                                             );
                                         }
@@ -4343,7 +4343,7 @@ mod tests {
             let kept = verdict.kept();
             let out = WriteOutcome::from(verdict)
                 .set_int32(self.twice, addr, 2 * kept)
-                .print(TraceMask::ERROR, "limit set");
+                .print(TraceMask::ERROR, "limit set\n");
             match value {
                 // Also sets TWICE at the next address, as Attribute's Reset
                 // sets every channel.
@@ -5186,11 +5186,11 @@ mod tests {
             vec![
                 (
                     TraceMask::ERROR,
-                    "NDPluginDriver::createCallbackThreads error, numThreads=98 must be <= maxThreads=1, setting to 1".to_string()
+                    "NDPluginDriver::createCallbackThreads error, numThreads=98 must be <= maxThreads=1, setting to 1\n".to_string()
                 ),
                 (
                     TraceMask::ERROR,
-                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={threads}, paramName=NUM_THREADS, value=98, connectedToArrayPort_=1")
+                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={threads}, paramName=NUM_THREADS, value=98, connectedToArrayPort_=1\n")
                 ),
             ]
         );
@@ -5205,11 +5205,11 @@ mod tests {
             vec![
                 (
                     TraceMask::ERROR,
-                    "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port BOGUS address 2, status=3, error=asynManager:connectDevice port BOGUS not found".to_string()
+                    "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port BOGUS address 2, status=3, error=asynManager:connectDevice port BOGUS not found\n".to_string()
                 ),
                 (
                     TraceMask::ERROR,
-                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={addr}, paramName=NDARRAY_ADDR, value=2, connectedToArrayPort_=0")
+                    format!("NDPluginDriver::writeInt32 ERROR, status=3, function={addr}, paramName=NDARRAY_ADDR, value=2, connectedToArrayPort_=0\n")
                 ),
             ]
         );

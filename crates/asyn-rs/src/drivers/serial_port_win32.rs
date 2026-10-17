@@ -712,7 +712,7 @@ impl PortDriver for DrvAsynSerialPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "connected to {} at {} baud",
+            "connected to {} at {} baud\n",
             self.config.device,
             self.dcb.map(|d| d.BaudRate).unwrap_or(self.config.baud)
         );
@@ -724,7 +724,7 @@ impl PortDriver for DrvAsynSerialPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "disconnect"
+            "disconnect\n"
         );
         if let Some(v) = self.io.handle_val.take() {
             unsafe { CloseHandle(v as HANDLE) };
@@ -788,7 +788,7 @@ impl PortDriver for DrvAsynSerialPort {
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             &buf[..result.nbytes_transferred],
-            "read"
+            "read\n"
         );
         Ok((result.nbytes_transferred, result.eom_reason))
     }
@@ -800,7 +800,7 @@ impl PortDriver for DrvAsynSerialPort {
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
-            "write"
+            "write\n"
         );
         match self.io.write(user, data) {
             Ok(n) => Ok(n),
@@ -810,7 +810,7 @@ impl PortDriver for DrvAsynSerialPort {
                         self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "write error, disconnecting: {e}"
+                        "write error, disconnecting: {e}\n"
                     );
                     self.drop_connection();
                 }

@@ -775,7 +775,8 @@ impl Hdf5Writer {
             Hdf5Layout::load(spec).map_err(|e| e.0)
         } else {
             lines.push(
-                "NDFileHDF5createFileLayout Warning: specified XML file does not exist".to_owned(),
+                "NDFileHDF5createFileLayout Warning: specified XML file does not exist\n"
+                    .to_owned(),
             );
             Err("specified XML file does not exist".to_owned())
         };
@@ -788,7 +789,7 @@ impl Hdf5Writer {
                 self.layout = None;
                 // NDFileHDF5.cpp:279-284.
                 lines.push(
-                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout"
+                    "NDFileHDF5::openFile ERROR Failed to create the specified file layout\n"
                         .to_owned(),
                 );
                 Err(ADError::Reported {
@@ -805,10 +806,10 @@ impl Hdf5Writer {
         ADError::Reported {
             lines: vec![
                 format!(
-                    "NDFileHDF5::createNewFile Unable to create HDF5 file: {}",
+                    "NDFileHDF5::createNewFile Unable to create HDF5 file: {}\n",
                     path.display()
                 ),
-                "NDFileHDF5::openFile ERROR Failed to create a new output file".to_owned(),
+                "NDFileHDF5::openFile ERROR Failed to create a new output file\n".to_owned(),
             ],
             message: format!("HDF5 create error: {e}"),
         }
@@ -3613,7 +3614,7 @@ impl Hdf5FileProcessor {
             .print(
                 TraceMask::ERROR,
                 format!(
-                    "NDFileHDF5:writeInt32: ERROR status=3, function={reason}, value={value} old={old}"
+                    "NDFileHDF5:writeInt32: ERROR status=3, function={reason}, value={value} old={old}\n"
                 ),
             )
         };
@@ -3740,7 +3741,7 @@ impl Hdf5FileProcessor {
         )
         .print(
             TraceMask::ERROR,
-            format!("NDFileHDF5::verifyLayoutXMLFile XML description file {line}."),
+            format!("NDFileHDF5::verifyLayoutXMLFile XML description file {line}.\n"),
         )
     }
 
@@ -7964,7 +7965,8 @@ mod tests {
     #[test]
     fn a_failed_open_carries_c_open_file_lines() {
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
-        let layout_failed = "NDFileHDF5::openFile ERROR Failed to create the specified file layout";
+        let layout_failed =
+            "NDFileHDF5::openFile ERROR Failed to create the specified file layout\n";
 
         let mut writer = Hdf5Writer::new();
         writer.set_layout_filename("/nonexistent/layout.xml");
@@ -7974,7 +7976,7 @@ mod tests {
         assert_eq!(
             err.lines(),
             [
-                "NDFileHDF5createFileLayout Warning: specified XML file does not exist",
+                "NDFileHDF5createFileLayout Warning: specified XML file does not exist\n",
                 layout_failed,
             ]
         );
@@ -7994,8 +7996,8 @@ mod tests {
             assert_eq!(
                 err.lines(),
                 [
-                    "NDFileHDF5::createNewFile Unable to create HDF5 file: /nonexistent/dir/f.h5",
-                    "NDFileHDF5::openFile ERROR Failed to create a new output file",
+                    "NDFileHDF5::createNewFile Unable to create HDF5 file: /nonexistent/dir/f.h5\n",
+                    "NDFileHDF5::openFile ERROR Failed to create a new output file\n",
                 ]
             );
         }

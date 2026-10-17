@@ -753,7 +753,8 @@ fn self_line(port: &str, multi_device: bool) -> (String, String) {
     let say = |text: &'static str| {
         fx.handle
             .with_driver_blocking(move |d: &mut DefaultPort| {
-                d.base.trace_print(TraceMask::ERROR, format_args!("{text}"))
+                d.base
+                    .trace_print(TraceMask::ERROR, format_args!("{text}\n"))
             })
             .unwrap()
     };

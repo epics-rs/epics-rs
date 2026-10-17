@@ -11,7 +11,7 @@ use std::time::Duration;
 use asyn_rs::interfaces::motor::MotorStatus;
 use asyn_rs::manager::PortManager;
 use asyn_rs::registry::open_owner;
-use asyn_rs::trace::TraceFile;
+use asyn_rs::trace::{TraceFile, TraceInfoMask};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::DevSup;
@@ -62,9 +62,12 @@ impl Capture {
         Capture(path)
     }
 
+    fn text(&self) -> String {
+        std::fs::read_to_string(&self.0).unwrap()
+    }
+
     fn lines(&self) -> Vec<String> {
-        let text = std::fs::read_to_string(&self.0).unwrap();
-        text.lines().map(str::to_owned).collect()
+        self.text().lines().map(str::to_owned).collect()
     }
 
     /// The lines once one ends with `want`; the io_intr pass that prints it
@@ -303,7 +306,8 @@ record(motor, "H:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(HOLE,1)") fiel
     db.scan_control().run();
     let ratio = "devMotorAsyn::init_controller, H:m failed to set encoder ratio to 1.000000";
     let lines = trace.until(ratio).await;
-    let has = |lines: &[String], want: &str| lines.iter().any(|l| l.ends_with(want));
+    // init_record prints with no newline, as C does, so the next print runs on.
+    let has = |lines: &[String], want: &str| lines.iter().any(|l| l.contains(want));
     assert!(
         has(
             &lines,
@@ -389,7 +393,8 @@ record(motor, "J:m1") { field(DTYP, "asynMotor") field(OUT, "@asyn(DRV2,4)") }
     )
     .await;
     let lines = trace.lines();
-    let has = |want: &str| lines.iter().any(|l| l.ends_with(want));
+    // init_record prints with no newline, as C does, so the next print runs on.
+    let has = |want: &str| lines.iter().any(|l| l.contains(want));
     assert!(
         has(
             "devMotorAsyn::init_record: J:m0 pasynGenericPointer->read returned drvMotorAsyn::readGenericPointer Uninitialised axis 1"
@@ -482,6 +487,9 @@ record(motor, "K:b") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") fiel
 async fn a_record_on_a_missing_axis_is_initialised_without_a_process() {
     register_drv_motor_asyn_port("NOPASS", 2).unwrap();
     let trace = Capture::of("NOPASS");
+    PortManager::global()
+        .trace_manager()
+        .set_trace_info_mask(Some("NOPASS"), TraceInfoMask::empty());
     let db = boot(
         r##"
 record(motor, "N:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NOPASS,1)") field(FLNK, "N:n") }
@@ -491,19 +499,15 @@ record(calc, "N:n") { field(CALC, "A+1") field(INPA, "N:n NPP") }
     .await;
     db.scan_control().run();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let lines = trace.lines();
-    let tails: Vec<&str> = lines
-        .iter()
-        .map(|l| l.split_once(' ').unwrap().1.split_once(' ').unwrap().1)
-        .collect();
+    // init_record's line has no newline in C, so the next print runs on.
     assert_eq!(
-        tails,
-        [
+        trace.text(),
+        concat!(
             "devMotorAsyn::init_record: N:m pasynGenericPointer->read returned drvMotorAsyn::readGenericPointer Uninitialised axis 1",
-            "devMotorAsyn::init_controller, N:m failed to set encoder ratio to 1.000000",
-            "devMotorAsyn::asynCallback: N:m pasyn{Float64,Int32}->write returned drvMotorAsyn::writeFloat64 Uninitialised axis 1",
-            "devMotorAsyn::asynCallback: N:m pasyn{Float64,Int32}->write returned drvMotorAsyn::writeFloat64 Uninitialised axis 1",
-        ]
+            "devMotorAsyn::init_controller, N:m failed to set encoder ratio to 1.000000\n",
+            "devMotorAsyn::asynCallback: N:m pasyn{Float64,Int32}->write returned drvMotorAsyn::writeFloat64 Uninitialised axis 1\n",
+            "devMotorAsyn::asynCallback: N:m pasyn{Float64,Int32}->write returned drvMotorAsyn::writeFloat64 Uninitialised axis 1\n",
+        )
     );
     assert_eq!(field(&db, "N:n"), EpicsValue::Double(0.0), "no FLNK");
     assert_eq!(field(&db, "N:m.STAT"), EpicsValue::Short(0));

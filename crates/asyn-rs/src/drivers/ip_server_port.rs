@@ -739,7 +739,7 @@ impl Acceptor {
                     self.trace,
                     &self.port_name,
                     TraceMask::FLOW,
-                    "new connection from {peer} on {child}"
+                    "new connection from {peer} on {child}\n"
                 );
                 // C :389-398 — the octet callbacks carry the child port name,
                 // not the payload. The listener walks the interrupt list and
@@ -780,7 +780,7 @@ impl Acceptor {
             self.trace,
             &self.port_name,
             TraceMask::FLOW,
-            "started listening for connections on {}",
+            "started listening for connections on {}\n",
             self.port_name
         );
         while !self.shutdown.load(Ordering::SeqCst) {
@@ -791,7 +791,7 @@ impl Acceptor {
                     self.trace,
                     &self.port_name,
                     TraceMask::ERROR,
-                    "accept error on {}: {}",
+                    "accept error on {}: {}\n",
                     self.port_name,
                     e.message()
                 ),
@@ -801,7 +801,7 @@ impl Acceptor {
             self.trace,
             &self.port_name,
             TraceMask::FLOW,
-            "terminating connection thread for {}",
+            "terminating connection thread for {}\n",
             self.port_name
         );
     }

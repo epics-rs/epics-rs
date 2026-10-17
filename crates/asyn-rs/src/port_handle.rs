@@ -352,6 +352,7 @@ pub struct PortHandle {
     /// in the manager the driver's `trace_print` reads; handing the registry
     /// a second manager at registration is what made those masks silent.
     trace: Arc<TraceManager>,
+    sync_lock: crate::port_actor::SyncLock,
 }
 
 /// A [`PortHandle`] that does not keep its port alive: the actor ends once
@@ -371,6 +372,7 @@ pub struct WeakPortHandle {
     max_addr: i32,
     interfaces: Arc<[Capability]>,
     trace: Arc<TraceManager>,
+    sync_lock: crate::port_actor::SyncLock,
 }
 
 impl WeakPortHandle {
@@ -389,6 +391,7 @@ impl WeakPortHandle {
             max_addr: self.max_addr,
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
+            sync_lock: self.sync_lock.clone(),
         })
     }
 }
@@ -437,6 +440,7 @@ impl PortHandle {
             max_addr: 1,
             interfaces: crate::interfaces::default_capabilities().into(),
             trace,
+            sync_lock: actor.sync_lock,
         }
     }
 
@@ -455,6 +459,7 @@ impl PortHandle {
             max_addr: self.max_addr,
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
+            sync_lock: self.sync_lock.clone(),
         }
     }
 
@@ -1231,7 +1236,12 @@ impl PortHandle {
 
     /// C `queueRequest`'s `ellAdd` + `epicsEventSignal` (asynManager.c:1615,
     /// :1628): the queue has no capacity to refuse on, so only a gone actor does.
-    fn send(&self, msg: ActorMessage) -> AsynResult<()> {
+    fn send(&self, mut msg: ActorMessage) -> AsynResult<()> {
+        // The actor cannot answer while it holds the lock, so the try-lock is
+        // taken here, on the submitting thread, for every route to a report.
+        if let RequestOp::Report { sync_locked, .. } = &mut msg.op {
+            *sync_locked = self.sync_lock.is_held();
+        }
         self.tx.send(msg).map_err(|_| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("actor channel closed for port {}", self.port_name),
@@ -1440,7 +1450,11 @@ impl PortHandle {
     /// thread. The caller picks the stream, as C's caller passes `fp`.
     pub fn report_blocking(&self, level: i32) -> AsynResult<String> {
         let user = AsynUser::default();
-        let result = self.submit_blocking(RequestOp::Report { level }, user)?;
+        let op = RequestOp::Report {
+            level,
+            sync_locked: false,
+        };
+        let result = self.submit_blocking(op, user)?;
         Ok(String::from_utf8_lossy(result.data.as_deref().unwrap_or_default()).into_owned())
     }
 
@@ -3907,6 +3921,82 @@ mod tests {
         assert!(events.lock().is_empty(), "{:?}", events.lock());
         let report = handle.report_blocking(1).unwrap();
         assert!(!report.contains("exceptionUsers 1"), "{report}");
+    }
+
+    /// The report's lock line, sampled as `reportPrintPort`'s own thread
+    /// try-locks `synchronousLock` (asynManager.c:1053) while `span` is inside
+    /// the actor. `span` runs on another thread; it signals `entered` from
+    /// inside the actor and stays there until `release` fires.
+    fn lock_line_during(
+        handle: &PortHandle,
+        span: impl FnOnce(PortHandle, Box<dyn FnOnce() + Send>) + Send + 'static,
+    ) -> String {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let inside: Box<dyn FnOnce() + Send> = Box::new(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let other = handle.clone();
+        let worker = std::thread::spawn(move || span(other, inside));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let report = RequestOp::Report {
+            level: 1,
+            sync_locked: false,
+        };
+        let pending = handle.try_submit(report, AsynUser::default()).unwrap();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let r = pending.wait_blocking(Duration::from_secs(5)).unwrap();
+        let text = String::from_utf8_lossy(r.data.as_deref().unwrap_or_default()).into_owned();
+        text.lines()
+            .find(|l| l.contains("synchronousLock"))
+            .unwrap()
+            .to_string()
+    }
+
+    /// C's port thread holds `synchronousLock` across a `lockPort` span and a
+    /// queued callback (asynManager.c:909, :1581, :1800), so a report taken
+    /// meanwhile prints Yes; an idle port, and a driver's own `lock()`
+    /// (asynPortDriver.cpp:3858, a different mutex), print No.
+    #[test]
+    fn report_shows_synchronous_lock_held_only_inside_a_port_lock_or_callback() {
+        use crate::request::{CellBody, Unrun};
+        const NO: &str = "    asynManagerLock:No synchronousLock:No";
+        const YES: &str = "    asynManagerLock:No synchronousLock:Yes";
+        let (handle, _) = counted_port("sync_rep", 1);
+        let idle = handle.report_blocking(1).unwrap();
+        assert!(idle.contains(&format!("{NO}\n")), "{idle}");
+
+        let lock_port = lock_line_during(&handle, |h, inside| {
+            h.lock_port_blocking(move |_| inside()).unwrap();
+        });
+        assert_eq!(lock_port, YES);
+
+        struct Body(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+        impl CellBody for Body {
+            fn process(&self, _: &mut dyn PortCalls) {
+                (self.0.lock().take().unwrap())();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the callback did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+        let callback = lock_line_during(&handle, |h, inside| {
+            let cell = h.new_cell(Arc::new(Body(parking_lot::Mutex::new(Some(inside)))));
+            h.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        });
+        assert_eq!(callback, YES);
+
+        let driver_lock = lock_line_during(&handle, |h, inside| {
+            h.with_driver_blocking::<Counted, _>(move |_| inside())
+                .unwrap();
+        });
+        assert_eq!(driver_lock, NO);
+
+        let after = handle.report_blocking(1).unwrap();
+        assert!(after.contains(&format!("{NO}\n")), "{after}");
     }
 
     /// C `exceptionDisconnect` (asynManager.c:2165-2190) marks the `dpCommon`

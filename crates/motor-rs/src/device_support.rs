@@ -379,7 +379,7 @@ impl DeviceSupport for MotorDeviceSupport {
             asyn_rs::trace::TraceMask::IO_DEVICE,
             self.port.trace.update_status_reason(),
             format_args!(
-                "{} devMotorAsyn::update_values, needUpdate=1",
+                "{} devMotorAsyn::update_values, needUpdate=1\n",
                 self.port.trace.record()
             ),
         );

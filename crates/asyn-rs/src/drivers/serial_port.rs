@@ -1324,7 +1324,7 @@ impl PortDriver for DrvAsynSerialPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "connected to {} at {} baud",
+            "connected to {} at {} baud\n",
             self.device,
             self.baud
         );
@@ -1336,7 +1336,7 @@ impl PortDriver for DrvAsynSerialPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "disconnect"
+            "disconnect\n"
         );
 
         // Close fd
@@ -1396,7 +1396,7 @@ impl PortDriver for DrvAsynSerialPort {
                         self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "read error, disconnecting: {e}"
+                        "read error, disconnecting: {e}\n"
                     );
                     self.drop_connection();
                 }
@@ -1408,7 +1408,7 @@ impl PortDriver for DrvAsynSerialPort {
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             &buf[..result.nbytes_transferred],
-            "read"
+            "read\n"
         );
         Ok((result.nbytes_transferred, result.eom_reason))
     }
@@ -1420,7 +1420,7 @@ impl PortDriver for DrvAsynSerialPort {
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
-            "write"
+            "write\n"
         );
         match self.io.write(user, data) {
             Ok(n) => Ok(n),
@@ -1433,7 +1433,7 @@ impl PortDriver for DrvAsynSerialPort {
                         self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "write error, disconnecting: {e}"
+                        "write error, disconnecting: {e}\n"
                     );
                     self.drop_connection();
                 }

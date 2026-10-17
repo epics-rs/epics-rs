@@ -147,7 +147,7 @@ const WRITER_ERROR: i32 = 3;
 /// writer printed, then C's own, with C's `message` for `NDFileWriteMessage`.
 fn base_failure(writer_lines: &[String], base: &str, message: String) -> ADError {
     let mut lines = writer_lines.to_vec();
-    lines.push(format!("NDPluginFile::{base} {message}"));
+    lines.push(format!("NDPluginFile::{base} {message}\n"));
     ADError::Reported { lines, message }
 }
 

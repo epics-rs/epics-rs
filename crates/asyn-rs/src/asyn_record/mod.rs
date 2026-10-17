@@ -1008,7 +1008,7 @@ fn trace_report(
         addr,
         reason,
         TraceMask::ERROR,
-        format_args!("{name}: {errs}"),
+        format_args!("{name}: {errs}\n"),
     );
 }
 

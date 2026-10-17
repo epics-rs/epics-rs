@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime};
 
 use epics_libcom_rs::SharedArray;
@@ -95,6 +95,34 @@ pub(crate) fn queue_request_gate(
     }
 }
 
+/// C's `synchronousLock` as `asynReport` sees it: held while the port thread
+/// runs a callback, a `lockPort` span or a connect attempt (asynManager.c:776,
+/// :830, :909, :1800), which the report's own thread try-locks (:1053). The
+/// actor is the only holder; a [`crate::port_handle::PortHandle`] only looks.
+#[derive(Clone, Default)]
+pub(crate) struct SyncLock(Arc<AtomicU32>);
+
+impl SyncLock {
+    /// Whether C's `epicsMutexTryLock` would fail now.
+    pub(crate) fn is_held(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire) != 0
+    }
+
+    fn hold(&self) -> SyncLockHeld {
+        self.0.fetch_add(1, AtomicOrdering::Release);
+        SyncLockHeld(Arc::clone(&self.0))
+    }
+}
+
+/// One hold of [`SyncLock`], released on every exit from the span.
+struct SyncLockHeld(Arc<AtomicU32>);
+
+impl Drop for SyncLockHeld {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::Release);
+    }
+}
+
 /// What a [`crate::port_handle::PortHandle`] takes from the actor behind its
 /// channel: the actor's identity, for the re-entrancy guard, and the port's
 /// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread.
@@ -105,6 +133,7 @@ pub(crate) struct ActorLink {
     pub(crate) cells: Arc<CellQueue>,
     pub(crate) gate: QueueGate,
     pub(crate) devices: crate::port::DeviceTable,
+    pub(crate) sync_lock: SyncLock,
 }
 
 impl ActorLink {
@@ -119,6 +148,7 @@ impl ActorLink {
             cells,
             gate: QueueGate::open(),
             devices: crate::port::DeviceTable::detached(),
+            sync_lock: SyncLock::default(),
         }
     }
 }
@@ -545,6 +575,7 @@ pub(crate) struct PortActor {
     /// came back or was re-enabled is an exception (asynManager.c:2249), and C's
     /// port thread rescans its whole queue on every wake.
     rescanned_exceptions: u64,
+    sync_lock: SyncLock,
 }
 
 /// A cell still queued when the actor goes runs its body as refused: a cell
@@ -595,6 +626,7 @@ impl PortActor {
             woken: false,
             seen_exceptions,
             rescanned_exceptions: seen_exceptions,
+            sync_lock: SyncLock::default(),
         }
     }
 
@@ -608,6 +640,7 @@ impl PortActor {
             cells: Arc::clone(&self.cells),
             gate: self.driver.base().queue_gate(),
             devices: self.driver.base().device_table(),
+            sync_lock: self.sync_lock.clone(),
         }
     }
 
@@ -833,7 +866,9 @@ impl PortActor {
         // neither `lastConnectDisconnect` nor `previousConnectStatus`, so the
         // `autoConnectDevice(pport,0)` the same wake reaches (:858-863) makes a
         // second attempt, and that one reports (`connectAttempt`, :778-786).
+        let held = self.sync_lock.hold();
         let _ = self.driver.connect(&AsynUser::default().with_addr(-1));
+        drop(held);
 
         if !self.driver.base().is_connected() {
             // Still down — back off and try again (C :3312).
@@ -971,8 +1006,8 @@ impl PortActor {
     /// prints one line and nothing else, driver included (:1040-1044) — its
     /// interfaces are gone. Disabled and disconnected are *not* such states: they
     /// report, as `enabled:No` / `connected:No`.
-    fn report_port(&mut self, details: i32) -> String {
-        let mut out = self.manager_report(details);
+    fn report_port(&mut self, details: i32, sync_locked: bool) -> String {
+        let mut out = self.manager_report(details, sync_locked);
         // C ends by calling the port's `asynCommon->report` (:1115-1124) — the
         // driver's own detail, and only that. A destroyed port's interfaces are
         // gone, so C never reaches it (:1040-1044).
@@ -985,7 +1020,7 @@ impl PortActor {
     /// The text of C's manager block, which [`Self::report_port`] starts with.
     /// Split out so the block can be asserted on: every line here is a question an
     /// operator ran `asynReport` to answer.
-    fn manager_report(&self, details: i32) -> String {
+    fn manager_report(&self, details: i32, sync_locked: bool) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
         let base = self.driver.base();
@@ -1027,13 +1062,15 @@ impl PortActor {
                 self.heap.len() + self.pending_while_blocked.len() + self.parked.len(),
                 yn(self.block_holders.any_held())
             );
-            // C try-locks the two port mutexes from a *separate* report thread, so
-            // a port thread stuck inside a driver call shows `Yes` (:1051-1072).
-            // The actor model has neither mutex: the driver is reachable only from
-            // the actor thread, and this report *is* the actor's current request —
-            // so if it prints at all, the actor is not inside a driver call. A
-            // wedged driver is visible instead as a report that never prints.
-            let _ = writeln!(out, "    asynManagerLock:No synchronousLock:No");
+            // C try-locks the two port mutexes from a *separate* report thread
+            // (:1051-1072). `synchronousLock` was sampled on the caller's thread
+            // as the report was submitted; the actor holds no counterpart of
+            // `asynManagerLock` across a call, so that one is always free.
+            let _ = writeln!(
+                out,
+                "    asynManagerLock:No synchronousLock:{}",
+                yn(sync_locked)
+            );
             // C's `exceptionActive` is set while `exceptionOccurred` is fanning
             // out (:621-634) and its notify list holds the users waiting on that
             // fan-out. Rust announces synchronously from the transition owner with
@@ -1500,13 +1537,19 @@ impl PortActor {
             file!(),
             line!(),
             format_args!(
-                "asynManager::portThread port={} callback",
+                "asynManager::portThread port={} callback\n",
                 self.driver.base().port_name
             ),
         );
 
-        // Dispatch
+        // C runs a callback and a `lockPort` span under `synchronousLock`
+        // (asynManager.c:830, :909, :1581, :1800); a direct manager call
+        // takes no port lock.
+        let held = (Self::c_dispatch(&op) != CDispatch::Direct
+            || matches!(op, RequestOp::LockPort(_)))
+        .then(|| self.sync_lock.hold());
         let result = self.dispatch_io(&mut user, &op);
+        drop(held);
         if let Some(reply) = reply {
             let _ = reply.send(result);
         }
@@ -1580,7 +1623,9 @@ impl PortActor {
             // `&pport->dpc`, i.e. no device (:718). A driver that reads the
             // address — prologix branches on it exactly as C's `prologixConnect`
             // does — must not see this as a device 0 connect.
+            let held = self.sync_lock.hold();
             let result = self.driver.connect(&AsynUser::default().with_addr(-1));
+            drop(held);
             self.report_connect_attempt(-1, &result);
             self.driver
                 .base_mut()
@@ -1608,7 +1653,7 @@ impl PortActor {
                 file!(),
                 line!(),
                 format_args!(
-                    "{port} {addr} autoConnect could not connect: {}",
+                    "{port} {addr} autoConnect could not connect: {}\n",
                     e.message_display()
                 ),
             ),
@@ -1616,7 +1661,7 @@ impl PortActor {
                 mask,
                 file!(),
                 line!(),
-                format_args!("{port} {addr} port is now connected"),
+                format_args!("{port} {addr} port is now connected\n"),
             ),
         }
     }
@@ -1692,7 +1737,9 @@ impl PortActor {
                 return false;
             }
             let connect_user = AsynUser::new(reason).with_addr(addr);
+            let held = self.sync_lock.hold();
             let result = self.driver.connect_addr(&connect_user);
+            drop(held);
             self.report_connect_attempt(addr, &result);
             self.driver
                 .base_mut()
@@ -2294,7 +2341,7 @@ impl PortActor {
                     if let Err(e) = outcome {
                         base.trace_print(
                             crate::trace::TraceMask::ERROR,
-                            format_args!("callParamCallbacks: param set failed: {e}"),
+                            format_args!("callParamCallbacks: param set failed: {e}\n"),
                         );
                         failed.get_or_insert(e);
                     }
@@ -2343,7 +2390,7 @@ impl PortActor {
                 self.driver.set_option(user, key, value)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Report { level } => {
+            RequestOp::Report { level, sync_locked } => {
                 // C parity: `asynManager::report` (asynManager.c:1138-1173) walks
                 // every registered port and hands each to `reportPrintPort`
                 // (:1020-1124), which prints the *manager's* view of the port and
@@ -2352,7 +2399,7 @@ impl PortActor {
                 // dispatch the per-port report from the actor thread so the driver
                 // observes its own state under the actor's serial ownership.
                 let mut result = RequestResult::write_ok();
-                result.data = Some(self.report_port(*level).into_bytes());
+                result.data = Some(self.report_port(*level, *sync_locked).into_bytes());
                 Ok(result)
             }
             RequestOp::Cell(cell) => {
@@ -2376,10 +2423,10 @@ impl PortActor {
             RequestOp::LockPort(call) => {
                 let port = self.driver.base().port_name.clone();
                 let trace = |actor: &Self, what: &str| {
-                    actor
-                        .driver
-                        .base()
-                        .trace_print(crate::trace::TraceMask::FLOW, format_args!("{port} {what}"));
+                    actor.driver.base().trace_print(
+                        crate::trace::TraceMask::FLOW,
+                        format_args!("{port} {what}\n"),
+                    );
                 };
                 // C `lockPort` traces before it looks (:1789), and refuses only
                 // a destroyed port (:1790-1795).
@@ -4700,7 +4747,10 @@ mod tests {
             RequestOp::GetConnected,
             RequestOp::GetEnable,
             RequestOp::GetAutoConnect,
-            RequestOp::Report { level: 1 },
+            RequestOp::Report {
+                level: 1,
+                sync_locked: false,
+            },
         ] {
             let label = format!("{op:?}");
             send_and_wait(&tx, op, AsynUser::default()).unwrap();
@@ -5201,11 +5251,11 @@ mod tests {
         let mut actor = PortActor::new(Box::new(TestDriver::new()), rx);
         assert!(
             actor
-                .manager_report(1)
+                .manager_report(1, false)
                 .contains("connected:No numberConnects 0")
         );
         actor.register();
-        let r = actor.manager_report(1);
+        let r = actor.manager_report(1, false);
         assert!(r.contains("connected:Yes numberConnects 1"), "{r}");
     }
 
@@ -5218,7 +5268,7 @@ mod tests {
         let actor = PortActor::new(Box::new(srv), rx);
 
         assert_eq!(
-            actor.manager_report(0).lines().next().unwrap(),
+            actor.manager_report(0, false).lines().next().unwrap(),
             "ipsrv_rep multiDevice:No canBlock:Yes autoConnect:Yes",
             "C's header line for the listener (asynManager.c:1045-1049)"
         );
@@ -5267,7 +5317,7 @@ mod tests {
         // disconnected device even at 0 (:1087), which is what the operator ran
         // the report for.
         let (actor, _tx) = build();
-        let r0 = actor.manager_report(0);
+        let r0 = actor.manager_report(0, false);
         assert_eq!(
             r0.lines().next().unwrap(),
             "rep_block multiDevice:Yes canBlock:Yes autoConnect:Yes",
@@ -5284,7 +5334,7 @@ mod tests {
         );
 
         // details = 1: the state, queue, lock, exception and trace lines.
-        let r1 = actor.manager_report(1);
+        let r1 = actor.manager_report(1, false);
         assert!(
             r1.contains("    enabled:Yes connected:Yes numberConnects 1"),
             "C :1059-1062 — including the count of connects: {r1}"
@@ -5321,7 +5371,7 @@ mod tests {
         );
 
         // details = 2: the interpose and interface lists (C :1078-1082).
-        let r2 = actor.manager_report(2);
+        let r2 = actor.manager_report(2, false);
         assert!(
             r2.contains("    interposeInterfaceList\n        asynOctet"),
             "the installed EOS interpose is an asynOctet interpose: {r2}"
@@ -5333,7 +5383,7 @@ mod tests {
         assert!(r2.contains("        asynOctet\n"), "…asynOctet among them");
 
         // A negative details is C's "detail, but no devices" (:1034-1037).
-        let rneg = actor.manager_report(-1);
+        let rneg = actor.manager_report(-1, false);
         assert!(
             rneg.contains("    enabled:Yes connected:Yes numberConnects 1"),
             "a negative details still prints the detail lines: {rneg}"
@@ -5347,7 +5397,7 @@ mod tests {
         let (mut actor, _tx) = build();
         actor.driver.base_mut().flags.destructible = true;
         actor.driver.base_mut().shutdown_lifecycle().unwrap();
-        assert_eq!(actor.manager_report(2), "rep_block destroyed\n");
+        assert_eq!(actor.manager_report(2, false), "rep_block destroyed\n");
     }
 
     /// W10-D6: C's `report` (asynManager.c:1138-1173) spawns a `reportPort` thread
@@ -5391,7 +5441,15 @@ mod tests {
             });
 
             let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-            send_and_wait(&tx, RequestOp::Report { level: 1 }, user).unwrap_or_else(|e| {
+            send_and_wait(
+                &tx,
+                RequestOp::Report {
+                    level: 1,
+                    sync_locked: false,
+                },
+                user,
+            )
+            .unwrap_or_else(|e| {
                 panic!(
                     "connected={connected} enabled={enabled}: C's report is a direct call \
                      and cannot be refused, got {e:?}"
@@ -5414,7 +5472,15 @@ mod tests {
             reports: reports.clone(),
         });
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        send_and_wait(&tx, RequestOp::Report { level: 1 }, user).unwrap();
+        send_and_wait(
+            &tx,
+            RequestOp::Report {
+                level: 1,
+                sync_locked: false,
+            },
+            user,
+        )
+        .unwrap();
         assert_eq!(
             reports.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -5451,7 +5517,7 @@ mod tests {
         // Boundary 1: the port auto-connects, one device does not.
         let (mut actor, _tx) = build(true);
         actor.driver.base_mut().set_auto_connect_addr(1, false);
-        let r = actor.manager_report(1);
+        let r = actor.manager_report(1, false);
         assert!(
             r.lines().next().unwrap().ends_with("autoConnect:Yes"),
             "the header line is the port's autoConnect: {r}"
@@ -5467,7 +5533,7 @@ mod tests {
 
         // Boundary 2: a manual-connect port — every device it creates inherits No.
         let (actor, _tx) = build(false);
-        let r = actor.manager_report(1);
+        let r = actor.manager_report(1, false);
         assert!(
             r.contains("addr 0 autoConnect No") && r.contains("addr 1 autoConnect No"),
             "a device of a manual-connect port must not claim autoConnect Yes: {r}"

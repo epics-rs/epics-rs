@@ -534,7 +534,7 @@ pub fn execute_commands(
                 TraceMask::FLOW,
                 function,
                 format_args!(
-                    "drvMotorAsyn::writeFloat64, reason={function}, pasynUser={:p} pAxis={:p}",
+                    "drvMotorAsyn::writeFloat64, reason={function}, pasynUser={:p} pAxis={:p}\n",
                     &user, motor as *const dyn AsynMotor as *const (),
                 ),
             );
@@ -549,7 +549,7 @@ pub fn execute_commands(
             } => {
                 let r = motor.move_absolute(&user, position, min_velocity, velocity, acceleration);
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} move absolute to {:.6}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}",
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} move absolute to {:.6}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}\n",
                     position, min_velocity, velocity, acceleration,
                 ));
                 r
@@ -562,7 +562,7 @@ pub fn execute_commands(
             } => {
                 let r = motor.move_relative(&user, distance, min_velocity, velocity, acceleration);
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} move relative by {:.6}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}",
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} move relative by {:.6}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}\n",
                     distance, min_velocity, velocity, acceleration,
                 ));
                 r
@@ -574,7 +574,7 @@ pub fn execute_commands(
             } => {
                 let r = motor.move_velocity(&user, min_velocity, velocity, acceleration);
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set port {port}, axis {axis} move with velocity of {:.6}, acceleration={:.6}",
+                    "asynMotorController:writeFloat64: Set port {port}, axis {axis} move with velocity of {:.6}, acceleration={:.6}\n",
                     velocity, acceleration,
                 ));
                 r
@@ -588,7 +588,7 @@ pub fn execute_commands(
                 let r = motor.home(&user, min_velocity, velocity, acceleration, forward);
                 let way = if forward { "FORWARDS" } else { "REVERSE" };
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} to home {way}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}",
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} to home {way}, base velocity={:.6}, velocity={:.6}, acceleration={:.6}\n",
                     min_velocity, velocity, acceleration,
                 ));
                 r
@@ -597,7 +597,7 @@ pub fn execute_commands(
             MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {
                 let r = motor.set_position(&user, position);
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} to position={:.6}",
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} to position={:.6}\n",
                     position
                 ));
                 r
@@ -605,7 +605,7 @@ pub fn execute_commands(
             MotorCommand::SetEncoderRatio { ratio } | MotorCommand::InitEncoderRatio { ratio } => {
                 let r = motor.set_encoder_ratio(&user, ratio);
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} encoder ratio={ratio:.6}"
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} encoder ratio={ratio:.6}\n"
                 ));
                 r
             }
@@ -622,7 +622,7 @@ pub fn execute_commands(
                 acceleration,
             } => {
                 flow(format_args!(
-                    "asynMotorController:writeInt32:: Starting a move to home for axis {axis}"
+                    "asynMotorController:writeInt32:: Starting a move to home for axis {axis}\n"
                 ));
                 // C hands the move to the moveToHome thread and writeInt32
                 // returns success; the thread reports a failure on its own.
@@ -637,7 +637,7 @@ pub fn execute_commands(
                     PidGainKind::Derivative => "derivative",
                 };
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} {what} gain={gain:.6}"
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} {what} gain={gain:.6}\n"
                 ));
                 r
             }
@@ -650,7 +650,7 @@ pub fn execute_commands(
                 };
                 let which = if high { "high" } else { "low" };
                 flow(format_args!(
-                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} {which} limit={:.6}",
+                    "asynMotorController:writeFloat64: Set driver {port}, axis {axis} {which} limit={:.6}\n",
                     position
                 ));
                 r
@@ -710,12 +710,12 @@ pub fn execute_commands(
                 CValue::Float64(v) => trace.print(
                     TraceMask::IO_DRIVER,
                     function,
-                    format_args!("drvMotorAsyn::writeFloat64, reason={function}, value={v:.6}"),
+                    format_args!("drvMotorAsyn::writeFloat64, reason={function}, value={v:.6}\n"),
                 ),
                 CValue::Int32(v) => trace.print(
                     TraceMask::IO_DRIVER,
                     function,
-                    format_args!("drvMotorAsyn::writeInt32, reason={function}, value={v}"),
+                    format_args!("drvMotorAsyn::writeInt32, reason={function}, value={v}\n"),
                 ),
             }
         } else if let Some((_, value)) = c {
@@ -729,7 +729,7 @@ pub fn execute_commands(
                         TraceMask::ERROR,
                         function,
                         format_args!(
-                            "asynMotorController:{iface} error, status={status} axis={axis}, function={function}, value={value}"
+                            "asynMotorController:{iface} error, status={status} axis={axis}, function={function}, value={value}\n"
                         ),
                     );
                 } else {
@@ -737,7 +737,7 @@ pub fn execute_commands(
                         TraceMask::IO_DRIVER,
                         function,
                         format_args!(
-                            "asynMotorController:{iface}:: axis={axis}, function={function}, value={value}"
+                            "asynMotorController:{iface}:: axis={axis}, function={function}, value={value}\n"
                         ),
                     );
                 }
@@ -753,7 +753,7 @@ pub fn execute_commands(
                 trace.print_self(
                     TraceMask::ERROR,
                     format_args!(
-                        "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={axis}"
+                        "asynMotorController:asynMotorMoveToHome: move to home failed in asynMotorController::asynMotorMoveToHome. Axis number={axis}\n"
                     ),
                 );
             }
@@ -834,7 +834,7 @@ fn dev_motor_asyn_reply(
                     TraceMask::ERROR,
                     function,
                     format_args!(
-                        "devMotorAsyn::asynCallback: {record} pasyn{{Float64,Int32}}->write returned {e}"
+                        "devMotorAsyn::asynCallback: {record} pasyn{{Float64,Int32}}->write returned {e}\n"
                     ),
                 );
             }
@@ -846,13 +846,13 @@ fn dev_motor_asyn_reply(
         None => trace.print(
             TraceMask::FLOW,
             reason,
-            format_args!("devMotorAsyn::init_controller, {record} set {what} to {value:.6}"),
+            format_args!("devMotorAsyn::init_controller, {record} set {what} to {value:.6}\n"),
         ),
         Some(_) => trace.print(
             TraceMask::ERROR,
             reason,
             format_args!(
-                "devMotorAsyn::init_controller, {record} failed to set {what} to {value:.6}"
+                "devMotorAsyn::init_controller, {record} failed to set {what} to {value:.6}\n"
             ),
         ),
     }

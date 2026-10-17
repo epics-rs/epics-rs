@@ -475,7 +475,7 @@ impl DeviceSupport for Unbound {
                     0,
                     TraceMask::ERROR,
                     format_args!(
-                        "devMotorAsyn::init_record, {name} connectDevice failed to {port}"
+                        "devMotorAsyn::init_record, {name} connectDevice failed to {port}\n"
                     ),
                 );
                 return Ok(bad(record));
@@ -495,14 +495,14 @@ impl DeviceSupport for Unbound {
                     )
                 };
                 print(format_args!(
-                    "asynPortDriver:getAddress: {port} invalid address={addr}, must be in range 0 to {}",
+                    "asynPortDriver:getAddress: {port} invalid address={addr}, must be in range 0 to {}\n",
                     num_axes - 1
                 ));
                 print(format_args!(
-                    "devMotorAsyn::findDrvInfo, {name} drvUserCreate failed for MOTOR_MOVE_REL"
+                    "devMotorAsyn::findDrvInfo, {name} drvUserCreate failed for MOTOR_MOVE_REL\n"
                 ));
                 let refused = format!(
-                    "asynPortDriver:getAddress: {port} invalid address={addr}, must be in range 0 to {}",
+                    "asynPortDriver:getAddress: {port} invalid address={addr}, must be in range 0 to {}\n",
                     num_axes - 1
                 );
                 // motorRecord's init_record still sends both dial limits
@@ -514,12 +514,12 @@ impl DeviceSupport for Unbound {
                     if auto_connect_due(port, *addr) {
                         print(format_args!("{refused}"));
                         print(format_args!(
-                            "{port} {addr} autoConnect could not connect: "
+                            "{port} {addr} autoConnect could not connect: \n"
                         ));
                     }
                     print(format_args!("{refused}"));
                     print(format_args!(
-                        "devMotorAsyn::asynCallback: {name} pasyn{{Float64,Int32}}->write returned "
+                        "devMotorAsyn::asynCallback: {name} pasyn{{Float64,Int32}}->write returned \n"
                     ));
                 }
                 return Ok(bad(record));

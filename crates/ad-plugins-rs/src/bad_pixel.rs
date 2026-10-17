@@ -309,7 +309,7 @@ impl NDPluginProcess for BadPixelProcessor {
             .print(
                 asyn_rs::trace::TraceMask::ERROR,
                 format!(
-                    "NDPluginBadPixel::readBadPixelFile JSON error parsing bad pixel file: {e}"
+                    "NDPluginBadPixel::readBadPixelFile JSON error parsing bad pixel file: {e}\n"
                 ),
             ),
         }

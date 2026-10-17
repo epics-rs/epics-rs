@@ -549,7 +549,7 @@ pub fn handle_pool_write_int32(
             None => port_base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
-                    "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+                    "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first\n"
                 ),
             ),
             Some(template) => {
@@ -560,7 +560,7 @@ pub fn handle_pool_write_int32(
                 if let Err(e) = pool.pre_allocate_buffers(template, count) {
                     port_base.trace_print(
                         TraceMask::ERROR,
-                        format_args!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}"),
+                        format_args!("asynNDArrayDriver::preAllocateBuffers: ERROR, {e}\n"),
                     );
                 }
                 refresh_pool_stats(port_base, params, pool)?;
@@ -613,7 +613,7 @@ pub(crate) fn trace_write_int32(
             file!(),
             line!(),
             format_args!(
-                "{driver_name}:writeInt32: error, status={} function={}, paramName={name}, value={value}",
+                "{driver_name}:writeInt32: error, status={} function={}, paramName={name}, value={value}\n",
                 e.c_status_code(),
                 user.reason,
             ),
@@ -623,7 +623,7 @@ pub(crate) fn trace_write_int32(
             file!(),
             line!(),
             format_args!(
-                "{driver_name}:writeInt32: function={}, paramName={name}, value={value}",
+                "{driver_name}:writeInt32: function={}, paramName={name}, value={value}\n",
                 user.reason,
             ),
         ),
@@ -1087,7 +1087,7 @@ fn expand_attribute_macros(port_base: &PortDriverBase, xml: String, macros: &str
     if expansion.errored() {
         port_base.trace_print(
             asyn_rs::trace::TraceMask::ERROR,
-            format_args!("asynNDArrayDriver::readNDAttributesFile, error expanding macros"),
+            format_args!("asynNDArrayDriver::readNDAttributesFile, error expanding macros\n"),
         );
         return xml;
     }
@@ -1236,7 +1236,7 @@ fn queued_count_updater(
                 0,
                 asyn_rs::trace::TraceMask::ERROR,
                 format_args!(
-                    "asynNDArrayDriver::asynNDArrayDriver error creating updateQueuedArrayCount thread"
+                    "asynNDArrayDriver::asynNDArrayDriver error creating updateQueuedArrayCount thread\n"
                 ),
             ),
         }

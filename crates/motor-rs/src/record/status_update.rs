@@ -9,7 +9,7 @@ impl MotorRecord {
             asyn_rs::trace::TraceMask::IO_DEVICE,
             trace.update_status_reason(),
             format_args!(
-                "{} devMotorAsyn::update_values, needUpdate={}",
+                "{} devMotorAsyn::update_values, needUpdate={}\n",
                 trace.record(),
                 i32::from(need_update)
             ),

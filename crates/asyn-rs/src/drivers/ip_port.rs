@@ -1399,7 +1399,7 @@ impl DrvAsynIPPort {
                     &self.base.port_name,
                     TraceMask::IO_DRIVER,
                     &buf[..r.nbytes_transferred],
-                    "read"
+                    "read\n"
                 );
                 // C drvAsynIPPort.c::readIt (815-819): a TCP EOF (reported
                 // as ASYN_EOM_END by the base read) is the *only* thing that
@@ -1443,7 +1443,7 @@ impl DrvAsynIPPort {
                         self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "read error, disconnecting: {}",
+                        "read error, disconnecting: {}\n",
                         failure.error
                     );
                     self.drop_connection();
@@ -1599,7 +1599,7 @@ impl DrvAsynIPPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::ERROR,
-            "Unable to restore parameters for port {}: {}",
+            "Unable to restore parameters for port {}: {}\n",
             self.base.port_name,
             e.message()
         );
@@ -1887,7 +1887,7 @@ impl PortDriver for DrvAsynIPPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "connected to {}:{} ({:?})",
+            "connected to {}:{} ({:?})\n",
             self.config.host,
             self.config.port,
             self.config.protocol
@@ -1904,7 +1904,7 @@ impl PortDriver for DrvAsynIPPort {
             self.base.trace,
             &self.base.port_name,
             TraceMask::FLOW,
-            "disconnect"
+            "disconnect\n"
         );
         self.io.inner = None;
         self.base.set_connected(false);
@@ -1964,7 +1964,7 @@ impl PortDriver for DrvAsynIPPort {
             &self.base.port_name,
             TraceMask::IO_DRIVER,
             data,
-            "write"
+            "write\n"
         );
         match self.with_base_link(|link| link.write(user, data)) {
             Ok(n) => Ok(n),
@@ -1980,7 +1980,7 @@ impl PortDriver for DrvAsynIPPort {
                         self.base.trace,
                         &self.base.port_name,
                         TraceMask::FLOW,
-                        "write error, disconnecting: {e}"
+                        "write error, disconnecting: {e}\n"
                     );
                     self.drop_connection();
                 }

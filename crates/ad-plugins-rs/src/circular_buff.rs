@@ -670,7 +670,7 @@ impl NDPluginProcess for CircularBuffProcessor {
             .print(
                 asyn_rs::trace::TraceMask::ERROR,
                 format!(
-                    "NDPluginCircularBuff::writeOctet error processing infix expression={value}, error={}",
+                    "NDPluginCircularBuff::writeOctet error processing infix expression={value}, error={}\n",
                     calc::calc_error_str(e.code()).unwrap_or("(null)")
                 ),
             ),
@@ -1603,7 +1603,7 @@ mod tests {
         );
         assert_eq!(
             out.trace[0].1,
-            "NDPluginCircularBuff::writeOctet error processing infix expression=A>, error=Incomplete expression, operand missing"
+            "NDPluginCircularBuff::writeOctet error processing infix expression=A>, error=Incomplete expression, operand missing\n"
         );
     }
 

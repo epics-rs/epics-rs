@@ -679,7 +679,7 @@ pub struct PortDriverBase {
 /// so an off-thread announcement still wakes the actor
 /// ([`PortDriverBase::exceptions_announced`]).
 ///
-/// Every clone shares one [`AnnouncerShared`]: a clone holds no state of its
+/// Every clone shares one `AnnouncerShared`: a clone holds no state of its
 /// own that a later bind or registration could leave behind.
 #[derive(Clone)]
 pub struct ExceptionAnnouncer {
@@ -972,7 +972,7 @@ impl PortDriverBase {
             file!(),
             line!(),
             format_args!(
-                "{}:{}: function={}, {}={}, value={}",
+                "{}:{}: function={}, {}={}, value={}\n",
                 writer.driver,
                 function_name,
                 user.reason,
@@ -1032,7 +1032,7 @@ impl PortDriverBase {
                 file!(),
                 line!(),
                 format_args!(
-                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}",
+                    "asynPortDriver:writeFloat64: error, status={} function={}, name={}, value={:.6}\n",
                     e.c_status_code(),
                     user.reason,
                     self.params.param_name(user.reason).unwrap_or(""),
@@ -1751,7 +1751,7 @@ impl PortDriverBase {
                 crate::trace::TraceMask::ERROR,
                 line!(),
                 format_args!(
-                    "asynPortDriver:drvUserCreate: addr={addr}, cannot find parameter {}",
+                    "asynPortDriver:drvUserCreate: addr={addr}, cannot find parameter {}\n",
                     req.drv_info
                 ),
             );
@@ -1762,7 +1762,7 @@ impl PortDriverBase {
             crate::trace::TraceMask::FLOW,
             line!(),
             format_args!(
-                "asynPortDriver:drvUserCreate: drvInfo={}, index={reason}",
+                "asynPortDriver:drvUserCreate: drvInfo={}, index={reason}\n",
                 req.drv_info
             ),
         );
@@ -1810,7 +1810,7 @@ impl PortDriverBase {
                 file!(),
                 line!(),
                 &format!(
-                    "asynPortDriver:getAddress: {} invalid address={address}, must be in range 0 to {}",
+                    "asynPortDriver:getAddress: {} invalid address={address}, must be in range 0 to {}\n",
                     self.port_name,
                     self.max_addr as i64 - 1
                 ),
@@ -1844,7 +1844,7 @@ impl PortDriverBase {
         self.trace_print(
             crate::trace::TraceMask::ERROR,
             format_args!(
-                "asynPortDriver:{function_name}: port={} error setting parameter {index} in list {addr}, {why}",
+                "asynPortDriver:{function_name}: port={} error setting parameter {index} in list {addr}, {why}\n",
                 self.port_name
             ),
         );
@@ -1869,13 +1869,13 @@ impl PortDriverBase {
             Some(name) if why != "bad index" => self.trace_print(
                 mask,
                 format_args!(
-                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} {name}, in list {addr}, {why}"
+                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} {name}, in list {addr}, {why}\n"
                 ),
             ),
             _ => self.trace_print(
                 mask,
                 format_args!(
-                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} in list {addr}, {why}"
+                    "asynPortDriver:{function_name}: port={port} error getting parameter {index} in list {addr}, {why}\n"
                 ),
             ),
         }
@@ -2633,7 +2633,7 @@ pub trait PortDriver: Any + Send + Sync {
             crate::trace::TraceMask::FLOW,
             file!(),
             line!(),
-            format_args!("asynPortDriver:connect:, pasynUser={user:p}"),
+            format_args!("asynPortDriver:connect:, pasynUser={user:p}\n"),
         );
         Ok(())
     }
@@ -2645,7 +2645,7 @@ pub trait PortDriver: Any + Send + Sync {
             crate::trace::TraceMask::FLOW,
             file!(),
             line!(),
-            format_args!("asynPortDriver:disconnect:, pasynUser={user:p}"),
+            format_args!("asynPortDriver:disconnect:, pasynUser={user:p}\n"),
         );
         Ok(())
     }
@@ -5798,11 +5798,11 @@ mod tests {
         let n = AtomicUsize::new(0);
 
         trace.set_trace_mask(Some("tprint"), TraceMask::empty());
-        base.trace_print(TraceMask::ERROR, format_args!("failed: {}", Counted(&n)));
+        base.trace_print(TraceMask::ERROR, format_args!("failed: {}\n", Counted(&n)));
         assert_eq!(n.load(Ordering::Relaxed), 0, "formatted with ERROR off");
 
         trace.set_trace_mask(Some("tprint"), TraceMask::ERROR);
-        base.trace_print(TraceMask::ERROR, format_args!("failed: {}", Counted(&n)));
+        base.trace_print(TraceMask::ERROR, format_args!("failed: {}\n", Counted(&n)));
         assert_eq!(n.load(Ordering::Relaxed), 1);
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.matches("failed: why\n").count(), 1, "{log:?}");

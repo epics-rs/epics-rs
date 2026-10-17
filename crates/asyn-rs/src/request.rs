@@ -1004,6 +1004,9 @@ pub enum RequestOp {
     /// asyn's `pport->lock` invariant for `report`).
     Report {
         level: i32,
+        /// C's `synchronousLock` try-lock (asynManager.c:1053). `PortHandle`
+        /// stamps it as the request is sent; a caller's value is replaced.
+        sync_locked: bool,
     },
     /// Run caller code against the driver from the actor — what C driver
     /// threads do between `lock()` and `unlock()` (asynPortDriver.cpp:3858).

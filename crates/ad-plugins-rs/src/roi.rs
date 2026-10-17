@@ -487,7 +487,7 @@ impl NDPluginProcess for ROIProcessor {
         let name = params.params.param_name(reason).unwrap_or("");
         outcome.print(
             asyn_rs::trace::TraceMask::ERROR,
-            format!("NDPluginROI:writeInt32: function={reason} {name}, value={value}"),
+            format!("NDPluginROI:writeInt32: function={reason} {name}, value={value}\n"),
         )
     }
 
@@ -725,7 +725,7 @@ mod tests {
             out.trace,
             vec![(
                 asyn_rs::trace::TraceMask::ERROR,
-                format!("NDPluginROI:writeInt32: function={threads} NUM_THREADS, value=98")
+                format!("NDPluginROI:writeInt32: function={threads} NUM_THREADS, value=98\n")
             )]
         );
         let out = proc.validate_int32(threads, 0, 1, WriteVerdict::Accept(1), &base);

@@ -776,7 +776,7 @@ mod tests {
             Duration::ZERO,
             InterfaceType::Octet,
         );
-        sio.print(0, TraceMask::ERROR, format_args!("unconnected line"));
+        sio.print(0, TraceMask::ERROR, format_args!("unconnected line\n"));
         trace.set_trace_file(None, TraceFile::default());
 
         let text = std::fs::read_to_string(&path).unwrap();

@@ -197,7 +197,7 @@ pub async fn mqtt_event_loop(
                     Err(e) => asyn_print(
                         &port_handle,
                         TraceMask::ERROR,
-                        format_args!("MqttDriver::onMessageCb: Non-UTF8 MQTT topic: {e}"),
+                        format_args!("MqttDriver::onMessageCb: Non-UTF8 MQTT topic: {e}\n"),
                     ),
                 }
             }
@@ -208,14 +208,14 @@ pub async fn mqtt_event_loop(
                     asyn_print(
                         &port_handle,
                         TraceMask::IO_DRIVER | TraceMask::ERROR,
-                        format_args!("MqttDriver::onConnectCb: Reconnected."),
+                        format_args!("MqttDriver::onConnectCb: Reconnected.\n"),
                     );
                 }
                 session = Session::Up;
                 asyn_print(
                     &port_handle,
                     TraceMask::IO_DRIVER,
-                    format_args!("MqttDriver::onConnectCb: Connected to broker"),
+                    format_args!("MqttDriver::onConnectCb: Connected to broker\n"),
                 );
                 // C parity: `onConnectCb` subscribes only the topics of records
                 // bound by `I/O Intr` / `asyn:READBACK` — the live
@@ -270,7 +270,7 @@ pub async fn mqtt_event_loop(
                             &port_handle,
                             TraceMask::ERROR,
                             format_args!(
-                                "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})"
+                                "MqttDriver::onDisconnectCb: Connection lost. Reconnecting... ({e})\n"
                             ),
                         );
                         session = Session::Spent;
@@ -444,7 +444,7 @@ fn print_fail(port_handle: &PortHandle, e: &str) {
     asyn_print(
         port_handle,
         TraceMask::ERROR,
-        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'"),
+        format_args!("MqttDriver::onFailCb: MQTT Operation error: 'Error: {e}'\n"),
     );
 }
 
@@ -462,7 +462,7 @@ fn subscribe(
         Ok(notice) => {
             let _ = acks.send(AckRequest::Owe(Owed {
                 ack: Box::pin(async move { subscribe_line(&notice.wait_async().await) }),
-                success: format!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'"),
+                success: format!("MqttDriver::onSubscribeCb: Subscribed to topic '{topic}'\n"),
             }));
         }
         Err(e) => {
@@ -659,7 +659,7 @@ async fn publish_task(
             Ok(notice) => {
                 let _ = acks.send(AckRequest::Owe(Owed {
                     ack: Box::pin(async move { publish_line(&notice.wait_async().await) }),
-                    success: format!("MqttDriver::onPublishCb: Published to topic '{topic}'"),
+                    success: format!("MqttDriver::onPublishCb: Published to topic '{topic}'\n"),
                 }));
             }
             Err(e) => print_fail(&port_handle, &e.to_string()),
@@ -835,12 +835,12 @@ fn report_drop(
     if json {
         let field = addr.json_field.as_deref().unwrap_or_default();
         report(format_args!(
-            "MqttDriver::onMessageCb: Failed to parse JSON payload for topic '{topic}', field '{field}': {why}"
+            "MqttDriver::onMessageCb: Failed to parse JSON payload for topic '{topic}', field '{field}': {why}\n"
         ));
     } else {
         // C's argument order, unbalanced `)` included.
         report(format_args!(
-            "MqttDriver::onMessageCb:{why}: Unexpected value received for topic: '{topic}': {})",
+            "MqttDriver::onMessageCb:{why}: Unexpected value received for topic: '{topic}': {})\n",
             CText(payload),
         ));
     }
@@ -2291,9 +2291,12 @@ mod tests {
         );
         assert!(batch.is_empty());
         assert_eq!(lines.len(), 3, "{lines:#?}");
-        // C: "%s::%s:%s: Unexpected value received for topic: '%s': %s)", the
+        // C: "%s::%s:%s: Unexpected value received for topic: '%s': %s)\n", the
         // cause before the topic and the whole payload last.
-        let tail = r#": Unexpected value received for topic: 'dev': {"temperature":"warm","battery":99.7})"#;
+        let tail = concat!(
+            r#": Unexpected value received for topic: 'dev': {"temperature":"warm","battery":99.7})"#,
+            "\n"
+        );
         for line in &lines[..2] {
             assert!(line.starts_with("MqttDriver::onMessageCb:"), "{line}");
             assert!(line.ends_with(tail), "{line}");
@@ -2323,7 +2326,7 @@ mod tests {
         assert!(batch.is_empty());
         assert_eq!(lines.len(), 1);
         assert!(
-            lines[0].ends_with(": Unexpected value received for topic: 'dev': x\u{FFFD}y)"),
+            lines[0].ends_with(": Unexpected value received for topic: 'dev': x\u{FFFD}y)\n"),
             "{}",
             lines[0]
         );

@@ -353,7 +353,7 @@ fn print_status_callback(trace: &MotorTrace, ds: &MotorDeviceState, status: &Mot
         TraceMask::IO_DEVICE,
         trace.status_reason(),
         format_args!(
-            "{} devMotorAsyn::statusCallback new value=[p:{:.6},e:{:.6},s:{:x}] {}{}",
+            "{} devMotorAsyn::statusCallback new value=[p:{:.6},e:{:.6},s:{:x}] {}{}\n",
             trace.record(),
             status.position,
             status.encoder_position,

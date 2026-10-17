@@ -381,7 +381,7 @@ impl MqttDriver {
             self.base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
-                    "MqttDriver::{function}: Failed to set value for topic '{topic}': {why}. asynStatus: {})",
+                    "MqttDriver::{function}: Failed to set value for topic '{topic}': {why}. asynStatus: {})\n",
                     AsynStatus::Error as i32
                 ),
             );
@@ -419,7 +419,7 @@ impl PortDriver for MqttDriver {
                     base.trace_print(
                         asyn_rs::trace::TraceMask::ERROR,
                         format_args!(
-                            "Autoparam::Driver: port={} could not parse '{drv_info}'",
+                            "Autoparam::Driver: port={} could not parse '{drv_info}'\n",
                             base.port_name
                         ),
                     );

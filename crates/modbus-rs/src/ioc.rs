@@ -872,7 +872,7 @@ impl ModbusPortDriver {
         self.base.trace_print(
             TraceMask::ERROR,
             format_args!(
-                "drvModbusAsyn::readPoller port {} offset {addr} {what}",
+                "drvModbusAsyn::readPoller port {} offset {addr} {what}\n",
                 self.base.port_name
             ),
         );
@@ -1280,7 +1280,7 @@ impl PortDriver for ModbusPortDriver {
             self.base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
-                    "drvModbusAsyn::drvUserCreate port {} invalid offset {addr}",
+                    "drvModbusAsyn::drvUserCreate port {} invalid offset {addr}\n",
                     self.base.port_name
                 ),
             );
@@ -1293,7 +1293,7 @@ impl PortDriver for ModbusPortDriver {
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "drvModbusAsyn::drvUserCreate port {} invalid drvUser: {drv_info}",
+                        "drvModbusAsyn::drvUserCreate port {} invalid drvUser: {drv_info}\n",
                         self.base.port_name
                     ),
                 );
@@ -1312,7 +1312,7 @@ impl PortDriver for ModbusPortDriver {
                     self.base.trace_print(
                         TraceMask::ERROR,
                         format_args!(
-                            "drvModbusAsyn::drvUserCreate port {} invalid string length: {suffix}",
+                            "drvModbusAsyn::drvUserCreate port {} invalid string length: {suffix}\n",
                             self.base.port_name
                         ),
                     );
@@ -1662,7 +1662,7 @@ impl PortDriver for ModbusPortDriver {
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
-                        "drvModbusAsyn::readPoller port {} poll cycle failed: {e}",
+                        "drvModbusAsyn::readPoller port {} poll cycle failed: {e}\n",
                         self.base.port_name
                     ),
                 );
@@ -2250,7 +2250,8 @@ impl CommandHandler for ModbusConfigHandler {
                     Err(outcome) => return Ok(outcome),
                 };
                 let _ = port_handle.with_driver_blocking(move |d: &mut ModbusHalfBuilt| {
-                    d.base.trace_print(TraceMask::ERROR, format_args!("{line}"))
+                    d.base
+                        .trace_print(TraceMask::ERROR, format_args!("{line}\n"))
                 });
                 return Ok(CommandOutcome::Continue);
             }

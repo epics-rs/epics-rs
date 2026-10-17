@@ -352,7 +352,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
             }
             return failed(
                 out,
-                "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first",
+                "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first\n",
             );
         }
         match self.file_base.mode() {
@@ -363,13 +363,13 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         p.write_message,
                         "ERROR: capture not supported in Single mode",
                     ),
-                    "NDPluginFile:doCapture ERROR: capture not supported in Single mode",
+                    "NDPluginFile:doCapture ERROR: capture not supported in Single mode\n",
                 );
             }
             NDFileMode::Capture if value != 0 && !has_array => {
                 return failed(
                     out,
-                    "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer",
+                    "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer\n",
                 );
             }
             NDFileMode::Stream => out = set_int(out, p.write_file, (value != 0) as i32),
@@ -1158,7 +1158,7 @@ mod tests {
             self.opens += 1;
             if self.fail_open {
                 return Err(ADError::Reported {
-                    lines: vec!["Mock::openFile cannot open".into()],
+                    lines: vec!["Mock::openFile cannot open\n".into()],
                     message: "cannot open".into(),
                 });
             }
@@ -1909,7 +1909,7 @@ mod tests {
                 out.trace,
                 vec![(
                     TraceMask::ERROR,
-                    "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first"
+                    "NDPluginFile::doCapture: ERROR, must collect an array to get dimensions first\n"
                         .to_string()
                 )]
             );
@@ -1929,7 +1929,7 @@ mod tests {
             out.trace,
             vec![(
                 TraceMask::ERROR,
-                "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer"
+                "NDPluginFile::doCapture ERROR: No arrays collected: cannot allocate capture buffer\n"
                     .to_string()
             )]
         );
@@ -2164,8 +2164,8 @@ mod tests {
         assert_eq!(
             out.trace,
             error_lines(&[
-                "Mock::openFile cannot open",
-                "NDPluginFile::openFileBase Error opening file /d/f_0, status=3",
+                "Mock::openFile cannot open\n",
+                "NDPluginFile::openFileBase Error opening file /d/f_0, status=3\n",
             ])
         );
         assert_eq!(
@@ -2184,7 +2184,7 @@ mod tests {
         let result = c.process_array(&Arc::new(array(2)));
         assert_eq!(
             result.trace,
-            error_lines(&["NDPluginFile::writeFileBase Error writing file, status=3"])
+            error_lines(&["NDPluginFile::writeFileBase Error writing file, status=3\n"])
         );
         let message = result.param_updates.iter().rev().find_map(|u| match u {
             ParamUpdate::Octet { reason, value, .. } if Some(*reason) == c.params.write_message => {
@@ -2204,7 +2204,7 @@ mod tests {
         let out = write_file(&mut c);
         assert_eq!(
             out.trace,
-            error_lines(&["NDPluginFile::closeFileBase Error closing file, status=3"])
+            error_lines(&["NDPluginFile::closeFileBase Error closing file, status=3\n"])
         );
         assert_eq!(
             message(&c, &out).as_deref(),
@@ -2217,7 +2217,7 @@ mod tests {
         let text = "Error renaming temporary file /d/f_0.tmp to /d/f_0";
         assert_eq!(
             out.trace,
-            error_lines(&[&format!("NDPluginFile::closeFileBase {text}")])
+            error_lines(&[&format!("NDPluginFile::closeFileBase {text}\n")])
         );
         assert_eq!(message(&c, &out).as_deref(), Some(text));
     }
@@ -2230,7 +2230,7 @@ mod tests {
         let out = c.write_int32(reason, 1, WriteVerdict::Accept(1));
         assert_eq!(
             out.trace,
-            error_lines(&["NDPluginFile::readFileBase Error  file /d/f_0, status=3"])
+            error_lines(&["NDPluginFile::readFileBase Error  file /d/f_0, status=3\n"])
         );
         assert_eq!(
             message(&c, &out).as_deref(),
@@ -2243,8 +2243,8 @@ mod tests {
         assert_eq!(
             out.trace,
             error_lines(&[
-                "Mock::openFile cannot open",
-                "NDPluginFile::readFileBase Error opening file /d/f_0, status=3",
+                "Mock::openFile cannot open\n",
+                "NDPluginFile::readFileBase Error opening file /d/f_0, status=3\n",
             ])
         );
     }

@@ -953,7 +953,7 @@ impl AsynDeviceSupport {
                 mask,
                 file!(),
                 line!(),
-                format_args!("{rec} {driver}{at} queueRequest status returned to normal"),
+                format_args!("{rec} {driver}{at} queueRequest status returned to normal\n"),
             );
         } else {
             let error = if array { "" } else { "error " };
@@ -961,7 +961,7 @@ impl AsynDeviceSupport {
                 mask,
                 file!(),
                 line!(),
-                format_args!("{rec} {driver}{at} queueRequest {error}{message}"),
+                format_args!("{rec} {driver}{at} queueRequest {error}{message}\n"),
             );
         }
     }
@@ -1455,14 +1455,14 @@ impl WriteReadSource {
                 crate::trace::TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("{rec} devAsynOctet::callbackWfWriteRead dbGet failed"),
+                format_args!("{rec} devAsynOctet::callbackWfWriteRead dbGet failed\n"),
             );
         } else {
             line.print(
                 crate::trace::TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("{rec} dbGet failed"),
+                format_args!("{rec} dbGet failed\n"),
             );
         }
     }
@@ -1741,7 +1741,7 @@ impl ProcessLine<'_> {
                             data,
                             file!(),
                             line!(),
-                            format_args!("{rec} devAsynOctet::writeIt"),
+                            format_args!("{rec} devAsynOctet::writeIt\n"),
                         );
                     }
                 }
@@ -1754,7 +1754,7 @@ impl ProcessLine<'_> {
                     TraceMask::ERROR,
                     file!(),
                     line!(),
-                    format_args!("{rec} devAsynOctet::{function} failed {message}"),
+                    format_args!("{rec} devAsynOctet::{function} failed {message}\n"),
                 );
             }
             (DevFile::Octet, None, Ok(r)) => {
@@ -1765,7 +1765,7 @@ impl ProcessLine<'_> {
                             file!(),
                             line!(),
                             format_args!(
-                                "{rec} devAsynOctet::writeIt requested {} but sent {} bytes",
+                                "{rec} devAsynOctet::writeIt requested {} but sent {} bytes\n",
                                 sent.len, r.nbytes
                             ),
                         );
@@ -1775,7 +1775,7 @@ impl ProcessLine<'_> {
                             data,
                             file!(),
                             line!(),
-                            format_args!("{rec} devAsynOctet::writeIt"),
+                            format_args!("{rec} devAsynOctet::writeIt\n"),
                         );
                     }
                 }
@@ -1785,7 +1785,7 @@ impl ProcessLine<'_> {
                         &data[..r.nbytes.min(data.len())],
                         file!(),
                         line!(),
-                        format_args!("{rec} devAsynOctet::readIt eomReason {}", r.eom_reason),
+                        format_args!("{rec} devAsynOctet::readIt eomReason {}\n", r.eom_reason),
                     );
                 }
             }
@@ -1793,7 +1793,7 @@ impl ProcessLine<'_> {
                 TraceMask::IO_DEVICE,
                 file!(),
                 line!(),
-                format_args!("{rec} devAsynXXXArray::queueRequestCallback OK"),
+                format_args!("{rec} devAsynXXXArray::queueRequestCallback OK\n"),
             ),
             (DevFile::Array, Some((status, message)), _) if status != *last => {
                 let verb = if sent.write { "write" } else { "read" };
@@ -1802,7 +1802,7 @@ impl ProcessLine<'_> {
                     file!(),
                     line!(),
                     format_args!(
-                        "{rec} devAsynXXXArray::queueRequestCallback {verb} error {message}"
+                        "{rec} devAsynXXXArray::queueRequestCallback {verb} error {message}\n"
                     ),
                 );
             }
@@ -1814,7 +1814,9 @@ impl ProcessLine<'_> {
                         TraceMask::IO_DEVICE,
                         file!(),
                         line!(),
-                        format_args!("{rec} {driver}::processCallbackOutput process value {value}"),
+                        format_args!(
+                            "{rec} {driver}::processCallbackOutput process value {value}\n"
+                        ),
                     );
                 } else if let Ok(r) = ran {
                     let value = Scalar::read(r);
@@ -1822,7 +1824,9 @@ impl ProcessLine<'_> {
                         TraceMask::IO_DEVICE,
                         file!(),
                         line!(),
-                        format_args!("{rec} {driver}::processCallbackInput process value={value}"),
+                        format_args!(
+                            "{rec} {driver}::processCallbackInput process value={value}\n"
+                        ),
                     );
                 }
             }
@@ -1837,7 +1841,7 @@ impl ProcessLine<'_> {
                     TraceMask::ERROR,
                     file!(),
                     line!(),
-                    format_args!("{rec} {driver}::{function} {what} {message}"),
+                    format_args!("{rec} {driver}::{function} {what} {message}\n"),
                 );
             }
             _ => {}

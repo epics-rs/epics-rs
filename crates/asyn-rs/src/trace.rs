@@ -289,9 +289,10 @@ impl TraceFile {
         }
     }
 
-    /// Stream one line, `body` then a newline, into the sink under its lock,
-    /// as C's `vfprintf(fp, ...)` writes a trace line of any length. Staged
-    /// in a stack buffer that spills when full, so nothing is allocated.
+    /// Stream `body` into the sink under its lock, as C's `vfprintf(fp, ...)`
+    /// writes a trace print of any length: nothing is added, so a line ends
+    /// where the caller's format ends it. Staged in a stack buffer that
+    /// spills when full, so nothing is allocated.
     fn write_streamed(&self, body: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result) {
         fn stream(
             out: &mut dyn std::io::Write,
@@ -302,9 +303,7 @@ impl TraceFile {
                 buf: [0; 512],
                 len: 0,
             };
-            if body(&mut spill).is_ok() {
-                let _ = std::fmt::Write::write_str(&mut spill, "\n");
-            }
+            let _ = body(&mut spill);
             let _ = spill.flush();
         }
         match self {
@@ -789,7 +788,7 @@ impl TraceManager {
             // C `traceVprint` (asynManager.c:3085-3088) delegates to the
             // source form with an empty file and line 0.
             let prefix = format_prefix_addr(port, addr, reason, ("", 0), cfg);
-            let line = format!("{prefix}{msg}\n");
+            let line = format!("{prefix}{msg}");
             cfg.file.write_line(&line);
         });
     }
@@ -859,7 +858,7 @@ impl TraceManager {
                 return;
             }
             let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
-            let out = format!("{prefix}{msg}\n");
+            let out = format!("{prefix}{msg}");
             cfg.file.write_line(&out);
         });
     }
@@ -887,9 +886,8 @@ impl TraceManager {
     /// participates in both config resolution AND the `[port,addr,reason]`
     /// `printPort` prefix.
     ///
-    /// The message line is the port's stand-in for C's `vfprintf(fp, pformat,
-    /// pvar)` — whose format string ends in `\n` at every asyn driver call site
-    /// — and the *data section* follows it, one block per enabled
+    /// `label` is C's `vfprintf(fp, pformat, pvar)` output, printed as given,
+    /// and the *data section* follows it, one block per enabled
     /// [`TraceIoMask`] bit (`append_io_data`).
     #[allow(clippy::too_many_arguments)]
     pub fn output_device_io(
@@ -908,7 +906,7 @@ impl TraceManager {
                 return;
             }
             let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
-            let mut out = format!("{prefix}{label}\n").into_bytes();
+            let mut out = format!("{prefix}{label}").into_bytes();
             append_io_data(&mut out, data, cfg);
             cfg.file.write_bytes(&out);
         });
@@ -1509,7 +1507,7 @@ mod tests {
 
     /// C `vfprintf`s a trace line into the file whole (asynManager.c:3106):
     /// a line far past the stack buffer, written both as one long piece and
-    /// as many short ones, lands uncut with one newline.
+    /// as many short ones, lands uncut.
     #[test]
     fn print_writes_a_long_line_uncut() {
         let dir = tempfile::tempdir().unwrap();
@@ -1522,17 +1520,43 @@ mod tests {
 
         let long = "x".repeat(1500);
         let short: Vec<String> = (0..400).map(|i| format!("{i},")).collect();
-        trace.print(None, None, 0, TraceMask::ERROR, format_args!("a{long}b"));
+        trace.print(None, None, 0, TraceMask::ERROR, format_args!("a{long}b\n"));
         trace.print(
             None,
             None,
             0,
             TraceMask::ERROR,
-            format_args!("{}", Join(&short)),
+            format_args!("{}\n", Join(&short)),
         );
 
         let got = std::fs::read_to_string(&path).unwrap();
         assert_eq!(got, format!("a{long}b\n{}\n", short.concat()));
+    }
+
+    /// C's `traceVprintSource` and `traceVprintIOSource` print the caller's
+    /// format as given (asynManager.c:3106, :3164): a C format's own `\n`
+    /// ends the line, and one without runs on into the next print.
+    #[test]
+    fn every_print_path_adds_nothing_to_the_callers_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let trace = TraceManager::new();
+        trace.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
+        trace.set_trace_mask(Some("p"), TraceMask::ERROR);
+        trace.set_trace_info_mask(Some("p"), TraceInfoMask::empty());
+        trace.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
+
+        let e = TraceMask::ERROR;
+        trace.print(Some("p"), None, 0, e, format_args!("print\n"));
+        trace.output_device("p", None, 0, e, "device\n");
+        trace.output_device_with_source("p", None, 0, e, "f.rs", 1, "source\n");
+        trace.output_device_io("p", None, 0, e, b"OK", "io\n", "f.rs", 1);
+        trace.print(Some("p"), None, 0, e, format_args!("no newline "));
+        trace.output_device("p", None, 0, e, "runs on\n");
+
+        let got = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(got, "print\ndevice\nsource\nio\nOK\nno newline runs on\n");
     }
 
     /// Displays its pieces with one `write_str` each.
@@ -2399,7 +2423,7 @@ mod tests {
             "p",
             TraceMask::IO_DRIVER,
             b"OK",
-            "read 2 bytes",
+            "read 2 bytes\n",
             "crates/asyn-rs/src/drivers/serial_port.rs",
             1355,
         );

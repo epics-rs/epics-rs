@@ -1658,7 +1658,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                         None,
                         0,
                         crate::trace::TraceMask::ERROR,
-                        format_args!("drvAsynIPServerPort: unable to create port {name}"),
+                        format_args!("drvAsynIPServerPort: unable to create port {name}\n"),
                     );
                 }
             }

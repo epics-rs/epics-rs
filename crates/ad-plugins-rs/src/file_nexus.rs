@@ -1058,7 +1058,7 @@ impl NDPluginProcess for NexusFileProcessor {
         }
         out.print(
             asyn_rs::trace::TraceMask::ERROR,
-            format!("NDFileNexus:loadTemplateFile: Parameter file {full} is invalid"),
+            format!("NDFileNexus:loadTemplateFile: Parameter file {full} is invalid\n"),
         )
     }
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
@@ -1438,7 +1438,7 @@ mod tests {
         )));
         assert_eq!(
             out.trace[0].1,
-            format!("NDFileNexus:loadTemplateFile: Parameter file {path} is invalid")
+            format!("NDFileNexus:loadTemplateFile: Parameter file {path} is invalid\n")
         );
         assert!(!proc.template.get(Option::is_some));
     }

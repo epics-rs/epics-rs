@@ -321,7 +321,7 @@ impl NDArrayPool {
                 port.port_name(),
                 asyn_rs::trace::TraceMask::ERROR,
                 &format!(
-                    "NDArrayPool::alloc:: error: reached limit of {} memory ({buffers} buffers)",
+                    "NDArrayPool::alloc:: error: reached limit of {} memory ({buffers} buffers)\n",
                     self.max_memory
                 ),
             );

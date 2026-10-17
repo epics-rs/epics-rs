@@ -561,6 +561,15 @@ mod tests {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("{src} -> {out}: {e}"))
     }
 
+    /// serde_json's default parser lands one ULP off here; C's strtod and the
+    /// `float_roundtrip` parser the workspace enables do not.
+    #[test]
+    fn a_double_parses_correctly_rounded() {
+        let v = parses(r#"{"const":-1.5432835417340557e+88}"#);
+        let got = v["const"].as_f64().unwrap();
+        assert_eq!(got.to_bits(), 0xd23f_0824_128b_2f33);
+    }
+
     #[test]
     fn strict_json_round_trips_unchanged() {
         let src = r#"{"arr":{"s":2,"i":2,"e":8}}"#;

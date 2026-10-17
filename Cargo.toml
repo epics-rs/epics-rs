@@ -74,6 +74,9 @@ optics-rs = { path = "crates/optics-rs", version = "0.32.0" }
 mca-rs = { path = "crates/mca-rs", version = "0.32.0" }
 mqtt-rs = { path = "crates/mqtt-rs", version = "0.32.0" }
 modbus-rs = { path = "crates/modbus-rs", version = "0.32.0", package = "epics-modbus-rs" }
+# float_roundtrip makes the parser correctly rounded, as C's strtod is;
+# without it some doubles parse 1 ULP off.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Record processing is frontend-bound -- 44.4 % of issue slots lost to
 # instruction fetch against C softIoc's 36.5 %, with backend stalls under 1 % on

@@ -40,7 +40,7 @@ hickory-client = { version = "0.24", default-features = false, features = ["dnss
 hickory-proto = { version = "0.24", default-features = false, features = ["dnssec-ring", "tokio-runtime"], optional = true }
 base64 = { version = "0.22", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
+serde_json = { workspace = true, optional = true }
 ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
 rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
 # Non-optional: the always-on `calink` module derives `thiserror::Error`

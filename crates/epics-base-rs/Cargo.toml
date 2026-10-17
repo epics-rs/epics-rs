@@ -37,7 +37,7 @@ epics-libcom-rs = { workspace = true }
 # alternative was writing the status set out twice, once in each IOC binary,
 # which is how two copies of a naming rule come to disagree.
 epics-rtems-boot = { workspace = true }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 # Host-only dependencies — gated out for the embedded targets (RTEMS's
 # armv7-rtems-eabihf, and the `*-wrs-vxworks*` triples).

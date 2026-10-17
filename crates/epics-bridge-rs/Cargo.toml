@@ -183,7 +183,7 @@ epics-pva-rs = { path = "../epics-pva-rs", version = "0.32.0", optional = true, 
 # Every host feature that pulls it restores `client`.
 epics-ca-rs = { path = "../epics-ca-rs", version = "0.32.0", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde_json = { workspace = true, optional = true }
 parking_lot = "0.12"
 arc-swap = "1"
 regex = { version = "1", optional = true }

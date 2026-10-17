@@ -833,9 +833,13 @@ impl ModbusPortDriver {
             // letting that decode abort the cycle silenced every `SCAN="I/O
             // Intr"` record on the port, every cycle, with IO_ERRORS reading
             // 0 because the wire transaction had succeeded. C never aborts
-            // either — `readPlcInt32` (drvModbusAsyn.cpp:1736) over-reads
-            // `data_` and fires the rest of the list — so the bounds check is
-            // right and only its blast radius was wrong.
+            // either: `readPlcInt64` reads `data_[offset+1]` (and +2, +3)
+            // with no bound (drvModbusAsyn.cpp:2487-2556, `readPlcFloat`
+            // :2808-2862), past the end of the `modbusLength_` buffer for an
+            // offset this narrow — a C defect, not copied — and fires the
+            // rest of the list. The decode runs on a failed read's transition
+            // cycle too, in C as here (:1644-1745 gate nothing on
+            // `ioStatus_`), so the refusal is printed with no device present.
             //
             // Narrowing the blast radius is not licence to say nothing: the
             // record then never processes, so the misconfiguration has no
@@ -843,7 +847,7 @@ impl ModbusPortDriver {
             // transaction succeeded, IO_ERRORS stays 0, and the operator sees
             // only a PV that never changes.
             if let Err(e) = self.fire_binding(reason, addr, force, port_gate, io_status) {
-                self.trace_binding_error(addr, &format!("data type does not fit: {e}"));
+                self.trace_binding_error(&format!("offset {addr} data type does not fit: {e}"));
                 self.fire_binding_failure(reason, addr);
             }
         }
@@ -859,20 +863,21 @@ impl ModbusPortDriver {
         self.force_callback = false;
     }
 
-    /// Report a binding the poll cycle could not service, in the shape C
-    /// prints it: `driverName::functionName port <port> <what> <offset>`
-    /// at `ASYN_TRACE_ERROR` (drvModbusAsyn.cpp:1723-1725 and :1730-1732).
+    /// Report a binding the poll cycle could not service as
+    /// `drvModbusAsyn::readPoller port <port> <what>` at `ASYN_TRACE_ERROR`,
+    /// C's shape (drvModbusAsyn.cpp:1723-1725 and :1730-1732); `what` is the
+    /// rest of C's line.
     ///
     /// The cycle skips the binding either way — this is the only thing that
     /// distinguishes a record whose offset is unserviceable from one whose
     /// device is simply quiet, since neither raises IO_ERRORS and neither
     /// moves the port's status off `asynSuccess`. Emitted every cycle, as C
     /// emits it, so `asynSetTraceMask <port> 0 0` is the same escape hatch.
-    fn trace_binding_error(&self, addr: i32, what: &str) {
+    fn trace_binding_error(&self, what: &str) {
         self.base.trace_print(
             TraceMask::ERROR,
             format_args!(
-                "drvModbusAsyn::readPoller port {} offset {addr} {what}\n",
+                "drvModbusAsyn::readPoller port {} {what}\n",
                 self.base.port_name
             ),
         );
@@ -934,10 +939,12 @@ impl ModbusPortDriver {
         io_status: AsynStatus,
     ) -> AsynResult<()> {
         let Ok(dt) = self.datatype_of(reason) else {
-            // C's `pasynUser->reason != P_Data` arm, which prints
-            // "invalid pasynUser->reason %d" at ASYN_TRACE_ERROR
-            // (drvModbusAsyn.cpp:1722-1727).
-            self.trace_binding_error(addr, &format!("invalid reason {reason}"));
+            // C's `pasynUser->reason != P_Data` arm (drvModbusAsyn.cpp:
+            // 1722-1727), reached by an `I/O Intr` READ_OK/IO_ERRORS record.
+            // C then `break`s, starving every later record on that interface
+            // list each poll — a C defect, not copied: only this binding is
+            // skipped here.
+            self.trace_binding_error(&format!("invalid pasynUser->reason {reason}"));
             return Ok(());
         };
         // Defense-in-depth: a subscriber may bind an out-of-range `addr`
@@ -949,7 +956,7 @@ impl ModbusPortDriver {
         let data = self.engine.data();
         if addr < 0 || addr as usize >= data.len() {
             let max = data.len();
-            self.trace_binding_error(addr, &format!("invalid memory request, max={max}"));
+            self.trace_binding_error(&format!("invalid memory request {addr}, max={max}"));
             self.fire_binding_failure(reason, addr);
             return Ok(());
         }
@@ -5552,6 +5559,90 @@ mod tests {
             "the skipped binding must name the port and the offset it could not \
              serve; the trace file holds {logged:?}"
         );
+    }
+
+    /// The two C-defined refusals print C's own text: `invalid
+    /// pasynUser->reason %d` (drvModbusAsyn.cpp:1723-1725), which an
+    /// `I/O Intr` READ_OK record reaches because it sits on the asynInt32
+    /// interrupt list with a reason that is not `P_Data`, and `invalid
+    /// memory request %d, max=%d` (:1730-1732).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_refusals_print_c_readpoller_text() {
+        use asyn_rs::services::PortServices;
+        use asyn_rs::trace::TraceFile;
+
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let driver = ModbusPortDriver::new(
+            "MB_TRACE_C_TEXT",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let read_ok = driver
+            .base
+            .find_param(PARAM_READ_OK)
+            .expect("READ_OK parameter must exist");
+        let good = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let read_reason = driver.read_reason;
+        let _subs: Vec<_> = [(read_ok, 0), (good, 99)]
+            .into_iter()
+            .map(|(reason, addr)| {
+                driver.base.interrupts.register_interrupt_user(
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(reason),
+                        addr: Some(addr),
+                        iface: Some(InterfaceType::Int32),
+                        ..Default::default()
+                    },
+                    4096,
+                )
+            })
+            .collect();
+
+        let path = std::env::temp_dir().join(format!(
+            "modbus_MB_TRACE_C_TEXT_{}.trace",
+            std::process::id()
+        ));
+        let services = PortServices::new();
+        services.trace().set_trace_file(
+            Some("MB_TRACE_C_TEXT"),
+            TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).expect("the trace sink must open"),
+            ))),
+        );
+        let (runtime, _jh) = create_port_runtime_unclaimed(
+            driver,
+            RuntimeConfig {
+                services,
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect("the modbus port runtime must start");
+        runtime
+            .port_handle()
+            .write_int32(read_reason, 0, 1)
+            .await
+            .expect("refused bindings must not fail the cycle");
+        runtime.shutdown();
+
+        let logged = std::fs::read_to_string(&path).expect("the trace sink must be readable");
+        let _ = std::fs::remove_file(&path);
+        for tail in [
+            format!(
+                "drvModbusAsyn::readPoller port MB_TRACE_C_TEXT invalid pasynUser->reason {read_ok}"
+            ),
+            "drvModbusAsyn::readPoller port MB_TRACE_C_TEXT invalid memory request 99, max=4"
+                .to_string(),
+        ] {
+            assert!(
+                logged.lines().any(|l| l.ends_with(&tail)),
+                "expected a line ending {tail:?}; the trace file holds {logged:?}"
+            );
+        }
     }
 
     /// BUG 1 regression — a statistics reason has no `reason_to_datatype`

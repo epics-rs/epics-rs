@@ -814,7 +814,7 @@ impl Record for MotorRecord {
     }
 
     /// The rest of C init_record after the device's init, when it gets
-    /// there: its tail and `monitor()` ([`MotorRecord::init_tail`]), and
+    /// there: its tail and `monitor()` (`MotorRecord::init_tail`), and
     /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
     /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
     /// collection's first read (1994-2005).

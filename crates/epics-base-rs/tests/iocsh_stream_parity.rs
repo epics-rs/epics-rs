@@ -256,6 +256,25 @@ const CASES: &[Case] = &[
         "cd\necho \"after\"\nafter\n",
         "Invalid directory path, ignored\n",
     ),
+    // --- a registered command's own failure is printed in its own text,
+    // unframed: `showError` frames only what `iocshBody` raises before
+    // the call (`iocsh.cpp:1272-1304`), and `onCallFunc` prints its
+    // usage itself (`:1529-1530`, `:1571-1573`) ---
+    (
+        "k31.cmd",
+        "on error bogus\necho \"after\"\n",
+        "on error bogus\necho \"after\"\nafter\n",
+        "Usage: on error [continue | break | halt | wait <delay>]\n",
+    ),
+    // --- a shell error inside `iocshCmd` is raised by an `iocshBody`
+    // whose filename is NULL, so it too wears no frame; that body's
+    // implied `on error break` then reports itself ---
+    (
+        "k32.cmd",
+        "iocshCmd \"dbpr A1 notanumber\"\necho \"after\"\n",
+        "iocshCmd \"dbpr A1 notanumber\"\necho \"after\"\nafter\n",
+        "Invalid integer 'notanumber'.\niocsh Error: Break\n",
+    ),
     // --- `iocshLoad`'s pathname up against the separator set: the `,` is
     // a separator like any other (`iocsh.cpp:271`), so the file opened is
     // `inner.iocsh` and not `inner.iocsh,`. The inner script's line is

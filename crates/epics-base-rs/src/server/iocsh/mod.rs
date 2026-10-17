@@ -752,21 +752,17 @@ impl IocShell {
                     // `on error break`.
                     let Some(path) = toks.get(1) else {
                         let _scope = self.push_macro_scope(&macros);
-                        return match self.run_repl() {
-                            Ok(()) => (Ok(CommandOutcome::Continue), Dispatch::Ran),
-                            Err(msg) => (Err(msg), Dispatch::Ran),
-                        };
+                        return self
+                            .command_ran(self.run_repl().map(|()| CommandOutcome::Continue));
                     };
                     // `iocshLoadCallFunc` is `iocshSetError(iocshLoad(...))`
                     // (`:1492-1495`) — the flag, not a second message, for
                     // the same reason as `<` above.
-                    return match self.run_script_with_macros(path, &macros) {
-                        Ok(()) => (Ok(CommandOutcome::Continue), Dispatch::Ran),
-                        Err(ScriptFailure::Reported(_)) => {
-                            (Ok(CommandOutcome::Failed), Dispatch::Ran)
-                        }
-                        Err(ScriptFailure::Unreported(msg)) => (Err(msg), Dispatch::Ran),
-                    };
+                    return self.command_ran(match self.run_script_with_macros(path, &macros) {
+                        Ok(()) => Ok(CommandOutcome::Continue),
+                        Err(ScriptFailure::Reported(_)) => Ok(CommandOutcome::Failed),
+                        Err(ScriptFailure::Unreported(msg)) => Err(msg),
+                    });
                 }
                 // `iocshCmd` and `iocshRun` are one entry point in C:
                 // `iocshCmd(cmd)` is literally `iocshRun(cmd, NULL)` and
@@ -791,13 +787,13 @@ impl IocShell {
                     let Some(cmd) = toks.get(1) else {
                         return (Ok(CommandOutcome::Continue), Dispatch::Ran);
                     };
-                    return (self.iocsh_cmd(cmd), Dispatch::Ran);
+                    return self.command_ran(self.iocsh_cmd(cmd));
                 }
                 // `on error continue|break|halt|wait <delay>` —
                 // sets how the running script reacts to a failing
                 // line. Mirrors C `iocsh.cpp` `onCallFunc`.
                 Some(b"on") => {
-                    return (self.handle_on_command(&toks), Dispatch::Ran);
+                    return self.command_ran(self.handle_on_command(&toks));
                 }
                 _ => {}
             }
@@ -823,7 +819,11 @@ impl IocShell {
         let _scope = self.enter_scope(IocshScope::command_line());
         let (outcome, dispatch) = self.execute_line_dispatched(cmd);
         let failure = match &outcome {
-            Err(e) => Some(e.clone()),
+            Err(e) => {
+                // `showError` with this scope's NULL filename: unframed.
+                self.show_error(e);
+                Some(e.clone())
+            }
             // The command reported for itself, as C's `iocshSetError`
             // callers do.
             Ok(CommandOutcome::Failed) => Some(String::new()),
@@ -834,7 +834,8 @@ impl IocShell {
         // before `if (raw != NULL) break;` ends the single-line loop, so the
         // implied Break still reports itself.
         let _ = self.react_to_error();
-        outcome
+        // Everything is said; C's `iocshCmd` hands back only the status.
+        outcome.or(Ok(CommandOutcome::Failed))
     }
 
     /// Execute a command, optionally redirecting output to a file.
@@ -932,7 +933,7 @@ impl IocShell {
 
             // Special handling for help — needs access to the registry
             if cmd_name == "help" {
-                return (self.execute_help(arg_tokens, &registry), Dispatch::Ran);
+                return self.command_ran(self.execute_help(arg_tokens, &registry));
             }
 
             // Every registered name is text, so a non-UTF-8 one misses as
@@ -977,7 +978,21 @@ impl IocShell {
             Ok(args) => args,
             Err(e) => return (Err(e), Dispatch::Nothing),
         };
-        (def.handler.call(&args, &self.ctx), Dispatch::Ran)
+        self.command_ran(def.handler.call(&args, &self.ctx))
+    }
+
+    /// The one rule for a line's diagnostic. C frames with `showError`
+    /// (`ERROR <file> line <n>:`) only what `iocshBody` raises before it
+    /// calls a function (`iocsh.cpp:1272-1304`); once a command runs, what
+    /// it prints is its own text, bare and on the stream it was given. So a
+    /// command's `Err` is printed here, inside any redirect, and leaves as
+    /// `Failed`: an `Err` past dispatch is always the shell's own.
+    fn command_ran(&self, result: CommandResult) -> (CommandResult, Dispatch) {
+        let result = result.or_else(|msg| {
+            self.ctx.eprintln(&msg);
+            Ok(CommandOutcome::Failed)
+        });
+        (result, Dispatch::Ran)
     }
 
     /// Execute a script with the `iocshLoad` macros pushed as a scope,
@@ -3366,7 +3381,10 @@ mod tests {
         let shell = make_shell();
         // TEST_REC was added by make_shell() — re-creating must fail.
         let r = shell.execute_line("dbCreateRecord pdbbase ai TEST_REC");
-        assert!(r.is_err(), "duplicate name must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "duplicate name must fail"
+        );
         // After the rejected call, the original record (val=42.0) is
         // still there, not overwritten. Verify with dbpr, which reads
         // the live record; `dbgf` cannot be the probe here because C
@@ -3382,14 +3400,20 @@ mod tests {
         // Space inside the name → validate_record_name returns Err.
         // Quote so the parser keeps the space as one argument.
         let r = shell.execute_line("dbCreateRecord pdbbase ai \"BAD NAME\"");
-        assert!(r.is_err(), "bad name must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "bad name must fail"
+        );
     }
 
     #[test]
     fn test_execute_line_db_create_record_rejects_unknown_type() {
         let shell = make_shell();
         let r = shell.execute_line("dbCreateRecord pdbbase nonexistent NEW_REC");
-        assert!(r.is_err(), "unknown record type must return Err");
+        assert!(
+            matches!(r, Ok(CommandOutcome::Failed)),
+            "unknown record type must fail"
+        );
     }
 
     /// UI-105 / epics-base#498 — a failing db* command must trip
@@ -3879,13 +3903,23 @@ mod tests {
         // C accepts the call and lets the body diagnose it:
         // `dbStaticIocRegister.c:294-295` at `f4ccf7bc8` sets
         // `S_dbLib_recordNameMissing` and `:307-308` prints it on stderr
-        // and sets the shell error, which is what Err carries here. The
-        // command is in no release tag, so it is absent at the `R7.0.10`
-        // pin.
-        match shell.execute_line("dbCreateRecord pdbbase ai") {
-            Err(msg) => assert_eq!(msg, "33554465 Record name is required"),
-            Ok(_) => panic!("a missing record name must fail the command"),
-        }
+        // and sets the shell error. The command is in no release tag, so
+        // it is absent at the `R7.0.10` pin.
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.err");
+        let result = shell
+            .ctx
+            .with_error(std::fs::File::create(&captured).unwrap(), || {
+                shell.execute_line("dbCreateRecord pdbbase ai")
+            });
+        assert!(
+            matches!(result, Ok(CommandOutcome::Failed)),
+            "a missing record name must fail the command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "33554465 Record name is required\n"
+        );
     }
 
     /// `iocshCmd("dbl")` runs a single command line by
@@ -4370,7 +4404,10 @@ mod tests {
         );
 
         assert!(
-            shell.execute_line("on error bogus").is_err(),
+            matches!(
+                shell.execute_line("on error bogus"),
+                Ok(CommandOutcome::Failed)
+            ),
             "an unrecognised mode is the one case C flags as an error"
         );
     }

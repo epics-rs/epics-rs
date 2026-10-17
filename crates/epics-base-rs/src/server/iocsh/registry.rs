@@ -219,7 +219,9 @@ pub enum CommandOutcome {
 /// Command result type.
 ///
 /// `Err(msg)` is C's "print `msg` AND mark the line errored"; the silent
-/// failure is [`CommandOutcome::Failed`] on the `Ok` side.
+/// failure is [`CommandOutcome::Failed`] on the `Ok` side. A handler's
+/// `msg` is printed exactly as given, with no `ERROR <file> line <n>:`
+/// frame: it stands for the text the C command prints itself.
 pub type CommandResult = Result<CommandOutcome, String>;
 
 /// Trait for command handlers.

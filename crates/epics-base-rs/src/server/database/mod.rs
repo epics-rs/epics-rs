@@ -46,7 +46,9 @@ pub use processing::{
     InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy};
-pub(crate) use record_lock::{CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard};
+pub(crate) use record_lock::{
+    CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_cvt,
+};
 pub use record_lock::{
     LockSetInfo, LockSetReport, ManyRecordWriteGuard, RecordWriteGuard, in_sync_driver_wait,
     scan_lock_held, sync_driver_wait,

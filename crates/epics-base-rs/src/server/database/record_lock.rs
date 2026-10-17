@@ -351,7 +351,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::server::record::RecordCell;
 use crate::server::record::record_instance::{HeldMut, RecordRef};
@@ -397,7 +397,10 @@ struct LockSet {
     /// — it drops its transient reference the moment it holds the mutex
     /// (`:220-222`) — which is why an idle set reports exactly as many refs as
     /// it has members, as the oracle capture in `iocsh`'s `dblsr` shows.
-    many_holds: AtomicUsize,
+    many_holds: AtomicU32,
+    /// [`Self::owed`] is not empty. Read by every fresh hold, so it shares
+    /// `many_holds`' word: the fields before [`Self::trace`] stay one line.
+    has_owed: AtomicBool,
     /// The mutex guard of the current outermost hold, kept here rather than
     /// in that hold's [`SetGuard`] so that a frame which does not own the
     /// guard can still give the set up and take it back — [`Self::unheld`],
@@ -408,6 +411,11 @@ struct LockSet {
     /// `dbProcess` is running under this set, as [`InFrame::trace_enter`]'s
     /// token, or 0. Written only under `lock`.
     trace: AtomicUsize,
+    /// Records whose `cvt_dbaddr` a lock-free resolve found busy
+    /// ([`owe_cvt`]): the next fresh hold of this set runs it
+    /// ([`Self::admit_owed`]) before the holder reads any of them. A leaf
+    /// lock, taken with or without the set.
+    owed: std::sync::Mutex<Vec<Arc<RecordCell>>>,
 }
 
 // SAFETY: `held` is the one non-`Sync` field, and it is read or written only
@@ -417,6 +425,10 @@ struct LockSet {
 // same thread that stashes it takes it out, so the `!Send` guard's
 // unlock-by-owner rule holds.
 unsafe impl Sync for LockSet {}
+
+// The scan walk prefetches the fields before `trace` as one line.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::offset_of!(LockSet, trace) == 64);
 
 /// The `'static` handle to a lock set. Sets are leaked: a guard hands out a
 /// `'static` borrow of the mutex, and a set outlives every record it holds —
@@ -536,7 +548,11 @@ impl LockRecord {
             return Some(set.reenter());
         }
         let guard = set.try_lock_fresh(me)?;
-        std::ptr::eq(self.set(), set).then_some(guard)
+        if !std::ptr::eq(self.set(), set) {
+            return None;
+        }
+        set.admit_owed();
+        Some(guard)
     }
 
     /// The set was not held. The common case is a free mutex and a record
@@ -547,6 +563,9 @@ impl LockRecord {
         let set = self.set();
         if let Some(guard) = set.try_lock_fresh(me) {
             if std::ptr::eq(self.set(), set) {
+                // After the re-check, where only the set is live, so the
+                // test costs no saved register.
+                set.admit_owed();
                 return guard;
             }
         }
@@ -596,6 +615,25 @@ impl LockRecord {
     }
 }
 
+/// Owe `cell`'s pending `cvt_dbaddr` to the set it is in, for that set's next
+/// fresh hold — a lock-free `dbNameToAddr` that found the record busy. The
+/// re-check closes a merge that moved the record between the read of its set
+/// and the push: the entry is pushed again behind the new set, and the stale
+/// one is skipped by the drain.
+pub(crate) fn owe_cvt(cell: &Arc<RecordCell>) {
+    loop {
+        let set = cell.lock_record().set();
+        {
+            let mut owed = set.owed.lock().unwrap_or_else(|e| e.into_inner());
+            owed.push(Arc::clone(cell));
+            set.has_owed.store(true, Ordering::Release);
+        }
+        if std::ptr::eq(cell.lock_record().set(), set) {
+            return;
+        }
+    }
+}
+
 /// C's `next_id` starts at 1 and `makeSet` uses the POST-increment
 /// (`dbLock.c:70`, `:87`), so C's first lock set is number 2. Matching it
 /// costs nothing and makes an A/B against a C IOC read straight across.
@@ -613,9 +651,11 @@ fn new_set(id: u64) -> Set {
         mutex_addr,
         owner: AtomicU64::new(0),
         depth: AtomicUsize::new(0),
-        many_holds: AtomicUsize::new(0),
+        many_holds: AtomicU32::new(0),
+        has_owed: AtomicBool::new(false),
         held: std::cell::UnsafeCell::new(None),
         trace: AtomicUsize::new(0),
+        owed: std::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -832,6 +872,61 @@ impl LockSet {
         self.depth.store(1, Ordering::Relaxed);
         #[cfg(debug_assertions)]
         SETS_HELD.with(|n| n.set(n.get() + 1));
+        self.admit_owed();
+    }
+
+    /// Run what [`owe_cvt`] left on this set. Called wherever a hold is taken
+    /// fresh — [`Self::lock_fresh`], and the callers of
+    /// [`Self::try_lock_fresh`] — where no borrow of any member can be live.
+    #[inline(always)]
+    fn admit_owed(&'static self) {
+        if self.has_owed.load(Ordering::Acquire) {
+            self.drain_owed();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drain_owed(&'static self) {
+        let cells = {
+            let mut owed = self.owed.lock().unwrap_or_else(|e| e.into_inner());
+            self.has_owed.store(false, Ordering::Relaxed);
+            std::mem::take(&mut *owed)
+        };
+        for cell in cells {
+            // An entry a merge moved elsewhere was forwarded by
+            // `Registry::place` or re-owed by `owe_cvt`'s re-check.
+            if std::ptr::eq(cell.lock_record().set(), self) {
+                // SAFETY: this thread took the set fresh, so no borrow of any
+                // member record is live.
+                unsafe { cell.apply_cvt_pending() };
+            }
+        }
+    }
+
+    /// Move `lr`'s owed cells to `to` — [`Registry::place`] moving the record.
+    ///
+    /// Always under `owed`, never on a `has_owed` test: [`owe_cvt`] stores the
+    /// flag and then loads the record's set, this stores the set and then
+    /// would load the flag, and both loads may see the old value. The mutex
+    /// orders the two: either this sees the entry, or `owe_cvt`'s re-check
+    /// sees the new set and owes it there. Merges are cold.
+    fn forward_owed(&self, lr: &LockRecord, to: Set) {
+        let mut owed = self.owed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut moved = Vec::new();
+        owed.retain(|cell| {
+            let mine = std::ptr::eq(&**cell.lock_record(), lr);
+            if mine {
+                moved.push(Arc::clone(cell));
+            }
+            !mine
+        });
+        drop(owed);
+        if !moved.is_empty() {
+            let mut dest = to.owed.lock().unwrap_or_else(|e| e.into_inner());
+            dest.extend(moved);
+            to.has_owed.store(true, Ordering::Release);
+        }
     }
 
     /// Release the mutex this thread holds and clear the hold. Only the
@@ -1178,7 +1273,13 @@ impl Registry {
         self.revision += 1;
         for name in names {
             match self.of_record.get(&name) {
-                Some(lr) => lr.store(set),
+                Some(lr) => {
+                    let old = lr.set();
+                    lr.store(set);
+                    if !std::ptr::eq(old, set) {
+                        old.forward_owed(lr, set);
+                    }
+                }
                 None => {
                     self.of_record.insert(name, LockRecord::new(set));
                 }
@@ -1411,7 +1512,7 @@ impl Registry {
         LockSetInfo {
             id,
             members: state.members.clone(),
-            refs: state.members.len() + state.set.many_holds.load(Ordering::Relaxed),
+            refs: state.members.len() + state.set.many_holds.load(Ordering::Relaxed) as usize,
             locked: state.set.is_locked(),
             mutex: rows.get(&state.set.mutex_addr).cloned(),
         }
@@ -2529,6 +2630,40 @@ mod tests {
             .record_locks
             .adopt(name.as_bytes(), cell.lock_record());
         cell
+    }
+
+    /// Boundary: a `cvt_dbaddr` owed to a set by a resolve that found the
+    /// record busy follows the record when a merge moves it. The emptied set
+    /// goes to the free list, where nothing holds it until `Registry::make_set`
+    /// hands it out again, and then its drain skips a record no longer in it:
+    /// an entry left there is never run.
+    #[test]
+    fn an_owed_cvt_dbaddr_follows_its_record_through_a_merge() {
+        use crate::server::record::{RecordCell, RecordInstance};
+        use crate::server::records::acalcout::AcalcoutRecord;
+        use crate::types::EpicsValue;
+        let db = PvDatabase::new();
+        let cell = RecordCell::new(
+            RecordInstance::new("OW:CALC", AcalcoutRecord::new()),
+            0,
+            false,
+            None,
+        );
+        db.inner.record_locks.adopt(b"OW:CALC", cell.lock_record());
+        db.build_lock_sets();
+        db.ensure_set(b"OW:B");
+        let amem = |cell: &RecordCell| cell.read().record.get_field("AMEM");
+
+        let busy = cell.write();
+        assert_eq!(cell.resolve_addr("AA"), Some(1));
+        db.merge_sets(b"OW:B", b"OW:CALC");
+        drop(busy);
+        assert_eq!(
+            db.inner.record_locks.set_id_of(b"OW:CALC"),
+            db.inner.record_locks.set_id_of(b"OW:B"),
+            "the record moved to the surviving set"
+        );
+        assert_eq!(amem(&cell), Some(EpicsValue::Long(8)));
     }
 
     /// Boundary `built == false`: a record adopted before `iocInit` waits on

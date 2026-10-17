@@ -92,7 +92,7 @@ pub fn char_view(inst: &RecordInstance, field: &str) -> Option<CharView> {
             let width = usize::from(served_element_size(&*inst.record, desc, DbfCode::String));
             match desc.declared_special {
                 Special::DbAddr => (
-                    inst.record.field_native_count(desc.name).unwrap_or(1) as usize,
+                    inst.record.dbaddr_count(desc.name).unwrap_or(1) as usize,
                     width,
                 ),
                 _ => (width, width),

@@ -2431,6 +2431,12 @@ pub struct RecordCell {
     /// (no read-modify-write) are enough — the atomic is for `Sync`, not for
     /// contention, and there is none.
     borrow: std::sync::atomic::AtomicIsize,
+    /// C `cvt_dbaddr` owed by a lock-free `dbNameToAddr`
+    /// ([`Self::resolve_addr`]): bit `i` is entry `i` of
+    /// [`Self::dbaddr_counts`]. A resolve that finds the record busy cannot
+    /// run [`super::Record::cvt_dbaddr`], so it owes the cell to its lock set,
+    /// and the set's next fresh hold runs it before anything reads the record.
+    cvt_pending: std::sync::atomic::AtomicU64,
     /// The type-static answers a process cycle tests — see [`ProcessPlan`].
     /// Fixed by the type, like `rdes`, so it is reachable without a borrow
     /// of the record.
@@ -2522,7 +2528,7 @@ fn dbaddr_counts_of(inst: &RecordInstance) -> Vec<(u16, u32)> {
         .filter(|(_, f)| !f.long_string && rec.field_is_dbaddr(f.name))
         .map(|(i, f)| {
             let count = rec
-                .field_native_count(f.name)
+                .dbaddr_count(f.name)
                 .or_else(|| inst.resolve_field(f.name).map(|v| v.count() as u32))
                 .unwrap_or(1);
             (i as u16, count)
@@ -3471,6 +3477,7 @@ impl RecordCell {
         Self {
             lock_record: crate::server::database::LockRecord::bootstrap(),
             borrow: std::sync::atomic::AtomicIsize::new(0),
+            cvt_pending: std::sync::atomic::AtomicU64::new(0),
             bkpt: instance.common.bkpt.share(),
             rdes: RecordDesc::of(&*instance.record),
             name: instance.name.clone(),
@@ -3568,6 +3575,55 @@ impl RecordCell {
                 .find(|(at, _)| usize::from(*at) == i)
                 .map_or(1, |(_, n)| *n),
         )
+    }
+
+    /// [`Self::no_elements`] as C's `dbNameToAddr` RUNS it: the record's
+    /// `cvt_dbaddr` too, now if the record is free, else owed to the next
+    /// fresh hold of its set (`record_lock::owe_cvt`).
+    pub(crate) fn resolve_addr(self: &Arc<Self>, field: &str) -> Option<u32> {
+        let count = self.no_elements(field)?;
+        let counts = self.dbaddr_counts.load();
+        let at = counts.iter().position(|(at, _)| {
+            self.rdes.fields[usize::from(*at)]
+                .name
+                .eq_ignore_ascii_case(field)
+        });
+        if let Some(bit) = at {
+            debug_assert!(bit < 64, "{} has over 64 SPC_DBADDR fields", self.name);
+            self.cvt_pending
+                .fetch_or(1 << bit, std::sync::atomic::Ordering::Release);
+            match self.try_read() {
+                // SAFETY: `_held` is a shared borrow of this record.
+                Some(_held) => unsafe { self.apply_cvt_pending() },
+                None => crate::server::database::owe_cvt(self),
+            }
+        }
+        Some(count)
+    }
+
+    /// Run the `cvt_dbaddr`s [`Self::resolve_addr`] left owed.
+    ///
+    /// # Safety
+    ///
+    /// This thread holds a guard of the record, or holds its lock set with no
+    /// borrow of the record live — so no `&mut` to the data exists.
+    pub(crate) unsafe fn apply_cvt_pending(&self) {
+        let mut owed = self
+            .cvt_pending
+            .swap(0, std::sync::atomic::Ordering::Acquire);
+        if owed == 0 {
+            return;
+        }
+        let counts = self.dbaddr_counts.load();
+        // SAFETY: the caller's contract.
+        let inst = unsafe { &*self.data.0.get() };
+        while owed != 0 {
+            let bit = owed.trailing_zeros() as usize;
+            owed &= owed - 1;
+            let (at, _) = counts[bit];
+            inst.record
+                .cvt_dbaddr(self.rdes.fields[usize::from(at)].name);
+        }
     }
 
     /// C `dbChannelCreate`'s `$` test (`dbChannel.c:486-503`) on the type
@@ -13395,6 +13451,7 @@ mod record_cell_layout_tests {
             data,
             lock_record,
             borrow,
+            cvt_pending,
             plan,
             name,
             // Not read by a process cycle from here on.

@@ -224,9 +224,8 @@ const PA_NAMES: [&str; 12] = [
 /// The ledger is held in atomics and every operation takes `&self`. That is not
 /// a concurrency feature: it is what lets the charge sit at C's OWN seam.
 /// `cvt_dbaddr` runs when a client resolves a channel on an `SPC_DBADDR` field,
-/// which reaches this port as [`AcalcoutRecord::dbaddr_capacity`] — a `&self`
-/// hook, because answering "how many elements does this channel have" is a
-/// read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
+/// which reaches this port as [`Record::cvt_dbaddr`] — a `&self` hook,
+/// because resolving a channel is a read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
 /// `fetch_or`, so the ledger stays a pure function of which buffers have been
 /// demanded, whoever asks and however often.
 mod array_mem {
@@ -1670,38 +1669,32 @@ impl Record for AcalcoutRecord {
     /// so that client never saw the array widen when `NUSE` grew — the exact
     /// reconnect problem the `SIZE` menu's own comment (`:619-626`) describes,
     /// arriving under the setting chosen to avoid it.
-    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        // This IS `cvt_dbaddr`, and its first act is the allocation
-        // (`aCalcoutRecord.c:589-617`) — the record cannot hand out a `pfield`
-        // for a buffer it has not `calloc`'d yet, so the charge belongs here and
-        // at no other read seam:
-        //
-        // ```c
-        // if (ppd[i] == NULL) {
-        //     ppd[i] = (double *)calloc(pcalc->nelm, sizeof(double));
-        //     pcalc->amem += pcalc->nelm * sizeof(double);
-        //     db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
-        //     pcalc->pmem = pcalc->amem;
-        // }
-        // paddr->pfield = ppd[i];
-        // ```
-        //
-        // C reaches it from `dbNameToAddr`, i.e. once per resolved channel;
-        // the port reaches it from `FieldDeclaration::field_native_count`,
-        // whose callers are CA create-channel (`epics-ca-rs` `server/tcp.rs`)
-        // and the three `dbNameToAddr`-shaped iocsh commands. `get_field` is
-        // NOT this seam even though C's `get_array_info` (`:653-658`) charges
-        // too: the framework reads every field through `get_field` for its own
-        // change detection on every cycle, and C's `dbGet` does no such thing,
-        // so charging there would allocate all fourteen buffers on cycle one.
-        //
-        // `field_native_count` has already refused any field the `.dbd` does
-        // not declare `special(SPC_DBADDR)`, which is exactly AVAL, AA..LL and
-        // OAV (`aCalcoutRecord.dbd`) — the fourteen buffers C allocates here.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.dbaddr_no_elements() as u32)
+    }
+
+    /// `cvt_dbaddr`'s first act is the allocation (`aCalcoutRecord.c:589-617`):
+    /// the record cannot hand out a `pfield` for a buffer it has not
+    /// `calloc`'d, so a channel resolving on AVAL, AA..LL or OAV charges it.
+    ///
+    /// ```c
+    /// if (ppd[i] == NULL) {
+    ///     ppd[i] = (double *)calloc(pcalc->nelm, sizeof(double));
+    ///     pcalc->amem += pcalc->nelm * sizeof(double);
+    ///     db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
+    ///     pcalc->pmem = pcalc->amem;
+    /// }
+    /// ```
+    ///
+    /// Not [`Record::dbaddr_capacity`]: the load settles all fourteen
+    /// capacities at once, and charging there read AMEM=112 on a record no
+    /// client had touched. Not `get_field` either, though C's `get_array_info`
+    /// (`:653-658`) charges: the framework reads every field through it on
+    /// every cycle for change detection, which C's `dbGet` does not.
+    fn cvt_dbaddr(&self, field: &str) {
         if let Some(buf) = Self::dbaddr_buf(field) {
             self.mem.allocate_for_dbaddr(buf, self.nelm);
         }
-        Some(self.dbaddr_no_elements() as u32)
     }
 
     /// C reads `prec->inpa..inpl / inaa..inll` off the record and copies nothing; the generic
@@ -3292,7 +3285,7 @@ mod tests {
     /// about to hand out a `pfield` for, charges it, posts AMEM with a literal
     /// `DBE_VALUE|DBE_LOG` and commits PMEM — all before the record has ever
     /// processed. Resolving a channel on `.AA` is what runs it, and here that
-    /// is `field_native_count` → `dbaddr_capacity`.
+    /// is `field_native_count` → `cvt_dbaddr`.
     #[test]
     fn resolving_a_channel_on_an_array_field_charges_it_like_cvt_dbaddr() {
         let rec = AcalcoutRecord::new();
@@ -3318,7 +3311,7 @@ mod tests {
         assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(16)));
     }
 
-    /// The reason the charge is at `dbaddr_capacity` and not at `get_field`.
+    /// The reason the charge is at `cvt_dbaddr` and not at `get_field`.
     /// The framework reads EVERY field through `get_field` on every cycle to
     /// change-detect it; C's `dbGet` does nothing of the kind. A process cycle
     /// must therefore charge its four buffers and no more — not the fourteen

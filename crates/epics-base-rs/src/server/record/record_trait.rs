@@ -3429,7 +3429,16 @@ pub trait FieldDeclaration {
     /// number ([`Record::dbaddr_capacity`]) — so the population comes from the
     /// one declaration every consumer already goes through, and a record cannot
     /// advertise a capacity for a field C would never have handed one.
+    ///
+    /// This is C's `cvt_dbaddr` RUNNING — a channel resolving on `field` — so
+    /// it first gives the record its [`Record::cvt_dbaddr`]. A caller that
+    /// only needs the number asks [`Self::dbaddr_count`].
     fn field_native_count(&self, field: &str) -> Option<u32>;
+
+    /// [`Self::field_native_count`]'s number, with no resolve behind it: the
+    /// load-time settlement of the lock-free `dbNameToAddr` counts asks every
+    /// `SPC_DBADDR` field at once, which C never does.
+    fn dbaddr_count(&self, field: &str) -> Option<u32>;
 
     /// C `paddr->pfldDes->special == SPC_DBADDR` — the field's STATIC `.dbd`
     /// declaration, and the single owner of "is this an ARRAY destination".
@@ -3470,6 +3479,14 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
     }
 
     fn field_native_count(&self, field: &str) -> Option<u32> {
+        if !self.field_is_dbaddr(field) {
+            return None;
+        }
+        self.cvt_dbaddr(field);
+        self.dbaddr_capacity(field)
+    }
+
+    fn dbaddr_count(&self, field: &str) -> Option<u32> {
         if !self.field_is_dbaddr(field) {
             return None;
         }
@@ -5234,6 +5251,12 @@ pub trait Record: Send + Sync + 'static {
     fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
         None
     }
+
+    /// What C's `cvt_dbaddr` DOES to the record before answering — acalcout
+    /// `calloc`s and charges the buffer it hands out (`aCalcoutRecord.c:589-617`).
+    /// Run only when a channel resolves on the `SPC_DBADDR` field `field`
+    /// ([`FieldDeclaration::field_native_count`]), never by a capacity query.
+    fn cvt_dbaddr(&self, _field: &str) {}
 
     /// The `paddr->field_size` this record's `cvt_dbaddr` stores for the
     /// `SPC_DBADDR` field `field`, when it is not the declaration's own

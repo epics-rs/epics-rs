@@ -786,7 +786,7 @@ impl AsyncDbHandle {
             return Some(pv.snapshot().value.count() as u32);
         }
         let (base, field) = super::parse_pv_name(name);
-        let count = db.get_record(base)?.no_elements(field)?;
+        let count = db.get_record(base)?.resolve_addr(field)?;
         db.db_get_snapshot(name, None);
         Some(count)
     }

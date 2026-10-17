@@ -3863,6 +3863,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "stream-rs"
+version = "0.32.0"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "tempfile",
+]
+
+[[package]]
 name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

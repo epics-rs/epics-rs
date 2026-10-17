@@ -1,0 +1,17 @@
+[package]
+name = "stream-rs"
+version.workspace = true
+edition.workspace = true
+description = "Rust port of PSI StreamDevice: protocol parser, buffers and the bus/converter/core boundaries"
+# A port of StreamDevice, which is LGPL-3.0-or-later (LICENSE.LESSER,
+# with the GPL text it extends in LICENSE).
+license = "LGPL-3.0-or-later"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = "0.4"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

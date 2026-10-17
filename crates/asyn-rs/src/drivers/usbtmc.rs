@@ -261,7 +261,6 @@ impl DrvAsynUsbtmcPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(!config.no_auto_connect());
         Ok(Self {
             base,

@@ -225,6 +225,8 @@ pub enum PortCommand {
     /// `locateDevice(..., TRUE)`. Appended last: the variant order is the
     /// wire encoding.
     ConnectUser,
+    /// C `pasynManager->exceptionDisconnect`. Appended last, as above.
+    ExceptionDisconnect,
 }
 
 #[cfg(test)]
@@ -316,6 +318,7 @@ mod tests {
                 connect_queue: true,
             },
             PortCommand::ConnectUser,
+            PortCommand::ExceptionDisconnect,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

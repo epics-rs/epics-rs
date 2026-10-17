@@ -159,7 +159,7 @@ fn blocking_port_record() -> (AsynRecord, epics_base_rs::server::database::PvDat
         rx,
     );
     let link = actor.link();
-    std::thread::spawn(move || actor.run());
+    std::thread::spawn(actor.registered());
     let mut handle = PortHandle::new(
         tx,
         "ALLOCIO".into(),
@@ -309,7 +309,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
             rx,
         );
         let link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let mut handle = PortHandle::new(
             tx,
             "ALLOCSP".into(),
@@ -384,7 +384,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(Device { base }), rx);
         let link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let mut handle = PortHandle::new(
             tx,
             "ALLOCRF".into(),
@@ -566,7 +566,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
             rx,
         );
         let link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             "QTIMER".into(),

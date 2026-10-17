@@ -1165,23 +1165,10 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
     if is_nonfatal_read_timeout(e.kind()) {
         AsynError::Status {
             status: AsynStatus::Timeout,
-            message: sock_err_text(&e),
+            message: super::errno_text(&e),
         }
     } else {
         AsynError::Io(e)
-    }
-}
-
-/// C `epicsSocketConvertErrnoToString`: the error's own text — for an errno,
-/// `strerror`'s, without std's ` (os error N)`.
-pub(crate) fn sock_err_text(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match e.raw_os_error() {
-        Some(code) => match text.strip_suffix(&format!(" (os error {code})")) {
-            Some(bare) => bare.to_owned(),
-            None => text,
-        },
-        None => text,
     }
 }
 
@@ -1193,14 +1180,17 @@ pub(crate) fn sock_err_text(e: &std::io::Error) -> String {
 fn connect_failure_text(device: &str, e: &socket::TcpConnectError) -> String {
     match e {
         socket::TcpConnectError::Setup(setup) => setup_failure_text(device, setup),
-        _ => format!("Can't connect to {device}: {}", sock_err_text(e.sockerr())),
+        _ => format!(
+            "Can't connect to {device}: {}",
+            super::errno_text(e.sockerr())
+        ),
     }
 }
 
 /// C `connectIt`'s text for each setup call that fails before `connect()`
 /// (drvAsynIPPort.c:443-524); `device` is C's `IPDeviceName`, the hostInfo.
 fn setup_failure_text(device: &str, e: &socket::SetupError) -> String {
-    let err = sock_err_text(&e.error);
+    let err = super::errno_text(&e.error);
     match e.step {
         socket::SetupStep::Create => format!("Can't create socket: {err}"),
         socket::SetupStep::Bind => format!("unable to bind to local port: {err}"),
@@ -1283,7 +1273,7 @@ pub(crate) fn would_block_text() -> String {
     let errno = libc::EWOULDBLOCK;
     #[cfg(windows)]
     let errno = windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK;
-    sock_err_text(&std::io::Error::from_raw_os_error(errno))
+    super::errno_text(&std::io::Error::from_raw_os_error(errno))
 }
 
 /// The errno C's non-blocking `connect()` leaves for a pending handshake, which
@@ -1295,21 +1285,24 @@ fn connect_in_progress_text() -> String {
     let errno = libc::EINPROGRESS;
     #[cfg(windows)]
     let errno = windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK;
-    sock_err_text(&std::io::Error::from_raw_os_error(errno))
+    super::errno_text(&std::io::Error::from_raw_os_error(errno))
 }
 
 /// C's `TCP_NODELAY` failure after the connect (drvAsynIPPort.c:580-589).
 fn nodelay_failure_text(device: &str, e: &std::io::Error) -> String {
     format!(
         "Can't set {device} socket NODELAY option: {}",
-        sock_err_text(e)
+        super::errno_text(e)
     )
 }
 
 /// C's `setNonBlock` failure (drvAsynIPPort.c:516-523), for libcom's switch
 /// around the bounded connect and for [`IpIoInner::own_blocking_mode`] alike.
 pub(crate) fn nonblock_failure_text(device: &str, e: &std::io::Error) -> String {
-    format!("Can't set {device} O_NONBLOCK option: {}", sock_err_text(e))
+    format!(
+        "Can't set {device} O_NONBLOCK option: {}",
+        super::errno_text(e)
+    )
 }
 
 /// The `sockerrmsg` a failed read carries up to [`classify_read_failure`]:
@@ -1317,7 +1310,7 @@ pub(crate) fn nonblock_failure_text(device: &str, e: &std::io::Error) -> String 
 fn sock_err_cause(e: &AsynError) -> String {
     match e {
         AsynError::PartialRead { source, .. } => sock_err_cause(source),
-        AsynError::Io(io) => sock_err_text(io),
+        AsynError::Io(io) => super::errno_text(io),
         other => other.message(),
     }
 }
@@ -1474,7 +1467,6 @@ impl DrvAsynIPPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynIPPort.c:1109): every successful octet read on this port fans out to
@@ -1769,7 +1761,11 @@ impl DrvAsynIPPort {
         let stream = std::os::unix::net::UnixStream::connect(&self.config.host).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("Can't connect to {}: {}", self.host_info, sock_err_text(&e)),
+                message: format!(
+                    "Can't connect to {}: {}",
+                    self.host_info,
+                    super::errno_text(&e)
+                ),
             }
         })?;
         Ok(stream)
@@ -1828,7 +1824,7 @@ impl PortDriver for DrvAsynIPPort {
         if self.io.inner.is_some() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("{}: Link already open!", self.base.port_name),
+                message: format!("{}: Link already open!", self.host_info),
             });
         }
         // Built into a local and installed by `publish_transport` below, never
@@ -3650,6 +3646,10 @@ mod tests {
 
         let err = drv.connect(&user).unwrap_err();
         assert!(matches!(err, AsynError::Status { .. }));
+        assert_eq!(
+            err.message(),
+            format!("127.0.0.1:{port}: Link already open!")
+        );
         // The original socket is left intact (still connected).
         assert!(drv.base().is_connected());
     }

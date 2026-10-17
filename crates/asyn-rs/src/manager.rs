@@ -280,11 +280,18 @@ impl PortManager {
     /// published to the process registry (`drvAsyn*PortConfigure`, plugin and
     /// driver ports), so `asynReport` sees the whole IOC rather than only the
     /// ports that happened to be created through this manager.
+    ///
+    /// In registration order, C's `asynPortList` order; a manager port whose
+    /// registry entry was withdrawn externally follows.
     pub fn list_port_names(&self) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> =
-            self.port_handles.lock().keys().cloned().collect();
-        names.extend(crate::registry::port_names());
-        names.into_iter().collect()
+        let mut names = crate::registry::port_names();
+        let mut stale: Vec<String> = (self.port_handles.lock().keys())
+            .filter(|name| !names.contains(name))
+            .cloned()
+            .collect();
+        stale.sort_unstable();
+        names.append(&mut stale);
+        names
     }
 }
 
@@ -790,9 +797,10 @@ mod tests {
         mgr.register_port_unclaimed(drv, &crate::registry::open_owner())
             .unwrap();
 
-        // The runtime sends a Started event but not via the exception manager.
-        // Exception manager is injected for driver-level exceptions.
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+        // Registration's connect is the one exception: the port starts down
+        // and its connect announces `asynExceptionConnect` (asynManager.c:523,
+        // :2133-2137).
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

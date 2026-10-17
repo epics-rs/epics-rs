@@ -419,6 +419,10 @@ impl OctetInterpose for EosInterpose {
     /// the *previous* connection's traffic, and an `eos_in_match == 1` left
     /// over from a 2-byte terminator that straddled the drop makes the first
     /// byte of the new session complete a spurious EOS match.
+    fn exception_user(&self) -> bool {
+        true
+    }
+
     fn connection_changed(&mut self) {
         // The connect exception is port-level: C fires it at every `eosPvt`
         // registered on the port — `exceptionOccurred` (asynManager.c:640)

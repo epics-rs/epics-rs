@@ -50,7 +50,16 @@ enum Slot {
 /// Shared port registry — can be injected into multiple IOC instances.
 #[derive(Clone)]
 pub struct PortRegistry {
-    inner: Arc<Mutex<HashMap<String, Slot>>>,
+    inner: Arc<Mutex<Ports>>,
+}
+
+/// The slots by name, each with the claim's sequence number: C's
+/// `asynPortList` is in `registerPort` order (asynManager.c:2097), and the
+/// claim is that call.
+#[derive(Default)]
+struct Ports {
+    next: u64,
+    slots: HashMap<String, (u64, Slot)>,
 }
 
 /// A port name held for a port still being built. C's `asynPortDriver`
@@ -104,8 +113,8 @@ impl PortClaim {
         let registry = self.registry.clone();
         let mut reg = registry.inner.lock().unwrap();
         // Only this claim's own `Drop` frees a claimed slot, so it is still ours.
-        match reg.get_mut(&self.name) {
-            Some(slot @ Slot::Claimed) => *slot = Slot::Published(PortEntry { handle }),
+        match reg.slots.get_mut(&self.name) {
+            Some((_, slot @ Slot::Claimed)) => *slot = Slot::Published(PortEntry { handle }),
             _ => unreachable!("claimed slot {} left its claim", self.name),
         }
         self.published = true;
@@ -148,9 +157,9 @@ impl Drop for PortClaim {
             return;
         }
         if let Ok(mut reg) = self.registry.inner.lock()
-            && matches!(reg.get(&self.name), Some(Slot::Claimed))
+            && matches!(reg.slots.get(&self.name), Some((_, Slot::Claimed)))
         {
-            reg.remove(&self.name);
+            reg.slots.remove(&self.name);
         }
     }
 }
@@ -164,7 +173,7 @@ impl Default for PortRegistry {
 impl PortRegistry {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(Ports::default())),
         }
     }
 
@@ -195,13 +204,15 @@ impl PortRegistry {
     /// as C `registerPort` refuses a duplicate.
     pub fn claim(&self, name: &str) -> AsynResult<PortClaim> {
         let mut reg = self.inner.lock().unwrap();
-        match reg.entry(name.to_string()) {
+        let seq = reg.next;
+        match reg.slots.entry(name.to_string()) {
             Entry::Occupied(_) => {
                 report_already_registered(name);
                 Err(AsynError::PortAlreadyRegistered(name.to_string()))
             }
             Entry::Vacant(slot) => {
-                slot.insert(Slot::Claimed);
+                slot.insert((seq, Slot::Claimed));
+                reg.next += 1;
                 Ok(PortClaim {
                     registry: self.clone(),
                     name: name.to_string(),
@@ -228,34 +239,37 @@ impl PortRegistry {
 
     pub fn get(&self, name: &str) -> Option<PortEntry> {
         let reg = self.inner.lock().ok()?;
-        match reg.get(name)? {
+        match &reg.slots.get(name)?.1 {
             Slot::Published(entry) => Some(entry.clone()),
             Slot::Claimed => None,
         }
     }
 
-    /// Names of every published port, in arbitrary order.
+    /// Names of every published port, in registration order.
     ///
     /// C parity: `asynManager::report` with no port argument walks the
     /// global port list. Since every port creator publishes here, this is
     /// that list.
     pub fn names(&self) -> Vec<String> {
-        match self.inner.lock() {
-            Ok(reg) => reg
-                .iter()
-                .filter(|(_, slot)| matches!(slot, Slot::Published(_)))
-                .map(|(name, _)| name.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        let Ok(reg) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut named: Vec<(u64, &String)> = reg
+            .slots
+            .iter()
+            .filter(|(_, (_, slot))| matches!(slot, Slot::Published(_)))
+            .map(|(name, (seq, _))| (*seq, name))
+            .collect();
+        named.sort_unstable();
+        named.into_iter().map(|(_, name)| name.clone()).collect()
     }
 
     /// Withdraw a published port. A name that was never published, or is
     /// claimed by a port still being built, is a no-op.
     pub fn remove(&self, name: &str) {
         if let Ok(mut reg) = self.inner.lock()
-            && let Entry::Occupied(slot) = reg.entry(name.to_string())
-            && matches!(slot.get(), Slot::Published(_))
+            && let Entry::Occupied(slot) = reg.slots.entry(name.to_string())
+            && matches!(slot.get().1, Slot::Published(_))
         {
             slot.remove();
         }
@@ -393,6 +407,27 @@ mod tests {
 
     /// `remove()` withdraws published ports only: a claim survives it, so no
     /// other creator can take the name before the claim publishes.
+    /// C's `asynPortList` is in `registerPort` order, and the claim is that
+    /// call: a port published later than one claimed after it still lists
+    /// first, and an unpublished claim is not listed.
+    #[test]
+    fn names_are_in_claim_order() {
+        let reg = PortRegistry::new();
+        reg.register("zeta", dummy_handle("zeta"), &open_owner())
+            .unwrap();
+        let alpha = reg.claim("alpha").unwrap();
+        let mid = reg.claim("mid").unwrap();
+        let pending = reg.claim("pending").unwrap();
+        mid.publish(dummy_handle("mid"), &open_owner()).unwrap();
+        alpha.publish(dummy_handle("alpha"), &open_owner()).unwrap();
+        assert_eq!(reg.names(), ["zeta", "alpha", "mid"]);
+        drop(pending);
+        reg.remove("zeta");
+        reg.register("zeta", dummy_handle("zeta"), &open_owner())
+            .unwrap();
+        assert_eq!(reg.names(), ["alpha", "mid", "zeta"]);
+    }
+
     #[test]
     fn remove_leaves_a_pending_claim_alone() {
         let reg = PortRegistry::new();

@@ -602,6 +602,14 @@ mod tests {
     use super::*;
     use asyn_rs::port::PortDriver;
 
+    /// The driver as registration leaves it: its port starts down and the
+    /// registration connect brings it up (asynManager.c:523, :2133-2137).
+    fn registered(port_name: &str, sim: Arc<Mutex<SimHsc>>) -> HscDriver {
+        let mut driver = HscDriver::new(port_name, sim).unwrap();
+        driver.connect(&AsynUser::default()).unwrap();
+        driver
+    }
+
     #[test]
     fn test_sim_hsc_initial_state() {
         let sim = SimHsc::new();
@@ -691,7 +699,7 @@ mod tests {
             s.right.position = 1.5;
         }
 
-        let mut driver = HscDriver::new("test_hsc", sim).unwrap();
+        let mut driver = registered("test_hsc", sim);
         driver.poll().unwrap();
 
         let p = driver.params();
@@ -713,7 +721,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_h_gap() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_gap", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_gap", sim.clone());
 
         // Write H_CENTER first, then H_GAP
         let p = driver.params;
@@ -734,7 +742,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_individual_blades() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_blades", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_blades", sim.clone());
 
         let p = driver.params;
         // Pre-set the target params so individual blade writes pick them up
@@ -758,7 +766,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_write_power_level() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_pwr", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_pwr", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.power_level);
@@ -771,7 +779,7 @@ mod tests {
     #[test]
     fn test_hsc_driver_busy_flag() {
         let sim = Arc::new(Mutex::new(SimHsc::new()));
-        let mut driver = HscDriver::new("test_hsc_busy", sim.clone()).unwrap();
+        let mut driver = registered("test_hsc_busy", sim.clone());
 
         // Initially not moving
         driver.poll().unwrap();

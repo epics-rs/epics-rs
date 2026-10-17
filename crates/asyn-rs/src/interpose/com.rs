@@ -265,6 +265,10 @@ fn next_char(next: &mut dyn OctetNext, user: &AsynUser) -> Result<u8, String> {
 }
 
 impl OctetInterpose for ComInterpose {
+    fn exception_user(&self) -> bool {
+        true
+    }
+
     /// C `readIt` (:197-245) — unstuff doubled IACs in place.
     ///
     /// The loop is C's, index-for-pointer. Two arms:

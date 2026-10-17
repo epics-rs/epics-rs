@@ -282,7 +282,6 @@ impl DrvVxi11Port {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(!no_auto_connect);
         Ok(Self {
             base,

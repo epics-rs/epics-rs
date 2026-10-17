@@ -146,7 +146,6 @@ impl DrvAsynFtdiPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(!no_auto_connect);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynFTDIPort.cpp:616): every successful octet read on this port fans out to

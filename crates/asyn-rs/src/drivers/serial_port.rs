@@ -1078,7 +1078,6 @@ impl DrvAsynSerialPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPort.c:1125-1126): every successful octet read on this port fans out to
@@ -2956,6 +2955,19 @@ mod tests {
             live.c_cflag & libc::CRTSCTS,
             0,
             "crtscts=Y set while disconnected must land on the device at connect"
+        );
+    }
+
+    /// C `connectIt`'s open refusal names the device and `strerror`
+    /// (drvAsynSerialPort.c:707-711).
+    #[test]
+    fn a_missing_device_is_refused_with_c_s_text() {
+        let mut drv = DrvAsynSerialPort::new("no_tty", "/dev/epics-rs-no-such-tty").unwrap();
+        let err = drv.connect(&AsynUser::default()).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error);
+        assert_eq!(
+            err.message(),
+            "/dev/epics-rs-no-such-tty Can't open  No such file or directory"
         );
     }
 

@@ -504,6 +504,14 @@ mod tests {
     use super::*;
     use asyn_rs::port::PortDriver;
 
+    /// The driver as registration leaves it: its port starts down and the
+    /// registration connect brings it up (asynManager.c:523, :2133-2137).
+    fn registered(port_name: &str, sim: Arc<Mutex<SimQxbpm>>) -> QxbpmDriver {
+        let mut driver = QxbpmDriver::new(port_name, sim).unwrap();
+        driver.connect(&AsynUser::default()).unwrap();
+        driver
+    }
+
     #[test]
     fn test_sim_qxbpm_centered() {
         let sim = SimQxbpm::new(0.0, 0.0);
@@ -572,7 +580,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_poll_updates_params() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(1.0, -0.5)));
-        let mut driver = QxbpmDriver::new("test_qxbpm", sim).unwrap();
+        let mut driver = registered("test_qxbpm", sim);
         driver.poll().unwrap();
 
         let p = driver.params();
@@ -597,7 +605,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_write_gain() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)));
-        let mut driver = QxbpmDriver::new("test_qxbpm_gain", sim.clone()).unwrap();
+        let mut driver = registered("test_qxbpm_gain", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.gain);
@@ -610,7 +618,7 @@ mod tests {
     #[test]
     fn test_qxbpm_driver_write_mode() {
         let sim = Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)));
-        let mut driver = QxbpmDriver::new("test_qxbpm_mode", sim.clone()).unwrap();
+        let mut driver = registered("test_qxbpm_mode", sim.clone());
 
         let p = driver.params;
         let mut user = AsynUser::new(p.mode);

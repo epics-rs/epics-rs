@@ -1435,15 +1435,13 @@ impl PortHandle {
         Ok(())
     }
 
-    /// Run the port driver's `report(level)` callback on the actor
-    /// thread. Mirrors C asyn `asynReport` (asynShellCommands.c:586)
-    /// which calls `pasynManager->report` to walk each port's
-    /// `pasynCommon->report` interface. Output is written to stderr
-    /// by the driver itself.
-    pub fn report_blocking(&self, level: i32) -> AsynResult<()> {
+    /// The port's `reportPrintPort` text (asynManager.c:1020-1124): the
+    /// manager block, then the driver's `report(level)`, run on the actor
+    /// thread. The caller picks the stream, as C's caller passes `fp`.
+    pub fn report_blocking(&self, level: i32) -> AsynResult<String> {
         let user = AsynUser::default();
-        self.submit_blocking(RequestOp::Report { level }, user)?;
-        Ok(())
+        let result = self.submit_blocking(RequestOp::Report { level }, user)?;
+        Ok(String::from_utf8_lossy(result.data.as_deref().unwrap_or_default()).into_owned())
     }
 
     /// Apply input EOS bytes to the port through the actor — C
@@ -1526,6 +1524,34 @@ impl PortHandle {
     /// [`crate::port::DpCells`]).
     pub fn connect_device(&self, addr: i32) -> crate::port::DpCells {
         self.devices.connect_user(addr)
+    }
+
+    /// C `exceptionCallbackAdd` (asynManager.c:1364-1382) for a user bound to
+    /// `addr`; dropping the guard is `exceptionCallbackRemove`. The callback
+    /// runs on the announcing thread — this port's actor, mid-transition — so
+    /// it may read [`Self::connect_device`]'s cells but must not wait on this
+    /// port.
+    pub fn exception_callback_add<F>(
+        &self,
+        addr: i32,
+        callback: F,
+    ) -> crate::exception::ExceptionCallbackGuard
+    where
+        F: Fn(&crate::exception::ExceptionEvent<'_>) + Send + Sync + 'static,
+    {
+        self.devices.exception_callback_add(addr, callback)
+    }
+
+    /// C `exceptionDisconnect` (asynManager.c:2165-2190) for a user bound to
+    /// `addr`. Queued without waiting: its caller is typically another port's
+    /// exception callback, running on that port's actor, and C's callers
+    /// ignore the status (drvLove.c:686).
+    pub fn exception_disconnect(&self, addr: i32) -> AsynResult<()> {
+        self.try_submit(
+            RequestOp::ExceptionDisconnect,
+            AsynUser::default().with_addr(addr),
+        )
+        .map(drop)
     }
 
     /// Was the port shut down? See [`crate::port::DeviceTable::is_defunct`].
@@ -1864,7 +1890,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-handle-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         PortHandle::new(
             tx,
@@ -1894,8 +1920,9 @@ mod tests {
             fn done(self: Arc<Self>) {}
         }
 
+        // Down from the start (asynManager.c:523), and nothing connects it.
         let mut down = TestDriver::new();
-        down.base.set_connected(false);
+        down.base.init_auto_connect(false);
         let handle = make_handle(down);
         let (tx, _rx) = std_mpsc::sync_channel(1);
         let cell = handle.new_cell(Arc::new(Ran(tx)));
@@ -2182,7 +2209,7 @@ mod tests {
             .expect("connectDevice waited on the actor");
         assert!(enabled, "a new device is seeded from the port's dpCommon");
 
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let devices = handle
             .with_driver_blocking(|d: &mut TestDriver| {
                 d.base
@@ -2380,7 +2407,7 @@ mod tests {
         let (tx, mut queued) = mpsc::unbounded_channel();
         let (relay, rx) = mpsc::unbounded_channel();
         let mut hand_on = || relay.send(queued.blocking_recv().unwrap()).unwrap();
-        let actor = PortActor::new(
+        let mut actor = PortActor::new(
             Box::new(Drops {
                 base,
                 entered: entered_tx,
@@ -2389,6 +2416,10 @@ mod tests {
             }),
             rx,
         );
+        // The line is up at registration and stays down once it drops.
+        line_up.store(true, Ordering::SeqCst);
+        actor.register();
+        line_up.store(false, Ordering::SeqCst);
         let link = actor.link();
         // The production loop: the test loop runs no connect-retry timer.
         let (_shutdown, shutdown_rx) = mpsc::channel(1);
@@ -2617,8 +2648,7 @@ mod tests {
             destructible: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new("lock_port", 1, flags);
-        base.set_connected(false);
+        let base = PortDriverBase::new("lock_port", 1, flags);
         let dir = tempfile::tempdir().expect("fixture root");
         let trace_path = dir.path().join("lock_port_trace.txt");
         base.trace
@@ -2633,6 +2663,10 @@ mod tests {
             base,
             connects: connects.clone(),
         });
+        // Registration's attempt and its pass's own (asynManager.c:2135,
+        // :858-863).
+        let registered = connects.load(Ordering::SeqCst);
+        assert_eq!(registered, 2);
 
         // Down: the driver's error, not the gate's asynDisconnected.
         match handle.lock_port_blocking(read).unwrap() {
@@ -2644,7 +2678,7 @@ mod tests {
         }
         assert_eq!(
             connects.load(Ordering::SeqCst),
-            0,
+            registered,
             "lockPort never autoconnects"
         );
 
@@ -2879,7 +2913,7 @@ mod tests {
         handle.set_auto_connect(2, false).unwrap();
         handle.set_enable(2, false).unwrap();
         handle.set_enable(-1, true).unwrap();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         handle
             .with_driver_blocking(|_: &mut TestDriver| ())
             .unwrap();
@@ -2978,9 +3012,10 @@ mod tests {
             }
         }
 
+        // A GPIB link is multi-device; a single-device port hands -1 (getAddr).
         let mut handle = make_handle(GpibDrv(PortDriverBase::new(
             "gpib_vtable",
-            1,
+            32,
             PortFlags::default(),
         )));
         handle.set_interfaces(vec![Capability::Gpib]);
@@ -3767,5 +3802,162 @@ mod tests {
             .wait_blocking(Duration::ZERO)
             .expect("the reply was already queued");
         assert_eq!(result.nbytes, 3);
+    }
+
+    /// A down-counting driver for the exception-callback tests: C
+    /// `exceptionDisconnect` must not reach the driver's `disconnect`.
+    struct Counted {
+        base: PortDriverBase,
+        disconnects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PortDriver for Counted {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+            self.disconnects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.base_mut().set_addr_connected(user.addr, false);
+            Ok(())
+        }
+    }
+
+    fn counted_port(
+        name: &str,
+        max_addr: usize,
+    ) -> (PortHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        let disconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = make_handle(Counted {
+            base: PortDriverBase::new(name, max_addr, PortFlags::default()),
+            disconnects: disconnects.clone(),
+        });
+        handle.connect_blocking().unwrap();
+        (handle, disconnects)
+    }
+
+    type Events = Arc<parking_lot::Mutex<Vec<(crate::exception::AsynException, i32)>>>;
+
+    fn recorder(
+        events: &Events,
+    ) -> impl Fn(&crate::exception::ExceptionEvent<'_>) + Send + Sync + 'static {
+        let events = events.clone();
+        move |e| events.lock().push((e.exception, e.addr))
+    }
+
+    /// The answer of a direct op queued behind `exception_disconnect`, which
+    /// does not wait for its own.
+    fn connected_after(handle: &PortHandle, addr: i32) -> bool {
+        let r = handle
+            .submit_blocking(RequestOp::GetConnected, AsynUser::default().with_addr(addr))
+            .unwrap();
+        r.int_val == Some(1)
+    }
+
+    /// C keeps one `exceptionUserList` per `dpCommon` (asynManager.c:1364-1382)
+    /// and `announceExceptionOccurred` walks the list of the one that changed
+    /// (:613-639): a port user hears the port, a device user its device.
+    #[test]
+    fn an_exception_callback_hears_only_its_own_dp_common() {
+        use crate::exception::AsynException;
+        let (handle, _) = counted_port("exc_dp", 4);
+        handle.connect_addr_blocking(1).unwrap();
+        handle.connect_addr_blocking(2).unwrap();
+        let port = Events::default();
+        let dev1 = Events::default();
+        let _p = handle.exception_callback_add(-1, recorder(&port));
+        let _d = handle.exception_callback_add(1, recorder(&dev1));
+
+        handle.exception_disconnect(2).unwrap();
+        handle.exception_disconnect(1).unwrap();
+        assert!(!connected_after(&handle, 1));
+        assert_eq!(*dev1.lock(), [(AsynException::Connect, 1)]);
+        assert!(port.lock().is_empty(), "{:?}", port.lock());
+
+        handle.disconnect_blocking().unwrap();
+        assert_eq!(*port.lock(), [(AsynException::Connect, -1)]);
+        assert_eq!(dev1.lock().len(), 1);
+    }
+
+    /// Dropping the guard is C `exceptionCallbackRemove` (asynManager.c:1384-1408),
+    /// and `asynReport`'s `exceptionUsers` counts the list of the `dpCommon` it
+    /// prints (:1070-1074, :1098).
+    #[test]
+    fn dropping_the_guard_removes_the_callback_from_its_dp_common() {
+        let (handle, _) = counted_port("exc_drop", 4);
+        handle.connect_addr_blocking(1).unwrap();
+        let events = Events::default();
+        let guard = handle.exception_callback_add(1, recorder(&events));
+        let report = handle.report_blocking(1).unwrap();
+        assert!(
+            report.contains("exceptionActive:No exceptionUsers 0 exceptionNotifys 0"),
+            "{report}"
+        );
+        assert!(
+            report.contains("exceptionActive No exceptionUsers 1 exceptionNotifys 0"),
+            "{report}"
+        );
+
+        drop(guard);
+        handle.exception_disconnect(1).unwrap();
+        assert!(!connected_after(&handle, 1));
+        assert!(events.lock().is_empty(), "{:?}", events.lock());
+        let report = handle.report_blocking(1).unwrap();
+        assert!(!report.contains("exceptionUsers 1"), "{report}");
+    }
+
+    /// C `exceptionDisconnect` (asynManager.c:2165-2190) marks the `dpCommon`
+    /// down and announces it without the driver's `disconnect`, and refuses a
+    /// `dpCommon` that is already down.
+    #[test]
+    fn exception_disconnect_downs_the_port_without_the_driver() {
+        use crate::exception::AsynException;
+        let (handle, disconnects) = counted_port("exc_down", 1);
+        let events = Events::default();
+        let _g = handle.exception_callback_add(0, recorder(&events));
+
+        handle
+            .submit_blocking(RequestOp::ExceptionDisconnect, AsynUser::default())
+            .unwrap();
+        assert!(!connected_after(&handle, -1));
+        assert_eq!(*events.lock(), [(AsynException::Connect, -1)]);
+        assert_eq!(disconnects.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let e = handle
+            .submit_blocking(RequestOp::ExceptionDisconnect, AsynUser::default())
+            .unwrap_err();
+        assert_eq!(
+            e.message(),
+            "exc_down addr -1 asynManager:exceptionDisconnect but not connected"
+        );
+        assert_eq!(events.lock().len(), 1);
+    }
+
+    /// drvLove.c:663-687: a layered port's callback on the serial port under it
+    /// takes the layered port down when the serial port drops — from the serial
+    /// port's actor, which must not wait on the layered one.
+    #[test]
+    fn a_layered_port_goes_down_when_the_port_under_it_drops() {
+        let (serial, _) = counted_port("exc_s0", 1);
+        let (layer, layer_disconnects) = counted_port("exc_l0", 1);
+        let under = serial.connect_device(-1);
+        let over = layer.connect_device(-1);
+        let on_layer = layer.clone();
+        let _g = serial.exception_callback_add(-1, move |_| {
+            if !under.connected() && over.connected() {
+                on_layer.exception_disconnect(-1).unwrap();
+            }
+        });
+
+        assert!(connected_after(&layer, -1));
+        serial.disconnect_blocking().unwrap();
+        assert!(!connected_after(&layer, -1));
+        assert_eq!(
+            layer_disconnects.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

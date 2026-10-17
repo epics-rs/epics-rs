@@ -68,6 +68,10 @@ use crate::user::AsynUser;
 /// the startup shell and the interactive shell a table each; the table is now
 /// one, so the second call would only displace the name with itself.
 pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) -> IocApplication {
+    epics_base_rs::server::driver_support::register_driver_support(
+        "drvAsyn",
+        Arc::new(DrvAsyn(mgr.clone())),
+    );
     for def in build_asyn_commands(mgr) {
         app = app.register_startup_command(def);
     }
@@ -372,19 +376,45 @@ fn shell_enable_target(
 }
 
 fn report_ports(mgr: &Arc<PortManager>, level: i32, port: Option<&str>) {
+    use std::io::Write as _;
+    // `asynReport` passes `stdout` to `pasynManager->report`
+    // (asynShellCommands.c:589): an answer to an operator's iocsh question
+    // belongs where a `>` redirect captures it, not on stderr.
+    print!("{}", ports_report(mgr, level, port));
+    let _ = std::io::stdout().flush();
+}
+
+/// C `pasynManager->report(fp, level, portName)` (asynManager.c:1138-1173):
+/// each port's `reportPrintPort` text, every port when `port` is `None`.
+fn ports_report(mgr: &PortManager, level: i32, port: Option<&str>) -> String {
+    use std::fmt::Write as _;
     let names = match port {
         Some(name) => vec![name.to_string()],
         None => mgr.list_port_names(),
     };
+    let mut out = String::new();
     for name in names {
         match mgr.find_port_handle(&name) {
-            Ok(handle) => {
-                let _ = handle
-                    .report_blocking(level)
-                    .map_err(|e| eprintln!("asynReport {name}: {e}"));
+            Ok(handle) => match handle.report_blocking(level) {
+                Ok(text) => out.push_str(&text),
+                Err(e) => eprintln!("asynReport {name}: {e}"),
+            },
+            // C prints the miss on the report's own `fp` (:1150-1153).
+            Err(_) => {
+                let _ = writeln!(out, "asynManager:report port {name} not found");
             }
-            Err(e) => eprintln!("asynReport: {e}"),
         }
+    }
+    out
+}
+
+/// C drvAsyn.c: the `drvet` asyn.dbd's `driver(drvAsyn)` adds so that
+/// `dbior` prints every port's report.
+struct DrvAsyn(Arc<PortManager>);
+
+impl epics_base_rs::server::driver_support::DriverSupport for DrvAsyn {
+    fn report(&self, level: i32) -> Option<String> {
+        Some(ports_report(&self.0, level, None))
     }
 }
 
@@ -2146,6 +2176,17 @@ mod tests {
     use crate::user::AsynUser;
     use std::sync::Mutex;
 
+    /// C `report` writes a missing port's line to the report's `fp`
+    /// (asynManager.c:1150-1153), the stream an `asynReport` redirect captures.
+    #[test]
+    fn a_missing_port_is_reported_in_the_report_text() {
+        let mgr = PortManager::new();
+        assert_eq!(
+            ports_report(&mgr, 0, Some("no_such_port")),
+            "asynManager:report port no_such_port not found\n"
+        );
+    }
+
     struct DummyDriver {
         base: PortDriverBase,
     }
@@ -3462,11 +3503,55 @@ mod tests {
     fn report_request_op_invokes_driver_report() -> AsynResult<()> {
         let mgr = fresh_mgr_with_port("report_port");
         let handle = mgr.find_port_handle("report_port")?;
-        // Default Drv impl prints to stderr; just confirm the round
-        // trip succeeds without error and returns `write_ok`.
-        handle.report_blocking(0)?;
-        handle.report_blocking(2)?;
+        assert!(handle.report_blocking(0)?.contains("Port: report_port"));
+        assert!(handle.report_blocking(2)?.contains("Port: report_port"));
         Ok(())
+    }
+
+    /// R15-51: `asynReport` writes to stdout. C's `asynReport` passes `stdout` to
+    /// `pasynManager->report` (asynShellCommands.c:589) — it is an answer to an
+    /// iocsh question, so `asynReport 1 port > file` captures it.
+    ///
+    /// libtest's capture rewrites `print!` to an in-process buffer before the
+    /// bytes reach fd 1, on any thread, unless the process was started with
+    /// `--nocapture`; so this re-execs the test binary as a child selecting just
+    /// this test with `--nocapture` forced, and reads the child's real stdout.
+    #[cfg(unix)]
+    #[test]
+    fn asyn_report_writes_to_stdout() {
+        const CHILD_ENV: &str = "ASYN_REPORT_WRITES_TO_STDOUT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mgr = fresh_mgr_with_port("stdout_rep");
+            report_ports(&mgr, 0, Some("stdout_rep"));
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "iocsh::tests::asyn_report_writes_to_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let captured = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            captured.contains("stdout_rep multiDevice:No") && captured.contains("Port: stdout_rep"),
+            "the manager block and the driver block both belong on stdout: {captured}"
+        );
+    }
+
+    /// `dbior` reaches asyn through drvAsyn, as asyn.dbd's `driver(drvAsyn)`
+    /// does in C.
+    #[test]
+    fn dbior_reports_asyn_ports_through_drv_asyn() {
+        use epics_base_rs::server::driver_support::DriverSupport as _;
+        let mgr = fresh_mgr_with_port("dbior_rep");
+        let text = DrvAsyn(mgr).report(0).unwrap();
+        assert!(text.contains("dbior_rep multiDevice:No"), "{text}");
+        assert!(text.contains("Port: dbior_rep"), "{text}");
     }
 
     /// `asynReport` covers every port of the process registry, not only the

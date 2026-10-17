@@ -88,15 +88,6 @@ pub struct DeviceState {
     pub last_connect_disconnect: Option<Instant>,
 }
 
-impl Default for DeviceState {
-    fn default() -> Self {
-        Self {
-            cells: DpCells::new(true, true, true),
-            last_connect_disconnect: None,
-        }
-    }
-}
-
 impl DeviceState {
     pub fn connected(&self) -> bool {
         self.cells.connected()
@@ -127,8 +118,9 @@ impl DeviceState {
 }
 
 /// C `locateDevice(pport, addr, TRUE)` (asynManager.c:576-589): the device at
-/// `addr`, created on first use with its `dpCommon` seeded from the port's
-/// (`dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`, :586).
+/// `addr`, created on first use with the port's `enabled` and `autoConnect`
+/// (`dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`, :586) but
+/// disconnected whatever the port is (:523): only a connect brings it up.
 fn locate_device(
     devices: &mut HashMap<i32, DeviceState>,
     addr: i32,
@@ -137,7 +129,7 @@ fn locate_device(
     devices.entry(addr).or_insert_with(|| {
         let port = port();
         DeviceState {
-            cells: DpCells::new(port.connected(), port.enabled(), port.auto_connect()),
+            cells: DpCells::new(false, port.enabled(), port.auto_connect()),
             last_connect_disconnect: None,
         }
     })
@@ -169,7 +161,7 @@ impl DeviceTable {
             port: DpCells::new(true, true, true),
             devices: Arc::default(),
             shared: Arc::default(),
-            announcer: Arc::new(ExceptionAnnouncer::new("detached")),
+            announcer: Arc::new(ExceptionAnnouncer::new("detached", false)),
         }
     }
 
@@ -186,6 +178,14 @@ impl DeviceTable {
             }
             None => self.port.clone(),
         }
+    }
+
+    /// See [`ExceptionAnnouncer::add_user`].
+    pub(crate) fn exception_callback_add<F>(&self, addr: i32, callback: F) -> ExceptionCallbackGuard
+    where
+        F: Fn(&ExceptionEvent<'_>) + Send + Sync + 'static,
+    {
+        self.announcer.add_user(addr, callback)
     }
 
     /// C `pport->dpc.defunct`, read without the actor as C's `findInterface`
@@ -338,7 +338,7 @@ pub fn param_list(multi_device: bool, addr: i32) -> i32 {
 }
 
 use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
-use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
+use crate::exception::{AsynException, ExceptionCallbackGuard, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
 use crate::interpose::{
     EomReason, EosSet, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
@@ -678,42 +678,90 @@ pub struct PortDriverBase {
 /// clone of this handle is that capability; it carries the wake counter with it,
 /// so an off-thread announcement still wakes the actor
 /// ([`PortDriverBase::exceptions_announced`]).
+///
+/// Every clone shares one [`AnnouncerShared`]: a clone holds no state of its
+/// own that a later bind or registration could leave behind.
 #[derive(Clone)]
 pub struct ExceptionAnnouncer {
     /// Shared, so a [`DeviceTable`] in every handle clone allocates nothing.
     port_name: Arc<str>,
-    /// Set once by [`crate::services::PortServices::bind`] at port creation, so
-    /// every clone taken afterwards carries the IOC's exception list.
-    sink: Option<Arc<ExceptionManager>>,
-    /// Shared so a clone's announcement is visible to the actor's count.
-    announced: Arc<AtomicU64>,
+    shared: Arc<AnnouncerShared>,
+    multi_device: bool,
+}
+
+#[derive(Default)]
+struct AnnouncerShared {
+    /// The IOC's exception list, bound by [`crate::services::PortServices::bind`]
+    /// at port creation — after a driver may already have cloned the announcer.
+    sink: Mutex<Option<Arc<ExceptionManager>>>,
+    /// The actor's wake count.
+    announced: AtomicU64,
+    /// C's `exceptionUserList`, one per `dpCommon`: the port's (`None`) and
+    /// each device's, keyed as [`dp_common_key`] resolves an addr.
+    users: Mutex<HashMap<Option<i32>, Arc<ExceptionManager>>>,
 }
 
 impl ExceptionAnnouncer {
-    fn new(port_name: &str) -> Self {
+    fn new(port_name: &str, multi_device: bool) -> Self {
         Self {
             port_name: Arc::from(port_name),
-            sink: None,
-            announced: Arc::new(AtomicU64::new(0)),
+            shared: Arc::default(),
+            multi_device,
         }
     }
 
     /// Announce. A port with no sink still counts the announcement — C's
     /// fan-out over an empty list still signals the port thread — so the count
-    /// moves before the sink is consulted.
+    /// moves before the sink is consulted. The `dpCommon` that changed calls
+    /// its own users first, as C `announceExceptionOccurred` does
+    /// (asynManager.c:613-639).
     pub fn announce(&self, exception: AsynException, addr: i32) {
-        self.announced.fetch_add(1, Ordering::Release);
-        if let Some(ref sink) = self.sink {
-            sink.announce(&ExceptionEvent {
-                port_name: &self.port_name,
-                exception,
-                addr,
-            });
+        self.shared.announced.fetch_add(1, Ordering::Release);
+        let event = ExceptionEvent {
+            port_name: &self.port_name,
+            exception,
+            addr,
+        };
+        let users = self.users(addr, false);
+        if let Some(users) = users {
+            users.announce(&event);
+        }
+        let sink = self.shared.sink.lock().clone();
+        if let Some(sink) = sink {
+            sink.announce(&event);
         }
     }
 
+    /// The exception list of the `dpCommon` `addr` resolves to, made if
+    /// `create`.
+    fn users(&self, addr: i32, create: bool) -> Option<Arc<ExceptionManager>> {
+        let key = dp_common_key(self.multi_device, addr);
+        let mut lists = self.shared.users.lock();
+        if create {
+            return Some(Arc::clone(lists.entry(key).or_default()));
+        }
+        lists.get(&key).cloned()
+    }
+
+    /// C `exceptionCallbackAdd` (asynManager.c:1364-1382) for a user bound to
+    /// `addr`. The callback runs on the thread that announces, inside the
+    /// port's transition, so it must not wait on this port.
+    pub(crate) fn add_user<F>(&self, addr: i32, callback: F) -> ExceptionCallbackGuard
+    where
+        F: Fn(&ExceptionEvent<'_>) + Send + Sync + 'static,
+    {
+        let list = self.users(addr, true).expect("created");
+        let id = list.add_callback(callback);
+        ExceptionCallbackGuard::new(list, id)
+    }
+
+    /// `ellCount(&pdpc->exceptionUserList)` for the `dpCommon` of `addr`.
+    fn user_count(&self, addr: i32) -> usize {
+        self.users(addr, false).map_or(0, |l| l.callback_count())
+    }
+
     fn count(&self) -> u64 {
-        self.announced.load(Ordering::Acquire)
+        self.shared.announced.load(Ordering::Acquire)
     }
 }
 
@@ -737,12 +785,14 @@ impl PortDriverBase {
             flags,
             params: ParamList::new(max_addr),
             interrupts: InterruptManager::new(),
-            connected: Connection::Own(Arc::new(AtomicBool::new(true))),
-            last_announced: true,
+            // C `dpCommonInit` (asynManager.c:523): every port starts down and
+            // comes up through its driver's connect, which registration queues.
+            connected: Connection::Own(Arc::new(AtomicBool::new(false))),
+            last_announced: false,
             enabled: Arc::new(AtomicBool::new(true)),
             auto_connect: Arc::new(AtomicBool::new(true)),
             shared: Arc::default(),
-            announcer: Arc::new(ExceptionAnnouncer::new(port_name)),
+            announcer: Arc::new(ExceptionAnnouncer::new(port_name, flags.multi_device)),
             options: HashMap::new(),
             eos: HashMap::new(),
             interpose_octet: OctetInterposeStack::new(flags.multi_device),
@@ -831,7 +881,7 @@ impl PortDriverBase {
     /// the production caller; tests that drive a driver without a runtime use it
     /// to stand in for that binding.
     pub(crate) fn bind_exception_sink(&mut self, sink: Arc<ExceptionManager>) {
-        Arc::make_mut(&mut self.announcer).sink = Some(sink);
+        *self.announcer.shared.sink.lock() = Some(sink);
     }
 
     /// How many exceptions this port has announced. Monotonic; the actor compares
@@ -841,15 +891,12 @@ impl PortDriverBase {
         self.announcer.count()
     }
 
-    /// How many callbacks are registered on this port's exception list — the
-    /// `exceptionUsers` count `reportPrintPort` prints (asynManager.c:1070-1074).
-    /// `asynReport` itself is the iocsh command (asynShellCommands.c:587); it
-    /// reaches this through `asynManager`'s own `report` (:1138).
-    pub fn exception_callback_count(&self) -> usize {
-        self.announcer
-            .sink
-            .as_ref()
-            .map_or(0, |m| m.callback_count())
+    /// The `exceptionUsers` count `reportPrintPort` prints for the `dpCommon`
+    /// `addr` resolves to (asynManager.c:1070-1074, :1098): the callbacks
+    /// registered on it and the interposes C registers one for. The IOC-wide
+    /// sink is no `dpCommon`'s list.
+    pub fn exception_user_count(&self, addr: i32) -> usize {
+        self.announcer.user_count(addr) + self.interpose_octet.exception_users(addr)
     }
 
     /// Query whether the port is connected — the truth, wherever it lives.
@@ -1405,9 +1452,9 @@ impl PortDriverBase {
     /// port, while on a CANBLOCK port the same condition makes `portThread` park
     /// the request instead (:877). Both callers ask this one function.
     ///
-    /// A port that is not `ASYN_MULTIDEVICE`, or an address with no device state,
-    /// resolves to the port's own `dpCommon` in C's `findDpCommon` — already
-    /// checked above — so there is nothing device-level left to refuse.
+    /// A port that is not `ASYN_MULTIDEVICE`, or an address < 0, resolves to
+    /// the port's own `dpCommon` in C's `findDpCommon` — already checked above —
+    /// so there is nothing device-level left to refuse.
     pub fn check_device_enabled(&self, addr: i32) -> AsynResult<()> {
         if self.device(addr, DeviceState::enabled) == Some(false) {
             return Err(AsynError::Status {
@@ -1434,11 +1481,13 @@ impl PortDriverBase {
     }
 
     /// The device `addr` resolves to, or `None` when C's `findDpCommon` would
-    /// resolve it to the port's own `dpCommon` (not multi-device, or no device
-    /// created at that address).
+    /// resolve it to the port's own `dpCommon` (not multi-device, or addr < 0).
+    /// A device address always names a device: C reaches one only through
+    /// `connectDevice`, which creates it, disconnected (asynManager.c:1349-1352,
+    /// :523), so an address no user has bound yet reads as that new device.
     fn device<R>(&self, addr: i32, read: impl FnOnce(&DeviceState) -> R) -> Option<R> {
         let addr = self.dp_addr(addr)?;
-        self.device_states.lock().get(&addr).map(read)
+        Some(self.device_mut(addr, |d| read(d)))
     }
 
     /// The devices created so far, in address order, as `asynReport` walks them.
@@ -2154,6 +2203,9 @@ impl PortDriverBase {
         // C stamps every callback with getTimeStamp (asynPortDriver.cpp:610-637).
         let ts = self.time_stamp;
         let interrupts = &self.interrupts;
+        // A C driver calls back on the list `getAddress` resolved, never on
+        // getAddr's -1, and its single-device clients filter on that list.
+        let list = param_list(self.flags.multi_device, addr);
         // C `callCallbacks` (asynPortDriver.cpp:833-873): every changed flag
         // is walked and cleared at the end; only a bad index returns early,
         // with the flags kept.
@@ -2184,7 +2236,7 @@ impl PortDriverBase {
                 .unwrap_or((AsynStatus::Success, 0, 0));
             interrupts.notify(InterruptValue {
                 reason,
-                addr,
+                addr: list,
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
@@ -2233,7 +2285,8 @@ impl PortDriverBase {
                 .unwrap_or((AsynStatus::Success, 0, 0));
             self.interrupts.notify(InterruptValue {
                 reason,
-                addr,
+                // The list, as `call_param_callbacks` fires.
+                addr: param_list(self.flags.multi_device, addr),
                 value,
                 timestamp: ts,
                 uint32_changed_mask: uint32_mask,
@@ -2292,7 +2345,8 @@ impl PortDriverBase {
         let ts = self.time_stamp;
         self.interrupts.notify(InterruptValue {
             reason,
-            addr,
+            // The list, as `call_param_callbacks` fires.
+            addr: param_list(self.flags.multi_device, addr),
             value,
             timestamp: ts,
             uint32_changed_mask,
@@ -2435,6 +2489,13 @@ impl DrvUserRequest {
 /// the port timestamp line of `asynPortDriver::report` (asynPortDriver.cpp:3682-3684).
 /// Local time, as `epicsTimeToStrftime` renders it.
 fn format_timestamp(ts: SystemTime) -> String {
+    // epicsTimeToStrftime takes the EPICS epoch for an unset stamp
+    // (epicsTime.cpp:174-178), the zeroed one a port starts with.
+    let epoch = SystemTime::UNIX_EPOCH
+        + Duration::from_secs(epics_libcom_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS);
+    if ts == epoch {
+        return "<undefined>".into();
+    }
     chrono::DateTime::<chrono::Local>::from(ts)
         .format("%Y/%m/%d %H:%M:%S%.3f")
         .to_string()
@@ -2638,8 +2699,8 @@ pub trait PortDriver: Any + Send + Sync {
     /// (:3695-3708).
     ///
     /// The report goes to `out`, C's `FILE *fp` — the driver never picks the
-    /// stream. `crate::port_actor::PortActor::report_port` is the one owner that
-    /// does, and it picks stdout, as `asynReport` does (asynShellCommands.c:589).
+    /// stream; the caller does: stdout for `asynReport`
+    /// (asynShellCommands.c:589), `dbior`'s stream through drvAsyn.
     fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         self.asyn_port_driver_report(out, level);
     }
@@ -3707,11 +3768,12 @@ mod tests {
     fn test_connect_disconnect() {
         let mut drv = TestDriver::new();
         let user = AsynUser::default();
-        assert!(drv.base().is_connected());
-        drv.disconnect(&user).unwrap();
+        // C `dpCommonInit` (asynManager.c:523): a port starts down.
         assert!(!drv.base().is_connected());
         drv.connect(&user).unwrap();
         assert!(drv.base().is_connected());
+        drv.disconnect(&user).unwrap();
+        assert!(!drv.base().is_connected());
     }
 
     #[test]
@@ -4455,7 +4517,9 @@ mod tests {
         let mut base = PortDriverBase::new("reset_test", 1, PortFlags::default());
         base.install_octet_interpose(Box::new(CountingInterpose(resets.clone())));
 
-        // Port starts connected. Disconnect edge → reset (C exceptionDisconnect).
+        // As registration's connect leaves it. Disconnect edge → reset (C
+        // exceptionDisconnect).
+        base.init_connected(true);
         assert!(base.set_connected(false));
         assert_eq!(resets.load(Ordering::Relaxed), 1);
 
@@ -4526,9 +4590,12 @@ mod tests {
         );
         base.create_param("V", ParamType::Int32).unwrap();
 
-        // Default: all connected
-        assert!(base.is_device_connected(0));
-        assert!(base.is_device_connected(1));
+        // Devices start down whatever the port is (C :523); connect them.
+        base.init_connected(true);
+        for addr in 0..3 {
+            assert!(!base.is_device_connected(addr));
+            base.connect_addr(addr);
+        }
 
         // Disable addr 1
         base.device_state(1).put_enabled(false);
@@ -4546,6 +4613,7 @@ mod tests {
     fn test_per_addr_single_device_ignored() {
         let mut base = PortDriverBase::new("single", 1, PortFlags::default());
         base.create_param("V", ParamType::Int32).unwrap();
+        base.init_connected(true);
         // For single-device, per-addr check passes even if no device state
         assert!(base.check_ready_addr(0).is_ok());
     }
@@ -4721,6 +4789,7 @@ mod tests {
             },
         );
         base.create_param("V", ParamType::Int32).unwrap();
+        base.init_connected(true);
 
         base.disconnect_addr(1);
         assert!(!base.is_device_connected(1));
@@ -4743,6 +4812,8 @@ mod tests {
             },
         );
         base.create_param("V", ParamType::Int32).unwrap();
+        base.init_connected(true);
+        base.connect_addr(2);
 
         base.disable_addr(2);
         let err = base.check_ready_addr(2).unwrap_err();
@@ -4796,11 +4867,33 @@ mod tests {
             last_addr2.store(event.addr, Ordering::Relaxed);
         });
 
-        base.disconnect_addr(3);
+        base.connect_addr(3);
         assert_eq!(last_addr.load(Ordering::Relaxed), 3);
 
         base.enable_addr(2);
         assert_eq!(last_addr.load(Ordering::Relaxed), 2);
+    }
+
+    /// The IOC's exception list is bound at runtime creation, after a driver may
+    /// have taken its announcer (the IP-server accept loop) and a handle its
+    /// device table: both must announce on the list the bind installed.
+    #[test]
+    fn an_announcer_cloned_before_the_bind_announces_on_the_bound_sink() {
+        let mut base = PortDriverBase::new("bind_late", 1, PortFlags::default());
+        let worker = base.exception_announcer();
+        let table = base.device_table();
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        exc_mgr.add_callback(move |e| seen2.lock().push(e.exception));
+        base.bind_exception_sink(exc_mgr);
+
+        worker.announce(AsynException::Connect, -1);
+        table.auto_connect(-1, false);
+        assert_eq!(
+            *seen.lock(),
+            [AsynException::Connect, AsynException::AutoConnect]
+        );
     }
 
     /// C parity (asynManager.c:2153-2162 exceptionConnect,
@@ -4834,30 +4927,28 @@ mod tests {
             }
         });
 
-        // device starts connected by DeviceState::default — a redundant
-        // connect_addr is a no-op.
-        base.connect_addr(2);
+        // A device starts down (C :523): a redundant disconnect_addr is a
+        // no-op.
+        base.disconnect_addr(2);
         assert_eq!(
             connect_hits.load(Ordering::Relaxed),
             0,
-            "redundant connect_addr must not fan out"
-        );
-
-        // First transition fires once.
-        base.disconnect_addr(2);
-        assert_eq!(connect_hits.load(Ordering::Relaxed), 1);
-
-        // Redundant disconnect is silent.
-        base.disconnect_addr(2);
-        assert_eq!(
-            connect_hits.load(Ordering::Relaxed),
-            1,
             "redundant disconnect_addr must not fan out"
         );
 
-        // Re-connect fires the transition.
+        // Each transition fires once.
         base.connect_addr(2);
+        base.disconnect_addr(2);
         assert_eq!(connect_hits.load(Ordering::Relaxed), 2);
+
+        // Redundant connect is silent.
+        base.connect_addr(2);
+        base.connect_addr(2);
+        assert_eq!(
+            connect_hits.load(Ordering::Relaxed),
+            3,
+            "redundant connect_addr must not fan out"
+        );
     }
 
     /// C parity: `autoConnectAsyn` (asynManager.c:2312-2329) fires
@@ -4911,9 +5002,9 @@ mod tests {
         base.set_auto_connect(false);
         assert!(base.connect_retry_at.is_none());
 
-        // connected + ON → nothing to retry (a fresh base is born
-        // `Connection::Own(true)`)
+        // connected + ON → nothing to retry
         let mut base = PortDriverBase::new("act3", 1, PortFlags::default());
+        base.init_connected(true);
         base.set_auto_connect(true);
         assert!(base.connect_retry_at.is_none());
 
@@ -4925,15 +5016,17 @@ mod tests {
             ..PortFlags::default()
         };
         let mut base = PortDriverBase::new("act4", 2, multi);
-        base.device_state(1).put_connected(false);
+        base.init_connected(true);
         assert!(base.connect_retry_at.is_none());
         base.set_auto_connect_addr(1, true);
         assert!(base.connect_retry_at.is_some());
 
         // the same call on a SINGLE-device port is a port write, because
         // `findDpCommon` has no device to give it (asynManager.c:541-544): the
-        // port is connected, so it arms nothing at all.
-        let mut base = PortDriverBase::new("act5", 2, PortFlags::default());
+        // port is connected, so it arms nothing at all. (`new` would make two
+        // addresses multi-device.)
+        let mut base = PortDriverBase::new_exact_flags("act5", 2, PortFlags::default());
+        base.init_connected(true);
         base.set_auto_connect_addr(1, true);
         assert!(base.connect_retry_at.is_none());
         assert!(
@@ -4971,7 +5064,7 @@ mod tests {
         // C exceptionDisconnect stamps lastConnectDisconnect (asynManager.c
         // :2186); exceptionConnect does not (:2159-2161). Mirror both edges.
         let mut base = PortDriverBase::new("thr", 1, PortFlags::default());
-        // Starts connected, no stamp.
+        base.init_connected(true);
         assert!(base.last_connect_disconnect.is_none());
 
         // Disconnect edge stamps.
@@ -4993,6 +5086,7 @@ mod tests {
         };
         let mut base = PortDriverBase::new("thr", 4, flags);
         let t0 = Instant::now();
+        base.connect_addr(1);
 
         // addr 1 disconnect stamps only addr 1's anchor.
         assert!(base.set_addr_connected(1, false));

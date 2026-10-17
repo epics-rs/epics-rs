@@ -294,22 +294,12 @@ pub fn create_port_runtime_boxed(
     config.services.bind(driver.base_mut());
 
     // C `registerInterface(asynCommonType)` — reached from `registerPort` for
-    // every port — calls `initPortConnect` and then `portConnectTimerCallback`
-    // (asynManager.c:2133-2138), which queues a connect at
-    // `asynQueuePriorityConnect` the moment the port exists (:3283-3297). An
-    // auto-connect port is therefore brought up BY REGISTRATION, not by whichever
-    // record first happens to do I/O: `CNCT` reads 1 straight after
-    // `drvAsynIPPortConfigure`, and a port no record ever talks to still comes up.
-    //
-    // Arming the actor's connect deadline is that queued request: the actor runs
-    // `service_connect_timer` ahead of anything in its queue, which is what C's
-    // Connect priority buys. It re-arms itself at `secondsBetweenPortConnect` on
-    // failure (C :3312), so a port whose device is down keeps trying without a
-    // single request ever being submitted.
+    // every port — queues the port's connect at `asynQueuePriorityConnect` the
+    // moment the port exists (asynManager.c:2133-2138, :3283-3297), so an
+    // auto-connect port is brought up BY REGISTRATION, not by whichever record
+    // first does I/O. [`PortActor::new`] arms that connect; it re-arms itself at
+    // `secondsBetweenPortConnect` on failure (C :3312).
     let connect_at_registration = driver.base().is_auto_connect() && !driver.base().is_connected();
-    if connect_at_registration {
-        driver.base_mut().connect_retry_at = Some(std::time::Instant::now());
-    }
 
     let port_name = driver.base().port_name.to_string();
     let can_block = driver.base().flags.can_block;

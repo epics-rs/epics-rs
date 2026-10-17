@@ -183,6 +183,13 @@ pub trait OctetInterpose: Send + Sync {
     /// [`crate::port::PortDriverBase::set_connected`] is the Rust owner of
     /// that transition and drives this hook for the whole stack.
     fn connection_changed(&mut self) {}
+
+    /// Whether C's layer registers an exception callback on its `dpCommon`
+    /// (asynInterposeEos.c:110, asynInterposeCom.c:856), one of the
+    /// `exceptionUsers` the port report counts (asynManager.c:1067-1071).
+    fn exception_user(&self) -> bool {
+        false
+    }
 }
 
 /// The key of the port's own interpose chain — C's `pport->dpc`, the
@@ -317,6 +324,15 @@ impl OctetInterposeStack {
     /// (`asynInterposeEos.c:142-151`); the only caller is the transition owner
     /// [`crate::port::PortDriverBase::set_connected`], and the link it moved is
     /// the one under *all* of them.
+    /// The layers on `addr`'s own chain that C counts among its `dpCommon`'s
+    /// exception users ([`OctetInterpose::exception_user`]); -1 is the port's.
+    pub fn exception_users(&self, addr: i32) -> usize {
+        let key = crate::port::eos_device_key(self.multi_device, addr);
+        self.chains
+            .get(&key)
+            .map_or(0, |c| c.iter().filter(|l| l.exception_user()).count())
+    }
+
     pub fn connection_changed(&mut self) {
         for chain in self.chains.values_mut() {
             for layer in chain {

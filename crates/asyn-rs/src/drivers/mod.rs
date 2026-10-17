@@ -76,6 +76,19 @@ pub(crate) fn wait_millis(budget: std::time::Duration) -> u128 {
     }
 }
 
+/// An OS error's own text — C's `strerror(errno)` and
+/// `epicsSocketConvertErrnoToString` — without std's ` (os error N)`.
+pub(crate) fn errno_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => match text.strip_suffix(&format!(" (os error {code})")) {
+            Some(bare) => bare.to_owned(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

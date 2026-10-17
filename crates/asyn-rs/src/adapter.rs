@@ -5839,7 +5839,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-bounds-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -5917,7 +5917,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-adapter-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -5959,7 +5959,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-seeded-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -5993,7 +5993,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-average-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -6064,7 +6064,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-ts-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -6481,7 +6481,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("ts-factory-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -6536,7 +6536,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-u32-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -7749,7 +7749,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-enum-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -8311,7 +8311,7 @@ mod tests {
             let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("cap-actor".into())
-                .spawn(move || actor.run())
+                .spawn(actor.registered())
                 .unwrap();
             let handle = PortHandle::new(
                 tx,
@@ -8936,7 +8936,7 @@ mod tests {
             let actor_link = actor.link();
             std::thread::Builder::new()
                 .name("ondemand-actor".into())
-                .spawn(move || actor.run())
+                .spawn(actor.registered())
                 .unwrap();
             let handle = PortHandle::new(
                 tx,
@@ -9327,7 +9327,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-arr-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -9408,7 +9408,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-octparam-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -10099,7 +10099,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("test-f64-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -10552,7 +10552,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("binwrite-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -10809,7 +10809,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("f32array-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -11022,7 +11022,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("cmdresp-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let handle = PortHandle::new(
             tx,
@@ -11208,7 +11208,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             "octet_partial".into(),

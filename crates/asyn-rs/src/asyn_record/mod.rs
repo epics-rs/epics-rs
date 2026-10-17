@@ -5847,7 +5847,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(NullOctetPort::new(port_name)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -6382,7 +6382,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(ParamDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -6504,7 +6504,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -6682,7 +6682,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -6766,7 +6766,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -7190,7 +7190,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -7260,7 +7260,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(TestDriver::new()), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -7312,7 +7312,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let mut handle =
             PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
@@ -7386,7 +7386,7 @@ mod tests {
                 rx,
             );
             let actor_link = actor.link();
-            std::thread::spawn(move || actor.run());
+            std::thread::spawn(actor.registered());
             let mut handle = PortHandle::new(
                 tx,
                 port_name.into(),
@@ -7597,7 +7597,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         // Non-default info mask set on the manager BEFORE the record connects.
@@ -7653,7 +7653,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
         // Wire the exception sink as a real IOC would (PortManager installs
@@ -7740,7 +7740,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -7847,7 +7847,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -7946,7 +7946,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8128,7 +8128,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8284,7 +8284,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8385,7 +8385,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8486,7 +8486,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8581,7 +8581,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8689,7 +8689,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -8881,7 +8881,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -9031,7 +9031,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let mut handle = PortHandle::new(
             tx,
@@ -9181,7 +9181,7 @@ mod tests {
             let mut base = PortDriverBase::new(name, 1, flags);
             base.seconds_between_port_connect = Duration::from_millis(20);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let actor = PortActor::new(
+            let mut actor = PortActor::new(
                 Box::new(Drops {
                     base,
                     entered: entered_tx,
@@ -9190,6 +9190,11 @@ mod tests {
                 }),
                 rx,
             );
+            // The line is up at registration and stays down once it drops.
+            let up = std::sync::atomic::Ordering::SeqCst;
+            line_up.store(true, up);
+            actor.register();
+            line_up.store(false, up);
             let link = actor.link();
             // The production loop: the test loop runs no connect-retry timer.
             let (shutdown, shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -9430,7 +9435,7 @@ mod tests {
                 rx,
             );
             let actor_link = actor.link();
-            std::thread::spawn(move || actor.run());
+            std::thread::spawn(actor.registered());
             let handle = PortHandle::new(
                 tx,
                 port_name.into(),
@@ -9560,7 +9565,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -9680,7 +9685,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -9789,7 +9794,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -9855,7 +9860,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -9958,7 +9963,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -10575,7 +10580,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("asynio-test-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
 
         let mut handle = PortHandle::new(
@@ -10721,7 +10726,7 @@ mod tests {
             rx,
         );
         let link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let mut handle = PortHandle::new(
             tx,
             "ASYNSPQ".into(),
@@ -10831,7 +10836,7 @@ mod tests {
         let actor_link = actor.link();
         std::thread::Builder::new()
             .name("asynaqr-test-actor".into())
-            .spawn(move || actor.run())
+            .spawn(actor.registered())
             .unwrap();
         let mut handle = PortHandle::new(
             tx,
@@ -10939,7 +10944,7 @@ mod tests {
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -11107,7 +11112,7 @@ A.TMSK 1
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -11666,7 +11671,7 @@ A.OEOS
             rx,
         );
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -11819,7 +11824,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -11935,7 +11940,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(DownDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let trace = Arc::new(TraceManager::new());
         let handle = PortHandle::new(
             tx,
@@ -12101,7 +12106,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(drv), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12211,7 +12216,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12313,7 +12318,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12412,7 +12417,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12536,7 +12541,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12598,7 +12603,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12670,7 +12675,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),
@@ -12737,7 +12742,7 @@ A.OEOS
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
-        std::thread::spawn(move || actor.run());
+        std::thread::spawn(actor.registered());
         let handle = PortHandle::new(
             tx,
             port_name.into(),

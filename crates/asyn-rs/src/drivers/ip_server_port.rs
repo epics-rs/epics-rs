@@ -59,9 +59,10 @@ use epics_libcom_rs::runtime::socket;
 use parking_lot::Mutex;
 
 use crate::asyn_trace;
+use crate::drivers::errno_text;
 use crate::drivers::ip_port::{
     BoundNextRead, DrvAsynIPPort, OWNED_NONBLOCKING, is_nonfatal_read_timeout, maxchars_zero_error,
-    nonblock_failure_text, sock_err_text, socket_poll_timeout, write_with_retry,
+    nonblock_failure_text, socket_poll_timeout, write_with_retry,
 };
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -111,7 +112,7 @@ pub enum IpServerProtocol {
 /// C `createServerSocket`'s text for each setup call that fails
 /// (drvAsynIPServerPort.c:412-478); `server_info` is C's `tty->serverInfo`.
 fn server_setup_failure_text(server_info: &str, e: &socket::SetupError) -> String {
-    let err = sock_err_text(&e.error);
+    let err = errno_text(&e.error);
     match e.step {
         socket::SetupStep::Create => format!("Can't create socket: {err}"),
         // C's own SO_REUSEADDR call (:448-454); the fanout helper's earlier
@@ -273,8 +274,8 @@ impl IpServerConfig {
 /// (drvAsynIPPort.c:851-860), so no caller can take the error and forget the
 /// `closeConnection`. What is left to the owner is the disconnect exception
 /// fan-out, which differs by port shape: the parent announces on the client's
-/// `addr`, the child port announces on its own single device and drops its
-/// port-level connected flag.
+/// `addr`, the child port drops its port-level connected flag, whose edge is
+/// the one announcement.
 struct SlotFailure {
     closed: bool,
     error: AsynError,
@@ -573,13 +574,13 @@ impl ClientSlot {
         {
             return SlotFailure::kept(AsynError::Status {
                 status: AsynStatus::Timeout,
-                message: format!("{device} timeout: {}", sock_err_text(&e)),
+                message: format!("{device} timeout: {}", errno_text(&e)),
             });
         }
         self.clear();
         SlotFailure::closed(AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("{device} read error: {}", sock_err_text(&e)),
+            message: format!("{device} read error: {}", errno_text(&e)),
         })
     }
 
@@ -935,7 +936,6 @@ impl DrvAsynIPServerPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(true);
         let mut slots = Vec::with_capacity(max);
         for _ in 0..max {
@@ -1140,7 +1140,7 @@ impl DrvAsynIPServerPort {
                 status: AsynStatus::Error,
                 message: format!(
                     "using ANY interface, cannot lookup '{host}': {}",
-                    super::ip_port::sock_err_text(&e)
+                    errno_text(&e)
                 ),
             })
     }
@@ -1721,13 +1721,11 @@ impl DrvAsynIPSubport {
     /// which is exactly what makes the listener see the slot as reusable
     /// (drvAsynIPServerPort.c:359-365). The socket is already gone.
     ///
-    /// Per-addr Connect carries addr=0 (this is the subport's single device
-    /// slot); the port-level `set_connected(false)` fires the port-level
-    /// transition once thanks to its edge guard. Both fan-outs are needed because
-    /// observers can listen at either granularity.
+    /// The child is single-device, so its one `dpCommon` is the port's and C
+    /// announces the drop once; the edge guard in `set_connected` is that one
+    /// announcement.
     fn finish_slot_failure(&mut self, failure: SlotFailure) -> AsynError {
         if failure.closed {
-            self.base.announce_exception(AsynException::Connect, 0);
             self.base.set_connected(false);
         }
         failure.error
@@ -1798,13 +1796,10 @@ impl PortDriver for DrvAsynIPSubport {
     }
 
     fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        // Subport disconnect drops the slot — same effect as the
-        // parent's drop_client(idx). Slot clear is an explicit
-        // ownership boundary (the slot owns the announce for
-        // per-addr); the port-level Connect transition is owner-API.
+        // Subport disconnect drops the slot — same effect as the parent's
+        // drop_client(idx) — and the edge guard announces it once.
         if self.slot.is_occupied() {
             self.slot.clear();
-            self.base.announce_exception(AsynException::Connect, 0);
         }
         self.base.set_connected(false);
         Ok(())
@@ -2469,6 +2464,40 @@ mod tests {
     /// false, and since the child is `noAutoConnect` nothing ever set it back: the
     /// next client accepted into that slot was served by a port that refused every
     /// read and write with `asynDisconnected`, forever, over a live socket.
+    /// C's child is a single-device `drvAsynIPPort`: `closeConnection`'s one
+    /// `exceptionDisconnect` (drvAsynIPPort.c:216) is the only announcement a
+    /// dropped client makes on it.
+    #[test]
+    fn a_dropped_client_is_announced_once_on_the_child() {
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("slot_once", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let port = srv.local_port();
+        let mut child = srv.make_subport(0).unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let _g = child.base().announcer.add_user(-1, move |e| {
+            seen.lock().push((e.exception, e.addr));
+        });
+
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for_slot(&srv, 0);
+        child.connect(&AsynUser::default()).unwrap();
+        drop(client);
+        let read_user = AsynUser::default().with_timeout(Duration::from_millis(200));
+        let mut buf = [0u8; 64];
+        read_until_slot_torn_down(|| {
+            let res = child.read_octet(&read_user, &mut buf);
+            (res, !child.base().is_connected())
+        });
+        assert_eq!(
+            *events.lock(),
+            [(AsynException::Connect, -1), (AsynException::Connect, -1)],
+            "one connect, one disconnect"
+        );
+    }
+
     #[test]
     fn a_reused_client_slot_revives_the_child_subport() {
         use socket2::{Domain, Socket, Type};

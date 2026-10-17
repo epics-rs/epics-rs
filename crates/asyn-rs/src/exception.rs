@@ -109,6 +109,27 @@ impl ExceptionManager {
     }
 }
 
+/// One `dpCommon`'s registration on its exception list, as
+/// [`crate::port_handle::PortHandle::exception_callback_add`] made it.
+/// Dropping it is C `exceptionCallbackRemove` (asynManager.c:1384-1408).
+#[must_use = "dropping the guard removes the callback"]
+pub struct ExceptionCallbackGuard {
+    list: Arc<ExceptionManager>,
+    id: ExceptionCallbackId,
+}
+
+impl ExceptionCallbackGuard {
+    pub(crate) fn new(list: Arc<ExceptionManager>, id: ExceptionCallbackId) -> Self {
+        Self { list, id }
+    }
+}
+
+impl Drop for ExceptionCallbackGuard {
+    fn drop(&mut self) {
+        self.list.remove_callback(self.id);
+    }
+}
+
 impl Default for ExceptionManager {
     fn default() -> Self {
         Self::new()

@@ -477,7 +477,6 @@ impl DrvAsynSerialPort {
                 ..PortFlags::default()
             },
         );
-        base.init_connected(false);
         base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
         // (drvAsynSerialPortWin32.c:798-799): every successful octet read on this port fans out to
@@ -642,7 +641,7 @@ impl PortDriver for DrvAsynSerialPort {
         if self.io.handle_val.is_some() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("{}: Link already open!", self.base.port_name),
+                message: format!("{}: Link already open!", self.config.device),
             });
         }
 
@@ -659,7 +658,17 @@ impl PortDriver for DrvAsynSerialPort {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(io_err());
+            // C formats `strerror(errno)` here (drvAsynSerialPortWin32.c:437-441),
+            // but CreateFile sets GetLastError, not errno; the reason is that.
+            let e = std::io::Error::last_os_error();
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{} Can't open  {}",
+                    self.config.device,
+                    super::errno_text(&e)
+                ),
+            });
         }
         self.io.handle_val = Some(handle as isize);
         self.io.last_timeout = None;

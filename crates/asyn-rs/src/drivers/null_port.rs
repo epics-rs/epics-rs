@@ -20,7 +20,7 @@
 //! * **`noAutoConnect`** (`base.init_auto_connect(false)`) — the port actor never
 //!   fires the auto-reconnect cycle, so nothing drives the link toward
 //!   connected behind the record's back.
-//! * **Never connected** (`base.init_connected(false)`, and a [`connect`] that
+//! * **Never connected** (every port starts down, and a [`connect`] that
 //!   is a no-op) — the link stays open-less. There is no socket, no host, no
 //!   thread doing I/O. CNCT stays `0` (Disconnect) and AUCT stays `0`
 //!   (noAutoConnect), matching the asyn record's honest portless defaults.
@@ -62,7 +62,6 @@ impl NullOctetPort {
         );
         // Disconnected link, noAutoConnect — the two properties that make CNCT
         // and AUCT deterministically 0.
-        base.init_connected(false);
         base.init_auto_connect(false);
         Self { base }
     }

@@ -875,6 +875,11 @@ pub enum RequestOp {
     SetEnable {
         yes: bool,
     },
+    /// C `pasynManager->exceptionDisconnect(pasynUser)` (asynManager.c:2165-2190):
+    /// mark the user's `dpCommon` down and announce it, without calling the
+    /// driver's `disconnect`. A layered driver calls it on its own port when the
+    /// port under it drops (drvLove.c:663-687).
+    ExceptionDisconnect,
     /// Enable / disable auto-connect — C
     /// `pasynManager->autoConnect(pasynUser, autoConnect)`
     /// (`asynManager.c::autoConnectAsyn` :2312-2329, fired by asynRecord `AUCT`

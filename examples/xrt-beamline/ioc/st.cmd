@@ -99,6 +99,9 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(XRT_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(XRT_BEAMLINE)/db/xrt_detector.template", "P=$(PREFIX),R=cam1:,IOC=bl:,BL=bl:,PORT=XRT")
 
 # Load standard areaDetector plugins
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix

@@ -11,14 +11,9 @@
 #   $(YSIZE)     - Max image height
 #   $(NCHANS)    - Max time series points
 #   $(CBUFFS)    - Circular buffer frame count (default 500)
-#   $(NELEMENTS) - Max waveform elements for image data
-#   $(FTVL)      - Waveform field type (default: UCHAR)
-#   $(TYPE)      - Array interface type (default: Int8)
-
-# ===== StdArrays plugin (image data for clients) =====
-
-NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
+#
+# As in C, no NDStdArrays here: each st.cmd creates its own image1 with
+# its detector's waveform type and size.
 
 # ===== File saving plugins =====
 
@@ -37,8 +32,9 @@ dbLoadRecords("NDFileNexus.template", "P=$(PREFIX),R=Nexus1:,PORT=FileNexus1,NDA
 NDFileHDF5Configure("FileHDF1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDFileHDF5.template", "P=$(PREFIX),R=HDF1:,PORT=FileHDF1,NDARRAY_PORT=$(PORT)")
 
-NDFileMagickConfigure("FileMagick1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDFileMagick.template", "P=$(PREFIX),R=Magick1:,PORT=FileMagick1,NDARRAY_PORT=$(PORT)")
+# Create a Magick file saving plugin
+#NDFileMagickConfigure("FileMagick1", $(QSIZE), 0, "$(PORT)", 0)
+#dbLoadRecords("NDFileMagick.template", "P=$(PREFIX),R=Magick1:,PORT=FileMagick1,NDARRAY_PORT=$(PORT)")
 
 # ===== ROI plugins (4 instances) =====
 
@@ -54,9 +50,9 @@ dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI3:,PORT=ROI3,NDARRAY_PORT=$(PO
 NDROIConfigure("ROI4", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=ROI4:,PORT=ROI4,NDARRAY_PORT=$(PORT)")
 
-# ===== ROI statistics (with 32 ROIs via substitute+include) =====
+# ===== ROI statistics (8 ROIs) =====
 
-NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0, 32, 0, 0, 0, 0)
+NDROIStatConfigure("ROISTAT1", $(QSIZE), 0, "$(PORT)", 0, 8, 0, 0, 0, 0)
 dbLoadRecords("NDROIStat.template", "P=$(PREFIX),R=ROIStat1:,PORT=ROISTAT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:1:,PORT=ROISTAT1,ADDR=0,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:2:,PORT=ROISTAT1,ADDR=1,TIMEOUT=1,NCHANS=$(NCHANS)")
@@ -66,30 +62,6 @@ dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:5:,PORT=ROISTAT1,AD
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:6:,PORT=ROISTAT1,ADDR=5,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:7:,PORT=ROISTAT1,ADDR=6,TIMEOUT=1,NCHANS=$(NCHANS)")
 dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:8:,PORT=ROISTAT1,ADDR=7,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:9:,PORT=ROISTAT1,ADDR=8,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:10:,PORT=ROISTAT1,ADDR=9,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:11:,PORT=ROISTAT1,ADDR=10,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:12:,PORT=ROISTAT1,ADDR=11,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:13:,PORT=ROISTAT1,ADDR=12,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:14:,PORT=ROISTAT1,ADDR=13,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:15:,PORT=ROISTAT1,ADDR=14,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:16:,PORT=ROISTAT1,ADDR=15,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:17:,PORT=ROISTAT1,ADDR=16,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:18:,PORT=ROISTAT1,ADDR=17,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:19:,PORT=ROISTAT1,ADDR=18,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:20:,PORT=ROISTAT1,ADDR=19,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:21:,PORT=ROISTAT1,ADDR=20,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:22:,PORT=ROISTAT1,ADDR=21,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:23:,PORT=ROISTAT1,ADDR=22,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:24:,PORT=ROISTAT1,ADDR=23,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:25:,PORT=ROISTAT1,ADDR=24,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:26:,PORT=ROISTAT1,ADDR=25,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:27:,PORT=ROISTAT1,ADDR=26,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:28:,PORT=ROISTAT1,ADDR=27,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:29:,PORT=ROISTAT1,ADDR=28,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:30:,PORT=ROISTAT1,ADDR=29,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:31:,PORT=ROISTAT1,ADDR=30,TIMEOUT=1,NCHANS=$(NCHANS)")
-dbLoadRecords("NDROIStatN.template", "P=$(PREFIX),R=ROIStat1:32:,PORT=ROISTAT1,ADDR=31,TIMEOUT=1,NCHANS=$(NCHANS)")
 
 # ===== Processing plugin (with helper TIFF for dark/flat field loading) =====
 
@@ -205,6 +177,20 @@ dbLoadRecords("NDCodec.template", "P=$(PREFIX),R=Codec2:,PORT=CODEC2,NDARRAY_POR
 
 NDBadPixelConfigure("BADPIX1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDBadPixel.template", "P=$(PREFIX),R=BadPix1:,PORT=BADPIX1,NDARRAY_PORT=$(PORT)")
+
+# ===== Autosave =====
+# C's request paths: $(ADCORE)/iocBoot holds commonPlugin_settings.req,
+# the copy of EXAMPLE_commonPlugin_settings.req a deployed C IOC has.
+set_requestfile_path("./")
+set_requestfile_path("$(ADCORE)/db")
+set_requestfile_path("$(ADCORE)/iocBoot")
+set_requestfile_path("$(AUTOSAVE)/db")
+set_savefile_path("./autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+save_restoreSet_status_prefix("$(PREFIX)")
+dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(PREFIX)")
+dbLoadRecords("$(AUTOSAVE)/db/configMenu.db", "P=$(PREFIX), CONFIG=ADAutoSave")
 
 # ===== PVA plugin =====
 

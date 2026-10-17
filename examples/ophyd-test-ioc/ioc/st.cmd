@@ -55,6 +55,9 @@ epicsEnvSet("CBUFFS",     "500")
 epicsEnvSet("NELEMENTS",  "307200")
 epicsEnvSet("FTVL",       "SHORT")
 epicsEnvSet("TYPE",       "Int16")
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Also load with ADSIM: prefix for ophyd test compatibility.
@@ -62,4 +65,7 @@ epicsEnvSet("TYPE",       "Int16")
 # record templates load with the new prefix.
 epicsEnvSet("PREFIX", "ADSIM:")
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=ADSIM:,R=cam1:,PORT=SIM,ADDR=0,TIMEOUT=1")
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd

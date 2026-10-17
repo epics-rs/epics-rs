@@ -210,7 +210,7 @@ cargo build --release -p mini-beamline --features ioc
 ```bash
 # 1. Enable callbacks on the driver AND on the plugin that serves ArrayData.
 #    NDPluginBase.template defaults EnableCallbacks to Disable, and
-#    commonPlugins.cmd does not override it, so without this ArrayData
+#    the st.cmd's image1 does not override it, so without this ArrayData
 #    stays at its .db value however many frames the driver produces.
 caput mini:dot:cam1:ArrayCallbacks 1
 caput mini:dot:image1:EnableCallbacks 1

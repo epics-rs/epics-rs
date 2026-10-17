@@ -1,0 +1,682 @@
+record(stringout, "$(P)$(CONFIG)Menu:currName") {
+	field(VAL, "defaultConfig")
+}
+record(stringout, "$(P)$(CONFIG)Menu:currDesc") {
+	field(VAL, "")
+}
+
+# If you want configMenu automatically to search the autosave directory
+# for .cfg files for this value of $(CONFIG), and populate the menu with
+# those names, cause this record to execute at init time.
+record(stringout, "$(P)$(CONFIG)Menu:menuName") {
+	field(PINI, "YES")
+	field(VAL, "$(CONFIG)")
+	field(OUT, "$(P)$(CONFIG)MenuList:do.A")
+	field(FLNK, "$(P)$(CONFIG)Menu:findFiles")
+}
+record(bo, "$(P)$(CONFIG)Menu:findFiles") {
+	field(DOL, "1")
+	field(OUT, "$(P)$(CONFIG)MenuList:do.C PP")
+}
+
+record(longout, "$(P)$(CONFIG)Menu:isSaveOp") {
+}
+
+record(bo, "$(P)$(CONFIG)Menu:set_busy") {
+	field(SDIS, "$(P)$(CONFIG)Menu:set_busy")
+	field(DISV, "0")
+	field(OUT, "$(P)$(CONFIG)Menu:busy PP")
+}
+record(bo, "$(P)$(CONFIG)Menu:clear_busy") {
+	field(SDIS, "$(P)$(CONFIG)Menu:clear_busy")
+	field(DISV, "1")
+	field(OUT, "$(P)$(CONFIG)Menu:busy CA")
+}
+record(busy, "$(P)$(CONFIG)Menu:busy") {
+	field(ONAM, "Loading")
+}
+
+record(longout, "$(P)$(CONFIG)Menu:Page") {
+	field(FLNK, "$(P)$(CONFIG)MenuList:do.PROC")
+}
+# Note: the number of menu entries per page must agree with NUM_ITEMS
+# in configMenuSub.c
+record(calcout, "$(P)$(CONFIG)Menu:PageUp") {
+	field(INPA, "$(P)$(CONFIG)Menu:Page")
+	field(CALC, "max(0,a+1)")
+	field(OUT, "$(P)$(CONFIG)Menu:Page PP")
+}
+record(calcout, "$(P)$(CONFIG)Menu:PageDn") {
+	field(INPA, "$(P)$(CONFIG)Menu:Page")
+	field(CALC, "max(0,a-1)")
+	field(OUT, "$(P)$(CONFIG)Menu:Page PP")
+}
+record(aSub,"$(P)$(CONFIG)MenuList:do") {
+	field(INAM, "configMenuList_init")
+	field(SNAM, "configMenuList_do")
+	field(EFLG, "ALWAYS")
+	field(FTA, "STRING")
+	field(FTB, "SHORT")
+	field(FTC, "SHORT")
+	field(INPB, "$(P)$(CONFIG)Menu:Page")
+	field(FTVA, "STRING")
+	field(FTVB, "STRING")
+	field(FTVC, "STRING")
+	field(FTVD, "STRING")
+	field(FTVE, "STRING")
+	field(FTVF, "STRING")
+	field(FTVG, "STRING")
+	field(FTVH, "STRING")
+	field(FTVI, "STRING")
+	field(FTVJ, "STRING")
+	field(FTVK, "STRING")
+	field(FTVL, "STRING")
+	field(FTVM, "STRING")
+	field(FTVN, "STRING")
+	field(FTVO, "STRING")
+	field(FTVP, "STRING")
+	field(FTVQ, "STRING")
+	field(FTVR, "STRING")
+	field(FTVS, "STRING")
+	field(FTVT, "STRING")
+	field(OUTA, "$(P)$(CONFIG)Menu:name1 PP")
+	field(OUTB, "$(P)$(CONFIG)Menu:name2 PP")
+	field(OUTC, "$(P)$(CONFIG)Menu:name3 PP")
+	field(OUTD, "$(P)$(CONFIG)Menu:name4 PP")
+	field(OUTE, "$(P)$(CONFIG)Menu:name5 PP")
+	field(OUTF, "$(P)$(CONFIG)Menu:name6 PP")
+	field(OUTG, "$(P)$(CONFIG)Menu:name7 PP")
+	field(OUTH, "$(P)$(CONFIG)Menu:name8 PP")
+	field(OUTI, "$(P)$(CONFIG)Menu:name9 PP")
+	field(OUTJ, "$(P)$(CONFIG)Menu:name10 PP")
+	field(OUTK, "$(P)$(CONFIG)Menu:desc1 PP")
+	field(OUTL, "$(P)$(CONFIG)Menu:desc2 PP")
+	field(OUTM, "$(P)$(CONFIG)Menu:desc3 PP")
+	field(OUTN, "$(P)$(CONFIG)Menu:desc4 PP")
+	field(OUTO, "$(P)$(CONFIG)Menu:desc5 PP")
+	field(OUTP, "$(P)$(CONFIG)Menu:desc6 PP")
+	field(OUTQ, "$(P)$(CONFIG)Menu:desc7 PP")
+	field(OUTR, "$(P)$(CONFIG)Menu:desc8 PP")
+	field(OUTS, "$(P)$(CONFIG)Menu:desc9 PP")
+	field(OUTT, "$(P)$(CONFIG)Menu:desc10 PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:reqFile") {
+	field(VAL, "$(CONFIG)Menu.req")
+}
+record(aSub,"$(P)$(CONFIG)Menu:do") {
+	field(INAM, "configMenu_init")
+	field(SNAM, "configMenu_do")
+	field(EFLG, "ALWAYS")
+	field(FTA, "STRING")
+	field(FTB, "LONG")
+	field(FTC, "STRING")
+	field(FTD, "LONG")
+	field(FTE, "SHORT")
+	field(FTF, "STRING")
+	field(FTG, "STRING")
+	field(INPC, "$(P)$(CONFIG)Menu:busy")
+	field(INPE, "$(P)$(CONFIG)Menu:isSaveOp")
+	field(INPF, "$(P)$(CONFIG)Menu:reqFile")
+	field(INPG, "$(P)$(CONFIG)Menu:menuName")
+	field(FTVA, "LONG")
+	field(FTVB, "LONG")
+	field(FTVC, "LONG")
+	field(OUTA, "$(P)$(CONFIG)Menu:set_busy PP")
+	field(OUTB, "$(P)$(CONFIG)Menu:clear_busy PP")
+	field(OUTC, "$(P)$(CONFIG)Menu:status PP")
+}
+record(bo, "$(P)$(CONFIG)Menu:status") {
+	field(ZNAM, "Success")
+	field(ONAM, "Failure")
+}
+
+record(bo, "$(P)$(CONFIG)Menu:enableSave") {
+	field(ZNAM, "No")
+	field(ONAM, "Yes")
+	field(DOL, "$(ENABLE_SAVE=1)")
+}
+record(calcout, "$(P)$(CONFIG)Menu:disable") {
+	field(INPA, "$(P)$(CONFIG)Menu:busy CP")
+	field(INPB, "$(P)$(CONFIG)Menu:enableSave CP")
+	field(CALC, "B==0 || A==1")
+}
+
+#################################
+
+record(stringout, "$(P)$(CONFIG)Menu:name1") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc1") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig1") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name1")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc1.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName1.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc1") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc1 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName1") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name1")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig1") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name1")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc1")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name1")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name2") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc2") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig2") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name2")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc2.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName2.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc2") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc2 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName2") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name2")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig2") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name2")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc2")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name2")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name3") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc3") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig3") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name3")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc3.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName3.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc3") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc3 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName3") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name3")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig3") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name3")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc3")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name3")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name4") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc4") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig4") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name4")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc4.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName4.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc4") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc4 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName4") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name4")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig4") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name4")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc4")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name4")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name5") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc5") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig5") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name5")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc5.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName5.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc5") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc5 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName5") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name5")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig5") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name5")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc5")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name5")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name6") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc6") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig6") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name6")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc6.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName6.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc6") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc6 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName6") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name6")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig6") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name6")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc6")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name6")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name7") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc7") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig7") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name7")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc7.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName7.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc7") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc7 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName7") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name7")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig7") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name7")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc7")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name7")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name8") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc8") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig8") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name8")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc8.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName8.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc8") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc8 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName8") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name8")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig8") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name8")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc8")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name8")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name9") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc9") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig9") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name9")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc9.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName9.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc9") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc9 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName9") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name9")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig9") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name9")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc9")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name9")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(stringout, "$(P)$(CONFIG)Menu:name10") {
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc10") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig10") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name10")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc10.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName10.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc10") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc10 PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName10") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name10")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}
+record(sseq, "$(P)$(CONFIG)Menu:saveConfig10") {
+	field(SDIS, "$(P)$(CONFIG)Menu:disable PP")
+	field(DISV, "1")
+	field(DOL1, "$(P)$(CONFIG)Menu:name10")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "$(P)$(CONFIG)Menu:desc10")
+	field(LNK2, "$(P)$(CONFIG)Menu:currDesc PP")
+	field(DOL3, "1")
+	field(LNK3, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name10")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.A PP")
+}
+
+record(sseq, "$(P)$(CONFIG)Menu:cvtToMbbo") {
+	field(DOL1, "$(P)$(CONFIG)Menu:name1 CP")
+	field(DOL2, "$(P)$(CONFIG)Menu:name2 CP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name3 CP")
+	field(DOL4, "$(P)$(CONFIG)Menu:name4 CP")
+	field(DOL5, "$(P)$(CONFIG)Menu:name5 CP")
+	field(DOL6, "$(P)$(CONFIG)Menu:name6 CP")
+	field(DOL7, "$(P)$(CONFIG)Menu:name7 CP")
+	field(DOL8, "$(P)$(CONFIG)Menu:name8 CP")
+	field(DOL9, "$(P)$(CONFIG)Menu:name9 CP")
+	field(DOLA, "$(P)$(CONFIG)Menu:name10 CP")
+	field(LNK1, "$(P)$(CONFIG)Menu.ZRST")
+	field(LNK2, "$(P)$(CONFIG)Menu.ONST")
+	field(LNK3, "$(P)$(CONFIG)Menu.TWST")
+	field(LNK4, "$(P)$(CONFIG)Menu.THST")
+	field(LNK5, "$(P)$(CONFIG)Menu.FRST")
+	field(LNK6, "$(P)$(CONFIG)Menu.FVST")
+	field(LNK7, "$(P)$(CONFIG)Menu.SXST")
+	field(LNK8, "$(P)$(CONFIG)Menu.SVST")
+	field(LNK9, "$(P)$(CONFIG)Menu.EIST")
+	field(LNKA, "$(P)$(CONFIG)Menu.NIST")
+}
+
+record(mbbo, "$(P)$(CONFIG)Menu") {
+	field(ZRVL, "1")
+	field(ONVL, "2")
+	field(TWVL, "3")
+	field(THVL, "4")
+	field(FRVL, "5")
+	field(FVVL, "6")
+	field(SXVL, "7")
+	field(SVVL, "8")
+	field(EIVL, "9")
+	field(NIVL, "10")
+	field(OUT, "$(P)$(CONFIG)Menu:mbboLoad.PROC PP")
+}
+
+record(sseq, "$(P)$(CONFIG)Menu:mbboLoad") {
+	field(SELM, "Specified")
+	field(SELL, "$(P)$(CONFIG)Menu.RVAL")
+	field(LNK1, "$(P)$(CONFIG)Menu:loadConfig1.PROC PP")
+	field(LNK2, "$(P)$(CONFIG)Menu:loadConfig2.PROC PP")
+	field(LNK3, "$(P)$(CONFIG)Menu:loadConfig3.PROC PP")
+	field(LNK4, "$(P)$(CONFIG)Menu:loadConfig4.PROC PP")
+	field(LNK5, "$(P)$(CONFIG)Menu:loadConfig5.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:loadConfig6.PROC PP")
+	field(LNK7, "$(P)$(CONFIG)Menu:loadConfig7.PROC PP")
+	field(LNK8, "$(P)$(CONFIG)Menu:loadConfig8.PROC PP")
+	field(LNK9, "$(P)$(CONFIG)Menu:loadConfig9.PROC PP")
+	field(LNKA, "$(P)$(CONFIG)Menu:loadConfig10.PROC PP")
+}
+
+# For CA clients to directly write a configuration name and load it
+record(stringout, "$(P)$(CONFIG)Menu:name") {
+	field(FLNK, "$(P)$(CONFIG)Menu:loadConfig")
+}
+record(stringout, "$(P)$(CONFIG)Menu:desc") {
+}
+record(sseq, "$(P)$(CONFIG)Menu:loadConfig") {
+	field(SDIS, "$(P)$(CONFIG)Menu:busy")
+	field(DISV, "1")
+	field(STR1, "working...")
+	field(LNK1, "$(P)$(CONFIG)Menu:currName PP")
+	field(DOL2, "0")
+	field(LNK2, "$(P)$(CONFIG)Menu:isSaveOp NPP")
+	field(DOL3, "$(P)$(CONFIG)Menu:name")
+	field(LNK3, "$(P)$(CONFIG)Menu:do.A NPP")
+	field(LNK4, "$(P)$(CONFIG)Menu:do.PROC CA")
+	field(WAIT4, "Wait")
+	field(LNK5, "$(P)$(CONFIG)Menu:cpDesc.PROC PP")
+	field(LNK6, "$(P)$(CONFIG)Menu:cpName.PROC PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpDesc") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:currDesc")
+	field(OUT, "$(P)$(CONFIG)Menu:desc PP")
+}
+record(stringout, "$(P)$(CONFIG)Menu:cpName") {
+	field(SDIS, "$(P)$(CONFIG)Menu:status")
+	field(DISV, "1")
+	field(OMSL, "closed_loop")
+	field(DOL, "$(P)$(CONFIG)Menu:name")
+	field(OUT, "$(P)$(CONFIG)Menu:currName PP")
+}

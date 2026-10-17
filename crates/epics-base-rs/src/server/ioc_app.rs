@@ -2344,6 +2344,8 @@ impl IocApplication {
             "AUTOSAVE",
             concat!(env!("CARGO_MANIFEST_DIR"), "/autosave"),
         );
+        // `$(CALC)`, for the calc records' `*_settings.req` in `$(CALC)/db`.
+        crate::runtime::env::set_default("CALC", concat!(env!("CARGO_MANIFEST_DIR"), "/calc"));
         self.autosave_startup = Some(config);
         self
     }

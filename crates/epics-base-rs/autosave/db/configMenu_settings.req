@@ -1,0 +1,5 @@
+$(P)$(CONFIG)Menu:currName
+$(P)$(CONFIG)Menu:currDesc
+$(P)$(CONFIG)Menu:enableSave
+# configMenu will search for .cfg files, so no need to autosave them
+#file configMenuNames.req P=$(P),CONFIG=$(CONFIG)

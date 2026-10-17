@@ -21,22 +21,23 @@ epicsEnvSet("CBUFFS", "500")
 epicsEnvSet("NELEMENTS", "1048576")
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
-# Autosave configuration
-set_requestfile_path("$(ADSIMDETECTOR)/db")
-set_requestfile_path("$(ADCORE)/db")
-set_savefile_path("$(ADSIMDETECTOR)/ioc/autosave")
-save_restoreSet_status_prefix("$(PREFIX)")
-set_pass0_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
-set_pass1_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
-
 # Create the SimDetector driver
 simDetectorConfig("$(PORT)", 1024, 1024, 1, 0, 50000000)
 
 # Load the detector database
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# Load all common plugins (includes image1 StdArrays)
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
+
+# Autosave configuration, after commonPlugins.cmd, whose C autosave block
+# sets the save path to ./autosave
+set_requestfile_path("$(ADSIMDETECTOR)/db")
+set_savefile_path("$(ADSIMDETECTOR)/ioc/autosave")
+set_pass0_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
+set_pass1_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
 
 # Autosave monitor sets (after all records are loaded)
 create_monitor_set("simDetector_settings.req", 5, "P=$(PREFIX),R=$(CAM)")

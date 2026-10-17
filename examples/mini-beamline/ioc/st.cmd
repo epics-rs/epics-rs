@@ -108,6 +108,9 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(MINI_BEAMLINE)/db:$(ADCORE)/db")
 dbLoadRecords("$(MINI_BEAMLINE)/db/moving_dot.template", "P=$(PREFIX),R=cam1:,IOC=mini:,PORT=DOT")
 
 # Load standard areaDetector plugins for MovingDot
+# image1, which commonPlugins.cmd leaves to the st.cmd as C's does
+NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
 
 # Restore top-level prefix

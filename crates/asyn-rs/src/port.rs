@@ -153,6 +153,11 @@ pub(crate) struct DeviceTable {
 }
 
 impl DeviceTable {
+    /// The port's announcement owner.
+    pub(crate) fn announcer(&self) -> ExceptionAnnouncer {
+        ExceptionAnnouncer::clone(&self.announcer)
+    }
+
     /// The table of a single-device port no actor owns — for a test fixture.
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
@@ -1106,8 +1111,8 @@ impl PortDriverBase {
     /// whose link is owned elsewhere: the owner (an IP-server listener assigning a
     /// slot) moves the truth without this port's actor running, and C fans that
     /// edge out from the owner's thread — `pasynCommonSyncIO->connectDevice` on
-    /// the child (drvAsynIPServerPort.c:372-375). Here it is published when the
-    /// child's actor next touches the port, which is the moment it can matter.
+    /// the child (drvAsynIPServerPort.c:372-375). Here the owner wakes the
+    /// child's actor, which publishes it at the top of its next pass.
     ///
     /// Returns `true` if an edge was published.
     pub fn sync_connection_edge(&mut self) -> bool {

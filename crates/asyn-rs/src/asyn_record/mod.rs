@@ -40,7 +40,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::drivers::option_parse::{is_option_key, option_key};
 use crate::error::{AsynError, AsynResult, AsynStatus};
-use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
+use crate::exception::{AsynException, ExceptionCallbackGuard};
 use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
 use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
@@ -554,7 +554,7 @@ pub struct AsynRecord {
     // Owner handle for the registered exception callback so it can
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
-    except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
+    except_cb: Option<ExceptionCallbackGuard>,
     // The SCAN put `cancelIOInterruptScan` makes, built once the record has a
     // database, so `special()` leaves it to the put path without allocating.
     cancel_scan: Option<epics_base_rs::server::record::SharedAfterWork>,
@@ -2914,20 +2914,14 @@ impl AsynRecord {
     /// `monitor_status`.
     fn register_exception_callback(&mut self) {
         self.clear_exception_callback();
-        let Some(entry) = self.device_user.device() else {
-            return;
-        };
-        let Some(mgr) = entry.handle.trace().exception_manager() else {
-            return;
-        };
-        let port = self.port.clone();
         let dirty = Arc::clone(&self.status_dirty);
         let own_raise = Arc::clone(&self.own_raise);
         let immediate = self.async_ctx.clone();
-        let id = mgr.add_callback(move |ev| {
-            // The subscription is per-port in C (the callback hangs off the
-            // record's `pasynUser`), which is what this name check reproduces.
-            if ev.port_name != port || own_raise.load(Ordering::Acquire) {
+        // On the record's own user, as C's: the `dpCommon` its PORT/ADDR bound,
+        // so `asynReport` counts it there and another device's exceptions
+        // never reach it.
+        self.except_cb = self.device_user.exception_callback_add(move |_| {
+            if own_raise.load(Ordering::Acquire) {
                 return;
             }
             let Some((name, db)) = immediate.clone() else {
@@ -2949,15 +2943,12 @@ impl AsynRecord {
                 });
             });
         });
-        self.except_cb = Some((mgr, id));
     }
 
     /// Remove the trace exception subscription (C `exceptionCallbackRemove`,
     /// asynRecord.c:523,1154,1313). Idempotent.
     fn clear_exception_callback(&mut self) {
-        if let Some((mgr, id)) = self.except_cb.take() {
-            mgr.remove_callback(id);
-        }
+        self.except_cb = None;
     }
 
     /// C `getOptions`'s field writes (asynRecord.c:1864-1927) from the
@@ -7283,6 +7274,74 @@ mod tests {
     /// controls to the (PORT,ADDR) device trace state, not the port-wide
     /// state (C findTracePvt, asynManager.c:548-550). A record adjusting
     /// device 3 must not change device 4 or the port default.
+    /// C `connectDevice` adds `exceptCallback` on the record's own user
+    /// (asynRecord.c:1269), so `asynReport` counts it on the `dpCommon` PORT/ADDR
+    /// bound — `exceptionUsers 1` on that device, 0 on the port — and a rebind
+    /// moves it.
+    #[test]
+    fn the_exception_callback_is_counted_on_the_bound_device() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct MdDriver(PortDriverBase);
+        impl PortDriver for MdDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_except_users_md";
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(
+            Box::new(MdDriver(PortDriverBase::new(port_name, 2, flags))),
+            rx,
+        );
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let trace = Arc::new(TraceManager::new());
+        let mut handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            trace,
+        );
+        handle.set_capabilities(true, 2);
+        register_port(port_name, handle.clone(), &crate::registry::open_owner()).unwrap();
+        let users = |report: &str| {
+            report
+                .lines()
+                .filter_map(|l| l.split("exceptionUsers ").nth(1))
+                .map(|rest| rest.split(' ').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.addr = 0;
+        let _ = rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        // The port's line, then device 0's.
+        assert_eq!(users(&handle.report_blocking(1).unwrap()), ["0", "1"]);
+
+        rec.addr = 1;
+        let _ = rec.connect_device();
+        assert_eq!(
+            users(&handle.report_blocking(1).unwrap()),
+            ["0", "0", "1"],
+            "the rebind moved it to device 1"
+        );
+    }
+
     #[test]
     fn trace_controls_route_to_device_on_multi_device_port() {
         use crate::interrupt::InterruptManager;

@@ -1345,6 +1345,17 @@ impl PortActor {
     }
 
     fn process_one(&mut self) {
+        // A port whose link is owned by another object — an IP-server child port,
+        // whose socket the parent's accept loop assigns and clears — can change
+        // connection state with no request of its own having run. The owner wakes
+        // this actor when it does, and every wake ends here, request or not: the
+        // `exceptionConnect` fan-out and the interpose stack's reset (which drops
+        // the previous client's EOS read-ahead) are published before anything is
+        // dispatched. C's listener publishes the same edge from its own thread
+        // (`connectDevice`, drvAsynIPServerPort.c:372-375). Every other port is
+        // already in sync (its own `set_connected` published the edge), so this
+        // is a no-op for them.
+        self.driver.base_mut().sync_connection_edge();
         let msg = match self.heap.pop() {
             Some(m) => m,
             None => return,
@@ -1379,18 +1390,6 @@ impl PortActor {
         // Bare Connect *priority* is not enough: C keeps the EOS readback at Low
         // priority with no waiver (:1296), so IEOS/OEOS still stay blank on a
         // disconnected port, and keying the waiver on the reason preserves that.
-        // A port whose link is owned by another object — an IP-server child port,
-        // whose socket the parent's accept loop assigns and clears — can change
-        // connection state with no request of its own having run. Its `connected`
-        // is the owner's cell, so the gate below already reads the truth; what is
-        // still owed is the edge C's listener publishes explicitly when it hands
-        // the child a socket (`connectDevice`, drvAsynIPServerPort.c:372-375):
-        // the `exceptionConnect` fan-out and the interpose stack's reset, which
-        // drops the previous client's EOS read-ahead. Every other port is already
-        // in sync here (its own `set_connected` published the edge), so this is a
-        // no-op for them.
-        self.driver.base_mut().sync_connection_edge();
-
         let multi_device = self.driver.base().flags.multi_device;
         if let Some(connect) = queue_gate(&msg.op, &msg.user, multi_device) {
             if !self.driver.base().flags.can_block {

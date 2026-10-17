@@ -395,9 +395,13 @@ fn ports_report(mgr: &PortManager, level: i32, port: Option<&str>) -> String {
     let mut out = String::new();
     for name in names {
         match mgr.find_port_handle(&name) {
+            // C's report reads the port directly and cannot fail; a port whose
+            // actor is gone says so on the same `fp`.
             Ok(handle) => match handle.report_blocking(level) {
                 Ok(text) => out.push_str(&text),
-                Err(e) => eprintln!("asynReport {name}: {e}"),
+                Err(e) => {
+                    let _ = writeln!(out, "asynReport {name}: {e}");
+                }
             },
             // C prints the miss on the report's own `fp` (:1150-1153).
             Err(_) => {
@@ -2185,6 +2189,20 @@ mod tests {
             ports_report(&mgr, 0, Some("no_such_port")),
             "asynManager:report port no_such_port not found\n"
         );
+    }
+
+    #[test]
+    fn a_port_that_cannot_report_says_so_in_the_report_text() {
+        let mgr = PortManager::new();
+        let rt = mgr
+            .register_port_unclaimed(
+                DummyDriver::new("gone_port"),
+                &crate::registry::open_owner(),
+            )
+            .unwrap();
+        rt.shutdown_and_wait();
+        let text = ports_report(&mgr, 0, Some("gone_port"));
+        assert!(text.starts_with("asynReport gone_port: "), "{text:?}");
     }
 
     struct DummyDriver {

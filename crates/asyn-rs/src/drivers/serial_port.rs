@@ -14,7 +14,6 @@ use crate::interpose::{EomReason, OctetNext, OctetReadResult};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
-use crate::{asyn_trace, asyn_trace_io};
 
 use super::option_parse::{
     bad_number, option_key, option_value, parse_yn_option, sscanf_int, sscanf_uint,
@@ -1057,11 +1056,23 @@ impl DrvAsynSerialPort {
     /// auto-reconnect re-opens it on the next request. C parity:
     /// `drvAsynSerialPort.c::closeConnection` (close, fd=-1,
     /// `exceptionDisconnect`).
-    fn drop_connection(&mut self) {
+    fn drop_connection(&mut self, user: &AsynUser) {
         if let Some(fd) = self.io.fd.take() {
+            self.trace_close(user);
             unsafe { libc::close(fd) };
         }
         self.base.set_connected(false);
+    }
+
+    /// `closeConnection`'s line (drvAsynSerialPort.c:629-630), printed only
+    /// while an fd is open.
+    fn trace_close(&self, user: &AsynUser) {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("Close {} connection.\n", self.device),
+        );
     }
 
     /// Create a new serial port driver.
@@ -1220,7 +1231,7 @@ impl PortDriver for DrvAsynSerialPort {
         crate::interfaces::octet_transport_capabilities()
     }
 
-    fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         // C drvAsynSerialPort.c::connectIt (694-698): reject a connect on
         // an already-open link ("Link already open!") rather than opening a
         // second fd and leaking the first (along with its saved termios).
@@ -1230,6 +1241,12 @@ impl PortDriver for DrvAsynSerialPort {
                 message: format!("{}: Link already open!", self.device),
             });
         }
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("Open connection to {}\n", self.device),
+        );
         // 1. Open device
         let c_path =
             std::ffi::CString::new(self.device.as_str()).map_err(|_| AsynError::Status {
@@ -1319,25 +1336,26 @@ impl PortDriver for DrvAsynSerialPort {
             return Err(e);
         }
 
-        self.base.set_connected(true);
-        asyn_trace!(
-            self.base.trace,
-            &self.base.port_name,
+        user.print(
             TraceMask::FLOW,
-            "connected to {} at {} baud\n",
-            self.device,
-            self.baud
+            file!(),
+            line!(),
+            format_args!("Opened connection to {}\n", self.device),
         );
+        self.base.set_connected(true);
         Ok(())
     }
 
-    fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        asyn_trace!(
-            self.base.trace,
-            &self.base.port_name,
+    fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        user.print(
             TraceMask::FLOW,
-            "disconnect\n"
+            file!(),
+            line!(),
+            format_args!("{} disconnect\n", self.device),
         );
+        if self.io.fd.is_some() {
+            self.trace_close(user);
+        }
 
         // Close fd
         if let Some(fd) = self.io.fd.take() {
@@ -1383,66 +1401,100 @@ impl PortDriver for DrvAsynSerialPort {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        self.require_fd()?;
-        let result = match self.io.read(user, buf) {
-            Ok(r) => r,
-            Err(e) => {
-                // C parity: drvAsynSerialPort.c::closeConnection on a fatal
-                // read error / EOF so the actor's auto-reconnect re-opens the
-                // device. EINTR/EAGAIN are already retried inside
-                // SerialIoState::read, so an error reaching here is fatal.
-                if e.is_fatal_transport() && self.base.is_connected() {
-                    asyn_trace!(
-                        self.base.trace,
-                        &self.base.port_name,
-                        TraceMask::FLOW,
-                        "read error, disconnecting: {e}\n"
-                    );
-                    self.drop_connection();
-                }
-                return Err(e);
-            }
-        };
-        asyn_trace_io!(
-            self.base.trace,
-            &self.base.port_name,
-            TraceMask::IO_DRIVER,
-            &buf[..result.nbytes_transferred],
-            "read\n"
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} read.\n", self.device),
         );
-        Ok((result.nbytes_transferred, result.eom_reason))
+        self.require_fd()?;
+        let result = self.io.read(user, buf);
+        let n_read = match &result {
+            Ok(r) => r.nbytes_transferred,
+            Err(e) => e.partial_read().map_or(0, |p| p.nbytes_transferred()),
+        };
+        if n_read > 0 {
+            let label = format!("{} read {n_read}\n", self.device);
+            user.print_io(
+                TraceMask::IO_DRIVER,
+                &buf[..n_read],
+                &label,
+                file!(),
+                line!(),
+            );
+        }
+        if let Err(e) = &result {
+            // C parity: drvAsynSerialPort.c::closeConnection on a fatal
+            // read error / EOF so the actor's auto-reconnect re-opens the
+            // device. EINTR/EAGAIN are already retried inside
+            // SerialIoState::read, so an error reaching here is fatal.
+            if e.is_fatal_transport() && self.base.is_connected() {
+                self.drop_connection(user);
+            }
+        }
+        // C's closing line prints the status as its int (:978-979), on every
+        // exit but the refusals before the loop.
+        if !buf.is_empty() {
+            let status = result
+                .as_ref()
+                .map_or_else(|e| e.status(), |_| AsynStatus::Success);
+            user.print(
+                TraceMask::FLOW,
+                file!(),
+                line!(),
+                format_args!("{} read {n_read}, return {}\n", self.device, status as i32),
+            );
+        }
+        result.map(|r| (r.nbytes_transferred, r.eom_reason))
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.require_fd()?;
-        asyn_trace_io!(
-            self.base.trace,
-            &self.base.port_name,
-            TraceMask::IO_DRIVER,
-            data,
-            "write\n"
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} write.\n", self.device),
         );
-        match self.io.write(user, data) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                // C parity: closeConnection on a fatal write error so the
-                // next request reconnects (symmetric with read; matches
-                // ip_port DRV-5).
-                if e.is_fatal_transport() && self.base.is_connected() {
-                    asyn_trace!(
-                        self.base.trace,
-                        &self.base.port_name,
-                        TraceMask::FLOW,
-                        "write error, disconnecting: {e}\n"
-                    );
-                    self.drop_connection();
-                }
-                Err(e)
+        let label = format!("{} write {}\n", self.device, data.len());
+        user.print_io(TraceMask::IO_DRIVER, data, &label, file!(), line!());
+        self.require_fd()?;
+        // C returns before the loop, and its closing line (:786-789).
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let result = self.io.write(user, data);
+        if let Err(e) = &result {
+            // C parity: closeConnection on a fatal write error so the
+            // next request reconnects (symmetric with read; matches
+            // ip_port DRV-5).
+            if e.is_fatal_transport() && self.base.is_connected() {
+                self.drop_connection(user);
             }
         }
+        let (sent, status) = match &result {
+            Ok(n) => (*n, AsynStatus::Success),
+            Err(e) => (e.partial_write().unwrap_or(0), e.status()),
+        };
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "wrote {sent} to {}, return {}\n",
+                self.device,
+                status.str_status()
+            ),
+        );
+        result
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} flush\n", self.device),
+        );
         self.io.flush(user)
     }
 
@@ -1462,7 +1514,13 @@ impl PortDriver for DrvAsynSerialPort {
     /// `clocal`/`ixon`/`ixoff`/`ixany` — which have no `SerialConfig` field —
     /// were silently dropped while down and erased at the next connect by the
     /// rebuild from config.
-    fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+    fn set_option(&mut self, user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!("{} setOption key {key} val {value}\n", self.base.port_name),
+        );
         let key = option_key(key);
         // C compares every option value with `epicsStrCaseCmp` as well
         // (`drvAsynSerialPort.c:361-528`), so the fold belongs at the entry

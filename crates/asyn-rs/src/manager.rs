@@ -454,6 +454,21 @@ impl DeviceUser {
         Ok(entry)
     }
 
+    /// C `exceptionCallbackAdd(pasynUser, callback)` (asynManager.c:1364-1382):
+    /// on the exception list of the `dpCommon` this user is bound to, so it
+    /// hears that device's or port's exceptions and no other. `None` when the
+    /// user is bound to nothing, C's "not connected" refusal.
+    pub fn exception_callback_add<F>(
+        &self,
+        callback: F,
+    ) -> Option<crate::exception::ExceptionCallbackGuard>
+    where
+        F: Fn(&crate::exception::ExceptionEvent<'_>) + Send + Sync + 'static,
+    {
+        let entry = self.device()?;
+        Some(entry.handle.exception_callback_add(self.addr, callback))
+    }
+
     /// C `disconnect` (asynManager.c:1359-1391): sever the binding.
     ///
     /// C refuses while the user has a queued request, holds a block, or is on

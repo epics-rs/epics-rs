@@ -436,6 +436,11 @@ struct PortTrace {
     devices: HashMap<i32, TraceConfig>,
     /// C `pport->attributes & ASYN_MULTIDEVICE`.
     multi_device: bool,
+    /// The port's announcement owner, once a port of this name is bound to
+    /// these services: C's `setTrace*` raise their exception on the
+    /// `dpCommon` written (`announceExceptionOccurred`, asynManager.c:2804),
+    /// so its exception users hear it, not only the IOC-wide list.
+    announcer: Option<crate::port::ExceptionAnnouncer>,
 }
 
 impl PortTrace {
@@ -447,6 +452,7 @@ impl PortTrace {
             port: TraceConfig::default(),
             devices: HashMap::new(),
             multi_device,
+            announcer: None,
         }
     }
 }
@@ -523,6 +529,40 @@ impl TraceManager {
                 .entry(port.to_string())
                 .or_insert_with(|| PortTrace::new(multi_device))
                 .multi_device = multi_device;
+        }
+    }
+
+    /// Route this port's trace exceptions through `announcer`
+    /// ([`crate::port_handle::PortHandle::new`], every port's creation).
+    pub(crate) fn bind_announcer(&self, port: &str, announcer: crate::port::ExceptionAnnouncer) {
+        if let Ok(mut ports) = self.ports.lock() {
+            ports
+                .entry(port.to_string())
+                .or_insert_with(|| PortTrace::new(false))
+                .announcer = Some(announcer);
+        }
+    }
+
+    /// Raise a trace exception on `port`'s `dpCommon` for `addr`: through the
+    /// port's announcer when one is bound, else on the IOC-wide list alone.
+    fn raise(
+        &self,
+        port: &str,
+        announcer: Option<crate::port::ExceptionAnnouncer>,
+        exception: AsynException,
+        addr: i32,
+    ) {
+        if let Some(announcer) = announcer {
+            announcer.announce(exception, addr);
+            return;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port,
+                exception,
+                addr,
+            });
         }
     }
 
@@ -655,10 +695,12 @@ impl TraceManager {
         F: FnMut(&mut TraceConfig),
     {
         let mut announced: Vec<i32> = Vec::new();
+        let mut announcer = None;
         if let Ok(mut ports) = self.ports.lock() {
             let pt = ports
                 .entry(port.to_string())
                 .or_insert_with(|| PortTrace::new(false));
+            announcer = pt.announcer.clone();
             match device_slot(pt.multi_device, addr) {
                 Some(a) => {
                     apply(pt.devices.entry(a).or_insert_with(TraceConfig::default));
@@ -680,15 +722,8 @@ impl TraceManager {
                 }
             }
         }
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            for a in announced {
-                sink.announce(&ExceptionEvent {
-                    port_name: port,
-                    exception,
-                    addr: a,
-                });
-            }
+        for a in announced {
+            self.raise(port, announcer.clone(), exception, a);
         }
     }
 
@@ -714,10 +749,12 @@ impl TraceManager {
         F: FnOnce(&mut TraceConfig),
     {
         let mut announced_at = None;
+        let mut announcer = None;
         if let Ok(mut ports) = self.ports.lock() {
             let pt = ports
                 .entry(port.to_string())
                 .or_insert_with(|| PortTrace::new(false));
+            announcer = pt.announcer.clone();
             match device_slot(pt.multi_device, addr) {
                 Some(a) => {
                     apply(pt.devices.entry(a).or_insert_with(TraceConfig::default));
@@ -732,14 +769,7 @@ impl TraceManager {
         let (Some(exception), Some(a)) = (exception, announced_at) else {
             return;
         };
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port,
-                exception,
-                addr: a,
-            });
-        }
+        self.raise(port, announcer, exception, a);
     }
 
     /// Set trace configuration for a specific device address.

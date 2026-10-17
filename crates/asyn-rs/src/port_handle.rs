@@ -376,6 +376,13 @@ pub struct WeakPortHandle {
 }
 
 impl WeakPortHandle {
+    /// Wake the actor with nothing queued, so it publishes a connection edge
+    /// the link's owner moved off the port thread
+    /// ([`crate::port::PortDriverBase::sync_connection_edge`]).
+    pub(crate) fn wake(&self) {
+        self.cells.nudge();
+    }
+
     /// The handle, or `None` once the last [`PortHandle`] has dropped.
     pub fn upgrade(&self) -> Option<PortHandle> {
         Some(PortHandle {
@@ -427,6 +434,9 @@ impl PortHandle {
         actor: ActorLink,
         trace: Arc<TraceManager>,
     ) -> Self {
+        // The one place a port meets the trace it reads, so its trace
+        // exceptions reach its exception users from the moment it exists.
+        trace.bind_announcer(&port_name, actor.devices.announcer());
         Self {
             tx,
             port_name: port_name.into(),

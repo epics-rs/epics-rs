@@ -135,7 +135,7 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
     let _ = std::fs::remove_file(&path);
 
     assert!(
-        log.contains("connected to"),
+        log.contains(&format!("Opened connection OK to {host}\n")),
         "an iocsh-created port must honour asynSetTraceMask — C traces the \
          connect at ASYN_TRACE_FLOW (drvAsynIPPort.c:591-592); trace file held: {log:?}"
     );

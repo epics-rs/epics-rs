@@ -11,6 +11,20 @@ pub enum AsynStatus {
     Disabled,
 }
 
+impl AsynStatus {
+    /// C `pasynManager->strStatus` (asynManager.c:3230-3246).
+    pub fn str_status(self) -> &'static str {
+        match self {
+            Self::Success => "asynSuccess",
+            Self::Timeout => "asynTimeout",
+            Self::Overflow => "asynOverflow",
+            Self::Error => "asynError",
+            Self::Disconnected => "asynDisconnected",
+            Self::Disabled => "asynDisabled",
+        }
+    }
+}
+
 /// The steps of [`crate::request::RequestOp::OctetWriteRead`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OctetStep {

@@ -2362,6 +2362,27 @@ fn parse_db_items(chars: &mut Feed, items: &mut DbItems) -> CaResult<()> {
         }
         if word == "device" {
             let a = parse_arg_list(chars, &mut pos, &mut line, &mut col, 4, 4)?;
+            // C `dbDevice` (`dbLexRoutines.c:822-838`): either refusal is a
+            // `yyerror(NULL)`, so the line is dropped and the parse goes on.
+            let refusal = if create_record_raw(&a[0]).is_err()
+                && !dbd.record_types.iter().any(|t| t.name == a[0])
+            {
+                Some(format!(
+                    "Record type '{}' not found for device '{}'",
+                    a[0], a[3]
+                ))
+            } else if crate::server::record::DbLinkType::from_c_name(&a[1]).is_none() {
+                Some(format!("Bad link type '{}' for device '{}'", a[1], a[3]))
+            } else {
+                None
+            };
+            if let Some(message) = refusal {
+                chars.faults.report_at(
+                    line as u32,
+                    DbDiagnostic::new(format!("{ERL_ERROR}: {message}")),
+                );
+                continue;
+            }
             dbd.devices.push(DbdDevice {
                 record_type: a[0].clone(),
                 link_type: a[1].clone(),

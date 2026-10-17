@@ -1776,6 +1776,10 @@ pub enum DbLinkType {
     AbIo,
     GpibIo,
     BitbusIo,
+    /// `MACRO_LINK` and `PN_LINK` — declarable by a `device()` line, never
+    /// what `dbParseLink` yields, so `dbCanSetLink` refuses every text.
+    MacroLink,
+    PnLink,
     /// `INST_IO` — `@dev arg …`. The form every asyn-based device support uses.
     InstIo,
     BbgpibIo,
@@ -1805,6 +1809,8 @@ impl DbLinkType {
             DbLinkType::AbIo => "AB_IO",
             DbLinkType::GpibIo => "GPIB_IO",
             DbLinkType::BitbusIo => "BITBUS_IO",
+            DbLinkType::MacroLink => "MACRO_LINK",
+            DbLinkType::PnLink => "PN_LINK",
             DbLinkType::InstIo => "INST_IO",
             DbLinkType::BbgpibIo => "BBGPIB_IO",
             DbLinkType::RfIo => "RF_IO",
@@ -1812,6 +1818,30 @@ impl DbLinkType {
             DbLinkType::DbLink => "DB_LINK",
             DbLinkType::CaLink => "CA_LINK",
         }
+    }
+
+    /// The `device()` line's link-type word, against C's `pamaplinkType`
+    /// (`dbStaticLib.c:64-81`); `None` for a word C refuses.
+    pub(crate) fn from_c_name(name: &str) -> Option<Self> {
+        const ALL: [DbLinkType; 16] = [
+            DbLinkType::Constant,
+            DbLinkType::PvLink,
+            DbLinkType::JsonLink,
+            DbLinkType::VmeIo,
+            DbLinkType::CamacIo,
+            DbLinkType::AbIo,
+            DbLinkType::GpibIo,
+            DbLinkType::BitbusIo,
+            DbLinkType::MacroLink,
+            DbLinkType::PnLink,
+            DbLinkType::InstIo,
+            DbLinkType::BbgpibIo,
+            DbLinkType::RfIo,
+            DbLinkType::VxiIo,
+            DbLinkType::DbLink,
+            DbLinkType::CaLink,
+        ];
+        ALL.into_iter().find(|t| t.c_name() == name)
     }
 
     /// What C renders a link of this type with an EMPTY payload as — the state
@@ -1838,6 +1868,9 @@ impl DbLinkType {
             DbLinkType::BbgpibIo => "#L0 B0 G0 @",
             DbLinkType::RfIo => "#R0 M0 D0 E0",
             DbLinkType::VxiIo => "#V0 C0 S0 @",
+            // Zeroed `macro_link` / `pv_link`; a reader sees the PN_LINK one
+            // as ` NMS` (`render_pn_link`).
+            DbLinkType::MacroLink | DbLinkType::PnLink => "",
         }
     }
 
@@ -1894,11 +1927,9 @@ pub fn declared_link_type(
     if super::has_no_device_support(record_type) {
         return Some(DbLinkType::Constant);
     }
-    let menu = super::dbd_generated::device_menu(record_type)?;
-    let dtyp = dtyp
-        .filter(|d| !d.is_empty())
-        .or_else(|| menu.first().copied())?;
-    super::dbd_generated::device_link_type(record_type, dtyp)
+    // The whole `devList`: base's rows, then every contributed one — a
+    // registered support's and a loaded `device()` line's alike.
+    super::dev_sup_of(record_type, dtyp.unwrap_or("")).map(|row| row.link_type)
 }
 
 /// C `dbParseLink` (`dbStaticLib.c:2626`) — the only half of the link gate a

@@ -151,13 +151,14 @@ fn render_removed_link(
 }
 
 /// C `dbGetString`'s `PN_LINK` arm (`dbStaticLib.c:1930-1933`): the target
-/// and the severity switch, nothing else.
+/// and the severity switch, nothing else — ` NMS` for the empty link a
+/// `PN_LINK` devSup is left with, whose `pvname` is NULL.
 fn render_pn_link(raw: &[u8]) -> PvString {
     let text = super::trim_link_text(raw);
     let ms = match super::parse_link_field(text, super::LinkFieldType::In) {
         ParsedLink::Db(link) => link.monitor_switch,
         ParsedLink::Ca(link) => link.monitor_switch,
-        _ => return text.into(),
+        _ => super::MonitorSwitch::default(),
     };
     [
         link_target_head(text),
@@ -8776,6 +8777,15 @@ impl RecordInstance {
         let rendered = match self.declared_record_link(desc.name).map(|l| &**l) {
             Some(ParsedLink::Removed(ty)) => render_removed_link(class, *ty, text),
             _ if desc.name == "INP" && self.inp_is_pn_link() => render_pn_link(text),
+            _ if matches!(desc.name, "INP" | "OUT")
+                && super::declared_link_type(
+                    self.record.record_type(),
+                    Some(self.common.dtyp.as_str()),
+                    desc.name,
+                ) == Some(super::DbLinkType::PnLink) =>
+            {
+                render_pn_link(text)
+            }
             _ => render_link_field(class, text),
         };
         EpicsValue::String(rendered)

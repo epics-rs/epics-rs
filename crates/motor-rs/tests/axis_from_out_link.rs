@@ -270,7 +270,9 @@ record(motor, "O:m2") { field(DTYP, "TestSim") field(OUT, "#C6 S4 @testOpen") }
 }
 
 /// devMotorSim.c:136-196 then motorRecord.cc:648-651: each refusal is a
-/// recGblRecordError and CARD -1. M_drvSup has no symbol table.
+/// recGblRecordError and CARD -1. M_drvSup has no symbol table. The
+/// `Illegal INP field` arm is unreachable from a `.db`: `dbInitRecordLinks`
+/// leaves I:m2 an empty VME_IO link, whose parm names no driver table.
 #[tokio::test]
 async fn a_motor_interface_record_reports_each_devmotorsim_refusal() {
     axis(sim(5, 0), 0.0);
@@ -288,7 +290,10 @@ record(motor, "I:m2") { field(DTYP, "TestSim") field(OUT, "@asyn(X,0)") }
             "cannot find device support entry table Error (513,3)",
         ),
         ("I:m1", "cannot open device support Error (513,1)"),
-        ("I:m2", "Illegal INP field Illegal field value"),
+        (
+            "I:m2",
+            "cannot find device support entry table Error (513,3)",
+        ),
     ] {
         let want = format!("recGblRecordError: devMotor (init_record) {why} PV: {pv}");
         assert!(
@@ -465,7 +470,9 @@ record(motor, "F:m2") { field(DTYP, "TestModel1") field(OUT, "#C3 S4 @") }
     assert_eq!(field(&db, "F:m1.CARD"), EpicsValue::Short(-1));
 }
 
-/// motordevCom.cc:217-223: a model-1 DTYP needs a VME_IO OUT.
+/// motordevCom.cc:217-223 refuses a non-VME_IO OUT, but no `.db` reaches it:
+/// `dbInitRecordLinks` refuses the INST_IO text against the VME_IO devSup
+/// and leaves `#C0 S0 @`, so init_record finds card 0, which does not exist.
 #[tokio::test]
 async fn a_model1_record_with_an_inst_io_out_is_an_illegal_bus() {
     let (db, lines) = errlog_of(boot(
@@ -474,13 +481,16 @@ record(motor, "G:m") { field(DTYP, "TestModel1") field(OUT, "@asyn(X,0)") }
 "##,
     ))
     .await;
-    assert!(
-        lines.iter().any(|l| l
-            == "recGblRecordError: motor_init_record_com(): Illegal OUT Bus Type Error (514,13) PV: G:m"),
-        "{lines:?}"
+    assert_eq!(
+        lines,
+        [
+            "ERROR: G:m.OUT: can't initialize link type VME_IO with \"@asyn(X,0)\" (type INST_IO)",
+            "recGblRecordError: motor_init_record_com(): card does not exist! Illegal field value PV: G:m",
+        ],
     );
     assert_eq!(field(&db, "G:m.CARD"), EpicsValue::Short(-1));
-    assert_eq!(field(&db, "G:m.MSTA"), EpicsValue::ULong(0));
+    // motordevCom.cc:250-258: the `rtnStat` arm sets RA_PROBLEM alone.
+    assert_eq!(field(&db, "G:m.MSTA"), EpicsValue::ULong(0x200));
 }
 
 /// devMotorAsyn.c:405-417 then init_controller: a live controller port that

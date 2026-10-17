@@ -5404,13 +5404,14 @@ fn cmd_db_load_records() -> CommandDef {
 /// LIMIT, stated: a `.dbd` reaches the same grammar C uses (one `yyparse`
 /// for both commands), so its `record(...)`, `alias(...)` and
 /// `breaktable(...)` install exactly as a `.db`'s would. Its DEFINITIONS —
-/// `recordtype`, `menu`, `device`, `driver`, `registrar`, `function`,
-/// `variable` — are parsed into [`db_loader::ParsedDb::dbd`] and then
-/// dropped, because this port's type system is generated at build time
-/// (`record/dbd_generated.rs`, `tools/dbd-codegen`) rather than built by the
-/// load. `dbLoadDatabase("softIoc.dbd")` therefore leaves a port IOC in the
-/// same state C reaches, since those record types are already present; a
-/// SITE `.dbd` declaring a new record type or device support does not.
+/// `recordtype`, `menu`, `driver`, `function`, `variable` — are parsed into
+/// [`db_loader::ParsedDb::dbd`] and then dropped, because this port's type
+/// system is generated at build time (`record/dbd_generated.rs`,
+/// `tools/dbd-codegen`) rather than built by the load.
+/// `dbLoadDatabase("softIoc.dbd")` therefore leaves a port IOC in the same
+/// state C reaches, since those record types are already present; a SITE
+/// `.dbd` declaring a new record type does not. Its `device()`, `link()` and
+/// `registrar()` lines are kept.
 fn cmd_db_load_database() -> CommandDef {
     CommandDef::new(
         "dbLoadDatabase",
@@ -5586,6 +5587,18 @@ fn db_read_database_macros(
     // Same for `link()`: `dbLinkType` fills `pdbbase->linkList` from the same
     // parse, so a site's own `link(<key>, <jlif>)` line reaches `dbDumpLink`.
     ctx.db().add_loaded_link_types(&parsed.dbd.link_types);
+    // And `device()`: `dbDevice` appends to the record type's `devList`, so
+    // a site's choice is a `DTYP` the same read's records may already name.
+    for device in &parsed.dbd.devices {
+        if let Some(link_type) = crate::server::record::DbLinkType::from_c_name(&device.link_type) {
+            crate::server::record::load_dbd_device(
+                &device.record_type,
+                link_type,
+                &device.dset,
+                &device.choice,
+            );
+        }
+    }
 
     // One install path for `dbLoadDatabase`, `dbLoadRecords` and
     // `dbLoadTemplate`: each definition flows through the SAME per-record

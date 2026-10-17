@@ -169,6 +169,7 @@ impl Dpvt {
 /// mca's `devMCA_soft` is a `"Soft Channel"` the framework does not serve.
 /// Asked at init and on a device-link put, never by the cycle.
 pub fn served_soft(record_type: &str, dtyp: &str) -> Option<SoftDtyp> {
+    let dtyp = crate::server::record::served_choice(record_type, dtyp);
     classify_soft(dtyp).filter(|_| !crate::server::record::has_device_object(record_type, dtyp))
 }
 

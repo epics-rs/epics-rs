@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 const DB: &str = r#"record(ai, "A:LC") { field(DTYP, "General Time") field(INP, "@time") }
 record(ai, "A:BAD") { field(DTYP, "General Time") field(INP, "@XX") }
 record(ai, "A:EMPTY") { field(DTYP, "General Time") }
+record(ai, "A:NOAT") { field(DTYP, "General Time") field(INP, "TIME") }
 record(bo, "B:BAD") { field(DTYP, "General Time") field(OUT, "@X") }
 record(longin, "L:CNT") { field(DTYP, "General Time") field(INP, "@GETERRCNT") }
 record(longin, "L:BAD") { field(DTYP, "General Time") field(INP, "@X") }
@@ -44,9 +45,13 @@ const C_DBGF: &[&str] = &[
     "DBF_UCHAR:          1 = 0x1",
 ];
 
+/// `prepareLinks` refuses the PV_LINK before `initDatabase` runs any
+/// `init_record`, which then reads the emptied link.
 const C_INIT_ERRORS: &[&str] = &[
+    "ERROR: A:NOAT.INP: can't initialize link type INST_IO with \"TIME\" (type PV_LINK)",
     "recGblRecordError: devAiGeneralTime::init_ai: Bad parm Illegal field value PV: A:BAD",
     "recGblRecordError: devAiGeneralTime::init_ai: Bad parm Illegal field value PV: A:EMPTY",
+    "recGblRecordError: devAiGeneralTime::init_ai: Bad parm Illegal field value PV: A:NOAT",
     "recGblRecordError: devBoGeneralTime::init_bo: Bad parm Illegal field value PV: B:BAD",
     "recGblRecordError: devLiGeneralTime::init_li: Bad parm Illegal field value PV: L:BAD",
     "recGblRecordError: devSiGeneralTime::init_si: Bad parm Illegal field value PV: S:BAD",
@@ -82,10 +87,23 @@ fn general_time_records_read_as_softioc_does() {
         .map(|w| w[1].trim_end())
         .collect();
     assert_eq!(dbgf, C_DBGF, "{stdout}");
-    let errors: Vec<&str> = stderr
+    let errors: Vec<String> = stderr
         .lines()
         .chain(stdout.lines())
-        .filter(|l| l.starts_with("recGblRecordError"))
+        .map(strip_colour)
+        .filter(|l| l.starts_with("recGblRecordError") || l.starts_with("ERROR: A:"))
         .collect();
     assert_eq!(errors, C_INIT_ERRORS, "{stderr}");
+}
+
+fn strip_colour(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(at) = rest.find('\x1b') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        rest = &rest[rest.find('m').map_or(rest.len(), |m| m + 1)..];
+    }
+    out.push_str(rest);
+    out
 }

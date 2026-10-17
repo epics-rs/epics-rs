@@ -22,6 +22,7 @@
 //! too, loading `asyn.dbd` extends the `dbDeviceMenu` of every `ai`, whether or
 //! not that particular record binds an asyn DTYP.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -110,8 +111,8 @@ fn menus_of(record_type: &str) -> &'static [DeviceMenu] {
 /// Publish `contributed()` with each row of `rows` whose choice
 /// `record_type`'s menu does not list yet appended, as C's `dbDevice`
 /// (dbLexRoutines.c:843-846) skips a `device()` line for a choice already
-/// loaded. The one writer of the menu.
-fn publish_rows(record_type: &str, rows: &'static [DevSup]) {
+/// loaded. The one writer of the menu; answers whether it appended any.
+fn publish_rows(record_type: &str, rows: &'static [DevSup]) -> bool {
     let _publish = PUBLISH.lock().expect("device-menu registry lock poisoned");
     let declared = super::dbd_generated::devices(record_type).unwrap_or_default();
     let mut next = contributed().to_vec();
@@ -133,9 +134,11 @@ fn publish_rows(record_type: &str, rows: &'static [DevSup]) {
             menus.push(std::slice::from_ref(row));
         }
     }
-    if menus.len() != before {
+    let added = menus.len() != before;
+    if added {
         CONTRIBUTED.store(Box::into_raw(Box::new(next)), Ordering::Release);
     }
+    added
 }
 
 /// Contribute a device-support DTYP menu for `record_type` — the choices a
@@ -149,6 +152,77 @@ fn publish_rows(record_type: &str, rows: &'static [DevSup]) {
 /// same support twice in one process is safe.
 pub fn register_device_menu(record_type: &str, menu: &'static [DevSup]) {
     publish_rows(record_type, menu);
+}
+
+/// A row only a loaded `.dbd`'s `device()` line added, and the choice of the
+/// row whose dset it names. C's `dbDevice` stores just the dset NAME and
+/// `initDevSup` finds the dset by it (`iocInit.c:453`); here every dset with
+/// support already has a row of its own, since each registration brings one
+/// before the startup script runs, so the name finds that row or nothing.
+#[derive(Clone, Copy)]
+struct LoadedRow {
+    row: &'static DevSup,
+    served_by: Option<&'static str>,
+}
+
+/// The loaded rows by record type in C's `recordTypeList` order (`strcmp`,
+/// as [`super::record_types`]), each type's in `devList` order. Same publish
+/// rule as [`CONTRIBUTED`]: [`served_choice`] is asked under the record's
+/// hold.
+type Loaded = BTreeMap<&'static str, Vec<LoadedRow>>;
+static LOADED: AtomicPtr<Loaded> = AtomicPtr::new(std::ptr::null_mut());
+
+fn loaded() -> Option<&'static Loaded> {
+    // SAFETY: a non-null pointer came from `Box::into_raw` and is never freed.
+    unsafe { LOADED.load(Ordering::Acquire).as_ref() }
+}
+
+/// A `device()` line from `dbLoadDatabase`: appended to `record_type`'s
+/// menu as C's `dbDevice` appends it to `devList`, a choice already listed
+/// skipped.
+pub(crate) fn load_dbd_device(record_type: &str, link_type: DbLinkType, dset: &str, choice: &str) {
+    let declared = super::dbd_generated::devices(record_type).unwrap_or_default();
+    let named = declared
+        .iter()
+        .chain(menus_of(record_type).iter().flat_map(|menu| menu.iter()))
+        .find(|row| row.name == dset);
+    let served_by = named.map(|row| served_choice(record_type, row.choice));
+    let row: &'static DevSup = Box::leak(Box::new(DevSup {
+        name: Box::leak(dset.into()),
+        choice: Box::leak(choice.into()),
+        link_type,
+        dset: named.map_or(Dset::new(0, &[], false), |row| row.dset),
+    }));
+    if !publish_rows(record_type, std::slice::from_ref(row)) {
+        return;
+    }
+    let _publish = PUBLISH.lock().expect("device-menu registry lock poisoned");
+    let mut next = loaded().cloned().unwrap_or_default();
+    next.entry(Box::leak(record_type.into()))
+        .or_default()
+        .push(LoadedRow { row, served_by });
+    LOADED.store(Box::into_raw(Box::new(next)), Ordering::Release);
+}
+
+/// The choice whose support serves `dtyp` on `record_type`: `dtyp` itself,
+/// unless a loaded `device()` line gave an existing dset a new choice.
+pub(crate) fn served_choice<'a>(record_type: &str, dtyp: &'a str) -> &'a str {
+    loaded()
+        .and_then(|loaded| loaded.get(record_type))
+        .and_then(|rows| rows.iter().find(|r| r.row.choice == dtyp))
+        .and_then(|r| r.served_by)
+        .unwrap_or(dtyp)
+}
+
+/// The dset names C's `initDevSup` reports as `device support %s not found`
+/// (`iocInit.c:445-453`): the loaded rows whose name finds no dset.
+pub(crate) fn unserved_dsets() -> Vec<&'static str> {
+    loaded()
+        .into_iter()
+        .flat_map(|loaded| loaded.values().flatten())
+        .filter(|r| r.served_by.is_none())
+        .map(|r| r.row.name)
+        .collect()
 }
 
 /// The record types whose `.dbd` came with every `device()` line it has,

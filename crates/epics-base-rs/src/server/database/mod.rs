@@ -820,6 +820,8 @@ struct PvDatabaseInner {
     /// approximate. Consumed and cleared by
     /// [`PvDatabase::db_init_record_links`], the way C frees the text.
     empty_link_assignments: std::sync::Mutex<HashMap<RecordName, Vec<String>>>,
+    /// Claimed by the one [`PvDatabase::db_init_record_links`] pass.
+    links_prepared: std::sync::atomic::AtomicBool,
     /// Lines queued by the iocsh `afterIocRunning <command>` directive
     /// (epics-base PR #558). Drained by the IOC application after PINI
     /// completes, then re-executed through a fresh IocShell so the
@@ -1537,6 +1539,7 @@ impl PvDatabase {
                     init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                     record_init_waiting: std::sync::Mutex::new(HashMap::new()),
                     empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
+                    links_prepared: std::sync::atomic::AtomicBool::new(false),
                     after_ioc_running: std::sync::Mutex::new(Vec::new()),
                     scan_ctl: Arc::new(crate::server::scan::ScanControl::new()),
                     pini_done: std::sync::atomic::AtomicBool::new(false),
@@ -2688,22 +2691,23 @@ impl PvDatabase {
         // bare shell). Idempotent — each record's debt is claimed once. Before
         // `ca_link_init` to keep the order the eager path had, where the init
         // passes ran at load, ahead of the link worker.
-        self.drain_deferred_record_inits(&|line| eprintln!("{line}"));
-        self.ca_link_init();
-        // C's `dbInitRecordLinks`: every link is typed, checked and opened at
-        // `iocInit`, not at `dbLoadRecords`. That is where a `{state:"NAME"}`
-        // link's `dbStateCreate` happens — so its state exists from `iocInit`
-        // onward whether or not anything ever reads it — and it is also where
-        // a link the record's device support cannot take is refused, with the
-        // record kept. Measured on softIoc R7.0.10: `dbStateShowAll 1` prints
-        // nothing after `dbLoadRecords` alone and lists every name any link
-        // mentions after `iocInit`, all FALSE, with nothing processed.
+        //
+        // The drain opens with C's `dbInitRecordLinks`: every link is typed,
+        // checked and opened at `iocInit`, not at `dbLoadRecords`. That is
+        // where a `{state:"NAME"}` link's `dbStateCreate` happens — so its
+        // state exists from `iocInit` onward whether or not anything ever
+        // reads it — and it is also where a link the record's device support
+        // cannot take is refused, with the record kept. Measured on softIoc
+        // R7.0.10: `dbStateShowAll 1` prints nothing after `dbLoadRecords`
+        // alone and lists every name any link mentions after `iocInit`, all
+        // FALSE, with nothing processed.
         //
         // Creating a state on first use alone — which the link read/write
         // owner still does, because a `dbLoadRecords` AFTER `iocInit` opens
         // its links then too — agrees on every value but left the registry
         // empty until a link was touched.
-        self.db_init_record_links().await;
+        self.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+        self.ca_link_init();
         // The pass is done and every link's text is final, so the phase becomes
         // terminal here — and what the pass queued joins the load's own
         // backlog, behind it, so a record classified twice publishes the later
@@ -2758,35 +2762,30 @@ impl PvDatabase {
     /// `lnkState_open` (`lnkState.c:110-116`) is `dbStateCreate`, find-or-create
     /// (`dbState.c:50-66`), and it is not called at all.
     ///
-    /// C runs this pass BEFORE `init_record`; this port runs the init passes
-    /// first — at load for a programmatic / `dbCreateRecord` record, and at the
-    /// barrier just above (`init_deferred_record` draining
-    /// `drain_deferred_record_inits`, which runs `init_deferred_record` for
-    /// every record that owes one) for a record loaded during the LOAD phase — so
-    /// the port's order is still init-then-link, and that ordering IS
-    /// observable. Measured against softIoc R7.0.10 on
-    /// `record(calcout,"X"){field(INPA,"@instio p") field(OUT,"@instio q")}`:
-    /// C reads `INAV`/`OUTV` as `Constant`, this port read `Ext PV NC`, because
-    /// calcout had classified both at init from text this pass then replaced.
-    /// A record's cached link status is therefore re-derived where the text
-    /// changes (see [`Self::set_link_text`]) and once per record at the end of
-    /// the loop, which is the same seam a runtime re-point uses. What is NOT
-    /// closed is the ORDER of the two passes: device support reads the refused
-    /// text at `init_record` where C reads the emptied link, because this pass
-    /// runs after the deferred-init drain rather than before it. Closing it
-    /// means running this pass ahead of that drain, a reordering the eager
-    /// (`IocBuilder`, non-LOAD `dbLoadRecords`) callers would have to follow too.
-    async fn db_init_record_links(&self) {
+    /// C runs this pass (`prepareLinks`, `iocInit.c:175`) after
+    /// `initHookAfterInitDevSup` and before `initDatabase`, so its refusals
+    /// print ahead of every `init_record` report and device support reads the
+    /// emptied link. [`Self::drain_deferred_record_inits`] runs it first for
+    /// that reason; it runs once, whichever barrier gets there. A record a
+    /// programmatic / `dbCreateRecord` caller initialised at creation has
+    /// already classified its links, so its cached link status is re-derived
+    /// where the text changes (see [`Self::set_link_text`]) and once per record
+    /// at the end of the loop, the seam a runtime re-point uses.
+    fn db_init_record_links(&self) {
+        if self
+            .inner
+            .links_prepared
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         use crate::server::record::{
             DbLinkType, ParsedLink, declared_link_type, link_type_refusal,
         };
         let empty_assigned =
             std::mem::take(&mut *self.inner.empty_link_assignments.lock().unwrap());
         let states = crate::server::database::filters::sync::db_state_registry();
-        for name in self.iterate_record_names().await {
-            let Some(rec) = self.get_record(&name) else {
-                continue;
-            };
+        for (name, rec) in self.iterate_records() {
             let (record_type, dtyp, fields) = {
                 let inst = rec.read();
                 (
@@ -3388,6 +3387,7 @@ impl PvDatabase {
     /// `err` is the building thread's stderr, where aSubRecord.c's epicsStdio
     /// lines go.
     pub(crate) fn drain_deferred_record_inits(&self, err: &dyn Fn(&str)) {
+        self.db_init_record_links();
         let records = self.iterate_records();
         self.init_owed_records(records.clone(), err);
         for (_, rec_arc) in &records {

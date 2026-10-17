@@ -1734,6 +1734,9 @@ impl IocBuild {
         // a plain pre-init field write (C dbPut before init_record): this hook
         // fires before the startup script's `iocInit` line, and the records it
         // restores were loaded before that.
+        for dset in crate::server::record::unserved_dsets() {
+            crate::runtime::log::errlog_printf(&format!("device support {dset} not found\n"));
+        }
         announce!(InitHookState::AfterInitDevSup);
         db.drain_deferred_record_inits(&err);
         setup_io_intr(db.clone()).await;
@@ -2949,7 +2952,7 @@ pub(crate) fn attach_device_support(
     );
     let ctx = DeviceSupportContext {
         record_type: instance.record.record_type(),
-        dtyp: &dtyp,
+        dtyp: crate::server::record::served_choice(instance.record.record_type(), &dtyp),
         inp: &inp,
         out: &out,
     };

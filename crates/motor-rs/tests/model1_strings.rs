@@ -37,6 +37,11 @@ fn user(card: i32) -> TraceUser {
 /// A done model-1 axis at `card`, signal 0, whose commands land on the
 /// returned channel; no poller runs.
 fn axis(card: i32) -> mpsc::UnboundedReceiver<CommandBatch> {
+    axis_with(card).0
+}
+
+/// [`axis`], with the subscribers its status posts go through.
+fn axis_with(card: i32) -> (mpsc::UnboundedReceiver<CommandBatch>, AxisSubscribers) {
     let subscribers = AxisSubscribers::new();
     subscribers.store(StampedStatus {
         seq: 1,
@@ -52,10 +57,10 @@ fn axis(card: i32) -> mpsc::UnboundedReceiver<CommandBatch> {
         Duration::from_secs(1),
         poll_tx,
         cmd_tx,
-        subscribers,
+        subscribers.clone(),
     ))
     .unwrap();
-    cmd_rx
+    (cmd_rx, subscribers)
 }
 
 async fn boot(db: &str) -> Arc<PvDatabase> {
@@ -198,7 +203,7 @@ fn armed_post(commands: &[MotorCommand]) -> Option<PostMessage> {
 /// and a POST set after an unarmed move's build is not sent for it.
 #[tokio::test]
 async fn post_is_read_when_the_move_is_done() {
-    let mut rx = axis(47);
+    let (mut rx, subscribers) = axis_with(47);
     let db = boot(
         r##"
 record(motor, "S:post") { field(DTYP, "TestStrings") field(OUT, "#C47 S0 @") field(MRES, "1") field(VELO, "1") field(POST, "MF") }
@@ -223,6 +228,19 @@ record(motor, "S:post") { field(DTYP, "TestStrings") field(OUT, "#C47 S0 @") fie
     put("POST", EpicsValue::String("".into())).await;
     assert!(post.is_empty(), "emptied during the move: nothing to send");
 
+    // A VAL put during the move is parked (C do_work 2457), so the next
+    // move is built once this one is done.
+    for pulse in subscribers.post(StampedStatus {
+        seq: 2,
+        status: MotorStatus {
+            position: 5.0,
+            done: true,
+            ..MotorStatus::default()
+        },
+    }) {
+        pulse.try_send(()).unwrap();
+    }
+    settle(&mut rx).await;
     put("VAL", EpicsValue::Double(6.0)).await;
     let commands = settle(&mut rx).await;
     assert!(

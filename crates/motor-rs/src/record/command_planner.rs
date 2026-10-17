@@ -56,8 +56,9 @@ impl MotorRecord {
         // housekeeping srcs (Sync/Set/Cnen) the gate defers to
         // the next pass instead: their arms map to C special()-time
         // actions that precede do_work, and a Go-resume must not swallow
-        // or reorder them.
-        if self.ctrl.spmg != self.internal.lspg && src != CommandSource::Spmg {
+        // or reorder them. A same-value SPMG put is no transition: C's
+        // top block does nothing and the pass falls into the sections.
+        if self.ctrl.spmg != self.internal.lspg {
             match src {
                 CommandSource::Sync | CommandSource::Set | CommandSource::Cnen => {}
                 _ => {
@@ -82,11 +83,7 @@ impl MotorRecord {
         // top-block branch (which returns before 1938), dropping the
         // taken mark with the pass; a coalesced SPMG transition is
         // parked unsynced, so the latent-SPMG gate replays it.
-        if res_reanchor
-            && src != CommandSource::Stop
-            && !(src == CommandSource::Spmg
-                && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause))
-        {
+        if res_reanchor && src != CommandSource::Stop {
             self.dispatch_res_reanchor(&mut effects);
             return effects;
         }
@@ -104,8 +101,10 @@ impl MotorRecord {
                 // No tweak collection or RDBL-error rollback here: C's
                 // set branch (2257) precedes the readback-validity
                 // check, and an RDBL error must not roll back a
-                // redefinition.
+                // redefinition. The collection still runs ahead of the
+                // return (2204-2235).
                 if !self.can_accept_command() {
+                    self.collect_drive_fields();
                     return effects;
                 }
             }
@@ -176,39 +175,7 @@ impl MotorRecord {
                     {
                         self.collect_tweak();
                     }
-                    if src == CommandSource::Val {
-                        self.collect_set_redefine();
-                    }
-                    self.mark_val_collected();
-                    return effects;
-                }
-                // C: 7493d50b — when URIP=Yes and the external RDBL link
-                // is in error, "do not start a new target position move
-                // (sans Home search or Jog)". The refusal is the
-                // move-block gate (`lvio || rtnstat == FALSE`,
-                // 2418-2453): it sits AFTER the home (2010) and jog
-                // (2078) sections — those dispatch normally with the
-                // readback link down — and the SET branches (2207,
-                // 2257-2262) return before reaching it, so a SET-mode
-                // write is never rolled back. Stopping an in-flight
-                // motion is owned by the poll-time read failure
-                // (3687-3697, db5da2f0), ported in check_completion;
-                // a refused write while moving only rolls back to the
-                // in-flight target like C.
-                if self.conv.urip
-                    && self.conv.rdbl_error
-                    && (!self.conv.set || self.conv.igset)
-                    && matches!(
-                        src,
-                        CommandSource::Val
-                            | CommandSource::Dval
-                            | CommandSource::Rval
-                            | CommandSource::Rlv
-                            | CommandSource::Twf
-                            | CommandSource::Twr
-                    )
-                {
-                    self.refuse_move_restore_lasts();
+                    self.collect_drive_fields();
                     return effects;
                 }
             }
@@ -228,27 +195,77 @@ impl MotorRecord {
             self.clear_buttons();
         }
 
-        // C's home/jog sections run before the tweak/val move blocks and
-        // act on latched button STATE every pass — evaluate latent
-        // buttons for the move-block srcs so a bare button put overtaken
-        // in last_write still fires here. The button srcs dispatch their
-        // own arms below; for the housekeeping srcs the arms must run
-        // unconditionally (see the latent-SPMG gate above). The sections
-        // live inside the closed-loop-bypassed collection else (2008),
-        // so a latched button never fires under closed loop with a
-        // DB-link DOL.
-        if !self.closed_loop_dol_collection()
-            && matches!(
-                src,
+        if src == CommandSource::Stop {
+            self.handle_stop(&mut effects);
+            return effects;
+        }
+
+        // C's home (2010) and jog-start (2079) sections run before the
+        // jog-stop section and act on latched button STATE every pass —
+        // the move-block srcs evaluate latent buttons so a bare button
+        // put overtaken in last_write still fires here; the button srcs
+        // run their own section. All live inside the closed-loop-bypassed
+        // collection else (2008): a latched button never fires under
+        // closed loop with a DB-link DOL.
+        if !self.closed_loop_dol_collection() {
+            match src {
                 CommandSource::Val
-                    | CommandSource::Dval
-                    | CommandSource::Rval
-                    | CommandSource::Rlv
-                    | CommandSource::Twf
-                    | CommandSource::Twr
-            )
-            && self.dispatch_latent_buttons(&mut effects)
-        {
+                | CommandSource::Dval
+                | CommandSource::Rval
+                | CommandSource::Rlv
+                | CommandSource::Twf
+                | CommandSource::Twr => {
+                    if self.dispatch_latent_buttons(&mut effects) {
+                        return effects;
+                    }
+                }
+                CommandSource::Homf | CommandSource::Homr => {
+                    // C home-section entry gate (2013-2014) acts on the
+                    // latched button STATE the put left behind, not on
+                    // src; a direction already homing or blocked by its
+                    // limit switch fails the gate and the button stays
+                    // latched (C falls through the section).
+                    if let Some(forward) = self.latent_home_request() {
+                        self.start_home(forward, &mut effects);
+                        return effects;
+                    }
+                }
+                CommandSource::Jogf | CommandSource::Jogr => {
+                    let forward = src == CommandSource::Jogf;
+                    let held = if forward {
+                        self.ctrl.jogf
+                    } else {
+                        self.ctrl.jogr
+                    };
+                    // C jog start (2079-2081) fires only on the request
+                    // special() armed (3042-3054, idle record only); a
+                    // press during a jog falls to jog_stop_section.
+                    let starting = self.stat.mip.contains(MipFlags::JOG_REQ)
+                        && !self.stat.mip.intersects(Self::MIP_JOG);
+                    if held && starting {
+                        // C defect: with both buttons latched, 2106 jogs
+                        // forward whichever was written. The written
+                        // button wins and the other is released
+                        // (epics-modules/motor #170).
+                        if forward {
+                            self.ctrl.jogr = false;
+                        } else {
+                            self.ctrl.jogf = false;
+                        }
+                        // A hardware-blocked direction: start_jog refuses
+                        // and the pass falls on, the button latched.
+                        if self.start_jog(forward, &mut effects) {
+                            return effects;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if self.jog_stop_section(&mut effects) {
+            // C returns at 2156/2161 before the collection (2187-2235):
+            // the written drive field stays raw.
             return effects;
         }
 
@@ -270,137 +287,42 @@ impl MotorRecord {
                     | CommandSource::Twr
             )
             && self.collect_tweak();
+        if self.collect_drive_fields() {
+            return effects;
+        }
+
+        // C: 7493d50b — when URIP=Yes and the external RDBL link
+        // is in error, "do not start a new target position move
+        // (sans Home search or Jog)". The refusal is the
+        // move-block gate (`lvio || rtnstat == FALSE`,
+        // 2418-2453): it sits AFTER the home (2010) and jog
+        // (2078) sections — those dispatch normally with the
+        // readback link down — and the SET branches (2207,
+        // 2257-2262) return before reaching it, so a SET-mode
+        // write is never rolled back. Stopping an in-flight
+        // motion is owned by the poll-time read failure
+        // (3687-3697, db5da2f0), ported in check_completion;
+        // a refused write while moving only rolls back to the
+        // in-flight target like C.
+        if self.conv.urip
+            && self.conv.rdbl_error
+            && (!self.conv.set || self.conv.igset)
+            && matches!(
+                src,
+                CommandSource::Val
+                    | CommandSource::Dval
+                    | CommandSource::Rval
+                    | CommandSource::Rlv
+                    | CommandSource::Twf
+                    | CommandSource::Twr
+            )
+        {
+            self.refuse_move_restore_lasts();
+            return effects;
+        }
 
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv => {
-                if src == CommandSource::Val && self.collect_set_redefine() {
-                    return effects;
-                }
-                // C 2187-2193: RLV folds into VAL in the do_work
-                // collection section ("Later, we'll act on this") and the
-                // pass proceeds exactly like a VAL change — including the
-                // in-flight retarget handling below. A separate RLV arm
-                // that dispatched directly bypassed the NTM stop-first
-                // path and the retarget invariants.
-                if src == CommandSource::Rlv {
-                    // The folded VAL change takes the same SET collection
-                    // branch as a direct VAL write (C 2204-2235):
-                    // Variable redefines the offset on the spot, Frozen
-                    // propagates to DVAL and the move block's set test
-                    // routes the dispatch to load_pos.
-                    if self.conv.set && !self.conv.igset {
-                        if self.conv.foff == FreezeOffset::Variable {
-                            // Offset-only (C 2206-2227): no controller
-                            // command, so the #231 LOAD_POS block does
-                            // not apply.
-                            self.pos.val += self.pos.rlv;
-                            self.pos.rlv = 0.0;
-                            self.mark(m::RLV);
-                            self.set_mode_redefine_val(self.pos.val);
-                            return effects;
-                        }
-                        // #231: LOAD_POS blocked — refuse the Frozen-leg
-                        // redefinition (C load_pos sends LOAD_POS
-                        // unconditionally, 3811); consume the latched RLV.
-                        if self.conv.loadpos_blocked {
-                            self.pos.rlv = 0.0;
-                            self.mark(m::RLV);
-                            return effects;
-                        }
-                        self.pos.val += self.pos.rlv;
-                        self.pos.rlv = 0.0;
-                        self.mark(m::RLV);
-                        let dval =
-                            coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
-                        if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
-                            self.pos.dval = dval;
-                            self.pos.rval = rval;
-                        }
-                    } else {
-                        self.pos.val += self.pos.rlv;
-                        self.pos.rlv = 0.0;
-                        self.mark(m::RLV);
-                        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                            self.pos.val,
-                            self.conv.dir,
-                            self.pos.off,
-                            self.conv.foff,
-                            self.conv.mres,
-                            false,
-                            self.pos.dval,
-                        ) {
-                            self.pos.dval = dval;
-                            self.pos.rval = rval;
-                            self.pos.off = off;
-                        }
-                    }
-                }
-                // Check for retarget if motion is in progress
-                if self.stat.phase != MotionPhase::Idle {
-                    let action = self.handle_retarget(self.pos.dval);
-                    match action {
-                        RetargetAction::Ignore => {
-                            return effects;
-                        }
-                        RetargetAction::StopAndReplan => {
-                            // Cancel any pending backlash/retry state
-                            self.internal.backlash_pending = false;
-                            if std::mem::take(&mut self.retry.rcnt) != 0 {
-                                self.mark(m::RCNT);
-                            }
-                            // A new explicit command path owns completion now;
-                            // disarm any safety-net verify flag armed by a
-                            // prior ExtendMove in this motion.
-                            self.internal.verify_retarget_on_completion = false;
-                            self.report_ntm_stop();
-                            // C 1341: pp = FALSE — "Don't post process the
-                            // previous move." The replanned target must not
-                            // be synced away at the stop completion.
-                            self.internal.pp = false;
-                            self.internal.pending_retarget = Some(self.pos.dval);
-                            self.stat.mip.insert(MipFlags::STOP);
-                            self.mark(m::MIP);
-                            effects.commands.push(MotorCommand::stop_axis());
-                            return effects;
-                        }
-                        RetargetAction::ExtendMove => {
-                            // Deliberate divergence from C. C never sends a
-                            // move while one is in flight: do_work's move
-                            // block is *entered* on every in-flight write
-                            // (motorRecord.cc:2241, `dval != ldvl || !dmov`)
-                            // and val/dval/rval take the new target, but the
-                            // command dispatch is gated at 2455 on
-                            // `mip == MIP_DONE || mip == MIP_RETRY` — the
-                            // target is parked and dispatched only at
-                            // completion (maybeRetry at 1431 measures diff
-                            // against the new dval, and the same pass
-                            // re-enters do_work where the gate passes). Here
-                            // the new move is emitted immediately so
-                            // controllers that accept on-the-fly retargets
-                            // track the newest target without the parked
-                            // round trip. plan_absolute_move also updates
-                            // ldvl/lval/lrvl as the C dispatch block does
-                            // (2469-2471).
-                            //
-                            // plan_absolute_move replaces MIP with MOVE,
-                            // clearing an in-flight STOP; drop any target
-                            // parked behind that stop so it cannot resurrect
-                            // over this newer explicit one (invariant:
-                            // pending_retarget is Some ⟹ MIP_STOP committed).
-                            self.internal.pending_retarget = None;
-                            //
-                            // Completion-time verification: if a driver
-                            // silently ignores the in-flight retarget and
-                            // stops at the old target, replan once before
-                            // finalizing — independent of RTRY/RDBD. For such
-                            // controllers this restores C's park-then-
-                            // dispatch-at-completion behavior.
-                            self.plan_absolute_move(&mut effects);
-                            self.internal.verify_retarget_on_completion = true;
-                            return effects;
-                        }
-                    }
-                }
                 // C move-block entry (2241): `dval != ldvl || !dmov`.
                 // A database put never fails this gate — the special()
                 // pass-0 blink (2591-2620) dropped DMOV before the pass
@@ -418,73 +340,21 @@ impl MotorRecord {
                     self.dispatch_latent_collection(&mut effects, true);
                 }
             }
-            CommandSource::Stop => {
-                self.handle_stop(&mut effects);
-            }
-            CommandSource::Jogf | CommandSource::Jogr => {
-                let forward = src == CommandSource::Jogf;
-                let starting = if forward {
-                    self.ctrl.jogf
-                } else {
-                    self.ctrl.jogr
-                };
-                if starting {
-                    // epics-modules/motor #170 — latest-wins: a fresh jog
-                    // command clears a still-latched opposite-direction
-                    // button so JOGF and JOGR are never both active.
-                    if forward {
-                        self.ctrl.jogr = false;
-                    } else {
-                        self.ctrl.jogf = false;
-                    }
-                    if !self.start_jog(forward, &mut effects) {
-                        // C special (3042-3053): a hardware-blocked
-                        // direction never arms MIP_JOG_REQ, so the put
-                        // pass skips the jog section and falls through
-                        // to the do_work chain end (implicit GET_INFO,
-                        // 2546). The button stays latched for the
-                        // latent collection.
-                        self.dispatch_latent_collection(&mut effects, true);
-                    }
-                } else if matches!(self.internal.queued_motion, Some(QueuedMotion::Jog { .. })) {
-                    // C 2148-2155 on a queued jog (mip = JOGF|STOP): the
-                    // release pass takes the stop-jogging branch — the
-                    // JOGF/JOGR bits drop out of MIP and MIP_JOG_STOP
-                    // rides the already-in-flight stop, so the request is
-                    // dead at the stop completion (postProcess re-fires
-                    // nothing). pp was armed by the queue branch; the
-                    // completion syncs and finalizes like a plain stop.
-                    self.internal.queued_motion = None;
-                    self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
-                    self.stat.mip.insert(MipFlags::JOG_STOP);
-                } else if self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
-                    self.stop_jog(&mut effects);
-                } else {
-                    // C: a release pass with no jog in MIP matches no jog
-                    // branch — an idle release falls through to the chain
-                    // end (implicit GET_INFO, 2546); a decelerating
-                    // release returns at 2160-2161, reproduced by the
-                    // collection's dmov gate.
-                    self.dispatch_latent_collection(&mut effects, true);
-                }
-            }
-            CommandSource::Homf | CommandSource::Homr => {
-                // C home-section entry gate (2013-2014) acts on the
-                // latched button STATE the put left behind, not on src; a
-                // direction already homing or blocked by its limit switch
-                // fails the gate and the button stays latched (C falls
-                // through the section without touching it).
-                if let Some(forward) = self.latent_home_request() {
-                    self.start_home(forward, &mut effects);
-                } else {
-                    // C: the failed gate (blocked, already homing, or a
-                    // button release) skips the section and the pass
-                    // falls through to the chain end (implicit GET_INFO,
-                    // 2546). A homing-in-progress pass is consumed by
-                    // the move block instead (!dmov) — the collection's
-                    // dmov gate reproduces that.
-                    self.dispatch_latent_collection(&mut effects, true);
-                }
+            // Returned from the top block before the sections.
+            CommandSource::Stop => {}
+            CommandSource::Jogf
+            | CommandSource::Jogr
+            | CommandSource::Homf
+            | CommandSource::Homr
+            | CommandSource::Spmg
+            | CommandSource::Cnen => {
+                // The sections did not consume the pass (failed home or
+                // jog-start gate, a release, a same-value SPMG, CNEN's
+                // pp pass): C falls through to the chain end (implicit
+                // GET_INFO, 2546). A pass during motion is consumed by
+                // the move block instead (!dmov) — the collection's dmov
+                // gate reproduces that.
+                self.dispatch_latent_collection(&mut effects, true);
             }
             CommandSource::Twf | CommandSource::Twr => {
                 // The fold already ran in the collection above (SET-mode
@@ -501,9 +371,6 @@ impl MotorRecord {
                         self.dispatch_latent_collection(&mut effects, true);
                     }
                 }
-            }
-            CommandSource::Spmg => {
-                self.handle_spmg_change(&mut effects);
             }
             CommandSource::Sync => {
                 // C 2540-2544: the latched SYNC applies only when idle
@@ -526,35 +393,19 @@ impl MotorRecord {
                     self.dispatch_latent_collection(&mut effects, true);
                 }
             }
-            CommandSource::Cnen => {
-                // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
-                // when the controller reports gain support (MSTA bit
-                // GAIN_SUPPORT). Drivers without it would reject the command.
-                if self.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
-                    effects.commands.push(MotorCommand::SetClosedLoop {
-                        enable: self.ctrl.cnen,
-                    });
-                }
-                // C: CNEN is pp(TRUE) and special() owns the torque send,
-                // so the process pass it triggers runs the full do_work —
-                // the sections act on latched button state and the chain
-                // end fires the implicit GET_INFO (2546) when nothing
-                // dispatches. Runs regardless of GAIN_SUPPORT (the pp
-                // pass is unconditional in C).
-                self.dispatch_latent_collection(&mut effects, true);
-            }
         }
 
         effects
     }
 
-    /// Plan an absolute move to current DVAL.
+    /// Plan an absolute move to current DVAL: C do_work's move block,
+    /// dispatching only at `mip == MIP_DONE || mip == MIP_RETRY`.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
         // C move-block entry (2248-2255): DIFF and RDIF are recomputed
         // from the requested target before anything else — they post
         // even when the pass is then suppressed (too_small) or refused
-        // (LVIO). The VAL/DVAL/RVAL/RLV/TWF write paths update
-        // `pos.dval` but never refresh them; only the poll does.
+        // (LVIO). The collection updates `pos.dval` but never
+        // refreshes them; only the poll does.
         if self.pos.dval != self.internal.ldvl {
             self.mark(m::DVAL);
         }
@@ -580,8 +431,13 @@ impl MotorRecord {
             }
             return;
         }
-        // C 2299-2305.
+        // C 2299-2305: the collection does not know which field moved
+        // DVAL, so VAL and RVAL are re-derived from it.
+        self.pos.val = coordinate::dial_to_user(self.pos.dval, self.conv.dir, self.pos.off);
         self.mark_val_collected();
+        if self.conv.mres != 0.0 {
+            self.pos.rval = coordinate::to_long((self.pos.dval / self.conv.mres).round());
+        }
         if self.pos.rval != self.internal.lrvl {
             self.mark(m::RVAL);
         }
@@ -681,6 +537,13 @@ impl MotorRecord {
         }
         if self.limits.lvio {
             self.refuse_move_restore_lasts();
+            return;
+        }
+
+        // C 2457: under any other motion (a home, a jog, an external
+        // move) the target stays parked in VAL/DVAL with the lasts
+        // untouched, and that motion's completion dispatches it.
+        if !(self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY) {
             return;
         }
 
@@ -861,21 +724,30 @@ impl MotorRecord {
     /// so the entries cannot drift.
     pub(super) fn stop_axis(&mut self, effects: &mut ProcessEffects) {
         let mip = self.stat.mip;
-        if mip.is_empty() || mip.intersects(MipFlags::STOP | MipFlags::RETRY) {
+        // C 1874-1888 leaves an unfinished pp-FALSE stop (a Pause, or an
+        // NTM stop's MIP_STOP|MIP_MOVE) as it is, so its completion's
+        // maybeRetry, or Go, drives back toward DVAL after the user's
+        // STOP. The same branch keeps a home queued behind a stop (mip =
+        // HOMF|STOP, 2028-2035), which postProcess (854-889) then starts
+        // after the user's STOP. That C defect is not copied: the STOP
+        // takes over as a commanded stop (pp, readback sync at
+        // completion) and drops the queued home. A jog started while
+        // moving (JOGF|STOP, 2106-2111) is never re-fired, so C's branch
+        // stands for it.
+        let uncommanded_stop = mip.contains(MipFlags::STOP) && !self.internal.pp && !self.stat.dmov;
+        let takes_over = uncommanded_stop || self.internal.queued_motion.is_some();
+        if !takes_over && (mip.is_empty() || mip.intersects(MipFlags::STOP | MipFlags::RETRY)) {
             // C 1874-1888: MIP DONE, STOP or RETRY sends STOP_AXIS and
             // returns with MIP untouched, except that a stop during retry
             // abandons the retry and reports done (mip = MIP_DONE, dmov =
             // TRUE) with no readback sync.
             if mip.contains(MipFlags::RETRY) {
+                // C drops only MIP here: the next callback marks the still
+                // moving axis EXTERNAL with pp (1314-1320) and a VAL parked
+                // during the retry replays (1384-1397), overriding the
+                // STOP. That C defect is not copied: finalize_motion adopts
+                // the parked target into the lasts, so nothing replays.
                 self.finalize_motion(effects);
-            } else if mip.contains(MipFlags::STOP) {
-                // A stop already in flight drops a parked NTM retarget —
-                // C discards the overtaken target at stop completion via
-                // the `(val != lval) && !(mip & MIP_STOP)` gate (1385)
-                // plus the postProcess sync. A queued jog/home survives:
-                // its buttons/MIP outlive the early return and postProcess
-                // re-fires it.
-                self.internal.pending_retarget = None;
             }
         } else {
             if self.stat.movn {
@@ -894,9 +766,10 @@ impl MotorRecord {
                 self.clear_buttons();
             }
             // C 1902-1907 replaces MIP wholesale, erasing the backlash
-            // legs with the rest: "When we wait for DLY, keep it.
-            // Otherwise the record may lock up."
+            // legs and any queued home/jog with the rest: "When we wait
+            // for DLY, keep it. Otherwise the record may lock up."
             self.internal.backlash_pending = false;
+            self.internal.queued_motion = None;
             if !mip.contains(MipFlags::DELAY_REQ) {
                 self.stat.mip = MipFlags::STOP;
                 self.mark(m::MIP);
@@ -916,13 +789,10 @@ impl MotorRecord {
     /// direction, which C never arms (special 3042-3053) — that put
     /// pass falls through to the do_work chain end.
     fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) -> bool {
-        // C: if motor is moving, stop first then queue jog for after stop.
-        // C 2106-2113: the dispatch consumes MIP_JOG_REQ wholesale (mip =
-        // MIP_JOGF/JOGR) and the movn branch ORs in MIP_STOP, so a queued
-        // jog reads back as JOGF|STOP. The replay discriminator stays
-        // internal.queued_motion — a plain STOP wholesale-replaces MIP and
-        // clears the buttons (C 1893/1905), so it never resembles this
-        // state, and only an explicit queued request is re-fired.
+        // C 2106-2115: the dispatch consumes MIP_JOG_REQ wholesale (mip =
+        // MIP_JOGF/JOGR) and, while the axis still moves, ORs in MIP_STOP
+        // and only stops it. Nothing re-fires the jog at the stop
+        // completion (postProcess re-fires only a home).
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
             self.stat.mip = if forward {
                 MipFlags::JOGF
@@ -931,9 +801,8 @@ impl MotorRecord {
             } | MipFlags::STOP;
             self.mark(m::MIP);
             // C 2110: pp = TRUE — the stop completion post-processes
-            // (VAL/DVAL <- readback) before the queued jog re-fires.
+            // (VAL/DVAL <- readback).
             self.internal.pp = true;
-            self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::stop_axis());
             return true;
@@ -1002,10 +871,7 @@ impl MotorRecord {
     /// commands the raw velocity `jogv = (jvel * dir) / mres`, whose
     /// dial equivalent is `±jvel * dir`. CDIR stays RAW-frame
     /// (C 2126-2137: jogf, inverted once for MRES<0 and once for
-    /// DIR=Neg). Both the fresh dispatch and the queued-jog replay
-    /// (C re-enters the same do_work jog section on replay) come
-    /// through here so the commanded direction and the CDIR ledger
-    /// cannot disagree.
+    /// DIR=Neg).
     pub(super) fn emit_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // Remember jog direction for backlash (MIP flags get cleared by stop_jog)
         self.internal.jog_was_forward = forward;
@@ -1028,6 +894,11 @@ impl MotorRecord {
         // C 2152: pp = TRUE — "When stopped, process() will correct
         // backlash" (and sync the drive fields via postProcess).
         self.internal.pp = true;
+        // A jog started while the axis moved (mip = JOGF|STOP) takes the
+        // same branch: STOP_AXIS is sent again on top of the in-flight
+        // stop, whose completion takes the JOG_STOP backlash (postProcess
+        // 908-958).
+        let queued = self.stat.mip.contains(MipFlags::STOP);
         // C 2153-2154: mip |= MIP_JOG_STOP; mip &= ~(MIP_JOGF | MIP_JOGR).
         // With the JOG bits gone, the deceleration is no longer "a jog"
         // to the enter_do_work LVIO recompute (1466 gates on MIP_JOG,
@@ -1036,7 +907,9 @@ impl MotorRecord {
         // neither write; MIP posts at the stop completion.
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
-        self.set_phase(MotionPhase::JogStopping);
+        if !queued {
+            self.set_phase(MotionPhase::JogStopping);
+        }
         effects.commands.push(MotorCommand::stop_axis());
     }
 
@@ -1054,7 +927,7 @@ impl MotorRecord {
 
     /// C do_work evaluates the latched HOMF/HOMR/JOGF/JOGR buttons by
     /// STATE on every put-processing pass — home section
-    /// (motorRecord.cc:2010), jog start (2079), jog stop (2148) — before
+    /// (motorRecord.cc:2010), jog start (2079) — before
     /// the tweak/val move blocks, not by which field write triggered the
     /// pass. The Rust dispatcher acts on `last_write`, so a bare button
     /// put (dbPut, no process) overtaken in `last_write` by a later
@@ -1088,17 +961,15 @@ impl MotorRecord {
             return true;
         }
 
-        let jog_active = self
-            .stat
-            .mip
-            .intersects(MipFlags::JOGF | MipFlags::JOGR | MipFlags::JOG_BL1 | MipFlags::JOG_BL2);
-        // Jog start (C 2079): a latched button with no jog in flight.
-        // The hardware-limit check mirrors C special()'s MIP_JOG_REQ
-        // arming gate (3042-3053); on a blocked direction the button
-        // stays latched and the pass falls through, like C's home/jog
-        // gates failing into the move block. Soft-limit refusal happens
-        // inside start_jog like the C section body.
-        if !jog_active && (self.ctrl.jogf || self.ctrl.jogr) {
+        // Jog start (C 2079-2081): an armed MIP_JOG_REQ with no jog in
+        // flight. On a hardware-blocked direction the button stays
+        // latched and the pass falls through, like C's home/jog gates
+        // failing into the move block. Soft-limit refusal happens inside
+        // start_jog like the C section body.
+        if !self.stat.mip.intersects(Self::MIP_JOG)
+            && self.stat.mip.contains(MipFlags::JOG_REQ)
+            && (self.ctrl.jogf || self.ctrl.jogr)
+        {
             let forward = self.ctrl.jogf;
             let dir = if forward {
                 MotionDirection::Positive
@@ -1106,8 +977,8 @@ impl MotorRecord {
                 MotionDirection::Negative
             };
             if !self.is_blocked_by_hw_limit(dir) {
-                // epics-modules/motor #170 latest-wins, as in the
-                // Jogf/Jogr dispatch arm.
+                // C 2106 JOGF precedence; the other button is released as
+                // in the Jogf/Jogr dispatch arm (#170).
                 if forward {
                     self.ctrl.jogr = false;
                 } else {
@@ -1118,26 +989,31 @@ impl MotorRecord {
             }
             return false;
         }
-        // Jog stop (C 2148): a jog in flight whose button is no longer
-        // held. With the opposite button latched, stop and queue the
-        // reverse jog (start_jog's moving branch) like the dispatch
-        // arm's latest-wins path.
-        if self.stat.phase == MotionPhase::Jog {
-            let held = if self.stat.mip.contains(MipFlags::JOGF) {
-                self.ctrl.jogf
-            } else {
-                self.ctrl.jogr
-            };
-            if !held {
-                if self.ctrl.jogf || self.ctrl.jogr {
-                    self.start_jog(self.ctrl.jogf, effects);
-                } else {
-                    self.stop_jog(effects);
-                }
-                return true;
-            }
-        }
         false
+    }
+
+    /// C `MIP_JOG` (motorRecord.cc:293): a jog or its backlash in flight.
+    const MIP_JOG: MipFlags = MipFlags::JOGF
+        .union(MipFlags::JOGR)
+        .union(MipFlags::JOG_BL1)
+        .union(MipFlags::JOG_BL2);
+
+    /// C do_work jog-stop section (2148-2161), the one owner for every
+    /// put-owned pass past the home and jog-start sections: a jog in MIP
+    /// (active, or queued behind a stop) with no MIP_JOG_REQ stops, and a
+    /// pass during the jog stop or its backlash returns. Returns true
+    /// when the pass is consumed. Inside the closed-loop-bypassed
+    /// collection else (2008).
+    fn jog_stop_section(&mut self, effects: &mut ProcessEffects) -> bool {
+        if self.closed_loop_dol_collection() {
+            return false;
+        }
+        let mip = self.stat.mip;
+        if !mip.contains(MipFlags::JOG_REQ) && mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
+            self.stop_jog(effects);
+            return true;
+        }
+        mip.intersects(MipFlags::JOG_STOP | MipFlags::JOG_BL1 | MipFlags::JOG_BL2)
     }
 
     /// C do_work gate (motorRecord.cc:1487-1492): do_work runs on every
@@ -1181,37 +1057,25 @@ impl MotorRecord {
             if self.dispatch_latent_buttons(effects) {
                 return;
             }
-            // C tweak section (2167-2181) + move block: the fold lands
-            // in VAL/DVAL on this pass and the move block dispatches
-            // it, like the Twf/Twr arm. A fold that consumed the
-            // buttons without arming a move (SET Variable redefinition
-            // C 2227, blocked direction) still owns the pass — C
-            // returns inside the section, never reaching the chain end.
+            // C tweak section (2167-2181): the fold lands in VAL and the
+            // collection and move block below take it, like the Twf/Twr
+            // arm. A #231-refused fold consumes the buttons and the pass.
             let had_tweak = self.ctrl.twf || self.ctrl.twr;
-            if self.collect_tweak() {
-                // C move-block entry (2241): a zero fold (TWV = 0)
-                // leaves DVAL at the lasts and the gate refuses — the
-                // pass continues to the chain end below instead.
-                if self.pos.dval != self.internal.ldvl {
-                    self.plan_absolute_move(effects);
-                    return;
-                }
-            } else if had_tweak {
+            if !self.collect_tweak() && had_tweak {
                 return;
             }
         }
+        if self.collect_drive_fields() {
+            return;
+        }
         // C move block entry (2241): `dval != ldvl || !dmov` — dmov is
-        // true past the gate above, so only a diverged DVAL enters.
-        // Its set test (2257-2263) replays a SET redefinition parked
-        // while a LOAD_POS was in flight (plan_absolute_move routes it
-        // to load_pos, which skips while MIP_LOAD_P is set). A non-SET
-        // divergence cannot reach here by construction — refusal paths
-        // restore the lasts and every dispatch/too_small path anchors
-        // them — so like C the pass is consumed either way.
+        // true past the gate above, so only a diverged DVAL enters: a
+        // drive field the collection just propagated, or a SET
+        // redefinition parked while a LOAD_POS was in flight (the set
+        // test, 2257-2263, routes it to load_pos, which skips while
+        // MIP_LOAD_P is set).
         if self.pos.dval != self.internal.ldvl {
-            if self.conv.set && !self.conv.igset {
-                self.plan_absolute_move(effects);
-            }
+            self.plan_absolute_move(effects);
             return;
         }
         // C SYNC arm (2540-2544): chain end, idle and done.
@@ -1250,7 +1114,6 @@ impl MotorRecord {
             self.internal.pp = true;
             self.internal.queued_motion = Some(QueuedMotion::Home { forward });
             self.internal.backlash_pending = false;
-            self.internal.pending_retarget = None;
             effects.commands.push(MotorCommand::stop_axis());
             return;
         }
@@ -1305,16 +1168,13 @@ impl MotorRecord {
     }
 
     /// Handle tweak (TWF/TWR).
-    /// C tweak collection (motorRecord.cc:2167-2181) plus the VAL change
-    /// it feeds (2204-2235): fold the latched tweak button(s) into VAL —
-    /// `val += twv * (twf ? 1 : -1)`, TWF wins when both are latched —
-    /// and release BOTH buttons. The fold acts on latched button STATE,
-    /// not on the src that triggered the pass, so a bare TWF/TWR put
-    /// overtaken in `last_write` still lands. In SET mode the VAL change
-    /// redefines coordinates without moving (C 2207-2227). Returns true
-    /// when a non-SET fold landed in DVAL — a move toward it is now
-    /// pending and the caller's pass dispatches (or, under SPMG
-    /// Stop/Pause, SPMG=Go later fires it via `dval != ldvl`).
+    /// C tweak collection (motorRecord.cc:2167-2181): fold the latched
+    /// tweak button(s) into VAL — `val += twv * (twf ? 1 : -1)`, TWF wins
+    /// when both are latched — and release BOTH buttons. The fold acts on
+    /// latched button STATE, not on the src that triggered the pass, so a
+    /// bare TWF/TWR put overtaken in `last_write` still lands. The VAL
+    /// change it makes is collect_drive_fields' (2204-2235). Returns true
+    /// when the fold landed in VAL.
     fn collect_tweak(&mut self) -> bool {
         if !self.ctrl.twf && !self.ctrl.twr {
             return false;
@@ -1336,53 +1196,17 @@ impl MotorRecord {
         } else {
             -self.ctrl.twv
         };
+        // #231: LOAD_POS blocked — refuse the Frozen-leg redefinition the
+        // fold would make (C load_pos sends LOAD_POS unconditionally,
+        // 3811), like the VAL put refusal.
+        if self.conv.set
+            && !self.conv.igset
+            && self.conv.foff == FreezeOffset::Frozen
+            && self.conv.loadpos_blocked
+        {
+            return false;
+        }
         self.pos.val += delta;
-
-        // C motorRecord.cc — a tweak that changes VAL flows through the same
-        // VAL-change path: in SET mode it redefines coordinates rather than
-        // moving the motor.
-        if self.conv.set && !self.conv.igset {
-            if self.conv.foff == FreezeOffset::Variable {
-                // C 2206-2227 via the tweak fold: offset-only
-                // redefinition — DVAL untouched, no controller command
-                // (so the #231 LOAD_POS block does not apply), complete
-                // on the spot (mip = MIP_DONE, dmov = TRUE).
-                self.set_mode_redefine_val(self.pos.val);
-                return false;
-            }
-            // #231: LOAD_POS blocked — refuse the Frozen-leg
-            // redefinition (C load_pos sends LOAD_POS unconditionally,
-            // 3811); undo the fold to keep VAL/DVAL/OFF consistent.
-            if self.conv.loadpos_blocked {
-                self.pos.val -= delta;
-                return false;
-            }
-            // C Frozen: the fold propagates VAL -> DVAL (2233); the
-            // dispatch is the move block's, whose set test routes it to
-            // load_pos (2257-2263) — so a fold collected under
-            // stop_or_pause (2237) defers like any position write.
-            let dval = coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
-            if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
-                self.pos.dval = dval;
-                self.pos.rval = rval;
-            }
-            return true;
-        }
-
-        // Normal (non-SET) tweak: cascade VAL->DVAL; the caller moves.
-        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-            self.pos.val,
-            self.conv.dir,
-            self.pos.off,
-            self.conv.foff,
-            self.conv.mres,
-            false,
-            self.pos.dval,
-        ) {
-            self.pos.dval = dval;
-            self.pos.rval = rval;
-            self.pos.off = off;
-        }
         true
     }
 
@@ -1419,7 +1243,6 @@ impl MotorRecord {
                     self.clear_buttons();
                 }
                 self.internal.queued_motion = None;
-                self.internal.pending_retarget = None;
                 // C 1902-1907: `mip = MIP_STOP` — wholesale, erasing a
                 // parked MIP_JOG_REQ and the JOGF/HOMF bits of a queued
                 // request — except while waiting on DLY ("keep it,
@@ -1467,13 +1290,16 @@ impl MotorRecord {
                         self.mark(m::MIP);
                     }
                     // C move-block entry (2241): `dval != ldvl || !dmov`
-                    // consumes the pass whether or not the inner 2455
-                    // gate (`mip == MIP_DONE || MIP_RETRY`) dispatches —
-                    // a queued jog/home (JOGF|STOP, HOMF|STOP) keeps its
-                    // direction bits and is NOT re-dispatched here; it
-                    // replays at stop completion exactly as before.
+                    // consumes the pass whether or not the move block's
+                    // 2457 gate dispatches — a queued home (HOMF|STOP) or a
+                    // jog started while moving (JOGF|STOP) keeps its
+                    // direction bits and is NOT re-dispatched here; only
+                    // the home re-fires, at stop completion.
+                    if self.collect_drive_fields() {
+                        return;
+                    }
                     let entry = !self.stat.dmov || self.pos.dval != self.internal.ldvl;
-                    if entry && (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY) {
+                    if entry {
                         self.plan_absolute_move(effects);
                     }
                     if !entry {
@@ -1502,6 +1328,8 @@ impl MotorRecord {
                 // home button fires instead of the move replan.
                 if let Some(forward) = self.latent_home_request() {
                     self.start_home(forward, effects);
+                } else if self.collect_drive_fields() {
+                    // C 2227: the SET redefinition ends the pass.
                 } else if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(effects);
                 } else {
@@ -1787,27 +1615,50 @@ impl MotorRecord {
         self.mark(m::HLM | m::LLM);
     }
 
+    /// C do_work collection after the tweak fold (2182-2235), the single
+    /// place a drive-field put cascades: RLV folds into VAL and RVAL
+    /// propagates to DVAL inside the closed-loop-bypassed else (1994),
+    /// then a VAL change either redefines the offset (SET with a variable
+    /// offset, 2206-2227) or propagates to DVAL. Returns true when the
+    /// redefinition ended the pass (C 2227 return), which C runs ahead of
+    /// the stop_or_pause return (2237).
+    pub(super) fn collect_drive_fields(&mut self) -> bool {
+        if !self.closed_loop_dol_collection() {
+            if self.pos.rlv != self.internal.lrlv {
+                // #231: LOAD_POS blocked — refuse the Frozen-leg
+                // redefinition the fold would make; consume the RLV.
+                let refused = self.conv.set
+                    && !self.conv.igset
+                    && self.conv.foff == FreezeOffset::Frozen
+                    && self.conv.loadpos_blocked;
+                if !refused {
+                    self.pos.val += self.pos.rlv;
+                }
+                self.pos.rlv = 0.0;
+                self.mark(m::RLV);
+                self.internal.lrlv = self.pos.rlv;
+            }
+            if self.pos.rval != self.internal.lrvl {
+                self.pos.dval = coordinate::raw_to_dial(self.pos.rval, self.conv.mres);
+            }
+        }
+        if self.pos.val != self.internal.lval {
+            self.mark(m::VAL);
+            if self.conv.set && !self.conv.igset && self.conv.foff == FreezeOffset::Variable {
+                self.set_mode_redefine_val(self.pos.val);
+                return true;
+            }
+            self.pos.dval = coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
+        }
+        false
+    }
+
     /// C SET + FOFF=Variable VAL collection (motorRecord.cc:2206-2227):
     /// redefine VAL to `new_val` by adjusting the offset (DVAL
     /// untouched), retranslate the user limits and RBV, sync LVAL, and
     /// complete on the spot — mip = MIP_DONE, dmov = TRUE, no
     /// controller command (LOAD_POS belongs to the Frozen/DVAL/RVAL
-    /// redefinition paths). Single owner for the direct-VAL,
-    /// tweak-fold, and RLV-fold entry points.
-    /// C's VAL collection under SET with a variable offset (2204-2227): a
-    /// collected VAL redefines the offset and the pass ends there. It runs
-    /// ahead of the stop_or_pause return (2237).
-    fn collect_set_redefine(&mut self) -> bool {
-        let redefine = self.conv.set
-            && !self.conv.igset
-            && self.conv.foff == FreezeOffset::Variable
-            && self.pos.val != self.internal.lval;
-        if redefine {
-            self.set_mode_redefine_val(self.pos.val);
-        }
-        redefine
-    }
-
+    /// redefinition paths). Called only from collect_drive_fields.
     pub(crate) fn set_mode_redefine_val(&mut self, new_val: f64) {
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
             new_val,
@@ -1856,109 +1707,6 @@ impl MotorRecord {
             dval > self.internal.ldvl
         };
         toward_positive == (self.retry.bdst > 0.0)
-    }
-
-    /// Handle a new target (VAL/DVAL/RVAL/RLV write) that arrives while a
-    /// motion is in progress.
-    ///
-    /// C behavior (`motorRecord.cc`), for reference:
-    ///
-    /// - A put-initiated process always reaches `do_work`, even while the
-    ///   axis is moving (gate at 1487-1491, `process_reason !=
-    ///   CALLBACK_DATA`). The move block is *entered* on every
-    ///   `dval != ldvl || !dmov` (2241) — independent of NTM — and
-    ///   val/dval/rval take the new target, but the command dispatch
-    ///   inside is gated at 2455 on `mip == MIP_DONE || mip == MIP_RETRY`,
-    ///   so C never sends a new move while MIP_MOVE or MIP_STOP is
-    ///   active. The parked target converges at completion: maybeRetry
-    ///   (1431) measures `diff` against the *new* dval, collapses MIP to
-    ///   RETRY/DONE, and the same pass re-enters `do_work` where the 2455
-    ///   gate now passes and dispatches. An earlier Rust version returned
-    ///   [`RetargetAction::Ignore`] whenever `ntm == No` (its
-    ///   `motorRecord.dbd` default, since NTM has no `initial()`),
-    ///   silently discarding the write — NTM does not gate this at all.
-    /// - NTM gates only the *opposite-direction* stop-first path in the
-    ///   `process()` `movn` block (1326-1341): when
-    ///   `ntm == menuYesNoYES && sign_rdif != cdir &&
-    ///   fabs(diff) > ntm_deadband && move_or_retry && !MIP_STOP`, C
-    ///   sends `STOP_AXIS` with `pp = FALSE` so the new target survives
-    ///   the stop completion and dispatches from there.
-    ///
-    /// Rust divergence (deliberate): [`RetargetAction::ExtendMove`]
-    /// dispatches the new target in-flight instead of parking it until
-    /// completion, so controllers that accept on-the-fly retargets track
-    /// the newest target immediately; the completion-time verification
-    /// armed by the ExtendMove arm in `plan_motion` restores C's
-    /// park-then-dispatch behavior for controllers that ignore in-flight
-    /// retargets. `plan_absolute_move`'s own too-small/SPDB deadband
-    /// checks suppress no-op moves. NTM mapping matches C: only an
-    /// opposite-direction, beyond-deadband retarget promotes to
-    /// [`RetargetAction::StopAndReplan`].
-    pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
-        // Only retarget during an active move, retry, or stop
-        // deceleration. MIP_STOP counts as in-flight because the C stop
-        // path replaces MIP wholesale (`mip = MIP_STOP`,
-        // motorRecord.cc:1905) while the axis keeps decelerating.
-        let in_move = self
-            .stat
-            .mip
-            .intersects(MipFlags::MOVE | MipFlags::RETRY | MipFlags::STOP);
-        if !in_move {
-            return RetargetAction::Ignore;
-        }
-        // Deliberate divergence from C: a target written during a
-        // commanded stop deceleration is honored here. In C the write
-        // reaches the do_work move block (entry 2241) but the 2455
-        // dispatch gate refuses while MIP_STOP, and the completion
-        // replay (motorRecord.cc:1384-1386) excludes MIP_STOP /
-        // MIP_JOG_STOP, so postProcess (827-849) syncs VAL/DVAL back to
-        // the readback — the write is silently lost (the kohzuCtl
-        // stop-then-rewrite retarget sequence hits exactly this window).
-        // Retargeting through the stop keeps the explicit user target
-        // instead; `mip = MIP_MOVE` replaces the stop state. The NTM
-        // stop-first branch stays excluded while stopping (C gate at
-        // 1330: `(pmr->mip & MIP_STOP) == 0`), so no double-stop is
-        // possible.
-        if self.stat.mip.contains(MipFlags::STOP) {
-            if self.internal.queued_motion.is_some() {
-                // An explicit queued jog/home owns this stop's
-                // completion — in C the do_work jog/home sections run
-                // before the move block and re-fire the queued request,
-                // so the position write is overtaken.
-                return RetargetAction::Ignore;
-            }
-            return RetargetAction::ExtendMove;
-        }
-
-        let diff = new_dval - self.pos.drbv;
-        let deadband = self.timing.ntmf as f64 * (self.retry.bdst.abs() + self.retry.rdbd);
-
-        // C `movn`-block STOP_AXIS gate: opposite direction AND error
-        // beyond the NTM deadband AND NTM enabled. The direction sign is
-        // C 1303 `sign_rdif = (rdif < 0) ? 0 : 1` — the RAW-frame INTEGER
-        // error, like CDIR itself (2526): under MRES < 0 the dial sign
-        // inverts, and a sub-half-step error rounds to 0 (forward).
-        let rdif = if self.conv.mres != 0.0 {
-            coordinate::to_long((diff / self.conv.mres).round())
-        } else {
-            0
-        };
-        let sign_rdif = rdif >= 0;
-        let direction_changed = sign_rdif != self.stat.cdir;
-
-        if self.timing.ntm && direction_changed && diff.abs() > deadband {
-            RetargetAction::StopAndReplan
-        } else if new_dval == self.internal.ldvl && self.stat.mip.contains(MipFlags::MOVE) {
-            // The move in flight already goes there: C's 2455 gate sends
-            // nothing, and there is no new target to extend to.
-            RetargetAction::Ignore
-        } else {
-            // Same-direction or within-deadband: extend the move
-            // in-flight. C parks the new target until completion behind
-            // the 2455 dispatch gate; see the doc comment above for the
-            // divergence rationale.
-            RetargetAction::ExtendMove
-        }
     }
 
     /// C `enforceMinRetryDeadband` (motorRecord.cc:557): RDBD must be at
@@ -2235,7 +1983,9 @@ impl MotorRecord {
                     // the implicit GET_INFO (2546-2557, NOTHING_DONE
                     // passes only — put_pass carries that discriminator).
                     let mut effects = ProcessEffects::default();
-                    self.dispatch_latent_collection(&mut effects, true);
+                    if !self.jog_stop_section(&mut effects) {
+                        self.dispatch_latent_collection(&mut effects, true);
+                    }
                     effects
                 }
             }

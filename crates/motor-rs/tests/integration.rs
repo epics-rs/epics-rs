@@ -446,22 +446,13 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
     let _ = poll_handle.await;
 }
 
-/// Held-jog resume must survive the idle-poll change-gate. The operator holds
-/// JOGF during a positional move; on a close-enough completion the jog resumes
-/// on a follow-up record pass (the Idle-arm `dispatch_latent_collection`). C
-/// strands this (special() arms MIP_JOG_REQ only at mip==MIP_DONE,
-/// motorRecord.cc:3045, so a button pressed during a move is never armed); Rust
-/// preserves the resume as a deliberate divergence. With the change-gate, a
-/// now-stationary axis no longer notifies on an unchanged poll, so the resume
-/// would strand unless `finalize_motion` requests one forced poll.
-///
-/// This test drives the record ONLY on `io_intr` — the production wiring —
-/// unlike the unit test `close_enough_defers_held_jog_to_next_idle_poll`, which
-/// calls `check_completion()` directly and so cannot observe a missing forced
-/// poll. Without the `finalize_motion` request_poll the settle poll is
-/// suppressed, no `io_intr` fires, and the axis stays Idle until the deadline.
+/// A JOGF held through a positional move strands, as C does: special() arms
+/// MIP_JOG_REQ only at mip==MIP_DONE (motorRecord.cc:3045), so no pass the
+/// poll loop delivers after the close-enough completion starts the jog, and a
+/// fresh press on the idle record does. Drives the record ONLY on `io_intr`,
+/// the production wiring.
 #[tokio::test(flavor = "current_thread")]
-async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
+async fn test_jog_held_through_a_move_strands_until_pressed_again() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor).build();
 
@@ -497,7 +488,10 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
 
     // Operator holds JOGF DURING the move (mip == MOVE, not DONE): MIP_JOG_REQ
     // is never armed — exactly the case C strands.
-    setup.record.ctrl.jogf = true;
+    setup
+        .record
+        .put_field("JOGF", EpicsValue::Short(1))
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(2);
 
@@ -528,32 +522,30 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     }
     assert!(completed, "the positional move must complete close-enough");
 
-    // The axis is stationary and its timed polls are change-gated, so the
-    // only io_intr left to come is the completion's forced poll.
-    // Phase 2: the held jog must resume. Without the finalize_motion forced
-    // poll, no io_intr fires and the axis stays Idle until the deadline.
-    let mut resumed = false;
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), io_intr_rx.recv()).await {
+    // Phase 2: every pass the poll loop still delivers leaves the axis idle.
+    let quiet = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < quiet {
+        match tokio::time::timeout(Duration::from_millis(50), io_intr_rx.recv()).await {
             Ok(Some(())) => {
                 setup.device_support.arm_readback_callback();
                 setup.record.process().unwrap();
                 setup.device_support.write(&mut setup.record).unwrap();
-                if setup.record.stat.phase == MotionPhase::Jog {
-                    resumed = true;
-                    break;
-                }
+                assert_ne!(setup.record.stat.phase, MotionPhase::Jog);
             }
             Ok(None) => break,
             Err(_) => continue,
         }
     }
+    assert!(setup.record.ctrl.jogf, "the button stays latched");
 
-    assert!(
-        resumed,
-        "held JOGF must resume via the real poll loop after a close-enough completion (phase={:?}, jogf={})",
-        setup.record.stat.phase, setup.record.ctrl.jogf
-    );
+    // Phase 3: a fresh press on the idle record arms and starts the jog.
+    setup
+        .record
+        .put_field("JOGF", EpicsValue::Short(1))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    assert_eq!(setup.record.stat.phase, MotionPhase::Jog);
 
     let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
@@ -1115,7 +1107,7 @@ async fn a_failure_raising_no_bit_posts_only_when_forced() {
 /// status pass, and on a fast axis the Startup readback then caught the
 /// move mid-flight and synced the instantaneous position into VAL/DVAL.
 #[tokio::test]
-async fn pass0_restored_val_is_not_a_move_command() {
+async fn pass0_restored_dval_is_not_a_move_command() {
     use asyn_rs::error::AsynError;
     use asyn_rs::interfaces::motor::MotorStatus;
     use asyn_rs::user::AsynUser;
@@ -1178,10 +1170,12 @@ async fn pass0_restored_val_is_not_a_move_command() {
     }));
     let mut setup = make_builder(motor.clone()).build();
 
-    // pass0 restore: a silent field write, before device init.
+    // pass0 restore: a silent field write, before device init. Autosave
+    // restores DVAL (motor_positions.req); a VAL write would stay raw,
+    // as C special() does not cascade it.
     setup
         .record
-        .put_field("VAL", EpicsValue::Double(1.5))
+        .put_field("DVAL", EpicsValue::Double(1.5))
         .unwrap();
     // C init_record era: initial readback seed + parked-put clear.
     setup.device_support.init(&mut setup.record).unwrap();
@@ -1192,14 +1186,14 @@ async fn pass0_restored_val_is_not_a_move_command() {
 
     assert_eq!(
         setup.record.pos.val, 1.5,
-        "restored VAL survives init and the Startup pass"
+        "restored DVAL survives init and the Startup pass"
     );
     assert_eq!(setup.record.pos.dval, 1.5);
     assert!(setup.record.stat.dmov, "restored axis comes up done");
     assert_eq!(
         moves.load(Ordering::SeqCst),
         0,
-        "a pass0-restored VAL must never dispatch a move"
+        "a pass0-restored DVAL must never dispatch a move"
     );
     assert_eq!(
         loads.load(Ordering::SeqCst),

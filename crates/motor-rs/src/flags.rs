@@ -184,12 +184,12 @@ impl FreezeOffset {
     }
 }
 
-/// A jog or home command queued behind an in-progress motion (stop-then-X).
+/// A home queued behind an in-progress motion (stop-then-home, C 2028).
 /// Tracked outside the MIP bitflags so it cannot be confused with an active
-/// jog/home that a plain STOP has just halted.
+/// home that a plain STOP has just halted. A jog has no queued form: C
+/// postProcess re-fires only a home (856-891).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedMotion {
-    Jog { forward: bool },
     Home { forward: bool },
 }
 
@@ -654,14 +654,6 @@ pub struct ProcessEffects {
     /// the record core neither sets nor reads this. Retained only so
     /// the public struct shape is unchanged.
     pub suppress_forward_link: bool,
-}
-
-/// Retarget action when a new target arrives during motion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetargetAction {
-    Ignore,
-    StopAndReplan,
-    ExtendMove,
 }
 
 /// Motor record errors.

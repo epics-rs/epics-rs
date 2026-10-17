@@ -66,7 +66,10 @@ fn run(scenario: &str) {
             moving(&mut rec, 25.0, true);
             rec.pos.dval = -10.0;
             rec.pos.val = -10.0;
-            let effects = rec.plan_motion(CommandSource::Val);
+            assert_eq!(rec.plan_motion(CommandSource::Val).commands, []);
+            // C prints at the next moving callback (1336), not at the put.
+            moving(&mut rec, 25.5, true);
+            let effects = rec.check_completion();
             assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
         }
         "ntm-poll" => {
@@ -129,7 +132,7 @@ fn printed(scenario: &str) -> Vec<String> {
 }
 
 #[test]
-fn an_ntm_stop_on_a_target_write_prints_tdir() {
+fn an_ntm_stop_after_a_target_write_prints_tdir() {
     assert_eq!(printed("ntm-write"), ["m1:tdir = 1"]);
 }
 

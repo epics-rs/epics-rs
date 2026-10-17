@@ -521,8 +521,6 @@ pub struct InternalFields {
     pub pp: bool,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,
-    /// Pending retarget value (for NTM stop-and-replan)
-    pub pending_retarget: Option<f64>,
     /// A jog/home command that arrived while the axis was already moving.
     /// The record stops the current motion first and re-issues this once the
     /// driver reports done. Kept separate from the MIP JOGF/JOGR/HOMF/HOMR
@@ -531,11 +529,6 @@ pub struct InternalFields {
     pub queued_motion: Option<QueuedMotion>,
     /// Remember jog direction for backlash (cleared by stop_jog)
     pub jog_was_forward: bool,
-    /// Set when a same-direction retarget (ExtendMove) occurred during a
-    /// motion. On completion, evaluate_position_error verifies that the
-    /// driver actually followed the retarget and, if not, replans once
-    /// independent of retry settings. Cleared after the check.
-    pub verify_retarget_on_completion: bool,
     /// Set once `init_record` pass 1 has reconciled the load-time
     /// invariants: raw limits (RHLM/RLLM derived from the loaded DHLM/DLLM
     /// at the final MRES) and the rev↔EGU speed pairs (S/VELO, SBAS/VBAS,

@@ -97,9 +97,13 @@ fn test_field_roundtrip_string() {
 
 #[test]
 fn test_val_cascades_to_dval_rval() {
+    // C special() stores VAL raw; the do_work collection (2204-2235) and
+    // the move block (2300-2305) cascade it.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    assert_eq!(rec.pos.dval, 0.0, "the put stores VAL only");
+    rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.pos.dval, 10.0);
     assert_eq!(rec.pos.rval, 1000);
 }
@@ -109,6 +113,8 @@ fn test_dval_cascades_to_val_rval() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.put_field("DVAL", EpicsValue::Double(5.0)).unwrap();
+    assert_eq!(rec.pos.val, 0.0, "the put stores DVAL only");
+    rec.plan_motion(CommandSource::Dval);
     assert_eq!(rec.pos.val, 5.0);
     assert_eq!(rec.pos.rval, 500);
 }
@@ -118,6 +124,8 @@ fn test_rval_cascades_to_val_dval() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.put_field("RVAL", EpicsValue::Long(1000)).unwrap();
+    assert_eq!(rec.pos.dval, 0.0, "the put stores RVAL only");
+    rec.plan_motion(CommandSource::Rval);
     assert_eq!(rec.pos.dval, 10.0);
     assert_eq!(rec.pos.val, 10.0);
 }
@@ -431,7 +439,7 @@ fn test_jog_start_stop() {
     rec.stat.msta = MstaFlags::DONE;
 
     // Start jog forward
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -494,6 +502,7 @@ fn test_set_mode_offset_redefinition_retranslates_user_limits() {
 
     // DVAL redefinition (FOFF=Variable default): off = 5 - 0 = 5.
     rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Set);
     assert_eq!(rec.pos.off, 5.0);
     assert_eq!(rec.limits.hlm, 15.0, "HLM follows the new offset");
     assert_eq!(rec.limits.llm, -5.0, "LLM follows the new offset");
@@ -1138,7 +1147,7 @@ fn test_paused_homf_wins_over_latched_jog_at_go() {
     rec.plan_motion(CommandSource::Spmg);
     rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Homf);
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -1688,46 +1697,20 @@ fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
 }
 
 #[test]
-fn test_ntm_retarget_direction_change() {
-    let mut rec = MotorRecord::new();
-    rec.timing.ntm = true;
-    rec.timing.ntmf = 2;
-    rec.retry.bdst = 0.0;
-    rec.retry.rdbd = 0.0;
-    rec.internal.ldvl = 10.0;
-    rec.pos.drbv = 5.0;
-    // Set up active motion state (required for NTM)
-    rec.stat.mip = MipFlags::MOVE;
-    rec.stat.phase = MotionPhase::MainMove;
-    // CDIR: moving positive (dval > drbv)
-    rec.stat.cdir = true;
-
-    // Same direction, farther -> ExtendMove
-    assert_eq!(rec.handle_retarget(15.0), RetargetAction::ExtendMove);
-
-    // Opposite direction (negative, deadband=0) -> StopAndReplan
-    assert_eq!(rec.handle_retarget(-5.0), RetargetAction::StopAndReplan);
-}
-
-#[test]
-fn test_val_write_during_stop_deceleration_reissues_move() {
-    // C parity: the kohzuCtl retarget sequence is a STOP put followed by a
-    // VAL rewrite a few ms later, while the axis is still decelerating.
-    // C do_work (motorRecord.cc:2241) dispatches the new move immediately
-    // (the move block never tests MIP_STOP); the stop must not eat it.
+fn test_val_write_during_stop_deceleration_is_synced_away() {
+    // C: the move block's 2457 gate refuses under MIP_STOP, and the
+    // commanded stop's completion excludes MIP_STOP from the replay
+    // (1384-1386), so postProcess syncs VAL to the readback (827-849).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.stat.msta = MstaFlags::DONE;
 
-    // Start a move to 50
     rec.pos.dval = 50.0;
     rec.pos.val = 50.0;
     let _ = rec.plan_motion(CommandSource::Val);
-    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 
-    // Axis under way at 25 when a STOP put processes
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
@@ -1735,44 +1718,231 @@ fn test_val_write_during_stop_deceleration_reissues_move() {
     rec.stat.movn = true;
     rec.ctrl.stop = true;
     let effects = rec.plan_motion(CommandSource::Stop);
-    assert!(rec.stat.mip.contains(MipFlags::STOP));
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    // C parity: no eager sync at stop-put time; VAL keeps the old target
-    // until the axis actually stops (postProcess sync).
-    assert_eq!(rec.pos.val, 50.0);
 
-    // New target written while still decelerating (driver not done yet)
     rec.pos.dval = 80.0;
     rec.pos.val = 80.0;
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(
-        matches!(
-            effects.commands.last(),
-            Some(MotorCommand::MoveAbsolute { .. })
-        ),
-        "VAL during stop deceleration must re-issue the move"
-    );
-    assert_eq!(rec.stat.mip, MipFlags::MOVE); // stop state replaced
+    assert_eq!(effects.commands, [], "no move while stopping");
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
 
-    // Driver finishes at the new target: completion finalizes there
-    // instead of running the plain-stop VAL<-RBV sync.
-    rec.pos.rbv = 80.0;
-    rec.pos.drbv = 80.0;
-    rec.pos.rrbv = 8000;
+    rec.pos.rbv = 30.0;
+    rec.pos.drbv = 30.0;
+    rec.pos.rrbv = 3000;
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = false;
-    let _ = rec.check_completion();
+    let effects = rec.check_completion();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. }))
+    );
     assert!(rec.stat.dmov);
-    assert_eq!(rec.pos.val, 80.0);
+    assert_eq!(rec.pos.val, 30.0);
 }
 
 #[test]
-fn test_val_write_during_stop_replan_supersedes_parked_target() {
-    // An NTM StopAndReplan parks its retarget in pending_retarget while
-    // the stop decelerates. A newer explicit VAL write during that window
-    // must win: the parked target is dropped (invariant: pending_retarget
-    // is Some only while MIP_STOP is committed) and the new move
-    // dispatched, exactly as C's last do_work pass would.
+fn test_val_write_during_ntm_stop_is_the_replanned_target() {
+    // After an NTM stop (pp = FALSE, C 1341) the newest write parked by
+    // the 2457 gate is the target dispatched at the stop completion.
+    let mut rec = ntm_stopping(10, 0.0);
+
+    rec.pos.dval = 30.0;
+    rec.pos.val = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(effects.commands, [], "no move while stopping");
+    assert!(rec.stat.mip.contains(MipFlags::MOVE) && !rec.internal.pp);
+
+    let effects = stop_done_at_26(&mut rec);
+    assert!(
+        effects.commands.iter().any(
+            |c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == 3000.0)
+        ),
+        "{:?}",
+        effects.commands
+    );
+}
+
+fn moving_to_50(rtry: i16) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.retry.rtry = rtry;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let e = rec.plan_motion(CommandSource::Val);
+    assert!(moves_to(&e, 5000.0));
+    rec.process_motor_info(&status_at(2500.0, true));
+    let _ = rec.check_completion();
+    rec
+}
+
+fn status_at(position: f64, moving: bool) -> asyn_rs::interfaces::motor::MotorStatus {
+    asyn_rs::interfaces::motor::MotorStatus {
+        position,
+        encoder_position: position,
+        done: !moving,
+        moving,
+        ..Default::default()
+    }
+}
+
+fn moves_to(effects: &ProcessEffects, raw: f64) -> bool {
+    effects
+        .commands
+        .iter()
+        .any(|c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == raw))
+}
+
+#[test]
+fn test_pause_parked_write_dispatches_at_go() {
+    // C: a VAL written while a Pause decelerates reaches DVAL with the
+    // lasts untouched (do_work returns at 2237); maybeRetry leaves the
+    // lasts alone, so Go's move block enters on dval != ldvl.
+    for rtry in [0, 3] {
+        let mut rec = moving_to_50(rtry);
+        rec.ctrl.spmg = SpmgMode::Pause;
+        let _ = rec.plan_motion(CommandSource::Spmg);
+        rec.pos.val = 30.0;
+        rec.pos.dval = 30.0;
+        let e = rec.plan_motion(CommandSource::Val);
+        assert!(!moves_to(&e, 3000.0), "rtry {rtry}: no move while paused");
+        rec.process_motor_info(&status_at(2600.0, false));
+        let e = rec.check_completion();
+        assert!(!moves_to(&e, 3000.0), "rtry {rtry}: {:?}", e.commands);
+        rec.ctrl.spmg = SpmgMode::Go;
+        let e = rec.plan_motion(CommandSource::Spmg);
+        assert!(moves_to(&e, 3000.0), "rtry {rtry}: Go {:?}", e.commands);
+    }
+}
+
+#[test]
+fn test_pause_completion_waits_out_dly_before_maybe_retry() {
+    // C 1441-1450: the fresh DMOV edge requests DLY; maybeRetry runs on
+    // the delayed pass.
+    let mut rec = moving_to_50(3);
+    rec.timing.dly = 0.5;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    let _ = rec.plan_motion(CommandSource::Spmg);
+    rec.process_motor_info(&status_at(2600.0, false));
+    let e = rec.check_completion();
+    assert!(e.schedule_delay.is_some(), "{:?}", rec.stat.mip);
+    assert_eq!(rec.retry.rcnt, 0, "maybeRetry waits for the delay");
+    rec.stat.mip.remove(MipFlags::DELAY_REQ);
+    rec.stat.mip.insert(MipFlags::DELAY_ACK);
+    let e = rec.check_completion();
+    assert_eq!(e.commands, [], "paused: the retry waits for Go");
+    assert_eq!(rec.retry.rcnt, 1);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+}
+
+#[test]
+fn test_val_parked_during_backlash_final_leg_replays_at_once() {
+    // C postProcess arms pp with the final leg (975), so a VAL parked
+    // during it is replayed at its completion (1384-1397): a fresh move in
+    // the same pass, RCNT 0, no DLY.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.retry.bdst = -1.0;
+    rec.retry.rtry = 3;
+    rec.timing.dly = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+    rec.process_motor_info(&status_at(2500.0, true));
+    let _ = rec.check_completion();
+    rec.process_motor_info(&status_at(5100.0, false));
+    let _ = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::BacklashFinal);
+    rec.process_motor_info(&status_at(5050.0, true));
+    let _ = rec.check_completion();
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let e = rec.plan_motion(CommandSource::Val);
+    assert!(!moves_to(&e, 3000.0), "parked during the leg");
+    rec.process_motor_info(&status_at(5000.0, false));
+    let e = rec.check_completion();
+    assert!(e.schedule_delay.is_none(), "no DLY");
+    // A fresh move to 30: its own first leg to DVAL - BDST.
+    assert!(moves_to(&e, 3100.0), "{:?}", e.commands);
+    assert_eq!(rec.retry.rcnt, 0);
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "{:?}",
+        rec.stat.mip
+    );
+}
+
+#[test]
+fn test_home_write_at_the_readback_does_not_move_after_home() {
+    // C: a VAL put during a home enters the move block (2241); too_small
+    // (within a step of DRBV) adopts it into the lasts (2318-2322), so at
+    // home done val == lval and postProcess syncs VAL to the readback.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.process_motor_info(&status_at(2500.0, false));
+    let _ = rec.check_completion();
+    rec.pos.val = 25.0;
+    rec.pos.dval = 25.0;
+    let _ = rec.put_field("HOMF", EpicsValue::Short(1));
+    let _ = rec.plan_motion(CommandSource::Homf);
+    rec.process_motor_info(&status_at(2000.0, true));
+    let _ = rec.check_completion();
+    rec.pos.val = 20.0;
+    rec.pos.dval = 20.0;
+    let e = rec.plan_motion(CommandSource::Val);
+    assert_eq!(e.commands, []);
+    assert_eq!(rec.internal.lval, 20.0, "too_small adopts the write");
+    rec.process_motor_info(&status_at(0.0, false));
+    let e = rec.check_completion();
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        e.commands
+    );
+    assert_eq!(rec.pos.val, 0.0);
+}
+
+#[test]
+fn test_val_put_during_a_home_is_refused_by_lvio() {
+    // C 2401-2449: the move block's LVIO refusal restores VAL/DVAL from
+    // the lasts on every put, homing or not.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.process_motor_info(&status_at(2500.0, false));
+    let _ = rec.check_completion();
+    rec.pos.val = 25.0;
+    rec.pos.dval = 25.0;
+    let _ = rec.put_field("HOMF", EpicsValue::Short(1));
+    let _ = rec.plan_motion(CommandSource::Homf);
+    rec.process_motor_info(&status_at(2000.0, true));
+    let _ = rec.check_completion();
+    rec.pos.val = 500.0;
+    rec.pos.dval = 500.0;
+    let e = rec.plan_motion(CommandSource::Val);
+    assert_eq!(e.commands, []);
+    assert!(rec.limits.lvio);
+    assert_eq!(rec.pos.val, rec.internal.lval);
+}
+
+#[test]
+fn test_ntm_direction_put_stops_at_the_next_moving_callback() {
+    // C takes the NTM stop in process()'s movn block (1326-1341), on the
+    // callback after the put; the put itself only parks the target (2457).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.limits.dhlm = 100.0;
@@ -1780,42 +1950,295 @@ fn test_val_write_during_stop_replan_supersedes_parked_target() {
     rec.timing.ntm = true;
     rec.timing.ntmf = 2;
     rec.stat.msta = MstaFlags::DONE;
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+    let moving_at = |position: f64| asyn_rs::interfaces::motor::MotorStatus {
+        position,
+        encoder_position: position,
+        done: false,
+        moving: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&moving_at(2500.0));
+    assert_eq!(rec.check_completion().commands, []);
 
+    rec.pos.dval = -10.0;
+    rec.pos.val = -10.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(effects.commands, [], "the put only parks");
+    assert!(!rec.stat.mip.contains(MipFlags::STOP));
+
+    rec.process_motor_info(&moving_at(2510.0));
+    let effects = rec.check_completion();
+    assert!(
+        matches!(effects.commands[..], [MotorCommand::Stop { .. }]),
+        "{:?}",
+        effects.commands
+    );
+    assert!(rec.stat.mip.contains(MipFlags::MOVE | MipFlags::STOP));
+    assert!(!rec.internal.pp);
+}
+
+/// A move to 50 under way at 25, VAL rewritten to -10 and the NTM stop
+/// done at 26. C 1341 leaves pp FALSE and MIP_MOVE set, so the stop
+/// completion waits out DLY and runs maybeRetry (1405-1440) against the
+/// new target, as any other move completion does.
+fn ntm_stopped(rtry: i16, dly: f64) -> (MotorRecord, ProcessEffects) {
+    let mut rec = ntm_stopping(rtry, dly);
+    let effects = stop_done_at_26(&mut rec);
+    (rec, effects)
+}
+
+fn ntm_stopping(rtry: i16, dly: f64) -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.timing.ntm = true;
+    rec.timing.ntmf = 2;
+    rec.timing.dly = dly;
+    rec.retry.rtry = rtry;
+    rec.stat.msta = MstaFlags::DONE;
     rec.pos.dval = 50.0;
     rec.pos.val = 50.0;
     let _ = rec.plan_motion(CommandSource::Val);
 
-    // Opposite-direction retarget mid-move -> StopAndReplan parks -10
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
     rec.pos.dval = -10.0;
     rec.pos.val = -10.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    assert!(rec.stat.mip.contains(MipFlags::STOP));
-    assert_eq!(rec.internal.pending_retarget, Some(-10.0));
+    let mut sent = rec.plan_motion(CommandSource::Val).commands;
+    rec.pos.diff = rec.pos.dval - rec.pos.drbv;
+    rec.pos.rdif = (rec.pos.diff / rec.conv.mres).round() as i32;
+    sent.extend(rec.check_completion().commands);
+    assert!(
+        sent.iter().any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "{sent:?}"
+    );
+    rec
+}
 
-    // Newer explicit target during the same stop window
-    rec.pos.dval = 30.0;
-    rec.pos.val = 30.0;
-    let effects = rec.plan_motion(CommandSource::Val);
-    assert!(matches!(
-        effects.commands.last(),
-        Some(MotorCommand::MoveAbsolute { .. })
-    ));
-    assert_eq!(rec.internal.pending_retarget, None);
-    assert_eq!(rec.stat.mip, MipFlags::MOVE);
-
-    // Completion at 30 finalizes there; the parked -10 must not resurrect.
-    rec.pos.rbv = 30.0;
-    rec.pos.drbv = 30.0;
-    rec.pos.rrbv = 3000;
+fn stop_done_at_26(rec: &mut MotorRecord) -> ProcessEffects {
+    rec.pos.rbv = 26.0;
+    rec.pos.drbv = 26.0;
+    rec.pos.rrbv = 2600;
     rec.stat.msta = MstaFlags::DONE;
-    let effects = rec.check_completion();
+    rec.stat.movn = false;
+    rec.check_completion()
+}
+
+fn dispatches_minus_10(effects: &ProcessEffects) -> bool {
+    effects
+        .commands
+        .iter()
+        .any(|c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == -1000.0))
+}
+
+#[test]
+fn test_ntm_stop_completion_dispatches_as_a_retry() {
+    let (rec, effects) = ntm_stopped(10, 0.0);
+    assert!(dispatches_minus_10(&effects), "{:?}", effects.commands);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+#[test]
+fn test_ntm_stop_completion_without_retry_dispatches_a_move() {
+    let (rec, effects) = ntm_stopped(0, 0.0);
+    assert!(dispatches_minus_10(&effects), "{:?}", effects.commands);
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "{:?}",
+        rec.stat.mip
+    );
+    assert_eq!(rec.retry.rcnt, 0);
+}
+
+#[test]
+fn test_stop_during_ntm_stop_ends_with_no_move() {
+    // C 1874-1888 leaves MIP_MOVE and pp FALSE, so C's completion drives
+    // back toward DVAL after the user's STOP — a C defect rs does not
+    // copy: the STOP takes over as a commanded stop.
+    let mut rec = ntm_stopping(10, 0.0);
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(effects.commands[..], [MotorCommand::Stop { .. }]));
+    let effects = stop_done_at_26(&mut rec);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        effects.commands
+    );
     assert!(rec.stat.dmov);
-    assert_eq!(rec.pos.val, 30.0);
-    assert!(effects.commands.is_empty());
+    assert_eq!(rec.pos.val, 26.0, "synced to the stop position");
+}
+
+#[test]
+fn test_stop_during_retry_with_a_parked_val_ends_with_no_move() {
+    // C 1876-1882 drops only MIP; the next callback marks the still
+    // moving axis EXTERNAL with pp (1314-1320) and the VAL parked during
+    // the retry replays (1384-1397) — the same C defect, not copied.
+    let mut rec = moving_to_50(3);
+    rec.process_motor_info(&status_at(4900.0, false));
+    let e = rec.check_completion();
+    assert!(moves_to(&e, 5000.0), "retry {:?}", e.commands);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    rec.process_motor_info(&status_at(4950.0, true));
+    let _ = rec.check_completion();
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    assert_eq!(rec.plan_motion(CommandSource::Val).commands, []);
+    let e = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(e.commands[..], [MotorCommand::Stop { .. }]));
+    let mut sent = Vec::new();
+    rec.process_motor_info(&status_at(4960.0, true));
+    sent.extend(rec.check_completion().commands);
+    rec.process_motor_info(&status_at(4970.0, false));
+    sent.extend(rec.check_completion().commands);
+    assert!(
+        !sent
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn test_stop_during_a_pause_deceleration_ends_with_no_move_at_go() {
+    // C 1874-1888 leaves the Pause's MIP_STOP and pp FALSE, so C's
+    // completion arms a retry (or keeps DVAL) and Go drives back toward
+    // the target after the user's STOP — the same C defect, not copied.
+    // Covers the STOP while moving and while the Pause waits out DLY.
+    for (rtry, dly) in [(0, 0.0), (3, 0.0), (3, 0.5)] {
+        let mut rec = moving_to_50(rtry);
+        rec.timing.dly = dly;
+        rec.ctrl.spmg = SpmgMode::Pause;
+        let _ = rec.plan_motion(CommandSource::Spmg);
+        let mut sent = Vec::new();
+        if dly > 0.0 {
+            rec.process_motor_info(&status_at(2600.0, false));
+            let e = rec.check_completion();
+            assert!(e.schedule_delay.is_some(), "{:?}", rec.stat.mip);
+        }
+        let e = rec.plan_motion(CommandSource::Stop);
+        assert!(matches!(e.commands[..], [MotorCommand::Stop { .. }]));
+        if dly > 0.0 {
+            rec.stat.mip.remove(MipFlags::DELAY_REQ);
+            rec.stat.mip.insert(MipFlags::DELAY_ACK);
+        } else {
+            rec.process_motor_info(&status_at(2600.0, false));
+        }
+        sent.extend(rec.check_completion().commands);
+        rec.ctrl.spmg = SpmgMode::Go;
+        sent.extend(rec.plan_motion(CommandSource::Spmg).commands);
+        assert!(
+            !sent
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "rtry {rtry} dly {dly}: {sent:?}"
+        );
+        assert_eq!(rec.pos.val, 26.0, "rtry {rtry} dly {dly}: synced");
+    }
+}
+
+#[test]
+fn test_ntm_stop_completion_waits_out_dly_before_the_retry() {
+    let (mut rec, effects) = ntm_stopped(10, 0.5);
+    assert_eq!(effects.commands, [], "DLY first");
+    assert!(effects.schedule_delay.is_some());
+    rec.stat.mip.remove(MipFlags::DELAY_REQ);
+    rec.stat.mip.insert(MipFlags::DELAY_ACK);
+    let effects = rec.check_completion();
+    assert!(dispatches_minus_10(&effects), "{:?}", effects.commands);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY), "{:?}", rec.stat.mip);
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+/// A move to 50 under way at 25 with VAL rewritten to 80: C's 2457 gate
+/// parks it, and the completion dispatches it — through maybeRetry and
+/// the same pass's do_work (1431, 1489), or through the pp replay after
+/// a backlash first leg (1384-1397).
+fn parked_during_move(rtry: i16, bdst: f64) -> (MotorRecord, ProcessEffects) {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.retry.rtry = rtry;
+    rec.retry.bdst = bdst;
+    rec.vel.velo = 1.0;
+    rec.vel.bvel = 0.5;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.pos.dval = 80.0;
+    rec.pos.val = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(effects.commands, [], "no move while one is in flight");
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+
+    let at = 50.0 - bdst;
+    rec.pos.rbv = at;
+    rec.pos.drbv = at;
+    rec.pos.rrbv = (at * 100.0) as i32;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    (rec, effects)
+}
+
+fn dispatches_80(effects: &ProcessEffects) -> bool {
+    effects
+        .commands
+        .iter()
+        .any(|c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == 8000.0))
+}
+
+#[test]
+fn test_val_parked_during_move_dispatches_at_completion_without_retry() {
+    let (rec, effects) = parked_during_move(0, 0.0);
+    assert!(dispatches_80(&effects), "{:?}", effects.commands);
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+    assert_eq!(rec.internal.ldvl, 80.0);
+}
+
+#[test]
+fn test_val_parked_during_move_dispatches_at_completion_as_a_retry() {
+    let (rec, effects) = parked_during_move(10, 0.0);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+#[test]
+fn test_val_parked_during_backlash_leg_replays_at_its_end() {
+    let (rec, effects) = parked_during_move(0, 1.0);
+    // A fresh plan toward 80 (pretarget 79), not the final leg to 80.
+    assert!(
+        effects.commands.iter().any(
+            |c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == 7900.0)
+        ),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 }
 
 #[test]
@@ -2104,9 +2527,11 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
     // not from gain support.
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
+    let mut rx = capture(&mut rec);
 
     // Without GAIN_SUPPORT: no torque command, the refresh still fires.
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    assert!(sent(&mut rx).is_empty());
     let effects = rec.plan_motion(CommandSource::Cnen);
     assert!(
         effects.commands == [MotorCommand::Poll],
@@ -2122,13 +2547,11 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
     rec.stat.stup = 0; // data callback acked the previous request
     rec.stat.msta.insert(MstaFlags::GAIN_SUPPORT);
     rec.put_field("CNEN", EpicsValue::Short(0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Cnen);
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetClosedLoop { enable: false }))
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetClosedLoop { enable: false }]
     );
+    let effects = rec.plan_motion(CommandSource::Cnen);
     assert!(sends_get_info(&effects));
     assert_eq!(rec.stat.stup, 2);
 }
@@ -2523,36 +2946,57 @@ fn test_both_limits_struck_moves_adopt_readback() {
 fn test_hls_blocks_forward_jog() {
     let mut rec = MotorRecord::new();
     rec.limits.hls = true;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(effects.commands.is_empty());
     assert!(rec.stat.dmov);
 }
 
 #[test]
-fn test_cnen_emits_set_closed_loop_with_gain_support() {
+fn test_cnen_put_sends_torque_whatever_the_pass_returns() {
+    // C special() CNEN (3029-3040) sends ENABLE/DISABL_TORQUE when the put
+    // lands; the pass that follows may return at the latent-stop branch
+    // (1874) and the command is already out.
     let mut rec = MotorRecord::new();
-    rec.stat.msta = MstaFlags::GAIN_SUPPORT; // controller supports gain
-    rec.ctrl.cnen = true;
+    let mut rx = capture(&mut rec);
+    rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
+    rec.ctrl.stop = true;
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Cnen);
-    assert_eq!(effects.commands.len(), 1);
-    assert!(matches!(
-        effects.commands[0],
-        MotorCommand::SetClosedLoop { enable: true }
-    ));
+    let mut all = sent(&mut rx);
+    all.extend(effects.commands);
+    assert_eq!(
+        all.iter()
+            .filter(|c| matches!(c, MotorCommand::SetClosedLoop { enable: true }))
+            .count(),
+        1,
+        "{all:?}"
+    );
 }
 
 #[test]
-fn test_cnen_false_emits_disable_with_gain_support() {
+fn test_cnen_put_sends_enable_and_disable_with_gain_support() {
     let mut rec = MotorRecord::new();
-    rec.stat.msta = MstaFlags::GAIN_SUPPORT;
-    rec.ctrl.cnen = false;
+    let mut rx = capture(&mut rec);
+    rec.stat.msta = MstaFlags::GAIN_SUPPORT; // controller supports gain
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetClosedLoop { enable: true }]
+    );
+    rec.put_field("CNEN", EpicsValue::Short(0)).unwrap();
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetClosedLoop { enable: false }]
+    );
+    // The pass does not repeat it.
     let effects = rec.plan_motion(CommandSource::Cnen);
-    assert_eq!(effects.commands.len(), 1);
-    assert!(matches!(
-        effects.commands[0],
-        MotorCommand::SetClosedLoop { enable: false }
-    ));
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetClosedLoop { .. }))
+    );
 }
 
 #[test]
@@ -2560,13 +3004,14 @@ fn test_cnen_no_command_without_gain_support() {
     // C: case motorRecordCNEN drives the torque command only when MSTA
     // reports gain support. A driver without it gets nothing.
     let mut rec = MotorRecord::new();
+    let mut rx = capture(&mut rec);
     assert!(!rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT));
-    rec.ctrl.cnen = true;
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Cnen);
     assert!(
-        !effects
-            .commands
+        !sent(&mut rx)
             .iter()
+            .chain(&effects.commands)
             .any(|c| matches!(c, MotorCommand::SetClosedLoop { .. })),
         "no SetClosedLoop without GAIN_SUPPORT"
     );
@@ -2730,11 +3175,11 @@ fn test_stop_during_retry_finalizes_immediately_without_sync() {
 }
 
 #[test]
-fn test_spmg_stop_preserves_queued_motion_behind_in_flight_stop() {
+fn test_spmg_stop_cancels_queued_motion_behind_in_flight_stop() {
     // C: SPMG=Stop while a stop is already in flight takes the early
-    // return (1874-1888) BEFORE the button/MIP clears — a home queued
-    // behind that stop survives and postProcess re-fires it once the
-    // axis stops.
+    // return (1874-1888) BEFORE the button/MIP clears, so postProcess
+    // homes after the user's stop. That C defect is not copied: the
+    // stop drops the queued home and its button.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -2753,21 +3198,19 @@ fn test_spmg_stop_preserves_queued_motion_behind_in_flight_stop() {
     rec.ctrl.spmg = SpmgMode::Stop;
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    assert!(
-        rec.internal.queued_motion.is_some(),
-        "queued home survives the early return like C"
-    );
+    assert!(rec.internal.queued_motion.is_none());
+    assert!(!rec.ctrl.homf);
 
-    // Axis stops — the queued home fires.
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = false;
     let effects = rec.check_completion();
     assert!(
-        effects
+        !effects
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::Home { .. })),
-        "queued home resumes at stop completion (C postProcess parity)"
+        "{:?}",
+        effects.commands
     );
 }
 
@@ -2828,7 +3271,7 @@ fn test_spmg_pause_with_queued_home_clears_latched_jog_button() {
     rec.ctrl.homf = true;
     rec.plan_motion(CommandSource::Homf);
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
-    rec.ctrl.jogf = true; // latched behind the queued home
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap(); // latched behind the queued home
 
     rec.ctrl.spmg = SpmgMode::Pause;
     rec.plan_motion(CommandSource::Spmg);
@@ -2866,7 +3309,7 @@ fn test_val_during_home_clears_latched_jog_button() {
     rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Homf);
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
-    rec.ctrl.jogf = true; // latched during the home, not yet dispatched
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap(); // latched during the home, not yet dispatched
 
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
     rec.plan_motion(CommandSource::Val);
@@ -2891,10 +3334,11 @@ fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
 
-    // JOGF while moving: stop first, queue the jog.
-    rec.ctrl.jogf = true;
+    // JOGF while moving: latched, but special() arms MIP_JOG_REQ only
+    // at MIP_DONE (3042-3046), so the press is inert.
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
-    assert!(rec.internal.queued_motion.is_some());
+    assert!(rec.internal.queued_motion.is_none());
 
     rec.ctrl.spmg = SpmgMode::Pause;
     rec.plan_motion(CommandSource::Spmg);
@@ -3040,7 +3484,7 @@ fn test_latent_jogf_fires_on_move_block_pass() {
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true; // bare put, never dispatched
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap(); // bare put, never dispatched
 
     rec.pos.val = 30.0;
     rec.pos.dval = 30.0;
@@ -3069,7 +3513,7 @@ fn test_latent_jog_release_stops_jog() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
 
@@ -3088,19 +3532,22 @@ fn test_latent_jog_release_stops_jog() {
     assert_eq!(rec.stat.phase, MotionPhase::JogStopping);
 }
 
+/// C: a jog whose button is released with the opposite one latched only
+/// stops (2148-2155), whatever is latched; the JOG_STOP completion
+/// corrects backlash (908-958) and nothing reverses.
 #[test]
-fn test_latent_opposite_jog_stops_and_queues_reverse() {
+fn test_latent_release_with_opposite_latched_only_stops() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
 
     // Bare puts: release JOGF, press JOGR.
     rec.ctrl.jogf = false;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     rec.pos.val = 30.0;
     rec.pos.dval = 30.0;
     let effects = rec.plan_motion(CommandSource::Val);
@@ -3109,12 +3556,18 @@ fn test_latent_opposite_jog_stops_and_queues_reverse() {
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::Stop { .. })),
-        "reversal stops the forward jog first"
+        "the release stops the forward jog"
     );
-    assert!(matches!(
-        rec.internal.queued_motion,
-        Some(QueuedMotion::Jog { forward: false })
-    ));
+    assert_eq!(rec.stat.mip, MipFlags::JOG_STOP);
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        effects.commands
+    );
 }
 
 #[test]
@@ -3152,19 +3605,31 @@ fn test_held_jog_button_does_not_refire_during_own_jog() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
 
-    // VAL write while the jog button is still held: no second jog
-    // command, no jog stop, and the position write is ignored while
-    // jogging (pre-existing retarget semantics).
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // C 2148-2156: a VAL write while the button is held stops the jog;
+    // 2106 consumed MIP_JOG_REQ, so the held button does not start a
+    // second jog when the stop completes.
     rec.pos.val = 30.0;
     rec.pos.dval = 30.0;
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty());
-    assert_eq!(rec.stat.phase, MotionPhase::Jog);
-    assert!(rec.stat.mip.contains(MipFlags::JOGF));
+    assert_eq!(effects.commands, [MotorCommand::stop_axis()]);
+    let effects = complete_stop_at(&mut rec, 12.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert!(rec.stat.dmov);
+    assert!(rec.ctrl.jogf, "the button stays latched, inert");
 }
 
 #[test]
@@ -3175,7 +3640,7 @@ fn test_latent_home_wins_over_latent_jog() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.ctrl.homf = true;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     rec.pos.val = 30.0;
     rec.pos.dval = 30.0;
@@ -3387,7 +3852,7 @@ fn test_stop_field_clears_latched_buttons_while_moving() {
     rec.stat.movn = true;
 
     // Buttons latched by bare puts that never processed the record.
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.ctrl.homr = true;
 
     rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
@@ -4295,7 +4760,7 @@ fn test_spmg_go_resumes_latched_jog() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Jog button latched while paused.
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.internal.lspg = SpmgMode::Pause;
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -4326,7 +4791,9 @@ fn test_spmg_go_without_jog_replans_to_dval() {
     )));
 }
 
-// --- JOGF + JOGR simultaneous: latest-wins (epics-modules/motor #170) ---
+// --- JOGF + JOGR latched on an idle record: C 2106 jogs forward whichever
+// was written (a C defect); the written button wins (epics-modules/motor
+// #170) ---
 
 #[test]
 fn test_jogr_command_clears_latched_jogf() {
@@ -4335,8 +4802,8 @@ fn test_jogr_command_clears_latched_jogf() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     // Both buttons latched (the ambiguous state #170 addresses)
-    rec.ctrl.jogf = true;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     // Latest command is JOGR
     let effects = rec.plan_motion(CommandSource::Jogr);
     assert!(!rec.ctrl.jogf, "JOGR command must clear latched JOGF");
@@ -4353,8 +4820,8 @@ fn test_jogf_command_clears_latched_jogr() {
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(!rec.ctrl.jogr, "JOGF command must clear latched JOGR");
     assert!(effects.commands.iter().any(|c| matches!(
@@ -4374,7 +4841,7 @@ fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
     rec.vel.jvel = 1.0;
     rec.pos.val = 9.5; // inside the limit but within the JVEL window
     rec.pos.dval = 9.5;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(
         !effects
@@ -4397,7 +4864,7 @@ fn test_reverse_jog_at_low_limit_is_rejected_and_clears_button() {
     rec.vel.jvel = 1.0;
     rec.pos.val = -9.5;
     rec.pos.dval = -9.5;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogr);
     assert!(!rec.ctrl.jogr);
     assert!(rec.limits.lvio);
@@ -4414,7 +4881,7 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
     rec.pos.val = 10.0; // at user high limit
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert!(
         !rec.ctrl.jogf,
@@ -4430,7 +4897,7 @@ fn test_reverse_jog_at_high_limit_is_allowed() {
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.pos.val = 10.0; // at high limit
     rec.pos.dval = 10.0;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogr);
     // Reverse jog back inside the window should proceed
     assert!(
@@ -4448,14 +4915,13 @@ fn test_reverse_jog_at_high_limit_is_allowed() {
 fn test_jog_finalize_clears_jog_button_when_driver_stops() {
     // phase=Jog, jogf still latched, driver reports done — record must
     // clear ctrl.jogf so the next process pass does not re-issue the jog.
-    let mut rec = MotorRecord::new();
-    rec.ctrl.jogf = true;
-    rec.stat.mip.insert(MipFlags::JOGF);
-    rec.stat.phase = MotionPhase::Jog;
-    rec.stat.dmov = false;
+    let mut rec = jogging();
     rec.retry.bdst = 0.0; // no jog backlash
+    assert_eq!(rec.stat.mip, MipFlags::JOGF);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
 
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
     rec.check_completion();
 
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
@@ -4466,22 +4932,20 @@ fn test_jog_finalize_clears_jog_button_when_driver_stops() {
 fn test_stop_field_during_active_jog_does_not_resume_jog() {
     // STOP field pressed while a jog is actively running: the axis must
     // finalize to Idle, NOT replay the jog. An active jog leaves MIP=JOGF;
-    // handle_stop adds STOP. The check_completion STOP branch must only
-    // resume a *queued* request (internal.queued_motion), which is absent here.
-    let mut rec = MotorRecord::new();
-    rec.ctrl.jogf = true;
-    rec.stat.mip.insert(MipFlags::JOGF);
-    rec.stat.phase = MotionPhase::Jog;
-    rec.stat.dmov = false;
+    // the STOP replaces it with MIP_STOP (C 1905). The check_completion
+    // STOP branch must only resume a *queued* request
+    // (internal.queued_motion), which is absent here.
+    let mut rec = jogging();
     rec.retry.bdst = 0.0;
+    assert_eq!(rec.stat.mip, MipFlags::JOGF);
 
-    // STOP field write → handle_stop adds MIP_STOP (mip = JOGF | STOP).
     rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Stop);
-    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
 
     // Driver reports done → check_completion must finalize, not re-jog.
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
     let effects = rec.check_completion();
     assert_eq!(
         rec.stat.phase,
@@ -4498,9 +4962,12 @@ fn test_stop_field_during_active_jog_does_not_resume_jog() {
 }
 
 #[test]
-fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
-    // A jog command issued while a move is in progress: the record stops the
-    // current motion, then resumes the queued jog once the driver is done.
+fn test_jog_started_while_moving_only_stops() {
+    // C 2105-2116: a jog request reaching do_work while the axis still
+    // moves sets mip = JOGF|STOP and sends STOP_AXIS. At the stop
+    // completion postProcess re-fires only a home (856-891); maybeRetry's
+    // close-enough clears mip (1088) and the consumed MIP_JOG_REQ (2106)
+    // starts nothing. The axis rests with JOGF latched.
     let mut rec = MotorRecord::new();
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -4510,9 +4977,8 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
     rec.plan_motion(CommandSource::Val);
     rec.stat.movn = true;
 
-    // Jog command arrives mid-move → queued, current motion stopped.
-    rec.ctrl.jogf = true;
-    let effects = rec.plan_motion(CommandSource::Jogf);
+    // Jog queued behind a stop.
+    let effects = queue_jog_behind_pause_stop(&mut rec);
     assert!(
         effects
             .commands
@@ -4520,16 +4986,23 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
             .any(|c| matches!(c, MotorCommand::Stop { .. }))
     );
 
-    // Driver reports done → queued jog resumes. The completion gate is
-    // MOVN (C 1301/1345), which the poll recomputes from the status.
+    // The completion gate is MOVN (C 1301/1345), which the poll
+    // recomputes from the status.
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.movn = false;
     let effects = rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Jog);
-    assert!(effects.commands.iter().any(|c| matches!(
-        c,
-        MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
-    )));
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(rec.stat.dmov);
+    assert!(rec.ctrl.jogf, "JOGF stays latched");
 }
 
 #[test]
@@ -4763,7 +5236,7 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
     // axis is not re-commanded on the next pass.
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_ne!(rec.stat.phase, MotionPhase::Idle);
 
@@ -5152,6 +5625,8 @@ fn test_closed_loop_tweak_and_rlv_not_collected() {
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
     rec.ctrl.twv = 1.0;
 
     rec.put_field("TWF", EpicsValue::Short(1)).unwrap();
@@ -5178,6 +5653,10 @@ fn test_closed_loop_rval_put_is_raw_struct_write() {
     rec.conv.mres = 0.01;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
+    rec.pos.rval = 1000;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.internal.lrvl = 1000;
     rec.stat.msta = MstaFlags::DONE;
 
     rec.put_field("RVAL", EpicsValue::Long(5000)).unwrap();
@@ -5254,6 +5733,10 @@ fn test_latent_tweak_folds_and_moves_after_omsl_flip() {
     rec.stat.msta = MstaFlags::DONE;
     rec.pos.val = 10.0;
     rec.pos.dval = 10.0;
+    rec.pos.rval = 1000;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.internal.lrvl = 1000;
     rec.ctrl.twv = 1.0;
 
     rec.put_field("TWF", EpicsValue::Short(1)).unwrap();
@@ -6820,7 +7303,7 @@ fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     rec.stat.msta = MstaFlags::MOVING;
@@ -6971,9 +7454,9 @@ fn test_retry_resume_within_deadband_quiesces() {
 
 #[test]
 fn test_val_written_during_home_replays_at_completion() {
-    // A VAL written while homing is ignored by the dispatcher
-    // (handle_retarget: HOMF is not in-move). C replays it at the home
-    // completion (1387-1397) instead of syncing it away.
+    // A VAL written while homing is parked by the move block's 2457
+    // gate. C replays it at the home completion (1387-1397) instead of
+    // syncing it away.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -7018,14 +7501,14 @@ fn test_home_without_write_syncs_at_completion() {
 }
 
 #[test]
-fn test_val_written_during_jog_replays_on_sudden_stop() {
-    // C 1357-1364 + 1383-1397: the controller stopped the jog on its own
-    // (mip collapses to DONE), so the replay gate passes and the VAL
-    // written during the jog re-fires.
+fn test_val_written_during_jog_stops_it_and_is_dropped() {
+    // C 2148-2156: the put stops the jog (MIP_JOG_STOP), and 1385-1386
+    // exclude a jog stop from the replay, so the written VAL is synced
+    // away at the stop completion.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     rec.stat.msta = MstaFlags::MOVING;
@@ -7033,18 +7516,18 @@ fn test_val_written_during_jog_replays_on_sudden_stop() {
 
     rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
-    assert!(effects.commands.is_empty(), "no dispatch while jogging");
+    assert_eq!(effects.commands, [MotorCommand::stop_axis()]);
 
-    // Driver reports done without a commanded stop.
     let effects = complete_stop_at(&mut rec, 30.0);
     assert!(
-        effects.commands.iter().any(|c| matches!(
-            c,
-            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
-        )),
-        "sudden jog stop replays the overtaken target"
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        effects.commands
     );
-    assert_eq!(rec.pos.val, 80.0);
+    assert_eq!(rec.pos.val, 30.0);
 }
 
 #[test]
@@ -7054,7 +7537,7 @@ fn test_val_written_during_jog_dropped_on_commanded_stop() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
@@ -7089,7 +7572,7 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     // Keep the replayed move single-leg (C case 1 needs BVEL == VELO
     // AND BACC == ACCL) so the replay assertion sees the target itself.
     rec.vel.bacc = rec.vel.accl;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
@@ -7103,7 +7586,8 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
 
-    // VAL written during the backlash: ignored by the dispatcher.
+    // VAL written during the backlash: C 2160-2161 return before the
+    // VAL collection, leaving val != lval for the BL2-done replay.
     rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
     assert!(effects.commands.is_empty());
@@ -7168,7 +7652,7 @@ fn jogging_record() -> MotorRecord {
     // JVEL has no dbd initial (defaults 0.0 = "not configured"); set it
     // as a .db would — the LVIO jog window tests depend on JVEL=1.
     rec.vel.jvel = 1.0;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     rec.stat.msta = MstaFlags::MOVING;
@@ -7229,7 +7713,7 @@ fn test_jog_away_from_limit_does_not_stop() {
     rec.pos.drbv = 95.0;
     rec.pos.val = 95.0;
     rec.pos.dval = 95.0;
-    rec.ctrl.jogr = true;
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogr);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     rec.stat.msta = MstaFlags::MOVING;
@@ -7485,7 +7969,7 @@ fn test_sudden_jog_stop_skips_backlash() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     rec.stat.msta = MstaFlags::MOVING;
@@ -7513,7 +7997,7 @@ fn test_commanded_jog_stop_still_corrects_backlash() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
@@ -7601,8 +8085,9 @@ fn test_hlm_put_while_idle_does_not_stop() {
 // === MIP_JOG_REQ lifecycle and queued/resumed MIP readback ===
 // C special() 3042-3054 (arm/clear), do_work 2082 (park across
 // stop_or_pause), 2106/2111 (wholesale consume, queued = JOGF|STOP),
-// 2023/2028 (queued home = HOMF|STOP), postProcess 866 (resume keeps
-// the direction bit), top block 1901-1922 (wholesale STOP / Go re-arm).
+// 2023/2028 (queued home = HOMF|STOP), postProcess 866 (the home
+// re-fire keeps its direction bit), top block 1901-1922 (wholesale STOP /
+// Go re-arm).
 
 /// Settle an idle record into SPMG=Pause: the Pause transition parks
 /// mip = MIP_STOP (C 1902-1907); the stop completion collapses it back
@@ -7707,60 +8192,6 @@ fn test_jogf_release_while_idle_is_noop() {
 }
 
 #[test]
-fn test_queued_jog_resumes_with_jogf_mip_and_live_lvio() {
-    let mut rec = MotorRecord::new();
-    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
-    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
-    // JVEL has no dbd initial (defaults 0.0); the LVIO window below
-    // (rbv > hlm - jvel) needs a configured JVEL=1.
-    rec.vel.jvel = 1.0;
-    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
-    rec.plan_motion(CommandSource::Val);
-    rec.stat.msta = MstaFlags::MOVING;
-    rec.stat.movn = true;
-
-    // JOGF mid-move: stop first, queue the jog — readback JOGF|STOP
-    // (C 2106 wholesale + 2111 `mip |= MIP_STOP`).
-    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Jogf);
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::Stop { .. }))
-    );
-    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
-
-    // Stop completes: the resume drops STOP and keeps the direction bit
-    // (C postProcess 866 `mip &= ~MIP_STOP`).
-    let effects = complete_stop_at(&mut rec, 30.0);
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. }))
-    );
-    assert_eq!(rec.stat.mip, MipFlags::JOGF, "resumed jog visible in MIP");
-    assert_eq!(rec.stat.phase, MotionPhase::Jog);
-
-    // Regression: the resumed jog must satisfy the live-RBV LVIO
-    // recompute (C 1466-1468), which keys on the MIP jog bits — with the
-    // old empty MIP the jog would coast through the soft-limit window.
-    rec.stat.msta = MstaFlags::MOVING;
-    rec.stat.movn = true;
-    let effects = poll_moving_at(&mut rec, 99.5);
-    assert!(rec.limits.lvio, "rbv > hlm - jvel raises LVIO");
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::Stop { .. })),
-        "rising LVIO stops the resumed jog"
-    );
-    assert!(!rec.ctrl.jogf, "buttons released (C 1481 clear_buttons)");
-}
-
-#[test]
 fn test_queued_home_resumes_with_homf_mip() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -7800,13 +8231,10 @@ fn test_jogf_release_cancels_queued_jog() {
     rec.plan_motion(CommandSource::Val);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
-    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
-    rec.plan_motion(CommandSource::Jogf);
-    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+    queue_jog_behind_pause_stop(&mut rec);
 
     rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
-    assert!(rec.internal.queued_motion.is_none(), "queued jog cancelled");
     assert_eq!(rec.stat.mip, MipFlags::STOP | MipFlags::JOG_STOP);
 
     let effects = complete_stop_at(&mut rec, 30.0);
@@ -7823,10 +8251,8 @@ fn test_jogf_release_cancels_queued_jog() {
 #[test]
 fn test_bare_release_kills_queued_jog_at_resume() {
     // A release that lands only in the button state (overtaken in
-    // last_write, never processed as Jogf) must still kill the queued
-    // jog at the resume point — C kills it on the release pass itself
-    // (2148-2155), so a resurrected jog with no held button has no C
-    // counterpart.
+    // last_write, never processed as Jogf): C re-fires no jog at the stop
+    // completion (postProcess re-fires only a home), held or not.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
@@ -7834,9 +8260,7 @@ fn test_bare_release_kills_queued_jog_at_resume() {
     rec.plan_motion(CommandSource::Val);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
-    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
-    rec.plan_motion(CommandSource::Jogf);
-    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+    queue_jog_behind_pause_stop(&mut rec);
 
     rec.ctrl.jogf = false; // bare release, no process pass
     let effects = complete_stop_at(&mut rec, 30.0);
@@ -7863,7 +8287,7 @@ fn test_go_with_jog_button_at_limit_switch_collapses_stop() {
     rec.plan_motion(CommandSource::Spmg);
     assert_eq!(rec.stat.mip, MipFlags::STOP);
 
-    rec.ctrl.jogf = true; // latched during the pause
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap(); // latched during the pause
     rec.limits.hls = true;
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -7887,7 +8311,7 @@ fn test_jog_direction_folds_dir_into_dial_command() {
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     let dial_dir = effects.commands.iter().find_map(|c| match c {
         MotorCommand::MoveVelocity { velocity, .. } => Some(*velocity > 0.0),
@@ -7899,43 +8323,6 @@ fn test_jog_direction_folds_dir_into_dial_command() {
         "JOGF with DIR=Neg commands dial-negative (C 2119 jvel*dir)"
     );
     assert!(!rec.stat.cdir, "CDIR raw-frame: jogf ^ DIR=Neg ^ MRES>0");
-}
-
-#[test]
-fn test_queued_jog_replay_folds_dir_and_updates_cdir() {
-    // The queued-jog replay re-enters the C jog section (2117-2144) on
-    // re-fire, re-deriving the commanded direction and CDIR — the
-    // replay must match a fresh dispatch on a DIR=Neg axis.
-    let mut rec = MotorRecord::new();
-    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
-    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
-    rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
-    // Start a move, then press JOGF mid-move: queues Jog + STOP.
-    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
-    rec.plan_motion(CommandSource::Val);
-    rec.stat.msta = MstaFlags::MOVING;
-    rec.stat.movn = true;
-    rec.ctrl.jogf = true;
-    rec.plan_motion(CommandSource::Jogf);
-    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
-
-    // Stop completes → queued jog replays.
-    rec.stat.msta = MstaFlags::DONE;
-    rec.stat.movn = false;
-    let effects = rec.check_completion();
-    let dial_dir = effects.commands.iter().find_map(|c| match c {
-        MotorCommand::MoveVelocity { velocity, .. } => Some(*velocity > 0.0),
-        _ => None,
-    });
-    assert_eq!(
-        dial_dir,
-        Some(false),
-        "queued JOGF replay on DIR=Neg commands dial-negative"
-    );
-    assert!(
-        !rec.stat.cdir,
-        "replay refreshes CDIR like C's re-entered jog section"
-    );
 }
 
 #[test]
@@ -8024,9 +8411,7 @@ fn test_spmg_move_during_deceleration_abandons_queued_jog_and_resumes() {
     rec.plan_motion(CommandSource::Val);
     rec.stat.msta = MstaFlags::MOVING;
     rec.stat.movn = true;
-    rec.ctrl.jogf = true;
-    rec.plan_motion(CommandSource::Jogf);
-    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+    queue_jog_behind_pause_stop(&mut rec);
 
     rec.ctrl.spmg = SpmgMode::Move;
     let effects = rec.plan_motion(CommandSource::Spmg);
@@ -8828,10 +9213,10 @@ mod jvel_live_retune {
         rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
         rec.init_record(1).unwrap(); // JVEL <- VELO = 1.0
         if forward {
-            rec.ctrl.jogf = true;
+            rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
             rec.plan_motion(CommandSource::Jogf);
         } else {
-            rec.ctrl.jogr = true;
+            rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
             rec.plan_motion(CommandSource::Jogr);
         }
         assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -9178,6 +9563,7 @@ mod miss_semantics {
         rec.conv.mres = 0.001;
         rec.retry.rdbd = 0.1;
         rec.pos.dval = 10.0;
+        rec.internal.ldvl = 10.0; // the dispatched target
         rec.pos.drbv = 9.5; // diff = 0.5 >= rdbd
     }
 
@@ -9445,7 +9831,7 @@ fn test_jog_with_inverted_limits_is_rejected() {
     rec.limits.llm = 5.0;
     rec.vel.jvel = 1.0;
     rec.pos.val = 0.0;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(
         !effects
@@ -9471,7 +9857,7 @@ fn test_jog_limit_disable_gate_is_dial_frame() {
     rec.limits.llm = 3.0;
     rec.vel.jvel = 1.0;
     rec.pos.val = 50.0;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(
         effects
@@ -9493,8 +9879,8 @@ fn test_jog_refusal_clears_both_buttons() {
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
     rec.pos.val = 9.5;
-    rec.ctrl.jogf = true;
-    rec.ctrl.jogr = true; // both held (e.g. racing writes)
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap(); // both held (e.g. racing writes)
     rec.plan_motion(CommandSource::Jogf);
     assert!(rec.limits.lvio);
     assert!(!rec.ctrl.jogf, "JOGF released");
@@ -9803,6 +10189,30 @@ fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
     );
 }
 
+/// C 2204: the SET Variable redefinition is the VAL collection's, gated
+/// on `val != lval`, so an unblinked zero fold redefines nothing and the
+/// pass ends at the chain end like a non-SET one.
+#[test]
+fn test_set_variable_zero_tweak_falls_to_chain_end() {
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.mres = 0.001;
+    rec.conv.set = true;
+    rec.conv.foff = FreezeOffset::Variable;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 10.0;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.ctrl.twv = 0.0;
+    rec.ctrl.twf = true;
+
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(sends_get_info(&effects), "{:?}", effects.commands);
+    assert!(!rec.ctrl.twf);
+}
+
 #[test]
 fn test_blinked_zero_tweak_pulses_dmov() {
     // A dbPut to TWF is preceded by the special() pass-0 blink
@@ -10004,7 +10414,7 @@ fn test_driver_sees_raw_steps_at_negative_mres() {
     assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Long(-38)));
     assert!(rec.stat.dmov);
 
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert_eq!(
         effects.commands,
@@ -10080,4 +10490,446 @@ fn test_ls_bits_on_the_first_poll_off_the_limit_do_not_end_the_move() {
     rec.do_process();
     assert!(rec.stat.dmov, "the stop ends the move");
     assert_eq!(rec.pos.val, -10.0);
+}
+
+#[test]
+fn test_val_put_during_external_motion_parks_until_done() {
+    // A home cut short by a done status (link's ACR comm loss) leaves
+    // the axis homing on its own: C marks MIP_EXTERNAL when MOVN returns
+    // (motorRecord.cc:1314-1320), and do_work dispatches a move only at
+    // `mip == MIP_DONE || mip == MIP_RETRY` (2457), so a VAL put sends
+    // nothing. pp, armed with MIP_EXTERNAL, replays the parked VAL when
+    // the axis stops (1382-1397).
+    use asyn_rs::interfaces::motor::MotorStatus;
+    use motor_rs::device_state::StampedStatus;
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.vel.velo = 1.0;
+    rec.vel.hvel = 0.01;
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    let state = motor_rs::device_state::new_shared_state();
+    rec.set_device_state(state.clone());
+    anchor(&mut rec, &state);
+    let status = |seq, moving: bool, position: f64| {
+        state.lock().unwrap().latest_status = Some(StampedStatus {
+            seq,
+            status: MotorStatus {
+                done: !moving,
+                moving,
+                position,
+                ..MotorStatus::default()
+            },
+        });
+    };
+    let pass = |rec: &mut MotorRecord| -> Vec<MotorCommand> {
+        rec.process().unwrap();
+        state
+            .lock()
+            .unwrap()
+            .pending_actions
+            .take()
+            .map(|a| a.commands)
+            .unwrap_or_default()
+    };
+    pass(&mut rec);
+
+    rec.put_field("HOMR", EpicsValue::Short(1)).unwrap();
+    pass(&mut rec);
+    status(2, true, 0.95);
+    pass(&mut rec);
+    assert!(rec.stat.mip.contains(MipFlags::HOMR));
+    status(3, false, 0.9);
+    pass(&mut rec);
+    assert!(rec.stat.dmov, "the done status ends the home");
+    assert!(rec.stat.mip.is_empty());
+
+    status(4, true, 0.8);
+    pass(&mut rec);
+    assert_eq!(rec.stat.mip, MipFlags::EXTERNAL);
+    assert!(!rec.stat.dmov);
+
+    rec.put_field("VAL", EpicsValue::Double(0.5)).unwrap();
+    assert_eq!(pass(&mut rec), [], "no move while the axis homes");
+    assert_eq!(rec.pos.val, 0.5);
+
+    status(5, false, 0.0);
+    let commands = pass(&mut rec);
+    assert!(
+        commands.iter().any(
+            |c| matches!(c, MotorCommand::MoveAbsolute { position, .. } if *position == 500.0)
+        ),
+        "the parked VAL dispatches when the axis stops: {commands:?}"
+    );
+}
+
+/// A jogf released into its backlash, with BL2 in flight.
+fn jog_backlash_bl2() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.retry.bdst = 2.0;
+    rec.vel.bacc = rec.vel.accl;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+    complete_stop_at(&mut rec, 30.0);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    let e = complete_stop_at(&mut rec, 28.0);
+    assert!(!e.commands.is_empty(), "BL2 dispatched");
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec
+}
+
+/// C 2160-2161: a put during jog backlash returns before the VAL
+/// collection, so a VAL at the readback is still val != lval at BL2 done
+/// and the replay (1384-1397) moves to it from where BL2 ended — a
+/// negative move, so its first leg goes to bpos = dval - bdst = 26.
+#[test]
+fn test_jog_backlash_put_at_readback_replays_at_bl2_done() {
+    let mut rec = jog_backlash_bl2();
+    rec.put_field("VAL", EpicsValue::Double(28.0)).unwrap();
+    let e = rec.plan_motion(CommandSource::Val);
+    assert_eq!(e.commands, [], "put during BL2");
+    let e = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        e.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 26.0).abs() < 1e-9
+        )),
+        "C replays toward 28 via bpos 26: {:?}",
+        e.commands
+    );
+}
+
+/// C 2148-2156: a put while jogging (mip = MIP_JOGF, JOG_REQ cleared at
+/// 2106) takes the stop-jogging branch: STOP_AXIS, MIP_JOG_STOP, and no
+/// VAL collection.
+#[test]
+fn test_put_during_jog_stops_the_jog() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let e = rec.plan_motion(CommandSource::Val);
+    assert_eq!(e.commands, [MotorCommand::stop_axis()]);
+    assert!(
+        rec.stat.mip.contains(MipFlags::JOG_STOP),
+        "{:?}",
+        rec.stat.mip
+    );
+    assert!(!rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR));
+}
+
+/// C 2148-2156 on a jog queued behind a stop (mip = JOGF|STOP): a put
+/// drops the queued jog and re-sends STOP_AXIS.
+#[test]
+fn test_put_during_queued_jog_cancels_it() {
+    let mut rec = moving_to_50(0);
+    rec.put_field("DHLM", EpicsValue::Double(1000.0)).unwrap();
+    queue_jog_behind_pause_stop(&mut rec);
+    rec.pos.val = 20.0;
+    rec.pos.dval = 20.0;
+    let e = rec.plan_motion(CommandSource::Val);
+    assert_eq!(e.commands, [MotorCommand::stop_axis()]);
+    rec.process_motor_info(&status_at(2600.0, false));
+    let e = rec.check_completion();
+    assert!(
+        !e.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity { .. } | MotorCommand::MoveAbsolute { .. }
+        )),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// Decided: a user STOP is not overridden (C 1874-1888 defect). A home
+/// queued behind a stop (mip = HOMF|STOP, pp TRUE, C 2028-2035) is the
+/// same C branch, where postProcess (854-889) would start the home when
+/// the axis stops.
+#[test]
+fn test_stop_during_queued_home_does_not_home() {
+    let mut rec = moving_to_50(0);
+    rec.ctrl.homf = true;
+    let _ = rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF | MipFlags::STOP));
+    rec.ctrl.stop = true;
+    let e = rec.plan_motion(CommandSource::Stop);
+    assert_eq!(e.commands, [MotorCommand::stop_axis()]);
+    rec.process_motor_info(&status_at(2600.0, false));
+    let e = rec.check_completion();
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "{:?}",
+        e.commands
+    );
+    assert!(!rec.ctrl.homf);
+}
+
+/// C 1874-1888 for a jog started while moving (mip = JOGF|STOP, pp
+/// TRUE): STOP_AXIS only, the button stays latched and nothing jogs.
+#[test]
+fn test_stop_during_queued_jog_does_not_jog() {
+    let mut rec = moving_to_50(0);
+    rec.put_field("DHLM", EpicsValue::Double(1000.0)).unwrap();
+    queue_jog_behind_pause_stop(&mut rec);
+    assert!(rec.stat.mip.contains(MipFlags::JOGF | MipFlags::STOP));
+    rec.ctrl.stop = true;
+    let e = rec.plan_motion(CommandSource::Stop);
+    assert_eq!(e.commands, [MotorCommand::stop_axis()]);
+    rec.process_motor_info(&status_at(2600.0, false));
+    let e = rec.check_completion();
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        e.commands
+    );
+    assert!(rec.ctrl.jogf);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+fn jogging() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    assert!(rec.stat.mip.contains(MipFlags::JOGF));
+    rec
+}
+
+fn stops(e: &ProcessEffects) -> bool {
+    e.commands
+        .iter()
+        .any(|c| matches!(c, MotorCommand::Stop { .. }))
+}
+
+/// C 2148-2156 runs on every non-callback do_work pass, so a pp(TRUE)
+/// put that is not a position (SYNC, CNEN, SET, a same-value SPMG)
+/// also stops a jog.
+#[test]
+fn test_housekeeping_put_during_jog_stops_it() {
+    for src in [
+        CommandSource::Sync,
+        CommandSource::Cnen,
+        CommandSource::Spmg,
+        CommandSource::Set,
+    ] {
+        let mut rec = jogging();
+        let e = rec.plan_motion(src);
+        assert!(stops(&e), "{src:?}: {:?}", e.commands);
+        assert!(rec.stat.mip.contains(MipFlags::JOG_STOP), "{src:?}");
+    }
+}
+
+/// The sourceless pass a pp(TRUE) HLM/OFF/DIR put or a PROC triggers.
+#[test]
+fn test_sourceless_put_pass_during_jog_stops_it() {
+    let mut rec = jogging();
+    let e = rec.do_process();
+    assert!(stops(&e), "{:?}", e.commands);
+    assert!(rec.stat.mip.contains(MipFlags::JOG_STOP));
+}
+
+/// C special 3042-3046: a JOGF press arms MIP_JOG_REQ only when mip ==
+/// MIP_DONE, so a press during a move is inert: the move completes and
+/// no jog starts.
+#[test]
+fn test_jog_press_during_a_move_is_inert() {
+    let mut rec = moving_to_50(0);
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let e = rec.plan_motion(CommandSource::Jogf);
+    assert!(!stops(&e), "{:?}", e.commands);
+    rec.process_motor_info(&status_at(5000.0, false));
+    let e = rec.check_completion();
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// C: a JOGR put during a JOGF jog arms nothing (special 3049-3054 needs
+/// mip == MIP_DONE); do_work 2148 stops the jog as MIP_JOG_STOP and the
+/// record goes idle. No reverse jog follows.
+#[test]
+fn test_opposite_press_during_jog_only_stops() {
+    let mut rec = jogging();
+    rec.put_field("JOGR", EpicsValue::Short(1)).unwrap();
+    let e = rec.plan_motion(CommandSource::Jogr);
+    assert!(stops(&e), "{:?}", e.commands);
+    assert_eq!(rec.stat.mip, MipFlags::JOG_STOP);
+    let e = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// A second JOGF=1 put while the jog runs: special arms nothing (mip !=
+/// DONE) and do_work 2148 stops the jog.
+#[test]
+fn test_jog_re_press_during_jog_stops_it() {
+    let mut rec = jogging();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let e = rec.plan_motion(CommandSource::Jogf);
+    assert!(stops(&e), "{:?}", e.commands);
+    assert!(rec.stat.mip.contains(MipFlags::JOG_STOP));
+}
+
+/// A JOGF press during a move is inert (C special 3042-3046 arms
+/// MIP_JOG_REQ only at MIP_DONE). The C route to a jog queued behind a
+/// stop (2106-2111) is Pause, then Go while the axis still decelerates:
+/// 1914-1918 re-arms the request from the held button.
+fn queue_jog_behind_pause_stop(rec: &mut MotorRecord) -> ProcessEffects {
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+    effects
+}
+
+/// A released jog queued behind a stop leaves mip = STOP|JOG_STOP (C
+/// 2153-2154); postProcess syncs and then takes the JOG_STOP branch
+/// (906-958), which runs the jog backlash when |BDST| >= |MRES|. The
+/// queue comes from Pause/Go (a press during the move arms nothing).
+#[test]
+fn test_released_queued_jog_still_corrects_backlash() {
+    let mut rec = moving_to_50(0);
+    rec.put_field("DHLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.retry.bdst = 2.0;
+    queue_jog_behind_pause_stop(&mut rec);
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.mip, MipFlags::STOP | MipFlags::JOG_STOP);
+    rec.process_motor_info(&status_at(3000.0, false));
+    let e = rec.check_completion();
+    assert!(
+        e.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 2800.0).abs() < 1e-9
+        )),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// C returns at 2156 before the VAL->DVAL propagation (2200), and the
+/// JOG_STOP postProcess syncs DVAL to DRBV (827-849) before computing
+/// the jog backlash target from it (911-918): BL1 goes to drbv - bdst.
+#[test]
+fn test_val_put_during_jog_does_not_steer_the_jog_backlash() {
+    let mut rec = jogging();
+    rec.retry.bdst = 2.0;
+    let (dval, rval) = (rec.pos.dval, rec.pos.rval);
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let e = rec.plan_motion(CommandSource::Val);
+    assert!(stops(&e), "{:?}", e.commands);
+    assert_eq!(
+        (rec.pos.val, rec.pos.dval, rec.pos.rval),
+        (80.0, dval, rval)
+    );
+    let e = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        e.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 28.0).abs() < 1e-9
+        )),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// C 1427-1430: BL2 done leaves mip = MIP_JOG_BL2, so maybeRetry runs
+/// against `dval - drbv` and a miss past RDBD retries.
+#[test]
+fn test_jog_backlash_bl2_miss_retries() {
+    let mut rec = jog_backlash_bl2();
+    rec.retry.rtry = 3;
+    let e = complete_stop_at(&mut rec, 25.0);
+    assert!(
+        e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        e.commands
+    );
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+/// A DVAL put during the jog backlash stays raw (C 2161); at BL2 done
+/// maybeRetry finds |dval - drbv| >= RDBD and retries toward it.
+#[test]
+fn test_dval_put_during_jog_backlash_rtry3_retries_to_it() {
+    let mut rec = jog_backlash_bl2();
+    rec.retry.rtry = 3;
+    rec.put_field("DVAL", EpicsValue::Double(10.0)).unwrap();
+    let _ = rec.plan_motion(CommandSource::Dval);
+    let e = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        e.commands
+    );
+}
+
+/// A SET-mode VAL put during a jog is consumed by C's jog-stop section
+/// (2148-2156), which returns before the VAL collection (2204): DVAL
+/// never follows it.
+#[test]
+fn test_set_mode_val_put_during_jog_keeps_dval() {
+    let mut rec = jogging();
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.put_field("FOFF", EpicsValue::Short(1)).unwrap();
+    let dval = rec.pos.dval;
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let e = rec.plan_motion(CommandSource::Set);
+    assert!(stops(&e), "{:?}", e.commands);
+    assert_eq!(rec.pos.dval, dval);
+}
+
+/// C: a DVAL put during the jog backlash returns at 2161 with VAL
+/// untouched, so BL2 completion has `val == lval` (no 1385 replay) and
+/// with RTRY = 0 maybeRetry ends the motion where it is.
+#[test]
+fn test_dval_put_during_jog_backlash_rtry0_does_not_move() {
+    let mut rec = jog_backlash_bl2();
+    rec.retry.rtry = 0;
+    rec.put_field("DVAL", EpicsValue::Double(10.0)).unwrap();
+    let e = rec.plan_motion(CommandSource::Dval);
+    assert_eq!(e.commands, [], "put during BL2");
+    let e = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !e.commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        e.commands
+    );
 }

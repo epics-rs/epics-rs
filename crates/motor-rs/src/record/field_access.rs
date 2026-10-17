@@ -184,52 +184,27 @@ pub(crate) fn motor_put_field(
     value: EpicsValue,
 ) -> CaResult<()> {
     match name {
-        // Position writes -- cascade and set command source
+        // Position writes store the field raw, like C's special() (2595-2607,
+        // a DMOV blink only); the do_work collection (2187-2235) and the
+        // move block (2300-2305) derive the rest. A put that the jog-stop
+        // section consumes therefore never cascades.
         "VAL" => {
             let v = match value {
                 EpicsValue::Double(v) => v,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            if rec.conv.set && !rec.conv.igset {
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // The cycle's collection redefines the offset (C
-                    // 2206-2227), after special()'s DMOV blink posted.
-                    rec.pos.val = v;
-                    rec.last_write = Some(CommandSource::Val);
-                } else {
-                    // #231: LOAD_POS blocked — refuse the Frozen-leg
-                    // redefinition, which needs the controller write
-                    // (C load_pos sends LOAD_POS unconditionally, 3811),
-                    // so DVAL/OFF stay consistent with the controller.
-                    if rec.conv.loadpos_blocked {
-                        return Ok(());
-                    }
-                    // SET+FOFF=Frozen: cascade VAL->DVAL normally, then SetPosition
-                    // C: dval = (val - off) / dir, then load_pos(dval/mres)
-                    let dval = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
-                    if let Ok(rval) = coordinate::dial_to_raw(dval, rec.conv.mres) {
-                        rec.pos.val = v;
-                        rec.pos.dval = dval;
-                        rec.pos.rval = rval;
-                    }
-                    rec.last_write = Some(CommandSource::Set);
+            if rec.conv.set && !rec.conv.igset && rec.conv.foff == FreezeOffset::Frozen {
+                // #231: LOAD_POS blocked — refuse the Frozen-leg
+                // redefinition, which needs the controller write
+                // (C load_pos sends LOAD_POS unconditionally, 3811),
+                // so DVAL/OFF stay consistent with the controller.
+                if rec.conv.loadpos_blocked {
+                    return Ok(());
                 }
+                rec.pos.val = v;
+                rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move (not in SET mode)
-                if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.dval,
-                ) {
-                    rec.pos.val = v;
-                    rec.pos.dval = dval;
-                    rec.pos.rval = rval;
-                    rec.pos.off = off;
-                }
+                rec.pos.val = v;
                 rec.last_write = Some(CommandSource::Val);
             }
             Ok(())
@@ -244,50 +219,10 @@ pub(crate) fn motor_put_field(
                 if rec.conv.loadpos_blocked {
                     return Ok(());
                 }
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // SET+FOFF=Variable: recalculate offset, signal SetPosition
-                    if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                        v,
-                        rec.conv.dir,
-                        rec.pos.off,
-                        rec.conv.foff,
-                        rec.conv.mres,
-                        true,
-                        rec.pos.val,
-                    ) {
-                        rec.pos.dval = v;
-                        rec.pos.val = val;
-                        rec.pos.rval = rval;
-                        rec.pos.off = off;
-                        // C load_pos Variable leg (motorRecord.cc:3800):
-                        // the recomputed offset retranslates user limits.
-                        rec.set_userlimits();
-                    }
-                } else {
-                    // SET+FOFF=Frozen: DVAL changes directly, SetPosition
-                    if let Ok(rval) = coordinate::dial_to_raw(v, rec.conv.mres) {
-                        rec.pos.dval = v;
-                        rec.pos.val = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
-                        rec.pos.rval = rval;
-                    }
-                }
+                rec.pos.dval = v;
                 rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move
-                if let Ok((val, rval, off)) = coordinate::cascade_from_dval(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.val,
-                ) {
-                    rec.pos.dval = v;
-                    rec.pos.val = val;
-                    rec.pos.rval = rval;
-                    rec.pos.off = off;
-                }
+                rec.pos.dval = v;
                 rec.last_write = Some(CommandSource::Dval);
             }
             Ok(())
@@ -311,62 +246,18 @@ pub(crate) fn motor_put_field(
                 },
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
-            // C special() has no RVAL cascade — the RVAL->DVAL
-            // propagation lives in the do_work collection block
-            // (2196-2197), inside the else that closed-loop OMSL with a
-            // DB-link DOL bypasses (1994). Under that gate a put is a raw
-            // struct write that stays inert (both move and SET-mode
-            // redefinition) until OMSL leaves closed loop.
-            if rec.closed_loop_dol_collection() {
-                rec.pos.rval = v;
-                rec.last_write = Some(CommandSource::Rval);
-                return Ok(());
-            }
-            if rec.conv.set && !rec.conv.igset {
+            // Under closed-loop OMSL with a DB-link DOL the collection
+            // never reads RVAL (1994): the put stays inert, and is not a
+            // SET-mode redefinition either.
+            if rec.conv.set && !rec.conv.igset && !rec.closed_loop_dol_collection() {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {
                     return Ok(());
                 }
-                if rec.conv.foff == FreezeOffset::Variable {
-                    // SET+FOFF=Variable: recalculate offset, signal SetPosition
-                    let (val, dval, off) = coordinate::cascade_from_rval(
-                        v,
-                        rec.conv.dir,
-                        rec.pos.off,
-                        rec.conv.foff,
-                        rec.conv.mres,
-                        true,
-                        rec.pos.val,
-                    );
-                    rec.pos.rval = v;
-                    rec.pos.val = val;
-                    rec.pos.dval = dval;
-                    rec.pos.off = off;
-                    // C load_pos Variable leg (motorRecord.cc:3800).
-                    rec.set_userlimits();
-                } else {
-                    // SET+FOFF=Frozen: RVAL->DVAL directly, SetPosition
-                    let dval = coordinate::raw_to_dial(v, rec.conv.mres);
-                    rec.pos.rval = v;
-                    rec.pos.dval = dval;
-                    rec.pos.val = coordinate::dial_to_user(dval, rec.conv.dir, rec.pos.off);
-                }
+                rec.pos.rval = v;
                 rec.last_write = Some(CommandSource::Set);
             } else {
-                // Normal move
-                let (val, dval, off) = coordinate::cascade_from_rval(
-                    v,
-                    rec.conv.dir,
-                    rec.pos.off,
-                    rec.conv.foff,
-                    rec.conv.mres,
-                    false,
-                    rec.pos.val,
-                );
                 rec.pos.rval = v;
-                rec.pos.val = val;
-                rec.pos.dval = dval;
-                rec.pos.off = off;
                 rec.last_write = Some(CommandSource::Rval);
             }
             Ok(())
@@ -1284,6 +1175,13 @@ pub(crate) fn motor_put_field(
         "CNEN" => match value {
             EpicsValue::Short(v) => {
                 rec.ctrl.cnen = v != 0;
+                // C special() CNEN (3029-3040): the torque command goes
+                // out when the put lands, whatever the pass then does.
+                if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    rec.send_special(vec![MotorCommand::SetClosedLoop {
+                        enable: rec.ctrl.cnen,
+                    }]);
+                }
                 rec.last_write = Some(CommandSource::Cnen);
                 Ok(())
             }

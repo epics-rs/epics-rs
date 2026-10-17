@@ -299,8 +299,8 @@ fn stop_during_move_clears_pending_motion() {
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
     // C parity: no eager VAL<-RBV sync at stop-put time; the sync runs
     // once the axis has actually stopped (postProcess). VAL still holds
-    // its pre-stop value (never written in this scenario).
-    assert_eq!(rec.pos.val, 0.0);
+    // the target the move block derived from DVAL (2300).
+    assert_eq!(rec.pos.val, 50.0);
 
     complete_move(&mut rec, 25.0);
     let _ = rec.check_completion();
@@ -314,7 +314,7 @@ fn jog_start_stop_backlash_sequence() {
     rec.retry.bdst = 1.0;
 
     // Start jog forward
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -488,14 +488,13 @@ fn ntm_retargets_while_in_motion() {
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
     assert!(rec.stat.cdir); // positive direction
 
-    // New target: 80 (same direction, farther)
-    assert_eq!(rec.handle_retarget(80.0), RetargetAction::ExtendMove);
-
-    // New target: -10 (opposite direction, beyond deadband)
-    assert_eq!(rec.handle_retarget(-10.0), RetargetAction::StopAndReplan);
-
-    // New target: 30 (same direction, closer) -> ExtendMove (same dir in C)
-    assert_eq!(rec.handle_retarget(30.0), RetargetAction::ExtendMove);
+    // Every new target parks at the put, opposite direction included:
+    // the NTM stop belongs to the next moving callback.
+    for target in [80.0, -10.0, 30.0] {
+        rec.pos.val = target;
+        rec.pos.dval = target;
+        assert_eq!(rec.plan_motion(CommandSource::Val).commands, [], "{target}");
+    }
 }
 
 #[test]
@@ -524,10 +523,12 @@ fn frozen_offset_non_set_cascades_normally() {
     let mut rec = make_record();
     rec.conv.foff = FreezeOffset::Frozen;
     rec.pos.val = 10.0;
+    rec.internal.lval = 10.0;
     rec.pos.off = 5.0;
 
     // C: FOFF has no effect in non-SET mode -- VAL recalculated, OFF unchanged
     rec.put_field("DVAL", EpicsValue::Double(20.0)).unwrap();
+    rec.plan_motion(CommandSource::Dval);
 
     assert_eq!(rec.pos.val, 25.0); // dial_to_user(20.0, Pos, 5.0)
     assert_eq!(rec.pos.dval, 20.0);
@@ -1275,7 +1276,7 @@ fn dir_neg_swaps_limit_mapping() {
 }
 
 #[test]
-fn new_target_opposite_direction_stops_immediately() {
+fn new_target_opposite_direction_stops_at_the_next_callback() {
     let mut rec = make_record();
     rec.timing.ntm = true;
 
@@ -1285,9 +1286,14 @@ fn new_target_opposite_direction_stops_immediately() {
     rec.internal.ldvl = 50.0;
     motor_moving(&mut rec, 25.0);
 
-    // Target in opposite direction
-    let action = rec.handle_retarget(-20.0);
-    assert_eq!(action, RetargetAction::StopAndReplan);
+    // Target in opposite direction: parked at the put, stopped by the
+    // next moving callback (C 1326-1341).
+    rec.pos.dval = -20.0;
+    rec.pos.val = -20.0;
+    assert_eq!(rec.plan_motion(CommandSource::Val).commands, []);
+    motor_moving(&mut rec, 25.5);
+    let effects = rec.check_completion();
+    assert!(matches!(effects.commands[..], [MotorCommand::Stop { .. }]));
 }
 
 #[test]
@@ -1779,7 +1785,7 @@ fn give_up_refires_held_jogf_same_pass() {
     arm_give_up(&mut rec);
 
     // Operator holds JOGF during the move; SPMG stays Go (default).
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     // Second short completion: rcnt(1) >= rtry(1) -> give up.
     complete_move(&mut rec, 9.5);
@@ -1847,8 +1853,11 @@ fn give_up_no_button_finalizes_quietly() {
     );
 }
 
+/// C special() arms MIP_JOG_REQ only at mip == MIP_DONE (3042-3046): a
+/// JOGF held through a positional move is never armed, so neither the
+/// completion pass nor a later idle poll starts the jog.
 #[test]
-fn close_enough_defers_held_jog_to_next_idle_poll() {
+fn close_enough_strands_a_jog_pressed_during_the_move() {
     let mut rec = make_record();
     rec.retry.rdbd = 0.5;
     rec.retry.rtry = 3;
@@ -1856,9 +1865,8 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
     rec.plan_motion(CommandSource::Val);
 
     // Operator holds JOGF during the move; SPMG stays Go.
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
-    // Close-enough completion (within rdbd): C drops the jog this pass.
     complete_move(&mut rec, 10.0);
     let effects = rec.check_completion();
     assert!(rec.stat.dmov);
@@ -1868,30 +1876,23 @@ fn close_enough_defers_held_jog_to_next_idle_poll() {
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
-        "close-enough must NOT re-fire the jog in the completion pass, got {:?}",
+        "{:?}",
         effects.commands
     );
-    // ...but it MUST request the forced poll that delivers the resume pass —
-    // otherwise the change-gate suppresses the unchanged settle poll and the
-    // held jog strands. (This is the unit-level guard of the R65 fix; the
-    // second check_completion below only proves the resume given a pass.)
-    assert!(
-        effects.request_poll,
-        "completion with a held jog must request the forced settle poll"
-    );
+    assert!(!effects.request_poll, "no armed request to resume");
 
-    // The next idle poll (level-triggered) re-fires the held jog.
     complete_move(&mut rec, 10.0);
     let effects = rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(
-        effects.commands.iter().any(|c| matches!(
-            c,
-            MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
-        )),
-        "idle poll must resume the held jog, got {:?}",
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "{:?}",
         effects.commands
     );
+    assert!(rec.ctrl.jogf, "the button stays latched");
 }
 
 /// The SET-mode pp-resync early-return (state_machine.rs:401) quiesces the axis
@@ -1906,7 +1907,7 @@ fn pp_resync_requests_forced_poll_for_held_jog() {
     // forced poll lands on this Idle-arm pp-resync with a jog still held.
     rec.ctrl.spmg = SpmgMode::Go;
     rec.internal.pp = true;
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     // Reached only with the axis already done and idle (make_record sets
     // msta=DONE; a fresh record is Idle with movn=false).
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
@@ -1932,7 +1933,7 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
 
-    rec.ctrl.jogf = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
 
     // Close-enough completion: restore_spmg_move_to_pause flips Move->Pause.
     complete_move(&mut rec, 10.0);
@@ -1953,10 +1954,10 @@ fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
         effects.commands
     );
 
-    // Operator presses Go: the held jog now re-fires.
+    // Operator presses Go: C 1914-1918 re-arms the jog from the held
+    // button.
     rec.ctrl.spmg = SpmgMode::Go;
-    complete_move(&mut rec, 10.0);
-    let effects = rec.check_completion();
+    let effects = rec.plan_motion(CommandSource::Spmg);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(
         effects.commands.iter().any(|c| matches!(

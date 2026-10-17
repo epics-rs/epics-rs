@@ -150,8 +150,8 @@ pub fn compose_with_server_info(user_source: super::DynSource) -> Result<super::
     }));
 
     let composite = super::CompositeSource::new();
-    composite.add_source(USER_SOURCE_NAME, user_source, 0)?;
-    composite.add_source(SERVER_SOURCE_NAME, server_info as super::DynSource, -1)?;
+    composite.add_uncounted(USER_SOURCE_NAME, user_source, 0)?;
+    composite.add_uncounted(SERVER_SOURCE_NAME, server_info as super::DynSource, -1)?;
     Ok(composite as super::DynSource)
 }
 

@@ -6,7 +6,10 @@
 //! The IOC runs in a child (this binary re-run on [`ioc_child`]) because
 //! `run_pva_ioc` ends in the iocsh REPL; the parent drives that REPL through a
 //! piped stdin and ends it with `exit`.
-#![cfg(all(feature = "client", tokio_backend, unix))]
+//!
+//! On both backends: the child serves through whichever server its build
+//! has, and the parent is only the client that reads it.
+#![cfg(all(feature = "client", unix))]
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -21,11 +24,7 @@ fn ioc_child() {
     let Ok(db) = std::env::var(CHILD) else {
         return;
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(epics_pva_rs::server::run_pva_ioc_app(
+    epics_base_rs::runtime::task::test_block_on(epics_pva_rs::server::run_pva_ioc_app(
         epics_base_rs::server::ioc_app::IocApplication::new()
             .startup_line(&format!("dbLoadRecords(\"{db}\")")),
     ))
@@ -66,6 +65,8 @@ fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
     // this handle (its pid), never by name.
     let mut stdin = child.stdin.take().unwrap();
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): the client side, which is tokio's on both
+    // backends; checked to pass under EPICS_RS_BUILD_EXEC_BACKEND=thread.
     let rt = tokio::runtime::Runtime::new().unwrap();
     // SAFETY: nextest runs this test alone in its process; the client
     // config reads these at build.
@@ -98,7 +99,8 @@ fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
     }
     drop((by_tcp, by_search));
 
-    let _ = stdin.write_all(b"exit\n");
+    // The console names the server it runs, on either backend.
+    let _ = stdin.write_all(b"pvxsr\nexit\n");
     drop(stdin);
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
@@ -136,6 +138,10 @@ fn serves_on_the_env_ports(db: &std::path::Path, tcp: u16) -> Option<()> {
     assert!(
         status.is_some_and(|s| s.success()),
         "the REPL did not end on `exit`: {status:?}\n{log}"
+    );
+    assert!(
+        log.contains(&format!("EPICS_PVAS_SERVER_PORT={tcp}\n")),
+        "pvxsr did not report the served port\n{log}"
     );
     Some(())
 }
@@ -193,5 +199,58 @@ fn a_held_search_port_is_printed_and_the_shell_survives() {
     assert!(
         status.is_some_and(|s| s.success()),
         "the shell did not survive: {status:?}\n{stderr}"
+    );
+}
+
+/// `pvxsr` typed before the server has bound still reports it: the prompt
+/// comes after the bind, as C's `iocsh` comes after `iocInit` started the
+/// servers, so the `config()` lines carry the bound port and not the `0`
+/// asked for.
+#[test]
+fn pvxsr_at_the_first_prompt_reports_the_bound_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("first.db");
+    std::fs::write(&db, "record(ai, \"FIRST:X\") { field(VAL, \"1\") }\n").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["ioc_child", "--exact", "--nocapture"])
+        .env(CHILD, &db)
+        .env("EPICS_PVAS_SERVER_PORT", "0")
+        .env("EPICS_PVAS_BROADCAST_PORT", "0")
+        .env("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1")
+        .env("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO")
+        .env("EPICS_PVAS_BEACON_ADDR_LIST", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the IOC child");
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(b"pvxsr\nexit\n");
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let out = child.wait_with_output().unwrap();
+    let log = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the REPL did not end on `exit`: {status:?}\n{log}"
+    );
+    assert!(
+        log.contains("Source: __server prio=-1") && !log.contains("EPICS_PVAS_SERVER_PORT=0\n"),
+        "pvxsr at the first prompt did not report the bound server\n{log}"
     );
 }

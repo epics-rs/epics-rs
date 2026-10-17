@@ -158,21 +158,19 @@ impl UdpCollector {
                 return Ok(());
             }
         }
+        // pvxs `SockEndpoint::resolve` (`config.cpp:88-120`): the `@iface`
+        // interface, the wildcard when it names none or none that resolves.
+        let ifmap = crate::config::IfaceMap::for_endpoints(std::iter::once(dest));
         match (group, dest.addr) {
             (IpAddr::V4(g), SocketAddr::V4(_)) => {
-                // `@iface` selects one interface; modifier-less joins on the
-                // unspecified interface and lets the OS choose (pvxs resolves
-                // the endpoint's interface, defaulting to wildcard).
-                let iface = match dest.iface.as_deref() {
-                    Some(spec) => crate::config::env::resolve_iface_v4(spec)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-                    None => Ipv4Addr::UNSPECIFIED,
-                };
-                self.state.sock.join_multicast_v4(g, iface)?;
+                self.state
+                    .sock
+                    .join_multicast_v4(g, dest.mcast_iface_v4(&ifmap))?;
             }
             (IpAddr::V6(g), SocketAddr::V6(_)) => {
-                // v6 multicast joins by scope id; 0 = let the OS pick.
-                self.state.sock.join_multicast_v6(&g, 0)?;
+                self.state
+                    .sock
+                    .join_multicast_v6(&g, dest.mcast_iface_v6(&ifmap))?;
             }
             _ => {
                 return Err(io::Error::new(
@@ -299,7 +297,7 @@ impl CollectorState {
         // ancillary data (pvxs `sock.enable_IP_PKTINFO()`,
         // `udp_collector.cpp:138`).
         #[cfg(any(unix, windows))]
-        crate::udp_rx::enable(&sock, is_v6)?;
+        epics_base_rs::net::udp_rx::enable(&sock, is_v6)?;
 
         let bind_addr: SocketAddr = if is_v6 {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
@@ -410,7 +408,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, weak: Weak<CollectorState>) {
 }
 
 /// Drive one non-blocking receive, returning the byte count, source address,
-/// and recovered original destination ([`crate::udp_rx`]). `Ok(None)` means
+/// and recovered original destination ([`epics_base_rs::net::udp_rx`]). `Ok(None)` means
 /// the read would block (re-arm and wait).
 #[cfg(any(unix, windows))]
 fn recv_with_orig_dest(
@@ -418,7 +416,7 @@ fn recv_with_orig_dest(
     buf: &mut [u8],
 ) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
     match sock.try_io(tokio::io::Interest::READABLE, || {
-        crate::udp_rx::recv(sock, buf)
+        epics_base_rs::net::udp_rx::recv(sock, buf)
     }) {
         Ok(d) => Ok(Some((d.len, d.src, d.dest))),
         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),

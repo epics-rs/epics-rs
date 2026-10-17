@@ -2,8 +2,9 @@
 //! destination address and arrival interface (`os/default/osdSockExt.cpp:71-200`,
 //! `os/WIN32/osdSockExt.cpp:85-140`), and on Linux the `SO_RXQ_OVFL` drop count.
 //!
-//! The one owner of that receive path for the client collector and both server
-//! search sockets, so no platform can have it on one and not the other.
+//! The one owner of that receive path for the client collector, both server
+//! search sockets and the exec-backend SEARCH receive pump, so no platform can
+//! have it on one and not the other.
 //!
 //! * Linux / Android: `IP_PKTINFO` (`in_pktinfo`: destination and interface).
 //! * Other Unix: `IP_RECVDSTADDR` for the destination — the one v4 option
@@ -18,13 +19,13 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 #[cfg(unix)]
-pub(crate) use std::os::fd::AsFd as AsSock;
+pub use std::os::fd::AsFd as AsSock;
 #[cfg(windows)]
-pub(crate) use std::os::windows::io::AsSocket as AsSock;
+pub use std::os::windows::io::AsSocket as AsSock;
 
 /// One received datagram.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Datagram {
+pub struct Datagram {
     pub len: usize,
     pub src: SocketAddr,
     /// The destination the datagram was sent to: a unicast, broadcast or
@@ -40,7 +41,7 @@ pub(crate) struct Datagram {
 impl Datagram {
     /// The v4 `(destination, interface index)` pair the server's
     /// `SearchListeners::arrival` routes by.
-    pub(crate) fn v4_pktinfo(&self) -> Option<(Ipv4Addr, u32)> {
+    pub fn v4_pktinfo(&self) -> Option<(Ipv4Addr, u32)> {
         match self.dest {
             Some(IpAddr::V4(dest)) => Some((dest, self.ifindex)),
             _ => None,
@@ -51,7 +52,7 @@ impl Datagram {
 /// Ask the OS to attach each datagram's destination and arrival interface
 /// (pvxs `evsocket::enable_IP_PKTINFO`).
 #[cfg(unix)]
-pub(crate) fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
+pub fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = sock.as_fd().as_raw_fd();
     let set = |level: libc::c_int, name: libc::c_int| -> io::Result<()> {
@@ -92,7 +93,7 @@ pub(crate) fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
 /// One `recvmsg`. A socket with nothing queued returns `WouldBlock` when
 /// non-blocking, as `recv_from` does.
 #[cfg(unix)]
-pub(crate) fn recv(sock: &impl AsSock, buf: &mut [u8]) -> io::Result<Datagram> {
+pub fn recv(sock: &impl AsSock, buf: &mut [u8]) -> io::Result<Datagram> {
     use std::mem::{size_of, zeroed};
     use std::os::fd::AsRawFd;
     // SAFETY: every pointer handed to `recvmsg` points at a local that
@@ -142,8 +143,8 @@ unsafe fn decode_cmsg(hdr: &libc::cmsghdr, data: *const libc::c_uchar, out: &mut
     use std::ptr::read_unaligned;
     // SAFETY (whole body): each read is of the payload type its
     // `(level, type)` carries, after checking the payload is that long.
-    let fits =
-        |size: usize| hdr.cmsg_len as usize >= unsafe { libc::CMSG_LEN(size as u32) } as usize;
+    // `as _`: `cmsg_len` is `usize` on glibc but `socklen_t` on BSD and musl.
+    let fits = |size: usize| hdr.cmsg_len >= unsafe { libc::CMSG_LEN(size as u32) } as _;
     match (hdr.cmsg_level, hdr.cmsg_type) {
         (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) if fits(size_of::<libc::in6_pktinfo>()) => {
             let info = unsafe { read_unaligned(data as *const libc::in6_pktinfo) };
@@ -222,7 +223,7 @@ fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage) -> io::Result<Socket
 /// and resolve `WSARecvMsg` now so the receive path cannot fail on first use
 /// (pvxs `enable_IP_PKTINFO` + `oseDoOnce`, `os/WIN32/osdSockExt.cpp`).
 #[cfg(windows)]
-pub(crate) fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
+pub fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
     use windows_sys::Win32::Networking::WinSock::{
         IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, setsockopt,
     };
@@ -253,7 +254,7 @@ pub(crate) fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
 /// One `WSARecvMsg`. A socket with nothing queued returns `WouldBlock` when
 /// non-blocking, as `recv_from` does.
 #[cfg(windows)]
-pub(crate) fn recv(sock: &impl AsSock, buf: &mut [u8]) -> io::Result<Datagram> {
+pub fn recv(sock: &impl AsSock, buf: &mut [u8]) -> io::Result<Datagram> {
     // SAFETY: `buf` is borrowed for the one call.
     unsafe { win::recvmsg_once(win::raw(sock), buf) }
 }
@@ -426,7 +427,7 @@ mod win {
             return wsa_cmsg_firsthdr(msg);
         }
         // SAFETY: caller guarantees `cmsg` is a valid header.
-        let cmsg_len = unsafe { (*cmsg).cmsg_len } as usize;
+        let cmsg_len = unsafe { (*cmsg).cmsg_len };
         let base = msg.Control.buf as usize;
         let end = base + msg.Control.len as usize;
         let next = (cmsg as usize) + cmsg_align(cmsg_len);

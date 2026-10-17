@@ -16,7 +16,7 @@
 //!
 //! The abort takes the process with it, so the IOC runs in a child: this test
 //! binary re-run on [`ioc_child`] with `QSRV_APP_CHILD_STCMD` set.
-#![cfg(all(feature = "qsrv", tokio_backend, unix))]
+#![cfg(all(feature = "qsrv", unix))]
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
@@ -30,15 +30,13 @@ fn ioc_child() {
     let Ok(stcmd) = std::env::var(CHILD) else {
         return;
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _ = rt.block_on(epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        epics_base_rs::server::ioc_app::IocApplication::new()
-            .port(0)
-            .startup_script(&stcmd),
-    ));
+    let _ = epics_base_rs::runtime::task::test_block_on(
+        epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
+            epics_base_rs::server::ioc_app::IocApplication::new()
+                .port(0)
+                .startup_script(&stcmd),
+        ),
+    );
 }
 
 #[test]

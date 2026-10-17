@@ -485,15 +485,18 @@ mod mutex_alloc_probe {
 #[cfg(exec_backend)]
 mod ioc {
     use std::collections::HashMap;
-    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::process::ExitCode;
     use std::sync::Arc;
+    #[cfg(feature = "bringup-probes")]
     use std::thread;
     use std::time::Instant;
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::runtime::net::cas_server_port;
-    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    #[cfg(feature = "bringup-probes")]
+    use epics_base_rs::runtime::task::StackSizeClass;
+    use epics_base_rs::runtime::task::{background_init, block_on_sync};
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::server::database::PvDatabase;
@@ -501,7 +504,9 @@ mod ioc {
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
     use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
-    use epics_ca_rs::server::blocking::{BlockingCaServer, bind_udp_search, refused_clients};
+    use epics_ca_rs::server::blocking::refused_clients;
+    use epics_ca_rs::server::blocking_serving::BlockingCaServing;
+    use epics_ca_rs::server::stats::ServerStats;
 
     use crate::demo_db::DEMO_DB;
 
@@ -749,7 +754,7 @@ mod ioc {
         seq: u32,
         resolver: &epics_ca_rs::calink::CaLinkResolver,
         db: &Arc<PvDatabase>,
-        server: &Arc<BlockingCaServer>,
+        stats: &ServerStats,
     ) {
         let conns = block_on_sync(resolver.client_connection_count())
             .ok()
@@ -764,7 +769,7 @@ mod ioc {
         };
         println!(
             "FDPROBE seq={seq} FD_CNT={fd_cnt} FD_MAX={fd_max} CA_CONN_CNT={}",
-            server.active_connections()
+            stats.active_clients()
         );
         println!(
             "C6 seq={seq} links={} circuits={conns:?}",
@@ -1175,26 +1180,6 @@ mod ioc {
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
         let db_for_status = db.clone();
         let db_for_names = db.clone();
-        let server = match BlockingCaServer::bind((Ipv4Addr::UNSPECIFIED, port), db, acf) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                // Not "cannot bind": `BlockingCaServer::bind` also calls
-                // `local_addr`, and on RTEMS that is the call that fails.
-                // The inner error says which.
-                eprintln!("realtime-ca-ioc: cannot start the CA TCP server on port {port}: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let udp = match bind_udp_search(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "realtime-ca-ioc: cannot start the CA UDP search responder on port {port}: {e}"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-
         // (3b) The status PVs. Nothing on this target has a shell, so these
         //      numbers are the only way to ask the IOC how it is doing from
         //      anywhere but the serial console — and the console is
@@ -1210,18 +1195,19 @@ mod ioc {
         //      is the entry point that owns a `BlockingPvaServer`, and it
         //      publishes it there.
         //
-        //      Registered after `bind` so `CA_CONN_CNT` reads the server that
-        //      is already listening, and before the accept thread starts so
-        //      the first client cannot find them missing.
+        //      Registered before the serving starts so the first client
+        //      cannot find them missing; `CA_CONN_CNT` reads the stats every
+        //      listener counts into.
         let started = Instant::now();
-        let conns_server = server.clone();
+        let stats = Arc::new(ServerStats::default());
+        let conns_stats = stats.clone();
         let mut status = target_status_pvs(STATUS_PREFIX, started);
         status.extend([
             // devIocStats' `@ca_connections` (ioc.template:82-94). The ceiling
             // number: measured on target at 142 concurrent, the 143rd refused
             // by the libbsd socket zone with ENFILE.
             StatusPv::new(format!("{STATUS_PREFIX}:CA_CONN_CNT"), move || {
-                EpicsValue::Double(conns_server.active_connections() as f64)
+                EpicsValue::Double(conns_stats.active_clients() as f64)
             }),
             // No upstream counterpart: devIocStats counts CA clients and CA
             // connections but never refusals. Named in the shape of the ones
@@ -1244,48 +1230,19 @@ mod ioc {
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
         names.sort();
 
-        let srv_tcp = server.clone();
-        // The stack class states what this thread takes; the charge is what
-        // makes the worker pool's budget know it was taken. Held inside the
-        // body, so it is released by the thread ending and by nothing else,
-        // and a `spawn` that fails drops the closure and gives it back.
-        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-        let tcp_thread = match thread::Builder::new()
-            .name("CAS-TCP".to_string())
-            // caservertask.c:717-719 — `epicsThreadStackMedium`. It accepts and
-            // hands off; the per-client thread is where the depth is.
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                let _charge = charge;
-                srv_tcp.serve()
-            }) {
-            Ok(h) => h,
+        let serving = match BlockingCaServing::start(port, port, db, acf, stats.clone()) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("realtime-ca-ioc: cannot start the CA accept thread: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let srv_udp = server.clone();
-        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-        let udp_thread = match thread::Builder::new()
-            .name("CAS-UDP".to_string())
-            // caservertask.c:723-725 — `epicsThreadStackMedium`, same as TCP.
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                let _charge = charge;
-                srv_udp.serve_udp_search(udp)
-            }) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("realtime-ca-ioc: cannot start the CA name-search thread: {e}");
+                eprintln!("realtime-ca-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
 
         println!(
-            "realtime-ca-ioc: serving {} records on CA port {port} (TCP + UDP search), \
+            "realtime-ca-ioc: serving {} records on CA port {} (TCP + UDP search), \
              RTEMS execution model, no tokio runtime",
-            names.len()
+            names.len(),
+            serving.tcp_port()
         );
 
         // (5-udp) PROBE: the client's SEARCH socket, end to end against this
@@ -1411,7 +1368,7 @@ mod ioc {
         {
             let probe_db = db_for_names.clone();
             let probe_resolver = resolver.clone();
-            let probe_server = server.clone();
+            let probe_stats = stats.clone();
             let env = |var| {
                 epics_base_rs::runtime::env::get_lossy(var).unwrap_or_else(|| "(unset)".to_string())
             };
@@ -1439,7 +1396,7 @@ mod ioc {
                     loop {
                         thread::sleep(std::time::Duration::from_secs(10));
                         seq += 1;
-                        c6_report(seq, &probe_resolver, &probe_db, &probe_server);
+                        c6_report(seq, &probe_resolver, &probe_db, &probe_stats);
                         // The census is one line per open descriptor, so it
                         // runs on the same 1-minute pass as the task census
                         // rather than every 10 s: an outage measurement wants
@@ -1480,15 +1437,10 @@ mod ioc {
         // on this target. Joining the accept thread is how the main thread
         // waits; the accept loop only returns if `shutdown()` is requested,
         // which nothing here does.
-        let _ = tcp_thread.join();
-        match udp_thread.join() {
-            Ok(Ok(())) => ExitCode::SUCCESS,
-            Ok(Err(e)) => {
+        match serving.join() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
                 eprintln!("realtime-ca-ioc: name-search responder failed: {e}");
-                ExitCode::FAILURE
-            }
-            Err(_) => {
-                eprintln!("realtime-ca-ioc: name-search thread panicked");
                 ExitCode::FAILURE
             }
         }
@@ -1589,9 +1541,9 @@ mod tests {
             }
         }
         assert_eq!(
-            sites, 5,
-            "expected the accept thread, the UDP responder, the bring-up \
-             probe and the write-deadline probe's two legs, found {sites} — \
+            sites, 3,
+            "expected the bring-up probe and the write-deadline probe's two \
+             legs (the serving threads are `BlockingCaServing`'s), found {sites} — \
              a thread was added or moved, and the account has to be told \
              about it"
         );

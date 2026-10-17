@@ -542,20 +542,13 @@ async fn bind_sockets(
     // An interface whose UDP bind failed is dropped whole, TCP socket
     // included (`caservertask.c:744-749`).
     tcp.retain_interfaces(&udp.interfaces());
-    // C's RSRV announces nothing, so a configured port stays silent and
-    // stderr carries only C's own lines. `--port 0` has no C counterpart and
-    // a caller must be able to read the ports it got; that report goes
-    // through the errlog so `eltc 0` silences it. Written here, where the
-    // ports become final, so it precedes the shell: from `run()` it raced the
-    // shell's EOF exit and was lost when the shell won.
-    if udp_port == 0 || tcp_port == 0 {
-        epics_base_rs::runtime::log::errlog_vprintf(format_args!(
-            "CA server: UDP search on port {}, TCP on port {}, beacons → {} address(es)\n",
-            udp.port(),
-            tcp.port(),
-            cfg.beacon_addrs.len()
-        ));
-    }
+    // Here, where the ports become final, so it precedes the shell: from
+    // `run()` it raced the shell's EOF exit and was lost when the shell won.
+    crate::server::udp::announce_requested_ephemeral(
+        (udp_port, udp.port()),
+        (tcp_port, tcp.port()),
+        cfg.beacon_addrs.len(),
+    );
     Ok((tcp, udp))
 }
 
@@ -1020,6 +1013,7 @@ impl CaServer {
         let ca_cmds = crate::server::iocsh::ca_server_commands();
 
         let server_clone = server.clone();
+        let generation = epics_base_rs::server::db_server::serving_generation();
         // `run` drives `tokio::net` listeners, so it belongs on the tokio
         // runtime and nowhere else. `bridge.reactor()` used to place it, and
         // under `exec_backend` that is a callback band with no reactor at all:
@@ -1028,11 +1022,14 @@ impl CaServer {
         // the outside as an IOC that announces its port and never answers.
         // The bridge itself stays — the shell thread below still needs it to
         // re-enter this runtime.
-        let server_handle = tokio::runtime::Handle::try_current()
+        let mut server_handle = tokio::runtime::Handle::try_current()
             .expect(
                 "CaServer::run_with_shell is awaited on the runtime its listeners bind sockets to",
             )
             .spawn(async move { server_clone.run().await });
+        let ended =
+            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
+                .await;
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -1057,8 +1054,10 @@ impl CaServer {
 
         let shell_result = rx.await;
 
-        server_handle.abort();
-        let _ = server_handle.await;
+        if ended.is_none() {
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
 
         match shell_result {
             Ok(Ok(())) => Ok(()),
@@ -1566,6 +1565,10 @@ impl CaServer {
         // into it, so the fact has to travel back: everything above this
         // point is bound and published, everything below it is the serving
         // loop, and `BuiltIoc::run` holds `iocInit` here.
+        let beacon_socket = beacon::beacon_socket().and_then(|s| {
+            s.set_nonblocking(true)?;
+            tokio::net::UdpSocket::from_std(s)
+        })?;
         epics_base_rs::server::db_server::announce_serving();
 
         let result = tokio::select! {
@@ -1588,16 +1591,14 @@ impl CaServer {
                 }
             }
             r = beacon::run_beacon_emitter(
+                beacon_socket,
                 tcp_port,
                 udp_cfg.beacon_addrs.clone(),
                 udp_cfg.beacon_period,
                 beacon_reset,
                 #[cfg(feature = "cap-tokens")]
                 None,
-            ) => {
-                eprintln!("Beacon emitter exited: {r:?}");
-                r
-            }
+            ) => match r {}
         };
 
         // Tear down spawned tasks whose JoinHandles were moved into the

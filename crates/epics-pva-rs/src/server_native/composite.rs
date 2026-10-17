@@ -114,20 +114,30 @@ impl CompositeSource {
     /// internals at `order = -1` (`src/server.cpp:542-546`) and application
     /// sources default to `order = 0` (`pvxs/server.h:116-118`).
     pub fn add_source(&self, name: &str, source: DynSource, order: i32) -> Result<(), String> {
-        let mut e = self.entries.write();
-        match e.entry((order, name.to_string())) {
-            Entry::Occupied(_) => {
-                return Err(format!("source ({name}, {order}) already registered"));
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(source);
-            }
-        }
+        self.add_uncounted(name, source, order)?;
         // pvxs `Server::addSource` bumps `beaconChange` unconditionally
         // (src/server.cpp:90-96) so the next BEACON signals the topology
         // change. Bump after the successful insert only.
         self.beacon_change.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// [`Self::add_source`] without the `beacon_change` bump: the server's
+    /// own composition, which pvxs inserts straight into `sources` from
+    /// the `Server::Pvt` constructor (`src/server.cpp:542-546`).
+    pub(crate) fn add_uncounted(
+        &self,
+        name: &str,
+        source: DynSource,
+        order: i32,
+    ) -> Result<(), String> {
+        match self.entries.write().entry((order, name.to_string())) {
+            Entry::Occupied(_) => Err(format!("source ({name}, {order}) already registered")),
+            Entry::Vacant(slot) => {
+                slot.insert(source);
+                Ok(())
+            }
+        }
     }
 
     /// Remove and return the source previously added with the given
@@ -141,8 +151,11 @@ impl CompositeSource {
         // (`name`, `order`) still advances the counter. Unconditional
         // here for the same reason: the caller asked for a topology
         // change, and pvxs lets the next BEACON carry a new change count
-        // either way.
-        self.beacon_change.fetch_add(1, Ordering::Relaxed);
+        // either way. The removed source's own count is kept, so the
+        // folded [`Self::beacon_change`] never goes back.
+        let kept = removed.as_ref().map_or(0, |s| s.beacon_change());
+        self.beacon_change
+            .fetch_add(kept.wrapping_add(1), Ordering::Relaxed);
         removed
     }
 
@@ -167,8 +180,11 @@ impl CompositeSource {
     /// fold would miss a bump on an inner whose value stayed below the
     /// peak.
     pub fn beacon_change(&self) -> u64 {
+        // Under the read lock: `remove_source` moves a count from an entry
+        // to the local counter while holding the write lock.
+        let entries = self.entries.read();
         let mut sum = self.beacon_change.load(Ordering::Relaxed);
-        for source in self.entries.read().values() {
+        for source in entries.values() {
             sum = sum.wrapping_add(source.beacon_change());
         }
         sum
@@ -1555,9 +1571,8 @@ mod tests {
     }
 
     /// The registry beacon-change counter must advance on every source
-    /// add/remove — including the two cases the PV-set hash cannot
-    /// detect: replacing a source with another serving the SAME
-    /// `list_pvs()` output, and changing a source's priority for the
+    /// add/remove — including replacing a source with another serving the
+    /// SAME `list_pvs()` output, and changing a source's priority for the
     /// same PV name. Mirrors pvxs `beaconChange` (src/server.cpp:90-115).
     #[epics_macros_rs::epics_test]
     async fn beacon_change_advances_on_registry_mutations() {
@@ -1578,8 +1593,7 @@ mod tests {
         assert!(v1 > v0, "add_source must bump beacon_change: {v0} -> {v1}");
 
         // Replace it with a DIFFERENT source serving the SAME name
-        // (identical list_pvs output) — the PV-set hash would not move,
-        // but the registry counter must.
+        // (identical list_pvs output) — the registry counter must move.
         comp.remove_source("a", 0).expect("source a removed");
         let v2 = comp.beacon_change();
         assert!(
@@ -1679,6 +1693,44 @@ mod tests {
             <CompositeSource as ChannelSource>::beacon_change(&comp),
             after_remove
         );
+    }
+
+    /// Removing a source whose own count is nonzero keeps that count, so
+    /// the folded counter only grows, as pvxs's single `beaconChange` does.
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_counted_source_never_lowers_beacon_change() {
+        use crate::server_native::{SharedPV, SharedSource};
+
+        let comp = CompositeSource::new();
+        let shared = Arc::new(SharedSource::new());
+        shared.add("X", SharedPV::new());
+        shared.add("Y", SharedPV::new());
+        comp.add_source("s", shared as DynSource, 0).unwrap();
+        assert_eq!(comp.beacon_change(), 3);
+        comp.remove_source("s", 0).expect("source s removed");
+        assert_eq!(comp.beacon_change(), 4);
+    }
+
+    /// The server's own composition counts nothing: pvxs inserts
+    /// `__server` from its constructor, so softIocPVX's count is only its
+    /// two qsrv `addSource` calls.
+    #[epics_macros_rs::epics_test]
+    async fn the_server_composition_adds_no_beacon_change() {
+        let user = CompositeSource::new();
+        for (name, order) in [("qsrvSingle", 0), ("qsrvGroup", 1)] {
+            user.add_source(
+                name,
+                Arc::new(PvSrc {
+                    name: "pv",
+                    value: 1,
+                }) as DynSource,
+                order,
+            )
+            .unwrap();
+        }
+        let served =
+            crate::server_native::server_info::compose_with_server_info(user as DynSource).unwrap();
+        assert_eq!(served.beacon_change(), 2);
     }
 
     #[epics_macros_rs::epics_test]

@@ -45,7 +45,7 @@ use epics_base_rs::types::RecordName;
 // one in here would make us answer strictly fewer TCP-circuit SEARCHes than
 // pvxs does. `tcp.rs` states the same conclusion at its call site.
 //
-// `protocols`, `reply_addr`, `reply_port`, `unicast` and `consumed` are read
+// `protocols`, `reply_addr`, `reply_port` and `consumed` are read
 // only on the UDP paths. The parser fills them for every caller because it is
 // one parser, not two — which is also why an RTEMS build that has no UDP
 // responder wired yet reports them as never read.
@@ -66,11 +66,6 @@ pub(crate) struct SearchRequest {
     /// (`udp_collector.cpp:367-370`).
     pub(crate) reply_addr: Option<IpAddr>,
     pub(crate) reply_port: u16,
-    /// True when the SEARCH header had the Unicast flag (`0x80`,
-    /// `pva_search_flags::Unicast`) set. pvxs uses this as a marker
-    /// that the forwarder must clear before relaying via the loopback
-    /// ORIGIN_TAG channel (`udp_collector.cpp:391`).
-    pub(crate) unicast: bool,
     /// True when the SEARCH header had the `MustReply` flag (`0x01`,
     /// `pva_search_flags::MustReply`) set — pvlist-style discovery
     /// probes set this so every reachable server answers even with
@@ -118,7 +113,8 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     let mut p = Cursor::new(payload);
     let seq = p.get_u32(order).ok()?;
     let flags = p.get_u8().ok()?;
-    let unicast = flags & 0x80 != 0;
+    // The Unicast flag (`0x80`) is not read: pvxs decides forwarding by
+    // destination and only clears the flag on the way (`udp_collector.cpp:391`).
     // `pva_search_flags::MustReply = 0x01`. pvxs `udp_collector.cpp:363`
     // mirrors the field into `SearchMsg::mustReply`; pvlist relies on
     // this to enumerate reachable servers regardless of name matches.
@@ -181,7 +177,6 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
         queries,
         reply_addr,
         reply_port,
-        unicast,
         must_reply,
         protocols,
         consumed: PvaHeader::SIZE + payload_len,

@@ -113,12 +113,12 @@ pub enum PortOrigin {
 /// deviation on unix only, see `docs/differences.md`. Winsock reads
 /// `SO_REUSEADDR` at bind time, so set after it the socket refuses every
 /// co-binder with WSAEACCES; Windows sets them first on every port, as C.
-pub fn bind_fanout(
+pub fn bind_fanout<E>(
     port: u16,
     origin: PortOrigin,
-    mut set_fanout: impl FnMut() -> io::Result<()>,
-    bind: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+    mut set_fanout: impl FnMut() -> Result<(), E>,
+    bind: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
     let shared_number = cfg!(windows) || (origin == PortOrigin::Configured && port != 0);
     if shared_number {
         set_fanout()?;

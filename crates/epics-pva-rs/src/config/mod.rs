@@ -28,6 +28,7 @@
 //! - `EPICS_PVAS_SERVER_PORT`            — TCP port (default 5075)
 
 pub mod env;
+pub mod iface;
 
 pub use env::{
     Endpoint, PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled, beacon_period,
@@ -37,6 +38,7 @@ pub use env::{
     seed_env_overrides, server_addr_list, server_beacon_addr_list, server_broadcast_port,
     server_intf_addr_list, server_port, server_tls_keychain_password,
 };
+pub use iface::IfaceMap;
 
 // Both need live interface enumeration (`if-addrs`), which neither newlib
 // (RTEMS) nor VxWorks's `libc` module provides `getifaddrs`/`ifaddrs` for —

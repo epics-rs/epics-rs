@@ -47,9 +47,8 @@
 //! via [`block_on_sync`] / `park_on`) and `sendto`s the reply, so a SEARCH
 //! reply is byte-identical to the async responder. The socket is bound with
 //! raw `libc` ([`bind_udp_search`]) so its `SO_REUSEADDR`/`SO_REUSEPORT`
-//! shared-port setup needs no `socket2`. S1b covers name-search replies only:
-//! no beacons, no multicast / broadcast-secondary socket, no same-source
-//! FIONREAD coalescing (each datagram yields its own reply).
+//! shared-port setup needs no `socket2`. The broadcast companion, the
+//! multicast joins and the `CAS-beacon` thread are `BlockingCaServing`'s.
 //!
 //! # What it reuses
 //!
@@ -132,7 +131,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -156,6 +155,7 @@ use crate::protocol::{
 };
 use crate::server::outbox::{self, OutboxDrain};
 use crate::server::recv::{Admit, Gate, RecvAccumulator};
+use crate::server::stats::ServerStats;
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
     RegisteredSubscription, SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome,
@@ -199,6 +199,30 @@ const CAS_TCP_PRIORITY: ThreadPriority =
 /// monitor send.
 const CAS_UDP_PRIORITY: ThreadPriority =
     ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 4);
+
+/// The EPICS priority the `CAS-beacon` sender runs at: `threadPrios[3]`
+/// (`caservertask.c:758`), `CAServerLow - 3` = **17** on RTEMS.
+const CAS_BEACON_PRIORITY: ThreadPriority =
+    ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 3);
+
+/// C `rsrv_online_notify_task` on the calling thread, beaconing `tcp_port`
+/// to `beacon_addrs` until `sleep` reports serving ended.
+pub(crate) fn serve_beacons(
+    socket: std::net::UdpSocket,
+    tcp_port: u16,
+    beacon_addrs: &[SocketAddr],
+    max_period: Duration,
+    sleep: impl FnMut(Duration) -> bool,
+) {
+    let _ = enter_ioc_thread(CAS_BEACON_PRIORITY);
+    crate::server::beacon::run_blocking_beacon_emitter(
+        &socket,
+        tcp_port,
+        beacon_addrs,
+        max_period,
+        sleep,
+    )
+}
 
 /// The most CA clients this **process** can serve at once, and therefore the
 /// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
@@ -374,10 +398,13 @@ pub struct BlockingCaServer {
     acf: SharedAcf,
     tcp_port: u16,
     shutdown: AtomicBool,
-    /// Clients currently being served — see [`active_connections`].
+    /// The counters `casr` reads, shared by every listener of one
+    /// [`BlockingCaServing`](super::blocking_serving::BlockingCaServing);
+    /// the served-client count is their connect/disconnect delta (see
+    /// [`active_connections`]).
     ///
     /// [`active_connections`]: Self::active_connections
-    active: Arc<AtomicUsize>,
+    stats: Arc<ServerStats>,
 }
 
 /// One served client's place in [`BlockingCaServer::active_connections`],
@@ -388,18 +415,18 @@ pub struct BlockingCaServer {
 /// could not be created was never served and must not be counted, and a client
 /// thread that panics must still give the slot back. Owning the decrement in a
 /// `Drop` is what covers the second — no cleanup on the normal exit path can.
-struct ClientSlot(Arc<AtomicUsize>);
+struct ClientSlot(Arc<ServerStats>);
 
 impl ClientSlot {
-    fn take(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::AcqRel);
-        Self(active)
+    fn take(stats: Arc<ServerStats>) -> Self {
+        stats.connects_total.fetch_add(1, Ordering::AcqRel);
+        Self(stats)
     }
 }
 
 impl Drop for ClientSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.disconnects_total.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -422,7 +449,21 @@ impl BlockingCaServer {
         db: Arc<PvDatabase>,
         acf: SharedAcf,
     ) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
+        Self::from_listener(
+            TcpListener::bind(addr)?,
+            db,
+            acf,
+            Arc::new(ServerStats::default()),
+        )
+    }
+
+    /// Serve on `listener`, already bound, counting clients into `stats`.
+    pub fn from_listener(
+        listener: TcpListener,
+        db: Arc<PvDatabase>,
+        acf: SharedAcf,
+        stats: Arc<ServerStats>,
+    ) -> std::io::Result<Self> {
         // Two fallible calls, two different diagnoses — so they must not
         // collapse into one `io::Error` the caller then labels "cannot bind".
         // On RTEMS this is the difference that matters: `bind` succeeds while
@@ -444,7 +485,7 @@ impl BlockingCaServer {
             acf,
             tcp_port,
             shutdown: AtomicBool::new(false),
-            active: Arc::new(AtomicUsize::new(0)),
+            stats,
         })
     }
 
@@ -465,7 +506,12 @@ impl BlockingCaServer {
     /// the descriptor client #142 needs to *hear why* is still there. Watching
     /// this climb is how an operator sees the wall coming.
     pub fn active_connections(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.stats.active_clients() as usize
+    }
+
+    /// The counters `casr` reads.
+    pub fn stats(&self) -> Arc<ServerStats> {
+        self.stats.clone()
     }
 
     /// Run the accept loop until [`shutdown`](Self::shutdown) is requested.
@@ -524,7 +570,7 @@ impl BlockingCaServer {
                     let db = self.db.clone();
                     let acf = self.acf.clone();
                     let tcp_port = self.tcp_port;
-                    let active = self.active.clone();
+                    let stats = self.stats.clone();
                     // The single admission point. A client costs two threads,
                     // and it borrows both *together* — a client that could take
                     // the receiver and then wait for the event sender would, at
@@ -571,7 +617,7 @@ impl BlockingCaServer {
                         let _lease = lease;
                         // Held for the whole client: its `Drop` returns the
                         // slot however this job ends, panic included.
-                        let _slot = ClientSlot::take(active);
+                        let _slot = ClientSlot::take(stats);
                         if let Err(e) =
                             handle_client_blocking(event_worker, stream, peer, db, acf, tcp_port)
                         {
@@ -632,8 +678,9 @@ impl BlockingCaServer {
     /// Analogue of the C `CAS-UDP` thread (`cast_server`, `cast_server.c:113`).
     /// Bind `socket` with [`bind_udp_search`].
     ///
-    /// Scope: name-search reply only. No beacons, no multicast /
-    /// broadcast-secondary socket. Same-source FIONREAD coalescing IS applied
+    /// Scope: one socket that receives and replies. `BlockingCaServing`
+    /// serves an interface's broadcast companion and the beacons beside it.
+    /// Same-source FIONREAD coalescing IS applied
     /// (C `cast_server.c:268-281`): a burst of same-peer search datagrams is
     /// batched into one reply datagram, and a held batch is flushed early when
     /// the next datagram comes from a different peer (`cast_server.c:205-214`).
@@ -644,8 +691,30 @@ impl BlockingCaServer {
         // Same rule as `serve`, and the same reason: the loop that blocks owns
         // its band, because inheritance from `POSIX_Init` would otherwise put
         // it one level above idle on the target.
+        self.serve_udp_responder(&socket, &socket, "CAS-UDP")
+    }
+
+    /// [`serve_udp_search`](Self::serve_udp_search) receiving on `recv` and
+    /// replying on `reply`: C's `CAS-UDP2` reads the broadcast socket and
+    /// answers through the interface's `conf->udp` (`cast_server.c:127-146`).
+    /// `role` names the watchdog row, as C names the thread.
+    pub(crate) fn serve_udp_responder(
+        &self,
+        recv: &UdpSocket,
+        reply: &UdpSocket,
+        role: &str,
+    ) -> CaResult<()> {
         let _ = enter_ioc_thread(CAS_UDP_PRIORITY);
-        handle_udp_search_blocking(socket, self.db.clone(), self.tcp_port, &self.shutdown)
+        let cfg = crate::server::addr_list::from_env()?;
+        handle_udp_search_blocking(
+            recv,
+            reply,
+            role,
+            &cfg.ignore_addrs,
+            self.db.clone(),
+            self.tcp_port,
+            &self.shutdown,
+        )
     }
 }
 
@@ -819,14 +888,10 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
 }
 
 /// Bind a blocking UDP name-search responder socket. Raw `libc` throughout
-/// (no `socket2`), so the socket-option path builds for RTEMS. For a
-/// well-known port, enables SO_REUSEADDR + SO_REUSEPORT *before* bind so
-/// several IOCs can share the CA search port — C
-/// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:629`).
-/// An ephemeral (`0`) port is left bare: the flags would let the kernel
-/// join this socket to an unrelated reuse group and load-balance SEARCHes
-/// away from it. (The async responder sets them after its bind instead,
-/// `epics_base_rs::net::bind_fanout`.)
+/// (no `socket2`), so the socket-option path builds for RTEMS. SO_REUSEADDR +
+/// SO_REUSEPORT go on every port, as C
+/// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:629`), in
+/// the order `epics_base_rs::net::bind_fanout` gives against the bind.
 pub fn bind_udp_search(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     bind_udp_search_socket(addr)
 }
@@ -862,10 +927,6 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     // Take ownership immediately so every early return closes the fd via Drop.
     // SAFETY: `fd` is a valid, exclusively-owned socket fd just returned above.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    if addr.port() != 0 {
-        set_reuse_opt(fd, libc::SO_REUSEADDR)?;
-        set_reuse_opt(fd, libc::SO_REUSEPORT)?;
-    }
     // Build sockaddr_in via zeroed to avoid touching platform-specific fields
     // (`sin_len`/`sin_zero`); s_addr and sin_port are network byte order.
     // SAFETY: `sockaddr_in` is a plain-old-data C struct; all-zero is a valid
@@ -876,17 +937,29 @@ fn bind_udp_search_socket(addr: SocketAddrV4) -> std::io::Result<UdpSocket> {
     sin.sin_addr = libc::in_addr {
         s_addr: u32::from(*addr.ip()).to_be(),
     };
-    // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is exact.
-    let rc = unsafe {
-        libc::bind(
-            fd,
-            &sin as *const libc::sockaddr_in as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    epics_base_rs::net::bind_fanout(
+        addr.port(),
+        epics_base_rs::net::PortOrigin::Configured,
+        || {
+            set_reuse_opt(fd, libc::SO_REUSEADDR)?;
+            set_reuse_opt(fd, libc::SO_REUSEPORT)
+        },
+        || {
+            // SAFETY: `sin` is a fully-initialized sockaddr_in; the length is
+            // exact.
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        },
+    )?;
     Ok(socket)
 }
 
@@ -926,7 +999,9 @@ fn flush_held_batch(
     }
 }
 
-/// Serve CA UDP name searches on `socket` until `shutdown` is set. C
+/// Serve CA UDP name searches received on `socket`, replying on `reply`,
+/// and dropping any from a source in `ignore` (`casIgnoreAddrs`), until
+/// `shutdown` is set. C
 /// `cast_server` (`cast_server.c:113`): `recvfrom`, decode VERSION + SEARCH,
 /// `sendto` the reply. The decode/respond core is the shared
 /// [`udp::parse_search_datagram`]; only the socket I/O is blocking-specific,
@@ -939,20 +1014,23 @@ fn flush_held_batch(
 /// arrives from a different peer (`cast_server.c:205-214`), and on idle /
 /// shutdown so a buffered reply is never stranded.
 fn handle_udp_search_blocking(
-    socket: UdpSocket,
+    socket: &UdpSocket,
+    reply: &UdpSocket,
+    role: &str,
+    ignore: &[std::net::Ipv4Addr],
     db: Arc<PvDatabase>,
     tcp_port: u16,
     shutdown: &AtomicBool,
 ) -> CaResult<()> {
     // C `cast_server` reaches the watchdog through `casAttachThreadToClient`
     // (`cast_server.c:151`), the same call its TCP siblings make — the UDP
-    // name-search thread is a registered task there too. This driver serves
-    // one socket per call, so one entry per call is C's one entry per
-    // `CAS-UDP` thread. Unbounded: the loop parks in `recv_from`.
+    // name-search thread is a registered task there too. One entry per call
+    // is C's one entry per `CAS-UDP`/`CAS-UDP2` thread, named by the
+    // interface it answers from. Unbounded: the loop parks in `recv_from`.
     let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
-        match socket.local_addr() {
-            Ok(a) => format!("CAS-UDP {}", a.ip()),
-            Err(_) => "CAS-UDP".to_string(),
+        match reply.local_addr() {
+            Ok(a) => format!("{role} {}", a.ip()),
+            Err(_) => role.to_string(),
         },
         epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
         None,
@@ -980,66 +1058,72 @@ fn handle_udp_search_blocking(
             // Idle cap fired: the recv queue is drained, so flush any held
             // batch (C flushes on FIONREAD == 0) and re-check `shutdown`.
             Err(ref e) if is_read_timeout(e.kind()) => {
-                flush_held_batch(&socket, &mut batch, &mut batch_addr);
+                flush_held_batch(reply, &mut batch, &mut batch_addr);
                 continue;
             }
-            // C `cast_server.c:171-179`: a UDP recv error never exits the
-            // responder — an earlier reply drawing an ICMP port-unreachable
-            // surfaces here as ECONNREFUSED/ECONNRESET. Log-and-continue.
-            Err(ref e) if is_peer_disconnect(e.kind()) => continue,
-            Err(e) => return Err(CaError::Io(e)),
+            // C `cast_server.c:170-178`: any recv error but EINTR is printed,
+            // then the responder sleeps 1 s and keeps receiving.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                tracing::warn!(target: "epics_ca_rs::server::udp", "CAS: UDP recv error: {e}");
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
         };
-        if len < CaHeader::SIZE {
-            continue;
-        }
-
-        // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
-        // to its source; if this datagram is from a different peer, flush the
-        // held batch to the old peer before adopting the new one.
-        if let Some(prev) = batch_addr {
-            if prev != src {
-                if let Some(dg) = batch.take_reply() {
-                    send_udp_reply(&socket, prev, &dg);
+        // C `cast_server.c:182-189`: a source on `casIgnoreAddrs` is dropped
+        // before `camessage`, as is a datagram too short to hold a header,
+        // yet both still reach the FIONREAD flush below.
+        let ignored = matches!(src, SocketAddr::V4(v4) if ignore.contains(v4.ip()));
+        if len >= CaHeader::SIZE && !ignored {
+            // Peer-change flush (C `cast_server.c:205-214`): a held batch belongs
+            // to its source; if this datagram is from a different peer, flush the
+            // held batch to the old peer before adopting the new one.
+            if let Some(prev) = batch_addr {
+                if prev != src {
+                    if let Some(dg) = batch.take_reply() {
+                        send_udp_reply(reply, prev, &dg);
+                    }
                 }
             }
-        }
-        batch_addr = Some(src);
+            batch_addr = Some(src);
 
-        // Drive the shared UDP decode on this thread into the held batch. Its
-        // only suspension point is the DB name lookup, Ready on the first poll
-        // for a local record, so `block_on_sync` selects `park_on` and needs
-        // no runtime. Over-threshold sub-batches come back in `ready` and go
-        // out immediately to this datagram's source (C `cas_send_dg_msg`
-        // flushes each full batch as it fills).
-        let mut ready: Vec<Vec<u8>> = Vec::new();
-        if block_on_sync(udp::parse_search_datagram(
-            &buf[..len],
-            &db,
-            tcp_port,
-            src,
-            &mut batch,
-            &mut ready,
-        ))
-        .is_err()
-        {
-            return Err(CaError::Protocol(
-                "blocking UDP responder: decode future not blockable in this thread context".into(),
-            ));
-        }
-        for dg in &ready {
-            send_udp_reply(&socket, src, dg);
+            // Drive the shared UDP decode on this thread into the held batch. Its
+            // only suspension point is the DB name lookup, Ready on the first poll
+            // for a local record, so `block_on_sync` selects `park_on` and needs
+            // no runtime. Over-threshold sub-batches come back in `ready` and go
+            // out immediately to this datagram's source (C `cas_send_dg_msg`
+            // flushes each full batch as it fills).
+            let mut ready: Vec<Vec<u8>> = Vec::new();
+            if block_on_sync(udp::parse_search_datagram(
+                &buf[..len],
+                &db,
+                tcp_port,
+                src,
+                &mut batch,
+                &mut ready,
+            ))
+            .is_err()
+            {
+                return Err(CaError::Protocol(
+                    "blocking UDP responder: decode future not blockable in this thread context"
+                        .into(),
+                ));
+            }
+            for dg in &ready {
+                send_udp_reply(reply, src, dg);
+            }
         }
 
         // FIONREAD batch-up gate (C `cast_server.c:268-281`): flush the held
         // batch only when the recv queue is drained (or FIONREAD errors);
         // otherwise hold so the next same-source datagram coalesces into it.
-        match blocking_io::pending_bytes(&socket) {
-            Ok(0) | Err(_) => flush_held_batch(&socket, &mut batch, &mut batch_addr),
+        match blocking_io::pending_bytes(socket) {
+            Ok(0) | Err(_) => flush_held_batch(reply, &mut batch, &mut batch_addr),
             Ok(_) => { /* more datagrams pending: hold to coalesce */ }
         }
     }
     // Shutdown requested: flush any held batch so a buffered reply is not lost.
-    flush_held_batch(&socket, &mut batch, &mut batch_addr);
+    flush_held_batch(reply, &mut batch, &mut batch_addr);
     Ok(())
 }
 
@@ -1769,6 +1853,7 @@ mod tests {
     use super::*;
     use crate::protocol::ECA_TOLARGE;
     use source_guard::{Comments, production};
+    use std::sync::atomic::AtomicUsize;
     /// The refusal must reach the peer as a protocol message, not as a bare
     /// close. Measured on target, a client past the ceiling completed its
     /// VERSION send and then saw the socket go away with nothing on it.
@@ -2031,6 +2116,18 @@ mod tests {
         );
     }
 
+    /// C sets the fanout options on every port (`caservertask.c:628`), so a
+    /// responder on a number it chose still takes a co-binding responder.
+    #[cfg(unix)]
+    #[test]
+    fn a_responder_on_a_chosen_port_lets_a_fanout_socket_co_bind() {
+        let first = bind_udp_search(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("first responder");
+        let port = first.local_addr().expect("local addr").port();
+        bind_udp_search(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))
+            .expect("fanout co-bind");
+    }
+
     /// The CA server's threads are the ones that scale with client count, so
     /// an unstated stack size here is what sets the target's first ceiling.
     ///
@@ -2060,6 +2157,10 @@ mod tests {
     fn every_ca_server_thread_states_a_stack_size() {
         let files = [
             ("server/blocking.rs", include_str!("blocking.rs")),
+            (
+                "server/blocking_serving.rs",
+                include_str!("blocking_serving.rs"),
+            ),
             (
                 "bin/realtime-ca-ioc.rs",
                 include_str!("../bin/realtime-ca-ioc.rs"),
@@ -2241,9 +2342,9 @@ mod tests {
 
         assert_eq!(
             prod.matches("enter_ioc_thread(").count(),
-            2,
-            "the accept loop and the UDP responder take their own band; the \
-             two per-client bands are the roster's"
+            3,
+            "the accept loop, the UDP responder and the beacon sender take \
+             their own band; the two per-client bands are the roster's"
         );
         // The per-client half: both bands stated, and C's ordering between them
         // (the event sender one level below the receiver) visible in the roster
@@ -2281,6 +2382,7 @@ mod tests {
         for (entry, band) in [
             ("pub fn serve(&self) {", "CAS_TCP_PRIORITY"),
             ("pub fn serve_udp_search(", "CAS_UDP_PRIORITY"),
+            ("pub(crate) fn serve_beacons(", "CAS_BEACON_PRIORITY"),
         ] {
             let at = prod
                 .find(entry)
@@ -2304,8 +2406,8 @@ mod tests {
     /// RTEMS is exactly `p - 1` (`libcom/src/osi/os/RTEMS-score/osdThread.c:
     /// 120-131`) — so `20, 19, 18, 17, 16` — and takes `[0]` for the per-client
     /// TCP receiver (`:109`), `[1]` for its event sender (`:560`, `:1508`),
-    /// `[2]` for `CAS-TCP` (`:716`) and `[4]` for `CAS-UDP` (`:722`). `[3]` is
-    /// the beacon sender, which we do not run as a separate thread.
+    /// `[2]` for `CAS-TCP` (`:716`), `[3]` for `CAS-beacon` (`:758`) and `[4]`
+    /// for `CAS-UDP` (`:722`).
     ///
     /// Wiring each is a one-line call that does nothing at all with the RT
     /// switch off, so nothing else in the suite would notice two of them being
@@ -2321,6 +2423,7 @@ mod tests {
         assert_eq!(receiver.value(), 20, "epicsThreadPriorityCAServerLow");
         assert_eq!(sender.value(), 19, "threadPrios[1]");
         assert_eq!(CAS_TCP_PRIORITY.value(), 18, "threadPrios[2]");
+        assert_eq!(CAS_BEACON_PRIORITY.value(), 17, "threadPrios[3]");
         assert_eq!(CAS_UDP_PRIORITY.value(), 16, "threadPrios[4]");
         assert!(
             sender.value() < receiver.value(),
@@ -2668,15 +2771,15 @@ mod tests {
     /// exit path covers this one.
     #[test]
     fn a_panicking_client_still_returns_its_slot() {
-        let active = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(ServerStats::default());
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _slot = ClientSlot::take(active.clone());
-            assert_eq!(active.load(Ordering::Acquire), 1);
+            let _slot = ClientSlot::take(stats.clone());
+            assert_eq!(stats.active_clients(), 1);
             panic!("client thread blew up");
         }));
         assert!(panicked.is_err(), "precondition: the body must panic");
         assert_eq!(
-            active.load(Ordering::Acquire),
+            stats.active_clients(),
             0,
             "an unwinding client thread must not leak its slot — the count \
              would drift up and never come down"
@@ -3381,6 +3484,147 @@ mod tests {
         );
 
         server.shutdown();
+        udp_thread.join().unwrap().unwrap();
+    }
+
+    /// A search read off the broadcast socket is answered from the
+    /// interface's own socket, as `cast_server` answers through `conf->udp`
+    /// whichever socket it reads (`cast_server.c:127`).
+    #[test]
+    fn a_cas_udp2_search_is_answered_from_the_interface_socket() {
+        let db = seed_db(&[("BLK:UDP2", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let any = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let (bcast, reply) = (UdpSocket::bind(any).unwrap(), UdpSocket::bind(any).unwrap());
+        let (bcast_addr, reply_addr) = (bcast.local_addr().unwrap(), reply.local_addr().unwrap());
+
+        let srv = server.clone();
+        let udp_thread = thread::spawn(move || srv.serve_udp_responder(&bcast, &reply, "CAS-UDP2"));
+
+        let client = UdpSocket::bind(any).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut dg = udp_version_prelude(1);
+        dg.extend_from_slice(&udp_search_frame(0x43, "BLK:UDP2"));
+        client.send_to(&dg, bcast_addr).unwrap();
+
+        let mut rbuf = vec![0u8; 64 * 1024];
+        let (n, from) = client.recv_from(&mut rbuf).expect("SEARCH reply");
+        assert_eq!(
+            from, reply_addr,
+            "answered from conf->udp, not the bcast socket"
+        );
+        assert_eq!(search_reply_cids(&rbuf[..n]), vec![0x43]);
+
+        server.shutdown();
+        udp_thread.join().unwrap().unwrap();
+    }
+
+    /// A recv error is reported and the responder keeps serving
+    /// (`cast_server.c:170-178`). The error is injected as the ECONNREFUSED a
+    /// connected socket's send to a closed port leaves pending.
+    #[test]
+    fn a_udp_recv_error_is_reported_and_the_responder_keeps_serving() {
+        let db = seed_db(&[("BLK:RERR", EpicsValue::Double(1.0))]);
+        let resp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let resp_addr = resp.local_addr().unwrap();
+        let closed = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        resp.connect(closed).unwrap();
+        resp.send(b"x").unwrap();
+        let resp = Arc::new(resp);
+        let rearm = resp.clone();
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let recorder = RefusalRecorder {
+            errlog: Arc::new(AtomicUsize::new(0)),
+            elsewhere: errors.clone(),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let udp_thread = thread::spawn(move || {
+            tracing::subscriber::with_default(recorder, || {
+                handle_udp_search_blocking(&resp, &resp, "CAS-UDP", &[], db, 5064, &stop)
+            })
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while errors.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recv error was not reported"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        rearm.connect(client.local_addr().unwrap()).unwrap();
+        client
+            .send_to(&udp_search_frame(7, "BLK:RERR"), resp_addr)
+            .unwrap();
+        let mut rbuf = vec![0u8; 64 * 1024];
+        let (n, _) = client
+            .recv_from(&mut rbuf)
+            .expect("the responder still answers");
+        assert_eq!(search_reply_cids(&rbuf[..n]), vec![7]);
+
+        shutdown.store(true, Ordering::Release);
+        udp_thread.join().unwrap().unwrap();
+    }
+
+    /// A search from an `EPICS_CAS_IGNORE_ADDR_LIST` source draws no reply,
+    /// one from any other source does (`cast_server.c:182-189`).
+    #[test]
+    fn a_search_from_an_ignored_source_is_not_answered() {
+        let db = seed_db(&[("BLK:IGN", EpicsValue::Double(1.0))]);
+        let resp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let resp_addr = resp.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = shutdown.clone();
+        let udp_thread = thread::spawn(move || {
+            handle_udp_search_blocking(
+                &resp,
+                &resp,
+                "CAS-UDP",
+                &[Ipv4Addr::LOCALHOST],
+                db,
+                5064,
+                &stop,
+            )
+        });
+
+        let mut rbuf = vec![0u8; 64 * 1024];
+        let ignored = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        ignored
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        ignored
+            .send_to(&udp_search_frame(1, "BLK:IGN"), resp_addr)
+            .unwrap();
+        let other = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        other
+            .send_to(&udp_search_frame(2, "BLK:IGN"), resp_addr)
+            .unwrap();
+
+        let (n, _) = other
+            .recv_from(&mut rbuf)
+            .expect("the other source is answered");
+        assert_eq!(search_reply_cids(&rbuf[..n]), vec![2]);
+        assert!(
+            ignored.recv_from(&mut rbuf).is_err(),
+            "the ignored source drew a reply"
+        );
+
+        shutdown.store(true, Ordering::Release);
         udp_thread.join().unwrap().unwrap();
     }
 

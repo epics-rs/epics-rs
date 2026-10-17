@@ -384,6 +384,11 @@ impl ReactorPvaServer {
         &self.peers
     }
 
+    /// The served source, `__server` composed in.
+    pub fn source(&self) -> &DynSource {
+        &self.source
+    }
+
     /// Connections currently being served — `ConnTable`'s count, which is
     /// the only one.
     pub fn active_connections(&self) -> usize {
@@ -408,6 +413,12 @@ impl ReactorPvaServer {
             self.config.tcp_port,
             &self.shutdown,
         )
+    }
+
+    /// This server's beacons; see
+    /// [`PvaServerDriver::beacon_sender`](super::driver::PvaServerDriver::beacon_sender).
+    pub fn beacon_sender(&self, udp_port: u16) -> io::Result<super::driver::BeaconSender> {
+        super::beacon::BeaconSender::bind(self.source.clone(), &self.config, udp_port)
     }
 
     /// Accept until [`shutdown`](Self::shutdown).

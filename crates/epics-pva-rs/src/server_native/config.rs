@@ -206,12 +206,11 @@ pub struct PvaServerConfig {
     /// at sites with strict UDP bandwidth budgets can lower this; the
     /// only correctness constraint is `> beacon_period`.
     pub beacon_period_long: Duration,
-    /// Number of short-interval beacons emitted before the cadence
-    /// drops to `beacon_period_long`. Default 10 (pvxs
-    /// `src/server.cpp:829` hardcodes the same value). After this many
-    /// bursts every receiver in earshot has had multiple chances to
-    /// notice the new server; further short-interval beacons just
-    /// burn UDP bandwidth without informational gain.
+    /// Number of `beacon_period` waits after the first beacon before the
+    /// cadence drops to `beacon_period_long`. Default 10, pvxs's hardcoded
+    /// `beaconCnt<10u` (`src/server.cpp:813-817`): 11 beacons at the short
+    /// period. After those every receiver in earshot has had multiple
+    /// chances to notice the new server.
     pub beacon_burst_count: u8,
     /// Explicit beacon destinations, each carrying optional pvxs multicast
     /// modifiers (TTL / outgoing interface; see [`crate::config::Endpoint`]).
@@ -324,17 +323,6 @@ pub struct PvaServerConfig {
     /// host's discovery traffic can be suppressed while its direct TCP
     /// clients still connect. Empty = allow all (default).
     pub ignore_addrs: Vec<(std::net::IpAddr, u16)>,
-    /// Spawn a parallel IPv6 UDP listener bound to `[::]:udp_port`
-    /// alongside the existing IPv4 per-NIC responder. Required for
-    /// PVA clients that send SEARCH over IPv6 unicast / multicast.
-    /// Default `false` keeps every existing deployment exactly v4-only.
-    ///
-    /// Stage 2 of the PR #205 IPv6 effort. The v6 responder shares
-    /// the GUID / TCP-port / protocol of the v4 path so a single
-    /// client sees one consistent PVA server regardless of which
-    /// address family carried the SEARCH. Beacon emission stays on
-    /// the v4 path for now; v6 multicast beacons are deferred.
-    pub enable_ipv6_udp: bool,
     /// Per-monitor "low" watermark, currently
     /// unused (pvxs notes the `onLowMark` callback isn't fully
     /// implemented either). Reserved for future flow-control logic.
@@ -415,7 +403,6 @@ impl Default for PvaServerConfig {
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
-            enable_ipv6_udp: false,
             monitor_low_watermark: 0,
             auth_complete: None,
             send_timeout: Duration::from_secs(5),

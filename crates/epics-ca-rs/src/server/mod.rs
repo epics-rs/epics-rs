@@ -2,18 +2,18 @@
 
 pub mod access_token;
 pub mod addr_list;
-// The async server front-end — the `tokio::net` accept/beacon/introspection
+// The async server front-end — the `tokio::net` accept/introspection
 // stack and the `CaServer` orchestrator (which also drives `tokio::signal` and
 // the `discovery` stack) — is host-only; its deps do not build for RTEMS or
 // VxWorks. The embedded build serves CA through the `std::net` `blocking`
 // driver plus the runtime-agnostic shared logic in
-// `tcp`/`udp`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
+// `tcp`/`udp`/`beacon`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
 // hands each client to `runtime::task::Reactor`, so it needs a build where
 // that seam is the tokio runtime, which excludes the two embedded targets and
 // a host `exec_backend` build alike.
-#[cfg(tokio_backend)]
 pub mod beacon;
 pub mod blocking;
+pub mod blocking_serving;
 #[cfg(tokio_backend)]
 pub mod ca_server;
 #[cfg(test)]
@@ -42,13 +42,10 @@ pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
 pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 
-// `run_ca_ioc` (below) builds a `CaServer` — the async front-end — so both it
-// and these imports carry its `tokio_backend` gate. Every reactor-free build
-// enters through the blocking server driver (`server::blocking`) instead: the
-// two embedded targets, and a host `exec_backend` build with them.
-#[cfg(tokio_backend)]
+// `run_ca_ioc` (below) builds a `CaServer` — the async front-end — on tokio;
+// every reactor-free build serves through `blocking_serving` instead: the two
+// embedded targets, and a host `exec_backend` build with them.
 use epics_base_rs::error::CaResult;
-#[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
 pub(crate) use epics_base_rs::server::database::channel_io::LongStringMode;
@@ -71,7 +68,6 @@ pub(crate) use epics_base_rs::server::database::dbr_delivery::DeliveryStage;
 ///
 /// The `ca` link set comes with it for the same reason: C's dbCa is in every
 /// IOC, so it is the runner's to install, not each head's.
-#[cfg(tokio_backend)]
 pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
     iocsh::register_rsrv_commands(app)
         .register_link_type("ca", {
@@ -135,6 +131,122 @@ pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
             }
         })
         .await
+}
+
+/// [`run_ca_ioc`] on the exec backend: RSRV through
+/// [`blocking_serving::BlockingCaServing`], then the same `dbServer` join and
+/// shell the tokio `CaServer::run_with_shell` gives.
+#[cfg(exec_backend)]
+pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
+    iocsh::declare_rsrv_registrar();
+    let serving = blocking_serving::BlockingCaServing::start(
+        config.port,
+        config.tcp_port.unwrap_or(config.port),
+        config.db.clone(),
+        config.acf.clone(),
+        std::sync::Arc::new(ServerStats::default()),
+    )
+    .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))?;
+    iocsh::register_ca_db_server();
+    epics_base_rs::server::db_server::db_run_servers();
+    epics_base_rs::server::db_server::announce_serving();
+    let result = config.run_shell(iocsh::ca_server_commands()).await;
+    serving.shutdown();
+    result
+}
+
+/// RSRV serving a database in the background, on either backend: the async
+/// `CaServer` on a reactor task under `tokio_backend`, the
+/// [`blocking_serving::BlockingCaServing`] threads under `exec_backend`.
+///
+/// For a head that serves CA beside something else in the foreground (a PVA
+/// shell, a second server). Bound, joined to `dbServer` and announced by the
+/// time [`Self::start`] returns, as C's `rsrv_run` has when `iocRun` returns.
+pub struct RsrvServing {
+    #[cfg(tokio_backend)]
+    task: epics_base_rs::runtime::task::TaskHandle<CaResult<()>>,
+    #[cfg(exec_backend)]
+    serving: blocking_serving::BlockingCaServing,
+}
+
+impl RsrvServing {
+    /// Serve `db` on UDP `port` and TCP `tcp_port` (`None` shares `port`),
+    /// on the sockets RSRV's init bound into `servers` when it ran.
+    pub async fn start(
+        db: std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+        port: u16,
+        tcp_port: Option<u16>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+        autosave_config: Option<(
+            epics_base_rs::server::autosave::SaveSetConfig,
+            epics_base_rs::server::autosave::SaveStrategy,
+        )>,
+        autosave_manager: Option<std::sync::Arc<epics_base_rs::server::autosave::AutosaveManager>>,
+        servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    ) -> CaResult<Self> {
+        #[cfg(tokio_backend)]
+        {
+            let mut builder =
+                CaServerBuilder::serving(db, acf, autosave_config, autosave_manager).port(port);
+            if let Some(tcp_port) = tcp_port {
+                builder = builder.tcp_port(tcp_port);
+            }
+            let server = builder.bound_at_init(servers).build().await?;
+            // `CaServer::run` drives `tokio::net`, so the task goes on the
+            // tokio runtime this is awaited on.
+            let task = tokio::runtime::Handle::try_current()
+                .expect("RsrvServing::start is awaited on the IOC's reactor")
+                .spawn(async move {
+                    let result = server.run().await;
+                    if let Err(e) = &result {
+                        eprintln!("CA server error: {e}");
+                    }
+                    result
+                });
+            Ok(Self { task })
+        }
+        #[cfg(exec_backend)]
+        {
+            // The blocking server has no autosave tail; the PVA server or the
+            // IOC head runs it. RSRV's init binds on tokio only, so there is
+            // nothing in `servers` to take.
+            let _ = (autosave_config, autosave_manager, servers);
+            let serving = blocking_serving::BlockingCaServing::start(
+                port,
+                tcp_port.unwrap_or(port),
+                db,
+                acf,
+                std::sync::Arc::new(ServerStats::default()),
+            )
+            .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))?;
+            iocsh::register_ca_db_server();
+            epics_base_rs::server::db_server::db_run_servers();
+            epics_base_rs::server::db_server::announce_serving();
+            Ok(Self { serving })
+        }
+    }
+
+    /// Until serving ends, with its result.
+    pub async fn wait(self) -> CaResult<()> {
+        #[cfg(tokio_backend)]
+        let joined = self.task.await;
+        #[cfg(exec_backend)]
+        let joined =
+            epics_base_rs::runtime::task::spawn_blocking(move || self.serving.join()).await;
+        joined.unwrap_or_else(|e| {
+            Err(epics_base_rs::error::CaError::InvalidValue(format!(
+                "CA server task failed: {e}"
+            )))
+        })
+    }
+
+    /// Stop serving.
+    pub fn shutdown(&self) {
+        #[cfg(tokio_backend)]
+        self.task.abort();
+        #[cfg(exec_backend)]
+        self.serving.shutdown();
+    }
 }
 
 /// The address lists RSRV's `casr` prints from level 1 up

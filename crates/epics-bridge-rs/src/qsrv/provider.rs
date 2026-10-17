@@ -708,11 +708,6 @@ pub struct BridgeProvider {
     /// [`Self::group_generation`] it judged. pvxs judges a group once, so its
     /// `dbChannelCreate`s (and their errlog lines) run once, not per serve.
     group_verdicts: parking_lot::RwLock<HashMap<String, (u64, [Option<String>; 2])>>,
-    /// Cumulative count of channels this provider has handed out, which
-    /// `qsrvStats` prints beside the server's live counts. Not a pvxs
-    /// metric — `qStats` (singlesourcehooks.cpp:88) reports only what is
-    /// live — and it never decrements; restart the IOC for a clean slate.
-    channels_created: std::sync::atomic::AtomicU64,
     /// Metadata cache for single-record channels: (NtType, DbFieldType).
     /// Avoids repeated record introspection on every create_channel() call.
     /// Corresponds to C++ PDBProvider's transient_pv_map.
@@ -840,7 +835,6 @@ impl BridgeProvider {
             group_verdicts: parking_lot::RwLock::new(HashMap::new()),
             record_cache: parking_lot::RwLock::new(HashMap::new()),
             access_cell: Arc::new(parking_lot::RwLock::new(Arc::new(AllowAllAccess))),
-            channels_created: std::sync::atomic::AtomicU64::new(0),
             base_group_defs: parking_lot::RwLock::new(Vec::new()),
             group_files: parking_lot::RwLock::new(Vec::new()),
             group_generation: std::sync::atomic::AtomicU64::new(0),
@@ -890,26 +884,6 @@ impl BridgeProvider {
     ) -> epics_base_rs::server::snapshot::PropertySupport {
         channel_property_support(&self.db, name).await
     }
-
-    /// Snapshot of the provider's cumulative channel-creation count.
-    pub fn op_stats(&self) -> ProviderOpStats {
-        use std::sync::atomic::Ordering::Relaxed;
-        ProviderOpStats {
-            channels_created: self.channels_created.load(Relaxed),
-        }
-    }
-
-    /// Bump the channel-creation counter. Called from `create_channel_for`.
-    pub fn note_channel_created(&self) {
-        self.channels_created
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Snapshot returned by [`BridgeProvider::op_stats`].
-#[derive(Debug, Clone, Default)]
-pub struct ProviderOpStats {
-    pub channels_created: u64,
 }
 
 impl BridgeProvider {
@@ -1526,7 +1500,6 @@ impl BridgeProvider {
                 String::from_utf8_lossy(name).into_owned(),
             ));
         }
-        self.note_channel_created();
         let def = self.servable_group(name).await.ok_or_else(|| {
             BridgeError::ChannelNotFound(String::from_utf8_lossy(name).into_owned())
         })?;
@@ -1589,14 +1562,12 @@ impl BridgeProvider {
     ) -> BridgeResult<AnyChannel> {
         // QSRV2 disabled: refuse to construct any DB-backed / group
         // channel. Mirrors pvxs not registering the single/group sources
-        // (iochooks.cpp:461-496); the not-counted early return keeps the
-        // `qsrvStats` channel tally honest about what was actually served.
+        // (iochooks.cpp:461-496).
         if !self.enabled {
             return Err(BridgeError::ChannelNotFound(
                 String::from_utf8_lossy(name).into_owned(),
             ));
         }
-        self.note_channel_created();
 
         // Check group PVs first — but a group name that collides with
         // a real record is ignored (the record wins), matching pvxs

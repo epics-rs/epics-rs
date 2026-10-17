@@ -529,76 +529,6 @@ pub fn resolve_host_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
         .ok_or_else(|| format!("no IPv4 address for {host:?}"))
 }
 
-/// Resolve an endpoint `@iface` suffix to the interface's IPv4 address.
-/// Accepts either a literal IPv4 address (returned verbatim) or an OS
-/// interface name (`eth0`, `en0`, `lo0`), looked up via `getifaddrs`.
-///
-/// pvxs's `SockEndpoint` ctor accepts both an interface name and an
-/// interface IPv4 address, normalising the address back to a name
-/// through `IfaceMap::name_of` (`config.cpp:76-80`). Resolving the
-/// suffix only as a DNS host — as the cable tester previously did — made
-/// `pvxvct -B 224.0.1.1@en0` fail unless `en0` happened to exist in DNS.
-/// This is the single owner both tools share for `@iface` resolution.
-pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
-    if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
-        return Ok(v4);
-    }
-    #[cfg(all(unix, not(epics_embedded_target)))]
-    {
-        iface_name_to_ipv4(spec)
-    }
-    // RTEMS and VxWorks are both `cfg(unix)`, but RTEMS's newlib exposes no
-    // `getifaddrs`/`ifaddrs`/`freeifaddrs` (design doc §8.1), and neither
-    // does VxWorks's `libc` module, so a name cannot be resolved on either.
-    // Same answer as any other non-getifaddrs host: say so and name the
-    // workaround, rather than guessing an address.
-    #[cfg(any(not(unix), epics_embedded_target))]
-    {
-        Err(format!(
-            "interface-name override {spec:?} requires a host with \
-             getifaddrs(3); pass the interface's IPv4 address instead"
-        ))
-    }
-}
-
-/// Look up an interface's first IPv4 address by name via `getifaddrs`.
-#[cfg(all(unix, not(epics_embedded_target)))]
-fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
-    use std::ffi::CStr;
-    use std::net::Ipv4Addr;
-
-    // SAFETY: getifaddrs allocates a linked list we free via
-    // freeifaddrs; every pointer is null-checked before deref.
-    unsafe {
-        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return Err(format!(
-                "getifaddrs failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut cur = ifap;
-        let mut found: Option<Ipv4Addr> = None;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                let sa = &*ifa.ifa_addr;
-                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
-                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    // s_addr is in network byte order.
-                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    found = Some(addr);
-                    break;
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,26 +781,6 @@ mod tests {
         );
         let lo = resolve_host_ipv4("localhost").expect("localhost resolves");
         assert!(lo.is_loopback(), "expected IPv4 loopback, got {lo}");
-    }
-
-    /// `resolve_iface_ipv4` accepts a literal interface IPv4 address
-    /// verbatim and, on Unix, resolves an interface *name* to its IPv4
-    /// address — the dual form pvxs's `SockEndpoint` ctor accepts
-    /// (`config.cpp:76-80`). The loopback interface is `lo` on Linux
-    /// and `lo0` on macOS/BSD; try both.
-    #[test]
-    fn resolve_iface_ipv4_literal_and_name() {
-        assert_eq!(
-            resolve_iface_ipv4("10.0.0.2").unwrap(),
-            std::net::Ipv4Addr::new(10, 0, 0, 2)
-        );
-        #[cfg(unix)]
-        {
-            let lo = resolve_iface_ipv4("lo").or_else(|_| resolve_iface_ipv4("lo0"));
-            if let Ok(v4) = lo {
-                assert!(v4.is_loopback(), "loopback iface IPv4 expected, got {v4}");
-            }
-        }
     }
 
     /// The two `getopt` failure lines every pvAccess tool prints for

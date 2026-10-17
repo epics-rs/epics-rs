@@ -2,8 +2,6 @@
 //!
 //! Built on top of the native runtime in [`crate::server_native`].
 
-// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend -
-// server/mod.rs declares it under #[cfg(tokio_backend)] mod pva_server;.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,6 +13,7 @@ use epics_base_rs::server::{access_security, autosave, iocsh};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::watch;
 
+use crate::error::PvaResult;
 use crate::server_native::{ChannelSource, PvaServerConfig, ServerReportHandle};
 
 use super::native_source::PvDatabaseSource;
@@ -38,11 +37,18 @@ pub struct PvaServerBuilder {
 /// `Server(conf)` exception thrown by a failed `sock.bind()`
 /// (`udp_collector.cpp:151`) and prints `Error in <func> : <what>`
 /// (`ioc/iochooks.cpp:508-509`, pvxs 1.5.3).
-fn announce_server_failure(result: CaResult<()>) -> CaResult<()> {
+fn announce_server_failure(result: PvaResult<()>) -> CaResult<()> {
     if let Err(e) = &result {
-        eprintln!("Error in pvxsBaseRegistrar : {e}");
+        eprintln!(
+            "Error in pvxsBaseRegistrar : {}",
+            super::iocsh::pvxs_what(e)
+        );
     }
-    result
+    result.map_err(into_ca)
+}
+
+fn into_ca(e: crate::error::PvaError) -> CaError {
+    CaError::InvalidValue(e.to_string())
 }
 
 impl PvaServerBuilder {
@@ -94,6 +100,7 @@ impl PvaServerBuilder {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager: None,
+            #[cfg(tokio_backend)]
             registrar: std::sync::Mutex::new(None),
         })
     }
@@ -128,6 +135,7 @@ pub struct PvaServer {
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     /// What [`super::iocsh::pvxs_base_registrar`] bound, taken by the first
     /// run; `None` binds at the run, as a server with no registrar must.
+    #[cfg(tokio_backend)]
     registrar: std::sync::Mutex<Option<super::iocsh::PvxsServer>>,
 }
 
@@ -159,6 +167,7 @@ impl PvaServer {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
+            #[cfg(tokio_backend)]
             registrar: std::sync::Mutex::new(None),
         }
     }
@@ -167,12 +176,17 @@ impl PvaServer {
     /// the startup script, as pvxs starts the registrar's server at
     /// `initHookAfterIocRunning` (`ioc/iochooks.cpp:374-379`). A registrar
     /// whose bind failed leaves no server, and this one then serves nothing.
+    /// On the exec backend no registrar binds, and the server binds at the run.
     pub fn bound_at_registrar(
         self,
+        #[cfg_attr(exec_backend, allow(unused_variables))]
         servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
     ) -> Self {
-        *self.registrar.lock().unwrap() =
-            servers.take::<super::iocsh::PvxsServer>(super::iocsh::PVXS_SERVER);
+        #[cfg(tokio_backend)]
+        {
+            *self.registrar.lock().unwrap() =
+                servers.take::<super::iocsh::PvxsServer>(super::iocsh::PVXS_SERVER);
+        }
         self
     }
 
@@ -254,12 +268,17 @@ impl PvaServer {
         &self,
         report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
     ) -> CaResult<()> {
-        let source = Arc::new(PvDatabaseSource::new_with_acf_and_version(
+        self.run_with_source_inner(self.db_source(), report_tx)
+            .await
+            .map_err(into_ca)
+    }
+
+    fn db_source(&self) -> Arc<PvDatabaseSource> {
+        Arc::new(PvDatabaseSource::new_with_acf_and_version(
             self.db.clone(),
             self.acf.clone(),
             self.acl_version.clone(),
-        ));
-        self.run_with_source_inner(source, report_tx).await
+        ))
     }
 
     /// Run with a caller-supplied [`ChannelSource`] (e.g. qsrv group source).
@@ -267,7 +286,9 @@ impl PvaServer {
         &self,
         source: Arc<S>,
     ) -> CaResult<()> {
-        self.run_with_source_inner(source, None).await
+        self.run_with_source_inner(source, None)
+            .await
+            .map_err(into_ca)
     }
 
     /// As [`Self::run_with_source`], but publishes a
@@ -280,24 +301,32 @@ impl PvaServer {
         &self,
         source: Arc<S>,
         report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
-    ) -> CaResult<()> {
+    ) -> PvaResult<()> {
         // The environment is the base (pvxs `Config::applyEnv`); an
         // explicit port overrides the TCP port alone. The search port is
         // `EPICS_PVAS_BROADCAST_PORT`, then `EPICS_PVA_BROADCAST_PORT`, then
         // 5076 (pvxs `config.cpp:410-415`), whatever the TCP port is.
+        //
+        // Read only by a path that binds: a server the registrar bound has
+        // read it already, and a second read logs its warnings twice.
+        #[cfg(tokio_backend)]
         let registrar = self.registrar.lock().unwrap().take();
-        let mut config = PvaServerConfig::default().with_env();
-        if let Some(port) = self.port {
-            config.tcp_port = port;
-            // An explicit `0` asks for a server on no fixed port, so the
-            // search port goes ephemeral with it and two such servers on one
-            // host never share one. `EPICS_PVAS_SERVER_PORT=0` is not this: it
-            // reaches here as `None` and leaves the search port alone, as
-            // softIocPVX 1.5.3 keeps 5076.
-            if port == 0 {
-                config.udp_port = 0;
+        let port = self.port;
+        let env_config = move || {
+            let mut config = PvaServerConfig::default().with_env();
+            if let Some(port) = port {
+                config.tcp_port = port;
+                // An explicit `0` asks for a server on no fixed port, so the
+                // search port goes ephemeral with it and two such servers on
+                // one host never share one. `EPICS_PVAS_SERVER_PORT=0` is not
+                // this: it reaches here as `None` and leaves the search port
+                // alone, as softIocPVX 1.5.3 keeps 5076.
+                if port == 0 {
+                    config.udp_port = 0;
+                }
             }
-        }
+            config
+        };
 
         // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
         // is owned by the IOC core — `epics_base_rs::server::scan::
@@ -321,46 +350,56 @@ impl PvaServer {
             None
         };
 
-        let started = match registrar {
-            Some(super::iocsh::PvxsServer(Some(bound))) => bound.start(source),
-            // pvxs's `initHookAfterIocRunning` with no `server()`: nothing to
-            // start, so `iocRun` is not held for it, and the autosave task
-            // above lives until the runner ends.
-            Some(super::iocsh::PvxsServer(None)) => {
-                epics_base_rs::server::db_server::announce_serving();
-                std::future::pending().await
+        let on_started = move |handle: ServerReportHandle| {
+            // pvxs `initialisePvxsServer` filling the `server()`
+            // singleton its already-registered `pvxsr` reads. Every
+            // caller publishes, shell or not, because the command may
+            // have been registered by `iocsh::register_pvxs_commands`
+            // at an application head this server knows nothing about.
+            super::iocsh::publish_pvxs_report(handle.clone());
+            if let Some(tx) = report_tx {
+                // Best-effort: a dropped receiver (no shell) just
+                // means nobody is watching the report.
+                let _ = tx.send(Some(handle));
             }
-            None => crate::server_native::PvaServer::bind(config).and_then(|bound| {
-                super::iocsh::publish_server_port(bound.bound_tcp_port());
-                bound.start(source)
-            }),
+            // Last in the callback, after everything the bound half owes:
+            // bound, published, report handed out, and about to serve —
+            // the PVA layer's half of what C's `dbRunServers()` returns
+            // having done. Every `run*` entry funnels through here, so it
+            // is the one place the layer can say it, and `BuiltIoc::run`
+            // holds the startup script's `iocInit` line until it has.
+            epics_base_rs::server::db_server::announce_serving();
         };
-        let served = async move {
-            crate::server_native::runtime::serve_reporting(started?, move |handle| {
-                // pvxs `initialisePvxsServer` filling the `server()`
-                // singleton its already-registered `pvxsr` reads. Every
-                // caller publishes, shell or not, because the command may
-                // have been registered by `iocsh::register_pvxs_commands`
-                // at an application head this server knows nothing about.
-                super::iocsh::publish_pvxs_report(handle.clone());
-                if let Some(tx) = report_tx {
-                    // Best-effort: a dropped receiver (no shell) just
-                    // means nobody is watching the report.
-                    let _ = tx.send(Some(handle));
+        // The one backend fork: which server the bound-and-serving half is.
+        #[cfg(tokio_backend)]
+        let result = async move {
+            let started = match registrar {
+                Some(super::iocsh::PvxsServer(Some(bound))) => bound.start(source),
+                // pvxs's `initHookAfterIocRunning` with no `server()`: nothing
+                // to start, so `iocRun` is not held for it, and the autosave
+                // task above lives until the runner ends.
+                Some(super::iocsh::PvxsServer(None)) => {
+                    epics_base_rs::server::db_server::announce_serving();
+                    std::future::pending().await
                 }
-                // Last in the callback, after everything the bound half owes:
-                // bound, published, report handed out, and about to serve —
-                // the PVA layer's half of what C's `dbRunServers()` returns
-                // having done. Every `run*` entry funnels through here, so it
-                // is the one place the layer can say it, and `BuiltIoc::run`
-                // holds the startup script's `iocInit` line until it has.
-                epics_base_rs::server::db_server::announce_serving();
-            })
-            .await
-        };
-        let result = served
-            .await
-            .map_err(|e| CaError::InvalidValue(e.to_string()));
+                None => crate::server_native::PvaServer::bind(env_config()).and_then(|bound| {
+                    super::iocsh::publish_server_port(bound.bound_tcp_port());
+                    bound.start(source)
+                }),
+            };
+            crate::server_native::runtime::serve_reporting(started?, on_started).await
+        }
+        .await;
+        #[cfg(exec_backend)]
+        let result = crate::server_native::serving::run_native_server_reporting(
+            source as crate::server_native::source::DynSource,
+            env_config(),
+            |handle| {
+                super::iocsh::publish_server_port(handle.bound_tcp_port());
+                on_started(handle)
+            },
+        )
+        .await;
 
         if let Some(h) = autosave_handle {
             h.abort();
@@ -384,9 +423,17 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let server_handle = bridge
-            .reactor()
-            .spawn(async move { announce_server_failure(server_clone.run_reporting(None).await) });
+        let generation = epics_base_rs::server::db_server::serving_generation();
+        let mut server_handle = bridge.reactor().spawn(async move {
+            announce_server_failure(
+                server_clone
+                    .run_with_source_inner(server_clone.db_source(), None)
+                    .await,
+            )
+        });
+        let ended =
+            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
+                .await;
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -409,8 +456,10 @@ impl PvaServer {
 
         let shell_result = rx.await;
 
-        server_handle.abort();
-        let _ = server_handle.await;
+        if ended.is_none() {
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
 
         match shell_result {
             Ok(Ok(())) => Ok(()),
@@ -446,9 +495,13 @@ impl PvaServer {
         let server = Arc::new(self);
 
         let server_clone = server.clone();
-        let server_handle = bridge.reactor().spawn(async move {
+        let generation = epics_base_rs::server::db_server::serving_generation();
+        let mut server_handle = bridge.reactor().spawn(async move {
             announce_server_failure(server_clone.run_with_source_inner(source, None).await)
         });
+        let ended =
+            epics_base_rs::server::db_server::serving_or_ended(generation, &mut server_handle)
+                .await;
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -471,8 +524,10 @@ impl PvaServer {
 
         let shell_result = rx.await;
 
-        server_handle.abort();
-        let _ = server_handle.await;
+        if ended.is_none() {
+            server_handle.abort();
+            let _ = server_handle.await;
+        }
 
         match shell_result {
             Ok(Ok(())) => Ok(()),
@@ -488,7 +543,8 @@ impl PvaServer {
     }
 }
 
-#[cfg(test)]
+// Every test here awaits a tokio server on `#[tokio::test]`.
+#[cfg(all(test, tokio_backend))]
 mod tests {
     use super::*;
 

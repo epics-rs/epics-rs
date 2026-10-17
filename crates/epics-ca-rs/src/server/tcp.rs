@@ -1376,14 +1376,7 @@ impl BoundTcp {
 /// takes it; `bind_tcp_set` holds what a failing interface does.
 #[cfg(tokio_backend)]
 pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
-    let intf_addrs: Vec<std::net::Ipv4Addr> = {
-        let cfg = super::addr_list::from_env()?;
-        if cfg.intf_addrs.is_empty() {
-            vec![std::net::Ipv4Addr::UNSPECIFIED]
-        } else {
-            cfg.intf_addrs
-        }
-    };
+    let intf_addrs = rsrv_intf_addrs()?;
 
     let (listeners, bound_port) = bind_tcp_set(intf_addrs, port).await?;
     announce_tcp_port(port, bound_port);
@@ -1395,9 +1388,41 @@ pub async fn bind_tcp_listeners(port: u16) -> CaResult<BoundTcp> {
 
 /// C's line for an address that is no interface (`caservertask.c:222`);
 /// `ipAddrToDottedIP` prints `a.b.c.d:port` (`osiSock.c:168-170`).
-#[cfg(tokio_backend)]
 fn skipping_line(ip: std::net::Ipv4Addr, port: u16) -> String {
     format!("Skipping {ip}:{port} which is not an interface address")
+}
+
+/// The interfaces RSRV binds: `EPICS_CAS_INTF_ADDR_LIST`, or the wildcard
+/// when it is empty.
+pub(crate) fn rsrv_intf_addrs() -> CaResult<Vec<std::net::Ipv4Addr>> {
+    let cfg = super::addr_list::from_env()?;
+    Ok(if cfg.intf_addrs.is_empty() {
+        vec![std::net::Ipv4Addr::UNSPECIFIED]
+    } else {
+        cfg.intf_addrs
+    })
+}
+
+#[cfg(tokio_backend)]
+async fn bind_tcp_set(
+    intf_addrs: Vec<std::net::Ipv4Addr>,
+    port: u16,
+) -> CaResult<(Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>, u16)> {
+    // `TcpListener::bind`, spelled out so the bind is the synchronous call
+    // the shared rule takes.
+    bind_tcp_set_with(
+        intf_addrs,
+        port,
+        |addr| {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            #[cfg(not(windows))]
+            socket.set_reuseaddr(true)?;
+            socket.bind(addr.into())?;
+            Ok(Arc::new(socket.listen(1024)?))
+        },
+        |l| Ok(l.local_addr()?.port()),
+    )
+    .map_err(Into::into)
 }
 
 /// `rsrv_grab_tcp` (`caservertask.c:155-267`): bind every interface on one
@@ -1406,11 +1431,15 @@ fn skipping_line(ip: std::net::Ipv4Addr, port: u16) -> String {
 /// host (`EADDRNOTAVAIL`) is dropped with C's line and the set restarted on an
 /// OS-picked port too (`:266`); any other error fails. C loops until it succeeds; the OS-picked
 /// restarts are bounded here.
-#[cfg(tokio_backend)]
-async fn bind_tcp_set(
+///
+/// Generic over the listener so the async server and the blocking driver bind
+/// their sets by the one rule.
+pub(crate) fn bind_tcp_set_with<L>(
     mut intf_addrs: Vec<std::net::Ipv4Addr>,
     port: u16,
-) -> CaResult<(Vec<(Arc<TcpListener>, std::net::Ipv4Addr)>, u16)> {
+    mut bind: impl FnMut(std::net::SocketAddrV4) -> std::io::Result<L>,
+    port_of: impl Fn(&L) -> std::io::Result<u16>,
+) -> std::io::Result<(Vec<(L, std::net::Ipv4Addr)>, u16)> {
     const OS_PICKED_TRIES: usize = 16;
     let mut want = port;
     let mut os_picked = 0;
@@ -1418,21 +1447,21 @@ async fn bind_tcp_set(
         if intf_addrs.is_empty() {
             // `cantProceed("Error: RSRV has empty interface list ...")`,
             // `caservertask.c:271`.
-            return Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 "RSRV has empty interface list: the CA server can't function \
                  without binding to at least one network interface",
-            )));
+            ));
         }
-        let mut listeners: Vec<(Arc<TcpListener>, std::net::Ipv4Addr)> = Vec::new();
+        let mut listeners: Vec<(L, std::net::Ipv4Addr)> = Vec::new();
         for (i, ip) in intf_addrs.iter().enumerate() {
-            match TcpListener::bind((std::net::IpAddr::V4(*ip), want)).await {
+            match bind(std::net::SocketAddrV4::new(*ip, want)) {
                 Ok(l) => {
                     if want == 0 {
                         // The first socket picks the number for the rest.
-                        want = l.local_addr()?.port();
+                        want = port_of(&l)?;
                     }
-                    listeners.push((Arc::new(l), *ip));
+                    listeners.push((l, *ip));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
                     // `ipAddrToDottedIP` prints `a.b.c.d:port` (`osiSock.c:168-170`).
@@ -1450,7 +1479,7 @@ async fn bind_tcp_set(
                     want = 0;
                     continue 'set;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
         return Ok((listeners, want));
@@ -1470,8 +1499,7 @@ async fn bind_tcp_set(
 /// (`softioc-rs --port 0`); C cannot express that — `envGetInetPortConfigParam`
 /// rejects any port at or below 5000 — so getting one back is what was asked
 /// for, not a fallback, and C's warning has nothing to say about it.
-#[cfg(tokio_backend)]
-fn announce_tcp_port(configured: u16, bound: u16) {
+pub(crate) fn announce_tcp_port(configured: u16, bound: u16) {
     if configured != 0 && bound != configured {
         // C `caservertask.c:585-590`, five `errlogPrintf` lines, verbatim —
         // including the trailing comma on line 2 and the missing period on

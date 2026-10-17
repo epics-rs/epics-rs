@@ -102,8 +102,5 @@ pub mod pva;
 #[cfg(not(epics_embedded_target))]
 pub mod attr_plot_args;
 
-// `tokio_backend` as well as the feature: the module stands its IOC up on
-// `epics_ca_rs::server::run_ca_ioc_app` and the QSRV runner, and neither
-// exists on the reactor-free backend.
-#[cfg(all(feature = "ioc", tokio_backend))]
+#[cfg(feature = "ioc")]
 pub mod ioc;

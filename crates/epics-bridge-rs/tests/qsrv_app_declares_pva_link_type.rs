@@ -11,7 +11,7 @@
 //! The port's `CA server:` line, which C's RSRV does not print, is required
 //! exactly once wherever the server's start lands it. The IOC serves until
 //! killed, so it runs in a child: this test binary re-run on [`ioc_child`].
-#![cfg(all(feature = "qsrv", tokio_backend, unix))]
+#![cfg(all(feature = "qsrv", unix))]
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -24,15 +24,13 @@ fn ioc_child() {
     let Ok(stcmd) = std::env::var(CHILD) else {
         return;
     };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _ = rt.block_on(epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
-        epics_base_rs::server::ioc_app::IocApplication::new()
-            .port(0)
-            .startup_script(&stcmd),
-    ));
+    let _ = epics_base_rs::runtime::task::test_block_on(
+        epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
+            epics_base_rs::server::ioc_app::IocApplication::new()
+                .port(0)
+                .startup_script(&stcmd),
+        ),
+    );
 }
 
 #[test]

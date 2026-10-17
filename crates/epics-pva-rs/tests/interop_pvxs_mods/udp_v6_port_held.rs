@@ -4,7 +4,7 @@
 //! `Server` constructor and qsrv runs with no server: "Error in
 //! pvxsBaseRegistrar : Address already in use", `pvxsr` "No Instance". With
 //! `0.0.0.0` alone it binds no v6 listener and starts on the same number. The
-//! Rust server's v6 responder (`enable_ipv6_udp`) refuses and starts the same.
+//! Rust server on the same two lists refuses and starts the same.
 
 // `server_native::PvaServer` exists only on the tokio backend.
 #![cfg(tokio_backend)]
@@ -76,12 +76,16 @@ fn soft_ioc_pvx_once(ioc: &Path, db: &Path, port: u16, intf: &str) -> String {
 }
 
 fn rs_start(port: u16, v6: bool) -> Result<PvaServer, PvaError> {
+    let intf: &[&str] = if v6 { &["0.0.0.0", "::"] } else { &["0.0.0.0"] };
     let config = PvaServerConfig {
         tcp_port: 0,
         udp_port: port,
         auto_beacon: false,
         beacon_destinations: Vec::new(),
-        enable_ipv6_udp: v6,
+        interfaces: intf
+            .iter()
+            .map(|t| epics_pva_rs::config::Endpoint::parse(t, 0).unwrap())
+            .collect(),
         ..Default::default()
     };
     PvaServer::start(Arc::new(SharedSource::new()), config)

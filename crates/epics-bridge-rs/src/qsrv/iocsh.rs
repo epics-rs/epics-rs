@@ -344,20 +344,12 @@ pub fn process_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
 
 /// The live channel and client counts pvxs `qStats` reports: it guards on its
 /// `server()` singleton and sums `conn.channels.size()` over
-/// `report.connections` (singlesourcehooks.cpp:88-99). `None` when there is no
-/// running server to ask — before the listeners bind, and on the thread-backend
-/// build, where the server's singleton does not exist at all.
+/// `report.connections` (singlesourcehooks.cpp:88-99). `None` before the
+/// listeners bind.
 fn live_channels_and_clients() -> Option<(u64, usize)> {
-    #[cfg(tokio_backend)]
-    {
-        let report = epics_pva_rs::server::iocsh::pvxs_report()?.report();
-        let channels = report.peers.iter().map(|(_, p)| p.channels).sum();
-        Some((channels, report.peer_count))
-    }
-    #[cfg(not(tokio_backend))]
-    {
-        None
-    }
+    let report = epics_pva_rs::server::iocsh::pvxs_report()?.report();
+    let channels = report.peers.iter().map(|(_, p)| p.channels).sum();
+    Some((channels, report.peer_count))
 }
 
 /// `qsrvStats [<recordOrGroupName>]` — print summary diagnostics for
@@ -405,14 +397,13 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
                     }
                 }
                 _ => {
-                    let created = provider.op_stats().channels_created;
                     match live_channels_and_clients() {
                         Some((channels, clients)) => ctx.println(&format!(
-                            "qsrvStats: {} group(s), {channels} channel(s) on {clients} client(s), {created} created (cumulative)",
+                            "qsrvStats: {} group(s), {channels} channel(s) on {clients} client(s)",
                             groups.len(),
                         )),
                         None => ctx.println(&format!(
-                            "qsrvStats: {} group(s), {created} channel(s) created (cumulative); pvAccess server not yet started",
+                            "qsrvStats: {} group(s); pvAccess server not yet started",
                             groups.len(),
                         )),
                     }

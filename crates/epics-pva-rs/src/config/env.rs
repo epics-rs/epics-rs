@@ -291,7 +291,29 @@ impl Endpoint {
             None => None,
         };
         let addr = resolve_token_addr(addr_str.trim(), default_port)?;
+        let iface = iface.and_then(|i| super::IfaceMap::current().normalize(addr, Some(i)));
         Some(Endpoint { addr, ttl, iface })
+    }
+
+    /// The TTL / hop limit pvxs `mcast_prep_sendto` sets for this endpoint
+    /// (`evhelper.cpp:588`, `:601`): its `ttl` default `-1` is the kernel's 1.
+    pub fn mcast_ttl(&self) -> u32 {
+        self.ttl.unwrap_or(1)
+    }
+
+    /// The v4 interface pvxs joins and sends this endpoint on
+    /// (`config.cpp:101-106`, `evhelper.cpp:584-592`), `0.0.0.0` when it
+    /// names none.
+    pub fn mcast_iface_v4(&self, ifmap: &super::IfaceMap) -> Ipv4Addr {
+        self.iface
+            .as_deref()
+            .map_or(Ipv4Addr::UNSPECIFIED, |n| ifmap.address_of_v4(n))
+    }
+
+    /// The v6 interface index the same way (`config.cpp:112-117`,
+    /// `evhelper.cpp:597-606`), 0 when it names none.
+    pub fn mcast_iface_v6(&self, ifmap: &super::IfaceMap) -> u32 {
+        self.iface.as_deref().map_or(0, |n| ifmap.index_of(n))
     }
 }
 
@@ -308,37 +330,6 @@ impl From<SocketAddr> for Endpoint {
             iface: None,
         }
     }
-}
-
-/// Resolve an `@iface` modifier — an interface NAME (`eth0`) or a literal
-/// IPv4 address — to the interface's IPv4 address, for selecting the
-/// outgoing multicast interface on the UDP send path. Mirrors pvxs
-/// `IfaceMap::address_of` (`evhelper.cpp:872-879`): a name is looked up in
-/// the live interface table; a dotted IPv4 address is accepted verbatim
-/// (pvxs normalises a dotted iface address back to a name in the
-/// `SockEndpoint` ctor, `config.cpp:76-80`, but the address itself is a
-/// valid spec). Errs when the name has no IPv4 address so the caller can
-/// fall back (best-effort) rather than silently mis-route.
-///
-/// Enumerates through [`epics_base_rs::net::iface_v4`] rather than
-/// `if-addrs`, so it exists on every target. That is the enumerator the
-/// design doc's §8.1 item owed: newlib and VxWorks's `libc` module expose no
-/// `getifaddrs`, and `iface_v4` is the workspace's own walk against the BSP's
-/// interface table. The client's UDP SEARCH path needs `@iface` to resolve on
-/// the embedded targets too, and a name that silently failed to resolve there
-/// would send a multicast join out the wrong interface.
-pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
-    if let Ok(v4) = spec.parse::<Ipv4Addr>() {
-        return Ok(v4);
-    }
-    let ifaces = epics_base_rs::net::iface_v4::enumerate()
-        .map_err(|e| format!("interface enumeration failed: {e}"))?;
-    for iface in ifaces {
-        if iface.name == spec {
-            return Ok(iface.ip);
-        }
-    }
-    Err(format!("interface {spec:?} has no IPv4 address"))
 }
 
 /// Resolve a single address token (no multicast modifiers) to a
@@ -370,9 +361,14 @@ fn resolve_token_addr(s: &str, default_port: u16) -> Option<SocketAddr> {
     if s.is_empty() {
         return None;
     }
+    // pvxs `SockAddr::setAddress` takes a bracketed v6 address with no port.
+    let bare = s
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(s);
     let mut addr = if let Ok(sa) = s.parse::<SocketAddr>() {
         sa
-    } else if let Ok(ip) = s.parse::<IpAddr>() {
+    } else if let Ok(ip) = bare.parse::<IpAddr>() {
         SocketAddr::new(ip, default_port)
     } else {
         let with_port = if s.contains(':') {
@@ -1113,16 +1109,21 @@ pub(crate) fn sock_addr_text(addr: SocketAddr) -> String {
     text
 }
 
+/// `EPICS_PVA_INTF_ADDR_LIST` as endpoints, multicast modifiers kept: the
+/// client's `Config::interfaces`.
+pub fn client_intf_endpoints() -> Vec<Endpoint> {
+    getenv("EPICS_PVA_INTF_ADDR_LIST")
+        .map(|s| resolve_intf_addr_list(&s, 0))
+        .unwrap_or_default()
+}
+
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
 /// Empty = bind to 0.0.0.0 (default behaviour). DNS hostnames resolve
 /// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
 /// `resolve_intf_addr_list`.
 pub fn list_intf_addresses() -> Vec<IpAddr> {
-    let addrs = getenv("EPICS_PVA_INTF_ADDR_LIST")
-        .map(|s| resolve_intf_addr_list(&s, 0))
-        .unwrap_or_default();
     let mut out: Vec<IpAddr> = Vec::new();
-    for ip in addrs.iter().map(|ep| ep.addr.ip()) {
+    for ip in client_intf_endpoints().iter().map(|ep| ep.addr.ip()) {
         if !out.contains(&ip) {
             out.push(ip);
         }
@@ -1162,7 +1163,7 @@ pub fn server_intf_addr_list() -> Vec<Endpoint> {
 /// and drops an unresolvable token, which is fine for a *partially* valid
 /// list — but a list whose tokens **all** drop must NOT silently become an
 /// empty list, because the bind path ([`super::super::server_native`]'s
-/// `tcp_bind_addresses`) then promotes empty to the wildcard `0.0.0.0`,
+/// `tcp_bind_addresses`) then promotes empty to the wildcard listeners,
 /// turning a typo'd bind-restriction into a listen-on-every-interface.
 /// Distinguish the three cases so the server can refuse that silent
 /// over-broad bind without failing on every benign typo in a partly-valid
@@ -1380,7 +1381,7 @@ pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
 /// Skips loopback and interfaces without a broadcast address.
 ///
 /// Enumerates through [`epics_base_rs::net::iface_v4`], so it exists on every
-/// target — see [`resolve_iface_v4`]. The eligibility and destination rules
+/// target. The eligibility and destination rules
 /// are `IfaceV4::search_destination`'s, which are C's
 /// (`osdNetIfAddrs.c:130-151`): up and non-loopback, the broadcast address
 /// unless it is `0.0.0.0`, else a point-to-point peer. The `if-addrs` version
@@ -1417,7 +1418,7 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
 ///   broadcast traffic leaves the host.
 ///
 /// Enumerates through [`epics_base_rs::net::iface_v4`], so it exists on every
-/// target — see [`resolve_iface_v4`].
+/// target.
 pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
     if interfaces.is_empty() || interfaces.iter().any(|ip| ip.is_unspecified()) {
         return list_broadcast_addresses(port);
@@ -1447,17 +1448,13 @@ pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<So
 
 /// pvxs `expandAddrList` (`config.cpp:284-308`): C
 /// `osiSockDiscoverBroadcastAddresses` matched to each interface — every
-/// NIC's destination for a wildcard (an empty list is pvxs's `0.0.0.0`),
-/// `127.0.0.1` itself for `127.0.0.1` (`osdNetIfAddrs.c:42-55`), else the
-/// destination of the NIC holding that address. No limited broadcast.
+/// NIC's destination for a wildcard, `127.0.0.1` itself for `127.0.0.1`
+/// (`osdNetIfAddrs.c:42-55`), else the destination of the NIC holding that
+/// address. No limited broadcast. An empty list expands to nothing: pvxs
+/// makes the unconfigured default `0.0.0.0` before it gets here
+/// (`config.cpp:491-493`).
 pub fn expand_addr_list(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
     let ifaces = epics_base_rs::net::iface_v4::enumerate().unwrap_or_default();
-    let any = [Ipv4Addr::UNSPECIFIED];
-    let interfaces = if interfaces.is_empty() {
-        &any[..]
-    } else {
-        interfaces
-    };
     let mut out = Vec::new();
     for &want in interfaces {
         if want == Ipv4Addr::LOCALHOST {
@@ -2148,23 +2145,12 @@ mod tests {
         assert_eq!(ep.iface, None);
     }
 
-    /// `resolve_iface_v4` accepts a literal IPv4 address verbatim (the egress
-    /// NIC is later selected by source-bind), so a dotted `@iface` spec needs
-    /// no interface-table lookup.
     #[test]
-    fn resolve_iface_v4_literal_passthrough() {
-        assert_eq!(
-            resolve_iface_v4("192.168.7.42"),
-            Ok(Ipv4Addr::new(192, 168, 7, 42))
-        );
-    }
-
-    /// A name with no IPv4 address (here a non-existent interface) errors so
-    /// the send path can fall back to the OS default route rather than
-    /// silently mis-routing.
-    #[test]
-    fn resolve_iface_v4_unknown_name_errors() {
-        assert!(resolve_iface_v4("nonexistent-iface-zzz").is_err());
+    fn a_bracketed_v6_address_takes_the_default_port() {
+        let got = parse_endpoints_with_port("[::] [::1]:7 [ff02::42:1],1@lo", 5076);
+        let addrs: Vec<String> = got.iter().map(|e| e.addr.to_string()).collect();
+        assert_eq!(addrs, ["[::]:5076", "[::1]:7", "[ff02::42:1]:5076"]);
+        assert_eq!((got[2].ttl, got[2].iface.as_deref()), (Some(1), Some("lo")));
     }
 
     /// The list splits on WHITESPACE only (pvxs `split_addr_into`); a comma
@@ -2216,11 +2202,11 @@ mod tests {
     fn dedup_beacon_endpoints_keeps_distinct_iface() {
         // Same multicast group on two different interfaces is two distinct
         // destinations (pvxs keys dedup by `(addr, iface)`, not addr alone).
-        let eps = parse_endpoints_with_port("224.0.2.3,8@127.0.0.1 224.0.2.3,8@127.0.0.2", 5076);
+        let eps = parse_endpoints_with_port("224.0.2.3,8@eth8 224.0.2.3,8@eth9", 5076);
         let deduped = dedup_endpoints(eps);
         assert_eq!(deduped.len(), 2, "distinct @iface stays separate");
-        assert_eq!(deduped[0].iface.as_deref(), Some("127.0.0.1"));
-        assert_eq!(deduped[1].iface.as_deref(), Some("127.0.0.2"));
+        assert_eq!(deduped[0].iface.as_deref(), Some("eth8"));
+        assert_eq!(deduped[1].iface.as_deref(), Some("eth9"));
     }
 
     #[test]
@@ -2290,8 +2276,8 @@ mod tests {
             vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
         );
         assert!(expand_addr_list(&[Ipv4Addr::new(192, 0, 2, 1)], port).is_empty());
-        let all = expand_addr_list(&[], port);
-        assert_eq!(all, expand_addr_list(&[Ipv4Addr::UNSPECIFIED], port));
+        assert!(expand_addr_list(&[], port).is_empty());
+        let all = expand_addr_list(&[Ipv4Addr::UNSPECIFIED], port);
         assert!(
             all.iter()
                 .all(|a| a.ip() != IpAddr::V4(Ipv4Addr::BROADCAST) && a.port() == port)

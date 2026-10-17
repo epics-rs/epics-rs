@@ -271,14 +271,17 @@ mod demo_db {
 #[cfg(exec_backend)]
 mod ioc {
     use std::collections::HashMap;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process::ExitCode;
     use std::sync::Arc;
+    #[cfg(feature = "bringup-probes")]
     use std::thread;
     use std::time::Instant;
 
     use epics_base_rs::error::CaResult;
-    use epics_base_rs::runtime::task::{StackSizeClass, background_init, block_on_sync};
+    #[cfg(feature = "bringup-probes")]
+    use epics_base_rs::runtime::task::StackSizeClass;
+    use epics_base_rs::runtime::task::{background_init, block_on_sync};
+    #[cfg(feature = "bringup-probes")]
     use epics_base_rs::runtime::worker_pool::ThreadCharge;
     #[cfg(feature = "bringup-probes")]
     use epics_base_rs::server::database::PvDatabase;
@@ -287,10 +290,9 @@ mod ioc {
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
     use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
-    use epics_pva_rs::server_native::blocking::bind_udp_search;
     use epics_pva_rs::server_native::composite::CompositeSource;
     use epics_pva_rs::server_native::config::PvaServerConfig;
-    use epics_pva_rs::server_native::driver::{self, DriverKind};
+    use epics_pva_rs::server_native::serving::BoundPva;
 
     use crate::demo_db::DEMO_DB;
 
@@ -420,9 +422,9 @@ mod ioc {
     /// echoed the configured port — which prints `UDP search on 0` for an
     /// ephemeral request and, worse, would keep claiming a port the bind had
     /// silently joined someone else's reuse group on.
-    fn search_status(bound: Option<std::io::Result<SocketAddr>>) -> String {
+    fn search_status(bound: Option<std::io::Result<u16>>) -> String {
         match bound {
-            Some(Ok(addr)) => format!("UDP search on {}", addr.port()),
+            Some(Ok(port)) => format!("UDP search on {port}"),
             // A bound socket whose port cannot be read back is a known *target*
             // state, not a failure to serve: RTEMS's libc omits the BSD
             // `sockaddr` length byte, so `bind` succeeds and `local_addr`
@@ -808,86 +810,50 @@ mod ioc {
             return ExitCode::FAILURE;
         }
 
-        // (3) The PVA front-end. `bind` consumes the config, so the two ports
-        //     are read off it first.
+        // (3) The PVA front-end, through the one exec serving path.
         //
         //     `PvaServerConfig::default().with_env()` and NOT a hand-built
         //     struct: `bind` stamps the GUID from `random_guid` at
         //     construction, and a config assembled field-by-field would ship
         //     the all-zero GUID a freshly-`Default`ed value carries — which
         //     degrades silently on every consumer.
-        let config = PvaServerConfig::default().with_env();
-        let (tcp_port, udp_port, bind_ip) = (config.tcp_port, config.udp_port, config.bind_ip);
-
+        //
         //     The sources went onto `composite` at step (2c), under pvxs's
         //     own names and orders: single records resolve on the database
         //     source at 0, and a group PV — not in the database under its own
         //     name — falls through to the QSRV store at 1. The status PVs
         //     registered below are ordinary records, so they answer from
         //     order 0, and with QSRV2 disabled they do not answer at all.
-
-        //     Which driver serves it is read from the environment, defaulting
-        //     to the reactor — the one the bring-up box measured at 38,483 B a
-        //     connection against the thread-per-connection driver's 1,559,487 B.
-        //     A value that is neither name is fatal rather than defaulted: an
-        //     IOC that quietly ran the driver the operator thought they had
-        //     turned off would be measured as the one they asked for.
-        let driver_kind = match DriverKind::from_env() {
-            Ok(k) => k,
+        //
+        //     The driver is `EPICS_PVA_RS_DRIVER`'s, defaulting to the reactor
+        //     — the one the bring-up box measured at 38,483 B a connection
+        //     against the thread-per-connection driver's 1,559,487 B.
+        let bound = match BoundPva::bind(composite, PvaServerConfig::default().with_env()) {
+            Ok(b) => b,
             Err(e) => {
                 eprintln!("realtime-pva-ioc: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        let server = match driver::bind(
-            driver_kind,
-            SocketAddr::new(bind_ip, tcp_port),
-            composite,
-            config,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // Not "cannot bind": both drivers' `bind` also call
-                // `local_addr`, and on RTEMS that is the call that fails
-                // (the libc `sockaddr` length byte). The inner error says which.
-                eprintln!(
-                    "realtime-pva-ioc: cannot start the PVA TCP server on port {tcp_port}: {e}"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-        let bound_tcp = server.tcp_port();
+        let bound_tcp = bound.server().tcp_port();
 
-        // (3b) The UDP search responder, bound wildcard rather than to
-        //      `bind_ip`: it has to receive broadcast and multicast SEARCHes,
-        //      which a socket bound to one interface address does not, and
-        //      that is why pvxs binds wildcard too (`udp_collector.cpp:140-151`,
-        //      quoted at `bind_udp_search`).
-        //
-        //      A failure here is NOT fatal — see the module docs. The IOC is
-        //      still reachable over TCP alone via `EPICS_PVA_NAME_SERVERS`,
-        //      which is exactly how it is reached under qemu SLIRP, so
-        //      refusing to start would take away the configuration the bring-up
-        //      box uses.
+        // (3b) A search port that cannot be bound is NOT fatal — see the module
+        //      docs. The IOC is still reachable over TCP alone via
+        //      `EPICS_PVA_NAME_SERVERS`, which is exactly how it is reached
+        //      under qemu SLIRP.
         //
         //      The reported port is read back off the bound socket, never
         //      echoed from the config: with an ephemeral request the two differ,
         //      and a console line that says "UDP search on 0" is worse than none.
-        let (udp, search_status) = match bind_udp_search(SocketAddrV4::new(
-            Ipv4Addr::UNSPECIFIED,
-            udp_port,
-        )) {
-            Ok(s) => {
-                let status = search_status(Some(s.local_addr()));
-                (Some(s), status)
-            }
-            Err(e) => {
+        let search_status = match bound.search() {
+            Ok(s) => search_status(Some(s.local_port())),
+            Err((udp_port, e)) => {
                 eprintln!(
                     "realtime-pva-ioc: no UDP name-search responder on port {udp_port}: {e}\n\
                          realtime-pva-ioc: the server is still serving on TCP {bound_tcp}; reach it \
                          with EPICS_PVA_NAME_SERVERS=<host>:{bound_tcp}"
                 );
-                (None, search_status(None))
+                search_status(None)
             }
         };
 
@@ -900,7 +866,7 @@ mod ioc {
         //      Registered after `bind` so the connection count reads the server
         //      that is already listening, and before the accept thread starts
         //      so the first client cannot find them missing.
-        let conns_server = server.clone();
+        let conns_server = bound.server().clone();
         let mut status = target_status_pvs(STATUS_PREFIX, Instant::now());
         status.push(
             // No upstream counterpart: devIocStats predates PVA entirely, so
@@ -922,59 +888,22 @@ mod ioc {
             .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
         names.sort();
 
-        // Raw `Builder` rather than `spawn_dedicated_thread`, matching
-        // `realtime-ca-ioc`: `serve` and `serve_udp_search` each take their own
-        // thread to their own priority through `enter_ioc_thread`, so a
-        // priority passed here would be set twice and the second one would win
-        // anyway. The stack class is stated, which is what one guard wants, and
-        // so is the charge, which is what the other wants: a thread the process
-        // account never hears about is memory the worker pool spends twice.
-        let srv_tcp = server.clone();
         let serve_reactor = epics_base_rs::runtime::task::Reactor::current()
             .expect("the exec backend's executor is process-global");
-        let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-        let tcp_thread = match thread::Builder::new()
-            .name("PVAS-TCP".to_string())
-            // Accepts and hands off; the per-connection threads are where the
-            // depth is (`blocking.rs` spawns those at Big/Medium).
-            .stack_size(StackSizeClass::Medium.bytes())
-            .spawn(move || {
-                let _charge = charge;
-                srv_tcp.serve(&serve_reactor)
-            }) {
-            Ok(h) => h,
+        let serving = match bound.serve(&serve_reactor) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("realtime-pva-ioc: cannot start the PVA accept thread: {e}");
+                eprintln!("realtime-pva-ioc: {e}");
                 return ExitCode::FAILURE;
             }
-        };
-        let udp_thread = match udp {
-            Some(socket) => {
-                let srv_udp = server.clone();
-                let charge = ThreadCharge::fixed(StackSizeClass::Medium);
-                match thread::Builder::new()
-                    .name("PVAS-UDP".to_string())
-                    .stack_size(StackSizeClass::Medium.bytes())
-                    .spawn(move || {
-                        let _charge = charge;
-                        srv_udp.serve_udp_search(socket)
-                    }) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        eprintln!("realtime-pva-ioc: cannot start the PVA name-search thread: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            None => None,
         };
 
         println!(
             "realtime-pva-ioc: serving {} records on PVA TCP port {bound_tcp} ({search_status}), \
              GUID {}, {} driver, RTEMS execution model, no tokio runtime",
             names.len(),
-            guid_hex(server.guid()),
-            driver_kind.as_str(),
+            guid_hex(serving.server().guid()),
+            serving.kind().as_str(),
         );
         println!(
             "realtime-pva-ioc: QSRV2 {}",
@@ -1058,15 +987,12 @@ mod ioc {
         // this target. Joining the accept thread is how the main thread waits;
         // the accept loop only returns if `shutdown()` is requested, which
         // nothing here does.
-        let _ = tcp_thread.join();
-        match udp_thread.map(|h| h.join()) {
-            None | Some(Ok(Ok(()))) => ExitCode::SUCCESS,
-            Some(Ok(Err(e))) => {
+        match block_on_sync(serving.wait())
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
                 eprintln!("realtime-pva-ioc: name-search responder failed: {e}");
-                ExitCode::FAILURE
-            }
-            Some(Err(_)) => {
-                eprintln!("realtime-pva-ioc: name-search thread panicked");
                 ExitCode::FAILURE
             }
         }
@@ -1075,7 +1001,6 @@ mod ioc {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::net::{IpAddr, SocketAddr};
 
         /// The reported port must be the one the socket says it has. An
         /// ephemeral request is the case that separates "read it back" from
@@ -1083,9 +1008,8 @@ mod ioc {
         /// never is.
         #[test]
         fn the_reported_search_port_comes_from_the_socket() {
-            let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51314);
             assert_eq!(
-                search_status(Some(Ok(bound))),
+                search_status(Some(Ok(51314))),
                 "UDP search on 51314",
                 "the console must name the bound port, not the requested one"
             );
@@ -1268,10 +1192,10 @@ mod tests {
             }
         }
         assert_eq!(
-            sites, 3,
-            "expected the accept thread, the UDP responder and the bring-up \
-             probe, found {sites} — a thread was added or moved, and the \
-             account has to be told about it"
+            sites, 1,
+            "expected the bring-up probe (the serving threads are \
+             `PvaServing`'s), found {sites} — a thread was added or moved, \
+             and the account has to be told about it"
         );
         assert!(
             unpaid.is_empty(),
@@ -1304,46 +1228,22 @@ mod tests {
         );
     }
 
-    /// The UDP responder is optional by construction. A regression that made a
-    /// UDP bind failure fatal would take away the only configuration a qemu
-    /// SLIRP guest is reachable on, and it would do so on the target, where
-    /// nobody is reading a backtrace.
+    /// The UDP responder is optional by construction: `BoundPva::bind` has no
+    /// search-port error, it hands the failure back as `search()`. What is
+    /// left here is that this entry point steps over it and names the
+    /// configuration that still works — a fatal arm would take away the only
+    /// one a qemu SLIRP guest is reachable on.
     #[test]
     fn a_udp_bind_failure_does_not_stop_the_server() {
-        let src = include_str!("realtime-pva-ioc.rs");
-        // Delimited by brace balance from the call, not by the line that
-        // happens to follow it: an earlier version of this guard split on the
-        // exact `let udp = match …` spelling and stopped checking anything the
-        // moment that binding was reshaped, while still reporting green.
-        let start = src
-            .find(concat!("bind_udp_search(", "SocketAddrV4"))
-            .expect("the UDP bind call site");
-        let tail = &src[start..];
-        let open = tail.find('{').expect("the match body opens");
-        let mut depth = 0usize;
-        let mut close = None;
-        for (i, c) in tail[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(open + i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let arm = &tail[open..=close.expect("the match body closes")];
-        assert!(
-            arm.contains(concat!("bind_udp", "_search")) || arm.contains("Err(e)"),
-            "the scanned region must be the UDP bind match, not an unrelated block"
-        );
+        let prod = production(include_str!("realtime-pva-ioc.rs"), Comments::Strip);
+        let start = prod
+            .find(concat!("Err((udp_port", ", e)) =>"))
+            .expect("the search-bind failure arm");
+        let arm = &prod[start..];
+        let arm = &arm[..arm.find("search_status(None)").expect("the arm's end")];
         assert!(
             !arm.contains("ExitCode::FAILURE"),
-            "a failed UDP search bind must be reported and stepped over, not fatal: \
-             the server is still reachable over TCP via EPICS_PVA_NAME_SERVERS"
+            "a failed UDP search bind must be reported and stepped over, not fatal"
         );
         assert!(
             arm.contains("EPICS_PVA_NAME_SERVERS"),

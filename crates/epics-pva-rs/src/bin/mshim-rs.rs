@@ -132,6 +132,8 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     if port == 0 {
         return Err("non-zero port number required".into());
     }
+    let iface =
+        epics_pva_rs::config::IfaceMap::current().normalize(SocketAddr::new(ip, port), iface);
     Ok(Endpoint {
         ip,
         port,
@@ -155,13 +157,11 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
     if let IpAddr::V4(v4) = ep.ip
         && v4.is_multicast()
     {
-        // `@iface`: scope the group join to the named interface, by
-        // its IPv4 address. Without it the kernel picks the default.
-        let join_iface = match &ep.iface {
-            Some(spec) => cli::resolve_iface_ipv4(spec)
-                .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?,
-            None => Ipv4Addr::UNSPECIFIED,
-        };
+        // pvxs `SockEndpoint::resolve`: the `@iface` interface's address,
+        // the wildcard when it names none or none that resolves.
+        let join_iface = ep.iface.as_deref().map_or(Ipv4Addr::UNSPECIFIED, |n| {
+            epics_pva_rs::config::IfaceMap::current().address_of_v4(n)
+        });
         sock.join_multicast_v4(&v4, &join_iface)?;
     }
     let std_sock: StdUdpSocket = sock.into();
@@ -289,29 +289,17 @@ async fn main() {
         }
     };
 
-    // Resolve each forward destination's `@iface` up-front so a bad
-    // interface name fails fast rather than per-datagram.
-    let forward_targets: Vec<ForwardTarget> = match forward
+    // Each forward destination's `@iface` resolved once, the wildcard when
+    // it names none that resolves (warned about at parse, as pvxs does).
+    let ifmap = epics_pva_rs::config::IfaceMap::current();
+    let forward_targets: Vec<ForwardTarget> = forward
         .iter()
-        .map(|e| {
-            let iface_v4 = match &e.iface {
-                Some(spec) => Some(cli::resolve_iface_ipv4(spec)?),
-                None => None,
-            };
-            Ok(ForwardTarget {
-                addr: SocketAddr::new(e.ip, e.port),
-                ttl: e.ttl,
-                iface_v4,
-            })
+        .map(|e| ForwardTarget {
+            addr: SocketAddr::new(e.ip, e.port),
+            ttl: e.ttl,
+            iface_v4: e.iface.as_deref().map(|n| ifmap.address_of_v4(n)),
         })
-        .collect::<Result<Vec<_>, String>>()
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("mshim-rs: forward interface: {e}");
-            std::process::exit(2);
-        }
-    };
+        .collect();
 
     // Build the send socket via socket2 so we can set per-socket
     // multicast options (TTL / outbound interface). Tokio requires

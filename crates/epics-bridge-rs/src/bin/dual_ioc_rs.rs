@@ -15,12 +15,6 @@
 //! dual-ioc-rs --db records.db -m P=BL13:
 //! ```
 
-// On `exec_backend` this program's `main` refuses instead of running, so
-// everything below it is unreachable in that configuration by construction.
-// The lint is reporting the intent, not dead code: the default build still
-// lints this file in full.
-#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,9 +24,7 @@ use clap::Parser;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
-#[cfg(tokio_backend)]
-use epics_ca_rs::server::CaServerBuilder;
-#[cfg(tokio_backend)]
+use epics_ca_rs::server::RsrvServing;
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser, Debug)]
@@ -127,6 +119,19 @@ fn parse_pv(def: &str) -> CaResult<(String, EpicsValue)> {
 #[cfg(tokio_backend)]
 #[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
+    run().await
+}
+
+/// The reactor-free arm: the same `run`, parked on the main thread.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    epics_base_rs::runtime::task::block_on_sync(run()).unwrap_or_else(|e| {
+        eprintln!("dual-ioc-rs: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+async fn run() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -194,7 +199,9 @@ async fn main() -> ExitCode {
         .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
     let pva_port = args.pva_port;
 
-    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`.
+    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`. The exec RSRV
+    // binds at `RsrvServing::start`.
+    #[cfg(tokio_backend)]
     if !args.no_ca {
         builder = builder.register_server_init(
             epics_ca_rs::server::ca_server::RSRV_SERVER,
@@ -224,44 +231,47 @@ async fn main() -> ExitCode {
     // One live policy cell for both protocol servers, so an ACF
     // (re)load gates CA and PVA together.
     let acf = epics_base_rs::server::access_security::new_acf_cell(None);
-    let ca_server = CaServerBuilder::serving(db.clone(), acf.clone(), None, None)
-        .port(ca_port)
-        .bound_at_init(ioc.servers());
+    // RSRV's sockets, bound at init, served once `iocRun` has run.
+    let mut servers = std::mem::take(ioc.servers());
     ioc.run().await;
 
-    let ca_handle = if args.no_ca {
+    let ca = if args.no_ca {
         None
     } else {
-        let server = match ca_server.build().await {
-            Ok(s) => s,
+        tracing::info!(port = ca_port, "CA listener starting");
+        match RsrvServing::start(
+            db.clone(),
+            ca_port,
+            None,
+            acf.clone(),
+            None,
+            None,
+            &mut servers,
+        )
+        .await
+        {
+            Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("error binding CA server on port {ca_port}: {e}");
                 return ExitCode::FAILURE;
             }
-        };
-        Some(tokio::spawn(async move {
-            tracing::info!(port = ca_port, "CA listener starting");
-            server.run().await
-        }))
+        }
     };
 
-    let pva_handle = if args.no_pva {
+    let pva = if args.no_pva {
         None
     } else {
-        let server = PvaServer::from_parts(db.clone(), pva_port, acf, None, None);
-        Some(tokio::spawn(async move {
-            tracing::info!(port = ?pva_port, "PVA listener starting");
-            server.run().await
-        }))
+        tracing::info!(port = ?pva_port, "PVA listener starting");
+        Some(PvaServer::from_parts(db.clone(), pva_port, acf, None, None))
     };
 
-    let result = match (ca_handle, pva_handle) {
+    let result = match (ca, pva) {
         (Some(ca), Some(pva)) => tokio::select! {
-            r = ca => format_join("CA", r),
-            r = pva => format_join("PVA", r),
+            r = ca.wait() => exited("CA", r),
+            r = pva.run() => exited("PVA", r),
         },
-        (Some(ca), None) => format_join("CA", ca.await),
-        (None, Some(pva)) => format_join("PVA", pva.await),
+        (Some(ca), None) => exited("CA", ca.wait().await),
+        (None, Some(pva)) => exited("PVA", pva.run().await),
         (None, None) => Ok(()),
     };
 
@@ -274,28 +284,8 @@ async fn main() -> ExitCode {
     }
 }
 
-#[cfg(tokio_backend)]
-fn format_join(which: &str, r: Result<CaResult<()>, tokio::task::JoinError>) -> Result<(), String> {
-    match r {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("{which} server exited: {e}")),
-        Err(e) => Err(format!("{which} task panicked: {e}")),
-    }
-}
-
-/// The `exec_backend` arm. Both halves of this program are the reactor-bound
-/// front-ends — `epics_ca_rs::server::CaServer` and
-/// `epics_pva_rs::server::PvaServer` — so on the reactor-free backend there is
-/// no dual IOC to stand. `realtime-pva-ioc` is the entry point that brings a
-/// CA+PVA IOC up on this execution model.
-#[cfg(exec_backend)]
-fn main() -> ExitCode {
-    epics_base_rs::runtime::task::refuse_backend(
-        "dual-ioc-rs: this build selects the reactor-free execution backend \
-         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the CA and the PVA server front-ends \
-         need a tokio reactor. Use `realtime-pva-ioc` on this backend, or \
-         rebuild without that feature.",
-    )
+fn exited(which: &str, r: CaResult<()>) -> Result<(), String> {
+    r.map_err(|e| format!("{which} server exited: {e}"))
 }
 
 #[cfg(test)]

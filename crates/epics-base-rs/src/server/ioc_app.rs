@@ -664,6 +664,76 @@ pub struct IocRunConfig {
     pub servers: InitializedServers,
 }
 
+impl IocRunConfig {
+    /// A protocol runner's tail once its servers serve: autosave on the
+    /// current reactor, then the interactive iocsh on the `_main_` thread
+    /// with `server_commands`, this config's `shell_commands` and the
+    /// autosave commands, until the shell ends. The exec runners' one copy
+    /// of what `CaServer::run_with_shell` and `PvaServer::run_with_shell` do.
+    pub async fn run_shell(self, server_commands: Vec<CommandDef>) -> CaResult<()> {
+        let reactor = crate::runtime::task::Reactor::current()
+            .ok_or_else(|| CaError::InvalidValue("the IOC runner has no reactor".into()))?;
+        let autosave_cmds = self
+            .autosave_manager
+            .as_ref()
+            .map(|mgr| autosave::iocsh::autosave_commands(mgr.clone()));
+        let autosave = if let Some(mgr) = self.autosave_manager {
+            Some(mgr.start(&reactor, self.db.clone()))
+        } else if let Some((cfg, method)) = self.autosave_config {
+            let mgr = autosave::AutosaveBuilder::new()
+                .add_set(cfg, method)
+                .build()
+                .await;
+            Some(Arc::new(mgr).start(&reactor, self.db.clone()))
+        } else {
+            None
+        };
+
+        let bridge = crate::runtime::task::BlockingBridge::capture();
+        let (db, acf, shell_commands) = (self.db, self.acf, self.shell_commands);
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        let started = crate::runtime::task::MandatoryThread::new(
+            "iocsh",
+            crate::runtime::task::ThreadPriority::Iocsh,
+            crate::runtime::task::StackSizeClass::Big,
+        )
+        .try_spawn(move || {
+            // C runs `iocsh(NULL)` on the thread `epicsThreadInit` lists as
+            // `_main_` (`osdThread.c:406-412`).
+            crate::runtime::task::register_main_thread();
+            let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
+            for cmd in server_commands
+                .into_iter()
+                .chain(shell_commands)
+                .chain(autosave_cmds.into_iter().flatten())
+            {
+                shell.register(cmd);
+            }
+            let _ = tx.send(shell.run_repl());
+        });
+        let result = match started {
+            Err(e) => Err(CaError::InvalidValue(format!(
+                "could not start the iocsh thread: {e}"
+            ))),
+            Ok(_) => match rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    eprintln!("shell error: {e}");
+                    Err(CaError::InvalidValue(e))
+                }
+                Err(_) => {
+                    eprintln!("shell thread dropped unexpectedly");
+                    Err(CaError::InvalidValue("shell thread dropped".to_string()))
+                }
+            },
+        };
+        if let Some(h) = autosave {
+            h.abort();
+        }
+        result
+    }
+}
+
 /// The two independent questions C softMain asks between the startup script
 /// and the end of `main`: whether to call `iocInit()` at all
 /// (`softMain.cpp:239`), and what this process does when it reaches its own
@@ -3535,8 +3605,9 @@ mod tests {
 
         assert_eq!(
             prod.matches("MandatoryThread::new(").count(),
-            3,
-            "the startup-script, afterIocRunning and uninitialised-tail threads"
+            4,
+            "the startup-script, afterIocRunning, uninitialised-tail and \
+             `IocRunConfig::run_shell` threads"
         );
         assert_eq!(
             prod.matches("name_current_thread(").count(),
@@ -3549,16 +3620,26 @@ mod tests {
             0,
             "banding without naming leaves an RTEMS-anonymous thread"
         );
-        for name in ["iocsh-startup", "iocsh-after-ioc-running", "iocsh"] {
-            let at = prod
-                .find(&format!("\"{name}\","))
-                .unwrap_or_else(|| panic!("the {name} thread moved; update this guard"));
-            let head = &prod[at..(at + 700).min(prod.len())];
-            assert!(
-                head.contains("ThreadPriority::Iocsh"),
-                "{name} must be declared at `ThreadPriority::Iocsh` \
-                 (posix/rtems_init.c:1002)"
+        for (name, sites) in [
+            ("iocsh-startup", 1),
+            ("iocsh-after-ioc-running", 1),
+            ("iocsh", 2),
+        ] {
+            let quoted = format!("\"{name}\",");
+            let at: Vec<usize> = prod.match_indices(&quoted).map(|(at, _)| at).collect();
+            assert_eq!(
+                at.len(),
+                sites,
+                "the {name} threads moved; update this guard"
             );
+            for at in at {
+                let head = &prod[at..(at + 700).min(prod.len())];
+                assert!(
+                    head.contains("ThreadPriority::Iocsh"),
+                    "{name} must be declared at `ThreadPriority::Iocsh` \
+                     (posix/rtems_init.c:1002)"
+                );
+            }
         }
     }
 

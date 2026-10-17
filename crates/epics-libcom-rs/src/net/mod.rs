@@ -66,7 +66,10 @@ pub mod iface_map;
 pub mod iface_v4;
 #[cfg(not(epics_embedded_target))]
 pub mod loopback_mcast;
+pub mod mcast_prep;
 pub mod search_udp;
+#[cfg(all(not(epics_embedded_target), any(unix, windows)))]
+pub mod udp_rx;
 
 /// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
 /// `udp_collector.cpp:127`: `"224.0.0.128,1@127.0.0.1"` — TTL=1,
@@ -84,14 +87,15 @@ pub const ORIGIN_TAG_MCAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
 
 pub use fanout::{PortOrigin, PortUse, bind_falls_back, bind_fanout, port_held};
 pub use iface_v4::{IfaceV4, broadcast_addrs, local_addr};
-pub use search_udp::{SearchDatagram, SearchUdpSocket, SearchUdpSocketV6};
+pub use mcast_prep::{McastSocket, mcast_prep_v4, mcast_prep_v6};
+pub use search_udp::{BeaconUdpSocket, SearchDatagram, SearchUdpSocket, SearchUdpSocketV6};
 
 #[cfg(tokio_backend)]
 pub use async_udp_v4::{
     AsyncUdpV4, RecvMeta, enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
 };
 #[cfg(not(epics_embedded_target))]
-pub use iface_map::{IfaceInfo, IfaceMap};
+pub use iface_map::{ExternalIface, IfaceInfo, IfaceMap, all_external};
 #[cfg(tokio_backend)]
 pub use loopback_mcast::bind_loopback_mcast;
 #[cfg(not(epics_embedded_target))]

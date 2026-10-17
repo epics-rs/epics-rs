@@ -1,7 +1,7 @@
 //! `--db-file` and `--macro` reach `dbLoadRecords` byte for byte, though they
 //! cross the startup shell as text through macro expansion and the splitter.
 //! Unix only: Windows filenames cannot hold `"` or `<`.
-#![cfg(all(feature = "qsrv-bin", unix, tokio_backend))]
+#![cfg(all(feature = "qsrv-bin", unix))]
 
 use std::process::{Command, Stdio};
 

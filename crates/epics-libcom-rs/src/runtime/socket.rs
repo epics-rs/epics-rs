@@ -28,14 +28,15 @@
 //! that already run. The same code in a crate outside those lists is compiled
 //! by nothing.
 //!
-//! # Why the option must precede the bind
+//! # Why the option is ordered against the bind
 //!
 //! `SO_REUSEPORT` is what lets several IOCs share one UDP port and have the
-//! kernel fan each datagram out to all of them. The kernel only honours it on
-//! an **unbound** socket, so `UdpSocket::bind()` followed by a `setsockopt` is
-//! not a slower version of this — it is a version that silently does nothing.
-//! That ordering constraint is the whole reason `std`'s constructors are not
-//! enough and a raw `socket()`/`setsockopt()`/`bind()` sequence is.
+//! kernel fan each datagram out to all of them. A configured number needs it
+//! set before the bind, or the bind of a shared port is `EADDRINUSE`; a number
+//! the kernel chooses needs it set after, or Linux may hand `bind(0)` a number
+//! a stranger's fanout group holds. [`udp_socket`] takes that order from
+//! `net::bind_fanout`; a TCP socket sets every option first. Either way `std`'s
+//! constructors, which bind before any option can be set, are not enough.
 //!
 //! # The C authority for each branch
 //!
@@ -66,7 +67,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 
-/// Options applied to a fresh socket *before* it is bound or connected.
+/// Options applied to a fresh socket around its bind (see the module docs).
 ///
 /// A struct rather than three positional `bool`s because the call sites set
 /// different subsets and a positional triple reads identically whichever two
@@ -116,7 +117,17 @@ fn fanout_refused(optname: &str) {
 
 /// Open a UDP socket, apply `opts`, and bind it to `local`.
 pub fn udp_socket(local: SocketAddr, opts: SocketOptions) -> Result<UdpSocket, SetupError> {
-    sys::udp_socket(local, opts)
+    udp_socket_on(local, opts, crate::net::PortOrigin::Configured)
+}
+
+/// [`udp_socket`] on a number of the given origin: one this process chose
+/// is bound before its reuse options, as `net::bind_fanout` orders them.
+pub fn udp_socket_on(
+    local: SocketAddr,
+    opts: SocketOptions,
+    origin: crate::net::PortOrigin,
+) -> Result<UdpSocket, SetupError> {
+    sys::udp_socket(local, opts, origin)
 }
 
 /// Open a TCP socket, apply `opts`, bind it to `local`, and start listening.
@@ -425,6 +436,12 @@ mod sys {
                 .set_broadcast(true)
                 .map_err(SetupError::at(SetupStep::Broadcast))?;
         }
+        Ok(socket)
+    }
+
+    /// The reuse options of `opts`; [`udp_socket`] orders them against the
+    /// bind with `bind_fanout`, every other socket sets them first.
+    fn set_reuse(socket: &socket2::Socket, opts: SocketOptions) -> Result<(), SetupError> {
         if opts.datagram_fanout {
             // Windows defines no SO_REUSEPORT, so C's helper sets only the
             // second (osdSockAddrReuse.cpp:63-66).
@@ -454,7 +471,7 @@ mod sys {
                 .set_reuse_address(true)
                 .map_err(SetupError::at(SetupStep::ReuseAddress))?;
         }
-        Ok(socket)
+        Ok(())
     }
 
     fn bind(socket: &socket2::Socket, local: SocketAddr) -> Result<(), SetupError> {
@@ -466,6 +483,7 @@ mod sys {
     pub(super) fn udp_socket(
         local: SocketAddr,
         opts: SocketOptions,
+        origin: crate::net::PortOrigin,
     ) -> Result<UdpSocket, SetupError> {
         let socket = new_socket(
             local.is_ipv6(),
@@ -473,7 +491,12 @@ mod sys {
             socket2::Protocol::UDP,
             opts,
         )?;
-        bind(&socket, local)?;
+        crate::net::bind_fanout(
+            local.port(),
+            origin,
+            || set_reuse(&socket, opts),
+            || bind(&socket, local),
+        )?;
         Ok(UdpSocket::from(socket))
     }
 
@@ -488,6 +511,7 @@ mod sys {
             socket2::Protocol::TCP,
             opts,
         )?;
+        set_reuse(&socket, opts)?;
         bind(&socket, local)?;
         socket
             .listen(backlog)
@@ -507,6 +531,7 @@ mod sys {
             socket2::Protocol::TCP,
             opts,
         )?;
+        set_reuse(&socket, opts)?;
         if let Some(local) = local {
             bind(&socket, local)?;
         }
@@ -659,6 +684,12 @@ mod sys {
             set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_BROADCAST)
                 .map_err(SetupError::at(SetupStep::Broadcast))?;
         }
+        Ok(owned)
+    }
+
+    /// The reuse options of `opts`; [`udp_socket`] orders them against the
+    /// bind with `bind_fanout`, every other socket sets them first.
+    fn set_reuse(fd: RawFd, opts: SocketOptions) -> Result<(), SetupError> {
         if opts.datagram_fanout {
             if set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT).is_err() {
                 super::fanout_refused("SO_REUSEPORT");
@@ -675,7 +706,7 @@ mod sys {
             set_bool_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR)
                 .map_err(SetupError::at(SetupStep::ReuseAddress))?;
         }
-        Ok(owned)
+        Ok(())
     }
 
     /// Marshal an IPv4 `SocketAddr` into a `sockaddr_in`.
@@ -726,9 +757,15 @@ mod sys {
     pub(super) fn udp_socket(
         local: SocketAddr,
         opts: SocketOptions,
+        origin: crate::net::PortOrigin,
     ) -> Result<UdpSocket, SetupError> {
         let owned = new_socket(libc::SOCK_DGRAM, libc::IPPROTO_UDP, opts)?;
-        bind_fd(owned.0, local)?;
+        crate::net::bind_fanout(
+            local.port(),
+            origin,
+            || set_reuse(owned.0, opts),
+            || bind_fd(owned.0, local),
+        )?;
         // SAFETY: a valid, exclusively-owned socket descriptor released by
         // `into_raw` precisely so `UdpSocket` becomes its sole owner.
         Ok(unsafe { UdpSocket::from_raw_fd(owned.into_raw()) })
@@ -740,6 +777,7 @@ mod sys {
         backlog: i32,
     ) -> Result<TcpListener, SetupError> {
         let owned = new_socket(libc::SOCK_STREAM, libc::IPPROTO_TCP, opts)?;
+        set_reuse(owned.0, opts)?;
         bind_fd(owned.0, local)?;
         // SAFETY: `owned.0` is a valid bound socket.
         if unsafe { libc::listen(owned.0, backlog) } != 0 {
@@ -788,6 +826,7 @@ mod sys {
         timeout: Duration,
     ) -> Result<TcpStream, TcpConnectError> {
         let owned = new_socket(libc::SOCK_STREAM, libc::IPPROTO_TCP, opts)?;
+        set_reuse(owned.0, opts)?;
         if let Some(local) = local {
             bind_fd(owned.0, local)?;
         }
@@ -971,9 +1010,8 @@ mod tests {
         assert_ne!(sock.local_addr().unwrap().port(), 0);
     }
 
-    /// The invariant the whole module exists for: the option is set on an
-    /// unbound socket, so two sockets can share one port. Bind-then-setsockopt
-    /// would leave the second bind failing with EADDRINUSE.
+    /// The invariant the whole module exists for: two fanout sockets share
+    /// one port, the first on a number it chose.
     #[test]
     fn fanout_options_let_two_sockets_share_a_port() {
         let first = udp_socket(localhost(0), SocketOptions::FANOUT).unwrap();
@@ -990,6 +1028,41 @@ mod tests {
         let first = udp_socket(localhost(0), SocketOptions::default()).unwrap();
         let port = first.local_addr().unwrap().port();
         assert!(udp_socket(localhost(port), SocketOptions::default()).is_err());
+    }
+
+    /// A fanout `bind(0)` never lands on a number a same-user fanout socket
+    /// holds: with the options set first, Linux hands out such a number about
+    /// one time in fifteen against 2000 holders (`net::bind_fanout`).
+    #[cfg(unix)]
+    #[test]
+    fn a_fanout_bind_zero_is_never_a_strangers_number() {
+        let any = |port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        let held: Vec<_> = (0..2000)
+            .map(|_| {
+                let s = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )
+                .unwrap();
+                s.set_reuse_address(true).unwrap();
+                s.set_reuse_port(true).unwrap();
+                s.bind(&any(0).into()).unwrap();
+                s
+            })
+            .collect();
+        let theirs: std::collections::HashSet<u16> = held
+            .iter()
+            .map(|s| s.local_addr().unwrap().as_socket().unwrap().port())
+            .collect();
+        for _ in 0..200 {
+            let port = udp_socket(any(0), SocketOptions::FANOUT)
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            assert!(!theirs.contains(&port), "bound {port}, a stranger's");
+        }
     }
 
     #[test]

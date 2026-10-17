@@ -11,9 +11,8 @@
 //! ```
 //!
 //! The last malformed line is the JSON parser's own message, so the lines
-//! before it are what is pinned. On the exec backend `qsrv-rs`'s `main`
-//! refuses before it boots, so the file runs on the tokio backend only.
-#![cfg(all(feature = "qsrv-bin", unix, tokio_backend))]
+//! before it are what is pinned.
+#![cfg(all(feature = "qsrv-bin", unix))]
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;

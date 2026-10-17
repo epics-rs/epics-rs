@@ -1496,10 +1496,7 @@ impl super::source::ChannelSource for SharedSource {
     /// Surface this source's PV-registry counter so the UDP beacon task
     /// advances `change_count` on an `add` / `remove` of a hosted PV —
     /// the Rust equivalent of pvxs `Server::addPV` / `removePV` bumping
-    /// the single server `beaconChange` (`src/server.cpp:180,189`). Without
-    /// this override the trait default returns `0`, and the beacon task
-    /// would fall back to the PV-name-set hash, which cannot see a
-    /// remove+re-add of the same name within one beacon interval.
+    /// the single server `beaconChange` (`src/server.cpp:180,189`).
     fn beacon_change(&self) -> u64 {
         self.beacon_change.load(Ordering::Relaxed)
     }
@@ -2876,10 +2873,8 @@ mod tests {
     /// A built-in `SharedSource`
     /// PV registry mutation must advance the beacon-change counter, the
     /// Rust analog of pvxs `Server::addPV` / `removePV` bumping
-    /// `beaconChange` (src/server.cpp:180,189). The boundary case the PV-name
-    /// hash fallback cannot detect — remove + re-add of the SAME name
-    /// within one beacon interval, so `list_pvs()` is identical
-    /// before/after — must still advance the counter.
+    /// `beaconChange` (src/server.cpp:180,189), including a remove + re-add
+    /// of the SAME name, which leaves `list_pvs()` identical.
     #[epics_macros_rs::epics_test]
     async fn shared_source_beacon_change_advances_on_pv_registry_mutations() {
         use super::super::source::ChannelSource;

@@ -23,6 +23,7 @@ use epics_base_rs::runtime::task::timeout;
 use tracing::debug;
 
 use crate::codec::PvaCodec;
+use crate::config::Endpoint;
 use crate::error::{PvaError, PvaResult};
 
 use super::decode::{PeerRole, SearchResponse, decode_search_response, try_parse_frame_role};
@@ -65,36 +66,34 @@ fn auto_addr_list_enabled() -> bool {
 
 /// Build a list of UDP destinations to broadcast SEARCH to.
 pub fn build_search_targets(extra: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut targets: Vec<SocketAddr> = Vec::new();
     let mut seen = HashSet::new();
+    search_endpoints(extra)
+        .into_iter()
+        .map(|e| e.addr)
+        .filter(|a| seen.insert(*a))
+        .collect()
+}
 
-    let push = |addr: SocketAddr, targets: &mut Vec<SocketAddr>, seen: &mut HashSet<SocketAddr>| {
-        if seen.insert(addr) {
-            targets.push(addr);
-        }
-    };
-
-    for &addr in extra {
-        push(addr, &mut targets, &mut seen);
-    }
-
+/// [`build_search_targets`] with each entry's `,ttl`/`@iface`, which a
+/// multicast destination is sent with.
+fn search_endpoints(extra: &[SocketAddr]) -> Vec<Endpoint> {
+    let mut targets: Vec<Endpoint> = extra.iter().copied().map(Endpoint::from).collect();
     if let Some(env) = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST") {
-        for addr in parse_addr_list(&env) {
-            push(addr, &mut targets, &mut seen);
-        }
+        targets.extend(crate::config::env::parse_endpoints_with_port(
+            &env,
+            default_broadcast_port(),
+        ));
     }
 
     if auto_addr_list_enabled() {
         // Auto: limited broadcast 255.255.255.255 (works on most LANs without
         // requiring per-NIC bookkeeping). Multi-NIC users can add EPICS_PVA_ADDR_LIST.
-        push(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), default_broadcast_port()),
-            &mut targets,
-            &mut seen,
+        targets.push(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), default_broadcast_port()).into(),
         );
     }
 
-    targets
+    crate::config::env::dedup_endpoints(targets)
 }
 
 /// Bind a per-NIC UDP socket bundle suitable for SEARCH: every NIC
@@ -114,7 +113,7 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
     let response_port = socket.local_addrs().first().map(|a| a.port()).unwrap_or(0);
 
     let codec = PvaCodec { big_endian: false };
-    let targets = build_search_targets(&[]);
+    let targets = search_endpoints(&[]);
     if targets.is_empty() {
         return Err(PvaError::Protocol(
             "no search targets (set EPICS_PVA_ADDR_LIST or enable AUTO_ADDR_LIST)".into(),
@@ -140,18 +139,22 @@ pub async fn search(pv_name: &str, total_timeout: Duration) -> PvaResult<SocketA
             response_port,
             false,
         );
-        for &target in &targets {
-            // Limited broadcast / multicast destinations need explicit
-            // per-NIC fanout. Per-subnet broadcast and unicast targets
-            // ride AsyncUdpV4's automatic NIC selection.
-            let needs_fanout = match target {
-                SocketAddr::V4(v4) => v4.ip().is_broadcast() || v4.ip().is_multicast(),
-                SocketAddr::V6(_) => false,
-            };
-            let result = if needs_fanout {
-                socket.fanout_to(&pkt, target).await.map(|_| ())
-            } else {
-                socket.send_to(&pkt, target).await.map(|_| ())
+        let ifmap = crate::config::IfaceMap::for_endpoints(targets.iter());
+        for ep in &targets {
+            let target = ep.addr;
+            // A multicast group is one send with its endpoint's TTL and
+            // `@iface` (pvxs `mcast_prep_sendto`); the limited broadcast fans
+            // out per NIC. Per-subnet broadcast and unicast targets ride
+            // AsyncUdpV4's automatic NIC selection.
+            let result = match target {
+                SocketAddr::V4(v4) if v4.ip().is_multicast() => socket
+                    .send_multicast_v4(&pkt, v4, ep.mcast_ttl(), ep.mcast_iface_v4(&ifmap))
+                    .await
+                    .map(|_| ()),
+                SocketAddr::V4(v4) if v4.ip().is_broadcast() => {
+                    socket.fanout_to(&pkt, target).await.map(|_| ())
+                }
+                _ => socket.send_to(&pkt, target).await.map(|_| ()),
             };
             // Non-fatal: a single bad NIC shouldn't kill the whole search.
             if let Err(e) = result {

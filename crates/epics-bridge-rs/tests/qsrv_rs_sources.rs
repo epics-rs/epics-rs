@@ -6,7 +6,7 @@
 //! G   record._options.atomic bool = true, a.value double = 1.5,
 //!     a.display.units string = "mm"
 //! ```
-#![cfg(all(feature = "qsrv-bin", unix, tokio_backend))]
+#![cfg(all(feature = "qsrv-bin", unix))]
 
 mod qsrv_named_ports;
 
@@ -38,6 +38,9 @@ fn leaf<'a>(v: &'a PvField, path: &str) -> &'a ScalarValue {
     }
 }
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the exec
+// backend; the tokio runtime is only the client harness, and the IOC under
+// test is the qsrv-rs process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_single_record_and_a_group_answer_as_softiocpvx() {
     let dir = tempfile::tempdir().unwrap();

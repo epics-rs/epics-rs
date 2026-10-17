@@ -55,7 +55,9 @@ use std::time::Duration;
 //
 // The IPv6 half is no longer target-shaped either: it binds through
 // `SearchUdpSocketV6` on both backends, over the same receive pump.
-use epics_base_rs::net::search_udp::{SearchUdpSocket, SearchUdpSocketV6};
+use crate::config::Endpoint;
+use crate::server_native::search_engine::McastJoins;
+use epics_base_rs::net::search_udp::{BeaconUdpSocket, SearchUdpSocket, SearchUdpSocketV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 // The periodic/one-shot timers come from the `runtime::task` seam, NOT from
@@ -129,12 +131,6 @@ const INITIAL_SEARCH_DELAY: Duration = Duration::from_millis(10);
 /// connection but never completes the PVA handshake; [`SearchEngine::spawn_with_auth`]
 /// supplies the client's own connection timeout instead.
 const NS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// PR #205 IPv6 Stage 4: default v6 multicast group for PVA SEARCH.
-/// pvxs `udp_collector.cpp` uses `ff0e::400` (organization-local,
-/// dynamic) for the IPv6 equivalent of the v4 `224.0.2.3` group.
-/// Joined/sent only when an IPv6 send socket is available.
-pub const DEFAULT_V6_MULTICAST_GROUP: Ipv6Addr = Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400);
 
 /// Command sent into the engine.
 /// Why a search is being initiated — controls bucket placement and
@@ -383,14 +379,15 @@ struct UdpTransport {
     search_socket_v6: Option<SearchUdpSocketV6>,
     /// Beacon listener on [`Self::broadcast_port`]. `None` when the bind
     /// failed — beacon-driven fast reconnect is best-effort.
-    beacon_socket: Option<SearchUdpSocket>,
+    beacon_socket: Option<BeaconListener>,
     /// PR #205 IPv6 Stage 6: optional v6 multicast beacon listener.
     beacon_socket_v6: Option<SearchUdpSocketV6>,
     /// Explicit `addr_list` UDP SEARCH targets (already merged with any
-    /// programmatic extras) — every datagram is sent to each of these.
-    extra_targets: Vec<SocketAddr>,
+    /// programmatic extras) — every datagram is sent to each of these, a
+    /// multicast one with its own `,ttl`/`@iface`.
+    extra_targets: Vec<Endpoint>,
     /// `EPICS_PVA_INTF_ADDR_LIST` (v4): constrains the auto-broadcast
-    /// expansion and the limited-broadcast / multicast fanout egress.
+    /// expansion and the limited-broadcast fanout egress.
     /// Empty = all-NIC default.
     client_interfaces: Vec<Ipv4Addr>,
     /// `EPICS_PVA_BROADCAST_PORT` — the port SEARCH datagrams are sent to
@@ -439,18 +436,15 @@ impl SearchTransport {
     /// SEARCH destination policy — the whole of the UDP transport, so that
     /// binding a socket and deciding where it transmits are one step.
     ///
-    /// `extra_targets` are the programmatic SEARCH targets; the config's
+    /// `extra` are the programmatic SEARCH targets; the config's
     /// `addr_list` is merged into them here (pva2pva client-config
     /// semantics: address-list entries are UDP SEARCH destinations on
     /// `broadcast_port`, never TCP name servers).
-    fn bind_udp(
-        config: &ClientSearchConfig,
-        mut extra_targets: Vec<SocketAddr>,
-    ) -> PvaResult<Self> {
+    fn bind_udp(config: &ClientSearchConfig, extra: Vec<SocketAddr>) -> PvaResult<Self> {
         // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the
         // auto-broadcast address expansion (in `search_targets`) and the
-        // limited-broadcast / multicast fanout egress (in `broadcast`) to
-        // the listed interfaces. It does NOT reduce the active-search
+        // limited-broadcast fanout egress (in `broadcast`) to the listed
+        // interfaces. It does NOT reduce the active-search
         // socket bundle: pvxs binds the search socket to wildcard
         // (`src/client.cpp:578-590`) and applies `client::Config::interfaces`
         // only to `expandAddrList` / `addGroups` (`config.cpp:624-651`)
@@ -471,60 +465,41 @@ impl SearchTransport {
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
         let search_socket_v6 = bind_search_udp_v6();
-        // Beacon receive uses the per-client UDP port and joins the
-        // per-client address-list multicast groups (pvxs `udp_port`).
-        let beacon_socket = bind_beacon_udp(config.broadcast_port, &config.addr_list); // Optional.
-        // PR #205 IPv6 Stage 6: optional v6 beacon listener bound to
-        // `[::]:5076` joined to `ff0e::400`. Receives v6 multicast
-        // beacons emitted by the server's Stage 5 path. None when the
-        // host has no v6.
-        let beacon_socket_v6 = bind_beacon_udp_v6(config.broadcast_port);
+        // pvxs `Config::expand` (`config.cpp:640-643`): the address list's
+        // groups join only under `autoAddrList`, on every external interface.
+        let joins = McastJoins::resolve(
+            &crate::config::env::client_intf_endpoints(),
+            &config.addr_list,
+            config.auto_addr_list,
+        );
+        let beacon_socket = bind_beacon_udp(config.broadcast_port, &joins.v4); // Optional.
+        // pvxs `client.cpp:640-651` pairs the wildcard beacon listener with
+        // one on `[::]`. None when the host has no v6.
+        let beacon_socket_v6 = bind_beacon_udp_v6(config.broadcast_port, &joins.v6);
 
-        // Merge the per-client address-list UDP SEARCH targets into
-        // `extra_targets`. The list was parsed once (DNS-resolved,
-        // `$(VAR)`-expanded) at config-build time via the shared
-        // `parse_endpoints_with_port`, so `IP`, `IP:port`, `hostname`, and
-        // `hostname:port` all work.
-        {
-            // PR #205 IPv6 Stage 4: v6 entries are routable only when
-            // `search_socket_v6` bound. On a host with no v6 stack, drop
-            // them (avoiding the InvalidInput retry storm on the v4 socket)
-            // with a one-shot warning rather than silently.
-            let v6_available = search_socket_v6.is_some();
-            let mut dropped_v6: Vec<SocketAddr> = Vec::new();
-            for ep in &config.addr_list {
-                let sa = ep.addr;
-                if matches!(sa, SocketAddr::V6(_)) && !v6_available {
-                    dropped_v6.push(sa);
-                    continue;
-                }
-                if !extra_targets.contains(&sa) {
-                    extra_targets.push(sa);
-                }
-            }
-            if !dropped_v6.is_empty() {
-                warn!(
-                    dropped = ?dropped_v6,
-                    "client addr_list contained IPv6 entries but no usable v6 \
-                     socket could be bound on this host. Dropping these entries; \
-                     the rest of the search remains IPv4-only."
-                );
-            }
-            // When v6 is available and auto-addr-list is on, add the
-            // default v6 multicast group (`ff0e::400:<udp_port>`) — there
-            // is no v6 limited broadcast, so the group is the only way to
-            // reach v6-only servers without enumerating each.
-            if v6_available && config.auto_addr_list {
-                let mcast = SocketAddr::V6(std::net::SocketAddrV6::new(
-                    DEFAULT_V6_MULTICAST_GROUP,
-                    config.broadcast_port,
-                    0,
-                    0,
-                ));
-                if !extra_targets.contains(&mcast) {
-                    extra_targets.push(mcast);
-                }
-            }
+        // The programmatic extras, then the per-client address list. The
+        // list was parsed once (DNS-resolved, `$(VAR)`-expanded) at
+        // config-build time via the shared `parse_endpoints_with_port`, so
+        // `IP`, `IP:port`, `hostname`, and `hostname:port` all work.
+        //
+        // PR #205 IPv6 Stage 4: v6 entries are routable only when
+        // `search_socket_v6` bound. On a host with no v6 stack, drop them
+        // (avoiding the InvalidInput retry storm on the v4 socket) with a
+        // one-shot warning rather than silently.
+        let v6_available = search_socket_v6.is_some();
+        let (dropped_v6, listed): (Vec<Endpoint>, Vec<Endpoint>) = extra
+            .into_iter()
+            .map(Endpoint::from)
+            .chain(config.addr_list.iter().cloned())
+            .partition(|ep| ep.addr.is_ipv6() && !v6_available);
+        let extra_targets = crate::config::env::dedup_endpoints(listed);
+        if !dropped_v6.is_empty() {
+            warn!(
+                dropped = ?dropped_v6.iter().map(|e| e.addr).collect::<Vec<_>>(),
+                "client addr_list contained IPv6 entries but no usable v6 \
+                 socket could be bound on this host. Dropping these entries; \
+                 the rest of the search remains IPv4-only."
+            );
         }
 
         let response_port = search_socket
@@ -583,7 +558,7 @@ impl SearchTransport {
                     }));
                 }
                 if let Some(s) = &u.beacon_socket {
-                    addrs.extend(s.local_addrs());
+                    addrs.extend(s.socket.local_addrs());
                 }
                 if let Some(s) = &u.beacon_socket_v6 {
                     addrs.extend(local_port_v6(s).map(|p| {
@@ -620,11 +595,16 @@ impl SearchTransport {
         }
     }
 
-    /// `select!` arm: the next v4 BEACON datagram.
-    async fn recv_beacon(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    /// `select!` arm: the next v4 BEACON datagram, with the address it was
+    /// sent to and the interface it arrived on where the receive path
+    /// reports them.
+    async fn recv_beacon(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr, Option<(Ipv4Addr, u32)>)> {
         match self {
             Self::Udp(u) => match &u.beacon_socket {
-                Some(s) => s.recv(buf).await.map(|d| (d.n, d.src)),
+                Some(s) => s.socket.recv(buf).await.map(|d| (d.n, d.src, d.pktinfo)),
                 None => std::future::pending().await,
             },
             Self::NameServersOnly => {
@@ -632,6 +612,24 @@ impl SearchTransport {
                 std::future::pending().await
             }
         }
+    }
+
+    /// Hand a SEARCH sent to this host that the v4 beacon listener took on
+    /// to the ORIGIN_TAG group; see [`BeaconListener`].
+    fn forward_unicast_search(
+        &self,
+        datagram: &[u8],
+        from: SocketAddr,
+        pktinfo: Option<(Ipv4Addr, u32)>,
+    ) {
+        #[cfg(not(epics_embedded_target))]
+        if let Self::Udp(u) = self
+            && let Some(listener) = &u.beacon_socket
+        {
+            listener.forward_unicast_search(datagram, from, pktinfo);
+        }
+        #[cfg(epics_embedded_target)]
+        let _ = (datagram, from, pktinfo);
     }
 
     /// `select!` arm: the next v6 multicast BEACON datagram.
@@ -1026,29 +1024,26 @@ fn bind_search_udp_v6() -> Option<SearchUdpSocketV6> {
     }
 }
 
-/// Bind the v6 beacon listener on `[::]:port` and join the default PVA v6
-/// multicast group.
+/// Bind the v6 beacon listener on `[::]:port`.
 ///
-/// Best-effort in both steps, as the v4 beacon listener is: a failed bind
-/// leaves fast-reconnect to the v4 socket, and a failed group join leaves the
-/// socket receiving unicast only.
-fn bind_beacon_udp_v6(port: u16) -> Option<SearchUdpSocketV6> {
-    let sock = match SearchUdpSocketV6::bind_beacon(port, "PVAC-BEACON6", PVA_SEARCH_UDP_PRIORITY) {
-        Ok(s) => s,
+/// Best-effort, as the v4 beacon listener is: a failed bind leaves
+/// fast-reconnect to the v4 socket.
+fn bind_beacon_udp_v6(port: u16, joins: &[(Ipv6Addr, u32)]) -> Option<SearchUdpSocketV6> {
+    match SearchUdpSocketV6::bind_beacon(port, "PVAC-BEACON6", PVA_SEARCH_UDP_PRIORITY) {
+        Ok(s) => {
+            for &(group, index) in joins {
+                match s.join_multicast_v6(group, index) {
+                    Ok(()) => debug!("joined multicast group {group} on interface {index}"),
+                    Err(e) => debug!("join {group}%{index} failed: {e}"),
+                }
+            }
+            Some(s)
+        }
         Err(e) => {
             debug!("v6 beacon socket: {e}; v6 beacon recv disabled");
-            return None;
+            None
         }
-    };
-    // Interface index 0: let the OS pick. Additional groups from
-    // EPICS_PVA_ADDR_LIST are joined separately.
-    if let Err(e) = sock.join_multicast_v6(DEFAULT_V6_MULTICAST_GROUP, 0) {
-        debug!(
-            "v6 beacon socket: join_multicast_v6 ff0e::400 failed: {e}; \
-             v6 multicast beacons will not be received"
-        );
     }
-    Some(sock)
 }
 
 /// The ephemeral port a bound v6 socket holds, for the SEARCH frame's
@@ -1103,99 +1098,123 @@ async fn recv_from_v6(
     }
 }
 
-fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<SearchUdpSocket> {
-    // The host arm skips the loopback NIC, which a per-NIC bundle can do and
-    // one wildcard socket cannot: any local pva-rs *server* has its UDP
-    // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a co-bound
-    // client beacon socket on the same (addr, port) would race with the
-    // server for inbound SEARCH packets via the kernel's REUSEPORT
-    // load-balancing on macOS / Linux. Beacons that the local server emits go
-    // to NIC subnet broadcasts (never to the loopback addr — see
-    // `config::env::list_broadcast_addresses`, which filters loopback), so
-    // dropping the loopback bind costs nothing on the receive side.
-    let sock = match SearchUdpSocket::bind_beacon(port, "PVAC-beacon", PVA_SEARCH_UDP_PRIORITY) {
+/// The v4 beacon socket and the loopback forward it owes the port it shares.
+///
+/// # Invariant
+///
+/// **A client socket bound into the SEARCH port's reuse group MUST forward
+/// every SEARCH sent to an address of the interface it arrived on to the
+/// ORIGIN_TAG group, and no other.** It co-binds
+/// `broadcast_port` with `SO_REUSEPORT` (pvxs `udp_collector.cpp:136`), so
+/// the kernel balances unicasts to that port between it and any local
+/// server's SEARCH socket on the same address; one it drops is a search the
+/// server never sees. pvxs forwards from every collector (`forwardM`); a
+/// listener constructed without its forward socket is the defect, so the two
+/// are one value. The destination decides, not the SEARCH's unicast flag, as
+/// in pvxs (`:286-306`, `:385-396`): a flagless unicast still needs the
+/// server, and a flagged subnet broadcast reaches the server's own sockets
+/// already, so forwarding it would answer it twice.
+///
+/// The forward is tagged with the datagram's original destination, as pvxs's
+/// is: a server whose listeners are its named interfaces takes a forward only
+/// when the tag names one of them (`udp_collector.cpp:451`), so a wildcard tag
+/// reaches a wildcard server alone.
+///
+/// `forward` is `None` only where its setup failed (logged), and absent on an
+/// embedded target, whose servers do not join the group and so could not
+/// take it, and whose receive path reports no destination to tag.
+struct BeaconListener {
+    socket: BeaconUdpSocket,
+    #[cfg(not(epics_embedded_target))]
+    forward: Option<LoForward>,
+}
+
+/// The ORIGIN_TAG send socket and the interface map that says which
+/// destinations are this host's.
+#[cfg(not(epics_embedded_target))]
+struct LoForward {
+    socket: std::net::UdpSocket,
+    routes: crate::server_native::search_engine::IfaceRoutes,
+}
+
+#[cfg(not(epics_embedded_target))]
+impl BeaconListener {
+    fn forward_unicast_search(
+        &self,
+        datagram: &[u8],
+        from: SocketAddr,
+        pktinfo: Option<(Ipv4Addr, u32)>,
+    ) {
+        use crate::server_native::search_engine::DestClass;
+        // A multicast source is forged; forwarding it would amplify
+        // (`udp_collector.cpp:261-265`).
+        if from.ip().is_multicast() {
+            return;
+        }
+        let (Some(forward), Some((dest, ifindex)), Some(port)) = (
+            &self.forward,
+            pktinfo,
+            self.socket.local_addrs().first().map(|a| a.port()),
+        ) else {
+            return;
+        };
+        if forward.routes.classify(dest, ifindex) != DestClass::Unicast(dest) {
+            return;
+        }
+        let Some(bytes) =
+            crate::server_native::search_engine::origin_tag_forward(datagram, from, dest)
+        else {
+            return;
+        };
+        let group = SocketAddr::from((epics_base_rs::net::ORIGIN_TAG_MCAST_GROUP, port));
+        if let Err(e) = forward.socket.send_to(&bytes, group) {
+            debug!("ORIGIN_TAG forward of a unicast SEARCH from {from} failed: {e}");
+        }
+    }
+}
+
+/// The send half of the ORIGIN_TAG channel: loopback egress, TTL 1. Bound
+/// ephemeral, so the group's datagrams to the SEARCH port never reach it.
+#[cfg(not(epics_embedded_target))]
+fn bind_lo_forward() -> Option<LoForward> {
+    let bound = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|socket| {
+        let map = epics_base_rs::net::IfaceMap::new()?;
+        Ok(LoForward {
+            socket,
+            routes: crate::server_native::search_engine::IfaceRoutes::new(&map.all()),
+        })
+    });
+    match bound {
+        Ok(forward) => {
+            epics_base_rs::net::enable_loopback_mcast(socket2::SockRef::from(&forward.socket));
+            Some(forward)
+        }
+        Err(e) => {
+            warn!("ORIGIN_TAG forward setup failed: {e}; a local server may miss unicast SEARCHes");
+            None
+        }
+    }
+}
+
+fn bind_beacon_udp(port: u16, joins: &[(Ipv4Addr, Ipv4Addr)]) -> Option<BeaconListener> {
+    let sock = match BeaconUdpSocket::bind(port, "PVAC-beacon", PVA_SEARCH_UDP_PRIORITY) {
         Ok(s) => s,
         Err(e) => {
             debug!("beacon socket bind to {port} failed: {e}; fast-reconnect disabled");
             return None;
         }
     };
-    // pvxs udp_collector.cpp:140 binds wildcard so we also receive
-    // multicast packets — but only for groups we've explicitly joined.
-    // Join any multicast groups present in the per-client address list
-    // (the standard PVA `224.0.2.3` group is left to user opt-in to avoid
-    // surprising multicast traffic from a default config).
-    join_addr_list_multicast(&sock, addr_list);
-    Some(sock)
-}
-
-/// Project `EPICS_PVA_ADDR_LIST` endpoints to their multicast join
-/// targets. Each entry is `(group, iface)`:
-///
-/// * `iface = Some(ip)` — the endpoint carried an explicit `@iface`
-///   modifier, so the group is joined on *that interface alone* (pvxs
-///   joins the one chosen interface; `udp_collector.cpp:186-196`).
-/// * `iface = None` — a modifier-less group, joined on every external NIC.
-///
-/// Non-multicast and IPv6 entries are dropped (the v4 socket cannot join a
-/// v6 group, and a unicast/broadcast search target needs no membership).
-/// An unresolvable `@iface` spec is skipped (logged). Pure given IP-literal
-/// `@iface` forms (`resolve_iface_v4` passthrough), so the projection is
-/// testable without real NIC multicast.
-fn addr_list_multicast_targets(
-    endpoints: &[crate::config::Endpoint],
-) -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
-    let mut out = Vec::new();
-    for ep in endpoints {
-        let SocketAddr::V4(v4) = ep.addr else {
-            continue;
-        };
-        let group = *v4.ip();
-        if !group.is_multicast() {
-            continue;
-        }
-        let iface = match ep.iface.as_deref() {
-            None => None,
-            Some(spec) => match crate::config::env::resolve_iface_v4(spec) {
-                Ok(ip) => Some(ip),
-                Err(e) => {
-                    debug!(
-                        "EPICS_PVA_ADDR_LIST {group}@{spec}: \
-                         interface resolve failed: {e}; skipping join"
-                    );
-                    continue;
-                }
-            },
-        };
-        out.push((group, iface));
-    }
-    out
-}
-
-/// Walk `EPICS_PVA_ADDR_LIST` and join its IPv4 multicast groups on `sock`.
-/// Errors are logged but not propagated — a single failed join shouldn't
-/// disable the rest of the discovery path.
-///
-/// A group with an explicit `@iface` modifier is joined on that interface
-/// alone; a modifier-less group passes `0.0.0.0`, which the host arm expands
-/// to every external NIC and the exec arm hands to the routing table. The
-/// previous code dropped the `@iface` and joined all-NIC for every group —
-/// the same `@iface`-dropping defect as the server beacon-join path, fixed
-/// here in the same change.
-fn join_addr_list_multicast(sock: &SearchUdpSocket, endpoints: &[crate::config::Endpoint]) {
-    // The endpoints were resolved once at config-build time through the
-    // single address-list parser (`parse_endpoints_with_port`): split on
-    // WHITESPACE only (pvxs `split_addr_into` — the comma is endpoint
-    // syntax, not a list separator), `$(VAR)` macros expanded, DNS /
-    // bracketed-v6 resolved the same way the active-SEARCH path does. We
-    // keep only the V4 multicast groups here.
-    for (group, iface) in addr_list_multicast_targets(endpoints) {
-        let iface_ip = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
-        match sock.join_multicast_v4(group, iface_ip) {
-            Ok(()) => debug!("joined multicast group {group} on interface {iface_ip}"),
-            Err(e) => debug!("join_multicast_v4 {group}@{iface_ip} failed: {e}"),
+    for &(group, iface) in joins {
+        match sock.join_multicast_v4(group, iface) {
+            Ok(()) => debug!("joined multicast group {group} on interface {iface}"),
+            Err(e) => debug!("join {group}@{iface} failed: {e}"),
         }
     }
+    Some(BeaconListener {
+        socket: sock,
+        #[cfg(not(epics_embedded_target))]
+        forward: bind_lo_forward(),
+    })
 }
 
 // ── Engine main loop ────────────────────────────────────────────────────
@@ -1769,7 +1788,8 @@ async fn run_engine(
             }
 
             res = transport.recv_beacon(&mut beacon_buf) => {
-                if let Ok((n, from)) = res {
+                if let Ok((n, from, pktinfo)) = res {
+                    transport.forward_unicast_search(&beacon_buf[..n], from, pktinfo);
                     let mut poke = false;
                     // Multi-message drain: same rationale as
                     // search responses — beacons can be chained.
@@ -2098,22 +2118,22 @@ fn maybe_poke(
 /// unicast target); `false` for broadcast / multicast.
 /// [`UdpTransport::broadcast`] uses it to pick which pre-built frame variant
 /// to send.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SearchTarget {
-    addr: SocketAddr,
+    ep: Endpoint,
     unicast: bool,
 }
 
 impl SearchTarget {
     fn broadcast(addr: SocketAddr) -> Self {
         Self {
-            addr,
+            ep: addr.into(),
             unicast: false,
         }
     }
     fn unicast(addr: SocketAddr) -> Self {
         Self {
-            addr,
+            ep: addr.into(),
             unicast: true,
         }
     }
@@ -2122,7 +2142,7 @@ impl SearchTarget {
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
-    extra_targets: &[SocketAddr],
+    extra_targets: &[Endpoint],
     client_interfaces: &[Ipv4Addr],
 ) -> Vec<SearchTarget> {
     let mut targets: Vec<SearchTarget> = Vec::with_capacity(8);
@@ -2184,7 +2204,7 @@ fn search_targets(
     let bcast_ips: std::collections::HashSet<IpAddr> = targets
         .iter()
         .filter(|t| !t.unicast)
-        .map(|t| t.addr.ip())
+        .map(|t| t.ep.addr.ip())
         .collect();
 
     // Explicitly configured / programmatic targets are always sent — they
@@ -2196,22 +2216,22 @@ fn search_targets(
     // effect (the datagram still reaches the subnet, and the Unicast bit only
     // governs a re-broadcast trigger that is moot for an already-broadcast
     // packet).
-    for &t in extra_targets {
-        let ip = t.ip();
+    for ep in extra_targets {
+        let ip = ep.addr.ip();
         let is_broadcastish = ip.is_multicast()
             || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
             || bcast_ips.contains(&ip);
-        targets.push(if is_broadcastish {
-            SearchTarget::broadcast(t)
-        } else {
-            SearchTarget::unicast(t)
+        targets.push(SearchTarget {
+            ep: ep.clone(),
+            unicast: !is_broadcastish,
         });
     }
 
-    // Dedup by address while preserving insertion order (first classification
-    // wins, so an auto broadcast entry shadows a duplicate extra).
+    // Dedup by `(address, interface)` while preserving insertion order (first
+    // classification wins, so an auto broadcast entry shadows a duplicate
+    // extra).
     let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| seen.insert(t.addr));
+    targets.retain(|t| seen.insert((t.ep.addr, t.ep.iface.clone())));
     targets
 }
 
@@ -2244,44 +2264,35 @@ impl UdpTransport {
         // bit-clear (built `unicast=false`); derive the unicast variant once.
         let ucast_v4 = PvaCodec::search_frame_unicast_copy(packet_v4);
         let ucast_v6 = PvaCodec::search_frame_unicast_copy(packet_v6);
+        let ifmap = crate::config::IfaceMap::for_endpoints(targets.iter().map(|t| &t.ep));
 
         for st in targets {
-            let t = st.addr;
+            let ep = &st.ep;
+            let t = ep.addr;
             let pkt_v4: &[u8] = if st.unicast { &ucast_v4 } else { packet_v4 };
             let pkt_v6: &[u8] = if st.unicast { &ucast_v6 } else { packet_v6 };
-            // Limited broadcast (255.255.255.255) and multicast (224/4)
-            // need explicit per-NIC fanout — OS routing alone would only
-            // pick the default-route NIC. Per-subnet broadcast and
-            // unicast destinations route via the NIC chosen by AsyncUdpV4.
-            // PR #205 IPv6 Stage 4: SocketAddr::V6 destinations are sent
-            // via the optional v6 socket. If the engine has no v6 socket
-            // the entry was already filtered at spawn time, so reaching
-            // this branch here means a programmatic addr_list passed v6
-            // through despite the missing socket — fall through to the
-            // error path for visibility.
+            // A multicast group is one send with its endpoint's TTL and
+            // `@iface`, pvxs `mcast_prep_sendto` (`client.cpp:1182-1194`).
+            // The limited broadcast is the auto-list stand-in for pvxs's
+            // per-interface directed broadcasts, so it fans out per NIC,
+            // constrained to `EPICS_PVA_INTF_ADDR_LIST` when set. A v6
+            // destination reaching here without a v6 socket was let through
+            // by a programmatic list; it errs for visibility.
             let result = match t {
-                SocketAddr::V4(v4) => {
-                    let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
-                    if needs_fanout {
-                        // Limited-broadcast (255.255.255.255) / multicast egress
-                        // is constrained to EPICS_PVA_INTF_ADDR_LIST when set, so
-                        // the all-NIC search bundle does not leak auto-broadcast
-                        // out an interface the operator excluded. Empty list =
-                        // every up-non-loopback NIC (the all-NIC default). This
-                        // reproduces the pre-fix interface-constrained bundle's
-                        // broadcast egress exactly while the bundle itself stays
-                        // all-NIC so explicit unicast routes via `pick_nic` below.
-                        // Per-subnet directed broadcasts and explicit unicast take
-                        // the `send_to` path.
-                        socket
-                            .fanout_to(pkt_v4, t, client_interfaces)
-                            .await
-                            .map(|_| ())
-                    } else {
-                        socket.send_to(pkt_v4, t).await.map(|_| ())
-                    }
-                }
-                SocketAddr::V6(_) => match socket_v6 {
+                SocketAddr::V4(v4) if v4.ip().is_multicast() => socket
+                    .send_multicast_v4(pkt_v4, v4, ep.mcast_ttl(), ep.mcast_iface_v4(&ifmap))
+                    .await
+                    .map(|_| ()),
+                SocketAddr::V4(v4) if v4.ip().is_broadcast() => socket
+                    .fanout_to(pkt_v4, t, client_interfaces)
+                    .await
+                    .map(|_| ()),
+                SocketAddr::V4(_) => socket.send_to(pkt_v4, t).await.map(|_| ()),
+                SocketAddr::V6(v6) => match socket_v6 {
+                    Some(s6) if v6.ip().is_multicast() => s6
+                        .send_multicast_v6(pkt_v6, v6, ep.mcast_ttl(), ep.mcast_iface_v6(&ifmap))
+                        .await
+                        .map(|_| ()),
                     Some(s6) => s6.send_to(pkt_v6, t).await.map(|_| ()),
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::AddrNotAvailable,
@@ -3238,48 +3249,6 @@ mod tests {
     // Used only by the gated TCP-name-server tests (stage 3).
     use crate::proto::ControlCommand;
     use serial_test::serial;
-
-    /// Client half, same
-    /// `@iface`-dropping defect family as the server beacon-join path: the
-    /// `EPICS_PVA_ADDR_LIST` multicast projection must keep the `@iface`
-    /// modifier so an explicit-interface group is joined on that interface
-    /// alone (`Some(ip)`), while a modifier-less group stays an all-NIC join
-    /// (`None`). The pre-fix code projected every group to the all-NIC
-    /// `join_multicast_v4`, dropping the interface entirely. IP-literal
-    /// `@iface` forms make `resolve_iface_v4` a pure passthrough.
-    #[cfg(tokio_backend)]
-    #[test]
-    fn addr_list_multicast_targets_preserves_iface_modifier() {
-        let modifierless: crate::config::Endpoint =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 4, 4)), 5076).into();
-        let explicit = crate::config::Endpoint {
-            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 5, 5)), 5076),
-            ttl: None,
-            iface: Some("192.168.7.7".to_string()),
-        };
-        // Unicast and v6 entries are dropped.
-        let unicast: crate::config::Endpoint =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 5076).into();
-        let v6: crate::config::Endpoint = SocketAddr::V6(std::net::SocketAddrV6::new(
-            Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x400),
-            5076,
-            0,
-            0,
-        ))
-        .into();
-
-        assert_eq!(
-            addr_list_multicast_targets(&[modifierless, explicit, unicast, v6]),
-            vec![
-                (Ipv4Addr::new(224, 0, 4, 4), None),
-                (
-                    Ipv4Addr::new(224, 0, 5, 5),
-                    Some(Ipv4Addr::new(192, 168, 7, 7))
-                ),
-            ],
-            "modifier-less group → all-NIC (None); @iface group → that interface (Some)"
-        );
-    }
 
     // ---- name-server dedup (pvxs split_addr_into sort+unique) ----
     //
@@ -5307,7 +5276,7 @@ mod tests {
         source.add("V6:SEARCH:PV", pv);
 
         // Ask for an ephemeral search port and read the number back off the
-        // running server: the v6 companion claims `[::]:udp_port` from the
+        // running server: the v6 collector claims `[::]:udp_port` from the
         // same stamped config, so the probe this replaces was handing both
         // listeners a number it had already released.
         let config = PvaServerConfig {
@@ -5316,7 +5285,9 @@ mod tests {
             bind_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
-            enable_ipv6_udp: true,
+            interfaces: ["127.0.0.1", "[::1]"]
+                .map(|t| crate::config::Endpoint::parse(t, 0).unwrap())
+                .to_vec(),
             ..Default::default()
         };
         let server = PvaServer::start(source, config).expect("test server must start");
@@ -5432,11 +5403,6 @@ mod tests {
         drop(engine);
     }
 
-    /// PR #205 IPv6 Stage 6: `bind_beacon_udp_v6` returns a usable
-    /// socket bound to `[::]:5076` (or `EPICS_PVA_BROADCAST_PORT`)
-    /// with the default v6 multicast group joined. Confirms the
-    /// plumbing — without it the recv arm in `run_engine` never
-    /// fires for v6 beacons.
     /// A v6 number this test owns on `[::]`, where the beacon socket binds:
     /// picked by the kernel, then opened to the beacon socket's fanout
     /// co-bind, so nobody else can take it while the test hands it over.
@@ -5455,16 +5421,18 @@ mod tests {
         (s, port)
     }
 
+    /// `bind_beacon_udp_v6` binds `[::]` on `EPICS_PVA_BROADCAST_PORT`;
+    /// without it the recv arm in `run_engine` never fires for v6 beacons.
     #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(epics_env)]
-    async fn v6_beacon_socket_binds_and_joins_default_group() {
+    async fn v6_beacon_socket_binds_the_broadcast_port() {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
         // 5076 socket.
         let (_holder, port) = hold_v6_beacon_port();
 
-        let sock = bind_beacon_udp_v6(port)
+        let sock = bind_beacon_udp_v6(port, &[])
             .expect("v6 beacon socket must bind on a host with IPv6 enabled");
         assert_eq!(
             local_port_v6(&sock),
@@ -6230,7 +6198,7 @@ mod tests {
     /// unicast classification).
     #[cfg(tokio_backend)]
     fn target_addrs(targets: &[SearchTarget]) -> Vec<SocketAddr> {
-        targets.iter().map(|t| t.addr).collect()
+        targets.iter().map(|t| t.ep.addr).collect()
     }
 
     /// AUTO_ADDR_LIST=NO with an empty configured address list must yield
@@ -6292,7 +6260,7 @@ mod tests {
     fn search_targets_loopback_only_interface_list_no_broadcast() {
         let targets = search_targets(5076, true, &[], &[Ipv4Addr::LOCALHOST]);
         assert!(
-            !targets.iter().any(|t| match t.addr {
+            !targets.iter().any(|t| match t.ep.addr {
                 SocketAddr::V4(v4) => !v4.ip().is_loopback(),
                 SocketAddr::V6(_) => true,
             }),
@@ -6301,14 +6269,14 @@ mod tests {
         assert!(
             !targets
                 .iter()
-                .any(|t| matches!(t.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+                .any(|t| matches!(t.ep.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
             "loopback-only interface list must not emit limited broadcast: {targets:?}"
         );
         // The loopback unicast convenience is still present (loopback is
         // the explicitly-listed interface) and is classified unicast.
         let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
         assert!(
-            targets.iter().any(|t| t.addr == lo && t.unicast),
+            targets.iter().any(|t| t.ep.addr == lo && t.unicast),
             "loopback unicast expected (flag set) when loopback is the listed interface"
         );
     }
@@ -6319,7 +6287,7 @@ mod tests {
     #[test]
     fn search_targets_auto_off_sends_only_configured_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, false, &[extra], &[]);
+        let targets = search_targets(5076, false, &[extra.into()], &[]);
         assert_eq!(target_addrs(&targets), vec![extra]);
         // A plain addr-list host is a unicast destination (pvxs sets the
         // Unicast flag bit for it; PVX-81).
@@ -6330,7 +6298,7 @@ mod tests {
         assert!(
             !targets
                 .iter()
-                .any(|t| matches!(t.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
+                .any(|t| matches!(t.ep.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
             "no limited broadcast may be added when AUTO_ADDR_LIST is off"
         );
     }
@@ -6344,13 +6312,13 @@ mod tests {
     fn search_targets_multicast_extra_is_not_unicast() {
         let mcast: SocketAddr = "224.0.2.3:5076".parse().unwrap();
         let host: SocketAddr = "10.0.0.7:5076".parse().unwrap();
-        let targets = search_targets(5076, false, &[mcast, host], &[]);
+        let targets = search_targets(5076, false, &[mcast.into(), host.into()], &[]);
         assert!(
-            targets.iter().any(|t| t.addr == mcast && !t.unicast),
+            targets.iter().any(|t| t.ep.addr == mcast && !t.unicast),
             "a multicast addr-list entry must be classified non-unicast"
         );
         assert!(
-            targets.iter().any(|t| t.addr == host && t.unicast),
+            targets.iter().any(|t| t.ep.addr == host && t.unicast),
             "a plain host addr-list entry must be classified unicast"
         );
     }
@@ -6361,7 +6329,7 @@ mod tests {
     #[test]
     fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
-        let targets = search_targets(5076, true, &[extra], &[]);
+        let targets = search_targets(5076, true, &[extra.into()], &[]);
         let limited = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076);
         assert!(
             target_addrs(&targets).contains(&limited),
@@ -6370,11 +6338,11 @@ mod tests {
         // PVX-81 classification: the limited broadcast is non-unicast (flag
         // clear); the explicit host extra is unicast (flag set).
         assert!(
-            targets.iter().any(|t| t.addr == limited && !t.unicast),
+            targets.iter().any(|t| t.ep.addr == limited && !t.unicast),
             "the limited broadcast must be classified non-unicast"
         );
         assert!(
-            targets.iter().any(|t| t.addr == extra && t.unicast),
+            targets.iter().any(|t| t.ep.addr == extra && t.unicast),
             "configured extras are always included and classified unicast"
         );
     }
@@ -6396,7 +6364,7 @@ mod tests {
         );
         // An explicit EPICS_PVA_ADDR_LIST=127.0.0.1 entry (carried in
         // extra_targets) still reaches loopback — the parity-correct path.
-        let with_explicit = search_targets(5076, true, &[lo], &[]);
+        let with_explicit = search_targets(5076, true, &[lo.into()], &[]);
         assert!(
             target_addrs(&with_explicit).contains(&lo),
             "explicit addr-list loopback entry must still target loopback: {with_explicit:?}"
@@ -6435,48 +6403,6 @@ mod tests {
                 .any(|e| e.addr == "192.168.1.9:5080".parse().unwrap()),
             "explicit-port addr-list entry must keep its port: {:?}",
             cfg.addr_list
-        );
-    }
-
-    /// A per-client `addr_list` carrying a multicast group must drive the
-    /// beacon-socket multicast join, with any `@iface` modifier honoured —
-    /// the join no longer reads `EPICS_PVA_ADDR_LIST` from the environment
-    /// (pvxs joins per-listener groups, `udp_collector.cpp:186-196`).
-    #[cfg(tokio_backend)]
-    #[test]
-    fn client_search_config_multicast_endpoint_drives_join() {
-        let endpoints = vec![
-            crate::config::Endpoint {
-                addr: "224.0.2.3:5076".parse().unwrap(),
-                ttl: None,
-                iface: None,
-            },
-            crate::config::Endpoint {
-                addr: "239.1.2.3:5076".parse().unwrap(),
-                ttl: None,
-                iface: Some("127.0.0.1".to_string()),
-            },
-            // A plain unicast entry contributes no multicast membership.
-            crate::config::Endpoint {
-                addr: "10.0.0.7:5076".parse().unwrap(),
-                ttl: None,
-                iface: None,
-            },
-        ];
-        let targets = addr_list_multicast_targets(&endpoints);
-        assert!(
-            targets.contains(&(Ipv4Addr::new(224, 0, 2, 3), None)),
-            "modifier-less multicast group must join on every NIC: {targets:?}"
-        );
-        assert!(
-            targets.contains(&(Ipv4Addr::new(239, 1, 2, 3), Some(Ipv4Addr::LOCALHOST))),
-            "@iface multicast group must join on that interface alone: {targets:?}"
-        );
-        assert!(
-            !targets
-                .iter()
-                .any(|(g, _)| *g == Ipv4Addr::new(10, 0, 0, 7)),
-            "unicast addr-list entry must not appear as a multicast target: {targets:?}"
         );
     }
 
@@ -6649,6 +6575,176 @@ mod tests {
         assert_eq!(
             SEARCH_SEQ, 0x6669_6e64,
             "search_seq is the ASCII bytes \"find\""
+        );
+    }
+
+    /// How a SEARCH reached the local server's socket.
+    #[cfg(not(epics_embedded_target))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Via {
+        Direct,
+        /// Through the ORIGIN_TAG group, under this tag.
+        Forward(Option<Ipv4Addr>),
+    }
+
+    /// The SEARCHES copies, `(cid, how)`, that a local server's SEARCH socket
+    /// co-bound with the engine's beacon listener receives when one SEARCH
+    /// per cid, `unicast`-flagged or not, is sent to `dest(nic)` on its port
+    /// from its own source port (spreading the kernel's 4-tuple hash). Reads
+    /// until `done(nic, copies)` holds or 3 s pass; returns the destination. `nic` is an up non-loopback interface,
+    /// which both backends' listeners bind (the host arm skips loopback).
+    #[cfg(not(epics_embedded_target))]
+    async fn search_copies_at_a_cobound_server(
+        dest: impl Fn(&epics_base_rs::net::IfaceV4) -> Option<Ipv4Addr>,
+        unicast: bool,
+        done: impl Fn(Ipv4Addr, &[(u32, Via)]) -> bool,
+    ) -> (Ipv4Addr, Vec<(u32, Via)>) {
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let (nic, dest) = epics_base_rs::net::iface_v4::enumerate()
+            .expect("enumerate interfaces")
+            .into_iter()
+            .filter(|i| i.is_up() && !i.is_loopback())
+            .find_map(|i| Some((i.ip, dest(&i)?)))
+            .expect("this test needs one up non-loopback IPv4 interface with that destination");
+        // A local server's SEARCH socket as pvxs and both rs drivers bind it:
+        // wildcard, port-shared, a member of the loopback ORIGIN_TAG group.
+        // Its own number is picked before the reuse options, as `bind_fanout`
+        // does, so it is nobody else's group.
+        let server = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        server
+            .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        server.set_reuse_address(true).unwrap();
+        #[cfg(unix)]
+        server.set_reuse_port(true).unwrap();
+        epics_base_rs::net::enable_loopback_mcast(socket2::SockRef::from(&server));
+        let server: std::net::UdpSocket = server.into();
+        server.set_nonblocking(true).unwrap();
+        let port = server.local_addr().unwrap().port();
+
+        let _engine = SearchEngine::spawn_with_config(
+            &crate::test_reactor(),
+            ClientSearchConfig {
+                addr_list: Vec::new(),
+                auto_addr_list: false,
+                broadcast_port: port,
+                server_port: 5075,
+            },
+            Vec::new(),
+            Vec::new(),
+            epics_base_rs::types::PvString::default(),
+            epics_base_rs::types::PvString::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("spawn engine");
+
+        let codec = PvaCodec { big_endian: false };
+        let senders: Vec<std::net::UdpSocket> = (0..SEARCHES)
+            .map(|_| {
+                let tx = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+                tx.set_broadcast(true).unwrap();
+                tx
+            })
+            .collect();
+        for (cid, tx) in (0..SEARCHES).zip(&senders) {
+            let frame = codec.build_search_batch(cid, &[(cid, "X")], [0; 4], 5076, unicast);
+            tx.send_to(&frame, (dest, port)).unwrap();
+        }
+
+        let mut copies = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 1500];
+        while !done(nic, &copies) && Instant::now() < deadline {
+            match server.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let (via, frame) = match PvaCodec::try_peel_origin_tag(&buf[..n]) {
+                        Some((tag, inner)) => (Via::Forward(tag), inner),
+                        None => (Via::Direct, &buf[..n]),
+                    };
+                    if let Some(req) = crate::server_native::search::parse_search_request(frame) {
+                        copies.extend(req.queries.iter().map(|(cid, _)| (*cid, via)));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        (dest, copies)
+    }
+
+    #[cfg(not(epics_embedded_target))]
+    const SEARCHES: u32 = 16;
+
+    /// The cids of `copies` a server listening on `nic` takes: direct, or
+    /// forwarded under a tag naming it (`udp_collector.cpp:451`).
+    #[cfg(not(epics_embedded_target))]
+    fn taken_at(nic: Ipv4Addr, copies: &[(u32, Via)]) -> HashSet<u32> {
+        copies
+            .iter()
+            .filter(|(_, via)| matches!(via, Via::Direct) || *via == Via::Forward(Some(nic)))
+            .map(|&(cid, _)| cid)
+            .collect()
+    }
+
+    /// The engine's beacon listener co-binds the SEARCH port in a local
+    /// server's `SO_REUSEPORT` group, so the kernel hands it a share of the
+    /// SEARCHes sent to this host's address. Each must still reach the
+    /// server — directly, or through the ORIGIN_TAG group the listener
+    /// forwards it to, tagged with that destination, as every pvxs collector
+    /// does — whether or not it carries the unicast flag: pvxs forwards by
+    /// destination (`udp_collector.cpp:286-306`, `:385-396`).
+    #[cfg(not(epics_embedded_target))]
+    #[epics_macros_rs::epics_test]
+    async fn a_search_to_this_host_the_beacon_listener_takes_still_reaches_the_server() {
+        for unicast in [true, false] {
+            let (nic, copies) = search_copies_at_a_cobound_server(
+                |i| Some(i.ip),
+                unicast,
+                |nic, c| taken_at(nic, c).len() == SEARCHES as usize,
+            )
+            .await;
+            let reached = taken_at(nic, &copies);
+            assert_eq!(
+                reached.len(),
+                SEARCHES as usize,
+                "SEARCHes (unicast flag {unicast}) to {nic} the server never saw: {:?}",
+                (0..SEARCHES)
+                    .filter(|c| !reached.contains(c))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A SEARCH to the subnet broadcast reaches every socket on the port, the
+    /// server's among them, so the beacon listener MUST NOT forward it even
+    /// when it is unicast-flagged: pvxs classifies it `Broadcast` by
+    /// destination, and a forward would have the server answer it twice.
+    #[cfg(not(epics_embedded_target))]
+    #[epics_macros_rs::epics_test]
+    async fn a_flagged_search_to_the_subnet_broadcast_is_not_forwarded() {
+        let (bcast, copies) = search_copies_at_a_cobound_server(
+            |i| i.dest.filter(|_| i.is_broadcast()),
+            true,
+            |_, _| false,
+        )
+        .await;
+        let forwarded: Vec<_> = copies
+            .iter()
+            .filter(|(_, via)| *via != Via::Direct)
+            .collect();
+        assert!(
+            forwarded.is_empty(),
+            "SEARCHes to {bcast} forwarded: {forwarded:?}"
+        );
+        let direct: HashSet<u32> = copies.iter().map(|&(cid, _)| cid).collect();
+        assert_eq!(
+            direct.len(),
+            SEARCHES as usize,
+            "the server's own socket takes every broadcast: {copies:?}"
         );
     }
 }

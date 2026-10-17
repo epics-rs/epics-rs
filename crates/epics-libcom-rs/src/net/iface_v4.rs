@@ -177,11 +177,12 @@ impl IfaceV4 {
 
 /// Enumerate the machine's IPv4 interfaces.
 ///
-/// Every `AF_INET` interface the OS reports, filtered by nothing: eligibility
-/// is [`IfaceV4::is_eligible`]'s job and the destination choice is
-/// [`IfaceV4::search_destination`]'s, so a caller that wants the raw list for
-/// diagnostics gets it and a caller that wants C's SEARCH destinations composes
-/// the two.
+/// Every `AF_INET` interface the OS reports up: one without `IFF_UP` is not
+/// configured, and C (`osdNetIfAddrs.c:100`) and pvxs (`IfaceMap::_refresh`,
+/// `osdSockExt.cpp:284`) drop it before any caller sees it, so no bind,
+/// join or route can name a down NIC's address. Loopback stays; excluding it
+/// is [`IfaceV4::is_eligible`]'s job, and the destination choice is
+/// [`IfaceV4::search_destination`]'s.
 pub fn enumerate() -> io::Result<Vec<IfaceV4>> {
     sys::enumerate()
 }
@@ -295,7 +296,7 @@ mod sys {
     //! | RTEMS 5 / 7 | `<bsp>/lib/include/ifaddrs.h` |
     //! | VxWorks 7 | `usr/h/public/net/ifaddrs.h` (sixth field is a union of `ifu_broadaddr`/`ifu_dstaddr`, which is one pointer) |
 
-    use super::IfaceV4;
+    use super::{IfaceV4, flags};
     use std::ffi::CStr;
     use std::io;
     use std::net::Ipv4Addr;
@@ -448,6 +449,9 @@ mod sys {
                     // family (`:75`) — both are skips, not failures.
                     continue;
                 };
+                if node.ifa_flags & flags::IFF_UP == 0 {
+                    continue;
+                }
                 let name = if node.ifa_name.is_null() {
                     String::new()
                 } else {

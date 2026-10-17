@@ -10,12 +10,6 @@
 //! qsrv-rs --db-file records.db [--group-file groups.json] [--port 5075]
 //!         [--macro KEY=VAL]...
 //! ```
-// On `exec_backend` this program's `main` refuses instead of running, so
-// everything below it is unreachable in that configuration by construction.
-// The lint is reporting the intent, not dead code: the default build still
-// lints this file in full.
-#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -23,13 +17,9 @@ use clap::Parser;
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::ioc_app::{GroupLoadRequest, IocApplication};
-#[cfg(tokio_backend)]
 use epics_base_rs::server::iocsh::registry::escape_arg;
-#[cfg(tokio_backend)]
 use epics_bridge_rs::qsrv::run_qsrv_ioc_app;
-#[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
-#[cfg(tokio_backend)]
 use epics_pva_rs::server_native::CompositeSource;
 
 #[derive(Parser, Debug)]
@@ -78,9 +68,20 @@ async fn main() -> ExitCode {
     // would keep errlog lines as its own records on stdout instead.
     epics_base_rs::runtime::log::install_console_subscriber();
 
-    let args = Args::parse();
+    exit(run(Args::parse()).await)
+}
 
-    match run(args).await {
+/// The reactor-free arm: the same `run`, parked on the main thread.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    epics_base_rs::runtime::log::install_console_subscriber();
+    let result = epics_base_rs::runtime::task::block_on_sync(run(Args::parse()))
+        .unwrap_or_else(|e| Err(e.to_string()));
+    exit(result)
+}
+
+fn exit(result: Result<(), String>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("qsrv-rs: {e}");
@@ -89,7 +90,6 @@ async fn main() -> ExitCode {
     }
 }
 
-#[cfg(tokio_backend)]
 async fn run(args: Args) -> Result<(), String> {
     let mut app = IocApplication::new();
     if let Some(path) = args.db_file.as_ref() {
@@ -131,16 +131,4 @@ async fn run(args: Args) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())
-}
-
-/// The `exec_backend` arm. QSRV serves its groups over the async PVA front-end
-/// (`server_native::runtime`), which is `tokio_backend`-only; `realtime-pva-ioc`
-/// is the entry point for this execution model.
-#[cfg(exec_backend)]
-fn main() -> ExitCode {
-    epics_base_rs::runtime::task::refuse_backend(
-        "qsrv-rs: this build selects the reactor-free execution backend \
-         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the PVA server front-end needs \
-         a tokio reactor. Unset that variable and rebuild.",
-    )
 }

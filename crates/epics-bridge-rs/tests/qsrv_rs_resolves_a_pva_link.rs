@@ -9,7 +9,7 @@
 //! DST       5
 //! DST.SEVR  (0) NO_ALARM
 //! ```
-#![cfg(all(feature = "qsrv-bin", tokio_backend, unix))]
+#![cfg(all(feature = "qsrv-bin", unix))]
 
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,9 @@ async fn value_and_severity(client: &PvaClient, pv: &str) -> Option<(f64, i32)> 
     Some((value, *sevr))
 }
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the exec
+// backend; the tokio runtime is only the client harness, and the IOC under
+// test is the qsrv-rs process.
 #[tokio::test]
 async fn qsrv_rs_resolves_a_pva_link_as_soft_ioc_pva() {
     let dir = tempfile::tempdir().unwrap();

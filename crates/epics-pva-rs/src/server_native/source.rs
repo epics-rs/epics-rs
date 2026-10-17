@@ -926,10 +926,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     ///
     /// Default `0` for leaf sources whose registry never changes; the
     /// registry owner ([`crate::server_native::CompositeSource`])
-    /// overrides this to return its live counter. The beacon task folds
-    /// this into the beacon `change_count`, keeping the PV-set hash only
-    /// as a fallback for sources that mutate their own list without
-    /// going through a registry mutation API.
+    /// overrides this to return its live counter. The beacon carries it as
+    /// its `change_count`; a source that changes its PV list without
+    /// bumping it does not move the beacon, as in pvxs.
     fn beacon_change(&self) -> u64 {
         0
     }

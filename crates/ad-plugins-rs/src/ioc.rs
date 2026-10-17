@@ -1266,10 +1266,7 @@ impl AdIoc {
     /// Run the IOC with both CA and PVA protocols (QSRV bridge).
     ///
     /// Same as [`Self::run`] but uses
-    /// `epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app` — named in a code span
-    /// rather than linked because it is `tokio_backend`-only and this doc is
-    /// rendered in configurations that do not have it —
-    /// as the protocol runner, serving records over CA (default port 5064) and
+    /// [`epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app`] as the protocol runner, serving records over CA (default port 5064) and
     /// pvAccess (default port 5075) simultaneously. PVA plugin PVs (NTNDArray)
     /// registered during st.cmd are wired into the PVA server automatically.
     #[cfg(feature = "pva")]

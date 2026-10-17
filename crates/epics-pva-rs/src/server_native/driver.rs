@@ -79,10 +79,13 @@ use epics_base_rs::runtime::task::Reactor;
 
 use super::blocking::{BlockingPvaServer, SearchSocket};
 use super::config::PvaServerConfig;
+use super::peers::PeerRegistry;
 #[cfg(unix)]
 use super::reactor::ReactorPvaServer;
 use super::source::DynSource;
 use crate::error::PvaResult;
+
+pub use super::beacon::BeaconSender;
 
 /// The environment variable [`DriverKind::from_env`] reads.
 pub const DRIVER_ENV: &str = "EPICS_PVA_RS_DRIVER";
@@ -114,6 +117,17 @@ pub trait PvaServerDriver: Send + Sync {
 
     /// Stop the accept loop and end every live connection.
     fn shutdown(&self);
+
+    /// The live connections `pvxsr` reports.
+    fn peers(&self) -> &Arc<PeerRegistry>;
+
+    /// The source served, `__server` composed in, whose entries `pvxsr`
+    /// lists.
+    fn source(&self) -> &DynSource;
+
+    /// This server's beacons, the auto destinations on the search port
+    /// `udp_port`; run them on a thread of their own.
+    fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender>;
 }
 
 impl PvaServerDriver for BlockingPvaServer {
@@ -143,6 +157,18 @@ impl PvaServerDriver for BlockingPvaServer {
 
     fn shutdown(&self) {
         BlockingPvaServer::shutdown(self)
+    }
+
+    fn peers(&self) -> &Arc<PeerRegistry> {
+        BlockingPvaServer::peers(self)
+    }
+
+    fn source(&self) -> &DynSource {
+        BlockingPvaServer::source(self)
+    }
+
+    fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender> {
+        BlockingPvaServer::beacon_sender(self, udp_port)
     }
 }
 
@@ -174,6 +200,18 @@ impl PvaServerDriver for ReactorPvaServer {
 
     fn shutdown(&self) {
         ReactorPvaServer::shutdown(self)
+    }
+
+    fn peers(&self) -> &Arc<PeerRegistry> {
+        ReactorPvaServer::peers(self)
+    }
+
+    fn source(&self) -> &DynSource {
+        ReactorPvaServer::source(self)
+    }
+
+    fn beacon_sender(&self, udp_port: u16) -> io::Result<BeaconSender> {
+        ReactorPvaServer::beacon_sender(self, udp_port)
     }
 }
 

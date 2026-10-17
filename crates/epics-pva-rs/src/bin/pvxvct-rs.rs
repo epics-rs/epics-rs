@@ -120,13 +120,14 @@ struct PeerFilter {
 }
 
 /// A parsed `-B` bind endpoint. `iface` is the multicast join
-/// interface (`UNSPECIFIED` lets the kernel choose); it is ignored for
+/// interface (none lets the kernel choose); it is ignored for
 /// unicast/wildcard binds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BindEndpoint {
     addr: Ipv4Addr,
     port: u16,
-    iface: Ipv4Addr,
+    /// As pvxs `SockEndpoint` holds it: an interface name.
+    iface: Option<String>,
 }
 
 /// The frame-display filters shared by every listener task.
@@ -235,13 +236,9 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
 /// Parse a `-B` value into a [`BindEndpoint`]. Grammar mirrors pvxs
 /// `SockEndpoint` (`tools/pvxvct.cpp:152-153`): `addr[,ttl][@iface][:port]`.
 /// The `ttl` is accepted for grammar compatibility but does not affect a
-/// pure listener, so it is validated and discarded. The endpoint body and
-/// the multicast `@iface` are resolved through the shared PVA-tool
-/// resolvers: the body via DNS (IPv4-preferred), and `@iface` accepting
-/// **either** an interface IPv4 address **or** an OS interface name
-/// (`en0`, `lo0`) — the dual form pvxs's `SockEndpoint` ctor accepts
-/// (`config.cpp:76-80`), so `-B 224.0.1.1@en0` works as it does under
-/// pvxs instead of being misresolved as a DNS host.
+/// pure listener, so it is validated and discarded. The body resolves via
+/// DNS (IPv4-preferred), and `@iface` is normalised as the `SockEndpoint`
+/// ctor does it (`config.cpp:64-85`).
 fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     let mut rest = spec;
     let mut port = default_port;
@@ -253,9 +250,9 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
         port = p;
         rest = head;
     }
-    let mut iface = Ipv4Addr::UNSPECIFIED;
+    let mut iface = None;
     if let Some((head, tail)) = rest.rsplit_once('@') {
-        iface = epics_pva_rs::cli::resolve_iface_ipv4(tail)?;
+        iface = Some(tail.to_string());
         rest = head;
     }
     if let Some((head, tail)) = rest.rsplit_once(',') {
@@ -265,6 +262,8 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
         rest = head;
     }
     let addr = epics_pva_rs::cli::resolve_host_ipv4(rest)?;
+    let iface = epics_pva_rs::config::IfaceMap::current()
+        .normalize(SocketAddr::new(IpAddr::V4(addr), port), iface);
     Ok(BindEndpoint { addr, port, iface })
 }
 
@@ -278,18 +277,14 @@ impl BindEndpoint {
     /// broadcast or specific-interface `-B` is received portably instead of
     /// failing to bind a broadcast address (not portable) or silently
     /// missing broadcast traffic on a unicast bind. A multicast endpoint
-    /// passes its `@iface` through (as a literal IPv4, which the collector's
-    /// `resolve_iface_v4` round-trips) for the group join; a unicast or
+    /// passes its `@iface` through for the group join; a unicast or
     /// broadcast endpoint carries none — the wildcard bind already receives it.
-    fn to_endpoint(self) -> Endpoint {
+    fn to_endpoint(&self) -> Endpoint {
+        let multicast = self.addr.is_multicast();
         Endpoint {
             addr: SocketAddr::new(IpAddr::V4(self.addr), self.port),
             ttl: None,
-            iface: if self.iface.is_unspecified() {
-                None
-            } else {
-                Some(self.iface.to_string())
-            },
+            iface: self.iface.clone().filter(|_| multicast),
         }
     }
 }
@@ -578,7 +573,9 @@ async fn sniff(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>) {
         if ep.addr.is_multicast() {
             eprintln!(
                 "pvxvct-rs: listening on {}:{} (multicast, iface {})",
-                ep.addr, ep.port, ep.iface
+                ep.addr,
+                ep.port,
+                ep.iface.as_deref().unwrap_or("0.0.0.0")
             );
         } else {
             eprintln!("pvxvct-rs: listening on {}:{}", ep.addr, ep.port);
@@ -693,7 +690,7 @@ mod tests {
         let ep = parse_bind("192.168.1.5", 5076).unwrap();
         assert_eq!(ep.addr, Ipv4Addr::new(192, 168, 1, 5));
         assert_eq!(ep.port, 5076);
-        assert_eq!(ep.iface, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(ep.iface, None);
     }
 
     #[test]
@@ -704,14 +701,18 @@ mod tests {
     }
 
     /// Multicast form `mcast,ttl@iface:port` parses all segments; the
-    /// ttl is validated and discarded (a listener ignores it).
+    /// ttl is validated and discarded (a listener ignores it). The literal
+    /// interface address becomes its name, an unknown one none.
+    #[cfg(target_os = "linux")]
     #[test]
     fn parse_bind_multicast_full_form() {
-        let ep = parse_bind("224.0.1.1,5@10.0.0.2:5078", 5076).unwrap();
+        let ep = parse_bind("224.0.1.1,5@127.0.0.1:5078", 5076).unwrap();
         assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
         assert!(ep.addr.is_multicast());
-        assert_eq!(ep.iface, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(ep.iface.as_deref(), Some("lo"));
         assert_eq!(ep.port, 5078);
+        let ep = parse_bind("224.0.1.1@192.0.2.77", 5076).unwrap();
+        assert_eq!(ep.iface, None);
     }
 
     #[test]
@@ -719,24 +720,12 @@ mod tests {
         assert!(parse_bind("224.0.1.1,abc", 5076).is_err());
     }
 
-    /// The multicast `@iface` suffix accepts an OS interface *name*, not
-    /// just an interface IPv4 address — the dual form pvxs's
-    /// `SockEndpoint` ctor accepts (`config.cpp:76-80`). The loopback
-    /// interface is `lo` on Linux and `lo0` on macOS/BSD; binding
-    /// `224.0.1.1@<loopback>` must resolve the name to that interface's
-    /// loopback IPv4 address.
-    #[cfg(unix)]
+    /// The multicast `@iface` suffix takes an interface name as given.
     #[test]
     fn parse_bind_iface_accepts_interface_name() {
-        let ep = parse_bind("224.0.1.1@lo0", 5076).or_else(|_| parse_bind("224.0.1.1@lo", 5076));
-        if let Ok(ep) = ep {
-            assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
-            assert!(
-                ep.iface.is_loopback(),
-                "interface name should resolve to the loopback IPv4, got {}",
-                ep.iface
-            );
-        }
+        let ep = parse_bind("224.0.1.1@lo", 5076).unwrap();
+        assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
+        assert_eq!(ep.iface.as_deref(), Some("lo"));
     }
 
     /// The bind default is the literal 5076 (pvxs `pvxvct` hard-codes it,
@@ -805,10 +794,10 @@ mod tests {
         assert_eq!(dest.iface, None);
 
         // Multicast with `@iface`: the iface is passed to the collector for
-        // the group join, as a literal IPv4 that `resolve_iface_v4` accepts.
-        let mcast = parse_bind("224.0.1.1@10.0.0.2:5078", 5076).unwrap();
+        // the group join.
+        let mcast = parse_bind("224.0.1.1@eth9:5078", 5076).unwrap();
         let dest = mcast.to_endpoint();
         assert_eq!(dest.addr, "224.0.1.1:5078".parse().unwrap());
-        assert_eq!(dest.iface.as_deref(), Some("10.0.0.2"));
+        assert_eq!(dest.iface.as_deref(), Some("eth9"));
     }
 }

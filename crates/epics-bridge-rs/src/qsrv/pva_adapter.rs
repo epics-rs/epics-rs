@@ -1472,7 +1472,6 @@ pub async fn pvalink_link_set_install(
     }
 }
 
-#[cfg(tokio_backend)]
 /// Runs a combined CA + PVA IOC with QSRV bridge.
 ///
 /// Runs `app` through [`epics_base_rs::server::ioc_app::IocApplication::run`]: starts a CA
@@ -1486,23 +1485,9 @@ pub async fn pvalink_link_set_install(
 /// run_ca_pva_qsrv_ioc_app(IocApplication::new().startup_script("st.cmd")).await
 /// ```
 ///
-/// Reactor-backed builds only, and it needs the full `qsrv` selection.
-///
-/// Two independent requirements, so two clauses, and both are load-bearing:
-///
-/// * `tokio_backend` — both servers this starts are themselves reactor-gated
-///   in their own crates. `epics_ca_rs::server::CaServer` and
-///   `epics_pva_rs::server::PvaServer` are each behind `cfg(tokio_backend)`,
-///   because every configuration without a reactor — the two embedded targets
-///   and a host `exec_backend` build alike — runs the blocking
-///   thread-per-client drivers instead of the async front ends. This function
-///   was the last caller that had not followed.
-/// * `feature = "qsrv"` — `epics-ca-rs` is a dependency of `qsrv`, not of
-///   `qsrv-core`. Gating on the target alone would compile this body in a
-///   host `--features qsrv-core` build, where the crate is not linked at all
-///   (E0433 on `epics_ca_rs`). A feature whose validity depended on which
-///   target you pointed it at would be exactly the dual meaning the
-///   `qsrv-core` split exists to avoid.
+/// Needs the full `qsrv` selection: `epics-ca-rs` is a dependency of `qsrv`,
+/// not of `qsrv-core`. Both backends: the CA leg is `CaServer` on tokio and
+/// `BlockingCaServing` on the exec backend, as `run_ca_ioc` forks.
 ///
 /// The target's equivalent entry point is `epics-bridge-rs`'s `realtime-pva-ioc`.
 /// Stand `app` up on CA + pvAccess + QSRV, with both protocol registrars
@@ -1521,7 +1506,7 @@ pub async fn pvalink_link_set_install(
 /// (iochooks.cpp:355), before `scanInit` and `initialProcess`; a protocol
 /// runner runs after `iocRun`, so the mount is built at that hook and handed
 /// over, and there is no runner entry point that builds it late.
-#[cfg(all(feature = "qsrv", tokio_backend))]
+#[cfg(feature = "qsrv")]
 pub async fn run_ca_pva_qsrv_ioc_app(
     app: epics_base_rs::server::ioc_app::IocApplication,
 ) -> epics_base_rs::error::CaResult<()> {
@@ -1540,7 +1525,7 @@ pub async fn run_ca_pva_qsrv_ioc_app(
 ///
 /// Every `IocApplication` route that serves QSRV goes through here, so none
 /// can order the mount against scan start by hand.
-#[cfg(all(feature = "qsrv", tokio_backend))]
+#[cfg(feature = "qsrv")]
 pub async fn run_qsrv_ioc_app<F, Fut>(
     app: epics_base_rs::server::ioc_app::IocApplication,
     group_files: Vec<epics_base_rs::server::ioc_app::GroupLoadRequest>,
@@ -1580,7 +1565,7 @@ where
     .await
 }
 
-#[cfg(all(feature = "qsrv", tokio_backend))]
+#[cfg(feature = "qsrv")]
 async fn serve_ca_pva_qsrv(
     mut config: epics_base_rs::server::ioc_app::IocRunConfig,
     mount: QsrvMount,
@@ -1588,19 +1573,12 @@ async fn serve_ca_pva_qsrv(
     use epics_base_rs::error::CaError;
 
     let db = config.db.clone();
-    // The IOC entry point owns the CA server task it starts below. It has to
-    // be the tokio runtime and not `runtime::task::Reactor`: `CaServer::run`
-    // drives `tokio::net` listeners, and the exec-backend arm of `Reactor` is
-    // the callback band, which has no reactor for the `TcpStream` each
-    // accepted client mints.
-    let reactor = tokio::runtime::Handle::try_current()
-        .expect("serve_ca_pva_qsrv is awaited on the IOC's reactor");
     let ca_port = config.port;
 
     // ── QSRV bridge ──
     // Built by `build_qsrv_mount` at `initHookAfterInitDatabase` — the one
     // owner shared with the RTEMS target IOC — over the same ACF cell the CA
-    // server adopts via `CaServer::from_parts` below.
+    // server adopts via `RsrvServing::start` below.
     let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
     mount
         .install_channel_sources(&db, &composite)
@@ -1661,21 +1639,16 @@ async fn serve_ca_pva_qsrv(
     ));
 
     // ── CA server (background) ──
-    let ca_server = epics_ca_rs::server::CaServerBuilder::serving(
+    let ca_serving = epics_ca_rs::server::RsrvServing::start(
         db.clone(),
+        ca_port,
+        config.tcp_port,
         config.acf.clone(),
         config.autosave_config.clone(),
         config.autosave_manager.clone(),
+        &mut config.servers,
     )
-    .port(ca_port)
-    .bound_at_init(&mut config.servers)
-    .build()
     .await?;
-    reactor.spawn(async move {
-        if let Err(e) = ca_server.run().await {
-            eprintln!("CA server error: {e}");
-        }
-    });
 
     // ── PVA server (foreground with iocsh) ──
     let pva_server = epics_pva_rs::server::PvaServer::from_parts(
@@ -1687,14 +1660,16 @@ async fn serve_ca_pva_qsrv(
     )
     .bound_at_registrar(&mut config.servers);
 
-    pva_server
+    let result = pva_server
         .run_with_source_and_shell(composite, move |shell| {
             for cmd in shell_commands {
                 shell.register(cmd);
             }
         })
         .await
-        .map_err(|e| CaError::InvalidValue(e.to_string()))
+        .map_err(|e| CaError::InvalidValue(e.to_string()));
+    ca_serving.shutdown();
+    result
 }
 
 /// Build the served provider's group set from both pvxs group sources,

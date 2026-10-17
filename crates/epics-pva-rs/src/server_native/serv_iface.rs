@@ -3,9 +3,9 @@
 //! std sockets so every driver — tokio, blocking, reactor — binds the same set.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::config::PvaServerConfig;
 use super::search_engine::ServerInterfaces;
@@ -16,21 +16,25 @@ use crate::pvxs_log::{self, Level, TCP_SETUP};
 /// list.
 ///
 /// `EPICS_PVAS_INTF_ADDR_LIST` (`interfaces`) is the address set the
-/// server binds to; when empty it falls back to the single `bind_ip`
-/// wildcard default (pvxs `src/server.cpp:407-487` derives the TCP listener
-/// set from `effective.interfaces`). One listener is bound per specific
-/// address, in list order, so each interface is constrained at the kernel.
-/// A listed entry with no port takes `port`, the server's resolved TCP port,
-/// as pvxs writes it into every interface string (`config.cpp:166-168`).
-/// A multicast entry is a search group, never a TCP listener
-/// (`server.cpp:413-418`). Any wildcard entries become one wildcard listener
-/// after the specific ones, on port 0 whatever port the entry named
-/// (`server.cpp:413-459`); with a specific listener already on that port it
-/// fails to bind, and pvxs fails the same way.
+/// server binds to; when empty it falls back to `bind_ip`, which pvxs
+/// does not have: its empty list is `0.0.0.0` (`config.cpp:166-168`).
+/// One listener is bound per specific address, in list order, so each
+/// interface is constrained at the kernel. A listed entry with no port
+/// takes `port`, the server's resolved TCP port, as pvxs writes it into
+/// every interface string (`config.cpp:166-168`). A multicast entry is a
+/// search group, never a TCP listener (`server.cpp:413-418`). Any wildcard
+/// entry, of either family, becomes the wildcard listeners after the
+/// specific ones, on port 0 whatever port the entry named
+/// (`server.cpp:441-458`): with `can_ipv6`, `[::]` alone on Linux, whose
+/// dual-stack socket would collide with a `0.0.0.0` one, and elsewhere
+/// `0.0.0.0` then `[::]`, the order Darwin requires; without it `0.0.0.0`.
+/// With a specific listener already on that port the wildcard fails to
+/// bind, and pvxs fails the same way.
 pub(crate) fn tcp_bind_addresses(
     interfaces: &[SocketAddr],
     bind_ip: IpAddr,
     port: u16,
+    can_ipv6: bool,
 ) -> Vec<SocketAddr> {
     let mut addrs: Vec<SocketAddr> = interfaces
         .iter()
@@ -40,13 +44,57 @@ pub(crate) fn tcp_bind_addresses(
             _ => *a,
         })
         .collect();
-    if let Some(wildcard) = interfaces.iter().find(|a| a.ip().is_unspecified()) {
-        addrs.push(SocketAddr::new(wildcard.ip(), 0));
+    let bind_any = match interfaces {
+        [] => bind_ip.is_unspecified(),
+        _ => interfaces.iter().any(|a| a.ip().is_unspecified()),
+    };
+    if bind_any {
+        let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        match (can_ipv6, cfg!(target_os = "linux")) {
+            (true, true) => addrs.push(v6),
+            (true, false) => addrs.extend([v4, v6]),
+            (false, _) => addrs.push(v4),
+        }
     }
     if addrs.is_empty() {
         addrs.push(SocketAddr::new(bind_ip, 0));
     }
     addrs
+}
+
+/// pvxs `evsocket::canIPv6` (`evhelper.cpp:696-726`), probed once:
+/// `PVXS_ENABLE_IPV6=NO` disables it, otherwise a UDP socket must bind
+/// `[::1]`.
+pub(crate) fn can_ipv6() -> bool {
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN.get_or_init(|| {
+        if let Some(ena6) = epics_base_rs::runtime::env::get_lossy("PVXS_ENABLE_IPV6") {
+            if ena6.eq_ignore_ascii_case("NO") {
+                info!("IPv6 support disabled");
+                return false;
+            } else if !ena6.eq_ignore_ascii_case("YES") {
+                warn!("PVXS_ENABLE_IPV6={ena6} ignoring unrecognized");
+            }
+        }
+        match std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) {
+            Ok(_) => true,
+            Err(e) => {
+                // EAFNOSUPPORT: no IPv6 in the kernel; EADDRNOTAVAIL: no [::1].
+                #[cfg(unix)]
+                let no_family = e.raw_os_error() == Some(libc::EAFNOSUPPORT);
+                #[cfg(windows)]
+                let no_family = e.raw_os_error() == Some(10047); // WSAEAFNOSUPPORT
+                if !no_family && e.kind() != io::ErrorKind::AddrNotAvailable {
+                    warn!(
+                        "Unexpected errno {} while probing IPv6: {e}",
+                        e.raw_os_error().unwrap_or(0)
+                    );
+                }
+                false
+            }
+        }
+    })
 }
 
 /// Bind one listener per address, pvxs `server.cpp:476-486`: an address
@@ -208,7 +256,7 @@ impl ServListeners {
             &config.beacon_destinations,
             config.auto_beacon,
         )?;
-        let addrs = tcp_bind_addresses(&interfaces.addrs, default.ip(), default.port());
+        let addrs = tcp_bind_addresses(&interfaces.addrs, default.ip(), default.port(), can_ipv6());
         let (listeners, port) = bind_serv_ifaces(addrs, default.port()).map_err(|e| match e {
             PvaError::Io(e) => e,
             e => io::Error::other(e),
@@ -345,5 +393,24 @@ mod tests {
         let (r, tried) = bind_counting(&["127.0.0.1:0", "0.0.0.0:0"], 0, |_, _| {});
         assert_eq!(io_kind(r), io::ErrorKind::AddrInUse);
         assert_eq!(tried.len(), 1, "{tried:?}");
+    }
+
+    /// The unconfigured server takes both families on one port, as
+    /// softIocPVX's `[::]` listener does: `EPICS_PVA_NAME_SERVERS=[::1]:port`
+    /// was refused while rs bound `0.0.0.0`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_default_listener_takes_v4_and_v6_peers() {
+        if !can_ipv6() {
+            return;
+        }
+        let listeners = ServListeners::bind(("0.0.0.0", 0), &PvaServerConfig::default()).unwrap();
+        assert_eq!(listeners.listeners.len(), 1);
+        for ip in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            TcpStream::connect((ip, listeners.port())).unwrap();
+        }
     }
 }

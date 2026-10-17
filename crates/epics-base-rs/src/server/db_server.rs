@@ -209,6 +209,20 @@ pub async fn serving_after(generation: u64) {
     }
 }
 
+/// Until a layer announces serving after `generation` (`None`), or `runner`
+/// ends first (its output). A shell started beside a runner waits here, so
+/// its first prompt comes after the bind as C's `iocsh` after `iocInit`.
+pub async fn serving_or_ended<F: std::future::Future + Unpin>(
+    generation: u64,
+    runner: &mut F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        out = runner => Some(out),
+        () = serving_after(generation) => None,
+    }
+}
+
 /// C `dbsr` (`dbServer.c:95-112`), verbatim in shape: the no-layers line and
 /// an early return, else the state line and then one `Server '<name>'` line
 /// per layer, each followed by that layer's report — and the report ONLY

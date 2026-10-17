@@ -143,28 +143,22 @@ async fn beacon_a_attempt(
 /// pvxs beacon datagram parses cleanly through the Rust
 /// `udp_collector` + onBeacon dispatch.
 ///
-/// The Rust client's `bind_beacon_udp` deliberately skips the
-/// loopback NIC (to avoid SO_REUSEPORT collision with a co-hosted
-/// Rust server), so this test cannot use 127.0.0.1 for beacons.
-/// Instead pick a non-loopback NIC address from the host and use
-/// that as both pvxs's beacon destination and the bind target the
-/// Rust client picks up. Fails when the host has no
-/// suitable non-loopback IPv4.
+/// The beacon is sent to a non-loopback NIC address, as a beacon
+/// from another host arrives. Fails when the host has no suitable
+/// non-loopback IPv4.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
     let softioc = super::interop_helpers::require_pvxs(super::interop_helpers::SOFT_IOC_PVX);
     let dbd_path = super::interop_helpers::pvxs_dbd_dir().join("softIocPVX.dbd");
     assert!(dbd_path.is_file(), "softIocPVX.dbd missing: {dbd_path:?}");
 
-    // Find a non-loopback IPv4 we can bind on (matches what
-    // `bind_non_loopback` enumerates).
+    // Find a non-loopback IPv4 to send the beacon to.
     let local_v4 = local_non_loopback_v4()
         .expect("no non-loopback IPv4 on this host; the pvxs beacon test needs one");
 
     // The agreed beacon / search broadcast port between pvxs and the Rust
-    // client, which binds it on every non-loopback NIC: owned on the
-    // wildcard and opened to that fanout co-bind, so nobody else can take
-    // it on any of them before the client has.
+    // client, which binds it on the wildcard: owned there and opened to
+    // that fanout co-bind, so nobody else can take it before the client has.
     let (beacon_holder, beacon_port) = {
         use epics_base_rs::net::{PortOrigin, PortUse};
         use socket2::{Domain, Protocol, Socket, Type};
@@ -285,8 +279,7 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
 }
 
 /// Return the first non-loopback IPv4 address bound on a UP
-/// interface, or None if there isn't one. Matches what the Rust
-/// client's `bind_non_loopback` UDP socket enumerates.
+/// interface, or None if there isn't one.
 fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
     let interfaces = epics_base_rs::net::iface_map::IfaceMap::new()
         .expect("getifaddrs must succeed on the host");

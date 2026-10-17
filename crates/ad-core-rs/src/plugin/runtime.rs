@@ -5940,12 +5940,16 @@ mod tests {
             .unwrap();
         params_applied(&up);
         send_array(up.array_sender(), make_test_array(101));
+        // The gate is read when the queued frame is processed, as C's
+        // processCallbacks reads arrayCallbacks on the plugin thread, so 101
+        // must be out before the write of 1.
+        assert_eq!(next(), 1101);
         port.write_int32_blocking(up.ndarray_params.array_callbacks, 0, 1)
             .unwrap();
         params_applied(&up);
         send_array(up.array_sender(), make_test_array(102));
         // The write of 0 already sees 0, so 5000 and 2101 were never made.
-        assert_eq!((next(), next(), next(), next()), (1101, 5001, 1102, 2102));
+        assert_eq!((next(), next(), next()), (5001, 1102, 2102));
         assert_eq!(gated_frames.load(Ordering::Relaxed), 2);
     }
 

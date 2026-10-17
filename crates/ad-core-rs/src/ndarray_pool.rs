@@ -168,111 +168,82 @@ impl NDArrayPool {
         let num_elements = data_size / element_size;
         let needed_bytes = data_size;
 
-        // Try to find a reusable buffer in the free list. Selection is by Vec
-        // capacity (a buffer big enough to hold the data without reallocating),
-        // but accounting always uses the exact `data_size`.
+        // C++ NDArrayPool::alloc (NDArrayPool.cpp:161-183): the smallest free
+        // buffer whose tracked `dataSize` holds the request, or, for a
+        // caller-supplied buffer, the smallest free one, whose buffer is
+        // replaced. A buffer over THRESHOLD_SIZE_RATIO of the request is
+        // freed and allocated afresh. A reused buffer keeps its `dataSize`,
+        // which is never below the request, so reuse charges nothing.
         let reused = {
             let mut free = self.free_list.lock();
-            let mut best_idx = None;
-            let mut best_cap = usize::MAX;
-            for (i, buf) in free.iter().enumerate() {
-                let cap = buf.data.capacity_bytes();
-                if cap >= needed_bytes && cap < best_cap {
-                    best_cap = cap;
-                    best_idx = Some(i);
-                }
-            }
-            if let Some(idx) = best_idx {
-                if best_cap as f64 > needed_bytes as f64 * THRESHOLD_SIZE_RATIO {
-                    // Oversized: discard it, subtract its tracked data_size.
-                    let dropped = free.swap_remove(idx);
+            let found = if data.is_some() {
+                free.iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| b.data_size)
+                    .map(|(i, _)| i)
+            } else {
+                free.iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.data_size >= needed_bytes)
+                    .min_by_key(|(_, b)| b.data_size)
+                    .map(|(i, _)| i)
+            };
+            match found {
+                Some(idx)
+                    if data.is_some()
+                        || free[idx].data_size as f64
+                            > needed_bytes as f64 * THRESHOLD_SIZE_RATIO =>
+                {
+                    // Its buffer is freed; the fresh allocation below
+                    // stands in for the C array object kept.
+                    let dropped = free.remove(idx);
                     self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
                     self.allocated_bytes
                         .fetch_sub(dropped.data_size as u64, Ordering::Relaxed);
                     self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
                     None
-                } else {
-                    let buf = free.swap_remove(idx);
-                    self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
-                    Some(buf)
                 }
-            } else {
-                None
+                Some(idx) => {
+                    self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
+                    Some(free.remove(idx))
+                }
+                None => None,
             }
         };
 
         if let Some(mut reused) = reused {
-            // Reuse: C parity (NDArrayPool.cpp `alloc`) keeps the buffer's
-            // tracked `dataSize` and `memorySize_` unchanged when the existing
-            // buffer is already large enough — only a grow (realloc) adjusts
-            // accounting. Reusing a 1000-byte buffer for an 800-byte request
-            // therefore leaves `allocated_bytes` at 1000.
-            let old_size = reused.data_size;
-            let effective_size = if needed_bytes > old_size {
-                let diff = (needed_bytes - old_size) as u64;
-                // CAS loop: the limit check and the increment must be atomic so
-                // two threads on the reuse-grow path cannot both pass the check
-                // and over-commit past `max_memory`. Mirrors the fresh-allocation
-                // path; C++ `NDArrayPool::alloc` is fully mutex-serialized.
-                if self.max_memory > 0 {
-                    loop {
-                        let current = self.allocated_bytes.load(Ordering::Relaxed);
-                        if current + diff > self.max_memory as u64 {
-                            // Put the buffer back untouched; the reuse path
-                            // does not consume a slot.
-                            let mut free = self.free_list.lock();
-                            free.push(reused);
-                            self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
-                            self.report_limit(self.num_alloc_buffers());
-                            return Err(ADError::PoolExhausted(needed_bytes, self.max_memory));
-                        }
-                        if self
-                            .allocated_bytes
-                            .compare_exchange_weak(
-                                current,
-                                current + diff,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                } else {
-                    self.allocated_bytes.fetch_add(diff, Ordering::Relaxed);
-                }
-                needed_bytes
-            } else {
-                // Buffer already big enough: keep the larger tracked size so
-                // accounting matches the byte count added when it was created.
-                old_size
-            };
-            if let Some(data) = data {
-                reused.data = data;
-            } else if reused.data.data_type() != data_type {
+            if reused.data.data_type() != data_type {
                 reused.data = NDDataBuffer::zeros(data_type, num_elements);
             } else {
                 reused.data.resize(num_elements);
             }
-            return Ok(self.adopt(dims, reused.data, effective_size));
+            return Ok(self.adopt(dims, reused.data, reused.data_size));
         }
 
         // Fresh allocation with CAS loop to avoid TOCTOU race. The reserved
         // amount is exactly `needed_bytes`; no capacity slack is ever added.
-        if self.max_memory > 0 {
+        // A caller-supplied buffer already exists: C++ charges it with no
+        // limit check (NDArrayPool.cpp:203-206).
+        if self.max_memory > 0 && data.is_none() {
             loop {
                 let current = self.allocated_bytes.load(Ordering::Relaxed);
                 if current + needed_bytes as u64 > self.max_memory as u64 {
                     let mut freed_enough = false;
                     {
                         let mut free = self.free_list.lock();
-                        free.sort_by_key(|e| std::cmp::Reverse(e.data.capacity_bytes()));
                         let mut reclaimed = 0u64;
                         let over =
                             (current + needed_bytes as u64).saturating_sub(self.max_memory as u64);
-                        while !free.is_empty() && reclaimed < over {
-                            let dropped = free.remove(0);
+                        // Largest `dataSize` first, the end of C++'s multiset
+                        // (NDArrayPool.cpp:207-218).
+                        while let Some(idx) = free
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, b)| b.data_size)
+                            .map(|(i, _)| i)
+                            && reclaimed < over
+                        {
+                            let dropped = free.remove(idx);
                             let dropped_size = dropped.data_size as u64;
                             self.allocated_bytes
                                 .fetch_sub(dropped_size, Ordering::Relaxed);
@@ -355,33 +326,11 @@ impl NDArrayPool {
     }
 
     /// The destructor's half of [`release`](Self::release): put a buffer this
-    /// pool charged for back on the free list, then trim the list while the
-    /// pool is over `max_memory`.
+    /// pool charged for back on the free list. C++ release never trims it
+    /// (NDArrayPool.cpp:360-366); only the next alloc evicts.
     pub(crate) fn recycle(&self, data: NDDataBuffer, data_size: usize) {
-        let mut free = self.free_list.lock();
-        free.push(FreeBuffer { data, data_size });
+        self.free_list.lock().push(FreeBuffer { data, data_size });
         self.num_free_buffers.fetch_add(1, Ordering::Relaxed);
-
-        // If total allocated exceeds max_memory, drop largest free entries.
-        // Accounting and the loop counter both use the exact `data_size` so the
-        // `usize` `excess` can never underflow (max_memory == 0 means unlimited).
-        let total = self.allocated_bytes.load(Ordering::Relaxed) as usize;
-        if self.max_memory > 0 && total > self.max_memory && !free.is_empty() {
-            free.sort_by_key(|e| std::cmp::Reverse(e.data_size));
-            let mut excess = total - self.max_memory;
-            while excess > 0 && !free.is_empty() {
-                let dropped = free.remove(0);
-                let dropped_size = dropped.data_size;
-                self.allocated_bytes
-                    .fetch_sub(dropped_size as u64, Ordering::Relaxed);
-                self.num_free_buffers.fetch_sub(1, Ordering::Relaxed);
-                self.num_alloc_buffers.fetch_sub(1, Ordering::Relaxed);
-                if dropped_size >= excess {
-                    break;
-                }
-                excess -= dropped_size;
-            }
-        }
     }
 
     /// Clear all entries from the free list.
@@ -891,19 +840,37 @@ mod tests {
         drop(frame);
     }
 
+    /// A wrapped frame is charged past `max_memory`; the next pool alloc
+    /// evicts the largest free buffers and then refuses
+    /// (NDArrayPool.cpp:203-206, :207-233).
     #[test]
-    fn a_wrapped_frame_over_max_memory_is_refused() {
-        // NDArrayPool.cpp:213-233: the free list is emptied first, then the
-        // frame is refused.
+    fn a_wrapped_frame_over_max_memory_is_charged_and_the_next_alloc_refused() {
         let pool = NDArrayPool::new(64);
-        drop(
-            pool.alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
-                .unwrap(),
-        );
-        let refused = pool.wrap(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]));
-        assert!(matches!(refused, Err(ADError::PoolExhausted(100, 64))));
-        assert_eq!(pool.allocated_bytes(), 0);
-        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (0, 0));
+        let big = pool
+            .wrap(vec![NDDimension::new(100)], NDDataBuffer::U8(vec![0; 100]))
+            .unwrap();
+        let small = pool
+            .wrap(vec![NDDimension::new(50)], NDDataBuffer::U8(vec![0; 50]))
+            .unwrap();
+        assert_eq!(pool.allocated_bytes(), 150);
+        drop(small);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (2, 1));
+        assert_eq!(pool.allocated_bytes(), 150);
+
+        let refused = pool.alloc(vec![NDDimension::new(60)], NDDataType::UInt8);
+        assert!(matches!(refused, Err(ADError::PoolExhausted(60, 64))));
+        assert_eq!(pool.allocated_bytes(), 100);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
+
+        // Released, the oversized 100-byte buffer is freed for an 8-byte one.
+        drop(big);
+        assert_eq!(pool.allocated_bytes(), 100);
+        let a = pool
+            .alloc(vec![NDDimension::new(8)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(a.data_size, 8);
+        assert_eq!(pool.allocated_bytes(), 8);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
     }
 
     #[test]
@@ -1088,6 +1055,70 @@ mod tests {
             .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
             .unwrap();
         assert!(reused.data.capacity_bytes() >= 900);
+    }
+
+    /// C++ finds a free buffer by its tracked `dataSize` (NDArrayPool.cpp:161-165),
+    /// which a reuse under another data type keeps.
+    #[test]
+    fn a_reused_buffer_is_found_by_its_data_size() {
+        let pool = NDArrayPool::new(1_000_000);
+        let a = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(a);
+        let b = pool
+            .alloc(vec![NDDimension::new(400)], NDDataType::UInt16)
+            .unwrap();
+        assert_eq!(b.data_size, 1000);
+        pool.release(b);
+        let c = pool
+            .alloc(vec![NDDimension::new(900)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(c.data_size, 1000);
+        assert_eq!(pool.num_alloc_buffers(), 1);
+        assert_eq!(pool.allocated_bytes(), 1000);
+    }
+
+    /// A buffer is not stretched past its `dataSize` whatever its capacity:
+    /// C++ has no reuse that grows (NDArrayPool.cpp:161-183).
+    #[test]
+    fn a_free_buffer_smaller_than_the_request_is_not_reused() {
+        let pool = NDArrayPool::new(1_000_000);
+        let mut a = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        if let NDDataBuffer::U8(ref mut v) = a.data {
+            v.reserve_exact(200);
+        }
+        pool.release(a);
+        let b = pool
+            .alloc(vec![NDDimension::new(150)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(b.data_size, 150);
+        assert_eq!(pool.num_alloc_buffers(), 2);
+        assert_eq!(pool.allocated_bytes(), 250);
+    }
+
+    /// A caller-supplied buffer replaces the smallest free one and is charged
+    /// its own size (NDArrayPool.cpp:166-168, :178-182, :203-206).
+    #[test]
+    fn a_wrapped_frame_replaces_the_smallest_free_buffer() {
+        let pool = NDArrayPool::new(1_000_000);
+        let big = pool
+            .alloc(vec![NDDimension::new(4000)], NDDataType::UInt8)
+            .unwrap();
+        let small = pool
+            .alloc(vec![NDDimension::new(1000)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(big);
+        pool.release(small);
+        let w = pool
+            .wrap(vec![NDDimension::new(800)], NDDataBuffer::U8(vec![0; 800]))
+            .unwrap();
+        assert_eq!(w.data_size, 800);
+        assert_eq!(pool.num_alloc_buffers(), 2);
+        assert_eq!(pool.num_free_buffers(), 1);
+        assert_eq!(pool.allocated_bytes(), 4800);
     }
 
     #[test]
@@ -1984,18 +2015,11 @@ mod tests {
         assert_eq!(pool.num_free_buffers(), 3);
     }
 
-    /// BUG 1 regression: concurrent reuse-grow must not overshoot
-    /// `max_memory`.
-    ///
-    /// Many threads each take a small free-list buffer and grow it (a
-    /// reuse-grow). The non-atomic load+fetch_add this test guards against
-    /// let two threads both pass the limit check on the same `current`
-    /// reading and both increment, pushing `allocated_bytes` past
-    /// `max_memory`. With the CAS loop, the invariant
-    /// `allocated_bytes <= max_memory` must hold after every successful
-    /// alloc.
+    /// Concurrent allocations that have to evict free buffers never push
+    /// `allocated_bytes` past `max_memory`: the limit check and the charge
+    /// are one CAS.
     #[test]
-    fn test_concurrent_reuse_grow_does_not_overshoot_max_memory() {
+    fn test_concurrent_evicting_allocs_do_not_overshoot_max_memory() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::thread;
@@ -2003,36 +2027,16 @@ mod tests {
         const N: usize = 16;
         // Repeat to exercise the race window.
         for _ in 0..50 {
-            // N free buffers, each tracked at data_size = 100 bytes:
-            // allocated_bytes = 1600. max_memory = 2000 leaves only 400 bytes
-            // of headroom. Each reuse-grow from 100 -> 200 bytes adds 100, so
-            // at most 4 of the N grows may succeed; the rest must be rejected.
-            // With a non-atomic load+fetch_add, more than 4 succeed and
-            // allocated_bytes overshoots 2000.
+            // N free 100-byte buffers hold 1600 of the 2000 bytes; none holds
+            // a 200-byte request, so every alloc is fresh and the later ones
+            // must evict.
             let pool = NDArrayPool::new(2000);
-            // Build N genuine reuse-grow candidates: each buffer is allocated
-            // and tracked at 100 bytes (data_size = 100) but its backing Vec is
-            // reserved to >= 200 bytes of capacity. A later 200-byte request
-            // then selects it (capacity 200 >= 200, within the 1.5x threshold)
-            // and takes the reuse-GROW branch (200 > old data_size 100). This
-            // makes the reuse-grow path deterministic regardless of allocator
-            // slack.
-            let mut warm = Vec::with_capacity(N);
-            for _ in 0..N {
-                let mut a = pool
-                    .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
-                    .unwrap();
-                // data_size stays 100 (pool accounting); only the Vec capacity
-                // grows. swap the buffer for one with len 100 but capacity 200.
-                if let NDDataBuffer::U8(ref mut v) = a.data {
-                    let mut big = Vec::with_capacity(200);
-                    big.resize(100, 0u8);
-                    *v = big;
-                }
-                assert_eq!(a.data_size, 100);
-                assert!(a.data.capacity_bytes() >= 200);
-                warm.push(a);
-            }
+            let warm: Vec<_> = (0..N)
+                .map(|_| {
+                    pool.alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+                        .unwrap()
+                })
+                .collect();
             for a in warm {
                 pool.release(a);
             }
@@ -2045,7 +2049,6 @@ mod tests {
                 let pool = pool.clone();
                 let overshoot = overshoot.clone();
                 handles.push(thread::spawn(move || {
-                    // Reuse a 100-byte free buffer, grow it to 200 bytes.
                     let res = pool.alloc(vec![NDDimension::new(200)], NDDataType::UInt8);
                     if res.is_ok() && pool.allocated_bytes() > pool.max_memory() as u64 {
                         overshoot.store(true, Ordering::Relaxed);
@@ -2058,7 +2061,7 @@ mod tests {
 
             assert!(
                 !overshoot.load(Ordering::Relaxed),
-                "allocated_bytes overshot max_memory during concurrent reuse-grow"
+                "allocated_bytes overshot max_memory during concurrent allocs"
             );
             assert!(
                 pool.allocated_bytes() <= pool.max_memory() as u64,

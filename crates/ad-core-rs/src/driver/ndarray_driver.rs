@@ -1966,9 +1966,9 @@ pub(crate) mod tests {
         );
         assert!(owner.port().is_some());
 
-        let refused = pool.wrap(
+        let refused = pool.alloc(
             vec![crate::ndarray::NDDimension::new(100)],
-            crate::ndarray::NDDataBuffer::U8(vec![0; 100]),
+            crate::ndarray::NDDataType::UInt8,
         );
         assert!(refused.is_err());
         let text = std::fs::read_to_string(&log).unwrap();

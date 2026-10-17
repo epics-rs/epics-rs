@@ -116,9 +116,6 @@ pub const C_PLUGIN_ASYN_FLAGS: [(&str, &str, &str); 25] = [
 ];
 
 /// Register all standard areaDetector plugin configure commands.
-///
-/// The `PluginManager` must have its driver context set (via `set_driver()`)
-/// before any of these commands are invoked from st.cmd.
 pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -> IocApplication {
     // --- NDStdArraysConfigure ---
     {
@@ -133,7 +130,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
                 let (handle, _data, _jh) = crate::std_arrays::create_std_arrays_runtime(
                     &claim,
                     max_memory_arg(args, 6),
@@ -168,7 +164,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
                 let (handle, _stats, _stats_params, _jh) = crate::stats::create_stats_runtime(
                     &claim,
                     max_memory_arg(args, 6),
@@ -206,7 +201,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
                 let (handle, _roi_params, _jh) = crate::roi::create_roi_runtime(
                     &claim,
                     max_memory_arg(args, 6),
@@ -337,7 +331,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_overlays = count_arg(args, 5);
-                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
                     crate::overlay::OverlayProcessor::new(max_overlays, vec![]),
@@ -471,7 +464,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
                 let max_ports = count_arg(args, 3);
-                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
                     crate::gather::GatherProcessor::new(max_ports),
@@ -545,7 +537,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
                 // Addr 0 always exists, so at least one address even for a
                 // degenerate 0/0 request.
                 let max_addr = n_attributes.max(n_data_blocks).max(1);
@@ -700,7 +691,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
 
                 let (handle, _jh) = crate::attribute::create_attribute_runtime(
                     &claim,
@@ -738,7 +728,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
                 let (handle, _roi_stat_params, _jh) = crate::roi_stat::create_roi_stat_runtime(
                     &claim,
                     max_memory_arg(args, 7),
@@ -828,7 +817,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
                     _ => 1,
                 };
-                m.driver()?;
                 let (handle, _jh) = create_plugin_runtime_multi_addr(
                     &claim,
                     crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
@@ -882,7 +870,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                m.driver()?;
 
                 // C++ NDPvaConfigure args[5] is pvName (6th argument).
                 // If not provided, fall back to "{portName}:Image". Only the
@@ -1008,7 +995,6 @@ where
                 Ok(claim) => claim,
                 Err(e) => return Ok(ctx.cxx_error(e)),
             };
-            m.driver()?;
             // C's file plugins hand `NDPluginFile` a 0 (e.g. NDFileTIFF.cpp:614).
             let max_memory = max_memory_idx.map_or(0, |idx| max_memory_arg(args, idx));
             let threads = match thread_args {

@@ -2492,12 +2492,17 @@ impl PluginPortDriver {
 
     fn unresolved(&self, port: &str, addr: i32) -> Option<String> {
         let key = self.wiring.key(port, addr);
-        (!port.is_empty() && self.wiring.lookup_output(&key).is_none()).then(|| {
-            format!(
-                "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found\n"
-            )
-        })
+        (!port.is_empty() && self.wiring.lookup_output(&key).is_none())
+            .then(|| connect_device_error(port, addr))
     }
+}
+
+/// C `connectToArrayPort`'s line when `connectDevice` finds no such port
+/// (NDPluginDriver.cpp:605-610).
+fn connect_device_error(port: &str, addr: i32) -> String {
+    format!(
+        "NDPluginDriver::connectToArrayPort Error calling pasynManager->connectDevice to array port {port} address {addr}, status=3, error=asynManager:connectDevice port {port} not found\n"
+    )
 }
 
 fn write_refused(message: String) -> AsynError {
@@ -2935,16 +2940,25 @@ pub struct PluginRuntimeHandle {
 impl PluginRuntimeHandle {
     /// Subscribe to the constructor's `NDArrayPort`/`NDArrayAddr`, as each C
     /// plugin constructor ends with `connectToArrayPort()` (e.g.
-    /// NDPluginROI.cpp:353). Later moves are the data loop's.
+    /// NDPluginROI.cpp:353). Later moves are the data loop's. A port that
+    /// does not exist is printed as C prints it, and the plugin stays
+    /// unconnected.
     pub fn connect_to_array_port(&self, wiring: &WiringRegistry) -> Result<(), String> {
-        if self.source.port.is_empty() {
+        let (port, addr) = (&self.source.port, self.source.addr);
+        if port.is_empty() {
             return Ok(());
         }
-        wiring.rewire(
-            &self.array_sender,
-            "",
-            &wiring.key(&self.source.port, self.source.addr),
-        )
+        let key = wiring.key(port, addr);
+        if wiring.lookup_output(&key).is_none() {
+            let handle = self.port_runtime.port_handle();
+            handle.trace().output(
+                handle.port_name(),
+                TraceMask::ERROR,
+                &connect_device_error(port, addr),
+            );
+            return Ok(());
+        }
+        wiring.rewire(&self.array_sender, "", &key)
     }
 
     /// The pool the plugin was built with, which it allocates from until an

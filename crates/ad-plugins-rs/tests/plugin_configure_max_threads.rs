@@ -29,8 +29,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
 use epics_base_rs::server::iocsh::registry::CommandOutcome;
 
-/// An `AdIoc` whose plugin commands can run: they all begin with `m.driver()?`,
-/// which is `Err` until a detector has been configured.
+/// An `AdIoc` with a detector configured, whose output the plugins read.
 fn ad_ioc_with_driver(upstream: &str) -> (AdIoc, IocShell) {
     let ioc = AdIoc::new();
     let pool = DriverPool::standalone(4_000_000);

@@ -80,3 +80,12 @@ pub fn sscan_record_factory() -> (&'static str, epics_base_rs::server::RecordFac
         Box::new(|| Box::new(records::sscan::SscanRecord::default())),
     )
 }
+
+/// The scanparm record type factory, for `IocBuilder::register_record_type`.
+pub fn scanparm_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_sscan_dbd();
+    (
+        "scanparm",
+        Box::new(|| Box::new(records::scanparm::ScanparmRecord::default())),
+    )
+}

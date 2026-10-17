@@ -3833,6 +3833,7 @@ dependencies = [
 name = "sscan-rs"
 version = "0.32.0"
 dependencies = [
+ "chrono",
  "epics-base-rs",
  "epics-ca-rs",
  "tokio",

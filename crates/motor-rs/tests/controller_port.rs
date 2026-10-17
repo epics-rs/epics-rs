@@ -763,7 +763,7 @@ type Seen = Arc<Mutex<Vec<(i32, usize, WriteValue, bool)>>>;
 /// parker's: a `failing` write runs a command after the base that fails.
 struct Gate {
     refused: i32,
-    failing: usize,
+    failing: [usize; 2],
     seen: Seen,
 }
 
@@ -787,7 +787,7 @@ impl WriteHook for Gate {
         ));
         let mut delta = ParamDelta::default();
         delta.set_int32(index::STATUS_COMMS_ERROR, write.status.is_err() as i32);
-        let status = (write.function == self.failing).then(|| {
+        let status = self.failing.contains(&write.function).then(|| {
             Err(asyn_rs::error::AsynError::Status {
                 status: asyn_rs::error::AsynStatus::Error,
                 message: "MR failed".into(),
@@ -813,7 +813,7 @@ impl Hooked {
             },
             gate: Arc::new(Gate {
                 refused: 1,
-                failing: index::REC_OFFSET,
+                failing: [index::REC_OFFSET, index::CLOSED_LOOP],
                 seen: seen.clone(),
             }),
         };
@@ -878,6 +878,42 @@ fn the_hook_status_reaches_the_port_writer() {
         take(&seen),
         [(0, index::REC_OFFSET, WriteValue::Float64(1.5), true)],
         "the base's own write succeeded"
+    );
+}
+
+#[test]
+fn the_hook_status_reaches_the_record() {
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::trace::TraceFile;
+    let (params, seen) = Hooked::new();
+    let _port = register_controller_port(&open_owner(), "CPHOOKSTAX", 2, params).unwrap();
+    let path = std::env::temp_dir().join(format!("cp-hookstax-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    PortManager::global().trace_manager().set_device_trace_file(
+        "CPHOOKSTAX",
+        0,
+        TraceFile::File(Arc::new(Mutex::new(file))),
+    );
+    let trace = motor_rs::trace::MotorTrace::new("CPHOOKSTAX", 0);
+    trace.set_record("m1");
+    motor_rs::poll_loop::execute_commands(
+        &mut Encoder::default(),
+        &trace,
+        &[MotorCommand::SetClosedLoop { enable: true }],
+        &mut |_| {},
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        take(&seen),
+        [(0, index::CLOSED_LOOP, WriteValue::Int32(1), true)],
+        "the driver's own write succeeded"
+    );
+    assert!(
+        text.contains(
+            "devMotorAsyn::asynCallback: m1 pasyn{Float64,Int32}->write returned MR failed\n"
+        ),
+        "{text}"
     );
 }
 

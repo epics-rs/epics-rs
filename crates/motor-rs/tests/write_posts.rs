@@ -129,10 +129,15 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         pending: Vec::new(),
     }));
     let subscribers = AxisSubscribers::new();
+    let trace = Arc::new(MotorTrace::with_user(user));
     let bind = || {
         let (io_intr_tx, io_intr) = mpsc::channel(8);
         let state = new_shared_state();
         state.lock().unwrap().accept();
+        // As MotorAxis::attach binds a model-1 record.
+        if trace.is_model1() {
+            state.lock().unwrap().set_motordevcom();
+        }
         subscribers.attach(state.clone(), io_intr_tx, Default::default());
         Bound { io_intr, state }
     };
@@ -151,7 +156,7 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
     Rig {
         poll_loop,
         commands,
-        trace: Arc::new(MotorTrace::with_user(user)),
+        trace,
         record,
         observer,
         fail,
@@ -315,11 +320,10 @@ fn model1() -> TraceUser {
     }
 }
 
-/// A model-1 record's move-done pass must not read the done status of the
-/// poll before the move: the record would end the move there and retry it,
-/// or leave a jog running that JOGF 0 then does not stop.
+/// motordrvCom sends a MOTION or VELOCITY message with no callback: the
+/// record hears of the move only from the held move's next query.
 #[test]
-fn a_model1_move_or_jog_processes_its_record_with_done_off() {
+fn a_model1_move_or_jog_posts_nothing() {
     let mut rig = rig(model1(), 1.0);
     for command in [
         move_to(5.0),
@@ -329,18 +333,18 @@ fn a_model1_move_or_jog_processes_its_record_with_done_off() {
             acceleration: 1.0,
         },
     ] {
-        rig.write(command);
-        let read = rig.record.passes();
-        assert_eq!(read.len(), 1);
-        assert!(!read[0].done);
+        assert_eq!(rig.write(command), None);
+        assert!(rig.record.passes().is_empty());
+        assert!(rig.observer.passes().is_empty());
     }
 }
 
 #[test]
-fn a_failed_model1_move_still_posts_done_off() {
+fn a_failed_model1_move_posts_nothing() {
     let mut rig = rig(model1(), 1.0);
     rig.fail.store(true, Ordering::Relaxed);
-    assert!(!rig.write(move_to(5.0)).unwrap().done);
+    assert_eq!(rig.write(move_to(5.0)), None);
+    assert!(rig.record.passes().is_empty());
 }
 
 #[test]

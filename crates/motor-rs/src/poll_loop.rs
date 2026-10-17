@@ -1220,11 +1220,10 @@ pub fn execute_commands(
                 writes.extend(position.or(moved));
             }
         } else {
-            // Model 1: motordrvCom `process_messages` holds every MOTION and
-            // VELOCITY message it sent as `motor_motion`, whatever the send
-            // returned, and reports RA_DONE 0 until the axis stops.
-            writes.extend(motor.take_status_writes());
-            writes.extend(moved);
+            // Model 1: motordrvCom `process_messages` sends a MOTION or
+            // VELOCITY message with no callback (motordrvCom.cc:396-438);
+            // only `query_axis` on the held move calls the record back.
+            let _ = motor.take_status_writes();
         }
         // A model-2 driver stores a parameter only once the write succeeded
         // (drvMotorSim.c:364-368, 424-428).

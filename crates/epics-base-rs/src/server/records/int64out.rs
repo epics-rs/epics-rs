@@ -139,6 +139,13 @@ impl Record for Int64outRecord {
         "int64out"
     }
 
+    // int64outRecord.c:113-118: a failed dset init returns before the seed.
+    fn seed_deadband_tracking(&mut self, dset_init: crate::server::device_support::DsetInit) {
+        if dset_init != crate::server::device_support::DsetInit::Failed {
+            crate::server::record::seed_trackers_from_val(self);
+        }
+    }
+
     /// devI64outSoft.c drops `dbPutLink`'s status; devI64outSoftCallback.c returns it.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {

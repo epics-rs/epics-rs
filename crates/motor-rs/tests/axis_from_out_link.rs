@@ -368,6 +368,69 @@ record(motor, "E:m") { field(DTYP, "TestModel1") field(OUT, "#C7 S0 @") }
     assert_eq!(field(&db, "E:m.SEVR"), EpicsValue::Short(3));
 }
 
+/// motorRecord.cc:646-651: a failed dset init returns before init_record's
+/// second half, so ERES is not seeded (692-696). dbLoadRecords' field()
+/// writes are raw: no special() derives HLM from DHLM or marks either.
+/// LVIO keeps its dbd initial 1 (motorRecord.dbd:654).
+/// What check_speed_and_resolution marked stays: UREV, and each raw limit
+/// that disagreed with its dial partner (3922-3927, 3982-3998).
+#[tokio::test]
+async fn a_failed_model1_init_keeps_the_fields_init_record_had_not_reached() {
+    let db = boot(
+        r##"
+record(motor, "F:m") { field(DTYP, "TestModel1") field(OUT, "#C8 S0 @")
+    field(DIR, "Pos") field(MRES, "0.01") field(DHLM, "10") field(DLLM, "-10") }
+record(motor, "F:n") { field(DTYP, "TestModel1") field(OUT, "#C8 S1 @")
+    field(MRES, "0.01") field(DHLM, "10") }
+"##,
+    )
+    .await;
+    assert_eq!(field(&db, "F:m.ERES"), EpicsValue::Double(0.0));
+    assert_eq!(field(&db, "F:m.LVIO"), EpicsValue::Short(1));
+    assert_eq!(field(&db, "F:m.HLM"), EpicsValue::Double(0.0));
+    assert_eq!(field(&db, "F:m.LLM"), EpicsValue::Double(0.0));
+    assert_eq!(field(&db, "F:m.MMAP"), EpicsValue::ULong(0));
+    assert_eq!(field(&db, "F:n.MMAP"), EpicsValue::ULong(0));
+    // M_UREV | M_RHLM | M_RLLM.
+    assert_eq!(field(&db, "F:m.NMAP"), EpicsValue::ULong(0x1804));
+    // DLLM 0 agrees with RLLM 0: M_UREV | M_RHLM.
+    assert_eq!(field(&db, "F:n.NMAP"), EpicsValue::ULong(0x804));
+}
+
+/// devMotorAsyn.c:449-451's `bad:` returns 0, so init_record runs to its
+/// closing monitor(), which clears every mark: ERES is seeded from MRES.
+#[tokio::test]
+async fn an_asyn_record_that_dies_at_init_still_runs_init_record_to_monitor() {
+    let db = boot(
+        r##"
+record(motor, "G:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(NEVER_CREATED_G,0)")
+    field(MRES, "0.01") field(DHLM, "10") field(DLLM, "-10") field(DIR, "Pos") }
+"##,
+    )
+    .await;
+    assert_eq!(field(&db, "G:m.ERES"), EpicsValue::Double(0.01));
+    assert_eq!(field(&db, "G:m.MMAP"), EpicsValue::ULong(0));
+    assert_eq!(field(&db, "G:m.NMAP"), EpicsValue::ULong(0));
+    assert_eq!(field(&db, "G:m.LVIO"), EpicsValue::Short(0));
+}
+
+/// motorRecord.cc init_record never seeds MLST/ALST from VAL; only
+/// monitor() writes them, and only under a nonzero MDEL/ADEL (3485-3501).
+#[tokio::test]
+async fn init_leaves_mlst_and_alst_at_zero() {
+    register_controller_port(&open_owner(), "MLSTA", 1, ()).unwrap();
+    axis(asyn("MLSTA", 0), 500.0);
+    let db = boot(
+        r##"
+record(motor, "H:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(MLSTA,0)") field(MRES, "0.01") }
+"##,
+    )
+    .await;
+    assert_eq!(field(&db, "H:m.VAL"), EpicsValue::Double(5.0));
+    assert_eq!(field(&db, "H:m.MLST"), EpicsValue::Double(0.0));
+    assert_eq!(field(&db, "H:m.ALST"), EpicsValue::Double(0.0));
+}
+
 /// motordevCom.cc:237-247: a signal the card does not have, and a second
 /// record on a signal already in use.
 #[tokio::test]

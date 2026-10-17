@@ -58,6 +58,7 @@ const INT64IN_STATUS: crate::server::record::ProcessStatusRule =
     metadata_override = int64in_metadata_override,
     process_posted_fields = INT64IN_POSTED,
     dset_owns_udf_on_computed,
+    seeds_trackers,
     process_status = INT64IN_STATUS,
     soft_input_read_as = Int64
 )]

@@ -298,6 +298,11 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   whose C `process()` keeps `prec->udf = FALSE` inside `if (status == 0)`
 ///   and folds `2` into `0` only afterwards (or not at all); omitted, the
 ///   trait default `true` applies
+/// - `#[record(type = "longin", seeds_trackers)]` — emit
+///   `Record::seed_deadband_tracking` seeding MLST/ALST/LALM from VAL unless
+///   the dset init failed, for a record whose C `init_record` ends
+///   `if (status) return status; prec->mlst = prec->alst = prec->lalm =
+///   prec->val`; omitted, the trait default (no seed) applies
 /// - `#[record(type = "longin", soft_input_read_as = Long)]` — emit
 ///   `Record::soft_input_request` answering `LinkReadAs::Long` under every
 ///   soft DTYP, for a record whose soft dsets all hand INP's `dbGetLink` one
@@ -436,6 +441,9 @@ struct RecordAttrs {
     /// trait default `true` applies), which is `aiRecord.c:158-161`'s shape and
     /// the majority.
     dset_owns_udf_on_computed: bool,
+    /// `#[record(seeds_trackers)]` — the record's C `init_record` seeds
+    /// MLST/ALST/LALM from VAL past its dset init's status return.
+    seeds_trackers: bool,
     /// `#[record(soft_input_read_as = Long)]` — the `LinkReadAs` variant every
     /// soft dset of the record type reads INP at (`devLiSoft` and
     /// `devLiSoftCallback` both ask `DBR_LONG`). Emitted as
@@ -816,6 +824,23 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    // `#[record(seeds_trackers)]` — emit the C `if (status) return status;`
+    // seed (`longinRecord.c:114-120`, `int64inRecord.c:114-116`).
+    let seed_trackers_method = if attrs.seeds_trackers {
+        quote! {
+            fn seed_deadband_tracking(
+                &mut self,
+                dset_init: #krate::server::device_support::DsetInit,
+            ) {
+                if dset_init != #krate::server::device_support::DsetInit::Failed {
+                    #krate::server::record::seed_trackers_from_val(self);
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let process_status_method = match &attrs.process_status {
         Some(path) => quote! {
             fn process_status_rule(&self) -> #krate::server::record::ProcessStatusRule {
@@ -977,6 +1002,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #init_method
             #value_monitor_method
             #computed_udf_method
+            #seed_trackers_method
             #soft_input_request_method
             #process_status_method
             #cycle_cell_methods
@@ -1046,6 +1072,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut fields_posted_only_when_marked: Option<syn::Path> = None;
     let mut process_posted_fields: Option<syn::Path> = None;
     let mut dset_owns_udf_on_computed = false;
+    let mut seeds_trackers = false;
     let mut soft_input_read_as: Option<syn::Ident> = None;
     let mut process_status: Option<syn::Path> = None;
 
@@ -1105,6 +1132,10 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                     // Bare flag.
                     dset_owns_udf_on_computed = true;
                     Ok(())
+                } else if meta.path.is_ident("seeds_trackers") {
+                    // Bare flag.
+                    seeds_trackers = true;
+                    Ok(())
                 } else if meta.path.is_ident("soft_input_read_as") {
                     soft_input_read_as = Some(meta.value()?.parse()?);
                     Ok(())
@@ -1117,7 +1148,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                          `metadata_override`, `link_metadata_field`, \
                          `no_value_monitor`, `take_cycle_posted_fields`, \
                          `fields_posted_only_when_marked`, `process_posted_fields`, \
-                         `dset_owns_udf_on_computed`, `soft_input_read_as` or \
+                         `dset_owns_udf_on_computed`, `seeds_trackers`, `soft_input_read_as` or \
                          `process_status`",
                     ))
                 }
@@ -1140,6 +1171,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         fields_posted_only_when_marked,
         process_posted_fields,
         dset_owns_udf_on_computed,
+        seeds_trackers,
         soft_input_read_as,
         process_status,
     })

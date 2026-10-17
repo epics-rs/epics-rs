@@ -35,6 +35,17 @@ fn test_default_values() {
     assert_eq!(rec.err, 0.0);
 }
 
+/// epidRecord.c init_record (159-180) seeds no MLST/ALST/LALM; only
+/// monitor() writes them (353-368).
+#[test]
+fn init_seeds_no_deadband_tracker() {
+    use epics_base_rs::server::device_support::DsetInit;
+    let mut rec = EpidRecord::default();
+    rec.val = 3.0;
+    rec.seed_deadband_tracking(DsetInit::Ok);
+    assert_eq!((rec.mlst, rec.alst, rec.lalm), (0.0, 0.0, 0.0));
+}
+
 #[test]
 fn test_as_any_mut() {
     let mut rec = EpidRecord::default();

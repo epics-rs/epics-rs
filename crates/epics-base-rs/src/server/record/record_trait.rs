@@ -5316,35 +5316,19 @@ pub trait Record: Send + Sync + 'static {
     /// from the initial value at iocInit, called once by the builder after
     /// both `init_record` passes and `post_init_finalize_undef`.
     ///
-    /// Most C value records end `init_record` with
-    /// `prec->mlst = prec->alst = prec->lalm = prec->val`
-    /// (`aiRecord.c:129-131`, `longinRecord.c:120-122`), so their first
-    /// `monitor()` evaluates `DELTA(mlst, val) > mdel` with `mlst == val`
-    /// and posts nothing for a value that has not moved since init. The
-    /// default does that for whichever of MLST/ALST/LALM the record serves,
-    /// so a record given a nonzero initial VAL (constant DOL, `field(VAL,..)`)
-    /// does not post a spurious first-cycle update.
+    /// The C value records whose `init_record` ends
+    /// `prec->mlst = prec->alst = prec->lalm = prec->val` (`aiRecord.c:129-131`,
+    /// `longinRecord.c:120-122`) post nothing on a first `monitor()` for a
+    /// value that has not moved since init; each overrides this to seed the
+    /// subset its C tail writes, after the dset outcome its C checks
+    /// (`biRecord.c:112-114`'s `if (status) return status;`, ai only without
+    /// a dset `init_record`, mbbi/calcout regardless), and only that.
+    /// [`Self::init_record_tail`] owns the rest of the tail.
     ///
-    /// It is NOT universal, which is why it stays overridable: `calcRecord.c`
-    /// (:90-114), `dfanoutRecord.c` (:96-111), `selRecord.c` (:88-110),
-    /// `sCalcoutRecord.c` (:203-322), `aCalcoutRecord.c` (:171-281) and
-    /// `busyRecord.c` (:127-183) end `init_record` without touching the
-    /// trackers, so those six leave them at 0 and DO post that first update.
-    /// Each overrides this with an empty body. The output records override it
-    /// only to name the subset their C tail actually writes (`mbboDirect`
-    /// seeds MLST and no LALM, `boRecord.c:172-173` seeds MLST and LALM but no
-    /// ALST); everything else their tail does is
-    /// [`Self::init_record_tail`]'s.
-    ///
-    /// `dset_init` is what the dset's `init_record` did. The default is
-    /// `biRecord.c:112-114`'s `if (status) return status;` ahead of the seed;
-    /// a type that seeds after a failed init (mbbi, calcout) or only without
-    /// a dset `init_record` (ai) overrides it.
-    fn seed_deadband_tracking(&mut self, dset_init: DsetInit) {
-        if dset_init != DsetInit::Failed {
-            seed_trackers_from_val(self);
-        }
-    }
+    /// The default seeds nothing: most record types (calc, sel, dfanout,
+    /// busy, the synApps calcs, motor, epid, ...) end `init_record` without
+    /// touching the trackers and so post that first update.
+    fn seed_deadband_tracking(&mut self, _dset_init: DsetInit) {}
 
     /// Called by the framework immediately after applying this cycle's
     /// [`Record::multi_input_links`] fetches, before `process()`.

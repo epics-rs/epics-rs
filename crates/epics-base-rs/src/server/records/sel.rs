@@ -251,11 +251,6 @@ impl Record for SelRecord {
         crate::server::record::CycleHooks::INPUT_FETCH
     }
 
-    /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and
-    /// returns; it never touches LALM, whose only writes are in
-    /// `checkAlarms` (:270-302).
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     /// `monitor()` posts VAL, SELN and A..L alone (`selRecord.c:321-338`).
     fn process_posted_fields(&self) -> Option<crate::server::record::DeclaredFields> {
         Some(

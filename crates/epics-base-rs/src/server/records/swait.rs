@@ -512,10 +512,6 @@ impl Record for SwaitRecord {
         self.put_report.take()
     }
 
-    /// C `swaitRecord.c::init_record` (:266-) ends without touching
-    /// MLST/ALST; both writes are in `monitor()` (:630,:639).
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     /// The same rset shape as `bo`'s `HIGH` and `busy`'s `HIGH`: one named
     /// field answered with a constant. `ODLY` is `DBF_FLOAT`, so it clears
     /// `dbAccess.c:388-389`'s float/double gate and the 3 reaches the wire.

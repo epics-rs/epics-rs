@@ -1656,24 +1656,28 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 ///
 /// The Rust default MRES is 1.0 where the dbd leaves it 0.0: the C
 /// `mres == 0 → 1.0` arm (3917-3921) makes both starting points converge,
-/// and the UREV-wins arm overwrites MRES regardless, so no load scenario
-/// can tell the defaults apart.
+/// and the UREV-wins arm overwrites MRES regardless. Only that arm's
+/// M_MRES tells them apart, in the MMAP of a record whose dset init failed.
 pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
     // C 3905-3909: SREV (steps/revolution) must be sane.
     if rec.conv.srev <= 0 {
         rec.conv.srev = 200;
+        rec.mark(m::SREV);
     }
     // C 3912-3916: UREV (EGU/revolution) <--> MRES (EGU/step).
     if rec.conv.urev != 0.0 {
         rec.conv.mres = rec.conv.urev / rec.conv.srev as f64;
+        rec.mark(m::MRES);
     }
     // C 3917-3921: MRES must end up nonzero.
     if rec.conv.mres == 0.0 {
         rec.conv.mres = 1.0;
+        rec.mark(m::MRES);
     }
     // C 3922-3927: keep the triple consistent at the final MRES.
     if rec.conv.urev != rec.conv.mres * rec.conv.srev as f64 {
         rec.conv.urev = rec.conv.mres * rec.conv.srev as f64;
+        rec.mark(m::UREV);
     }
 }
 
@@ -1848,26 +1852,41 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
             // C 3968-3992.
             if rec.limits.rllm != 0.0 {
                 rec.limits.dllm = rec.limits.rllm * mres;
+                rec.mark(m::DLLM);
             }
-            rec.limits.rllm = rec.limits.dllm / mres;
+            if rec.limits.rllm != rec.limits.dllm / mres {
+                rec.limits.rllm = rec.limits.dllm / mres;
+                rec.mark(m::RLLM);
+            }
             if rec.limits.rhlm != 0.0 {
                 rec.limits.dhlm = rec.limits.rhlm * mres;
+                rec.mark(m::DHLM);
             }
-            rec.limits.rhlm = rec.limits.dhlm / mres;
+            if rec.limits.rhlm != rec.limits.dhlm / mres {
+                rec.limits.rhlm = rec.limits.dhlm / mres;
+                rec.mark(m::RHLM);
+            }
         } else {
             // C 3993-4017: MRES < 0 register convention.
             let abs_mres = mres.abs();
             if rec.limits.rllm != 0.0 {
                 rec.limits.dhlm = rec.limits.rllm * abs_mres;
+                rec.mark(m::DHLM);
             }
-            rec.limits.rllm = rec.limits.dhlm / abs_mres;
+            if rec.limits.rllm != rec.limits.dhlm / abs_mres {
+                rec.limits.rllm = rec.limits.dhlm / abs_mres;
+                rec.mark(m::RLLM);
+            }
             if rec.limits.rhlm != 0.0 {
                 rec.limits.dllm = rec.limits.rhlm * abs_mres;
+                rec.mark(m::DLLM);
             }
-            rec.limits.rhlm = rec.limits.dllm / abs_mres;
+            if rec.limits.rhlm != rec.limits.dllm / abs_mres {
+                rec.limits.rhlm = rec.limits.dllm / abs_mres;
+                rec.mark(m::RHLM);
+            }
         }
     }
-    rec.mark(m::DHLM | m::DLLM | m::RHLM | m::RLLM);
 }
 
 /// Re-evaluate LVIO after a soft-limit put.

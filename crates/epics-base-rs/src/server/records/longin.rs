@@ -48,6 +48,7 @@ const LONGIN_STATUS: crate::server::record::ProcessStatusRule =
     metadata_override = longin_metadata_override,
     process_posted_fields = LONGIN_POSTED,
     dset_owns_udf_on_computed,
+    seeds_trackers,
     process_status = LONGIN_STATUS,
     soft_input_read_as = Long
 )]

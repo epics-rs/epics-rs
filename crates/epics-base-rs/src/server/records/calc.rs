@@ -395,12 +395,6 @@ impl Record for CalcRecord {
         crate::server::record::CycleHooks::INPUT_FETCH
     }
 
-    /// C `calcRecord.c::init_record` (:90-114) ends without touching
-    /// MLST/ALST/LALM — `sub` and `calcout`, the two records closest to it,
-    /// both do seed (`subRecord.c:130-132`, `calcoutRecord.c:217-219`), so
-    /// this is per-type and not derivable from the record's shape.
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     fn has_array_monitor_post(&self) -> bool {
         false
     }

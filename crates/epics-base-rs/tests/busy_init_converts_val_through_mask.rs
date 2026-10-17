@@ -25,8 +25,8 @@
 //! line sits.
 //!
 //! Separately, `busyRecord.c:127-181` assigns neither `mlst` nor `lalm` where
-//! `boRecord.c:172-173` seeds both — the reason busy overrides
-//! `seed_deadband_tracking` with an empty body.
+//! `boRecord.c:172-173` seeds both — the reason busy keeps the trait's
+//! no-seed `seed_deadband_tracking`.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::records::busy::BusyRecord;

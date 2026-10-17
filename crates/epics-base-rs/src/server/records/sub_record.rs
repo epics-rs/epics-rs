@@ -152,14 +152,6 @@ impl Record for SubRecord {
     // before the resolution existed, and seeded the trackers of records C
     // leaves at zero.
 
-    /// Empty for the reason the note above `record_type` gives: `sub`'s
-    /// tracker seed is `subRecord.c:130-132`, the tail below `init_record`'s
-    /// two early returns, and only a record whose SNAM actually resolved
-    /// reaches it. The generic tail runs before the resolution and so cannot
-    /// answer that; `ioc_app::wire_subroutine`, which performs the resolution,
-    /// does it there.
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
     /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
     /// returns 0 — the record serves its fields but `dbProcess` takes the

@@ -721,10 +721,6 @@ impl Record for ScalcoutRecord {
         crate::server::record::StampPoint::AfterAlarms
     }
 
-    /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
-    /// LALM; every write to it is in `checkAlarms` (:727-750).
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     /// PAA..PLL, the `SPC_DBADDR` fields, are each one string.
     fn dbaddr_stored_as_scalar(&self, _field: &str) -> bool {
         true

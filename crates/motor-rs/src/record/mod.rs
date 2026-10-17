@@ -388,10 +388,16 @@ impl MotorRecord {
         Some(out)
     }
 
-    /// C `init_record` ran to its closing `monitor()`: devMotorAsyn's
-    /// `bad:` arm returns 0, so a record it parks still gets there.
+    /// C `init_record` got past the device init (motorRecord.cc:646-651),
+    /// and so runs to its closing `monitor()`: devMotorAsyn's `bad:` arm
+    /// returns 0, so a record it parks still gets there. A failed dset init
+    /// returns before the ERES seed (692-696) and the limit reset (717-718).
     pub(crate) fn finish_init(&mut self) {
         self.initialized = true;
+        if self.conv.eres == 0.0 {
+            self.conv.eres = self.conv.mres;
+            self.mark(m::ERES);
+        }
     }
 
     pub fn set_event(&mut self, event: MotorEvent) {
@@ -790,11 +796,6 @@ impl Record for MotorRecord {
             // RDBD >= |MRES|, against the reconciled resolution. The RDBD
             // put handler stays inert during load.
             self.enforce_min_retry_deadband();
-            // C 692-696: a zero ERES (unset, or loaded as 0) is seeded
-            // from the reconciled MRES.
-            if self.conv.eres == 0.0 {
-                self.conv.eres = self.conv.mres;
-            }
             self.internal.init_invariants_synced = true;
         }
         Ok(())

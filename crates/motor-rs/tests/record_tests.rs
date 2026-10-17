@@ -62,9 +62,9 @@ fn test_default_values() {
     assert_eq!(rec.vel.velo, 0.0);
     assert_eq!(rec.vel.accl, 0.2);
     assert_eq!(rec.retry.rtry, 10);
-    // C dbd LVIO has no initial() and init_record clears it before the
+    // C dbd LVIO initial("1"); init_record clears it before the
     // initial-readback check (motorRecord.cc:734-743).
-    assert!(!rec.limits.lvio);
+    assert!(rec.limits.lvio);
 }
 
 #[test]
@@ -7014,7 +7014,8 @@ fn test_init_monitor_derives_cnen_from_msta() {
 
 #[test]
 fn test_eres_seeded_from_mres_at_init() {
-    // C init_record 692-696: ERES == 0 is seeded from MRES at init —
+    // C init_record 692-696: ERES == 0 is seeded from MRES once the
+    // device init has returned —
     // whether the .db never set it or loaded an explicit 0, and
     // regardless of where MRES appeared in the load order. Regression:
     // the load-time ERES put mapped 0 -> the mid-load MRES (default
@@ -7024,6 +7025,7 @@ fn test_eres_seeded_from_mres_at_init() {
     rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    rec.initial_readback(&asyn_rs::interfaces::motor::MotorStatus::default());
     assert_eq!(rec.conv.eres, 0.25);
 
     // Explicit zero ERES loaded before MRES.
@@ -7032,6 +7034,7 @@ fn test_eres_seeded_from_mres_at_init() {
     rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    rec.initial_readback(&asyn_rs::interfaces::motor::MotorStatus::default());
     assert_eq!(rec.conv.eres, 0.25);
 
     // A configured nonzero ERES survives.
@@ -7040,6 +7043,7 @@ fn test_eres_seeded_from_mres_at_init() {
     rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    rec.initial_readback(&asyn_rs::interfaces::motor::MotorStatus::default());
     assert_eq!(rec.conv.eres, 0.5);
 }
 
@@ -8915,6 +8919,19 @@ fn test_limit_put_during_load_does_not_forward() {
         [],
         "load-time limit put must not reach the driver"
     );
+}
+
+#[test]
+fn test_frac_loads_raw_and_clamps_at_runtime() {
+    // C clamps FRAC to [0.1, 1.5] in special() (motorRecord.cc:2816-2827),
+    // which a dbLoadRecords field() never reaches.
+    let mut rec = MotorRecord::new();
+    rec.put_field("FRAC", EpicsValue::Float(2.0)).unwrap();
+    assert_eq!(rec.retry.frac, 2.0);
+
+    rec.init_record(1).unwrap();
+    rec.put_field("FRAC", EpicsValue::Float(2.0)).unwrap();
+    assert_eq!(rec.retry.frac, 1.5);
 }
 
 #[test]

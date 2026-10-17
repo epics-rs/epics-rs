@@ -225,16 +225,6 @@ impl Record for BusyRecord {
         self.convert_val_to_rval();
     }
 
-    /// C `busyRecord.c:127-181` assigns neither `mlst` nor `lalm`, unlike
-    /// `boRecord.c:172-173` which seeds both from VAL — so busy's first
-    /// `monitor()` (`busyRecord.c:365`, `mlst != prec->val`) must find them at
-    /// 0 even when a constant DOL has already driven VAL to 1, and post the
-    /// change C posts. busy serves both fields to clients, so the framework
-    /// default would try to seed them; that attempt is inert today only because
-    /// busy's `put_field` binds no MLST/LALM arm, and this override is what
-    /// keeps it inert if one is ever added.
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
     /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
     fn fetches_dol_closed_loop(&self) -> bool {

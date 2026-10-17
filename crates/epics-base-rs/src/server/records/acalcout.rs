@@ -1183,12 +1183,6 @@ impl Record for AcalcoutRecord {
         self.put_report.take()
     }
 
-    /// C `aCalcoutRecord.c::init_record` (:171-281) ends without touching
-    /// MLST/ALST/LALM, unlike the `calcout` it is modelled on
-    /// (`calcoutRecord.c:217-219`). An `acalcout` given a nonzero initial
-    /// VAL posts that value once on its first cycle in C.
-    fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {}
-
     fn has_array_monitor_post(&self) -> bool {
         false
     }

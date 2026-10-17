@@ -654,6 +654,16 @@ impl PortDriver for RefusingPort {
             message: "refused".into(),
         })
     }
+    fn write_int32(
+        &mut self,
+        _user: &mut asyn_rs::user::AsynUser,
+        _value: i32,
+    ) -> asyn_rs::error::AsynResult<()> {
+        Err(asyn_rs::error::AsynError::Status {
+            status: asyn_rs::error::AsynStatus::Error,
+            message: "refused".into(),
+        })
+    }
 }
 
 /// A port that keeps every `asynPortDriver` default, the octet read too.
@@ -917,4 +927,84 @@ fn a_refused_param_read_prints_report_get_param_errors() {
     ] {
         assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
     }
+}
+
+/// devBusyAsyn.c:309-327: a busy record's write prints its own dset's
+/// `processCallbackOutput` lines, and a failure each time, since busy keeps
+/// no `lastStatus`.
+#[test]
+fn a_busy_write_prints_dev_busy_asyn_lines() {
+    use epics_base_rs::server::records::busy::BusyRecord;
+
+    let fx = fixture("TRBUSY");
+    let mut rec = BusyRecord::new();
+    let mut busy = fx.bound("TR:BUSY", "busy", "asynInt32", "I32", &mut rec);
+    busy.write(&mut rec).unwrap();
+
+    let refusing = fixture_of("TRBUSYF", PortFlags::default(), |base| RefusingPort {
+        base,
+    });
+    let mut rec = BusyRecord::new();
+    let mut failing = refusing.bound("TR:BUSYF", "busy", "asynInt32", "I32", &mut rec);
+    for _ in 0..2 {
+        let _ = failing.write(&mut rec);
+    }
+
+    let log = fx.log();
+    let value = "TR:BUSY devBusyAsyn::processCallbackOutput process value 0\n";
+    assert!(log.contains(value), "missing {value:?} in:\n{log}");
+    assert!(!log.contains("devAsynInt32"), "{log}");
+    let log = refusing.log();
+    let error = "TR:BUSYF devBusyAsyn::processCallbackOutput process error refused\n";
+    assert_eq!(log.matches(error).count(), 2, "{log}");
+    assert!(!log.contains("devAsynInt32"), "{log}");
+}
+
+/// devAsynXXXTimeSeries.h:197-199: a sample prints its value and the count
+/// before it, but only while `process` has the callback registered: from
+/// BUSY 0->1 to BUSY 1->0 (:155-176).
+#[test]
+fn a_time_series_sample_prints_its_interrupt_callback_line_while_armed() {
+    use asyn_rs::interrupt::InterruptValue;
+    use asyn_rs::param::ParamValue;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let fx = fixture("TRTS");
+    let ctx = epics_base_rs::server::ioc_app::DeviceSupportContext {
+        record_type: "waveform",
+        dtyp: "asynInt32TimeSeries",
+        inp: "@asyn(TRTS,0,1)I32",
+        out: "",
+    };
+    let mut dev = asyn_rs::adapter::universal_asyn_factory(&ctx).expect("the factory binds");
+    dev.set_record_info("TR:TS", ScanType::Passive);
+    let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+    dev.init(&mut rec).unwrap();
+    let _wake = dev.io_intr_receiver();
+    let sample = |v| {
+        fx.handle.interrupts().notify(InterruptValue {
+            reason: 3,
+            addr: 0,
+            value: ParamValue::Int32(v),
+            ..Default::default()
+        })
+    };
+    sample(7);
+    rec.rarm = 1;
+    dev.read(&mut rec).unwrap();
+    sample(8);
+    sample(9);
+    rec.rarm = 2;
+    dev.read(&mut rec).unwrap();
+    sample(10);
+
+    let log = fx.log();
+    let line = |v: i32, nord: usize| {
+        format!("TR:TS devAsynInt32TimeSeries::interruptCallback, value={v}.000000, nord={nord}\n")
+    };
+    for armed in [line(8, 0), line(9, 1)] {
+        assert!(log.contains(&armed), "missing {armed:?} in:\n{log}");
+    }
+    assert_eq!(log.matches("::interruptCallback").count(), 2, "{log}");
 }

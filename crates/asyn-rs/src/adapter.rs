@@ -426,15 +426,17 @@ pub struct AsynDeviceSupport {
     average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// `Some` ⟹ time-series device support (`asynInt32TimeSeries` /
     /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`, all waveform-only). The
-    /// always-on interrupt callback appends each driver sample into the array
-    /// while `BUSY`; the record process (RARM-driven + the completion callback)
+    /// interrupt callback, registered while `BUSY`, appends each driver sample
+    /// into the array; the record process (RARM-driven + the completion callback)
     /// commits the buffer to VAL/NORD/BUSY — C `devAsynXXXTimeSeries.h`
     /// `interruptCallback` + `process`. `None` for every other DTYP.
     time_series: Option<Arc<TimeSeriesState>>,
-    /// RAII handle for the time-series synchronous accumulating callback —
-    /// dropping unregisters it (mirrors `average_callback_sub`; the time-series
-    /// support also needs every sample, so a synchronous callback, not a mailbox).
+    /// RAII handle for the time-series synchronous accumulating callback,
+    /// held while BUSY — dropping unregisters it (the time-series support
+    /// needs every sample, so a synchronous callback, not a mailbox).
     time_series_sub: Option<crate::interrupt::SyncCallbackSubscription>,
+    /// The time-series record's reprocess wakeup, sent at buffer-full.
+    time_series_wake: Option<tokio::sync::mpsc::Sender<()>>,
     /// RAII handle for the `SCAN="I/O Intr"` synchronous interrupt callback —
     /// dropping unregisters it. Synchronous like the averaging and time-series
     /// callbacks: the C ring (`interruptCallbackInput`, devAsynInt32.c:564-576)
@@ -453,6 +455,9 @@ pub struct AsynDeviceSupport {
     interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
     /// The `interruptAccept` the ring/average callbacks drop on.
     gate: Arc<RecordGate>,
+    /// The C dset whose lines this record prints; settled at `init`, once
+    /// the record type is known.
+    dset: Dset,
     /// C `devAsynInt32.c::newOutputCallbackValue` (asyn devEpics, the
     /// `devPvt` flag). Set when a driver-callback readback cycle is armed
     /// (`arm_readback_callback`, mirrors `outputCallbackCallback` setting
@@ -594,6 +599,18 @@ impl TsBuf {
         }
     }
 
+    /// C's `(double)value` of one sample.
+    fn sample(value: &crate::param::ParamValue) -> f64 {
+        use crate::param::ParamValue;
+        match value {
+            ParamValue::Int32(x) => *x as f64,
+            ParamValue::Int64(x) => *x as f64,
+            ParamValue::UInt64(x) => *x as f64,
+            ParamValue::Float64(x) => *x,
+            _ => 0.0,
+        }
+    }
+
     /// Snapshot the accumulated samples as the record VAL value. `set_val`/
     /// `put_field("VAL")` then sets `NORD = len` (C `pwf->nord = pPvt->nord`).
     fn to_epics_value(&self) -> EpicsValue {
@@ -608,7 +625,7 @@ impl TsBuf {
 
 /// Shared state for a time-series (`asynInt32TimeSeries` /
 /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`) waveform record. The
-/// always-on accumulating callback (registered in `io_intr_receiver`) appends
+/// accumulating callback (registered by the process while BUSY) appends
 /// samples while `busy`; the record process commits them. Mirrors C
 /// `devAsynXXXTimeSeries.h`'s `devAsynWfPvt` (busy/nord live here; the array is
 /// `buf`, committed to the record VAL each process rather than written into the
@@ -779,7 +796,7 @@ impl AsynDeviceSupport {
     /// while a queued write holds the record (`numDeferredOutputCallbacks`):
     /// every one with output callbacks but `devAsynXXXArray`.
     fn defers_output_callbacks(&self) -> bool {
-        self.asyn_readback && DevFile::of(&self.iface_type) != DevFile::Array
+        self.asyn_readback && self.dset != Dset::Array
     }
 
     /// The bottom of C's `processXxx`: the cycle is over, and a callback
@@ -802,6 +819,7 @@ impl AsynDeviceSupport {
         });
         Self {
             gate,
+            dset: Dset::of("", iface_type),
             handle,
             addr: link.addr,
             timeout: link.timeout,
@@ -831,6 +849,7 @@ impl AsynDeviceSupport {
             average_callback_sub: None,
             time_series: None,
             time_series_sub: None,
+            time_series_wake: None,
             interrupt_sub: None,
             readback_wake: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
@@ -884,7 +903,7 @@ impl AsynDeviceSupport {
                 let _ = self.device_job.trace.set(ProcessTrace {
                     trace: self.handle.user_trace(),
                     record: self.record_name.clone(),
-                    file: DevFile::of(&self.iface_type),
+                    file: self.dset,
                     int32_mask: self.int32_mask,
                 });
                 let job: Arc<dyn CellBody> = self.device_job.clone();
@@ -940,9 +959,9 @@ impl AsynDeviceSupport {
             return;
         }
         self.queue_status = status;
-        let (rec, driver) = (&self.record_name, self.driver_name());
+        let (rec, driver) = (&self.record_name, self.dset.driver());
         let mask = crate::trace::TraceMask::ERROR;
-        let array = driver == "devAsynXXXArray";
+        let array = self.dset == Dset::Array;
         let at = if array {
             ""
         } else {
@@ -1517,56 +1536,12 @@ impl Default for LastStatus {
     }
 }
 
-/// C devAsyn's device-support file, which decides the lines a finished
-/// request prints.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DevFile {
-    Int32,
-    Int64,
-    UInt32Digital,
-    Float64,
-    Octet,
-    Array,
-}
-
-impl DevFile {
-    /// The array dsets share `devAsynXXXArray`; `asynOctetCmdResponse` and its
-    /// kin are `devAsynOctet`.
-    fn of(iface: &str) -> Self {
-        if iface.contains("Array") {
-            Self::Array
-        } else if iface.starts_with("asynOctet") {
-            Self::Octet
-        } else if iface.starts_with("asynUInt32Digital") {
-            Self::UInt32Digital
-        } else if iface.starts_with("asynInt64") {
-            Self::Int64
-        } else if iface.starts_with("asynFloat64") {
-            Self::Float64
-        } else {
-            Self::Int32
-        }
-    }
-
-    /// C's `driverName`.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Int32 => "devAsynInt32",
-            Self::Int64 => "devAsynInt64",
-            Self::UInt32Digital => "devAsynUInt32Digital",
-            Self::Float64 => "devAsynFloat64",
-            Self::Octet => "devAsynOctet",
-            Self::Array => "devAsynXXXArray",
-        }
-    }
-}
-
 /// What the record's request callback needs on the port thread: the names its
 /// lines print and the asynInt32 `@asynMask` its read applies.
 struct ProcessTrace {
     trace: crate::user::UserTrace,
     record: String,
-    file: DevFile,
+    file: Dset,
     int32_mask: Option<Int32Mask>,
 }
 
@@ -1624,11 +1599,11 @@ impl<'a> Sent<'a> {
     /// (devAsynOctet.c:685), folded into the result whose own alarm
     /// processCommon raises after it (:806-809): equal severity keeps
     /// WRITE, a higher one replaces it.
-    fn raise_short_write(&self, file: DevFile, ran: &mut AsynResult<RequestResult>) {
+    fn raise_short_write(&self, file: Dset, ran: &mut AsynResult<RequestResult>) {
         use epics_base_rs::server::{recgbl::alarm_status, record::AlarmSeverity};
         let minor = AlarmSeverity::Minor as u16;
         if let Ok(r) = ran {
-            if file == DevFile::Octet && self.came_up_short(r) && r.alarm_severity <= minor {
+            if file == Dset::Octet && self.came_up_short(r) && r.alarm_severity <= minor {
                 r.alarm_status = alarm_status::WRITE_ALARM;
                 r.alarm_severity = minor;
             }
@@ -1699,7 +1674,7 @@ impl std::fmt::Display for Scalar {
 struct ProcessLine<'a> {
     trace: &'a crate::user::UserTrace,
     record: &'a str,
-    file: DevFile,
+    file: Dset,
     addr: i32,
     reason: i32,
 }
@@ -1764,7 +1739,7 @@ impl ProcessLine<'_> {
         };
         let mut last = last.0.lock();
         match (self.file, failure, ran) {
-            (DevFile::Octet, Some((_, message)), _) => {
+            (Dset::Octet, Some((_, message)), _) => {
                 use crate::error::OctetStep;
                 let step = match ran.err().and_then(AsynError::octet_step) {
                     Some(step) => step,
@@ -1796,7 +1771,7 @@ impl ProcessLine<'_> {
                     format_args!("{rec} devAsynOctet::{function} failed {message}\n"),
                 );
             }
-            (DevFile::Octet, None, Ok(r)) => {
+            (Dset::Octet, None, Ok(r)) => {
                 if sent.write {
                     if sent.came_up_short(r) {
                         self.print(
@@ -1828,13 +1803,13 @@ impl ProcessLine<'_> {
                     );
                 }
             }
-            (DevFile::Array, None, _) => self.print(
+            (Dset::Array, None, _) => self.print(
                 TraceMask::IO_DEVICE,
                 file!(),
                 line!(),
                 format_args!("{rec} devAsynXXXArray::queueRequestCallback OK\n"),
             ),
-            (DevFile::Array, Some((status, message)), _) if status != *last => {
+            (Dset::Array, Some((status, message)), _) if status != *last => {
                 let verb = if sent.write { "write" } else { "read" };
                 self.print(
                     TraceMask::ERROR,
@@ -1845,8 +1820,8 @@ impl ProcessLine<'_> {
                     ),
                 );
             }
-            (scalar, None, ran) if scalar != DevFile::Array && scalar != DevFile::Octet => {
-                let driver = scalar.name();
+            (scalar, None, ran) if scalar.is_scalar() => {
+                let driver = scalar.driver();
                 if sent.write {
                     let value = Scalar::sent(sent.op);
                     self.print(
@@ -1869,10 +1844,16 @@ impl ProcessLine<'_> {
                     );
                 }
             }
-            (scalar, Some((status, message)), _) if scalar != DevFile::Array && status != *last => {
-                let driver = scalar.name();
+            // devBusyAsyn keeps no `lastStatus` (devBusyAsyn.c:322-326).
+            (scalar, Some((status, message)), _)
+                if scalar.is_scalar()
+                    && (status != *last || scalar == Dset::Int32 { busy: true }) =>
+            {
+                let driver = scalar.driver();
                 let (function, what) = match (sent.write, scalar) {
-                    (true, DevFile::Int64) => ("processCallbackOutput", "process error"),
+                    (true, Dset::Int64 | Dset::Int32 { busy: true }) => {
+                        ("processCallbackOutput", "process error")
+                    }
                     (true, _) => ("processCallbackOutput", "process write error"),
                     (false, _) => ("processCallbackInput", "process read error"),
                 };
@@ -2530,9 +2511,100 @@ impl AsynDeviceSupport {
             .print(self.addr, self.reason as i32, mask, file, line, args);
     }
 
-    /// C's `driverName` for the device support file this interface names.
-    fn driver_name(&self) -> &'static str {
-        DevFile::of(&self.iface_type).name()
+    /// The C dset this record's DTYP bound. A time series keeps only its base
+    /// interface, so the suffix is put back.
+    /// C `registerInterruptUser(interruptCallback)` (devAsynXXXTimeSeries.h:
+    /// 158-160): the accumulating callback, registered by `process` on BUSY
+    /// 0->1 and cancelled, by dropping it, on BUSY 1->0.
+    fn time_series_subscribe(
+        &self,
+        ts: Arc<TimeSeriesState>,
+    ) -> crate::interrupt::SyncCallbackSubscription {
+        let filter = InterruptFilter {
+            reason: Some(self.reason),
+            addr: Some(self.handle.param_list(self.addr)),
+            uint32_mask: None,
+            // Per-interface routing: a driver that fires interface-typed
+            // values (e.g. Modbus) must reach this accumulating callback
+            // with only this record's interface, or a single poll's several
+            // typed fires would each be accumulated as separate samples.
+            iface: self.iface,
+        };
+        let tx = self.time_series_wake.clone();
+        let trace = self.handle.user_trace();
+        let (addr, reason) = (self.addr, self.reason as i32);
+        let (record, driver) = (self.record_name.clone(), self.dset.driver());
+        self.handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
+                let mut st = ts.inner.lock().unwrap();
+                let nord = st.buf.as_ref().map_or(0, TsBuf::len);
+                trace.print(
+                    addr,
+                    reason,
+                    crate::trace::TraceMask::IO_DEVICE,
+                    file!(),
+                    line!(),
+                    format_args!(
+                        "{record} {driver}::interruptCallback, value={:.6}, nord={nord}\n",
+                        TsBuf::sample(&iv.value)
+                    ),
+                );
+                // Not acquiring (C `if (pPvt->busy)` guard): nothing to do.
+                if !st.busy {
+                    return;
+                }
+                let nelm = st.nelm;
+                // Append while room remains (C `if (pPvt->nord < pwf->nelm)`).
+                // A None buffer (FTVL invalid) or a full buffer returns.
+                let full = match st.buf.as_mut() {
+                    Some(buf) if buf.len() < nelm => {
+                        buf.push(&iv.value);
+                        buf.len() >= nelm
+                    }
+                    _ => return,
+                };
+                // Transport status: C updates `pPvt->status = pasynUser->
+                // auxStatus` on EVERY callback, including one between the
+                // buffer filling and the process that cancels it
+                // (devAsynXXXTimeSeries.h:213 is outside the `if(busy)`).
+                // Here it is reached only while acquiring (the not-busy guard
+                // returned above) — a deliberate divergence: that sample's
+                // error does not leak into the next acquisition's alarm. Within acquisition the behaviour is C's:
+                // keep the first non-success status until the next process.
+                if st.status == crate::error::AsynStatus::Success
+                    && iv.aux_status != crate::error::AsynStatus::Success
+                {
+                    st.status = iv.aux_status;
+                }
+                // Completion. DIVERGENCE from C: C completes LAZILY — the
+                // sample that fills the last slot is stored and acquisition
+                // stays busy; the NEXT sample finds `nord == nelm`, is
+                // discarded, and only then clears busy + processes
+                // (devAsynXXXTimeSeries.h:203-211). That delays completion by
+                // one sample and hangs busy=1 forever if the stream stops at
+                // exactly NELM. This port completes EAGERLY on the filling
+                // sample: identical stored data (the first NELM samples; the
+                // would-be C trigger sample is dropped by the not-busy guard
+                // either way) but deterministic completion. try_send: the
+                // callback runs inline in the driver notify and must not block;
+                // a full wakeup channel means a process is already pending.
+                if full {
+                    st.busy = false;
+                    drop(st);
+                    if let Some(tx) = &tx {
+                        let _ = tx.try_send(());
+                    }
+                }
+            })
+    }
+
+    fn bound_dset(&self, record_type: &str) -> Dset {
+        if self.time_series.is_some() {
+            Dset::of(record_type, &format!("{}TimeSeries", self.iface_type))
+        } else {
+            Dset::of(record_type, &self.iface_type)
+        }
     }
 
     /// C's `queueRequest` on a port that cannot block: the callback runs
@@ -2541,7 +2613,7 @@ impl AsynDeviceSupport {
         let trace = self.handle.user_trace();
         // Only an octet write prints its buffer, and only when traced.
         let keep = !carries_buffer(&op)
-            || DevFile::of(&self.iface_type) == DevFile::Octet
+            || self.dset == Dset::Octet
                 && trace.manager.is_enabled_device(
                     &trace.port,
                     self.addr,
@@ -2553,14 +2625,14 @@ impl AsynDeviceSupport {
         if let Ok(result) = &mut ran {
             Int32Mask::apply_to_read(self.int32_mask, result);
         }
-        sent.raise_short_write(DevFile::of(&self.iface_type), &mut ran);
+        sent.raise_short_write(self.dset, &mut ran);
         // The callback ran inside `queueRequest`, before `processXxx` reports
         // its status (devAsynInt32.c:838-841).
         if !ran.as_ref().is_err_and(AsynError::is_queue_refused) {
             ProcessLine {
                 trace: &trace,
                 record: &self.record_name,
-                file: DevFile::of(&self.iface_type),
+                file: self.dset,
                 addr: self.addr,
                 reason: self.reason as i32,
             }
@@ -2580,7 +2652,7 @@ impl AsynDeviceSupport {
                 let ran = src.failed(Some(&ProcessLine {
                     trace: &trace,
                     record: &self.record_name,
-                    file: DevFile::Octet,
+                    file: Dset::Octet,
                     addr: self.addr,
                     reason: self.reason as i32,
                 }));
@@ -2887,6 +2959,11 @@ impl AsynDeviceSupport {
 
 impl DeviceSupport for AsynDeviceSupport {
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        self.dset = self.bound_dset(record.record_type());
+        let ts_buf = match self.dset.check_ftvl(&self.record_name, record) {
+            Ok(buf) => buf,
+            Err(dead) => return Ok(dead),
+        };
         // busy is the driver-clearable output: the busy module's devBusyAsyn
         // registers the output interrupt callback UNCONDITIONALLY (`if
         // (interruptCallback)` with no `asyn:READBACK` info gate,
@@ -2933,21 +3010,15 @@ impl DeviceSupport for AsynDeviceSupport {
                     Err(e) => {
                         // Param not found, or the driver rejected the bind (e.g. an
                         // out-of-range offset) — this record cannot bind to a param.
-                        // C prints and `goto bad` (devAsynInt32.c:272-276), whose
-                        // body raises LINK_ALARM/INVALID and sets `pr->pact = 1`
-                        // (:348-351). Leaving the record live would let it keep
-                        // processing against reason 0 — a different parameter —
-                        // and report whatever that one holds.
-                        eprintln!(
-                            "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
-                            self.handle.port_name(),
-                            self.drv_info
-                        );
+                        // C prints and `goto bad` (devAsynInt32.c:272-276). Leaving
+                        // the record live would let it keep processing against
+                        // reason 0 — a different parameter.
                         self.reason_set = false;
-                        return Ok(DeviceInitOutcome::dead_with_alarm(
-                            epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                            epics_base_rs::server::record::AlarmSeverity::Invalid,
-                        ));
+                        self.dset.report(
+                            &self.record_name,
+                            &LinkRefusal::DrvUser(drv_user_message(&e)),
+                        );
+                        return Ok(self.dset.bad());
                     }
                 }
             }
@@ -2966,9 +3037,9 @@ impl DeviceSupport for AsynDeviceSupport {
         // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
         // a plain asynOctetRead, so this only fires for a CmdResponse record.
         if self.octet_cmd.is_some() && self.drv_info.is_empty() {
-            eprintln!(
-                "[asyn] asynOctetCmdResponse port='{}': no userParam (empty command)",
-                self.handle.port_name()
+            println!(
+                "{}  devAsynOctet::initCmdBuffer no userParam",
+                self.record_name
             );
             return Ok(DeviceInitOutcome::dead_with_alarm(
                 epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
@@ -3001,54 +3072,11 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
-        // Time-series FTVL validation + buffer sizing. C `initRecord`
-        // (devAsynXXXTimeSeries.h:73-77) requires FTVL be the signed or unsigned
-        // EPICS type of the interface, else `errlogPrintf` + `goto bad`, whose
-        // whole body is `pr->pact = 1; return -1` (:118-120). Mirror that
-        // literally: print, then return `Dead` so the framework leaves the record
-        // in PACT and `dbProcess` refuses every later entry — PACT reads 1
-        // forever, BUSY stays 0 and `caput REC.RARM 1` sets RPRO and processes
-        // nothing. The early return is C's `goto bad` skipping the rest of
-        // initRecord. menuFtype indices: LONG=5, ULONG=6, INT64=7, UINT64=8,
-        // DOUBLE=10.
-        if let Some(ts) = self.time_series.clone() {
-            let ftvl = match record.get_field("FTVL") {
-                Some(EpicsValue::Short(v)) => v,
-                _ => -1,
-            };
-            let buf = match self.iface_type.as_str() {
-                "asynInt32" => match ftvl {
-                    5 | 6 => Some(TsBuf::Long(Vec::new())),
-                    _ => None,
-                },
-                "asynInt64" => match ftvl {
-                    7 => Some(TsBuf::Int64(Vec::new())),
-                    8 => Some(TsBuf::UInt64(Vec::new())),
-                    _ => None,
-                },
-                "asynFloat64" => match ftvl {
-                    10 => Some(TsBuf::Double(Vec::new())),
-                    _ => None,
-                },
-                _ => None,
-            };
-            match buf {
-                Some(b) => {
-                    let mut st = ts.inner.lock().unwrap();
-                    st.nelm = self.max_array_elements;
-                    st.buf = Some(b);
-                }
-                None => {
-                    eprintln!(
-                        "[asyn] TimeSeries port='{}' drv_info='{}': FTVL must be the \
-                         signed/unsigned EPICS type of {}",
-                        self.handle.port_name(),
-                        self.drv_info,
-                        self.iface_type
-                    );
-                    return Ok(DeviceInitOutcome::dead());
-                }
-            }
+        // The time-series buffer `check_ftvl` chose, sized to NELM.
+        if let (Some(ts), Some(buf)) = (&self.time_series, ts_buf) {
+            let mut st = ts.inner.lock().unwrap();
+            st.nelm = self.max_array_elements;
+            st.buf = Some(buf);
         }
 
         // C devAsynOctet `valSize`. SIZV is DBF_USHORT
@@ -3308,6 +3336,12 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             // Sync the device-only fields the framework does not touch: BUSY
             // reflects acquisition; RARM resets to 0 (C `pwf->rarm = 0`).
+            // C `process` registers the callback on BUSY 0->1 and cancels it
+            // on 1->0 (devAsynXXXTimeSeries.h:155-176); the callback clearing
+            // `st.busy` at buffer-full leaves it registered until then.
+            if wf.busy != busy {
+                self.time_series_sub = busy.then(|| self.time_series_subscribe(ts.clone()));
+            }
             wf.busy = busy;
             wf.rarm = 0;
             // C `if (pPvt->status != asynSuccess) recGblSetSevr(prec, READ_ALARM,
@@ -3846,80 +3880,14 @@ impl DeviceSupport for AsynDeviceSupport {
             return None;
         }
 
-        // Time-series device support (asynInt32/Float64/Int64TimeSeries):
-        // register an ALWAYS-ON synchronous accumulating callback (C
-        // `registerInterruptUser(interruptCallback)`, devAsynXXXTimeSeries.h:159).
-        // Like averaging it observes EVERY sample through a sync callback.
-        // The callback appends to the buffer only while BUSY
-        // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
-        // the record to process (C `callbackRequestProcessCallback`,
-        // devAsynXXXTimeSeries.h:202-212). Process registration/cancellation by
-        // BUSY (C process) is folded into this always-on callback's BUSY gate —
-        // a not-busy sample is a no-op either way, so the observable behaviour is
-        // identical without dynamic register/cancel churn.
-        if let Some(ts) = self.time_series.clone() {
-            let filter = InterruptFilter {
-                reason: Some(self.reason),
-                addr: Some(self.handle.param_list(self.addr)),
-                uint32_mask: None,
-                // Per-interface routing: a driver that fires interface-typed
-                // values (e.g. Modbus) must reach this accumulating callback
-                // with only this record's interface, or a single poll's several
-                // typed fires would each be accumulated as separate samples.
-                iface: self.iface,
-            };
+        // Time-series device support (asynInt32/Float64/Int64TimeSeries): the
+        // wakeup the callback sends when the buffer fills (C
+        // `callbackRequestProcessCallback`, devAsynXXXTimeSeries.h:202-212).
+        // The callback itself is registered by process while BUSY
+        // ([`Self::time_series_subscribe`]).
+        if self.time_series.is_some() {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
-            let sub = self
-                .handle
-                .interrupts()
-                .register_sync_callback(filter, move |iv| {
-                    let mut st = ts.inner.lock().unwrap();
-                    // Not acquiring (C `if (pPvt->busy)` guard): nothing to do.
-                    if !st.busy {
-                        return;
-                    }
-                    let nelm = st.nelm;
-                    // Append while room remains (C `if (pPvt->nord < pwf->nelm)`).
-                    // A None buffer (FTVL invalid) or a full buffer returns.
-                    let full = match st.buf.as_mut() {
-                        Some(buf) if buf.len() < nelm => {
-                            buf.push(&iv.value);
-                            buf.len() >= nelm
-                        }
-                        _ => return,
-                    };
-                    // Transport status: C updates `pPvt->status = pasynUser->
-                    // auxStatus` on EVERY callback, even when not acquiring
-                    // (devAsynXXXTimeSeries.h:213 is outside the `if(busy)`).
-                    // Here it is reached only while acquiring (the not-busy guard
-                    // returned above) — a deliberate divergence: an error on a
-                    // sample received while stopped does not leak into the next
-                    // acquisition's alarm. Within acquisition the behaviour is C's:
-                    // keep the first non-success status until the next process.
-                    if st.status == crate::error::AsynStatus::Success
-                        && iv.aux_status != crate::error::AsynStatus::Success
-                    {
-                        st.status = iv.aux_status;
-                    }
-                    // Completion. DIVERGENCE from C: C completes LAZILY — the
-                    // sample that fills the last slot is stored and acquisition
-                    // stays busy; the NEXT sample finds `nord == nelm`, is
-                    // discarded, and only then clears busy + processes
-                    // (devAsynXXXTimeSeries.h:203-211). That delays completion by
-                    // one sample and hangs busy=1 forever if the stream stops at
-                    // exactly NELM. This port completes EAGERLY on the filling
-                    // sample: identical stored data (the first NELM samples; the
-                    // would-be C trigger sample is dropped by the not-busy guard
-                    // either way) but deterministic completion. try_send: the
-                    // callback runs inline in the driver notify and must not block;
-                    // a full wakeup channel means a process is already pending.
-                    if full {
-                        st.busy = false;
-                        drop(st);
-                        let _ = tx.try_send(());
-                    }
-                });
-            self.time_series_sub = Some(sub);
+            self.time_series_wake = Some(tx);
             return Some(rx);
         }
 
@@ -4385,10 +4353,10 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
     dtyp.to_string()
 }
 
-/// The C dset a DTYP binds, for what its `initCommon` does with the link:
-/// which parser it calls and the line it prints when the parse fails.
-#[derive(Clone, Copy)]
-enum LinkDset {
+/// The C dset a record's DTYP binds, which names every line it prints: its
+/// `initCommon` refusals and the lines a request prints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dset {
     /// devAsynInt32.c:220-230 and devBusyAsyn.c:158-167: `parseLink`, then
     /// `parseLinkMask`, whose message is the one left to print.
     Int32 {
@@ -4402,7 +4370,7 @@ enum LinkDset {
     TimeSeries(&'static str),
 }
 
-impl LinkDset {
+impl Dset {
     fn of(record_type: &str, dtyp: &str) -> Self {
         match dtyp {
             "asynInt32TimeSeries" => Self::TimeSeries("devAsynInt32TimeSeries"),
@@ -4410,9 +4378,9 @@ impl LinkDset {
             "asynFloat64TimeSeries" => Self::TimeSeries("devAsynFloat64TimeSeries"),
             d if d.contains("Array") => Self::Array,
             d if d.starts_with("asynOctet") => Self::Octet,
-            "asynUInt32Digital" => Self::UInt32Digital,
-            "asynInt64" => Self::Int64,
-            "asynFloat64" | "asynFloat64Average" => Self::Float64,
+            d if d.starts_with("asynUInt32Digital") => Self::UInt32Digital,
+            d if d.starts_with("asynInt64") => Self::Int64,
+            d if d.starts_with("asynFloat64") => Self::Float64,
             _ => Self::Int32 {
                 busy: record_type == "busy",
             },
@@ -4435,6 +4403,14 @@ impl LinkDset {
         }
     }
 
+    /// The dsets whose requests print `processCallbackOutput`/`Input` lines.
+    fn is_scalar(self) -> bool {
+        matches!(
+            self,
+            Self::Int32 { .. } | Self::Int64 | Self::UInt32Digital | Self::Float64
+        )
+    }
+
     /// The C dset's `driverName`.
     fn driver(self) -> &'static str {
         match self {
@@ -4447,6 +4423,58 @@ impl LinkDset {
             Self::Array => "devAsynXXXArray",
             Self::TimeSeries(driver) => driver,
         }
+    }
+
+    /// Print C's line for a refusal where C prints it.
+    fn report(self, record: &str, refusal: &LinkRefusal) {
+        match self.refusal_line(record, refusal) {
+            (line, true) => epics_base_rs::runtime::log::errlog_vprintf(format_args!("{line}\n")),
+            (line, false) => println!("{line}"),
+        }
+    }
+
+    /// The record after C's `bad:` arm.
+    fn bad(self) -> DeviceInitOutcome {
+        match self {
+            // devAsynXXXTimeSeries.h:118-120 raises no alarm.
+            Self::TimeSeries(_) => DeviceInitOutcome::dead(),
+            _ => DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ),
+        }
+    }
+
+    /// A time-series record's buffer for its FTVL. C checks FTVL first in
+    /// `initRecord` (devAsynXXXTimeSeries.h:73-77): the signed or unsigned
+    /// type of the interface, else errlog and `goto bad`. menuFtype indices:
+    /// LONG=5, ULONG=6, INT64=7, UINT64=8, DOUBLE=10. `Ok(None)` for every
+    /// other dset.
+    fn check_ftvl(
+        self,
+        name: &str,
+        record: &dyn Record,
+    ) -> Result<Option<TsBuf>, DeviceInitOutcome> {
+        let Self::TimeSeries(driver) = self else {
+            return Ok(None);
+        };
+        let ftvl = match record.get_field("FTVL") {
+            Some(EpicsValue::Short(v)) => v,
+            _ => -1,
+        };
+        let buf = match (driver, ftvl) {
+            ("devAsynInt32TimeSeries", 5 | 6) => TsBuf::Long(Vec::new()),
+            ("devAsynInt64TimeSeries", 7) => TsBuf::Int64(Vec::new()),
+            ("devAsynInt64TimeSeries", 8) => TsBuf::UInt64(Vec::new()),
+            ("devAsynFloat64TimeSeries", 10) => TsBuf::Double(Vec::new()),
+            _ => {
+                epics_base_rs::runtime::log::errlog_vprintf(format_args!(
+                    "{driver}::initCommon, {name} field type must be SIGNED_TYPE or UNSIGNED_TYPE\n"
+                ));
+                return Err(self.bad());
+            }
+        };
+        Ok(Some(buf))
     }
 
     /// C's line for an `initCommon` refusal, and whether C sends it through
@@ -4472,6 +4500,24 @@ impl LinkDset {
                 Self::TimeSeries(_) => (
                     format!("{driver}::initCommon, {record} error in link {message}"),
                     true,
+                ),
+            },
+            LinkRefusal::DrvUser(message) => match self {
+                Self::Octet => (
+                    format!("{record} {driver}::initDrvUser drvUserCreate failed {message}"),
+                    false,
+                ),
+                Self::Array => (
+                    format!("{driver}::devAsynXXXArray, {record} drvUserCreate failed {message}"),
+                    true,
+                ),
+                Self::TimeSeries(_) => (
+                    format!("{driver}::initCommon, {record} drvUserCreate failed {message}"),
+                    true,
+                ),
+                _ => (
+                    format!("{record} {driver}::initCommon drvUserCreate {message}"),
+                    false,
                 ),
             },
             LinkRefusal::NoPort(port) => {
@@ -4503,12 +4549,24 @@ enum LinkRefusal {
     Parse(&'static str),
     /// `connectDevice` found no port of this name.
     NoPort(String),
+    /// `drvUserCreate` failed with this `errorMessage`.
+    DrvUser(String),
+}
+
+/// What `pasynUser->errorMessage` holds after a failed `drvUserCreate`.
+/// asynPortDriver reports a missing parameter by its trace line alone
+/// (asynPortDriver.cpp:3571-3575) and leaves the message empty.
+fn drv_user_message(e: &AsynError) -> String {
+    match e {
+        AsynError::ParamNotFound(_) => String::new(),
+        e => e.message(),
+    }
 }
 
 /// A record whose link C's dset refused: the dset is bound, and its
 /// `init_record` prints why and takes the `bad:` arm.
 struct BadLink {
-    dset: LinkDset,
+    dset: Dset,
     dtyp: String,
     refusal: LinkRefusal,
     record: String,
@@ -4523,19 +4581,12 @@ impl DeviceSupport for BadLink {
         self.record = name.to_string();
     }
 
-    fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        match self.dset.refusal_line(&self.record, &self.refusal) {
-            (line, true) => epics_base_rs::runtime::log::errlog_vprintf(format_args!("{line}\n")),
-            (line, false) => println!("{line}"),
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        if let Err(dead) = self.dset.check_ftvl(&self.record, record) {
+            return Ok(dead);
         }
-        Ok(match self.dset {
-            // devAsynXXXTimeSeries.h:118-120 raises no alarm.
-            LinkDset::TimeSeries(_) => DeviceInitOutcome::dead(),
-            _ => DeviceInitOutcome::dead_with_alarm(
-                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                epics_base_rs::server::record::AlarmSeverity::Invalid,
-            ),
-        })
+        self.dset.report(&self.record, &self.refusal);
+        Ok(self.dset.bad())
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -4543,7 +4594,7 @@ impl DeviceSupport for BadLink {
     }
 }
 
-fn bad_link(dset: LinkDset, dtyp: &str, refusal: LinkRefusal) -> Box<dyn DeviceSupport> {
+fn bad_link(dset: Dset, dtyp: &str, refusal: LinkRefusal) -> Box<dyn DeviceSupport> {
     Box::new(BadLink {
         dset,
         dtyp: dtyp.to_string(),
@@ -4608,7 +4659,7 @@ pub fn universal_asyn_factory(
         (ctx.inp, out, out)
     };
 
-    let dset = LinkDset::of(ctx.record_type, ctx.dtyp);
+    let dset = Dset::of(ctx.record_type, ctx.dtyp);
     let (link, mask) = match dset.parse(link_str) {
         Ok((io, mask)) => (
             AsynLink {
@@ -5407,15 +5458,12 @@ mod tests {
                 inp,
                 out: "",
             };
-            let dset = LinkDset::of(record_type, dtyp);
+            let dset = Dset::of(record_type, dtyp);
             assert_eq!(dset.parse(inp).err(), Some(message), "{dtyp} {inp}");
             let (line, errlog) = dset.refusal_line("R", &LinkRefusal::Parse(message));
             let prefix = prefix.unwrap_or("devAsynInt32TimeSeries::initCommon, R error in link ");
             assert_eq!(line, format!("{prefix}{message}"), "{dtyp}");
-            assert_eq!(
-                errlog,
-                matches!(dset, LinkDset::Array | LinkDset::TimeSeries(_))
-            );
+            assert_eq!(errlog, matches!(dset, Dset::Array | Dset::TimeSeries(_)));
 
             let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
             assert_eq!(dev.dtyp(), dtyp);
@@ -5434,9 +5482,296 @@ mod tests {
         }
         // The forms each C dset accepts: asynInt32 falls back to the mask
         // parser and keeps its mask, a plain link leaves the mask off.
-        let int32 = LinkDset::of("ai", "asynInt32");
+        let int32 = Dset::of("ai", "asynInt32");
         assert_eq!(int32.parse("@asynMask(p 0 8)D").unwrap().1, Some(8));
         assert_eq!(int32.parse("@asyn(p 0)D").unwrap().1, None);
+    }
+
+    /// A drvInfo the port has no parameter for: each dset prints its own
+    /// `drvUserCreate` line, where C does (devAsynInt32.c:272-276,
+    /// devAsynOctet.c:615-619), behind asynPortDriver's trace line. The base
+    /// class leaves `errorMessage` empty. A child, to read its stdout.
+    #[test]
+    fn a_missing_parameter_prints_the_dsets_drv_user_create_line() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+
+        const CHILD: &str = "ASYN_DRV_USER_LINE_CHILD";
+        const TEST: &str =
+            "adapter::tests::a_missing_parameter_prints_the_dsets_drv_user_create_line";
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "DU:I32 devAsynInt32::initCommon drvUserCreate ",
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "DU:F64 devAsynFloat64::initCommon drvUserCreate ",
+            ),
+            (
+                "stringin",
+                "asynOctetRead",
+                "DU:OCT devAsynOctet::initDrvUser drvUserCreate failed ",
+            ),
+            // devAsynOctet.c:631-637: a command-response with no command.
+            (
+                "stringin",
+                "asynOctetCmdResponse",
+                "DU:CMD  devAsynOctet::initCmdBuffer no userParam",
+            ),
+        ];
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            for (_, _, line) in cases {
+                assert!(stdout.lines().any(|l| l == line), "{line:?}: {stdout}");
+            }
+            assert!(
+                !stdout.contains("[asyn]") && !stderr.contains("[asyn]"),
+                "{stderr}"
+            );
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::new()), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "du_port".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("du_port", handle, &crate::registry::open_owner())
+            .unwrap();
+        for (record_type, dtyp, line) in cases {
+            let cmd = dtyp == "asynOctetCmdResponse";
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp,
+                inp: if cmd {
+                    "@asyn(du_port,0)"
+                } else {
+                    "@asyn(du_port,0)NOPE"
+                },
+                out: "",
+            };
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            dev.set_record_info(line.split(' ').next().unwrap(), ScanType::Passive);
+            let mut rec = epics_base_rs::server::records::ai::AiRecord::default();
+            assert_eq!(
+                dev.init(&mut rec).unwrap(),
+                DeviceInitOutcome::dead_with_alarm(
+                    epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                    epics_base_rs::server::record::AlarmSeverity::Invalid,
+                ),
+                "{dtyp}"
+            );
+        }
+    }
+
+    /// Each dset's `drvUserCreate` refusal: devAsynInt32.c:273,
+    /// devBusyAsyn.c:193, devAsynUInt32Digital.c:228, devAsynFloat64.c:187,
+    /// devAsynInt64.c:229 and devAsynOctet.c:616 printf it;
+    /// devAsynXXXArray.cpp:153 and devAsynXXXTimeSeries.h:102 errlog it.
+    #[test]
+    fn a_drv_user_refusal_is_each_dsets_line() {
+        let cases = [
+            (
+                "ai",
+                "asynInt32",
+                "R devAsynInt32::initCommon drvUserCreate m",
+            ),
+            (
+                "busy",
+                "asynInt32",
+                "R devBusyAsyn::initCommon drvUserCreate m",
+            ),
+            (
+                "bi",
+                "asynUInt32Digital",
+                "R devAsynUInt32Digital::initCommon drvUserCreate m",
+            ),
+            (
+                "ai",
+                "asynFloat64",
+                "R devAsynFloat64::initCommon drvUserCreate m",
+            ),
+            (
+                "int64in",
+                "asynInt64",
+                "R devAsynInt64::initCommon drvUserCreate m",
+            ),
+            (
+                "stringin",
+                "asynOctetRead",
+                "R devAsynOctet::initDrvUser drvUserCreate failed m",
+            ),
+            (
+                "waveform",
+                "asynInt8ArrayIn",
+                "devAsynXXXArray::devAsynXXXArray, R drvUserCreate failed m",
+            ),
+            (
+                "waveform",
+                "asynFloat64TimeSeries",
+                "devAsynFloat64TimeSeries::initCommon, R drvUserCreate failed m",
+            ),
+        ];
+        for (record_type, dtyp, want) in cases {
+            let dset = Dset::of(record_type, dtyp);
+            let (line, errlog) = dset.refusal_line("R", &LinkRefusal::DrvUser("m".into()));
+            assert_eq!(line, want, "{dtyp}");
+            assert_eq!(errlog, matches!(dset, Dset::Array | Dset::TimeSeries(_)));
+        }
+        assert_eq!(drv_user_message(&AsynError::ParamNotFound("X".into())), "");
+    }
+
+    /// devAsynXXXTimeSeries.h:118-120: the `bad:` arm a failed `drvUserCreate`
+    /// takes raises no alarm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_series_with_a_missing_parameter_dies_without_an_alarm() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::new()), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "du_ts".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("du_ts", handle, &crate::registry::open_owner()).unwrap();
+        let ctx = DeviceSupportContext {
+            record_type: "waveform",
+            dtyp: "asynInt32TimeSeries",
+            inp: "@asyn(du_ts,0)NOPE",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+        dev.set_record_info("DU:TS", ScanType::Passive);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        assert_eq!(dev.init(&mut rec).unwrap(), DeviceInitOutcome::dead());
+    }
+
+    /// devAsynXXXTimeSeries.h:73-77: an FTVL that is not the interface's
+    /// type errlogs C's line and dies without an alarm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_series_with_the_wrong_ftvl_errlogs_cs_line() {
+        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::new()), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "du_ftvl".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("du_ftvl", handle, &crate::registry::open_owner())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+
+        let ctx = DeviceSupportContext {
+            record_type: "waveform",
+            dtyp: "asynInt32TimeSeries",
+            inp: "@asyn(du_ftvl,0)VAL",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+        dev.set_record_info("DU:FTVL", ScanType::Passive);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Double);
+        assert_eq!(dev.init(&mut rec).unwrap(), DeviceInitOutcome::dead());
+        errlog_flush();
+        let line = "devAsynInt32TimeSeries::initCommon, DU:FTVL field type must be \
+                    SIGNED_TYPE or UNSIGNED_TYPE";
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|m| m.trim_end() == line), "{seen:?}");
+    }
+
+    /// devAsynXXXTimeSeries.h:73-77 checks FTVL before it parses the link,
+    /// connects or calls `drvUserCreate`: a bad FTVL prints only its line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_time_series_checks_ftvl_before_the_link() {
+        use epics_base_rs::runtime::log::{errlog_add_listener, errlog_flush};
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(TestPort::new()), rx);
+        let actor_link = actor.link();
+        std::thread::spawn(actor.registered());
+        let handle = PortHandle::new(
+            tx,
+            "du_order".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        crate::asyn_record::register_port("du_order", handle, &crate::registry::open_owner())
+            .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        errlog_add_listener(move |m: &str| sink.lock().unwrap().push(m.to_string()));
+
+        let cases = [
+            ("DU:ORD_PARAM", "@asyn(du_order,0)NOPE"),
+            ("DU:ORD_PORT", "@asyn(NOPORT_ORDER,0)VAL"),
+        ];
+        for (name, inp) in cases {
+            let ctx = DeviceSupportContext {
+                record_type: "waveform",
+                dtyp: "asynFloat64TimeSeries",
+                inp,
+                out: "",
+            };
+            let mut dev = universal_asyn_factory(&ctx).expect("the dset binds");
+            dev.set_record_info(name, ScanType::Passive);
+            let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+            assert_eq!(dev.init(&mut rec).unwrap(), DeviceInitOutcome::dead());
+        }
+        errlog_flush();
+        let seen = seen.lock().unwrap();
+        for (name, _) in cases {
+            let ours: Vec<_> = seen.iter().filter(|m| m.contains(name)).collect();
+            let line = format!(
+                "devAsynFloat64TimeSeries::initCommon, {name} field type must be \
+                 SIGNED_TYPE or UNSIGNED_TYPE"
+            );
+            assert_eq!(
+                ours.iter().map(|m| m.trim_end()).collect::<Vec<_>>(),
+                [line.as_str()],
+                "{seen:?}"
+            );
+        }
     }
 
     /// A link naming a port no one created: the dset still binds, as C's
@@ -5497,17 +5832,14 @@ mod tests {
             ),
         ];
         for (record_type, dtyp, inp, prefix) in cases {
-            let dset = LinkDset::of(record_type, dtyp);
+            let dset = Dset::of(record_type, dtyp);
             let (line, errlog) = dset.refusal_line("R", &LinkRefusal::NoPort("NOPORT_X".into()));
             assert_eq!(
                 line,
                 format!("{prefix} connectDevice failed {no_port}"),
                 "{dtyp}"
             );
-            assert_eq!(
-                errlog,
-                matches!(dset, LinkDset::Array | LinkDset::TimeSeries(_))
-            );
+            assert_eq!(errlog, matches!(dset, Dset::Array | Dset::TimeSeries(_)));
 
             let ctx = DeviceSupportContext {
                 record_type,

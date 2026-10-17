@@ -71,7 +71,7 @@
 //!   reuse group and SEARCHes are load-balanced away. A successful UDP bind is
 //!   therefore not proof of exclusive ownership; `pvxlist` is.
 //! * The GUID is not a configuration field the caller fills in.
-//!   [`driver::bind`](epics_pva_rs::server_native::driver::bind) stamps it from
+//!   [`BoundPva::attach`](epics_pva_rs::server_native::serving::BoundPva::attach) stamps it from
 //!   [`random_guid`](epics_pva_rs::server_native::search_engine::random_guid)
 //!   at construction, so there is no window in which this binary could
 //!   advertise the all-zero GUID a freshly-`Default`ed [`PvaServerConfig`](epics_pva_rs::server_native::config::PvaServerConfig)
@@ -1351,7 +1351,7 @@ mod tests {
 
     /// The server config comes from the constructor that fills the GUID.
     ///
-    /// `driver::bind` stamps the GUID from `random_guid`; a config
+    /// `BoundPva::attach` stamps the GUID from `random_guid`; a config
     /// assembled field-by-field from `PvaServerConfig::default()` without
     /// `with_env` — or a struct literal — ships the all-zero GUID, which
     /// degrades silently on every consumer rather than failing.

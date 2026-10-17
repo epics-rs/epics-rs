@@ -63,9 +63,11 @@ pub const SSCAN_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
 pub const SSCAN_DBD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dbd");
 
 /// Hand sscan's generated `.dbd` to base, C's `dbLoadDatabase` of
-/// `sscanSupport.dbd`: its record types and menus. Idempotent.
+/// `sscanSupport.dbd`: its record types and menus, and its
+/// `registrar(saveDataRegistrar)`. Idempotent.
 pub fn register_sscan_dbd() {
     epics_base_rs::server::record::register_contributed_dbd(&records::dbd_generated::DBD);
+    save_data::task::register_save_data();
 }
 
 /// The sscan record type factory, for `IocBuilder::register_record_type`;

@@ -11813,17 +11813,23 @@ impl RecordInstance {
         // handled by the full process_record_with_links() path in processing.rs
         // — save the `PutAfterEpilogue`s, applied after `monitor()` below.
         //
-        // It must still apply the `PutInLinkStage` stores. There are no link
-        // writes here for them to be ordered against, so they apply now; what
+        // It must still apply the `PutInLinkStage` stores and `Trace`s. There
+        // are no link writes here for them to be ordered against, so they
+        // apply now; what
         // is NOT optional is applying them at all — a record that hands its
         // completion-flag clear to the framework (sseq's `busy`) would
         // otherwise stay busy forever on this path.
         let after_epilogue = outcome.actions;
         for action in &after_epilogue {
-            if let crate::server::record::ProcessAction::PutInLinkStage { field, value, post } =
-                *action
-            {
-                self.put_in_link_stage(field, value, post);
+            match *action {
+                crate::server::record::ProcessAction::PutInLinkStage { field, value, post } => {
+                    self.put_in_link_stage(field, value, post);
+                }
+                crate::server::record::ProcessAction::Trace { prefix, suffix } => {
+                    let name = String::from_utf8_lossy(self.name.as_bytes());
+                    println!("{prefix}{name}{suffix}");
+                }
+                _ => {}
             }
         }
 

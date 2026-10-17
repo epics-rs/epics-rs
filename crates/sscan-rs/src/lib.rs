@@ -63,23 +63,23 @@ pub const SSCAN_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
 pub const SSCAN_DBD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dbd");
 
 /// Hand sscan's generated `.dbd` to base, C's `dbLoadDatabase` of
-/// `sscanSupport.dbd`: its record types and menus, and its
-/// `registrar(saveDataRegistrar)`. Idempotent.
+/// `sscanSupport.dbd`: its record types, menus, the iocsh variables it
+/// declares and its `registrar(saveDataRegistrar)`. Idempotent.
 pub fn register_sscan_dbd() {
     epics_base_rs::server::record::register_contributed_dbd(&records::dbd_generated::DBD);
-    save_data::task::register_save_data();
-}
-
-/// The sscan record type factory, for `IocBuilder::register_record_type`;
-/// also registers the record's iocsh variables.
-pub fn sscan_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
-    register_sscan_dbd();
     for def in records::sscan::iocsh_vars()
         .into_iter()
+        .chain(records::scanparm::iocsh_vars())
         .chain(rec_dyn_link::iocsh_vars())
     {
         epics_base_rs::server::iocsh::vars::register_variable(def);
     }
+    save_data::task::register_save_data();
+}
+
+/// The sscan record type factory, for `IocBuilder::register_record_type`.
+pub fn sscan_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
+    register_sscan_dbd();
     (
         "sscan",
         Box::new(|| Box::new(records::sscan::SscanRecord::default())),

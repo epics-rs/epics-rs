@@ -8602,6 +8602,9 @@ impl PvDatabase {
                 ProcessAction::PutInLinkStage { field, value, post } => {
                     rec.write().put_in_link_stage(field, value, post);
                 }
+                ProcessAction::Trace { prefix, suffix } => {
+                    println!("{prefix}{}{suffix}", String::from_utf8_lossy(record_name));
+                }
             }
         }
         ControlFlow::Continue(())
@@ -11536,6 +11539,7 @@ fn runs_in_link_stage(a: &crate::server::record::ProcessAction) -> bool {
             | crate::server::record::ProcessAction::GetLink { .. }
             | crate::server::record::ProcessAction::ReadDbLink { .. }
             | crate::server::record::ProcessAction::PutInLinkStage { .. }
+            | crate::server::record::ProcessAction::Trace { .. }
     )
 }
 

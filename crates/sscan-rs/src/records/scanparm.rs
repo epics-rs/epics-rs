@@ -5,15 +5,37 @@
 //! `P1SP`, `OSC` to `EXSC`, ...). IACT reads the sscan's BUSY so a running
 //! scan is never re-loaded; IMP reads its MPTS to clamp NP.
 
+use std::sync::atomic::{AtomicI32, Ordering};
+
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
     ConstantInitLink, CycleHooks, CycleMarks, CyclePostMask, CycleValue, DeclaredFields, FieldDesc,
     FieldIx, FieldMetadataOverride, InputLinkRequest, LinkRead, LinkReadAs, PostStage,
     ProcessAction, ProcessActions, ProcessOutcome, ProcessStatusRule, Record, ReturnPact,
     StampPoint,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, RecordName};
+
+/// iocsh `scanparmRecordDebug`: non-zero prints `process()`'s three traces.
+pub static SCANPARM_RECORD_DEBUG: AtomicI32 = AtomicI32::new(0);
+
+/// The iocsh variable `sscanSupport.dbd` declares for the record.
+pub(crate) fn iocsh_vars() -> Vec<epics_base_rs::server::iocsh::vars::VarDef> {
+    use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
+    vec![VarDef {
+        name: "scanparmRecordDebug",
+        access: VarAccess::Int {
+            get: || i64::from(SCANPARM_RECORD_DEBUG.load(Ordering::Relaxed)),
+            set: |v| SCANPARM_RECORD_DEBUG.store(v as i32, Ordering::Relaxed),
+        },
+    }]
+}
+
+fn debug() -> bool {
+    SCANPARM_RECORD_DEBUG.load(Ordering::Relaxed) != 0
+}
 
 /// C `#define VERSION 3.0`, stored into VERS by `init_record` pass 0
 /// (`scanparmRecord.c:117-120`).
@@ -99,6 +121,8 @@ pub struct ScanparmRecord {
     /// Both of `process()`'s `dbGetLink`s succeeded this cycle; C returns
     /// their status ahead of everything else when either fails (`:136-142`).
     reads_ok: bool,
+    /// `prec->name`, for the debug traces.
+    name: String,
     process_posts: u128,
     monitor_posts: u128,
 }
@@ -253,6 +277,14 @@ impl Record for ScanparmRecord {
                 _ => self.mp = long(link_field, v).unwrap_or(self.mp),
             }
         }
+        // C prints ACT only past its status check and MP ahead of it
+        // (`scanparmRecord.c:137-146`).
+        if debug() && link_field == "IACT" && ok {
+            println!("scanparm({}):process:act={}", self.name, self.act);
+        }
+        if debug() && link_field == "IMP" {
+            println!("scanparm({}):process:mp={}", self.name, self.mp);
+        }
         if link_field == "IACT" && ok {
             return ProcessActions::from(vec![ProcessAction::GetLink { link_field: "IMP" }]);
         }
@@ -281,6 +313,13 @@ impl Record for ScanparmRecord {
         if self.act == 0 && (self.load != 0 || self.go != 0) {
             self.put_group(&mut actions, &LOAD_LINKS);
             if self.go != 0 {
+                // After the LOAD group, so a group that returns skips it (:206-211).
+                if debug() {
+                    actions.push(ProcessAction::Trace {
+                        prefix: "scanparm(",
+                        suffix: "):process:starting scan",
+                    });
+                }
                 self.put_group(&mut actions, &GO_LINKS);
             }
         }
@@ -315,6 +354,10 @@ impl Record for ScanparmRecord {
 
     /// `return(status)` (:271) is the last of the OGO and OLOAD puts
     /// (:250-258); a returning group put leaves through its own action.
+    fn set_async_context(&mut self, name: RecordName, _db: AsyncDbHandle) {
+        self.name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+    }
+
     fn process_status_rule(&self) -> ProcessStatusRule {
         ProcessStatusRule::ZERO.with_status_links(&["OGO", "OLOAD"])
     }

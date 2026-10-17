@@ -2312,6 +2312,15 @@ pub enum ProcessAction {
         value: CycleValue,
         post: PostStage,
     },
+
+    /// Print `prefix`, the record's name and `suffix` as one stdout line at
+    /// this place among the cycle's link writes: a C debug `printf` between
+    /// two `dbPutLink` groups, which a group that returns ahead of it never
+    /// reaches (scanparm's "starting scan", `scanparmRecord.c:206-211`).
+    Trace {
+        prefix: &'static str,
+        suffix: &'static str,
+    },
 }
 
 /// PACT where a C `process()` returns a failed put's status

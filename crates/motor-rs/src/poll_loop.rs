@@ -1219,7 +1219,8 @@ fn c_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
     let (function, value) = match *cmd {
         MotorCommand::MoveRelative { distance, .. } => (c::MOVE_REL, Float64(distance)),
         MotorCommand::MoveAbsolute { position, .. } => (c::MOVE_ABS, Float64(position)),
-        MotorCommand::MoveVelocity { velocity, .. } => (c::MOVE_VEL, Float64(velocity)),
+        MotorCommand::MoveVelocity { velocity, .. }
+        | MotorCommand::JogVelocity { velocity, .. } => (c::MOVE_VEL, Float64(velocity)),
         MotorCommand::Home { forward, .. } => (c::HOME, Float64(f64::from(u8::from(forward)))),
         // devMotorAsyn's STOP_AXIS leaves `ivalue` at 0.
         MotorCommand::Stop { .. } => (c::STOP, Int32(0)),
@@ -1281,7 +1282,7 @@ fn drv_motor_asyn_reason(cmd: &MotorCommand) -> Option<i32> {
         MotorCommand::SetAccel { .. } => 102,
         MotorCommand::MoveRelative { .. } => 103,
         MotorCommand::MoveAbsolute { .. } => 104,
-        MotorCommand::MoveVelocity { .. } => 105,
+        MotorCommand::MoveVelocity { .. } | MotorCommand::JogVelocity { .. } => 105,
         MotorCommand::Home { .. } => 106,
         MotorCommand::Stop { .. } => 107,
         MotorCommand::Poll => 109,
@@ -1382,7 +1383,7 @@ fn dev_motor_asyn_command(cmd: &MotorCommand) -> Option<i32> {
     Some(match *cmd {
         MotorCommand::MoveAbsolute { .. } => 0,
         MotorCommand::MoveRelative { .. } => 1,
-        MotorCommand::MoveVelocity { .. } => 2,
+        MotorCommand::MoveVelocity { .. } | MotorCommand::JogVelocity { .. } => 2,
         MotorCommand::Home { .. } => 3,
         MotorCommand::Stop { .. } => 4,
         MotorCommand::SetVelocity { .. } => 5,
@@ -1439,9 +1440,8 @@ impl MotorAsynMessage {
 /// The motorRecord `build_trans` calls (motor_cmnd, value) behind a record's
 /// `cmd`, the last one the call that queues it. A move is its MOVE_ABS,
 /// MOVE_REL or HOME_FOR/HOME_REV and then GO; HOME's value is `hpos = 0`
-/// (motorRecord.cc:2048). A velocity move is JOG from do_work (:2142) and
-/// JOG_VELOCITY from special's JVEL retune (:3069), the one site with pact 0.
-fn build_trans_calls(cmd: &MotorCommand, pact: bool) -> Vec<(i32, f64)> {
+/// (motorRecord.cc:2048).
+fn build_trans_calls(cmd: &MotorCommand) -> Vec<(i32, f64)> {
     const GO: (i32, f64) = (8, 0.0);
     match *cmd {
         MotorCommand::MoveAbsolute { position, .. } => vec![(0, position), GO],
@@ -1454,7 +1454,8 @@ fn build_trans_calls(cmd: &MotorCommand, pact: bool) -> Vec<(i32, f64)> {
         MotorCommand::SetEncoderRatio { pulses } => vec![(9, pulses[0])],
         MotorCommand::Poll => vec![(10, 0.0)],
         MotorCommand::Stop { .. } => vec![(11, 0.0)],
-        MotorCommand::MoveVelocity { velocity, .. } => vec![(if pact { 12 } else { 21 }, velocity)],
+        MotorCommand::MoveVelocity { velocity, .. } => vec![(12, velocity)],
+        MotorCommand::JogVelocity { velocity, .. } => vec![(21, velocity)],
         MotorCommand::SetPidGain { kind, gain } => vec![(
             match kind {
                 PidGainKind::Proportional => 13,
@@ -1488,7 +1489,7 @@ pub(crate) fn build_trans_flow(
     }
     let reason = trace.update_status_reason();
     for cmd in commands {
-        let calls = build_trans_calls(cmd, pact);
+        let calls = build_trans_calls(cmd);
         for &(motor_cmnd, value) in &calls {
             trace.print(
                 TraceMask::FLOW,
@@ -1693,6 +1694,11 @@ fn execute_commands_after(
                 min_velocity,
                 velocity,
                 acceleration,
+            }
+            | MotorCommand::JogVelocity {
+                min_velocity,
+                velocity,
+                acceleration,
             } => {
                 let r = motor.move_velocity(&user, min_velocity, velocity, acceleration);
                 flow(format_args!(
@@ -1846,6 +1852,7 @@ fn execute_commands_after(
             MotorCommand::MoveAbsolute { .. }
                 | MotorCommand::MoveRelative { .. }
                 | MotorCommand::MoveVelocity { .. }
+                | MotorCommand::JogVelocity { .. }
                 | MotorCommand::Home { .. }
         )
         .then_some(StatusWrite::Done(false));
@@ -2636,14 +2643,19 @@ mod tests {
     }
 
     #[test]
-    fn a_velocity_move_is_jog_in_process_and_jog_velocity_in_special() {
+    fn a_velocity_move_is_jog_and_a_jvel_retune_jog_velocity() {
         let jog = MotorCommand::MoveVelocity {
             min_velocity: 0.0,
             velocity: -3.0,
             acceleration: 1.0,
         };
-        assert_eq!(build_trans_calls(&jog, true), [(12, -3.0)]);
-        assert_eq!(build_trans_calls(&jog, false), [(21, -3.0)]);
+        assert_eq!(build_trans_calls(&jog), [(12, -3.0)]);
+        let retune = MotorCommand::JogVelocity {
+            min_velocity: 0.0,
+            velocity: -3.0,
+            acceleration: 1.0,
+        };
+        assert_eq!(build_trans_calls(&retune), [(21, -3.0)]);
     }
 
     #[test]

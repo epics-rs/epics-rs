@@ -45,6 +45,19 @@ fn make_builder(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorBuilder {
         })
 }
 
+/// A built record is past init_record, as an IOC's is: a put on it is a
+/// runtime put, whose special() HLM sets DHLM (motorRecord.cc:2796-2797).
+#[test]
+fn a_put_on_a_built_record_runs_special() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let mut setup = make_builder(motor).build();
+    setup
+        .record
+        .put_field("HLM", EpicsValue::Double(50.0))
+        .unwrap();
+    assert_eq!(setup.record.limits.dhlm, 50.0);
+}
+
 #[tokio::test]
 async fn test_full_move_via_mailbox() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
@@ -1621,4 +1634,215 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
 
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;
+}
+
+/// C init_record (717-718): set_dial_highlimit sends nothing when the
+/// device refuses the limit, and HLM follows DHLM as the device reset it
+/// (devMM4000.cc:316-336).
+#[tokio::test]
+async fn init_dial_limit_follows_a_refusing_device() {
+    use motor_rs::device_support::{BuildTrans, DialLimitReset, LimitBuild};
+    struct Clamp;
+    impl BuildTrans for Clamp {
+        fn limit(&self, high: bool, raw: f64, mres: f64) -> LimitBuild {
+            if high && raw * mres > 80.0 {
+                LimitBuild::Refused(Some(DialLimitReset::Dhlm(80.0)))
+            } else {
+                LimitBuild::Built
+            }
+        }
+    }
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let setup = make_builder(motor).build_axis();
+    let mut support = setup.axis.with_build_trans(Arc::new(Clamp)).attach();
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.limits.hlm = 100.0;
+    rec.limits.llm = -100.0;
+    support.init(&mut rec).unwrap();
+    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (80.0, 80.0));
+    assert_eq!((rec.limits.dllm, rec.limits.llm), (-100.0, -100.0));
+}
+
+/// motordevCom.cc:327-343: init_record's commands go through the device's
+/// build_trans too, so a device that defers sees them.
+#[tokio::test]
+async fn init_commands_reach_the_device_build_trans() {
+    use motor_rs::device_support::BuildTrans;
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<MotorCommand>>);
+    impl BuildTrans for Seen {
+        fn defers(&self, command: &MotorCommand) -> bool {
+            self.0.lock().unwrap().push(command.clone());
+            false
+        }
+    }
+    let seen = Arc::new(Seen::default());
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let setup = make_builder(motor).build_axis();
+    let mut support = setup.axis.with_build_trans(seen.clone()).attach();
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.conv.mres = 0.001;
+    support.init(&mut rec).unwrap();
+    let seen = seen.0.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|c| matches!(c, MotorCommand::InitEncoderRatio { .. })),
+        "{seen:?}"
+    );
+}
+
+/// motordevCom.cc:327-343: each init command is its own transaction, so a
+/// device deferring INIT ends that one with its own INFO before the encoder
+/// ratio goes out.
+#[tokio::test]
+async fn a_deferred_init_command_ends_its_own_transaction() {
+    use asyn_rs::error::AsynError;
+    use asyn_rs::interfaces::motor::{MotorStatus, PollFailure};
+    use asyn_rs::user::AsynUser;
+    use motor_rs::device_support::BuildTrans;
+    struct DefersInit;
+    impl BuildTrans for DefersInit {
+        fn defers(&self, command: &MotorCommand) -> bool {
+            matches!(command, MotorCommand::Primitive { .. })
+        }
+    }
+    struct Calls(Arc<Mutex<Vec<&'static str>>>);
+    impl AsynMotor for Calls {
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> Result<MotorStatus, AsynError> {
+            self.0.lock().unwrap().push("poll");
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
+            Ok(())
+        }
+        fn set_encoder_ratio(&mut self, _: &AsynUser, _: f64) -> Result<(), AsynError> {
+            self.0.lock().unwrap().push("ratio");
+            Ok(())
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Calls(calls.clone())));
+    let setup = make_builder(motor).build_axis();
+    let mut poll_loop = setup.poll_loop;
+    let mut support = setup.axis.with_build_trans(Arc::new(DefersInit)).attach();
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.put_field("INIT", EpicsValue::String("X".into()))
+        .unwrap();
+    support.init(&mut rec).unwrap();
+    calls.lock().unwrap().clear();
+    poll_loop.run_queued_commands();
+    assert_eq!(*calls.lock().unwrap(), ["poll", "ratio"]);
+}
+
+/// C set_dial_highlimit/lowlimit (4236-4325), run by init_record (717-718),
+/// re-derive HLM/LLM and set RHLM/RLLM to the raw limit they sent whether
+/// or not the device built it.
+#[tokio::test]
+async fn init_dial_limits_always_set_user_and_raw_limits() {
+    use motor_rs::device_support::{BuildTrans, DialLimitReset, LimitBuild};
+    struct Clamp(bool);
+    impl BuildTrans for Clamp {
+        fn limit(&self, high: bool, _: f64, _: f64) -> LimitBuild {
+            if self.0 && high {
+                LimitBuild::Refused(Some(DialLimitReset::Dhlm(80.0)))
+            } else {
+                LimitBuild::Built
+            }
+        }
+    }
+    for refuse in [false, true] {
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+        let setup = make_builder(motor).build_axis();
+        let mut support = setup
+            .axis
+            .with_build_trans(Arc::new(Clamp(refuse)))
+            .attach();
+        let mut rec = motor_rs::MotorRecord::new();
+        rec.conv.mres = 0.001;
+        rec.limits.dhlm = 100.0;
+        rec.limits.dllm = -100.0;
+        support.init(&mut rec).unwrap();
+        let hlm = if refuse { 80.0 } else { 100.0 };
+        assert_eq!((rec.limits.hlm, rec.limits.llm), (hlm, -100.0), "{refuse}");
+        assert_eq!(
+            (rec.limits.rhlm, rec.limits.rllm),
+            (100.0 / 0.001, -100.0 / 0.001),
+            "{refuse}"
+        );
+    }
+}
+
+/// Review probe: a dbLoadRecords HLM is a raw field() write in C; init_record
+/// 717 then re-derives HLM from DHLM (set_dial_highlimit 4255-4258).
+#[tokio::test]
+async fn review_loaded_hlm_yields_to_dhlm_at_init() {
+    use epics_base_rs::server::record::Record;
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let setup = make_builder(motor).build_axis();
+    let mut support = setup.axis.attach();
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(20.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    rec.init_record(1).unwrap();
+    support.init(&mut rec).unwrap();
+    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (20.0, 20.0));
+}
+
+/// Review probe: dbLoadRecords OFF then DIR are raw field() writes in C;
+/// init_record does not recompute OFF.
+#[tokio::test]
+async fn review_loaded_off_survives_loaded_dir() {
+    use epics_base_rs::server::record::Record;
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let setup = make_builder(motor).build_axis();
+    let mut support = setup.axis.attach();
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("OFF", EpicsValue::Double(5.0)).unwrap();
+    rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
+    rec.init_record(1).unwrap();
+    support.init(&mut rec).unwrap();
+    assert_eq!(rec.pos.off, 5.0);
+}
+
+/// Review probe: no device init reaches 717 (C returns at 646-652), so a
+/// loaded HLM stays as loaded even when DIR is loaded after it.
+#[test]
+fn review_loaded_hlm_kept_without_device_init() {
+    use epics_base_rs::server::record::Record;
+    let mut rec = motor_rs::MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(20.0)).unwrap();
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    rec.put_field("DIR", EpicsValue::Short(1)).unwrap();
+    rec.put_field("OFF", EpicsValue::Double(1.0)).unwrap();
+    rec.init_record(1).unwrap();
+    assert_eq!((rec.limits.dhlm, rec.limits.hlm), (20.0, 50.0));
 }

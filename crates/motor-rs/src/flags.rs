@@ -325,6 +325,14 @@ pub enum MotorCommand {
         velocity: f64,
         acceleration: f64,
     },
+    /// C's JOG_VELOCITY: special()'s JVEL retune of a running jog
+    /// (motorRecord.cc:3059-3072). A device runs it as the jog itself
+    /// (devMotorAsyn.c motorMoveVel) but builds it without PREM or POST.
+    JogVelocity {
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    },
     Home {
         forward: bool,
         min_velocity: f64,
@@ -501,6 +509,7 @@ impl MotorCommand {
             Self::MoveAbsolute { .. }
                 | Self::MoveRelative { .. }
                 | Self::MoveVelocity { .. }
+                | Self::JogVelocity { .. }
                 | Self::Home { .. }
                 | Self::SetPosition { .. }
         )
@@ -548,6 +557,11 @@ impl MotorCommand {
             } => (min_velocity, Some(velocity), acceleration),
             // A jog's velocity is its own message's value.
             Self::MoveVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            }
+            | Self::JogVelocity {
                 min_velocity,
                 acceleration,
                 ..
@@ -601,6 +615,11 @@ impl MotorCommand {
                 min_velocity,
                 acceleration,
                 ..
+            }
+            | Self::JogVelocity {
+                min_velocity,
+                acceleration,
+                ..
             } => {
                 *min_velocity = speeds.min_velocity;
                 *acceleration = speeds.acceleration;
@@ -619,6 +638,7 @@ impl MotorCommand {
             Self::MoveAbsolute { .. }
                 | Self::MoveRelative { .. }
                 | Self::MoveVelocity { .. }
+                | Self::JogVelocity { .. }
                 | Self::Home { .. }
                 | Self::Stop { .. }
         )

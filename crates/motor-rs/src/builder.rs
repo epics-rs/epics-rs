@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::interfaces::motor::AsynMotor;
+use epics_base_rs::server::record::Record;
 use tokio::sync::mpsc;
 
 use crate::device_state::AxisSubscribers;
@@ -142,7 +143,9 @@ impl MotorBuilder {
         }
     }
 
-    /// One record bound to a fresh axis.
+    /// One record bound to a fresh axis, past both `init_record` passes as
+    /// an IOC's is: `configure_record` is its load, a later put a runtime
+    /// put through special().
     pub fn build(mut self) -> MotorSetup {
         let configure_record = self.configure_record.take();
         let AxisSetup {
@@ -155,6 +158,10 @@ impl MotorBuilder {
             MotorRecord::new().with_device_state(device_support.device_state().clone());
         if let Some(configure) = configure_record {
             configure(&mut record);
+        }
+        // init_record never fails for a motor record.
+        for pass in [0, 1] {
+            let _ = record.init_record(pass);
         }
         MotorSetup {
             record,

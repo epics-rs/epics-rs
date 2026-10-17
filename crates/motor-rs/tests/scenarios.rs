@@ -29,6 +29,7 @@ fn motion(effects: &ProcessEffects) -> Vec<&MotorCommand> {
 
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = MRES;
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
@@ -1994,4 +1995,154 @@ fn sim_motor_rep_counts_motor_steps_whatever_eres() {
         rec.process_motor_info(&motor.poll(&user).unwrap());
         assert_eq!(rec.pos.rep, 3000, "ERES {eres} then {}", eres * 2.0);
     }
+}
+
+/// A model-1 device that, like devEMC18011 with another motor selected
+/// (devEMC18011.cc:224-231), defers its first `remaining` commands.
+struct DeferringDevice {
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+impl motor_rs::device_support::BuildTrans for DeferringDevice {
+    fn defers(&self, _command: &MotorCommand) -> bool {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
+/// Defers the moves once armed.
+struct DeferringMoves {
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl motor_rs::device_support::BuildTrans for DeferringMoves {
+    fn defers(&self, command: &MotorCommand) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(
+                command,
+                MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+            )
+    }
+}
+
+/// A record whose move to 1.0 ends short at 0.5, with RTRY = 3, on a
+/// device that defers `deferred` of the retry's commands. Returns what the
+/// retry pass queued.
+fn deferred_retry(deferred: usize) -> (MotorRecord, Vec<MotorCommand>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let device = std::sync::Arc::new(DeferringDevice {
+        remaining: AtomicUsize::new(0),
+    });
+    retry_on(device, |d| d.remaining.store(deferred, Ordering::Relaxed))
+}
+
+/// The retry rig on `device`, with `arm` run just before the retry pass.
+fn retry_on<D: motor_rs::device_support::BuildTrans + 'static>(
+    device: std::sync::Arc<D>,
+    arm: impl FnOnce(&D),
+) -> (MotorRecord, Vec<MotorCommand>) {
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+    let mut rec = make_record();
+    rec.retry.rtry = 3;
+    rec.set_device_state(state.clone());
+    let (port, _rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port.with_build_trans(device.clone()));
+    rec.process().unwrap(); // startup
+
+    rec.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
+    rec.process().unwrap();
+    state.lock().unwrap().pending_actions.take();
+    state.lock().unwrap().latest_status = Some(StampedStatus {
+        seq: 2,
+        status: MotorStatus {
+            position: 0.2 / MRES,
+            encoder_position: 0.2 / MRES,
+            done: false,
+            moving: true,
+            ..Default::default()
+        },
+    });
+    rec.process().unwrap();
+    state.lock().unwrap().pending_actions.take();
+
+    arm(&device);
+    state.lock().unwrap().latest_status = Some(idle_status_at(3, 0.5));
+    rec.process().unwrap();
+    let commands = state
+        .lock()
+        .unwrap()
+        .pending_actions
+        .take()
+        .map(|a| a.commands)
+        .unwrap_or_default();
+    (rec, commands)
+}
+
+#[test]
+fn retry_deferred_by_the_device_is_not_counted() {
+    // devEMC18011.cc:224-231: every command of the retry defers, so
+    // build_trans takes back the count maybeRetry made (rcnt-- per call,
+    // floored at 0) and the transaction goes out as INFO, which sends no
+    // message (motordrvCom.cc:441).
+    let (rec, commands) = deferred_retry(usize::MAX);
+    assert_eq!(commands, [MotorCommand::Poll]);
+    assert_eq!(rec.retry.rcnt, 0);
+    assert!(!rec.retry.miss);
+}
+
+#[test]
+fn retry_partly_deferred_sends_the_rest() {
+    // The device selects this motor at the second command: the first
+    // defers and is dropped, the rest go out and the retry is uncounted.
+    let (_, mut all) = deferred_retry(0);
+    all.retain(|c| !matches!(c, MotorCommand::SetVelocity { .. }));
+    let (rec, commands) = deferred_retry(1);
+    assert_eq!(commands, all);
+    assert_eq!(rec.retry.rcnt, 0);
+}
+
+#[test]
+fn retry_not_deferred_counts() {
+    let (rec, commands) = deferred_retry(0);
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{commands:?}"
+    );
+    assert_eq!(rec.retry.rcnt, 1);
+}
+
+#[test]
+fn retry_last_deferred_keeps_the_built_commands() {
+    // devEMC18011.cc:405-414: each built command is sent by its own
+    // motor_end_trans_com; a deferred last command leaves only an INFO
+    // node behind it (motordrvCom.cc:441). With no move built, nothing
+    // carries the move's record fields or direction.
+    let (_, all) = deferred_retry(0);
+    let device = std::sync::Arc::new(DeferringMoves {
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (_, commands) = retry_on(device, |d| {
+        d.armed.store(true, std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut expect: Vec<MotorCommand> = all
+        .into_iter()
+        .filter(|c| {
+            !matches!(
+                c,
+                MotorCommand::MoveAbsolute { .. }
+                    | MotorCommand::MoveRelative { .. }
+                    | MotorCommand::RecordFields(_)
+                    | MotorCommand::MoveDirection { .. }
+            )
+        })
+        .collect();
+    expect.push(MotorCommand::Poll);
+    assert_eq!(commands, expect);
 }

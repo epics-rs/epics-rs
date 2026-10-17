@@ -872,3 +872,32 @@ record(motor, "A:m1") { field(DTYP, "asynMotor") field(OUT, "@asyn(MVAL1,0)") fi
     assert_eq!(field(&db, "A:m1.DMOV"), EpicsValue::Short(0));
     assert_eq!(field(&db, "A:m1.STAT"), EpicsValue::Short(0), "reset");
 }
+
+/// motorRecord.cc:648-651 returns before set_dial_highlimit/lowlimit
+/// (717-718): a failed dset init keeps the raw limits
+/// check_speed_and_resolution seeded with |MRES| (3993-4017). The
+/// devMotorAsyn `bad:` arm returns 0, so that record gets 717-718's signed
+/// ones.
+#[tokio::test]
+async fn only_a_record_past_dset_init_resets_its_limits() {
+    let limits = r#"field(MRES, "-1") field(DHLM, "10") field(DLLM, "-10")"#;
+    let db = boot(&format!(
+        r##"
+record(motor, "L:failed") {{ field(DTYP, "TestModel1") field(OUT, "#C9 S0 @") {limits} }}
+record(motor, "L:bad") {{ field(DTYP, "asynMotor") field(OUT, "@NEVER_CREATED") {limits} }}
+"##
+    ))
+    .await;
+    let limits = |pv: &str, fields: &[&str]| -> Vec<EpicsValue> {
+        fields
+            .iter()
+            .map(|f| field(&db, &format!("{pv}.{f}")))
+            .collect()
+    };
+    let d = EpicsValue::Double;
+    assert_eq!(limits("L:failed", &["RHLM", "RLLM"]), [d(-10.0), d(10.0)]);
+    assert_eq!(
+        limits("L:bad", &["HLM", "LLM", "RHLM", "RLLM"]),
+        [d(10.0), d(-10.0), d(10.0), d(-10.0)]
+    );
+}

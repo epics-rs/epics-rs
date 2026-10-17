@@ -94,7 +94,9 @@ impl MotorRecord {
         });
 
         DeviceActions {
-            commands: self.transaction(effects.commands.clone()),
+            commands: self
+                .transaction(effects.commands.clone())
+                .unwrap_or_default(),
             force_poll: effects.request_poll,
             schedule_delay,
         }

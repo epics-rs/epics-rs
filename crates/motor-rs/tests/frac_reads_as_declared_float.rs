@@ -8,6 +8,8 @@ use motor_rs::record::MotorRecord;
 #[test]
 fn frac_reads_as_declared_float() {
     let mut rec = MotorRecord::default();
+    // A runtime put: C special() clamps FRAC (motorRecord.cc:2816-2829).
+    rec.internal.init_invariants_synced = true;
     assert_eq!(rec.get_field("FRAC"), Some(EpicsValue::Float(1.0)));
     rec.put_field("FRAC", EpicsValue::Double(0.3)).unwrap();
     assert_eq!(rec.get_field("FRAC"), Some(EpicsValue::Float(0.3)));

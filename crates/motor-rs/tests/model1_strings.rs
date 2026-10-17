@@ -292,14 +292,15 @@ record(motor, "S:pp") { field(DTYP, "TestStrings") field(OUT, "#C42 S0 @") field
     );
 }
 
-/// motorRecord.cc:3059-3072: a JVEL put retunes a jog through JOG, which
-/// the device builds with PREM as it built the jog itself.
+/// A jog is C's JOG, which the device builds with PREM (devIM483PL.cc:
+/// 191-205); a JVEL put during it is special()'s SET_ACCEL and JOG_VELOCITY
+/// (motorRecord.cc:3059-3072), which carry neither PREM nor POST.
 #[tokio::test]
-async fn a_jog_and_its_jvel_retune_carry_prem() {
+async fn a_jog_carries_prem_and_its_jvel_retune_does_not() {
     let mut rx = axis(43);
     let db = boot(
         r##"
-record(motor, "S:jog") { field(DTYP, "TestStrings") field(OUT, "#C43 S0 @") field(MRES, "1") field(JVEL, "1") field(PREM, "MO") }
+record(motor, "S:jog") { field(DTYP, "TestStrings") field(OUT, "#C43 S0 @") field(MRES, "1") field(JVEL, "1") field(JAR, "4") field(PREM, "MO") field(POST, "MF") }
 "##,
     )
     .await;
@@ -308,17 +309,38 @@ record(motor, "S:jog") { field(DTYP, "TestStrings") field(OUT, "#C43 S0 @") fiel
     db.put_record_field_from_ca("S:jog", "JOGF", EpicsValue::Short(1))
         .await
         .unwrap();
-    db.put_record_field_from_ca("S:jog", "JVEL", EpicsValue::Double(2.0))
-        .await
-        .unwrap();
     let commands = settle(&mut rx).await;
     let jogs = with_previous(&commands, |c| {
         matches!(c, MotorCommand::MoveVelocity { .. })
     });
-    assert_eq!(jogs.len(), 2, "{commands:?}");
-    for (before, _) in jogs {
-        assert_eq!(before, Some(&strings("MO", "")), "{commands:?}");
-    }
+    assert_eq!(jogs.len(), 1, "{commands:?}");
+    assert_eq!(jogs[0].0, Some(&strings("MO", "MF")), "{commands:?}");
+
+    db.put_record_field_from_ca("S:jog", "JVEL", EpicsValue::Double(2.0))
+        .await
+        .unwrap();
+    let commands = settle(&mut rx).await;
+    let sent: Vec<_> = commands
+        .iter()
+        .filter(|c| {
+            !matches!(
+                c,
+                MotorCommand::RecordFields(_) | MotorCommand::MoveDirection { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            &MotorCommand::SetAccel { acceleration: 4.0 },
+            &MotorCommand::JogVelocity {
+                min_velocity: 0.0,
+                velocity: 2.0,
+                acceleration: 4.0,
+            },
+        ],
+        "{commands:?}"
+    );
 }
 
 #[tokio::test]

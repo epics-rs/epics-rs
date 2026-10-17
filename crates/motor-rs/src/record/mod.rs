@@ -15,6 +15,7 @@ use epics_base_rs::types::EpicsValue;
 
 use crate::coordinate;
 use crate::device_state::*;
+use crate::device_support::{DialLimitReset, LimitBuild};
 use crate::fields::*;
 use crate::flags::*;
 
@@ -246,20 +247,107 @@ impl MotorRecord {
         self.port = Some(port);
     }
 
-    /// C `special()`'s `SEND_MSG`: queued at put time, with no process. A
-    /// record with no device support has nowhere to send.
-    pub(crate) fn send_special(&self, commands: Vec<MotorCommand>) {
-        if let Some(port) = &self.port {
-            port.send(self.transaction(commands), false);
+    /// C `special()`'s `build_trans` and `SEND_MSG`: queued at put time,
+    /// with no process. A record with no device support has nowhere to
+    /// send. Returns false when the device refused a command, which sends
+    /// nothing (`if (rtnval == OK) SEND_MSG()`).
+    pub(crate) fn send_special(&mut self, commands: Vec<MotorCommand>) -> bool {
+        if self.port.is_none() {
+            return true;
         }
+        let Some(commands) = self.transaction(commands) else {
+            return false;
+        };
+        if let Some(port) = &self.port {
+            port.send(commands, false);
+        }
+        true
+    }
+
+    /// C `set_dial_highlimit`/`set_dial_lowlimit` (4236-4325): send the
+    /// dial limit, then, built or not, set the raw limit to what was sent
+    /// and the one user limit it maps to (HLM for a high dial limit under
+    /// DIR=Pos, LLM under DIR=Neg) from the dial limit as a refusing device
+    /// may have reset it.
+    pub(crate) fn set_dial_limit(&mut self, high: bool) {
+        let dial = if high {
+            self.limits.dhlm
+        } else {
+            self.limits.dllm
+        };
+        let raw = dial / self.conv.mres;
+        let command = self.dial_limit_command(high, dial);
+        let raw_high = matches!(command, MotorCommand::SetHighLimit { .. });
+        self.send_special(vec![command]);
+        if raw_high {
+            self.limits.rhlm = raw;
+            self.mark(m::RHLM);
+        } else {
+            self.limits.rllm = raw;
+            self.mark(m::RLLM);
+        }
+        let dial = if high {
+            self.limits.dhlm
+        } else {
+            self.limits.dllm
+        };
+        let user = coordinate::dial_to_user(dial, self.conv.dir, self.pos.off);
+        if high == (self.conv.dir == MotorDir::Pos) {
+            self.limits.hlm = user;
+            self.mark(m::HLM);
+        } else {
+            self.limits.llm = user;
+            self.mark(m::LLM);
+        }
+        self.mark(if high { m::DHLM } else { m::DLLM });
+    }
+
+    /// C `build_trans` per command, the one place a device's verdict is
+    /// asked, once per command. A deferred command (devEMC18011.cc:233-240,
+    /// another motor selected) is not built and gives back a retry
+    /// (`if (rcnt > 0) rcnt--`, unmarked), ahead of any limit verdict. The
+    /// built ones still go out (each is sent by its own
+    /// motor_end_trans_com, :405-414), and a last command that deferred
+    /// leaves the node INFO, which sends no message (motordrvCom.cc:441): a
+    /// status query after them. A refused soft limit (devMM4000.cc:316-336)
+    /// may reset one dial limit and makes the call ERROR: `None`.
+    fn build(&mut self, commands: Vec<MotorCommand>) -> Option<Vec<MotorCommand>> {
+        let Some(port) = &self.port else {
+            return Some(commands);
+        };
+        let mut built = Vec::with_capacity(commands.len());
+        let mut last_deferred = false;
+        for command in commands {
+            last_deferred = port.defers(&command);
+            if last_deferred {
+                self.retry.rcnt = (self.retry.rcnt - 1).max(0);
+                continue;
+            }
+            if let LimitBuild::Refused(reset) = port.build_limit(&command, self.conv.mres) {
+                match reset {
+                    Some(DialLimitReset::Dhlm(dial)) => self.limits.dhlm = dial,
+                    Some(DialLimitReset::Dllm(dial)) => self.limits.dllm = dial,
+                    None => {}
+                }
+                return None;
+            }
+            built.push(command);
+        }
+        if last_deferred {
+            built.push(MotorCommand::Poll);
+        }
+        Some(built)
     }
 
     /// `commands` as C `build_trans` builds them from the record: led by
     /// the record's fields, which a device reads at any of them, and each move
     /// preceded by the record's CDIR and by the PREM and POST it reads
-    /// (devIM483PL.cc:191-205), when either is set. A record's process and
-    /// `special()` puts both send through it.
-    pub(crate) fn transaction(&self, commands: Vec<MotorCommand>) -> Vec<MotorCommand> {
+    /// (devIM483PL.cc:191-205), when either is set; JOG_VELOCITY reads
+    /// neither. A record's init, process
+    /// and `special()` puts all send through it. `None` is a refusal
+    /// ([`build`](Self::build)): nothing to send.
+    pub(crate) fn transaction(&mut self, commands: Vec<MotorCommand>) -> Option<Vec<MotorCommand>> {
+        let commands = self.build(commands)?;
         let prem = &self.links.prem;
         // C `if (strlen(mr->post) != 0) postmsgptr = &mr->post`: the field,
         // not its text, so the device sends what POST holds when it is done.
@@ -270,11 +358,12 @@ impl MotorRecord {
                 MotorCommand::MoveAbsolute { .. }
                     | MotorCommand::MoveRelative { .. }
                     | MotorCommand::MoveVelocity { .. }
+                    | MotorCommand::JogVelocity { .. }
                     | MotorCommand::Home { .. }
             )
         };
         if !commands.iter().any(built) {
-            return commands;
+            return Some(commands);
         }
         let strings = !prem.is_empty() || post.is_some();
         let mut out = Vec::with_capacity(commands.len() + 3);
@@ -287,7 +376,7 @@ impl MotorRecord {
                 out.push(MotorCommand::MoveDirection {
                     forward: self.stat.cdir,
                 });
-                if strings {
+                if strings && !matches!(command, MotorCommand::JogVelocity { .. }) {
                     out.push(MotorCommand::MoveStrings {
                         prem: prem.clone(),
                         post: post.clone(),
@@ -296,7 +385,7 @@ impl MotorRecord {
             }
             out.push(command);
         }
-        out
+        Some(out)
     }
 
     /// C `init_record` ran to its closing `monitor()`: devMotorAsyn's
@@ -981,12 +1070,14 @@ mod tests {
     fn test_stup_processes_after_put_only_when_on() {
         // STUP == ON -> reprocess.
         let mut on = MotorRecord::new();
+        on.internal.init_invariants_synced = true;
         on.put_field("STUP", EpicsValue::Short(1)).unwrap();
         assert_eq!(on.stat.stup, 1);
         assert!(on.processes_after_put("STUP", true));
 
         // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
         let mut off = MotorRecord::new();
+        off.internal.init_invariants_synced = true;
         off.put_field("STUP", EpicsValue::Short(2)).unwrap();
         assert_eq!(off.stat.stup, 0);
         assert!(!off.processes_after_put("STUP", true));

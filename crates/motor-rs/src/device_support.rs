@@ -5,7 +5,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::runtime::task::{CallbackPriority, sleep_background, spawn_background};
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::types::PvString;
 use tokio::sync::mpsc;
 
 use crate::device_state::*;
@@ -24,6 +24,39 @@ pub trait AxisReport: Send + Sync {
     fn report(&self, out: &mut dyn std::fmt::Write, level: i32);
 }
 
+/// A model-1 device's C `build_trans` return, which it decides from its
+/// own state while the record builds the transaction: no controller
+/// reply, and without the driver's lock, which a poller may hold.
+pub trait BuildTrans: Send + Sync {
+    /// SET_HIGH_LIMIT (`high`) or SET_LOW_LIMIT at `raw` (dial / MRES).
+    fn limit(&self, _high: bool, _raw: f64, _mres: f64) -> LimitBuild {
+        LimitBuild::Built
+    }
+
+    /// OK with nothing built (devEMC18011.cc:224-231, another motor
+    /// selected): the record does not count it against RTRY.
+    fn defers(&self, _command: &MotorCommand) -> bool {
+        false
+    }
+}
+
+/// C `build_trans`'s return on a soft-limit command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LimitBuild {
+    /// OK: the record sends it.
+    Built,
+    /// ERROR: nothing is sent, and the device may have reset one of the
+    /// record's dial limits to the controller's (devMM4000.cc:316-336).
+    Refused(Option<DialLimitReset>),
+}
+
+/// The record dial limit a refusing device wrote, C `mr->dhlm` / `mr->dllm`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DialLimitReset {
+    Dhlm(f64),
+    Dllm(f64),
+}
+
 /// One axis as its create command registers it: the poller's queues and the
 /// records bound to it. Each record binding gets its own
 /// [`MotorDeviceSupport`] from [`Self::attach`], as each C devMotorAsyn
@@ -38,6 +71,7 @@ pub struct MotorAxis {
     /// The model-2 parameter library its poller keeps.
     params: Model2Params,
     report: Option<Arc<dyn AxisReport>>,
+    build_trans: Option<Arc<dyn BuildTrans>>,
     /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
     disables_ntm: bool,
 }
@@ -59,6 +93,7 @@ impl MotorAxis {
             subscribers,
             params: Model2Params::default(),
             report: None,
+            build_trans: None,
             disables_ntm: false,
         }
     }
@@ -79,6 +114,7 @@ impl MotorAxis {
             subscribers: self.subscribers.clone(),
             params: self.params.clone(),
             report: self.report.clone(),
+            build_trans: self.build_trans.clone(),
             disables_ntm: self.disables_ntm,
         }
     }
@@ -91,6 +127,12 @@ impl MotorAxis {
     /// The driver's [`AxisReport`], C's `asynMotorAxis::report` override.
     pub fn with_report(mut self, report: Arc<dyn AxisReport>) -> Self {
         self.report = Some(report);
+        self
+    }
+
+    /// The device's [`BuildTrans`]; an axis with none builds everything.
+    pub fn with_build_trans(mut self, build_trans: Arc<dyn BuildTrans>) -> Self {
+        self.build_trans = Some(build_trans);
         self
     }
 
@@ -153,6 +195,7 @@ impl MotorAxis {
             (io_intr_tx, io_intr_rx),
         );
         support.disables_ntm = self.disables_ntm;
+        support.port.build_trans = self.build_trans.clone();
         support
     }
 }
@@ -181,6 +224,7 @@ pub struct CommandPort {
     /// The record's `PRIO` band, C's `callbackSetPriority(pmr->prio, ...)`
     /// for the settle delay (motorRecord.cc:634); LOW is PRIO's default.
     prio: CallbackPriority,
+    build_trans: Option<Arc<dyn BuildTrans>>,
 }
 
 impl std::fmt::Debug for CommandPort {
@@ -250,6 +294,7 @@ impl MotorDeviceSupport {
                 device_state,
                 io_intr_tx,
                 prio: CallbackPriority::Low,
+                build_trans: None,
             },
             _timeout: timeout,
             io_intr_rx: Some(io_intr_rx),
@@ -313,8 +358,34 @@ impl CommandPort {
             device_state: new_shared_state(),
             io_intr_tx: mpsc::channel(1).0,
             prio: CallbackPriority::Low,
+            build_trans: None,
         };
         (port, motor_cmd_rx)
+    }
+
+    /// This port with `build_trans` as its device's.
+    pub fn with_build_trans(mut self, build_trans: Arc<dyn BuildTrans>) -> Self {
+        self.build_trans = Some(build_trans);
+        self
+    }
+
+    /// C `build_trans` on a soft-limit `command`; a port with no device
+    /// verdict builds it.
+    pub(crate) fn build_limit(&self, command: &MotorCommand, mres: f64) -> LimitBuild {
+        let (high, raw) = match *command {
+            MotorCommand::SetHighLimit { position } => (true, position),
+            MotorCommand::SetLowLimit { position } => (false, position),
+            _ => return LimitBuild::Built,
+        };
+        match &self.build_trans {
+            Some(device) => device.limit(high, raw, mres),
+            None => LimitBuild::Built,
+        }
+    }
+
+    /// Whether the device defers `command`; a port with no device builds it.
+    pub(crate) fn defers(&self, command: &MotorCommand) -> bool {
+        self.build_trans.as_ref().is_some_and(|d| d.defers(command))
     }
 
     /// Queue `commands` on the poller thread, or refuse them as the port
@@ -467,41 +538,30 @@ impl DeviceSupport for MotorDeviceSupport {
 
         // C init_record: the dset's init_controller, then
         // process_motor_info(initcall) and the drive sync, all before any
-        // process.
-        let anchor = record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-            .map(|rec| rec.initial_readback(&status));
-        if let Some(effects) = anchor {
-            self.port.send(effects.commands, false);
-            if effects.request_poll {
-                self.port.send_poll(PollCommand::ForcePoll);
-            }
-        }
-
-        // C init_record 717-718 ("Reset limits in case database values
-        // are invalid"): both dial limits are forwarded to the driver
-        // unconditionally after the initial readback, high first.
-        let dial_limits = record
+        // process. Each of its commands is a transaction of its own
+        // (motordevCom.cc:327-343).
+        let request_poll = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
             .map(|rec| {
-                let read =
-                    |rec: &mut crate::record::MotorRecord, name: &str| match rec.get_field(name) {
-                        Some(EpicsValue::Double(d)) => d,
-                        _ => 0.0,
-                    };
-                let (dhlm, dllm) = (read(rec, "DHLM"), read(rec, "DLLM"));
-                vec![
-                    rec.dial_limit_command(true, dhlm),
-                    rec.dial_limit_command(false, dllm),
-                ]
+                let effects = rec.initial_readback(&status);
+                for command in effects.commands {
+                    rec.send_special(vec![command]);
+                }
+                effects.request_poll
             });
-        if let Some(commands) = dial_limits {
-            // Queued like C's SEND_MSG; non-fatal, as C ignores the
-            // build_trans return, and a refusal prints asynCallback's line
-            // on the poller.
-            self.port.send(commands, false);
+        if request_poll == Some(true) {
+            self.port.send_poll(PollCommand::ForcePoll);
+        }
+
+        // C init_record 717-718 ("Reset limits in case database values
+        // are invalid"): set_dial_highlimit then set_dial_lowlimit.
+        if let Some(rec) = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+        {
+            rec.set_dial_limit(true);
+            rec.set_dial_limit(false);
         }
 
         self.initialized = true;

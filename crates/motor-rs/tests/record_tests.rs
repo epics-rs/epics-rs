@@ -147,6 +147,8 @@ fn test_unknown_field() {
 #[test]
 fn test_hlm_cascades_to_dhlm() {
     let mut rec = MotorRecord::new();
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     assert_eq!(rec.limits.dhlm, 100.0);
@@ -157,6 +159,8 @@ fn test_hlm_cascades_to_dhlm() {
 fn test_dir_neg_limit_mapping() {
     let mut rec = MotorRecord::new();
     rec.conv.dir = MotorDir::Neg;
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     // DIR=Neg: user 100 -> dial -100, user -100 -> dial 100
@@ -219,6 +223,7 @@ fn test_limit_strike_completes_move_and_clears_buttons() {
     // process callback then takes the stopped branch (1301/1345)
     // instead of waiting for RA_DONE.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
     rec.vel.jvel = 2.0;
@@ -434,6 +439,7 @@ fn test_stop_during_move() {
 #[test]
 fn test_jog_start_stop() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.vel.jvel = 1.0;
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
@@ -1172,6 +1178,7 @@ fn test_homf_homr_puts_rejected_while_home_in_flight() {
     // C special() (motorRecord.cc:2610-2614): a HOMF/HOMR put while
     // mip & MIP_HOME returns ERROR — button not written, no processing.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.stat.msta = MstaFlags::DONE;
     assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_ok());
     rec.plan_motion(CommandSource::Homf);
@@ -1193,6 +1200,7 @@ fn test_homf_put_rejected_while_home_queued_behind_stop() {
     // A queued home reads back as MIP_HOMF|MIP_STOP (C 2023-2033),
     // which still intersects MIP_HOME — the 2610-2614 veto applies.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.pos.dval = 50.0;
@@ -2459,6 +2467,7 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
     // back to OFF and does not trigger the protocol; (2615-2617): a put
     // while the previous request is in flight is refused.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     let state = motor_rs::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
@@ -2526,6 +2535,7 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
     // implicit GET_INFO (2546-2557). The refresh comes from the pass,
     // not from gain support.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     let mut rx = capture(&mut rec);
 
@@ -2661,6 +2671,7 @@ fn test_lvio_refused_jog_consumes_pass_no_get_info() {
     // pass is consumed (buttons released, LVIO raised) and never
     // reaches the implicit GET_INFO arm.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.limits.dhlm = 10.0;
     rec.limits.dllm = -10.0;
@@ -2717,6 +2728,7 @@ fn test_put_pass_leaves_injected_device_update_pending() {
     // completion pipeline on the following pass instead of being
     // reduced to a readback apply.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     rec.do_process();
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
@@ -2749,6 +2761,7 @@ fn test_put_pass_leaves_delay_expiry_pending() {
     // the settle watchdog timer is one-shot, so consuming it without
     // acting would leave DELAY_REQ armed forever.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.timing.dly = 0.5;
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
@@ -2958,6 +2971,7 @@ fn test_cnen_put_sends_torque_whatever_the_pass_returns() {
     // lands; the pass that follows may return at the latent-stop branch
     // (1874) and the command is already out.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     rec.ctrl.stop = true;
@@ -2977,6 +2991,7 @@ fn test_cnen_put_sends_torque_whatever_the_pass_returns() {
 #[test]
 fn test_cnen_put_sends_enable_and_disable_with_gain_support() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::GAIN_SUPPORT; // controller supports gain
     rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
@@ -3481,6 +3496,7 @@ fn test_latent_homf_during_move_stops_and_queues_home() {
 #[test]
 fn test_latent_jogf_fires_on_move_block_pass() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -3511,6 +3527,7 @@ fn test_latent_jog_release_stops_jog() {
     // A bare JOGF=0 put (button released) overtaken in last_write must
     // still stop the jog: C's jog-stop section (2148) fires on state.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -3538,6 +3555,7 @@ fn test_latent_jog_release_stops_jog() {
 #[test]
 fn test_latent_release_with_opposite_latched_only_stops() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -3603,6 +3621,7 @@ fn test_latent_home_blocked_by_limit_falls_through_to_val() {
 #[test]
 fn test_held_jog_button_does_not_refire_during_own_jog() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -4798,6 +4817,7 @@ fn test_spmg_go_without_jog_replans_to_dval() {
 #[test]
 fn test_jogr_command_clears_latched_jogf() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -4817,6 +4837,7 @@ fn test_jogr_command_clears_latched_jogf() {
 #[test]
 fn test_jogf_command_clears_latched_jogr() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -4836,6 +4857,8 @@ fn test_jogf_command_clears_latched_jogr() {
 fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
     // C 2087: refuse when val > hlm - jvel — one JVEL of decel margin.
     let mut rec = MotorRecord::new();
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
@@ -4859,6 +4882,8 @@ fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
 fn test_reverse_jog_at_low_limit_is_rejected_and_clears_button() {
     // C 2088: refuse when val < llm + jvel.
     let mut rec = MotorRecord::new();
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
@@ -4877,6 +4902,8 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
     // jog at the user high limit is rejected regardless of DIR.
     let mut rec = MotorRecord::new();
     rec.conv.dir = MotorDir::Neg;
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
@@ -4893,6 +4920,7 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
 #[test]
 fn test_reverse_jog_at_high_limit_is_allowed() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.pos.val = 10.0; // at high limit
@@ -5156,6 +5184,7 @@ fn test_urip_rdbl_error_jog_and_home_dispatch_normally() {
     // move-block rtnstat gate (2418-2453), so both dispatch with the
     // readback link down.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.urip = true;
     rec.set_rdbl_error(true);
     rec.stat.msta = MstaFlags::DONE;
@@ -5235,6 +5264,7 @@ fn test_urip_rdbl_error_stop_clears_latched_buttons() {
     // setting stop=1, releasing any held jog/home button so the halted
     // axis is not re-commanded on the next pass.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.urip = true;
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
     rec.plan_motion(CommandSource::Jogf);
@@ -5288,6 +5318,7 @@ fn test_rdbl_resolution_report_drives_rdbl_error() {
 #[test]
 fn test_dllm_greater_than_dhlm_sets_lvio_immediately() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     // Sequence that produces an inverted dial pair via direct DHLM put.
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(100.0)).unwrap();
@@ -5300,6 +5331,8 @@ fn test_llm_greater_than_hlm_sets_lvio_immediately() {
     let mut rec = MotorRecord::new();
     // Each user-limit write moves one dial limit (C set_user_*limit), so
     // the inverted pair lands in BOTH frames and latches LVIO.
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(100.0)).unwrap();
     assert!(rec.limits.llm > rec.limits.hlm);
@@ -5311,6 +5344,7 @@ fn test_correcting_inverted_limits_clears_lvio_without_poll() {
     // C: 270347df — LVIO must clear when the limit pair becomes valid again,
     // even on an idle axis that is not being polled.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 1.0;
     rec.pos.dval = 0.0; // inside any sane window
     // Create the inverted state.
@@ -5328,6 +5362,7 @@ fn test_correcting_inverted_limits_clears_lvio_without_poll() {
 #[test]
 fn test_correcting_limits_keeps_lvio_when_position_still_outside() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 1.0;
     rec.pos.dval = 500.0; // far outside the corrected window
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
@@ -5607,6 +5642,7 @@ fn test_closed_loop_constant_dol_keeps_buttons_active() {
     // C 1994 requires dol.type == DB_LINK: a constant DOL under closed
     // loop leaves the collection block running.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.links.omsl = 1;
     rec.links.dol = "5.0".into(); // CONSTANT, not a DB link
     rec.stat.msta = MstaFlags::DONE;
@@ -5705,6 +5741,7 @@ fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
     // here the no-event process pass after the OMSL flip — without
     // JOGF being re-written.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.links.omsl = 1;
     rec.links.dol = "setpoint_src.VAL".into();
     rec.stat.msta = MstaFlags::DONE;
@@ -6269,17 +6306,9 @@ fn test_template_load_dhlm_before_mres_preserves_egu_limits() {
         "DLLM={}",
         rec.limits.dllm
     );
-    assert!(
-        (rec.limits.hlm - 100.0).abs() < 1e-9,
-        "HLM={}",
-        rec.limits.hlm
-    );
-    assert!(
-        (rec.limits.llm + 100.0).abs() < 1e-9,
-        "LLM={}",
-        rec.limits.llm
-    );
-    // Raw limits derived from the dial limits at the final MRES.
+    // HLM/LLM follow at device init (717-718; integration
+    // init_dial_limits_always_set_user_and_raw_limits). Raw limits derived
+    // from the dial limits at the final MRES.
     assert!(
         (rec.limits.rhlm - 100_000.0).abs() < 1e-3,
         "RHLM={}",
@@ -6310,10 +6339,9 @@ fn test_rhlm_rllm_registry_read_only() {
 #[test]
 fn test_init_negative_mres_loaded_rllm_drives_dhlm() {
     // C check_speed_and_resolution (3993-4017): under MRES < 0 a loaded
-    // RLLM seeds DHLM through fabs(mres). Then init_record 717-718 runs
-    // set_dial_high/lowlimit, whose SIGNED re-derivation lands
-    // dhlm/mres in the LOW raw register — flipping the sign of the
-    // fabs-seeded raw value (C verbatim quirk).
+    // RLLM seeds DHLM through fabs(mres) and keeps its fabs sign. The
+    // signed re-derivation of 717-718 belongs to the device init after it
+    // (axis_from_out_link only_a_record_past_dset_init_resets_its_limits).
     let mut rec = MotorRecord::new();
     rec.put_field("MRES", EpicsValue::Double(-0.001)).unwrap();
     rec.put_field("RLLM", EpicsValue::Double(50_000.0)).unwrap();
@@ -6325,7 +6353,7 @@ fn test_init_negative_mres_loaded_rllm_drives_dhlm() {
     );
     assert_eq!(rec.limits.dllm, 0.0);
     assert!(
-        (rec.limits.rllm + 50_000.0).abs() < 1e-6,
+        (rec.limits.rllm - 50_000.0).abs() < 1e-6,
         "RLLM={}",
         rec.limits.rllm
     );
@@ -6379,8 +6407,9 @@ fn test_runtime_dial_high_put_under_negative_mres_lands_in_rllm() {
     rec.put_field("MRES", EpicsValue::Double(-1.0)).unwrap();
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     rec.init_record(1).unwrap();
+    // check_speed_and_resolution seeds it with fabs(mres).
     assert!(
-        (rec.limits.rllm + 10.0).abs() < 1e-9,
+        (rec.limits.rllm - 10.0).abs() < 1e-9,
         "RLLM={}",
         rec.limits.rllm
     );
@@ -7304,6 +7333,7 @@ fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     // post-processes (sync) instead of arming a move resume; the
     // still-latched button resumes the JOG on Go (1916-1918).
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.vel.jvel = 1.0;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
@@ -7510,6 +7540,7 @@ fn test_val_written_during_jog_stops_it_and_is_dropped() {
     // exclude a jog stop from the replay, so the written VAL is synced
     // away at the stop completion.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -7539,6 +7570,7 @@ fn test_val_written_during_jog_dropped_on_commanded_stop() {
     // C 1385-1386: MIP_JOG_STOP is excluded from the replay — a release
     // of the jog button drops the mid-jog write via the postProcess sync.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -7570,6 +7602,7 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     // C: MIP_JOG_BL2 passes the replay gate — a VAL written during the
     // jog backlash correction re-fires when BL2 completes.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -7651,6 +7684,8 @@ fn test_sub_step_replay_quiesces_without_loop() {
 /// report the axis moving.
 fn jogging_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     // JVEL has no dbd initial (defaults 0.0 = "not configured"); set it
@@ -7711,6 +7746,7 @@ fn test_jog_away_from_limit_does_not_stop() {
     // jogr near the HIGH limit: the reverse-jog window (rbv < llm + jvel)
     // is not violated, so the jog keeps running.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.pos.rbv = 95.0;
@@ -7970,6 +8006,7 @@ fn test_sudden_jog_stop_skips_backlash() {
     // postProcess's backlash branch requires MIP_JOG_STOP or MIP_MOVE
     // (908) — so no correction fires, the record syncs and finishes.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -7998,6 +8035,7 @@ fn test_commanded_jog_stop_still_corrects_backlash() {
     // Boundary: the commanded release (JogStopping = C MIP_JOG_STOP)
     // keeps the postProcess backlash correction (932-947).
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -8098,6 +8136,7 @@ fn test_hlm_put_while_idle_does_not_stop() {
 /// to DONE via maybeRetry's close-enough branch.
 fn paused_idle_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.ctrl.spmg = SpmgMode::Pause;
@@ -8312,6 +8351,7 @@ fn test_jog_direction_folds_dir_into_dial_command() {
     // dial-negative. CDIR stays raw: jogf, inverted for DIR=Neg and
     // MRES<0 (C 2126-2137).
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
     rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
@@ -8563,6 +8603,7 @@ fn test_pid_gain_clamp_under_gain_support() {
     // C special pidcof (3003-3014): GAIN_SUPPORT clamps the PID gains
     // to [0,1] at write time.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.stat.msta = MstaFlags::GAIN_SUPPORT;
     rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
     rec.put_field("ICOF", EpicsValue::Double(-0.5)).unwrap();
@@ -8588,6 +8629,7 @@ fn test_pid_gain_put_forwards_driver_command() {
     // put builds SET_PGAIN/SET_IGAIN/SET_DGAIN with the CLAMPED value
     // and sends it from special(), with no process.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     let mut rx = capture(&mut rec);
     rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
     rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
@@ -8683,6 +8725,176 @@ fn test_user_limit_put_folds_dir_into_forwarded_side() {
         sent(&mut rx),
         [MotorCommand::SetLowLimit { position: -1000.0 }],
         "user high under DIR=Neg is the dial low limit"
+    );
+}
+
+/// A model-1 device's build_trans on SET_HIGH/LOW_LIMIT: devEMC18011.cc
+/// (394-398) refuses every limit; devMM4000.cc (316-336) refuses one
+/// past the controller's own travel limit and resets the record's dial
+/// limit to it.
+struct LimitDevice {
+    controller_high: Option<f64>,
+}
+
+impl motor_rs::device_support::BuildTrans for LimitDevice {
+    fn limit(&self, high: bool, raw: f64, _mres: f64) -> motor_rs::device_support::LimitBuild {
+        use motor_rs::device_support::{DialLimitReset, LimitBuild};
+        match self.controller_high {
+            None => LimitBuild::Refused(None),
+            Some(max) if high && raw > max => LimitBuild::Refused(Some(DialLimitReset::Dhlm(max))),
+            Some(_) => LimitBuild::Built,
+        }
+    }
+}
+
+fn limit_device_record(
+    controller_high: Option<f64>,
+) -> (
+    MotorRecord,
+    tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+) {
+    let mut rec = MotorRecord::new();
+    let (port, rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(
+        port.with_build_trans(std::sync::Arc::new(LimitDevice { controller_high })),
+    );
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.limits.dhlm = 100.0;
+    rec.limits.hlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.limits.llm = -100.0;
+    rec.limits.rhlm = 100.0;
+    rec.limits.rllm = -100.0;
+    rec.internal.init_invariants_synced = true;
+    (rec, rx)
+}
+
+/// C set_user_highlimit (4112-4121): a refused limit sends nothing and
+/// HLM goes back to the dial limit it would have replaced.
+#[test]
+fn test_refused_user_limit_restores_hlm() {
+    let (mut rec, mut rx) = limit_device_record(None);
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    assert_eq!(sent(&mut rx), []);
+    assert_eq!(
+        (rec.limits.hlm, rec.limits.dhlm, rec.limits.rhlm),
+        (100.0, 100.0, 100.0)
+    );
+
+    rec.conv.dir = MotorDir::Neg;
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    assert_eq!(sent(&mut rx), []);
+    assert_eq!((rec.limits.hlm, rec.limits.dllm), (100.0, -100.0));
+    rec.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
+    assert_eq!((rec.limits.llm, rec.limits.dhlm), (-100.0, 100.0));
+}
+
+/// devEMC18011 tests the selected motor (:233) before its limit refusal
+/// (:394-398): a limit put while another motor is selected is OK with
+/// nothing built, so HLM keeps the put.
+#[test]
+fn test_deferred_limit_is_not_refused() {
+    struct DefersAll;
+    impl motor_rs::device_support::BuildTrans for DefersAll {
+        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
+            motor_rs::device_support::LimitBuild::Refused(None)
+        }
+        fn defers(&self, _: &MotorCommand) -> bool {
+            true
+        }
+    }
+    let (mut rec, _) = limit_device_record(None);
+    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port.with_build_trans(std::sync::Arc::new(DefersAll)));
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    assert_eq!(sent(&mut rx), [MotorCommand::Poll]);
+    assert_eq!((rec.limits.hlm, rec.limits.dhlm), (50.0, 50.0));
+}
+
+/// devEMC18011.cc:233-240 decides deferral once per build_trans call: a
+/// device whose answer changes between two asks (another motor selected
+/// meanwhile) is asked once, and the deferred limit goes out as INFO.
+#[test]
+fn test_a_limit_is_asked_for_deferral_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct DefersFirst(AtomicUsize);
+    impl motor_rs::device_support::BuildTrans for DefersFirst {
+        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
+            motor_rs::device_support::LimitBuild::Refused(None)
+        }
+        fn defers(&self, _: &MotorCommand) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed) == 0
+        }
+    }
+    let (mut rec, _) = limit_device_record(None);
+    let device = std::sync::Arc::new(DefersFirst(AtomicUsize::new(0)));
+    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port.with_build_trans(device.clone()));
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    let asked = device.0.load(Ordering::Relaxed);
+    assert_eq!((asked, sent(&mut rx)), (1, vec![MotorCommand::Poll]));
+}
+
+/// A DHLM/DLLM put runs C special()'s set_dial_highlimit/lowlimit
+/// (2806-2813); a dbLoadRecords field() is a raw write that runs neither,
+/// so a load leaves HLM/LLM and the raw limits alone.
+#[test]
+fn test_a_loaded_dial_limit_moves_no_user_limit() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    assert_eq!(
+        (
+            rec.limits.hlm,
+            rec.limits.llm,
+            rec.limits.rhlm,
+            rec.limits.rllm
+        ),
+        (0.0, 0.0, 0.0, 0.0)
+    );
+}
+
+/// C set_user_highlimit: the device's reset of DHLM is what HLM follows.
+#[test]
+fn test_clamped_user_limit_follows_the_device_reset() {
+    let (mut rec, mut rx) = limit_device_record(Some(80.0));
+    rec.put_field("HLM", EpicsValue::Double(90.0)).unwrap();
+    assert_eq!(sent(&mut rx), []);
+    assert_eq!(
+        (rec.limits.hlm, rec.limits.dhlm, rec.limits.rhlm),
+        (80.0, 80.0, 100.0)
+    );
+
+    rec.put_field("HLM", EpicsValue::Double(70.0)).unwrap();
+    assert_eq!(
+        sent(&mut rx),
+        [MotorCommand::SetHighLimit { position: 70.0 }]
+    );
+    assert_eq!(
+        (rec.limits.hlm, rec.limits.dhlm, rec.limits.rhlm),
+        (70.0, 70.0, 70.0)
+    );
+}
+
+/// C set_dial_highlimit (4236-4277): a refusal only skips the send; HLM
+/// follows DHLM as the device left it, and the raw limit is the write's.
+#[test]
+fn test_clamped_dial_limit_follows_the_device_reset() {
+    let (mut rec, mut rx) = limit_device_record(Some(80.0));
+    rec.put_field("DHLM", EpicsValue::Double(90.0)).unwrap();
+    assert_eq!(sent(&mut rx), []);
+    assert_eq!(
+        (rec.limits.hlm, rec.limits.dhlm, rec.limits.rhlm),
+        (80.0, 80.0, 90.0)
+    );
+
+    let (mut rec, mut rx) = limit_device_record(None);
+    rec.put_field("DLLM", EpicsValue::Double(-50.0)).unwrap();
+    assert_eq!(sent(&mut rx), []);
+    assert_eq!(
+        (rec.limits.llm, rec.limits.dllm, rec.limits.rllm),
+        (-50.0, -50.0, -50.0)
     );
 }
 
@@ -8958,6 +9170,7 @@ mod flnk_dmov_gate {
     #[test]
     fn refused_jog_at_soft_limit_fires_flnk() {
         let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
         rec.conv.mres = 1.0;
         rec.vel.jvel = 1.0;
         rec.limits.hlm = 10.0;
@@ -8989,6 +9202,8 @@ mod one_sided_limit_writes {
     fn hlm_below_llm_preserves_inverted_dial_pair_and_latches_lvio() {
         let mut rec = MotorRecord::new();
         rec.conv.mres = 1.0;
+        // A runtime put: a load-time HLM/LLM is a raw write.
+        rec.internal.init_invariants_synced = true;
         rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
         rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
         assert!(!rec.limits.lvio || rec.pos.dval > 10.0);
@@ -9008,6 +9223,8 @@ mod one_sided_limit_writes {
         rec.conv.dir = MotorDir::Neg;
         rec.pos.off = 5.0;
         rec.limits.dhlm = 77.0;
+        // A runtime put: a load-time HLM/LLM is a raw write.
+        rec.internal.init_invariants_synced = true;
         rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
         assert_eq!(rec.limits.dllm, -95.0); // -(100 - 5)
         assert_eq!(rec.limits.dhlm, 77.0, "DHLM untouched");
@@ -9022,6 +9239,7 @@ mod one_sided_limit_writes {
         rec.conv.mres = 1.0;
         rec.pos.off = 5.0;
         rec.limits.hlm = 33.0;
+        rec.internal.init_invariants_synced = true;
         rec.put_field("DHLM", EpicsValue::Double(50.0)).unwrap();
         assert_eq!(rec.limits.llm, -45.0); // -(50) + 5
         assert_eq!(rec.limits.hlm, 33.0, "HLM untouched");
@@ -9232,7 +9450,7 @@ mod jvel_live_retune {
     // C 3059-3072: JVEL written mid-jog re-sends the jog command with
     // the new velocity, same direction.
     #[test]
-    fn jvel_write_during_active_jog_reemits_move_velocity() {
+    fn jvel_write_during_active_jog_sends_jog_velocity() {
         let mut rec = jogging_after_init(true);
         let mut rx = capture(&mut rec);
         rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
@@ -9244,10 +9462,10 @@ mod jvel_live_retune {
                     MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: true },
-                    MotorCommand::MoveVelocity { velocity, .. }
+                    MotorCommand::JogVelocity { velocity, .. }
                 ] if *velocity == 2.5
             ),
-            "retune re-emits the jog at the new JVEL: {commands:?}"
+            "retune sends JOG_VELOCITY at the new JVEL: {commands:?}"
         );
     }
 
@@ -9265,7 +9483,7 @@ mod jvel_live_retune {
                     MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
-                    MotorCommand::MoveVelocity { velocity, .. }
+                    MotorCommand::JogVelocity { velocity, .. }
                 ] if *velocity < 0.0
             ),
             "reverse jog retunes in the reverse direction: {commands:?}"
@@ -9289,7 +9507,7 @@ mod jvel_live_retune {
                     MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
-                    MotorCommand::MoveVelocity { velocity, .. }
+                    MotorCommand::JogVelocity { velocity, .. }
                 ] if *velocity > 0.0
             ),
             "JOGR 0 retunes forward: {commands:?}"
@@ -9485,6 +9703,7 @@ mod retry_after_dly_settle {
     #[test]
     fn stop_completion_post_delay_skips_retry_eval() {
         let mut rec = MotorRecord::new();
+        rec.internal.init_invariants_synced = true;
         rec.conv.mres = 0.1;
         rec.retry.rtry = 3;
         rec.retry.rdbd = 0.5;
@@ -9734,6 +9953,8 @@ fn test_lvio_refused_fresh_move_still_resets_rcnt() {
     // (2434-2452): a refused fresh move zeroes a latched RCNT.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.pos.drbv = 0.0;
@@ -9753,6 +9974,8 @@ fn test_lvio_refused_write_rolls_back_drive_fields() {
     // last dispatched target — the refused value does not stick.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.stat.msta = MstaFlags::DONE;
@@ -9829,6 +10052,7 @@ fn test_lvio_refused_retry_collapses_to_done() {
 fn test_jog_with_inverted_limits_is_rejected() {
     // C 2089: DLLM > DHLM refuses the jog in either direction.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.limits.dhlm = -5.0;
     rec.limits.dllm = 5.0;
     rec.limits.hlm = -5.0;
@@ -9854,6 +10078,7 @@ fn test_jog_limit_disable_gate_is_dial_frame() {
     // the DIAL pair. A nonzero OFF leaves the user pair offset from
     // zero, but the limits are still disabled.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.limits.dhlm = 0.0;
     rec.limits.dllm = 0.0;
     rec.pos.off = 3.0;
@@ -9879,6 +10104,8 @@ fn test_jog_refusal_clears_both_buttons() {
     // C 2095-2104: the refusal releases BOTH buttons, not just the
     // pressed one.
     let mut rec = MotorRecord::new();
+    // A runtime put: a load-time HLM/LLM is a raw write.
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
     rec.vel.jvel = 1.0;
@@ -10019,6 +10246,7 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
     // (do_process_inner's anchor-first gate), which would swallow the
     // re-dispatch this test asserts on.
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     let state = motor_rs::device_state::new_shared_state();
     rec.set_device_state(state.clone());
     anchor(&mut rec, &state);
@@ -10304,6 +10532,7 @@ fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
     // is left for a later SPMG pass to dispatch.
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = 0.001;
     let on_limit = MotorStatus {
         position: 0.0,
@@ -10378,6 +10607,7 @@ fn every_field_default_is_the_dbd_initial() {
 fn test_driver_sees_raw_steps_at_negative_mres() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.conv.mres = -0.01;
     rec.vel.velo = 1.0;
     rec.vel.accl = 0.2;
@@ -10570,6 +10800,7 @@ fn test_val_put_during_external_motion_parks_until_done() {
 /// A jogf released into its backlash, with BL2 in flight.
 fn jog_backlash_bl2() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
@@ -10617,6 +10848,7 @@ fn test_jog_backlash_put_at_readback_replays_at_bl2_done() {
 #[test]
 fn test_put_during_jog_stops_the_jog() {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -10708,6 +10940,7 @@ fn test_stop_during_queued_jog_does_not_jog() {
 
 fn jogging() -> MotorRecord {
     let mut rec = MotorRecord::new();
+    rec.internal.init_invariants_synced = true;
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -10936,4 +11169,28 @@ fn test_dval_put_during_jog_backlash_rtry0_does_not_move() {
         "{:?}",
         e.commands
     );
+}
+
+/// Review: one C build_trans call decides deferral once (devEMC18011.cc:233).
+/// A device that defers the call it is asked about must see one query per
+/// limit command, so the limit still goes out as INFO only.
+#[test]
+fn review_deferred_limit_is_asked_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct DefersOnce(AtomicUsize);
+    impl motor_rs::device_support::BuildTrans for DefersOnce {
+        fn limit(&self, _: bool, _: f64, _: f64) -> motor_rs::device_support::LimitBuild {
+            motor_rs::device_support::LimitBuild::Refused(None)
+        }
+        fn defers(&self, _: &MotorCommand) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed) == 0
+        }
+    }
+    let (mut rec, _) = limit_device_record(None);
+    let device = std::sync::Arc::new(DefersOnce(AtomicUsize::new(0)));
+    let (port, mut rx) = motor_rs::device_support::CommandPort::capture();
+    rec.set_command_port(port.with_build_trans(device.clone()));
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    let asked = device.0.load(Ordering::Relaxed);
+    assert_eq!((asked, sent(&mut rx)), (1, vec![MotorCommand::Poll]));
 }

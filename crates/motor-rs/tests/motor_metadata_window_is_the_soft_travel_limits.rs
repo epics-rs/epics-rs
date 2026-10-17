@@ -75,7 +75,8 @@ fn val_serves_egu_and_prec_from_the_record() {
 /// `DIR=Pos` and `OFF=0` the user and dial limits are numerically equal by
 /// construction (`set_dial_highlimit` keeps `HLM = DHLM + OFF`), so a pass
 /// that served the wrong pair would still look right. `OFF=100` separates
-/// them.
+/// them. A dial-limit field() sets no user limit, so the pair is loaded as
+/// an IOC that already ran `set_dial_highlimit` saves it.
 fn dial_and_raw_loaded(mres: f64) -> RecordInstance {
     let mut rec = MotorRecord::new();
     for (name, value) in [
@@ -84,6 +85,8 @@ fn dial_and_raw_loaded(mres: f64) -> RecordInstance {
         ("OFF", EpicsValue::Double(100.0)),
         ("DHLM", EpicsValue::Double(6.0)),
         ("DLLM", EpicsValue::Double(-4.0)),
+        ("HLM", EpicsValue::Double(106.0)),
+        ("LLM", EpicsValue::Double(96.0)),
         ("MRES", EpicsValue::Double(mres)),
         ("VMAX", EpicsValue::Double(7.0)),
         ("VBAS", EpicsValue::Double(0.5)),

@@ -774,13 +774,16 @@ fn auto_connect_due(port: &str, addr: i32) -> bool {
 }
 
 /// devMotorAsyn's `bad:` arm: `pmr->pact = 1; return 0`, after which
-/// motorRecord's init_record runs on to its closing `monitor()`.
+/// motorRecord's init_record runs on to its closing `monitor()`, through
+/// set_dial_highlimit/lowlimit (717-718).
 fn bad(record: &mut dyn Record) -> DeviceInitOutcome {
     if let Some(motor) = record
         .as_any_mut()
         .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
     {
         motor.finish_init();
+        motor.set_dial_limit(true);
+        motor.set_dial_limit(false);
     }
     DeviceInitOutcome::dead()
 }

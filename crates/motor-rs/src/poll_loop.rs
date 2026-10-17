@@ -918,9 +918,13 @@ impl MotorPollLoop {
         }
     }
 
-    /// Run a batch of axis `index`'s commands.
-    fn execute(&mut self, index: usize, batch: &CommandBatch) {
-        self.axes[index].execute(batch, &mut self.controller_poll);
+    /// Run a batch of axis `index`'s commands and send what they posted, as
+    /// C's write ends in `pAxis->callParamCallbacks()` before its
+    /// `wakeupPoller` (asynMotorController.cpp:317-320).
+    async fn execute(&mut self, index: usize, batch: &CommandBatch) {
+        let axis = &mut self.axes[index];
+        axis.execute(batch, &mut self.controller_poll);
+        axis.send_pulses().await;
     }
 
     fn is_motor_task(&self) -> bool {
@@ -1091,14 +1095,14 @@ impl MotorPollLoop {
                     // query (motordrvCom.cc:255, :351).
                     let tick = Instant::now();
                     self.query_task().await;
-                    self.execute(index, &batch);
+                    self.execute(index, &batch).await;
                     for axis in &mut self.axes {
                         axis.run_queued_commands(&mut self.controller_poll);
                     }
                     due = self.task_due(tick);
                 }
                 Wake::Batch(index, batch) => {
-                    self.execute(index, &batch);
+                    self.execute(index, &batch).await;
                     if std::mem::take(&mut self.axes[index].woken) {
                         due = self.poller_pass(true).await;
                     }
@@ -2181,7 +2185,7 @@ mod tests {
                 port: port.into(),
                 addr: 0,
             }));
-            self.poll_loop.execute(
+            now(self.poll_loop.execute(
                 0,
                 &CommandBatch {
                     trace,
@@ -2193,7 +2197,7 @@ mod tests {
                         acceleration: 1.0,
                     }],
                 },
-            );
+            ));
         }
 
         /// A poller pass with the axis `moving`.
@@ -2279,14 +2283,14 @@ mod tests {
     }
 
     fn write_stop(poll_loop: &mut MotorPollLoop, port: &str) {
-        poll_loop.execute(
+        now(poll_loop.execute(
             0,
             &CommandBatch {
                 trace: Arc::new(MotorTrace::new(port, 0)),
                 record: None,
                 commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
             },
-        );
+        ));
     }
 
     #[test]
@@ -2618,7 +2622,7 @@ mod tests {
             card: 0,
             signal: 0,
         }));
-        poll_loop.execute(
+        now(poll_loop.execute(
             0,
             &CommandBatch {
                 trace,
@@ -2630,7 +2634,7 @@ mod tests {
                     acceleration: 1.0,
                 }],
             },
-        );
+        ));
     }
 
     fn held(poll_loop: &MotorPollLoop) -> Held {
@@ -3021,7 +3025,7 @@ mod tests {
             MotorStatus::default(),
             vec![Some(hit.clone()), Some(back.clone())],
         );
-        poll_loop.execute(
+        now(poll_loop.execute(
             0,
             &interface_batch(vec![MotorCommand::MoveAbsolute {
                 position: 9.0,
@@ -3029,7 +3033,7 @@ mod tests {
                 velocity: 1.0,
                 acceleration: 1.0,
             }]),
-        );
+        ));
         for (want, word) in [(hit, 1029), (back, 1028)] {
             assert!(now(poll_loop.timed_pass()).is_some());
             assert_eq!(poll_loop.axes[0].last_status.as_ref(), Some(&want));
@@ -3081,9 +3085,13 @@ mod tests {
             moving: false,
             ..MotorStatus::default()
         };
-        let (mut poll_loop, _, _record) = interface_task(parked.clone(), vec![]);
+        let (mut poll_loop, _, mut record) = interface_task(parked.clone(), vec![]);
+        let mut io_intr = {
+            use epics_base_rs::server::device_support::DeviceSupport;
+            record.io_intr_receiver().unwrap()
+        };
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.execute(
+        now(poll_loop.execute(
             0,
             &interface_batch(vec![MotorCommand::Home {
                 forward: false,
@@ -3091,7 +3099,7 @@ mod tests {
                 velocity: 1.0,
                 acceleration: 1.0,
             }]),
-        );
+        ));
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         assert_eq!(
             poll_loop.axes[0].last_status,
@@ -3100,7 +3108,8 @@ mod tests {
                 ..parked
             })
         );
-        assert_eq!(poll_loop.axes[0].pulses.len(), 1);
+        assert!(io_intr.try_recv().is_ok());
+        assert!(io_intr.try_recv().is_err());
         assert!(!poll_loop.axes[0].woken);
     }
 
@@ -3113,7 +3122,7 @@ mod tests {
         let state = record.device_state().clone();
         state.lock().unwrap().init_status();
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.execute(0, &interface_batch(vec![MotorCommand::Poll]));
+        now(poll_loop.execute(0, &interface_batch(vec![MotorCommand::Poll])));
         assert_eq!(
             script.lock().unwrap().0.len(),
             1,

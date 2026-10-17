@@ -319,3 +319,124 @@ async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
         .unwrap();
     poller.await.unwrap();
 }
+
+/// Done until it is told to move, then moving at the same place.
+#[derive(Default)]
+struct Mover {
+    moved: bool,
+}
+
+impl AsynMotor for Mover {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        self.moved = true;
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        Ok(MotorStatus {
+            done: !self.moved,
+            moving: self.moved,
+            ..MotorStatus::default()
+        })
+    }
+}
+
+/// C `writeFloat64` posts the moved axis (`pAxis->callParamCallbacks()`)
+/// before `wakeupPoller`, so its records see the move before the pass polls
+/// the axes ahead of it (asynMotorController.cpp:317-320).
+#[tokio::test]
+async fn a_move_write_posts_before_the_pass_it_wakes() {
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use motor_rs::controller_port::index;
+
+    const PORT: &str = "CPMOVEPOST";
+    let port =
+        motor_rs::devices::register_controller_port(&asyn_rs::registry::open_owner(), PORT, 2, ())
+            .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut controller = ControllerBuilder::new();
+    let user = |addr| TraceUser::Asyn {
+        port: PORT.into(),
+        addr,
+    };
+    let mover = Arc::new(Mutex::new(Mover::default()));
+    let m0 = {
+        let watched = Arc::new(Mutex::new(None::<tokio::sync::mpsc::Receiver<()>>));
+        let watcher = MoveWatcher {
+            io_intr: watched.clone(),
+            pulses: 0,
+            seen: seen.clone(),
+        };
+        let m0 = controller.axis(Arc::new(Mutex::new(watcher)), user(0));
+        let m1 = controller.axis(mover, user(1));
+        let mut record = m1.axis.attach();
+        record.bind_dev_sup_gate(&InterruptGate::opened());
+        *watched.lock().unwrap() = record.io_intr_receiver();
+        motor_rs::devices::register_axis(m0.axis.clone()).unwrap();
+        motor_rs::devices::register_axis(m1.axis.clone()).unwrap();
+        (m0, record)
+    };
+    let idle = Duration::from_secs(60);
+    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
+    tokio::time::sleep(PERIOD * 4).await;
+    tokio::task::spawn_blocking(move || port.write_float64_blocking(index::MOVE_ABS, 1, 3.0))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(PERIOD * 4).await;
+    // m0 once more: every post m1's records had by now.
+    m0.0.poll_cmd_tx.send(PollCommand::ForcePoll).await.unwrap();
+    tokio::time::sleep(PERIOD * 4).await;
+    m0.0.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    // At the startup pass, the pass the move woke and the forced poll: m1's
+    // move post (DMOV 0), then its poll's (MOVN 1).
+    assert_eq!(seen, [0, 1, 2]);
+}
+
+/// At each poll, the pulses another axis's record had received.
+struct MoveWatcher {
+    io_intr: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<()>>>>,
+    pulses: u32,
+    seen: Arc<Mutex<Vec<u32>>>,
+}
+
+impl AsynMotor for MoveWatcher {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        if let Some(rx) = self.io_intr.lock().unwrap().as_mut() {
+            while rx.try_recv().is_ok() {
+                self.pulses += 1;
+            }
+        }
+        self.seen.lock().unwrap().push(self.pulses);
+        Ok(MotorStatus::default())
+    }
+}

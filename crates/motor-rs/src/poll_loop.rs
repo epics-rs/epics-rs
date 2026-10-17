@@ -902,12 +902,10 @@ impl MotorPollLoop {
         }
     }
 
-    /// An add to the running controller. A new axis's first poll follows a
-    /// controller poll, as on the pass C's poller first finds it.
-    fn join(&mut self, Joining { mut join, joined }: Joining) {
-        if let Join::Axis(axis) = &mut join {
-            axis.prime_cache(&polled::after(&mut self.controller_poll));
-        }
+    /// An add to the running controller. C's poller runs one startup pass;
+    /// a later axis is first polled on the next pass, and a record bound
+    /// before reads C's zeroed status ([`MotorDeviceState::init_status`]).
+    fn join(&mut self, Joining { join, joined }: Joining) {
         join.place(&mut self.axes);
         let _ = joined.send(());
     }
@@ -930,11 +928,13 @@ impl MotorPollLoop {
     }
 
     /// One wake of `motor_task`, before it processes the messages: query
-    /// each held move (motordrvCom.cc:244-254).
-    fn query_task(&mut self) {
+    /// each held move (motordrvCom.cc:244-254), its callback queued as its
+    /// query returns (:280-318).
+    async fn query_task(&mut self) {
         let polled = polled::after(&mut self.controller_poll);
         for axis in &mut self.axes {
             axis.query_task(&polled);
+            axis.send_pulses().await;
         }
     }
 
@@ -950,10 +950,11 @@ impl MotorPollLoop {
     }
 
     /// One pass of C `asynMotorPoller` (asynMotorController.cpp:632-695):
-    /// the controller poll, then every axis in turn, posting on change, and
-    /// return when the next timed pass is due. `woken` is a `wakeupPoller`,
-    /// which reloads the forced fast polls.
-    fn poller_pass(&mut self, woken: bool) -> Option<Instant> {
+    /// the controller poll, then every axis in turn, its change posted to
+    /// its records before the next axis polls as `pAxis->poll` ends in
+    /// callParamCallbacks, and return when the next timed pass is due.
+    /// `woken` is a `wakeupPoller`, which reloads the forced fast polls.
+    async fn poller_pass(&mut self, woken: bool) -> Option<Instant> {
         if woken {
             self.reload_forced_fast_polls();
         }
@@ -961,6 +962,7 @@ impl MotorPollLoop {
         let mut moving = false;
         for axis in &mut self.axes {
             moving |= axis.poller_poll(&polled);
+            axis.send_pulses().await;
         }
         self.next_pass(moving)
     }
@@ -977,12 +979,12 @@ impl MotorPollLoop {
     }
 
     /// A timed wake of either task.
-    fn timed_pass(&mut self) -> Option<Instant> {
+    async fn timed_pass(&mut self) -> Option<Instant> {
         if !self.is_motor_task() {
-            return self.poller_pass(false);
+            return self.poller_pass(false).await;
         }
         let tick = Instant::now();
-        self.query_task();
+        self.query_task().await;
         self.task_due(tick)
     }
 
@@ -1088,7 +1090,7 @@ impl MotorPollLoop {
                     // One wake drains the driver's whole queue after the
                     // query (motordrvCom.cc:255, :351).
                     let tick = Instant::now();
-                    self.query_task();
+                    self.query_task().await;
                     self.execute(index, &batch);
                     for axis in &mut self.axes {
                         axis.run_queued_commands(&mut self.controller_poll);
@@ -1098,13 +1100,13 @@ impl MotorPollLoop {
                 Wake::Batch(index, batch) => {
                     self.execute(index, &batch);
                     if std::mem::take(&mut self.axes[index].woken) {
-                        due = self.poller_pass(true);
+                        due = self.poller_pass(true).await;
                     }
                 }
                 Wake::Command(index, cmd) => match cmd {
                     Some(PollCommand::ForcePoll) if self.is_motor_task() => {
                         let tick = Instant::now();
-                        self.query_task();
+                        self.query_task().await;
                         let polled = polled::after(&mut self.controller_poll);
                         let axis = &mut self.axes[index];
                         let status = axis.poll_result(&polled);
@@ -1118,11 +1120,11 @@ impl MotorPollLoop {
                     }
                     Some(PollCommand::Wakeup) if self.is_motor_task() => {
                         let tick = Instant::now();
-                        self.query_task();
+                        self.query_task().await;
                         due = self.task_due(tick);
                     }
                     Some(PollCommand::Wakeup) => {
-                        due = self.poller_pass(true);
+                        due = self.poller_pass(true).await;
                     }
                     Some(PollCommand::Post(status)) => self.axes[index].notify(status, false),
                     // C shutdownPoller ends the controller's one poller.
@@ -1130,7 +1132,7 @@ impl MotorPollLoop {
                 },
                 Wake::Join(join) => self.join(*join),
                 Wake::Due => {
-                    due = self.timed_pass();
+                    due = self.timed_pass().await;
                 }
             }
         }
@@ -1982,6 +1984,11 @@ mod tests {
     use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 
     use super::*;
+
+    /// A pass on the test thread, which has no runtime to starve.
+    fn now<F: std::future::Future>(pass: F) -> F::Output {
+        block_on_sync(pass).expect("a test thread can block")
+    }
     use crate::flags::MstaFlags;
     use crate::trace::TraceUser;
 
@@ -2193,7 +2200,7 @@ mod tests {
         fn pass(&mut self, moving: bool) {
             self.moving
                 .store(moving, std::sync::atomic::Ordering::SeqCst);
-            self.poll_loop.poller_pass(false);
+            now(self.poll_loop.poller_pass(false));
         }
 
         fn calls(&self) -> Vec<&'static str> {
@@ -2302,10 +2309,10 @@ mod tests {
         let script = vec![at(1.0), comms_error, at(3.0)];
         let (mut poll_loop, handle, _) = hooked_poller("PLHOOKBIT", script);
         write_stop(&mut poll_loop, "PLHOOKBIT");
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(comms(&handle), Some(1), "a new status leaves it");
-        poll_loop.poller_pass(false);
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
+        now(poll_loop.poller_pass(false));
         assert_eq!(comms(&handle), Some(0), "the driver's own clear");
     }
 
@@ -2392,7 +2399,7 @@ mod tests {
         write_stop(&mut poll_loop, "PLHOOKPASS");
         assert_eq!(posted(&handle, &mut rx), None, "set, not yet called back");
         assert_eq!(comms(&handle), Some(1), "set in the parameter library");
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(posted(&handle, &mut rx), Some(1));
     }
 
@@ -2408,7 +2415,7 @@ mod tests {
             Some(1),
             "the second write's posts the first's"
         );
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(posted(&handle, &mut rx), Some(2));
     }
 
@@ -2538,12 +2545,12 @@ mod tests {
             Ok(fresh.clone()),
         ]);
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(
             poll_loop.axes[0].status_seq, seq,
             "the early return posts nothing"
         );
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         assert_eq!(poll_loop.axes[0].last_status, Some(fresh));
     }
@@ -2555,8 +2562,8 @@ mod tests {
             Ok(MotorStatus::default()),
         ]);
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.poller_pass(false);
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
+        now(poll_loop.poller_pass(false));
         assert_eq!(poll_loop.axes[0].status_seq, seq);
     }
 
@@ -2569,7 +2576,7 @@ mod tests {
         let mut poll_loop =
             failing_poller(vec![Err((PollFailure::COMMS_ERROR, Some(fresh.clone())))]);
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.poller_pass(false);
+        now(poll_loop.poller_pass(false));
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         let posted = poll_loop.axes[0].last_status.clone().unwrap();
         assert!(posted.home && posted.comms_error && !posted.problem);
@@ -2596,9 +2603,9 @@ mod tests {
         })));
         send_move(&mut poll_loop);
         let seq = poll_loop.axes[0].status_seq;
-        poll_loop.timed_pass();
+        now(poll_loop.timed_pass());
         assert_eq!(poll_loop.axes[0].status_seq, seq, "RETRY posts nothing");
-        poll_loop.timed_pass();
+        now(poll_loop.timed_pass());
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         let posted = poll_loop.axes[0].last_status.clone().unwrap();
         assert!(posted.home, "{posted:?}");
@@ -2646,7 +2653,7 @@ mod tests {
         let posts = (0..n)
             .map(|_| {
                 let seq = poll_loop.axes[0].status_seq;
-                poll_loop.timed_pass();
+                now(poll_loop.timed_pass());
                 (poll_loop.axes[0].status_seq != seq)
                     .then(|| poll_loop.axes[0].last_status.clone().unwrap())
             })
@@ -2756,7 +2763,7 @@ mod tests {
     #[test]
     fn an_idle_model1_axis_is_never_polled() {
         let (mut poll_loop, script) = model1_task(vec![Some(at(1.0))]);
-        assert_eq!(poll_loop.timed_pass(), None);
+        assert_eq!(now(poll_loop.timed_pass()), None);
         assert_eq!(script.lock().unwrap().0.len(), 1);
     }
 
@@ -2766,7 +2773,7 @@ mod tests {
     fn a_new_move_is_first_queried_a_scan_period_later() {
         let (mut poll_loop, script) = model1_task(vec![Some(at(1.0))]);
         let tick = Instant::now();
-        poll_loop.query_task();
+        now(poll_loop.query_task());
         send_move(&mut poll_loop);
         assert_eq!(poll_loop.task_due(tick), Some(tick + SCAN));
         assert_eq!(script.lock().unwrap().0.len(), 1);
@@ -2792,6 +2799,31 @@ mod tests {
         assert!(poll_loop.axes[0].last_status.as_ref().unwrap().done);
     }
 
+    // motordrvCom queues each axis's callback as its query returns
+    // (motordrvCom.cc:280-318), not after the task's last axis.
+    #[test]
+    fn a_queried_change_reaches_the_record_in_its_query() {
+        let moving = MotorStatus {
+            moving: true,
+            done: false,
+            ..at(2.0)
+        };
+        let (mut poll_loop, _) = model1_task(vec![Some(moving)]);
+        let state = new_shared_state();
+        state.lock().unwrap().set_motordevcom();
+        state.lock().unwrap().accept();
+        let (io_intr_tx, mut io_intr) = mpsc::channel(4);
+        poll_loop.axes[0].subscribers.attach(
+            state,
+            io_intr_tx,
+            Arc::new(MotorTrace::new("queried", 0)),
+        );
+        send_move(&mut poll_loop);
+        now(poll_loop.query_task());
+        assert!(poll_loop.axes[0].pulses.is_empty());
+        assert!(io_intr.try_recv().is_ok());
+    }
+
     #[test]
     fn an_ended_move_stops_the_scan() {
         let done = MotorStatus {
@@ -2801,7 +2833,7 @@ mod tests {
         };
         let (mut poll_loop, _) = model1_task(vec![Some(done)]);
         send_move(&mut poll_loop);
-        assert_eq!(poll_loop.timed_pass(), None);
+        assert_eq!(now(poll_loop.timed_pass()), None);
         assert_eq!(held(&poll_loop), None);
     }
 
@@ -2831,7 +2863,7 @@ mod tests {
         };
         let (mut poll_loop, _) = model1_task(vec![Some(unflagged)]);
         send_move(&mut poll_loop);
-        assert!(poll_loop.timed_pass().is_some());
+        assert!(now(poll_loop.timed_pass()).is_some());
         assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
 
@@ -2861,7 +2893,7 @@ mod tests {
     /// The period of one poller pass over `status`, and the MSTA it posts.
     fn pace_and_msta(status: MotorStatus) -> (Duration, MstaFlags) {
         let mut poll_loop = poller(vec![status]);
-        let due = poll_loop.poller_pass(false).unwrap();
+        let due = now(poll_loop.poller_pass(false)).unwrap();
         let period = due.saturating_duration_since(Instant::now());
         let msta = MstaFlags::from_status(poll_loop.axes[0].last_status.as_ref().unwrap());
         (period, msta)
@@ -2917,7 +2949,7 @@ mod tests {
         };
         let (mut poll_loop, _) = model1_task(vec![Some(done)]);
         send_move(&mut poll_loop);
-        assert_eq!(poll_loop.timed_pass(), None);
+        assert_eq!(now(poll_loop.timed_pass()), None);
         assert_eq!(held(&poll_loop), None);
     }
 
@@ -2999,7 +3031,7 @@ mod tests {
             }]),
         );
         for (want, word) in [(hit, 1029), (back, 1028)] {
-            assert!(poll_loop.timed_pass().is_some());
+            assert!(now(poll_loop.timed_pass()).is_some());
             assert_eq!(poll_loop.axes[0].last_status.as_ref(), Some(&want));
             assert_eq!(msta(&want), word);
         }
@@ -3014,16 +3046,24 @@ mod tests {
             position: 1.0,
             ..rest.clone()
         };
-        let (mut poll_loop, script, _record) =
+        let (mut poll_loop, script, mut record) =
             interface_task(rest.clone(), vec![Some(rest), Some(nudged.clone())]);
+        let mut io_intr = {
+            use epics_base_rs::server::device_support::DeviceSupport;
+            record.io_intr_receiver().unwrap()
+        };
         let seq = poll_loop.axes[0].status_seq;
         let tick = Instant::now();
-        assert!(poll_loop.timed_pass().is_some_and(|due| due >= tick + SCAN));
+        assert!(now(poll_loop.timed_pass()).is_some_and(|due| due >= tick + SCAN));
         assert_eq!(poll_loop.axes[0].status_seq, seq, "unchanged: no post");
-        assert!(poll_loop.timed_pass().is_some());
+        assert!(now(poll_loop.timed_pass()).is_some());
         assert_eq!(poll_loop.axes[0].status_seq, seq + 1);
         assert_eq!(poll_loop.axes[0].last_status, Some(nudged));
-        assert_eq!(poll_loop.axes[0].pulses.len(), 1);
+        assert!(poll_loop.axes[0].pulses.is_empty());
+        assert!(
+            io_intr.try_recv().is_ok(),
+            "the change reached the record in its pass"
+        );
         assert!(script.lock().unwrap().0.is_empty());
     }
 

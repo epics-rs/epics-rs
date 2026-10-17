@@ -166,3 +166,156 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
         "{names:?}"
     );
 }
+
+/// Moves one count every poll, so every poll posts a change.
+struct Creeping(Arc<std::sync::atomic::AtomicU32>);
+
+impl AsynMotor for Creeping {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(MotorStatus {
+            position: f64::from(n),
+            ..MotorStatus::default()
+        })
+    }
+}
+
+/// At each poll, the pulses axis 0's record had received and the polls
+/// axis 0 had made.
+struct Watching {
+    io_intr: tokio::sync::mpsc::Receiver<()>,
+    pulses: u32,
+    polls: Arc<std::sync::atomic::AtomicU32>,
+    seen: Arc<Mutex<Vec<(u32, u32)>>>,
+}
+
+impl AsynMotor for Watching {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        while self.io_intr.try_recv().is_ok() {
+            self.pulses += 1;
+        }
+        let polls = self.polls.load(std::sync::atomic::Ordering::SeqCst);
+        self.seen.lock().unwrap().push((polls, self.pulses));
+        Ok(MotorStatus::default())
+    }
+}
+
+/// C's poller posts each axis's change as its poll returns
+/// (asynMotorAxis::callParamCallbacks inside pAxis->poll), so on a silent
+/// controller m1 alarms one read timeout before m2.
+#[tokio::test]
+async fn an_axis_s_post_reaches_its_records_before_the_next_axis_polls() {
+    use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+    use epics_base_rs::server::device_support::DeviceSupport;
+
+    let polls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut controller = ControllerBuilder::new();
+    let user = |addr| TraceUser::Asyn {
+        port: String::new(),
+        addr,
+    };
+    let a0 = controller.axis(Arc::new(Mutex::new(Creeping(polls.clone()))), user(0));
+    let mut record = a0.axis.attach();
+    record.bind_dev_sup_gate(&InterruptGate::opened());
+    let watching = Watching {
+        io_intr: record.io_intr_receiver().unwrap(),
+        pulses: 0,
+        polls: polls.clone(),
+        seen: seen.clone(),
+    };
+    let a1 = controller.axis(Arc::new(Mutex::new(watching)), user(1));
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
+    tokio::time::sleep(PERIOD * 8).await;
+    a1.poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await.unwrap();
+    drop(a0);
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.len() >= 3, "{seen:?}");
+    // The startup poll posts nothing; every later poll of axis 0 does.
+    for &(polls, pulses) in &seen[1..] {
+        assert_eq!(pulses, polls - 1, "{seen:?}");
+    }
+}
+
+/// C's poller runs one startup pass, the wakeupPoller before its loop
+/// (asynMotorController.cpp:630); an axis created after the poller started
+/// is first polled on a later pass, not on one of its own.
+#[tokio::test]
+async fn axes_joining_a_running_poller_get_no_pass_of_their_own() {
+    let log = Log::default();
+    let controller_log = log.clone();
+    let controller = ControllerBuilder::new()
+        .controller_poll(move || controller_log.lock().unwrap().push(("C", Instant::now())));
+    let axes = controller.axes();
+    let idle = Duration::from_secs(60);
+    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
+    let names = |log: &Log| -> Vec<&'static str> {
+        log.lock().unwrap().iter().map(|(name, _)| *name).collect()
+    };
+    let mut joined = Vec::new();
+    for (addr, name) in ["A0", "A1", "A2"].into_iter().enumerate() {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let axes = axes.clone();
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr: addr as i32,
+        };
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(motor));
+        joined.push(
+            tokio::task::spawn_blocking(move || axes.add(motor, user))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(PERIOD * 4).await;
+    assert_eq!(names(&log), ["C"], "the startup pass alone");
+    joined[0]
+        .poll_cmd_tx
+        .send(PollCommand::Wakeup)
+        .await
+        .unwrap();
+    tokio::time::sleep(PERIOD * 4).await;
+    assert_eq!(names(&log), ["C", "C", "A0", "A1", "A2"]);
+    joined[0]
+        .poll_cmd_tx
+        .send(PollCommand::Shutdown)
+        .await
+        .unwrap();
+    poller.await.unwrap();
+}

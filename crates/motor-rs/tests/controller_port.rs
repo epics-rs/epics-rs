@@ -1041,3 +1041,54 @@ fn the_controller_report_runs_the_driver_then_each_axis_then_the_base() {
     port.report(&mut out, 0);
     assert_eq!(out, "driver CPREPORT numAxes=3\nPort: CPREPORT\n");
 }
+
+/// ACR's shape: `writeUInt32Digital` on its binary outputs sends `BIT n=v`
+/// and never reaches the base (ACRMotorDriver.cpp:232-248).
+#[derive(Default)]
+struct BinaryOut {
+    out: usize,
+    seen: Arc<Mutex<Vec<(u32, u32)>>>,
+}
+
+impl ControllerParams for BinaryOut {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.out = base.create_param("BINARY_OUT", ParamType::UInt32Digital)?;
+        base.create_param("BINARY_STORED", ParamType::UInt32Digital)?;
+        Ok(())
+    }
+
+    fn write_uint32_digital(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: &AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> ParamWrite {
+        if user.reason != self.out {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        self.seen.lock().unwrap().push((value, mask));
+        ParamWrite::Handled(Ok(()))
+    }
+}
+
+#[test]
+fn a_uint32_digital_write_reaches_the_driver_s_own_code() {
+    use asyn_rs::sync_io::SyncIOHandle;
+    let regs = BinaryOut::default();
+    let seen = regs.seen.clone();
+    let port = register_controller_port(&open_owner(), "CPBINOUT", 1, regs).unwrap();
+    let _ax = axis("CPBINOUT", 0);
+    let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+    let (out, stored) = (BASE_PARAMS.len(), BASE_PARAMS.len() + 1);
+    io.write_uint32_digital(out, 1, 0x4).unwrap();
+    assert_eq!(*seen.lock().unwrap(), [(1, 0x4)]);
+    assert!(
+        io.read_uint32_digital(out, 0xffff_ffff).is_err(),
+        "C never stores it"
+    );
+    // asynMotorController has no writeUInt32Digital: the rest is asynPortDriver's.
+    io.write_uint32_digital(stored, 0x6, 0x2).unwrap();
+    assert_eq!(io.read_uint32_digital(stored, 0xffff_ffff).unwrap(), 0x2);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

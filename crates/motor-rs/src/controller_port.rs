@@ -367,6 +367,18 @@ pub trait ControllerParams: Send + Sync + 'static {
         ParamWrite::PassToBase(Ok(()))
     }
 
+    /// The subclass `writeUInt32Digital`; see [`Self::write_int32`].
+    /// asynMotorController has none, so the base is asynPortDriver's.
+    fn write_uint32_digital(
+        &mut self,
+        _base: &mut PortDriverBase,
+        _user: &AsynUser,
+        _value: u32,
+        _mask: u32,
+    ) -> ParamWrite {
+        ParamWrite::PassToBase(Ok(()))
+    }
+
     /// The subclass `initializeProfile`; an override calls
     /// [`ControllerCtx::initialize_profile`] as C calls the base.
     fn initialize_profile(
@@ -1045,6 +1057,24 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
         let (addr, axis) = self.axis(user)?;
         let status = self.write_float64_base(user, addr, axis, value);
         self.after_write(addr, user.reason, WriteValue::Float64(value), status)
+    }
+
+    fn write_uint32_digital(
+        &mut self,
+        user: &mut AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> AsynResult<()> {
+        match self
+            .params
+            .write_uint32_digital(&mut self.base, user, value, mask)
+        {
+            ParamWrite::Handled(status) => status,
+            ParamWrite::PassToBase(own) => {
+                let status = self.base.write_uint32_digital_param(user, value, mask);
+                own.and(status)
+            }
+        }
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {

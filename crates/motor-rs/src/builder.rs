@@ -250,7 +250,7 @@ impl Default for ControllerAxes {
 
 impl ControllerAxes {
     /// Add an axis; on a running poller, return once the poller has taken
-    /// it, so its status is cached before any record binds it. A `motor`
+    /// it, to be polled from its next pass. A `motor`
     /// added before is not polled twice: `user` reaches the same axis.
     pub fn add(
         &self,

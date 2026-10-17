@@ -547,15 +547,16 @@ pub struct NDArray {
 pub(crate) enum PoolTie {
     /// Charged on the pool; the destructor returns the buffer to it.
     Charged(Weak<NDArrayPool>),
-    /// A publish of a [`crate::ndarray_pool::PersistentArray`], which holds
-    /// the charge: the pool's array, but its destructor leaves the pool alone.
-    Shown(Weak<NDArrayPool>),
+    /// A [`crate::ndarray_pool::PersistentArray`] or a publish of it: one
+    /// charge they all hold, returned when the last of them goes.
+    Shared(std::sync::Arc<crate::ndarray_pool::SharedCharge>),
 }
 
 impl PoolTie {
     fn pool(&self) -> &Weak<NDArrayPool> {
         match self {
-            Self::Charged(pool) | Self::Shown(pool) => pool,
+            Self::Charged(pool) => pool,
+            Self::Shared(charge) => charge.pool(),
         }
     }
 }

@@ -722,21 +722,54 @@ impl std::ops::Deref for PublishedArray {
     }
 }
 
+/// The pool's one charge for a [`PersistentArray`]'s buffer, held by the
+/// array and by every publish of it: C's one `NDArray` and its reference
+/// count. The buffer goes back to the pool when the last holder goes.
+#[derive(Debug)]
+pub(crate) struct SharedCharge {
+    pool: Weak<NDArrayPool>,
+    data_size: usize,
+    /// The persistent array's buffer, parked here when it is dropped first.
+    parked: Mutex<NDDataBuffer>,
+}
+
+impl SharedCharge {
+    pub(crate) fn pool(&self) -> &Weak<NDArrayPool> {
+        &self.pool
+    }
+}
+
+impl Drop for SharedCharge {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.recycle(std::mem::take(self.parked.get_mut()), self.data_size);
+        }
+    }
+}
+
 /// An array a driver allocates once and refills, C's persistent `NDArray *`
-/// such as pilatus `pFlatField`: charged for as long as the driver keeps it,
-/// and refilled in place whoever holds its last publish.
+/// such as pilatus `pFlatField` or NDDriverStdArrays `pArrays[0]`: refilled
+/// in place whoever holds its last publish.
 ///
-/// It holds the pool's charge; a publish is a copy tagged with the pool but
-/// not charged on it, so a plugin still holding one neither blocks a refill
-/// nor shows on the pool: C allocates `pFlatField` once and reads each file
-/// into it (pilatusDetector.cpp:1728, :290).
+/// A publish is a copy, so a refill never races a plugin, but it is not a
+/// second charge: the array and its publishes hold one charge, so
+/// the pool counts one buffer until the driver and every plugin have let go,
+/// as C's reserve/release of the one array (pilatusDetector.cpp:1728, :290;
+/// NDDriverStdArrays.cpp:153-158, :328).
 pub struct PersistentArray {
     array: DriverArray,
     shown: Option<PublishedArray>,
 }
 
 impl PersistentArray {
-    pub fn new(array: DriverArray) -> Self {
+    pub fn new(mut array: DriverArray) -> Self {
+        if let Some(PoolTie::Charged(pool)) = array.array.pool.take() {
+            array.array.pool = Some(PoolTie::Shared(Arc::new(SharedCharge {
+                pool,
+                data_size: array.array.data_size,
+                parked: Mutex::default(),
+            })));
+        }
         Self { array, shown: None }
     }
 
@@ -751,13 +784,24 @@ impl PersistentArray {
         self.shown
             .get_or_insert_with(|| {
                 let mut copy = NDArray::clone(&self.array);
-                copy.pool = Some(PoolTie::Shown(Arc::downgrade(&self.array.pool.pool)));
+                copy.pool = match &self.array.array.pool {
+                    Some(PoolTie::Shared(charge)) => Some(PoolTie::Shared(charge.clone())),
+                    _ => None,
+                };
                 PublishedArray {
                     array: Arc::new(copy),
                     pool: self.array.pool.clone(),
                 }
             })
             .clone()
+    }
+}
+
+impl Drop for PersistentArray {
+    fn drop(&mut self) {
+        if let Some(PoolTie::Shared(charge)) = &self.array.array.pool {
+            *charge.parked.lock() = std::mem::take(&mut self.array.array.data);
+        }
     }
 }
 
@@ -807,6 +851,29 @@ mod tests {
         );
         drop(flat);
         assert_eq!(counts(&pool), (1, 1, 8));
+    }
+
+    /// The persistent array and every publish of it hold one charge, as C's
+    /// one `NDArray` and its reserves: with the pool exactly full, a publish
+    /// still goes out, and a held publish keeps the buffer charged past the
+    /// persistent array, so the next alloc is refused until it is let go.
+    #[test]
+    fn a_held_publish_keeps_the_persistent_array_charged() {
+        let pool = DriverPool::standalone(8);
+        let alloc = || pool.alloc(vec![NDDimension::new(2)], NDDataType::Int32);
+        let mut current = PersistentArray::new(alloc().unwrap());
+        current.refill().unique_id = 1;
+        let held = current.published();
+        assert_eq!(held.unique_id, 1);
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
+
+        drop(current);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 0));
+        assert!(alloc().is_err(), "the held publish still holds the pool");
+
+        drop(held);
+        assert_eq!((pool.num_alloc_buffers(), pool.num_free_buffers()), (1, 1));
+        assert!(alloc().is_ok());
     }
 
     /// A frame takes a free buffer that holds it, as an alloc does, and is

@@ -2788,7 +2788,7 @@ mod tests {
         write_at(&tx, -1, 23).unwrap();
         assert!(matches!(
             write_at(&tx, 2, 24),
-            Err(AsynError::AddressOutOfRange(2))
+            Err(AsynError::ParamInvalidList(2))
         ));
         assert_eq!(*seen.lock(), vec![1, 0, -1, 2]);
         // List 1's callback is not list 0's; -1 calls back on list 0.

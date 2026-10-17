@@ -1316,6 +1316,45 @@ fn convert_param_array_to_iface(
     }
 }
 
+/// `a` as `T` elements, its whole capacity kept: shared when it already
+/// holds `T`, cast element by element otherwise.
+fn share_or_cast_buf<S: Copy + 'static, T: Copy + 'static>(
+    a: epics_base_rs::types::SharedArray<S>,
+    cast: impl Fn(S) -> T,
+) -> epics_base_rs::types::SharedArray<T> {
+    use epics_base_rs::types::SharedArray;
+    if let Some(same) = (&a as &dyn std::any::Any).downcast_ref::<SharedArray<T>>() {
+        return same.clone();
+    }
+    let mut out: SharedArray<T> = a.buffer().iter().map(|&x| cast(x)).collect();
+    out.truncate(a.len());
+    out
+}
+
+/// The record's array buffer as `$t` elements for an array read, as C passes
+/// `bptr` (devAsynXXXArray.cpp:352); a same-width FTVL C reinterprets is an
+/// `as` cast. A value that is no array gives an empty buffer.
+macro_rules! record_read_buf {
+    ($val:expr, $t:ty) => {
+        match $val {
+            Some(EpicsValue::CharArray(a)) | Some(EpicsValue::UCharArray(a)) => {
+                share_or_cast_buf(a, |x| x as $t)
+            }
+            Some(EpicsValue::ShortArray(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::UShortArray(a)) | Some(EpicsValue::EnumArray(a)) => {
+                share_or_cast_buf(a, |x| x as $t)
+            }
+            Some(EpicsValue::LongArray(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::ULongArray(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::Int64Array(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::UInt64Array(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::FloatArray(a)) => share_or_cast_buf(a, |x| x as $t),
+            Some(EpicsValue::DoubleArray(a)) => share_or_cast_buf(a, |x| x as $t),
+            _ => epics_base_rs::types::SharedArray::default(),
+        }
+    };
+}
+
 /// An element type a request op carries its data in.
 trait OpData: Sized {
     fn buffer(op: RequestOp) -> Option<Vec<Self>>;
@@ -2128,8 +2167,9 @@ impl AsynDeviceSupport {
         let _ = record.put_field("EOFF", EpicsValue::Double(eoff));
     }
 
-    /// Build a `RequestOp` for reading the current interface type.
-    fn read_op(&self) -> Option<RequestOp> {
+    /// Build a `RequestOp` for reading the current interface type; an array
+    /// read carries `record`'s buffer.
+    fn read_op(&self, record: &dyn Record) -> Option<RequestOp> {
         match self.iface_type.as_str() {
             "asynInt32" => Some(RequestOp::Int32Read),
             "asynInt64" => Some(RequestOp::Int64Read),
@@ -2163,21 +2203,27 @@ impl AsynDeviceSupport {
             "asynUInt32Digital" => Some(RequestOp::UInt32DigitalRead { mask: self.mask }),
             "asynEnum" => Some(RequestOp::EnumRead),
             "asynInt8Array" => Some(RequestOp::Int8ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), i8),
                 max_elements: self.max_array_elements,
             }),
             "asynInt16Array" => Some(RequestOp::Int16ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), i16),
                 max_elements: self.max_array_elements,
             }),
             "asynInt32Array" => Some(RequestOp::Int32ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), i32),
                 max_elements: self.max_array_elements,
             }),
             "asynInt64Array" => Some(RequestOp::Int64ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), i64),
                 max_elements: self.max_array_elements,
             }),
             "asynFloat32Array" => Some(RequestOp::Float32ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), f32),
                 max_elements: self.max_array_elements,
             }),
             "asynFloat64Array" => Some(RequestOp::Float64ArrayRead {
+                buf: record_read_buf!(record.get_field("VAL"), f64),
                 max_elements: self.max_array_elements,
             }),
             _ => None,
@@ -3138,7 +3184,7 @@ impl DeviceSupport for AsynDeviceSupport {
 
         let mut read_back = false;
         if self.initial_readback {
-            if let Some(op) = self.read_op() {
+            if let Some(op) = self.read_op(&*record) {
                 let user = self.init_user();
                 if let Ok(mut result) = self.handle.submit_blocking(op, user) {
                     Int32Mask::apply_to_read(self.int32_mask, &mut result);
@@ -3545,7 +3591,9 @@ impl DeviceSupport for AsynDeviceSupport {
                 self.report_queued(ran.as_ref().err());
                 Some(ran)
             }
-            None => self.read_op().map(|op| self.submit_read(op, &*record)),
+            None => self
+                .read_op(&*record)
+                .map(|op| self.submit_read(op, &*record)),
         };
         if let Some(ran) = ran {
             match ran {
@@ -3762,7 +3810,7 @@ impl DeviceSupport for AsynDeviceSupport {
         let op = if self.write_only {
             self.write_only_op(&*record)
         } else {
-            self.read_op()
+            self.read_op(&*record)
         };
         let Some(op) = op else {
             return Ok(ReadStart::Synchronous);
@@ -9314,6 +9362,88 @@ mod tests {
         assert_eq!(ads.last_alarm().map(|a| (a.stat, a.sevr)), None);
     }
 
+    /// A driver that draws into the read buffer: it marks element 0 and
+    /// keeps the rest, as a C driver drawing into `bptr` does.
+    struct DrawPort {
+        base: PortDriverBase,
+    }
+    impl PortDriver for DrawPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+            buf[0] = 7;
+            Ok(3)
+        }
+        fn read_int8_array(&mut self, _user: &AsynUser, buf: &mut [i8]) -> AsynResult<usize> {
+            buf[0] = -1;
+            Ok(3)
+        }
+    }
+
+    fn draw_port_adapter(iface: &str, param: ParamType) -> AsynDeviceSupport {
+        let mut base = PortDriverBase::new("draw", 1, PortFlags::default());
+        base.create_param("VAL", param).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(DrawPort { base }), rx);
+        let actor_link = actor.link();
+        std::thread::Builder::new()
+            .name("test-draw-actor".into())
+            .spawn(actor.registered())
+            .unwrap();
+        let handle = PortHandle::new(
+            tx,
+            "draw".into(),
+            Arc::new(InterruptManager::new()),
+            actor_link,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+        let link = AsynLink {
+            port_name: "draw".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.set_record_info("TEST:DRAW", ScanType::Passive);
+        ads
+    }
+
+    /// C reads into the record's own buffer (devAsynXXXArray.cpp:352), so a
+    /// driver drawing into it sees what a caput left there.
+    #[test]
+    fn an_array_read_hands_the_driver_the_records_contents() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = draw_port_adapter("asynInt32Array", ParamType::Int32Array);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+        rec.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3].into()))
+            .unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![7, 2, 3].into())));
+    }
+
+    /// The same through a cast: a UCHAR waveform on asynInt8Array.
+    #[test]
+    fn an_int8_array_read_hands_the_driver_the_records_bytes() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = draw_port_adapter("asynInt8Array", ParamType::Int8Array);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Char);
+        ads.init(&mut rec).unwrap();
+        rec.put_field("VAL", EpicsValue::CharArray(vec![1, 2, 3].into()))
+            .unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::CharArray(vec![255, 2, 3].into()))
+        );
+    }
+
     /// Array dsets gate the same way (devAsynXXXArray.cpp:317 copies bptr/nord
     /// only on `rp->status == asynSuccess`) but use READ_ALARM as the default
     /// EVEN for aao output (the single shared process(), :330-331). So an array
@@ -11055,14 +11185,14 @@ mod tests {
         ads.octet_max_size = 128;
 
         // No command → plain read.
-        match ads.read_op() {
+        match ads.read_op(&epics_base_rs::server::records::ai::AiRecord::new(0.0)) {
             Some(RequestOp::OctetRead { buf_size }) => assert_eq!(buf_size, 128),
             other => panic!("expected OctetRead, got {other:?}"),
         }
 
         // Command cached → write-then-read carrying the command bytes.
         ads.octet_cmd = Some(b"*IDN?\r\n".to_vec());
-        match ads.read_op() {
+        match ads.read_op(&epics_base_rs::server::records::ai::AiRecord::new(0.0)) {
             Some(RequestOp::OctetWriteRead {
                 data,
                 buf_size,

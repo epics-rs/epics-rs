@@ -928,6 +928,9 @@ pub enum RequestOp {
     },
     /// Read an i32 array.
     Int32ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<i32>,
         max_elements: usize,
     },
     /// Write an i32 array.
@@ -936,6 +939,9 @@ pub enum RequestOp {
     },
     /// Read an f64 array.
     Float64ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<f64>,
         max_elements: usize,
     },
     /// Write an f64 array.
@@ -944,6 +950,9 @@ pub enum RequestOp {
     },
     /// Read an i8 array.
     Int8ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<i8>,
         max_elements: usize,
     },
     /// Write an i8 array.
@@ -952,6 +961,9 @@ pub enum RequestOp {
     },
     /// Read an i16 array.
     Int16ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<i16>,
         max_elements: usize,
     },
     /// Write an i16 array.
@@ -960,6 +972,9 @@ pub enum RequestOp {
     },
     /// Read an i64 array.
     Int64ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<i64>,
         max_elements: usize,
     },
     /// Write an i64 array.
@@ -968,6 +983,9 @@ pub enum RequestOp {
     },
     /// Read an f32 array.
     Float32ArrayRead {
+        /// The caller's buffer, read in place as C passes the record's
+        /// `bptr` (devAsynXXXArray.cpp:352): the driver sees its contents.
+        buf: SharedArray<f32>,
         max_elements: usize,
     },
     /// Write an f32 array.

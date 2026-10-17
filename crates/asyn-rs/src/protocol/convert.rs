@@ -45,27 +45,33 @@ impl From<&RequestOp> for PortCommand {
             },
             RequestOp::EnumRead => Self::EnumRead,
             RequestOp::EnumWrite { index } => Self::EnumWrite { index: *index },
-            RequestOp::Int32ArrayRead { max_elements } => Self::Int32ArrayRead {
+            RequestOp::Int32ArrayRead { buf, max_elements } => Self::Int32ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int32ArrayWrite { data } => Self::Int32ArrayWrite { data: data.clone() },
-            RequestOp::Float64ArrayRead { max_elements } => Self::Float64ArrayRead {
+            RequestOp::Float64ArrayRead { buf, max_elements } => Self::Float64ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Float64ArrayWrite { data } => Self::Float64ArrayWrite { data: data.clone() },
-            RequestOp::Int8ArrayRead { max_elements } => Self::Int8ArrayRead {
+            RequestOp::Int8ArrayRead { buf, max_elements } => Self::Int8ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int8ArrayWrite { data } => Self::Int8ArrayWrite { data: data.clone() },
-            RequestOp::Int16ArrayRead { max_elements } => Self::Int16ArrayRead {
+            RequestOp::Int16ArrayRead { buf, max_elements } => Self::Int16ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int16ArrayWrite { data } => Self::Int16ArrayWrite { data: data.clone() },
-            RequestOp::Int64ArrayRead { max_elements } => Self::Int64ArrayRead {
+            RequestOp::Int64ArrayRead { buf, max_elements } => Self::Int64ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Int64ArrayWrite { data } => Self::Int64ArrayWrite { data: data.clone() },
-            RequestOp::Float32ArrayRead { max_elements } => Self::Float32ArrayRead {
+            RequestOp::Float32ArrayRead { buf, max_elements } => Self::Float32ArrayRead {
+                data: buf.to_vec(),
                 max_elements: *max_elements,
             },
             RequestOp::Float32ArrayWrite { data } => Self::Float32ArrayWrite { data: data.clone() },
@@ -176,29 +182,35 @@ impl From<&PortCommand> for RequestOp {
             },
             PortCommand::EnumRead => Self::EnumRead,
             PortCommand::EnumWrite { index } => Self::EnumWrite { index: *index },
-            PortCommand::Int32ArrayRead { max_elements } => Self::Int32ArrayRead {
+            PortCommand::Int32ArrayRead { data, max_elements } => Self::Int32ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int32ArrayWrite { data } => Self::Int32ArrayWrite { data: data.clone() },
-            PortCommand::Float64ArrayRead { max_elements } => Self::Float64ArrayRead {
+            PortCommand::Float64ArrayRead { data, max_elements } => Self::Float64ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Float64ArrayWrite { data } => {
                 Self::Float64ArrayWrite { data: data.clone() }
             }
-            PortCommand::Int8ArrayRead { max_elements } => Self::Int8ArrayRead {
+            PortCommand::Int8ArrayRead { data, max_elements } => Self::Int8ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int8ArrayWrite { data } => Self::Int8ArrayWrite { data: data.clone() },
-            PortCommand::Int16ArrayRead { max_elements } => Self::Int16ArrayRead {
+            PortCommand::Int16ArrayRead { data, max_elements } => Self::Int16ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int16ArrayWrite { data } => Self::Int16ArrayWrite { data: data.clone() },
-            PortCommand::Int64ArrayRead { max_elements } => Self::Int64ArrayRead {
+            PortCommand::Int64ArrayRead { data, max_elements } => Self::Int64ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Int64ArrayWrite { data } => Self::Int64ArrayWrite { data: data.clone() },
-            PortCommand::Float32ArrayRead { max_elements } => Self::Float32ArrayRead {
+            PortCommand::Float32ArrayRead { data, max_elements } => Self::Float32ArrayRead {
+                buf: data.as_slice().into(),
                 max_elements: *max_elements,
             },
             PortCommand::Float32ArrayWrite { data } => {
@@ -411,11 +423,17 @@ mod tests {
             },
             RequestOp::EnumRead,
             RequestOp::EnumWrite { index: 2 },
-            RequestOp::Int32ArrayRead { max_elements: 100 },
+            RequestOp::Int32ArrayRead {
+                buf: Default::default(),
+                max_elements: 100,
+            },
             RequestOp::Int32ArrayWrite {
                 data: vec![1, 2, 3],
             },
-            RequestOp::Float64ArrayRead { max_elements: 50 },
+            RequestOp::Float64ArrayRead {
+                buf: Default::default(),
+                max_elements: 50,
+            },
             RequestOp::Float64ArrayWrite {
                 data: vec![1.0, 2.0],
             },

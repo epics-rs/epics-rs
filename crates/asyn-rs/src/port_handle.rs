@@ -1013,7 +1013,13 @@ impl PortHandle {
     ) -> AsynResult<SharedArray<i32>> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self
-            .submit_async(RequestOp::Int32ArrayRead { max_elements }, user)
+            .submit_async(
+                RequestOp::Int32ArrayRead {
+                    buf: SharedArray::default(),
+                    max_elements,
+                },
+                user,
+            )
             .await?;
         result.int32_array.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
@@ -1041,7 +1047,13 @@ impl PortHandle {
     ) -> AsynResult<SharedArray<f64>> {
         let user = AsynUser::new(reason).with_addr(addr);
         let result = self
-            .submit_async(RequestOp::Float64ArrayRead { max_elements }, user)
+            .submit_async(
+                RequestOp::Float64ArrayRead {
+                    buf: SharedArray::default(),
+                    max_elements,
+                },
+                user,
+            )
             .await?;
         result.float64_array.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
@@ -3664,31 +3676,55 @@ mod tests {
             }
         };
         assert_eq!(
-            rd(RequestOp::Int8ArrayRead { max_elements: 8 }, 1)
-                .await
-                .int8_array
-                .unwrap(),
+            rd(
+                RequestOp::Int8ArrayRead {
+                    buf: Default::default(),
+                    max_elements: 8
+                },
+                1
+            )
+            .await
+            .int8_array
+            .unwrap(),
             vec![-1i8, 2]
         );
         assert_eq!(
-            rd(RequestOp::Int16ArrayRead { max_elements: 8 }, 2)
-                .await
-                .int16_array
-                .unwrap(),
+            rd(
+                RequestOp::Int16ArrayRead {
+                    buf: Default::default(),
+                    max_elements: 8
+                },
+                2
+            )
+            .await
+            .int16_array
+            .unwrap(),
             vec![7i16, -8]
         );
         assert_eq!(
-            rd(RequestOp::Int64ArrayRead { max_elements: 8 }, 3)
-                .await
-                .int64_array
-                .unwrap(),
+            rd(
+                RequestOp::Int64ArrayRead {
+                    buf: Default::default(),
+                    max_elements: 8
+                },
+                3
+            )
+            .await
+            .int64_array
+            .unwrap(),
             vec![1i64 << 40]
         );
         assert_eq!(
-            rd(RequestOp::Float32ArrayRead { max_elements: 8 }, 4)
-                .await
-                .float32_array
-                .unwrap(),
+            rd(
+                RequestOp::Float32ArrayRead {
+                    buf: Default::default(),
+                    max_elements: 8
+                },
+                4
+            )
+            .await
+            .float32_array
+            .unwrap(),
             vec![1.5f32]
         );
     }

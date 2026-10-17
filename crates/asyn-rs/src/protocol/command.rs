@@ -51,36 +51,48 @@ pub enum PortCommand {
         index: usize,
     },
     Int32ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i32>,
         max_elements: usize,
     },
     Int32ArrayWrite {
         data: Vec<i32>,
     },
     Float64ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<f64>,
         max_elements: usize,
     },
     Float64ArrayWrite {
         data: Vec<f64>,
     },
     Int8ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i8>,
         max_elements: usize,
     },
     Int8ArrayWrite {
         data: Vec<i8>,
     },
     Int16ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i16>,
         max_elements: usize,
     },
     Int16ArrayWrite {
         data: Vec<i16>,
     },
     Int64ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<i64>,
         max_elements: usize,
     },
     Int64ArrayWrite {
         data: Vec<i64>,
     },
     Float32ArrayRead {
+        /// The caller's buffer contents the driver reads into.
+        data: Vec<f32>,
         max_elements: usize,
     },
     Float32ArrayWrite {
@@ -258,11 +270,17 @@ mod tests {
             },
             PortCommand::EnumRead,
             PortCommand::EnumWrite { index: 2 },
-            PortCommand::Int32ArrayRead { max_elements: 100 },
+            PortCommand::Int32ArrayRead {
+                data: vec![],
+                max_elements: 100,
+            },
             PortCommand::Int32ArrayWrite {
                 data: vec![1, 2, 3],
             },
-            PortCommand::Float64ArrayRead { max_elements: 50 },
+            PortCommand::Float64ArrayRead {
+                data: vec![],
+                max_elements: 50,
+            },
             PortCommand::Float64ArrayWrite {
                 data: vec![1.0, 2.0],
             },

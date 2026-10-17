@@ -2230,60 +2230,59 @@ impl PortActor {
                 self.driver.write_enum(user, *index)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Int32ArrayRead { max_elements } => {
-                let mut buf: SharedArray<i32> = std::iter::repeat_n(0i32, *max_elements).collect();
-                let n = self.driver.read_int32_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Int32ArrayRead { buf, max_elements } => {
+                let buf = read_in_place(buf, *max_elements, |b| {
+                    self.driver.read_int32_array(user, b)
+                })?;
                 Ok(RequestResult::int32_array_read(buf))
             }
             RequestOp::Int32ArrayWrite { data } => {
                 self.driver.write_int32_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Float64ArrayRead { max_elements } => {
-                let mut buf: SharedArray<f64> = std::iter::repeat_n(0f64, *max_elements).collect();
-                let n = self.driver.read_float64_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Float64ArrayRead { buf, max_elements } => {
+                let buf = read_in_place(buf, *max_elements, |b| {
+                    self.driver.read_float64_array(user, b)
+                })?;
                 Ok(RequestResult::float64_array_read(buf))
             }
             RequestOp::Float64ArrayWrite { data } => {
                 self.driver.write_float64_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Int8ArrayRead { max_elements } => {
-                let mut buf: SharedArray<i8> = std::iter::repeat_n(0i8, *max_elements).collect();
-                let n = self.driver.read_int8_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Int8ArrayRead { buf, max_elements } => {
+                let buf =
+                    read_in_place(buf, *max_elements, |b| self.driver.read_int8_array(user, b))?;
                 Ok(RequestResult::int8_array_read(buf))
             }
             RequestOp::Int8ArrayWrite { data } => {
                 self.driver.write_int8_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Int16ArrayRead { max_elements } => {
-                let mut buf: SharedArray<i16> = std::iter::repeat_n(0i16, *max_elements).collect();
-                let n = self.driver.read_int16_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Int16ArrayRead { buf, max_elements } => {
+                let buf = read_in_place(buf, *max_elements, |b| {
+                    self.driver.read_int16_array(user, b)
+                })?;
                 Ok(RequestResult::int16_array_read(buf))
             }
             RequestOp::Int16ArrayWrite { data } => {
                 self.driver.write_int16_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Int64ArrayRead { max_elements } => {
-                let mut buf: SharedArray<i64> = std::iter::repeat_n(0i64, *max_elements).collect();
-                let n = self.driver.read_int64_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Int64ArrayRead { buf, max_elements } => {
+                let buf = read_in_place(buf, *max_elements, |b| {
+                    self.driver.read_int64_array(user, b)
+                })?;
                 Ok(RequestResult::int64_array_read(buf))
             }
             RequestOp::Int64ArrayWrite { data } => {
                 self.driver.write_int64_array(user, data)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::Float32ArrayRead { max_elements } => {
-                let mut buf: SharedArray<f32> = std::iter::repeat_n(0f32, *max_elements).collect();
-                let n = self.driver.read_float32_array(user, buf.make_mut())?;
-                buf.truncate(n);
+            RequestOp::Float32ArrayRead { buf, max_elements } => {
+                let buf = read_in_place(buf, *max_elements, |b| {
+                    self.driver.read_float32_array(user, b)
+                })?;
                 Ok(RequestResult::float32_array_read(buf))
             }
             RequestOp::Float32ArrayWrite { data } => {
@@ -2542,6 +2541,20 @@ impl PortCalls for ActorCalls<'_> {
         self.0.link_user(&mut user);
         self.0.dispatch_io(&mut user, op)
     }
+}
+
+/// An array read into the caller's buffer: the driver sees its contents, as
+/// a C driver sees the record's `bptr`, and a driver that leaves them alone
+/// returns them. A buffer still shared with its owner is copied once.
+fn read_in_place<T: Clone + Default>(
+    buf: &SharedArray<T>,
+    max_elements: usize,
+    read: impl FnOnce(&mut [T]) -> AsynResult<usize>,
+) -> AsynResult<SharedArray<T>> {
+    let mut buf = buf.clone();
+    let n = read(buf.make_mut_resized(max_elements, T::default()))?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// Combine a param's stored asynStatus with its explicit setParamAlarm into

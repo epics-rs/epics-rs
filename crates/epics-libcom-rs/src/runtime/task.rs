@@ -595,24 +595,6 @@ pub fn background_scan_once(
     background().scan_once().scan_once(name, cb)
 }
 
-/// Poll `fut` once on the calling thread and, if it suspends, finish it on
-/// `priority`'s band. C's `onceTask` runs `dbProcess` on the scanOnce thread;
-/// a record that goes asynchronous there completes later from a callback,
-/// which is what the band continuation is. Parking the facility thread
-/// instead is what [`block_on_sync`] refuses.
-pub fn poll_here_then_background<F>(priority: CallbackPriority, fut: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let mut fut = Box::pin(fut);
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    if fut.as_mut().poll(&mut cx).is_pending() {
-        // The first band poll re-registers a real waker; a wake that hit the
-        // no-op one in between is seen by that poll.
-        spawn_background(priority, fut);
-    }
-}
-
 /// Ring statistics for the `scanOnce` facility, or `None` before the
 /// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
 /// and its `if (!onceQ) return -1` guard.

@@ -55,20 +55,17 @@ impl PvDatabase {
     /// no Passive gate, because no put of the caller's processes the record.
     ///
     /// Queued on the libcom `scanOnce` ring and processed on its one thread,
-    /// so a full ring drops the request with C's overflow line.
+    /// so a full ring drops the request with C's overflow line. The frame
+    /// runs to its end on that thread, as C's `onceTask` holds `dbScanLock`
+    /// through `dbProcess`: the next request cannot start before it.
     pub fn scan_once(&self, name: &[u8]) {
         let db = self.clone();
         let record = RecordName::from(name);
         let _ = crate::runtime::task::background_scan_once(
             &String::from_utf8_lossy(name),
             Box::new(move || {
-                crate::runtime::task::poll_here_then_background(
-                    crate::runtime::task::CallbackPriority::Medium,
-                    async move {
-                        let mut visited = ProcStack::new();
-                        let _ = db.process_record_with_links(&record, &mut visited).await;
-                    },
-                );
+                let mut visited = ProcStack::new();
+                let _ = db.process_record_with_links_sync(record.as_bytes(), &mut visited);
             }),
         );
     }

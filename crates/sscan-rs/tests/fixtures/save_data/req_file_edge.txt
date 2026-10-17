@@ -1,0 +1,179 @@
+file name: edge.req
+macros:
+ $(P)= dup:
+ $(BIG)= 0123456789012345678
+ $(LONGNAME)= toolongname
+ $(Q)= q
+ $(P)= ioc:
+goto prefix = 0
+  id 4 'dup:' eos=1 cur=-1
+goto status = 0
+  id -1 '' eos=0 cur=115
+goto message = -1
+goto filename = 0
+  id 13 'dup:qfileName' eos=1 cur=-1
+goto fullPathName = -1
+goto counter = 0
+  id -1 '' eos=0 cur=83
+goto fileSystem = 0
+  id 60 'dup:01234567890123456780123456789012345678012345678901234567' eos=0 cur=36
+goto subdir = -1
+goto basename = -1
+goto realTime1D = -1
+goto noSuch = -1
+goto averyveryveryverylon = -1
+goto noclose = -1
+  scan 9 'dup:scan1'
+  , 9 'handshake'
+  scan 9 'dup:scan2'
+  , 15 'dup:scan2.AWAIT'
+  scan 9 'dup:scan3'
+  extra 5 'dup:a'
+  desc 10 'first desc'
+  extra 5 'dup:b'
+  desc 19 'unterminated
+$(P)c
+'
+next status
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  5 'UNDEF'
+  0 ''
+  stuck at 41
+  15 'saveData_status'
+next filename
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'Q'
+  0 ''
+  stuck at 41
+  8 'fileName'
+next counter
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  9 'LONGNAMES'
+  0 ''
+  stuck at 41
+  1 'x'
+next fileSystem
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  3 'BIG'
+  0 ''
+  stuck at 41
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  3 'BIG'
+  0 ''
+  stuck at 41
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  3 'BIG'
+  0 ''
+  stuck at 41
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  3 'BIG'
+  0 ''
+  stuck at 41
+  4 'tail'
+next scanRecord
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan1'
+  0 ''
+  stuck at 44
+  9 'handshake'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan2'
+  0 ''
+  stuck at 44
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scan2.AWAIT'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan3'
+next extraPV
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  1 'a'
+  0 ''
+  stuck at 34
+  5 'first'
+  4 'desc'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  1 'b'
+  0 ''
+  stuck at 34
+  12 'unterminated'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  1 'c'

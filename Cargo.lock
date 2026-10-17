@@ -3836,6 +3836,9 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
+ "futures-util",
+ "parking_lot",
+ "tempfile",
  "tokio",
  "tracing",
 ]

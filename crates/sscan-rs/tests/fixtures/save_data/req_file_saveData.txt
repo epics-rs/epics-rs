@@ -1,0 +1,833 @@
+file name: saveData.req
+macros:
+ $(P)= xxx:
+goto prefix = 0
+  id 4 'xxx:' eos=1 cur=-1
+goto status = 0
+  id 19 'xxx:saveData_status' eos=1 cur=-1
+goto message = 0
+  id 20 'xxx:saveData_message' eos=1 cur=-1
+goto filename = 0
+  id 21 'xxx:saveData_fileName' eos=1 cur=-1
+goto fullPathName = 0
+  id 25 'xxx:saveData_fullPathName' eos=1 cur=-1
+goto counter = 0
+  id 23 'xxx:saveData_scanNumber' eos=1 cur=-1
+goto fileSystem = 0
+  id 23 'xxx:saveData_fileSystem' eos=1 cur=-1
+goto subdir = 0
+  id 19 'xxx:saveData_subDir' eos=1 cur=-1
+goto basename = 0
+  id 21 'xxx:saveData_baseName' eos=1 cur=-1
+goto realTime1D = 0
+  id 23 'xxx:saveData_realTime1D' eos=1 cur=-1
+goto noSuch = -1
+goto averyveryveryverylon = -1
+goto noclose = -1
+  scan 9 'xxx:scanH'
+  scan 9 'xxx:scan1'
+  scan 9 'xxx:scan2'
+  scan 9 'xxx:scan3'
+  scan 9 'xxx:scan4'
+  extra 21 'xxx:saveData_comment1'
+  extra 21 'xxx:saveData_comment2'
+  extra 14 'xxx:scaler1.TP'
+  extra 15 'xxx:scaler1.NM1'
+  extra 15 'xxx:scaler1.NM2'
+  extra 15 'xxx:scaler1.NM3'
+  extra 15 'xxx:scaler1.NM4'
+  extra 15 'xxx:scaler1.NM5'
+  extra 15 'xxx:scaler1.NM6'
+  extra 15 'xxx:scaler1.NM7'
+  extra 15 'xxx:scaler1.NM8'
+  extra 16 'xxx:scaler1.FREQ'
+  extra 14 'xxx:scan1.P1SM'
+  desc 9 'scan mode'
+  extra 13 'xxx:mca1.NUSE'
+  desc 9 'CHANNELS:'
+  extra 13 'xxx:mca1.ERTM'
+  desc 10 'REAL_TIME:'
+  extra 13 'xxx:mca1.ELTM'
+  desc 10 'LIVE_TIME:'
+  extra 13 'xxx:mca1.CALO'
+  desc 11 'CAL_OFFSET:'
+  extra 13 'xxx:mca1.CALS'
+  desc 10 'CAL_SLOPE:'
+  extra 13 'xxx:mca1.CALQ'
+  desc 9 'CAL_QUAD:'
+  extra 12 'xxx:mca1.TTH'
+  desc 10 'TWO_THETA:'
+  extra 13 'xxx:mca1.R0LO'
+  desc 11 'ROI_0_LEFT:'
+  extra 13 'xxx:mca1.R0HI'
+  desc 12 'ROI_0_RIGHT:'
+  extra 13 'xxx:mca1.R0NM'
+  desc 12 'ROI_0_LABEL:'
+  extra 13 'xxx:mca1.R1LO'
+  desc 11 'ROI_1_LEFT:'
+  extra 13 'xxx:mca1.R1HI'
+  desc 12 'ROI_1_RIGHT:'
+  extra 13 'xxx:mca1.R1NM'
+  desc 12 'ROI_1_LABEL:'
+  extra 13 'xxx:mca1.R2LO'
+  desc 11 'ROI_2_LEFT:'
+  extra 13 'xxx:mca1.R2HI'
+  desc 12 'ROI_2_RIGHT:'
+  extra 13 'xxx:mca1.R2NM'
+  desc 12 'ROI_2_LABEL:'
+  extra 13 'xxx:mca1.R3LO'
+  desc 11 'ROI_3_LEFT:'
+  extra 13 'xxx:mca1.R3HI'
+  desc 12 'ROI_3_RIGHT:'
+  extra 13 'xxx:mca1.R3NM'
+  desc 12 'ROI_3_LABEL:'
+  extra 13 'xxx:mca1.R4LO'
+  desc 11 'ROI_4_LEFT:'
+  extra 13 'xxx:mca1.R4HI'
+  desc 12 'ROI_4_RIGHT:'
+  extra 13 'xxx:mca1.R4NM'
+  desc 12 'ROI_4_LABEL:'
+  extra 13 'xxx:mca1.R5LO'
+  desc 11 'ROI_5_LEFT:'
+  extra 13 'xxx:mca1.R5HI'
+  desc 12 'ROI_5_RIGHT:'
+  extra 13 'xxx:mca1.R5NM'
+  desc 12 'ROI_5_LABEL:'
+  extra 13 'xxx:mca1.R6LO'
+  desc 11 'ROI_6_LEFT:'
+  extra 13 'xxx:mca1.R6HI'
+  desc 12 'ROI_6_RIGHT:'
+  extra 13 'xxx:mca1.R6NM'
+  desc 12 'ROI_6_LABEL:'
+  extra 13 'xxx:mca1.R7LO'
+  desc 11 'ROI_7_LEFT:'
+  extra 13 'xxx:mca1.R7HI'
+  desc 12 'ROI_7_RIGHT:'
+  extra 13 'xxx:mca1.R7NM'
+  desc 12 'ROI_7_LABEL:'
+  extra 13 'xxx:mca1.R8LO'
+  desc 11 'ROI_8_LEFT:'
+  extra 13 'xxx:mca1.R8HI'
+  desc 12 'ROI_8_RIGHT:'
+  extra 13 'xxx:mca1.R8NM'
+  desc 12 'ROI_8_LABEL:'
+  extra 13 'xxx:mca1.R9LO'
+  desc 11 'ROI_9_LEFT:'
+  extra 13 'xxx:mca1.R9HI'
+  desc 12 'ROI_9_RIGHT:'
+  extra 13 'xxx:mca1.R9NM'
+  desc 12 'ROI_9_LABEL:'
+next status
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  15 'saveData_status'
+next message
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  16 'saveData_message'
+next filename
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  17 'saveData_fileName'
+next counter
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  19 'saveData_scanNumber'
+next fileSystem
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  19 'saveData_fileSystem'
+next subdir
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  15 'saveData_subDir'
+next basename
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  17 'saveData_baseName'
+next fullPathName
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  21 'saveData_fullPathName'
+next realTime1D
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  19 'saveData_realTime1D'
+next scanRecord
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scanH'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan1'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan2'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan3'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  5 'scan4'
+next extraPV
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  17 'saveData_comment1'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  17 'saveData_comment2'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  10 'scaler1.TP'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM1'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM2'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM3'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM4'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM5'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM6'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM7'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  11 'scaler1.NM8'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  12 'scaler1.FREQ'
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  10 'scan1.P1SM'
+  0 ''
+  stuck at 34
+  4 'scan'
+  4 'mode'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.NUSE'
+  0 ''
+  stuck at 34
+  9 'CHANNELS:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.ERTM'
+  0 ''
+  stuck at 34
+  10 'REAL_TIME:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.ELTM'
+  0 ''
+  stuck at 34
+  10 'LIVE_TIME:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.CALO'
+  0 ''
+  stuck at 34
+  11 'CAL_OFFSET:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.CALS'
+  0 ''
+  stuck at 34
+  10 'CAL_SLOPE:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.CALQ'
+  0 ''
+  stuck at 34
+  9 'CAL_QUAD:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  8 'mca1.TTH'
+  0 ''
+  stuck at 34
+  10 'TWO_THETA:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R0LO'
+  0 ''
+  stuck at 34
+  11 'ROI_0_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R0HI'
+  0 ''
+  stuck at 34
+  12 'ROI_0_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R0NM'
+  0 ''
+  stuck at 34
+  12 'ROI_0_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R1LO'
+  0 ''
+  stuck at 34
+  11 'ROI_1_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R1HI'
+  0 ''
+  stuck at 34
+  12 'ROI_1_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R1NM'
+  0 ''
+  stuck at 34
+  12 'ROI_1_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R2LO'
+  0 ''
+  stuck at 34
+  11 'ROI_2_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R2HI'
+  0 ''
+  stuck at 34
+  12 'ROI_2_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R2NM'
+  0 ''
+  stuck at 34
+  12 'ROI_2_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R3LO'
+  0 ''
+  stuck at 34
+  11 'ROI_3_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R3HI'
+  0 ''
+  stuck at 34
+  12 'ROI_3_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R3NM'
+  0 ''
+  stuck at 34
+  12 'ROI_3_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R4LO'
+  0 ''
+  stuck at 34
+  11 'ROI_4_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R4HI'
+  0 ''
+  stuck at 34
+  12 'ROI_4_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R4NM'
+  0 ''
+  stuck at 34
+  12 'ROI_4_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R5LO'
+  0 ''
+  stuck at 34
+  11 'ROI_5_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R5HI'
+  0 ''
+  stuck at 34
+  12 'ROI_5_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R5NM'
+  0 ''
+  stuck at 34
+  12 'ROI_5_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R6LO'
+  0 ''
+  stuck at 34
+  11 'ROI_6_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R6HI'
+  0 ''
+  stuck at 34
+  12 'ROI_6_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R6NM'
+  0 ''
+  stuck at 34
+  12 'ROI_6_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R7LO'
+  0 ''
+  stuck at 34
+  11 'ROI_7_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R7HI'
+  0 ''
+  stuck at 34
+  12 'ROI_7_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R7NM'
+  0 ''
+  stuck at 34
+  12 'ROI_7_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R8LO'
+  0 ''
+  stuck at 34
+  11 'ROI_8_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R8HI'
+  0 ''
+  stuck at 34
+  12 'ROI_8_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R8NM'
+  0 ''
+  stuck at 34
+  12 'ROI_8_LABEL:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R9LO'
+  0 ''
+  stuck at 34
+  11 'ROI_9_LEFT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R9HI'
+  0 ''
+  stuck at 34
+  12 'ROI_9_RIGHT:'
+  0 ''
+  stuck at 34
+  0 ''
+  stuck at 36
+  0 ''
+  stuck at 40
+  1 'P'
+  0 ''
+  stuck at 41
+  9 'mca1.R9NM'
+  0 ''
+  stuck at 34
+  12 'ROI_9_LABEL:'
+  0 ''
+  stuck at 34

@@ -10,11 +10,14 @@ repository.workspace = true
 [dependencies]
 chrono = "0.4"
 epics-base-rs = { workspace = true }
+futures-util = "0.3"
+parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 
 [features]
 
 [dev-dependencies]
+tempfile = "3"
 epics-ca-rs = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -189,10 +189,11 @@ fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
 /// never raises an alarm from it, and neither does this port.
 ///
 /// `dbpr`'s `TIME` row is the second C caller (`dbTest.c:1228-1231`), with the
-/// same 40-byte buffer, which is why this is `pub(crate)` rather than private
-/// to the soft timestamp device: two renderers of one C routine would be two
-/// answers to "what does an unset stamp look like".
-pub(crate) fn epics_time_to_strftime(format: &str, ts: WallTime) -> String {
+/// same 40-byte buffer, and sscan's saveData the third (its scan stamps), which
+/// is why this is shared rather than private to the soft timestamp device: two
+/// renderers of one C routine would be two answers to "what does an unset
+/// stamp look like".
+pub fn epics_time_to_strftime(format: &str, ts: WallTime) -> String {
     let (sec_past_epoch, nsec) = epics_time_parts(ts);
     let mut out = String::new();
     // C `bufLength` = `sizeof prec->val` = STRINGIN_VAL_BYTES; `bufLenLeft`

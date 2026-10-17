@@ -1,0 +1,89 @@
+[prefix]
+$(P)
+
+[status]
+$(P)saveData_status
+
+[message]
+$(P)saveData_message
+
+[filename]
+$(P)saveData_fileName
+
+[counter]	# scan counter
+$(P)saveData_scanNumber
+
+[fileSystem] # scan file system
+$(P)saveData_fileSystem
+
+[subdir]	# scan file subdirectory
+$(P)saveData_subDir
+
+[basename]	# PV containing the desired data-file base name
+$(P)saveData_baseName
+
+[fullPathName]
+$(P)saveData_fullPathName
+
+[realTime1D] # if nonzero, write 1D data as it comes in
+$(P)saveData_realTime1D
+
+[scanRecord]	# specify scan records to be monitored
+$(P)scanH
+$(P)scan1
+$(P)scan2
+$(P)scan3
+$(P)scan4
+
+[extraPV]
+
+$(P)saveData_comment1
+$(P)saveData_comment2
+$(P)scaler1.TP
+$(P)scaler1.NM1
+$(P)scaler1.NM2
+$(P)scaler1.NM3
+$(P)scaler1.NM4
+$(P)scaler1.NM5
+$(P)scaler1.NM6
+$(P)scaler1.NM7
+$(P)scaler1.NM8
+$(P)scaler1.FREQ
+$(P)scan1.P1SM		"scan mode"
+$(P)mca1.NUSE  "CHANNELS:"
+$(P)mca1.ERTM  "REAL_TIME:"
+$(P)mca1.ELTM  "LIVE_TIME:"
+$(P)mca1.CALO  "CAL_OFFSET:"
+$(P)mca1.CALS  "CAL_SLOPE:"
+$(P)mca1.CALQ  "CAL_QUAD:"
+$(P)mca1.TTH   "TWO_THETA:"
+$(P)mca1.R0LO  "ROI_0_LEFT:"
+$(P)mca1.R0HI  "ROI_0_RIGHT:"
+$(P)mca1.R0NM  "ROI_0_LABEL:"
+$(P)mca1.R1LO  "ROI_1_LEFT:"
+$(P)mca1.R1HI  "ROI_1_RIGHT:"
+$(P)mca1.R1NM  "ROI_1_LABEL:"
+$(P)mca1.R2LO  "ROI_2_LEFT:"
+$(P)mca1.R2HI  "ROI_2_RIGHT:"
+$(P)mca1.R2NM  "ROI_2_LABEL:"
+$(P)mca1.R3LO  "ROI_3_LEFT:"
+$(P)mca1.R3HI  "ROI_3_RIGHT:"
+$(P)mca1.R3NM  "ROI_3_LABEL:"
+$(P)mca1.R4LO  "ROI_4_LEFT:"
+$(P)mca1.R4HI  "ROI_4_RIGHT:"
+$(P)mca1.R4NM  "ROI_4_LABEL:"
+$(P)mca1.R5LO  "ROI_5_LEFT:"
+$(P)mca1.R5HI  "ROI_5_RIGHT:"
+$(P)mca1.R5NM  "ROI_5_LABEL:"
+$(P)mca1.R6LO  "ROI_6_LEFT:"
+$(P)mca1.R6HI  "ROI_6_RIGHT:"
+$(P)mca1.R6NM  "ROI_6_LABEL:"
+$(P)mca1.R7LO  "ROI_7_LEFT:"
+$(P)mca1.R7HI  "ROI_7_RIGHT:"
+$(P)mca1.R7NM  "ROI_7_LABEL:"
+$(P)mca1.R8LO  "ROI_8_LEFT:"
+$(P)mca1.R8HI  "ROI_8_RIGHT:"
+$(P)mca1.R8NM  "ROI_8_LABEL:"
+$(P)mca1.R9LO  "ROI_9_LEFT:"
+$(P)mca1.R9HI  "ROI_9_RIGHT:"
+$(P)mca1.R9NM  "ROI_9_LABEL:"

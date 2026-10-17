@@ -107,6 +107,7 @@ fn test_driver_to_std_arrays_pipeline() {
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
         &asyn_rs::asyn_record::claim_port("IMAGE1").unwrap(),
         pool.max_memory(),
+        1,
         "SIM1",
         wiring,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,
@@ -841,6 +842,7 @@ fn test_std_arrays_leaves_the_array_sizes_unset() {
     let (image_handle, image_data, _jh) = create_std_arrays_runtime(
         &asyn_rs::asyn_record::claim_port("IMG_SZ").unwrap(),
         pool.max_memory(),
+        1,
         "DRV1",
         wiring,
         ad_core_rs::plugin::runtime::DEFAULT_PLUGIN_THREADS,

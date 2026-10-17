@@ -125,7 +125,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDStdArraysConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, _queue_size, source) = extract_plugin_args(args)?;
+                let (port_name, queue_size, source) = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -133,6 +133,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 let (handle, _data, _jh) = crate::std_arrays::create_std_arrays_runtime(
                     &claim,
                     max_memory_arg(args, 6),
+                    queue_size,
                     &source,
                     m.wiring().clone(),
                     threads_arg(args, 8),

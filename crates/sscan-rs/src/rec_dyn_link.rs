@@ -18,6 +18,7 @@
 //! dropped, which is what `ca_set_puser(chid, NULL)` does for C.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use epics_base_rs::runtime::task::TaskHandle;
 use epics_base_rs::server::database::{
@@ -28,6 +29,36 @@ use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DBR_CTRL_DOUBLE, DBR_TIME_DOUBLE, DBR_TIME_FLOAT};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use tokio::sync::mpsc;
+
+/// iocsh `recDynLinkDebug`. Stored for an `st.cmd` that sets it; nothing
+/// here prints by level.
+pub static REC_DYN_LINK_DEBUG: AtomicI32 = AtomicI32::new(0);
+/// iocsh `recDynLinkQsize`, C's message-queue depth. Stored only: commands
+/// go to each link's own task over an unbounded channel, so there is no
+/// queue to size. C's unexported `recDynINPCallPend*` poll knobs have no
+/// counterpart either — no thread here polls.
+pub static REC_DYN_LINK_QSIZE: AtomicI32 = AtomicI32::new(256);
+
+/// The iocsh variables `sscanSupport.dbd` declares for `recDynLink.c`.
+pub(crate) fn iocsh_vars() -> Vec<epics_base_rs::server::iocsh::vars::VarDef> {
+    use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
+    vec![
+        VarDef {
+            name: "recDynLinkDebug",
+            access: VarAccess::Int {
+                get: || i64::from(REC_DYN_LINK_DEBUG.load(Ordering::Relaxed)),
+                set: |v| REC_DYN_LINK_DEBUG.store(v as i32, Ordering::Relaxed),
+            },
+        },
+        VarDef {
+            name: "recDynLinkQsize",
+            access: VarAccess::Int {
+                get: || i64::from(REC_DYN_LINK_QSIZE.load(Ordering::Relaxed)),
+                set: |v| REC_DYN_LINK_QSIZE.store(v as i32, Ordering::Relaxed),
+            },
+        },
+    ]
+}
 
 /// `recDynLinkPutCallback`: a notify is already outstanding.
 pub const NOTIFY_IN_PROGRESS: i64 = 1;

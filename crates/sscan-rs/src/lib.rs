@@ -72,7 +72,10 @@ pub fn register_sscan_dbd() {
 /// also registers the record's iocsh variables.
 pub fn sscan_record_factory() -> (&'static str, epics_base_rs::server::RecordFactory) {
     register_sscan_dbd();
-    for def in records::sscan::iocsh_vars() {
+    for def in records::sscan::iocsh_vars()
+        .into_iter()
+        .chain(rec_dyn_link::iocsh_vars())
+    {
         epics_base_rs::server::iocsh::vars::register_variable(def);
     }
     (

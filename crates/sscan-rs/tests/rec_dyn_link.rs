@@ -256,3 +256,25 @@ async fn a_name_nobody_serves_never_connects() {
         assert_ne!(t.link.status, FATAL_ERROR);
     });
 }
+
+/// An `st.cmd` setting C's exported recDynLink knobs runs: `var` reaches
+/// the globals the factory registers.
+#[epics_base_rs::epics_test]
+async fn var_sets_the_rec_dyn_link_knobs() {
+    use std::sync::atomic::Ordering;
+
+    use epics_base_rs::server::iocsh::IocShell;
+    use sscan_rs::rec_dyn_link::{REC_DYN_LINK_DEBUG, REC_DYN_LINK_QSIZE};
+
+    let _ = sscan_rs::sscan_record_factory();
+    let bridge = epics_base_rs::runtime::task::BlockingBridge::capture();
+    std::thread::spawn(move || {
+        let shell = IocShell::new(Arc::new(PvDatabase::new()), bridge);
+        shell.execute_line("var recDynLinkDebug 3").unwrap();
+        shell.execute_line("var recDynLinkQsize 512").unwrap();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(REC_DYN_LINK_DEBUG.load(Ordering::Relaxed), 3);
+    assert_eq!(REC_DYN_LINK_QSIZE.load(Ordering::Relaxed), 512);
+}

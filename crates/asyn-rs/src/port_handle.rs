@@ -1145,6 +1145,16 @@ impl PortHandle {
         Ok(())
     }
 
+    /// The flush when interrupts open, on the actor; see
+    /// [`PortDriverBase::boot_param_callbacks`](crate::port::PortDriverBase::boot_param_callbacks).
+    pub(crate) fn boot_param_callbacks_blocking(&self, addr: i32) -> AsynResult<()> {
+        let call = DriverCall::new(move |driver| {
+            let _ = driver.base_mut().boot_param_callbacks(addr);
+        });
+        self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
+        Ok(())
+    }
+
     /// Flush changed parameters as interrupt notifications (blocking).
     pub fn call_param_callbacks_blocking(&self, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);

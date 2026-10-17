@@ -2285,6 +2285,19 @@ impl PortDriverBase {
     /// Flush changed parameters as interrupt notifications.
     /// Equivalent to C asyn's callParamCallbacks().
     pub fn call_param_callbacks(&mut self, addr: i32) -> AsynResult<()> {
+        self.flush_param_callbacks(addr, true)
+    }
+
+    /// The one-shot flush when interrupts open: C `callbackThread::run`
+    /// (asynPortDriver.cpp:923-937) is a bare `callParamCallbacks`, whose
+    /// switch has no array arm, and a `doCallbacks*Array` issued before
+    /// `iocInit` reached no record. An array changed before then is consumed
+    /// here without firing.
+    pub(crate) fn boot_param_callbacks(&mut self, addr: i32) -> AsynResult<()> {
+        self.flush_param_callbacks(addr, false)
+    }
+
+    fn flush_param_callbacks(&mut self, addr: i32, arrays: bool) -> AsynResult<()> {
         // C asynPortDriver.cpp:838 — `callCallbacks` returns before the loop
         // AND before `flags.clear()` (:871) while `interruptAccept` is false,
         // so every callback fired during IOC build is a no-op that PRESERVES
@@ -2306,7 +2319,11 @@ impl PortDriverBase {
         // is walked and cleared at the end; only a bad index returns early,
         // with the flags kept.
         self.params.flush_changed(addr, |params, reason| {
-            let value = params.get_value(reason, addr)?.clone();
+            let value = params.get_value(reason, addr)?;
+            if value.is_array() && !arrays {
+                return Ok(false);
+            }
+            let value = value.clone();
             // C asynPortDriver.cpp:845 — callCallbacks skips firing for an
             // undefined param even though its changed flag is consumed
             // (flags.clear() at :871). A status/alarm change or bare

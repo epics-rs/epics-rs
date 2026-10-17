@@ -313,7 +313,7 @@ pub fn claim_port(name: &str) -> AsynResult<PortClaim> {
 pub(crate) fn flush_port(handle: &PortHandle) {
     // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
     for addr in 0..handle.max_addr().max(1) {
-        let _ = handle.call_param_callbacks_blocking(addr);
+        let _ = handle.boot_param_callbacks_blocking(addr);
     }
 }
 

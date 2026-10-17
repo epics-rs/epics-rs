@@ -4418,8 +4418,10 @@ impl NDPluginProcess for Hdf5FileProcessor {
         self.attributes = Some(attributes);
     }
 
+    /// C appends `H5get_libversion` (NDFileHDF5.cpp:2388-2392); rust-hdf5 has
+    /// no such call, so the library named is its pin, as in `_NCProperties`.
     fn plugin_type(&self) -> &str {
-        "NDFileHDF5"
+        concat!("NDFileHDF5 ver", env!("RUST_HDF5_PIN"))
     }
 
     /// C `NDFileHDF5` passes `compressionAware = true` to the file driver
@@ -4639,6 +4641,26 @@ impl NDPluginProcess for Hdf5FileProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C names the HDF5 library it links (NDFileHDF5.cpp:2388-2392,
+    /// `"NDFileHDF5 ver%d.%d.%d"` from `H5get_libversion`); here that library
+    /// is rust-hdf5, at the version the workspace lock resolves.
+    #[test]
+    fn plugin_type_names_the_linked_hdf5_library() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("workspace Cargo.lock");
+        let linked = lock
+            .split("[[package]]")
+            .find(|p| p.contains("name = \"rust-hdf5\""))
+            .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .and_then(|v| v.strip_suffix('"'))
+            .expect("rust-hdf5 in Cargo.lock");
+        assert_eq!(
+            Hdf5FileProcessor::new().plugin_type(),
+            format!("NDFileHDF5 ver{linked}")
+        );
+    }
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
     use rust_hdf5::format::messages::filter::FILTER_LZ4;
     use std::sync::atomic::{AtomicU32, Ordering};

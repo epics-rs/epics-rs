@@ -170,7 +170,8 @@ pub fn pvxs_base_registrar_with_enable2(
     crate::pvxs_log::logger_config_env();
     enable2();
     let app = register_pvxs_commands(app);
-    let bound = match bind_pvxs_server(PvaServerConfig::default().with_env()) {
+    let config = PvaServerConfig::default().with_env();
+    let bound = match config.map_err(Into::into).and_then(bind_pvxs_server) {
         Ok(bound) => {
             publish_server_port(bound.bound_tcp_port());
             publish_pvxs_report(bound.report_handle());

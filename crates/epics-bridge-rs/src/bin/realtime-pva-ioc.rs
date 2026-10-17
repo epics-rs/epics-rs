@@ -828,7 +828,14 @@ mod ioc {
         //     The driver is `EPICS_PVA_RS_DRIVER`'s, defaulting to the reactor
         //     — the one the bring-up box measured at 38,483 B a connection
         //     against the thread-per-connection driver's 1,559,487 B.
-        let bound = match BoundPva::bind(composite, PvaServerConfig::default().with_env()) {
+        let config = match PvaServerConfig::default().with_env() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("realtime-pva-ioc: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let bound = match BoundPva::bind(composite, config) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("realtime-pva-ioc: {e}");

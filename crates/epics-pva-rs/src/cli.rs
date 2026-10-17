@@ -340,8 +340,8 @@ fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
     use std::fmt::Write;
     let mut s = ep.addr.to_string();
     if ep.addr.ip().is_multicast() {
-        if let Some(ttl) = ep.ttl {
-            let _ = write!(s, ",{ttl}");
+        if ep.ttl != 0 {
+            let _ = write!(s, ",{}", ep.ttl);
         }
         if let Some(iface) = &ep.iface {
             let _ = write!(s, "@{iface}");
@@ -443,16 +443,21 @@ pub fn effective_config_string() -> String {
 /// as configured, not pvxs's post-`expand()` auto-beacon fan-out; that
 /// expansion needs a server `Config`/`expand()` value in the config
 /// module, which this CLI-scoped readback does not own.
-pub fn effective_server_config_string() -> String {
+///
+/// An invalid interface or ignore entry is pvxs `Config::fromEnv`'s throw,
+/// returned as its `what()`.
+pub fn effective_server_config_string() -> Result<String, String> {
     use crate::config;
     use std::fmt::Write;
+    let interfaces = config::server_intf_addr_list()?;
+    let ignore = config::env::server_ignore_addr_list()?;
     let beacon = config::server_beacon_addr_list()
         .iter()
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(" ");
     // pvxs prints each entry with the server port filled in.
-    let interfaces = config::server_intf_addr_list()
+    let interfaces = interfaces
         .into_iter()
         .map(|ep| {
             let mut a = ep.addr;
@@ -465,7 +470,7 @@ pub fn effective_server_config_string() -> String {
         .join(" ");
     // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is
     // the wildcard "any port from this IP" match.
-    let ignore = config::env::server_ignore_addr_list()
+    let ignore = ignore
         .iter()
         .map(|(ip, port)| format!("{ip}:{port}"))
         .collect::<Vec<_>>()
@@ -497,7 +502,7 @@ pub fn effective_server_config_string() -> String {
         "  EPICS_PVAS_SERVER_PORT={}",
         config::env::pvas_server_port()
     );
-    s
+    Ok(s)
 }
 
 /// Resolve a PVA tool endpoint **body** (the address part of `mshim
@@ -713,7 +718,7 @@ mod tests {
     /// `operator<<` filters to the `EPICS_PVAS_` prefix.
     #[test]
     fn effective_server_config_emits_pvas_keys_and_v_stays_client_only() {
-        let s = effective_server_config_string();
+        let s = effective_server_config_string().unwrap();
         assert!(s.starts_with("Effective server config\n"), "got: {s:?}");
         for key in [
             "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=",

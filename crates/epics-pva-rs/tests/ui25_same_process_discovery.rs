@@ -183,7 +183,7 @@ fn serve(pv_name: &str) -> PvaServer {
         .expect("open shared pv");
     let source = SharedSource::new();
     source.add(pv_name, pv);
-    let config = PvaServerConfig::default().with_env();
+    let config = PvaServerConfig::default().with_env().unwrap();
     PvaServer::start(Arc::new(source), config).expect("PVA server must start")
 }
 

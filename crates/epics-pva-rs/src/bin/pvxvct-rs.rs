@@ -283,7 +283,7 @@ impl BindEndpoint {
         let multicast = self.addr.is_multicast();
         Endpoint {
             addr: SocketAddr::new(IpAddr::V4(self.addr), self.port),
-            ttl: None,
+            ttl: -1,
             iface: self.iface.clone().filter(|_| multicast),
         }
     }

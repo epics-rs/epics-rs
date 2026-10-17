@@ -319,6 +319,31 @@ pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
 /// (the `abc` is extraneous). The port's decimal-only `str::parse` rejected
 /// the first two and accepted nothing pvxs rejects.
 pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
+    parse_base0(s, "integer", |negate, v| {
+        // C: "if the subject sequence begins with a minus sign, the value is
+        // negated" — a wrap, not an error.
+        Some(if negate { v.wrapping_neg() } else { v })
+    })
+}
+
+/// pvxs `parseTo<int64_t>` (`util.cpp:802-816`) — `std::stoll(s, &idx, 0)`,
+/// the same scan as [`parse_to_u64`] with a signed range. Its extraneous text
+/// says "unsigned", as pvxs's does.
+pub fn parse_to_i64(s: &str) -> Result<i64, NoConvert> {
+    parse_base0(s, "unsigned", |negate, v| match negate {
+        false => i64::try_from(v).ok(),
+        true => (v <= 1 << 63).then(|| (v as i64).wrapping_neg()),
+    })
+}
+
+/// The `strtoull` / `strtoll` base-0 scan `parseTo` wraps. `range` turns the
+/// sign and magnitude into the value, `None` being `std::out_of_range`, which
+/// C raises before the trailing check.
+fn parse_base0<T>(
+    s: &str,
+    what: &str,
+    range: impl FnOnce(bool, u64) -> Option<T>,
+) -> Result<T, NoConvert> {
     let b = s.as_bytes();
     let mut i = 0usize;
     while i < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[i] as char) {
@@ -351,20 +376,17 @@ pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
         // wording only: strtoull consumes the `0` and leaves `x` extraneous.)
         return Err(NoConvert::new(format!("Invalid input : \"{s}\"")));
     }
-    let mut v = u64::from_str_radix(&s[start..end], radix)
-        .map_err(|_| NoConvert::new(format!("Out of range : \"{s}\"")))?;
-    if negate {
-        // C: "if the subject sequence begins with a minus sign, the value is
-        // negated" — a wrap, not an error.
-        v = v.wrapping_neg();
-    }
+    let v = u64::from_str_radix(&s[start..end], radix)
+        .ok()
+        .and_then(|v| range(negate, v))
+        .ok_or_else(|| NoConvert::new(format!("Out of range : \"{s}\"")))?;
     let mut j = end;
     while j < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[j] as char) {
         j += 1;
     }
     if j != b.len() {
         return Err(NoConvert::new(format!(
-            "Extraneous characters after integer: \"{s}\""
+            "Extraneous characters after {what}: \"{s}\""
         )));
     }
     Ok(v)
@@ -536,6 +558,31 @@ mod tests {
         assert!(parse_to_u64("08").is_err());
         // Overflow is `std::out_of_range` → NoConvert.
         assert!(parse_to_u64("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn parse_to_i64_is_stoll_base_zero() {
+        assert_eq!(parse_to_i64("-1"), Ok(-1));
+        assert_eq!(parse_to_i64("0x10"), Ok(16));
+        assert_eq!(parse_to_i64("-010"), Ok(-8));
+        assert_eq!(parse_to_i64("-9223372036854775808"), Ok(i64::MIN));
+        assert_eq!(
+            parse_to_i64("9223372036854775808").unwrap_err().message(),
+            "Out of range : \"9223372036854775808\""
+        );
+        // stoll raises out_of_range before parseTo looks at the tail.
+        assert_eq!(
+            parse_to_i64("9999999999999999999x").unwrap_err().message(),
+            "Out of range : \"9999999999999999999x\""
+        );
+        assert_eq!(
+            parse_to_i64("5x").unwrap_err().message(),
+            "Extraneous characters after unsigned: \"5x\""
+        );
+        assert_eq!(
+            parse_to_i64("x").unwrap_err().message(),
+            "Invalid input : \"x\""
+        );
     }
 
     #[test]

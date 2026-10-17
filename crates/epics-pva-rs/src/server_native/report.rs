@@ -218,10 +218,8 @@ pub(crate) fn pvxs_config_text(
     let endpoint = |ep: &crate::config::Endpoint| {
         let mut text = sock_addr_text(ep.addr);
         if ep.addr.ip().is_multicast() {
-            match ep.ttl {
-                Some(0) => {}
-                Some(ttl) => text.push_str(&format!(",{ttl}")),
-                None => text.push_str(",-1"),
+            if ep.ttl != 0 {
+                text.push_str(&format!(",{}", ep.ttl));
             }
             if let Some(iface) = &ep.iface {
                 text.push_str(&format!("@{iface}"));

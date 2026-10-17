@@ -29,6 +29,7 @@
 
 pub mod env;
 pub mod iface;
+mod sockaddr;
 
 pub use env::{
     Endpoint, PvaConfigDefs, auto_addr_list_enabled, auto_beacon_addr_list_enabled, beacon_period,

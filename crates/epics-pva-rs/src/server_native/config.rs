@@ -230,23 +230,6 @@ pub struct PvaServerConfig {
     /// (`config.cpp:497-509`). From `EPICS_PVAS_INTF_ADDR_LIST`; a plain
     /// `SocketAddr` converts via `.into()`.
     pub interfaces: Vec<crate::config::Endpoint>,
-    /// PVX-82: deferred config error set by [`Self::with_env`] when
-    /// `EPICS_PVAS_INTF_ADDR_LIST` named interface(s) that all failed to
-    /// resolve. `PvaServer::start` refuses to bind in that case rather than
-    /// silently promoting the (now-empty) `interfaces` to the wildcard
-    /// `0.0.0.0`. `None` on any programmatically-built config — an empty
-    /// `interfaces` set directly by a caller is an intentional wildcard.
-    /// Public only because the config is built with struct-update syntax
-    /// across the crate boundary; it is not a user-facing knob.
-    pub intf_addr_error: Option<String>,
-    /// PVX-82 (IGNORE sibling): deferred config error set by
-    /// [`Self::with_env`] when `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s)
-    /// to block that all failed to resolve. `PvaServer::start` refuses to
-    /// start rather than running with a silently-empty blocklist (pvxs
-    /// hard-fails the same config — `config.cpp:172-174`, `required=true`).
-    /// `None` on any programmatically-built config. Public for the same
-    /// struct-update reason as [`Self::intf_addr_error`]; not a user knob.
-    pub ignore_addr_error: Option<String>,
     /// Emit `0xFD` / `0xFE` type-cache markers in INIT and RPC responses
     /// so repeated compound descriptors collapse to a 3-byte reference
     /// (saves 100-500 bytes per repeat for NTScalar / NTTable channels).
@@ -398,8 +381,6 @@ impl Default for PvaServerConfig {
             beacon_destinations: Vec::new(),
             auto_beacon: true,
             interfaces: Vec::new(),
-            intf_addr_error: None,
-            ignore_addr_error: None,
             emit_type_cache: false,
             write_queue_depth: 1024,
             ignore_addrs: Vec::new(),
@@ -444,7 +425,12 @@ impl PvaServerConfig {
     /// `PvaServerConfig::isolated().with_env()` isolated in an empty
     /// environment (ports stay ephemeral, `auto_beacon` stays off) instead
     /// of silently reverting to the LAN-facing defaults.
-    pub fn with_env(mut self) -> Self {
+    ///
+    /// An invalid interface or ignore entry fails it with pvxs's `what()`,
+    /// as `required=true` throws out of `Config::fromEnv`
+    /// (`config.cpp:172-173`), so no server binds a configuration pvxs
+    /// refuses.
+    pub fn with_env(mut self) -> std::io::Result<Self> {
         use crate::config::env;
         // server respects EPICS_PVAS_SERVER_PORT first, then
         // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
@@ -492,21 +478,20 @@ impl PvaServerConfig {
                 .saturating_mul(12)
                 .max(self.beacon_period + Duration::from_secs(1));
         }
+        // pvxs reads the interfaces, the ignore list, then the beacons
+        // (`config.cpp:418-432`).
+        let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidInput, what);
+        if let Some(v) = env::server_intf_addr_list_opt().map_err(invalid)? {
+            self.interfaces = v;
+        }
+        if let Some(v) = env::server_ignore_addr_list_opt().map_err(invalid)? {
+            self.ignore_addrs = v;
+        }
         if let Some(v) = env::server_beacon_endpoints_opt() {
             self.beacon_destinations = v;
         }
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
             self.auto_beacon = v;
-        }
-        // PVX-82: a non-blank INTF list whose tokens all fail to resolve is
-        // a misconfiguration — record it so `PvaServer::start` refuses to
-        // bind rather than silently falling back to the wildcard. A blank /
-        // unset var leaves `interfaces` untouched (caller value preserved;
-        // empty ⟹ intentional wildcard at bind).
-        match env::server_intf_addr_list_checked() {
-            Ok(Some(v)) => self.interfaces = v,
-            Ok(None) => {}
-            Err(msg) => self.intf_addr_error = Some(msg),
         }
         if let Some(v) = env::send_timeout_secs_opt() {
             self.send_timeout = Duration::from_secs_f64(v);
@@ -524,17 +509,7 @@ impl PvaServerConfig {
         if let Some(c) = env::conn_timeout_secs_opt() {
             self.idle_timeout = Duration::from_secs_f64(env::effective_tcp_timeout_secs(c));
         }
-        // PVX-82 (IGNORE sibling): same all-unresolvable gate as INTF —
-        // a non-blank IGNORE list that resolves to nothing means the
-        // requested blocklist is silently empty; record it so
-        // `PvaServer::start` refuses rather than running unfiltered. A
-        // blank / unset var leaves a caller-supplied `ignore_addrs` intact.
-        match env::server_ignore_addr_list_checked() {
-            Ok(Some(v)) => self.ignore_addrs = v,
-            Ok(None) => {}
-            Err(msg) => self.ignore_addr_error = Some(msg),
-        }
-        self
+        Ok(self)
     }
 }
 

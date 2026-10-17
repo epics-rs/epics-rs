@@ -230,20 +230,6 @@ impl PvaServer {
     /// and fallen-back ones included, and a held search port fails here.
     pub fn bind(config: PvaServerConfig) -> PvaResult<BoundPvaServer> {
         let mut config = config;
-        // PVX-82: refuse to start when the env named interface(s) that all
-        // failed to resolve — binding the wildcard `0.0.0.0` here would
-        // silently listen on every interface instead of the requested
-        // restriction (pvxs hard-fails such a config: `config.cpp:172-174`).
-        if let Some(msg) = config.intf_addr_error.take() {
-            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
-        }
-        // PVX-82 (IGNORE sibling): same refusal for an all-unresolvable
-        // blocklist — running with a silently-empty IGNORE list would let
-        // peers the operator meant to block through (pvxs `required=true`
-        // hard-fails this config at `config.cpp:172-174`).
-        if let Some(msg) = config.ignore_addr_error.take() {
-            return Err(PvaError::Protocol(format!("PvaServer::start: {msg}")));
-        }
         // `EPICS_PVAS_INTF_ADDR_LIST` expanded once, for TCP, UDP and beacons.
         let interfaces = ServerInterfaces::resolve(
             &config.interfaces,
@@ -961,7 +947,7 @@ mod tcp_fallback_tests {
                 std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", list);
                 std::env::set_var("EPICS_PVAS_SERVER_PORT", port.to_string());
             }
-            let config = PvaServerConfig::default().with_env();
+            let config = PvaServerConfig::default().with_env().unwrap();
             unsafe {
                 std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
                 std::env::remove_var("EPICS_PVAS_SERVER_PORT");
@@ -1012,7 +998,7 @@ mod tcp_fallback_tests {
                 std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", list);
                 std::env::set_var("EPICS_PVAS_SERVER_PORT", port.to_string());
             }
-            let config = PvaServerConfig::default().with_env();
+            let config = PvaServerConfig::default().with_env().unwrap();
             unsafe {
                 std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
                 std::env::remove_var("EPICS_PVAS_SERVER_PORT");
@@ -1082,7 +1068,7 @@ mod tcp_fallback_tests {
             std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1 0.0.0.0:7000");
             std::env::set_var("EPICS_PVAS_SERVER_PORT", port.to_string());
         }
-        let config = PvaServerConfig::default().with_env();
+        let config = PvaServerConfig::default().with_env().unwrap();
         unsafe {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
             std::env::remove_var("EPICS_PVAS_SERVER_PORT");
@@ -1707,63 +1693,6 @@ mod tcp_fallback_tests {
         let _stream = connect.expect("loopback TCP connect must succeed");
         drop(server);
     }
-
-    /// PVX-82: when `with_env` recorded that `EPICS_PVAS_INTF_ADDR_LIST`
-    /// named interface(s) that all failed to resolve, `PvaServer::start`
-    /// must refuse to bind rather than silently promoting the empty
-    /// `interfaces` to the wildcard `0.0.0.0`. Deterministic — no DNS, no
-    /// real bind (it errors before any listener is created).
-    #[test]
-    fn start_refuses_when_intf_addr_error_recorded() {
-        let source = Arc::new(SharedSource::new());
-        let config = PvaServerConfig {
-            tcp_port: 0,
-            udp_port: 0,
-            interfaces: Vec::new(),
-            intf_addr_error: Some(
-                "EPICS_PVAS_INTF_ADDR_LIST=\"bad.invalid\" named interface(s) \
-                 but none resolved"
-                    .to_string(),
-            ),
-            auto_beacon: false,
-            ..Default::default()
-        };
-        // `PvaServer` is not `Debug`, so match on the result rather than
-        // `expect_err` (which would require the `Ok` type to be `Debug`).
-        let result = PvaServer::start(source, config);
-        assert!(
-            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
-            "an unresolved INTF list must fail server start with the resolution \
-             error, not bind 0.0.0.0"
-        );
-    }
-
-    /// PVX-82 (IGNORE sibling): when `with_env` recorded that
-    /// `EPICS_PVAS_IGNORE_ADDR_LIST` named peer(s) that all failed to
-    /// resolve, `PvaServer::start` must refuse rather than run with a
-    /// silently-empty blocklist. Same deterministic start-refusal as the
-    /// INTF case (errors before any listener is created).
-    #[test]
-    fn start_refuses_when_ignore_addr_error_recorded() {
-        let source = Arc::new(SharedSource::new());
-        let config = PvaServerConfig {
-            tcp_port: 0,
-            udp_port: 0,
-            ignore_addr_error: Some(
-                "EPICS_PVAS_IGNORE_ADDR_LIST=\"bad.invalid\" named peer(s) to \
-                 block but none resolved"
-                    .to_string(),
-            ),
-            auto_beacon: false,
-            ..Default::default()
-        };
-        let result = PvaServer::start(source, config);
-        assert!(
-            matches!(&result, Err(PvaError::Protocol(m)) if m.contains("none resolved")),
-            "an unresolved IGNORE list must fail server start, not run with an \
-             empty blocklist"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1798,7 +1727,10 @@ mod sr9_message_size_tests {
         );
         // `with_env()` neither introduces nor removes a cap.
         assert_eq!(
-            PvaServerConfig::default().with_env().max_message_size,
+            PvaServerConfig::default()
+                .with_env()
+                .unwrap()
+                .max_message_size,
             Some(DEFAULT_MAX_MESSAGE_SIZE)
         );
     }
@@ -1880,7 +1812,8 @@ mod with_env_preserve_tests {
                 udp_port: 11111,
                 ..Default::default()
             }
-            .with_env();
+            .with_env()
+            .unwrap();
             assert_eq!(
                 cfg.tcp_port, 12345,
                 "absent server-port var must not reset tcp_port"
@@ -1902,7 +1835,8 @@ mod with_env_preserve_tests {
                 udp_port: 11111,
                 ..Default::default()
             }
-            .with_env();
+            .with_env()
+            .unwrap();
             assert_eq!(
                 cfg.tcp_port, 6789,
                 "present EPICS_PVAS_SERVER_PORT must override tcp_port"
@@ -1932,28 +1866,28 @@ mod with_env_preserve_tests {
 
             // Absent → caller value preserved.
             assert_eq!(
-                base.clone().with_env().idle_timeout,
+                base.clone().with_env().unwrap().idle_timeout,
                 Duration::from_secs(45)
             );
 
             // Default-shaped value: 30 × 4/3 = 40 s.
             unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "30") };
             assert_eq!(
-                base.clone().with_env().idle_timeout,
+                base.clone().with_env().unwrap().idle_timeout,
                 Duration::from_secs_f64(40.0)
             );
 
             // Below the floor: 1.0 × 4/3 = 1.333 → 2 s.
             unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "1.0") };
             assert_eq!(
-                base.clone().with_env().idle_timeout,
+                base.clone().with_env().unwrap().idle_timeout,
                 Duration::from_secs_f64(2.0)
             );
 
             // Upper reset: scaled >= time_t::max → 40 s.
             unsafe { std::env::set_var("EPICS_PVA_CONN_TMO", "7e18") };
             assert_eq!(
-                base.with_env().idle_timeout,
+                base.with_env().unwrap().idle_timeout,
                 Duration::from_secs_f64(40.0),
                 "scaled CONN_TMO >= time_t::max must reset to pvxs's 40s default"
             );
@@ -1975,17 +1909,18 @@ mod with_env_preserve_tests {
                 tls_port: 5555,
                 ..Default::default()
             }
-            .with_env();
+            .with_env()
+            .unwrap();
             assert_eq!(cfg.tls_port, 5555, "absent TLS-port var must not reset");
 
             // Shared form alone is honoured.
             unsafe { std::env::set_var("EPICS_PVA_TLS_PORT", "5077") };
-            let cfg = PvaServerConfig::default().with_env();
+            let cfg = PvaServerConfig::default().with_env().unwrap();
             assert_eq!(cfg.tls_port, 5077, "shared EPICS_PVA_TLS_PORT must apply");
 
             // Server-specific form takes precedence over the shared form.
             unsafe { std::env::set_var("EPICS_PVAS_TLS_PORT", "5078") };
-            let cfg = PvaServerConfig::default().with_env();
+            let cfg = PvaServerConfig::default().with_env().unwrap();
             assert_eq!(
                 cfg.tls_port, 5078,
                 "EPICS_PVAS_TLS_PORT must win over EPICS_PVA_TLS_PORT"
@@ -2005,18 +1940,18 @@ mod with_env_preserve_tests {
             "EPICS_PVA_AUTO_ADDR_LIST",
         ];
         with_cleared_env(&vars, || {
-            let cfg = PvaServerConfig::isolated().with_env();
+            let cfg = PvaServerConfig::isolated().with_env().unwrap();
             assert_eq!(
                 cfg.tcp_port, 0,
-                "isolated().with_env() must keep the ephemeral tcp_port"
+                "isolated().with_env().unwrap() must keep the ephemeral tcp_port"
             );
             assert_eq!(
                 cfg.udp_port, 0,
-                "isolated().with_env() must keep the ephemeral udp_port"
+                "isolated().with_env().unwrap() must keep the ephemeral udp_port"
             );
             assert!(
                 !cfg.auto_beacon,
-                "isolated().with_env() must keep auto_beacon off"
+                "isolated().with_env().unwrap() must keep auto_beacon off"
             );
         });
     }

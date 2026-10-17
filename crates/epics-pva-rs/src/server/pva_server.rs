@@ -304,7 +304,7 @@ impl PvaServer {
         let registrar = self.registrar.lock().unwrap().take();
         let port = self.port;
         let env_config = move || {
-            let mut config = PvaServerConfig::default().with_env();
+            let mut config = PvaServerConfig::default().with_env()?;
             if let Some(port) = port {
                 config.tcp_port = port;
                 // An explicit `0` asks for a server on no fixed port, so the
@@ -316,7 +316,7 @@ impl PvaServer {
                     config.udp_port = 0;
                 }
             }
-            config
+            Ok::<_, std::io::Error>(config)
         };
 
         // NOTE: no scan scheduler here. Scanning (and the PINI=YES pass)
@@ -372,7 +372,7 @@ impl PvaServer {
                     std::future::pending().await
                 }
                 None => {
-                    let bound = super::iocsh::bind_pvxs_server(env_config())?;
+                    let bound = super::iocsh::bind_pvxs_server(env_config()?)?;
                     super::iocsh::publish_server_port(bound.bound_tcp_port());
                     bound
                 }

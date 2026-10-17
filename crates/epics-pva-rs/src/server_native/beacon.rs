@@ -380,7 +380,7 @@ mod tests {
         let group = std::net::SocketAddrV6::new("ff02::1".parse().unwrap(), 5076, 0, 0);
         let ep = Endpoint {
             addr: SocketAddr::V6(group),
-            ttl: Some(4),
+            ttl: 4,
             iface: Some("lo".to_string()),
         };
         let sref = socket2::SockRef::from(&sock);
@@ -394,7 +394,7 @@ mod tests {
         let unicast = std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 5076, 0, 0);
         let ep = Endpoint {
             addr: SocketAddr::V6(unicast),
-            ttl: Some(9),
+            ttl: 9,
             iface: None,
         };
         mcast_prep(&sock, &ep, ep.addr, &crate::config::IfaceMap::current());

@@ -446,7 +446,7 @@ mod tests {
     fn ep(addr: &str) -> Endpoint {
         Endpoint {
             addr: addr.parse().unwrap(),
-            ttl: None,
+            ttl: -1,
             iface: None,
         }
     }

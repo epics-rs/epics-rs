@@ -87,7 +87,11 @@ fn show_credentials_for(verbose: bool, show_credentials: bool) -> bool {
 ///     (`describe.cpp:115-129`); the server block is the `EPICS_PVAS_*`
 ///     set an operator needs to debug why a server does or does not
 ///     advertise, and it never appears in the client-only `-v` output.
-fn target_information_string() -> String {
+///
+/// An invalid server interface or ignore entry ends the report after the
+/// server block's header, as pvxs's `Config::fromEnv` throw does, with that
+/// partial report and the throw's `what()`.
+fn target_information_string() -> Result<String, (String, String)> {
     use std::fmt::Write;
     let mut s = String::new();
 
@@ -132,14 +136,32 @@ fn target_information_string() -> String {
     // (describe.cpp:115-129). The client block is the same one `-v` shows;
     // the server (`EPICS_PVAS_*`) block is `-D`-only.
     let _ = write!(s, "{}", cli::effective_config_string());
-    let _ = write!(s, "{}", cli::effective_server_config_string());
-    s
+    match cli::effective_server_config_string() {
+        Ok(server) => {
+            let _ = write!(s, "{server}");
+            Ok(s)
+        }
+        Err(what) => {
+            let _ = writeln!(s, "Effective server config");
+            Err((s, what))
+        }
+    }
 }
 
 /// Print the `-D` host-troubleshooting report and return (`tools/info.cpp:
 /// 62-64`: `target_information(std::cout); return 0;`).
+///
+/// A throw reaches `main`'s catch: `ERL_ERROR ": " << e.what()`, exit 1
+/// (`tools/info.cpp:123-126`).
 fn target_information() {
-    print!("{}", target_information_string());
+    match target_information_string() {
+        Ok(s) => print!("{s}"),
+        Err((partial, what)) => {
+            print!("{partial}");
+            eprintln!("\x1b[31;1mERROR\x1b[0m: {what}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
@@ -354,7 +376,7 @@ mod tests {
     /// a server does or does not advertise.
     #[test]
     fn target_information_includes_all_sections() {
-        let s = target_information_string();
+        let s = target_information_string().unwrap();
         for needle in [
             "Host: ",
             "Versions",
@@ -391,7 +413,7 @@ mod tests {
             std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "10.1.2.3");
         }
 
-        let d = target_information_string();
+        let d = target_information_string().unwrap();
         assert!(
             d.contains("EPICS_PVAS_SERVER_PORT=5099"),
             "-D must reflect EPICS_PVAS_SERVER_PORT: {d}"

@@ -2833,7 +2833,7 @@ mod tests {
         // Explicit @iface: joined on that NIC alone.
         let explicit = Endpoint {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 2, 9)), 5076),
-            ttl: None,
+            ttl: -1,
             iface: Some("n1".to_string()),
         };
         assert_eq!(

@@ -76,10 +76,6 @@ pub struct CaServerBuilder {
     bound: Option<RsrvSockets>,
 }
 
-/// The name RSRV's [`RsrvSockets`] are registered under — C's
-/// `dbServer.name` for RSRV (`caservertask.c:1562`).
-pub const RSRV_SERVER: &str = "rsrv";
-
 /// RSRV's sockets, bound by `iocInit` at C's `dbInitServers()` point
 /// (`rsrv_init`) and served by the runner from `iocRun`.
 pub struct RsrvSockets {
@@ -88,9 +84,10 @@ pub struct RsrvSockets {
 }
 
 impl RsrvSockets {
-    /// C `rsrv_init`: what [`epics_base_rs::server::ioc_app::IocApplication::register_server_init`]
-    /// runs for RSRV.
-    pub async fn bind(args: epics_base_rs::server::ioc_app::ServerInitArgs) -> CaResult<Self> {
+    /// C `rsrv_init` on this backend; [`crate::server::rsrv_init`].
+    pub(crate) async fn bind(
+        args: epics_base_rs::server::ioc_app::ServerInitArgs,
+    ) -> CaResult<Self> {
         let (tcp, udp) = bind_sockets(args.port, args.tcp_port.unwrap_or(args.port)).await?;
         Ok(Self { tcp, udp })
     }
@@ -153,7 +150,7 @@ impl CaServerBuilder {
         mut self,
         servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
     ) -> Self {
-        self.bound = servers.take::<RsrvSockets>(RSRV_SERVER);
+        self.bound = servers.take::<RsrvSockets>(crate::server::RSRV_SERVER);
         self
     }
 

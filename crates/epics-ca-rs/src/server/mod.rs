@@ -36,6 +36,56 @@ pub mod udp;
 
 #[cfg(tokio_backend)]
 pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
+
+/// The name RSRV's init is registered under — C's `dbServer.name` for RSRV
+/// (`caservertask.c:1562`).
+pub const RSRV_SERVER: &str = "rsrv";
+
+/// RSRV's sockets as [`rsrv_init`] binds them on this backend.
+#[cfg(tokio_backend)]
+pub type RsrvSockets = ca_server::RsrvSockets;
+#[cfg(exec_backend)]
+pub type RsrvSockets = blocking_serving::BlockingRsrvSockets;
+
+/// C `rsrv_init`, RSRV's `dbServer.init`: what
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_server_init`]
+/// runs under [`RSRV_SERVER`], on either backend, so a CA port this IOC
+/// cannot have fails `iocInit` and not a later line.
+pub async fn rsrv_init(
+    args: epics_base_rs::server::ioc_app::ServerInitArgs,
+) -> epics_base_rs::error::CaResult<RsrvSockets> {
+    #[cfg(tokio_backend)]
+    return RsrvSockets::bind(args).await;
+    #[cfg(exec_backend)]
+    RsrvSockets::bind(args.port, args.tcp_port.unwrap_or(args.port))
+        .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))
+}
+
+/// The blocking RSRV on the sockets its init bound into `servers`, or bound
+/// here for a runner given an `IocRunConfig` by hand.
+#[cfg(exec_backend)]
+fn serve_blocking(
+    servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
+    port: u16,
+    tcp_port: Option<u16>,
+    db: std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+    acf: epics_base_rs::server::access_security::AcfCell,
+) -> epics_base_rs::error::CaResult<blocking_serving::BlockingCaServing> {
+    let invalid = |e: blocking_serving::ServeError| {
+        epics_base_rs::error::CaError::InvalidValue(e.to_string())
+    };
+    let sockets = match servers.take::<RsrvSockets>(RSRV_SERVER) {
+        Some(sockets) => sockets,
+        None => RsrvSockets::bind(port, tcp_port.unwrap_or(port)).map_err(invalid)?,
+    };
+    blocking_serving::BlockingCaServing::serve(
+        sockets,
+        db,
+        acf,
+        std::sync::Arc::new(ServerStats::default()),
+    )
+    .map_err(invalid)
+}
 /// Live-connection / byte / channel / subscription counters. Runtime-agnostic
 /// (pure atomics) and shared by the async server and the blocking driver's
 /// monitor path, so it lives outside the host-only `ca_server` module.
@@ -137,16 +187,15 @@ pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
 /// [`blocking_serving::BlockingCaServing`], then the same `dbServer` join and
 /// shell the tokio `CaServer::run_with_shell` gives.
 #[cfg(exec_backend)]
-pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
+pub async fn run_ca_ioc(mut config: IocRunConfig) -> CaResult<()> {
     iocsh::declare_rsrv_registrar();
-    let serving = blocking_serving::BlockingCaServing::start(
+    let serving = serve_blocking(
+        &mut config.servers,
         config.port,
-        config.tcp_port.unwrap_or(config.port),
+        config.tcp_port,
         config.db.clone(),
         config.acf.clone(),
-        std::sync::Arc::new(ServerStats::default()),
-    )
-    .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))?;
+    )?;
     iocsh::register_ca_db_server();
     epics_base_rs::server::db_server::db_run_servers();
     epics_base_rs::server::db_server::announce_serving();
@@ -208,17 +257,9 @@ impl RsrvServing {
         #[cfg(exec_backend)]
         {
             // The blocking server has no autosave tail; the PVA server or the
-            // IOC head runs it. RSRV's init binds on tokio only, so there is
-            // nothing in `servers` to take.
-            let _ = (autosave_config, autosave_manager, servers);
-            let serving = blocking_serving::BlockingCaServing::start(
-                port,
-                tcp_port.unwrap_or(port),
-                db,
-                acf,
-                std::sync::Arc::new(ServerStats::default()),
-            )
-            .map_err(|e| epics_base_rs::error::CaError::InvalidValue(e.to_string()))?;
+            // IOC head runs it.
+            let _ = (autosave_config, autosave_manager);
+            let serving = serve_blocking(servers, port, tcp_port, db, acf)?;
             iocsh::register_ca_db_server();
             epics_base_rs::server::db_server::db_run_servers();
             epics_base_rs::server::db_server::announce_serving();

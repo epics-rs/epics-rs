@@ -159,12 +159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // warnings come between the PINI=YES and PINI=RUN passes.
     if !args.pva {
         builder = builder.register_server_init(
-            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            epics_ca_rs::server::RSRV_SERVER,
             epics_base_rs::server::ioc_app::ServerInitArgs {
                 port: args.port,
                 tcp_port: None,
             },
-            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+            epics_ca_rs::server::rsrv_init,
         );
     }
     let mut ioc = match builder.build_ioc().await {

@@ -733,7 +733,15 @@ impl BlockingPvaServer {
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        let listeners = ServListeners::bind(addr, &config)?;
+        Self::from_listeners(ServListeners::bind(addr, &config)?, source, config)
+    }
+
+    /// [`bind`](Self::bind) on listeners bound already.
+    pub(crate) fn from_listeners(
+        listeners: ServListeners,
+        source: DynSource,
+        config: PvaServerConfig,
+    ) -> io::Result<Self> {
         // One GUID per server, stamped here for the same reason the hosted
         // runtime stamps it in `start()` (`runtime.rs:224-229`): the
         // TCP-circuit SEARCH handler reads it out of its per-connection config
@@ -1400,7 +1408,7 @@ fn recv_search_datagram(
     Ok((len, src, None))
 }
 
-/// Send a SEARCH reply from `socket`, pinned as [`reply_pin`] says.
+/// Send a SEARCH reply from `socket`, pinned on Linux as `reply_pin` says.
 fn send_search_reply(
     socket: &UdpSocket,
     bytes: &[u8],

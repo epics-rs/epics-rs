@@ -20,6 +20,7 @@ use super::config::PvaServerConfig;
 use super::driver::{self, BeaconSender, DriverKind, PvaServerDriver};
 use super::report::{Liveness, LivenessGuard, Running, ServerReportHandle, pvxs_config_text};
 use super::search_engine::ServerInterfaces;
+use super::serv_iface::ServListeners;
 use super::source::DynSource;
 use crate::error::{PvaError, PvaResult};
 use tokio::sync::mpsc;
@@ -34,9 +35,12 @@ pub enum ServeError {
     /// `EPICS_PVAS_INTF_ADDR_LIST` expands to an address no socket can take,
     /// which pvxs's `Server` constructor throws on.
     Interfaces(io::Error),
-    /// The TCP listener on the configured `port`. Not "cannot bind": both
-    /// drivers' `bind` also call `local_addr`, which is what fails on RTEMS.
+    /// The TCP listener on the configured `port`. Not "cannot bind": the
+    /// listener set's bind also calls `local_addr`, which is what fails on
+    /// RTEMS.
     Tcp { port: u16, cause: io::Error },
+    /// The driver on the bound listeners: its GUID, poller or executors.
+    Server(io::Error),
     /// A serving thread could not be created.
     Thread(&'static str, io::Error),
     /// The beacon senders or their destinations, which pvxs sets up in the
@@ -52,6 +56,7 @@ impl fmt::Display for ServeError {
             Self::Tcp { port, cause } => {
                 write!(f, "cannot start the PVA TCP server on port {port}: {cause}")
             }
+            Self::Server(e) => write!(f, "cannot start the PVA server: {e}"),
             Self::Thread(name, e) => write!(f, "cannot start the {name} thread: {e}"),
             Self::Beacon(e) => write!(f, "cannot set up the PVA beacons: {e}"),
         }
@@ -95,41 +100,116 @@ pub struct BoundPva {
     pvxs_config: Arc<str>,
 }
 
-impl BoundPva {
-    /// Bind `source` on `config`'s TCP address, and the search responder
+/// The sockets a [`BoundPva`] serves on, bound before it has a source:
+/// pvxs's `Server` constructor (`server.cpp:385-500`), which
+/// `pvxsBaseRegistrar` runs before the startup script.
+pub struct PvaSockets {
+    kind: DriverKind,
+    config: PvaServerConfig,
+    listeners: ServListeners,
+    search: SearchBind,
+    udp_port: u16,
+    /// [`pvxs_config_text`] of the bound server.
+    pvxs_config: Arc<str>,
+}
+
+impl PvaSockets {
+    /// The TCP listeners on `config`'s address, and the search responder
     /// wildcard on its UDP port — wildcard so it receives broadcast and
     /// multicast SEARCHes, as pvxs binds it (`udp_collector.cpp:140-151`).
-    pub fn bind(source: DynSource, config: PvaServerConfig) -> Result<Self, ServeError> {
+    pub fn bind(config: PvaServerConfig) -> Result<Self, ServeError> {
         let kind = DriverKind::from_env().map_err(ServeError::Driver)?;
-        let (tcp_port, udp_port) = (config.tcp_port, config.udp_port);
-        let config_udp_port = udp_port;
-        let ignore_addrs = config.ignore_addrs.len();
-        let beacon_period_secs = config.beacon_period.as_secs();
+        let (tcp_port, config_udp_port) = (config.tcp_port, config.udp_port);
         let interfaces = ServerInterfaces::resolve(
             &config.interfaces,
             &config.beacon_destinations,
             config.auto_beacon,
         )
         .map_err(ServeError::Interfaces)?;
-        let search = bind_search(udp_port, &config, &interfaces).map_err(|e| (udp_port, e));
-        let mut reported = config.clone();
-        let server = driver::bind(
-            kind,
-            SocketAddr::new(config.bind_ip, tcp_port),
-            source,
-            config,
-        )
-        .map_err(|cause| ServeError::Tcp {
-            port: tcp_port,
-            cause,
-        })?;
+        let search =
+            bind_search(config_udp_port, &config, &interfaces).map_err(|e| (config_udp_port, e));
+        let listeners = ServListeners::bind(SocketAddr::new(config.bind_ip, tcp_port), &config)
+            .map_err(|cause| ServeError::Tcp {
+                port: tcp_port,
+                cause,
+            })?;
         let udp_port = match &search {
-            Ok(s) => s.local_port().unwrap_or(udp_port),
-            Err(_) => udp_port,
+            Ok(s) => s.local_port().unwrap_or(config_udp_port),
+            Err(_) => config_udp_port,
         };
-        let beacons = server.beacon_sender(udp_port).map_err(ServeError::Beacon)?;
-        (reported.tcp_port, reported.udp_port) = (server.tcp_port(), udp_port);
+        let mut reported = config.clone();
+        (reported.tcp_port, reported.udp_port) = (listeners.port(), udp_port);
         let pvxs_config = pvxs_config_text(&reported, &interfaces, config_udp_port).into();
+        Ok(Self {
+            kind,
+            config,
+            listeners,
+            search,
+            udp_port,
+            pvxs_config,
+        })
+    }
+
+    /// [`bind`](Self::bind) as an IOC binds it, the tokio `PvaServer::bind`
+    /// twin: a search port that cannot be had fails it, and the error is the
+    /// `PvaError::Io` `pvxsBaseRegistrar`'s line prints pvxs's `what()` of.
+    pub fn bind_ioc(config: PvaServerConfig) -> PvaResult<Self> {
+        let sockets = Self::bind(config).map_err(|e| match e {
+            ServeError::Tcp { cause, .. } | ServeError::Interfaces(cause) => PvaError::Io(cause),
+            e => PvaError::Protocol(e.to_string()),
+        })?;
+        if let Err((_, e)) = &sockets.search {
+            return Err(PvaError::Io(e.raw_os_error().map_or_else(
+                || io::Error::new(e.kind(), e.to_string()),
+                io::Error::from_raw_os_error,
+            )));
+        }
+        Ok(sockets)
+    }
+
+    /// The TCP port the listeners hold — the requested one, or the fallback.
+    pub fn bound_tcp_port(&self) -> u16 {
+        self.listeners.port()
+    }
+
+    /// The report of a server that has not started: pvxs's `Stopped`, with
+    /// no sources and no peers.
+    pub fn report_handle(&self) -> ServerReportHandle {
+        ServerReportHandle {
+            bound_tcp_port: self.bound_tcp_port(),
+            udp_port: self.udp_port,
+            bound_tls_port: 0,
+            tls_enabled: false,
+            ignore_addrs: self.config.ignore_addrs.len(),
+            beacon_period_secs: self.config.beacon_period.as_secs(),
+            pvxs_config: self.pvxs_config.clone(),
+            peers: super::peers::PeerRegistry::new(),
+            running: None,
+        }
+    }
+}
+
+impl BoundPva {
+    /// [`PvaSockets::bind`] then [`attach`](Self::attach).
+    pub fn bind(source: DynSource, config: PvaServerConfig) -> Result<Self, ServeError> {
+        Self::attach(PvaSockets::bind(config)?, source)
+    }
+
+    /// `source` on `sockets`: the driver and the beacon senders.
+    pub fn attach(sockets: PvaSockets, source: DynSource) -> Result<Self, ServeError> {
+        let PvaSockets {
+            kind,
+            config,
+            listeners,
+            search,
+            udp_port,
+            pvxs_config,
+        } = sockets;
+        let ignore_addrs = config.ignore_addrs.len();
+        let beacon_period_secs = config.beacon_period.as_secs();
+        let server =
+            driver::from_listeners(kind, listeners, source, config).map_err(ServeError::Server)?;
+        let beacons = server.beacon_sender(udp_port).map_err(ServeError::Beacon)?;
         Ok(Self {
             server,
             kind,
@@ -280,21 +360,10 @@ impl BeaconStop {
 /// A search port it cannot bind fails the start, as the tokio server's does.
 pub async fn run_native_server_reporting(
     source: DynSource,
-    config: PvaServerConfig,
+    sockets: PvaSockets,
     on_started: impl FnOnce(ServerReportHandle),
 ) -> PvaResult<()> {
-    // A failed bind stays `PvaError::Io`, as the tokio `PvaServer::bind`
-    // returns it, so `pvxsBaseRegistrar`'s line prints pvxs's `what()`.
-    let bound = BoundPva::bind(source, config).map_err(|e| match e {
-        ServeError::Tcp { cause, .. } | ServeError::Interfaces(cause) => PvaError::Io(cause),
-        e => PvaError::Protocol(e.to_string()),
-    })?;
-    if let Err((_, e)) = bound.search() {
-        return Err(PvaError::Io(e.raw_os_error().map_or_else(
-            || io::Error::new(e.kind(), e.to_string()),
-            io::Error::from_raw_os_error,
-        )));
-    }
+    let bound = BoundPva::attach(sockets, source).map_err(|e| PvaError::Protocol(e.to_string()))?;
     let reactor = Reactor::current()
         .ok_or_else(|| PvaError::Protocol("no reactor to serve PVA on".into()))?;
     let serving = bound

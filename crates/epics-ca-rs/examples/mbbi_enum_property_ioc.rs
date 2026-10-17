@@ -131,9 +131,9 @@ record(mbbi, "RIG:MBBI") {
         .db_string(db, &HashMap::new())?
         .register_device_support("mbbi", &ENUM_PROP, || Box::new(EnumProp::new()))
         .register_server_init(
-            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            epics_ca_rs::server::RSRV_SERVER,
             args,
-            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+            epics_ca_rs::server::rsrv_init,
         )
         .build_ioc()
         .await?;

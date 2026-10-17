@@ -100,7 +100,6 @@ impl PvaServerBuilder {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager: None,
-            #[cfg(tokio_backend)]
             registrar: std::sync::Mutex::new(None),
         })
     }
@@ -135,7 +134,6 @@ pub struct PvaServer {
     autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     /// What [`super::iocsh::pvxs_base_registrar`] bound, taken by the first
     /// run; `None` binds at the run, as a server with no registrar must.
-    #[cfg(tokio_backend)]
     registrar: std::sync::Mutex<Option<super::iocsh::PvxsServer>>,
 }
 
@@ -167,7 +165,6 @@ impl PvaServer {
             acl_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             autosave_config,
             autosave_manager,
-            #[cfg(tokio_backend)]
             registrar: std::sync::Mutex::new(None),
         }
     }
@@ -176,17 +173,12 @@ impl PvaServer {
     /// the startup script, as pvxs starts the registrar's server at
     /// `initHookAfterIocRunning` (`ioc/iochooks.cpp:374-379`). A registrar
     /// whose bind failed leaves no server, and this one then serves nothing.
-    /// On the exec backend no registrar binds, and the server binds at the run.
     pub fn bound_at_registrar(
         self,
-        #[cfg_attr(exec_backend, allow(unused_variables))]
         servers: &mut epics_base_rs::server::ioc_app::InitializedServers,
     ) -> Self {
-        #[cfg(tokio_backend)]
-        {
-            *self.registrar.lock().unwrap() =
-                servers.take::<super::iocsh::PvxsServer>(super::iocsh::PVXS_SERVER);
-        }
+        *self.registrar.lock().unwrap() =
+            servers.take::<super::iocsh::PvxsServer>(super::iocsh::PVXS_SERVER);
         self
     }
 
@@ -309,7 +301,6 @@ impl PvaServer {
         //
         // Read only by a path that binds: a server the registrar bound has
         // read it already, and a second read logs its warnings twice.
-        #[cfg(tokio_backend)]
         let registrar = self.registrar.lock().unwrap().take();
         let port = self.port;
         let env_config = move || {
@@ -370,11 +361,9 @@ impl PvaServer {
             // holds the startup script's `iocInit` line until it has.
             epics_base_rs::server::db_server::announce_serving();
         };
-        // The one backend fork: which server the bound-and-serving half is.
-        #[cfg(tokio_backend)]
         let result = async move {
-            let started = match registrar {
-                Some(super::iocsh::PvxsServer(Some(bound))) => bound.start(source),
+            let bound = match registrar {
+                Some(super::iocsh::PvxsServer(Some(bound))) => bound,
                 // pvxs's `initHookAfterIocRunning` with no `server()`: nothing
                 // to start, so `iocRun` is not held for it, and the autosave
                 // task above lives until the runner ends.
@@ -382,23 +371,27 @@ impl PvaServer {
                     epics_base_rs::server::db_server::announce_serving();
                     std::future::pending().await
                 }
-                None => crate::server_native::PvaServer::bind(env_config()).and_then(|bound| {
+                None => {
+                    let bound = super::iocsh::bind_pvxs_server(env_config())?;
                     super::iocsh::publish_server_port(bound.bound_tcp_port());
-                    bound.start(source)
-                }),
+                    bound
+                }
             };
-            crate::server_native::runtime::serve_reporting(started?, on_started).await
+            // The one backend fork: which server the bound half serves as.
+            #[cfg(tokio_backend)]
+            return crate::server_native::runtime::serve_reporting(
+                bound.start(source)?,
+                on_started,
+            )
+            .await;
+            #[cfg(exec_backend)]
+            crate::server_native::serving::run_native_server_reporting(
+                source as crate::server_native::source::DynSource,
+                bound,
+                on_started,
+            )
+            .await
         }
-        .await;
-        #[cfg(exec_backend)]
-        let result = crate::server_native::serving::run_native_server_reporting(
-            source as crate::server_native::source::DynSource,
-            env_config(),
-            |handle| {
-                super::iocsh::publish_server_port(handle.bound_tcp_port());
-                on_started(handle)
-            },
-        )
         .await;
 
         if let Some(h) = autosave_handle {

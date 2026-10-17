@@ -10,7 +10,7 @@
 //! driver adds 24.
 //!
 //! Two identical surfaces are a trait, not a `match` at every call site: with
-//! [`bind`] returning `Arc<dyn PvaServerDriver>` the choice is made in one
+//! `from_listeners` returning `Arc<dyn PvaServerDriver>` the choice is made in one
 //! place and nothing downstream can tell — or come to depend on — which it
 //! got. That matters more than the line count, because the consumer is a
 //! target IOC whose accept thread, status PV and shutdown path would
@@ -72,7 +72,7 @@
 //! takes it back out.
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use epics_base_rs::runtime::task::Reactor;
@@ -82,6 +82,7 @@ use super::config::PvaServerConfig;
 use super::peers::PeerRegistry;
 #[cfg(unix)]
 use super::reactor::ReactorPvaServer;
+use super::serv_iface::ServListeners;
 use super::source::DynSource;
 use crate::error::PvaResult;
 
@@ -94,7 +95,8 @@ pub const DRIVER_ENV: &str = "EPICS_PVA_RS_DRIVER";
 ///
 /// `bind` is absent on purpose: it is generic over the address and returns
 /// `Self`, neither of which an object-safe trait can carry, and it is the one
-/// call that has to know which driver it is building. [`bind`] is that call.
+/// call that has to know which driver it is building. `from_listeners` is
+/// that call.
 pub trait PvaServerDriver: Send + Sync {
     /// The actual bound address — the value to use when the configured port
     /// was 0.
@@ -271,21 +273,21 @@ impl DriverKind {
     }
 }
 
-/// Bind the accept socket with the selected driver.
-///
-/// The error is the driver's own: both bind a [`TcpListener`](std::net::TcpListener)
-/// and both keep "bind failed" distinguishable from "local_addr failed", which
-/// on RTEMS are different defects.
-pub fn bind<A: ToSocketAddrs>(
+/// The selected driver serving `source` on `listeners`, bound already.
+pub(crate) fn from_listeners(
     kind: DriverKind,
-    addr: A,
+    listeners: ServListeners,
     source: DynSource,
     config: PvaServerConfig,
 ) -> io::Result<Arc<dyn PvaServerDriver>> {
     Ok(match kind {
-        DriverKind::Blocking => Arc::new(BlockingPvaServer::bind(addr, source, config)?),
+        DriverKind::Blocking => Arc::new(BlockingPvaServer::from_listeners(
+            listeners, source, config,
+        )?),
         #[cfg(unix)]
-        DriverKind::Reactor => Arc::new(ReactorPvaServer::bind(addr, source, config)?),
+        DriverKind::Reactor => {
+            Arc::new(ReactorPvaServer::from_listeners(listeners, source, config)?)
+        }
     })
 }
 
@@ -355,13 +357,12 @@ mod tests {
         #[cfg(not(unix))]
         let kinds = [DriverKind::Blocking];
         for kind in kinds {
-            let server = bind(
-                kind,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                test_source(),
-                isolated_config(),
-            )
-            .unwrap_or_else(|e| panic!("{kind:?} binds: {e}"));
+            let config = isolated_config();
+            let listeners =
+                ServListeners::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), &config)
+                    .expect("bind the listeners");
+            let server = from_listeners(kind, listeners, test_source(), config)
+                .unwrap_or_else(|e| panic!("{kind:?} binds: {e}"));
             assert_ne!(server.tcp_port(), 0, "{kind:?} reports its bound port");
             assert_eq!(
                 server.local_addr().expect("local_addr").port(),

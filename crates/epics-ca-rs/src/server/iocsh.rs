@@ -302,16 +302,7 @@ pub fn register_rsrv_commands(mut app: IocApplication) -> IocApplication {
         app = app.register_startup_command(cmd.clone());
         app = app.register_shell_command(cmd);
     }
-    // C `rsrv_init`, RSRV's `dbServer.init`: bound by `iocInit`, so a CA port
-    // this IOC cannot have fails `iocInit` and not a later line.
-    #[cfg(tokio_backend)]
-    {
-        app = app.register_server_init(
-            crate::server::ca_server::RSRV_SERVER,
-            crate::server::ca_server::RsrvSockets::bind,
-        );
-    }
-    app
+    app.register_server_init(crate::server::RSRV_SERVER, crate::server::rsrv_init)
 }
 
 /// C's `registrar(rsrvRegistrar)` line — `softIoc.dbd`'s seventh — whose

@@ -1026,7 +1026,9 @@ impl McastJoins {
         out
     }
 
-    /// [`Self::new`] against this host's interfaces.
+    /// [`Self::new`] against this host's interfaces, for the client's
+    /// collector.
+    #[cfg(feature = "client")]
     pub(crate) fn resolve(
         listed: &[crate::config::Endpoint],
         dests: &[crate::config::Endpoint],
@@ -1198,6 +1200,8 @@ impl V6Listen {
     /// is never answered: pvxs's reply goes from a v6 address of the
     /// arrival interface to the v4-mapped sender and the send fails
     /// (`:299-313`), as softIocPVX's does under `EPICS_PVAS_INTF_ADDR_LIST=[::]`.
+    /// An embedded build has no destination address to route on.
+    #[cfg(not(epics_embedded_target))]
     pub(crate) fn takes(&self, src: SocketAddr, dest: Option<IpAddr>) -> bool {
         let SocketAddr::V6(src) = src else {
             return false;

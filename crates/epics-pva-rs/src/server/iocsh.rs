@@ -39,9 +39,8 @@ use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
+use crate::server_native::PvaServerConfig;
 use crate::server_native::ServerReportHandle;
-#[cfg(tokio_backend)]
-use crate::server_native::{BoundPvaServer, PvaServerConfig};
 
 /// pvxs's `server()` singleton as this port can spell it: `None` until a
 /// server is bound, which is the state `pvxsr` is registered in.
@@ -126,15 +125,29 @@ fn pvxs_log_clear_command() -> CommandDef {
 }
 
 /// The name [`pvxs_base_registrar`] hands its server to the runner under.
-#[cfg(tokio_backend)]
 pub const PVXS_SERVER: &str = "pvxs";
 
 /// What `pvxsBaseRegistrar` left in pvxs's `server()` singleton: the server it
 /// bound, or nothing when the bind threw and the IOC runs without pvAccess.
 /// The runner takes it from [`IocRunConfig::servers`](epics_base_rs::server::ioc_app::IocRunConfig::servers)
 /// through `PvaServer::bound_at_registrar`.
+pub struct PvxsServer(pub(crate) Option<BoundPvxsServer>);
+
+/// A PVA server bound and not yet serving, on this backend.
 #[cfg(tokio_backend)]
-pub struct PvxsServer(pub(crate) Option<BoundPvaServer>);
+pub(crate) type BoundPvxsServer = crate::server_native::BoundPvaServer;
+#[cfg(exec_backend)]
+pub(crate) type BoundPvxsServer = crate::server_native::serving::PvaSockets;
+
+/// Bind a PVA server for an IOC on `config`, a held search port included.
+pub(crate) fn bind_pvxs_server(
+    config: PvaServerConfig,
+) -> crate::error::PvaResult<BoundPvxsServer> {
+    #[cfg(tokio_backend)]
+    return crate::server_native::PvaServer::bind(config);
+    #[cfg(exec_backend)]
+    crate::server_native::serving::PvaSockets::bind_ioc(config)
+}
 
 /// pvxs `pvxsBaseRegistrar` (`ioc/iochooks.cpp:461-511`): the commands, then
 /// `initialisePvxsServer`, which binds the server from the environment and
@@ -157,27 +170,20 @@ pub fn pvxs_base_registrar_with_enable2(
     crate::pvxs_log::logger_config_env();
     enable2();
     let app = register_pvxs_commands(app);
-    // The exec backend's native server binds with its source, so it binds
-    // at the runner and there is nothing to bind here.
-    #[cfg(tokio_backend)]
-    let app = {
-        let bound =
-            match crate::server_native::PvaServer::bind(PvaServerConfig::default().with_env()) {
-                Ok(bound) => {
-                    publish_server_port(bound.bound_tcp_port());
-                    publish_pvxs_report(bound.report_handle());
-                    Some(bound)
-                }
-                Err(e) => {
-                    eprintln!("Error in pvxsBaseRegistrar : {}", pvxs_what(&e));
-                    None
-                }
-            };
-        app.register_server_init(PVXS_SERVER, move |_| async move {
-            Ok::<_, epics_base_rs::error::CaError>(PvxsServer(bound))
-        })
+    let bound = match bind_pvxs_server(PvaServerConfig::default().with_env()) {
+        Ok(bound) => {
+            publish_server_port(bound.bound_tcp_port());
+            publish_pvxs_report(bound.report_handle());
+            Some(bound)
+        }
+        Err(e) => {
+            eprintln!("Error in pvxsBaseRegistrar : {}", pvxs_what(&e));
+            None
+        }
     };
-    app
+    app.register_server_init(PVXS_SERVER, move |_| async move {
+        Ok::<_, epics_base_rs::error::CaError>(PvxsServer(bound))
+    })
 }
 
 /// pvxs's `e.what()` for a failed server: a bind throws `std::system_error`,

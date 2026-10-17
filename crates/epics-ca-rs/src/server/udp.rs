@@ -115,8 +115,8 @@ impl BoundUdp {
     }
 
     /// The responders, in interface-list order.
-    pub(crate) fn responders(&self) -> &[BoundResponder] {
-        &self.responders
+    pub(crate) fn into_responders(self) -> Vec<BoundResponder> {
+        self.responders
     }
 }
 

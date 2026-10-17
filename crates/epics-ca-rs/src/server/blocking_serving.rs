@@ -82,31 +82,34 @@ pub struct BlockingCaServing {
     udp_port: u16,
 }
 
-impl BlockingCaServing {
-    /// Bind and start serving `db`: UDP search on `udp_port`, TCP on
-    /// `tcp_port` (the same number unless `EPICS_CAS_SERVER_PORT` split
-    /// them), with C's fallback to an OS-picked TCP port when it is taken.
-    /// Every listener counts into `stats`, so a reader built before the
-    /// serving starts (a status PV) reads the live numbers.
-    pub fn start(
-        udp_port: u16,
-        tcp_port: u16,
-        db: Arc<PvDatabase>,
-        acf: SharedAcf,
-        stats: Arc<ServerStats>,
-    ) -> Result<Self, ServeError> {
+/// RSRV's sockets on the blocking driver, bound by `iocInit` at C's
+/// `dbInitServers()` point (`rsrv_init`) and served from `iocRun`
+/// ([`BlockingCaServing::serve`]).
+pub struct BlockingRsrvSockets {
+    listeners: Vec<TcpListener>,
+    responders: Vec<udp::BoundResponder>,
+    cfg: addr_list::CasUdpConfig,
+    beacon: std::net::UdpSocket,
+    tcp_port: u16,
+    udp_port: u16,
+}
+
+impl BlockingRsrvSockets {
+    /// Bind UDP search on `udp_port` and TCP on `tcp_port` (the same number
+    /// unless `EPICS_CAS_SERVER_PORT` split them), with C's fallback to an
+    /// OS-picked TCP port when it is taken.
+    pub fn bind(udp_port: u16, tcp_port: u16) -> Result<Self, ServeError> {
         epics_base_rs::server::event_queue::configure_events_per_que();
         let requested_udp = udp_port;
         let intf = tcp::rsrv_intf_addrs().map_err(ServeError::Config)?;
-        let tcp_err = move |cause| ServeError::Tcp {
-            port: tcp_port,
-            cause,
-        };
         let (mut listeners, bound_tcp) =
             tcp::bind_tcp_set_with(intf, tcp_port, TcpListener::bind, |l| {
                 Ok(l.local_addr()?.port())
             })
-            .map_err(tcp_err)?;
+            .map_err(|cause| ServeError::Tcp {
+                port: tcp_port,
+                cause,
+            })?;
         tcp::announce_tcp_port(tcp_port, bound_tcp);
 
         // The responders take the TCP set's interfaces, which have already
@@ -131,28 +134,72 @@ impl BlockingCaServing {
         })?;
         let keep = bound_udp.interfaces();
         listeners.retain(|(_, ip)| keep.contains(ip));
-        let paired: Vec<_> = listeners
-            .into_iter()
-            .map(|(listener, _)| listener)
-            .zip(bound_udp.responders().iter().cloned())
-            .collect();
-
-        let _ = stats.started_at.set(std::time::Instant::now());
-        let mut servers = Vec::with_capacity(paired.len());
-        let mut sockets = Vec::with_capacity(paired.len());
-        for (listener, responder) in paired {
-            let server =
-                BlockingCaServer::from_listener(listener, db.clone(), acf.clone(), stats.clone())
-                    .map_err(tcp_err)?;
-            servers.push(Arc::new(server));
-            sockets.push(responder);
-        }
         let udp_port = bound_udp.port();
         udp::announce_requested_ephemeral(
             (requested_udp, udp_port),
             (tcp_port, bound_tcp),
             cfg.beacon_addrs.len(),
         );
+        let beacon = crate::server::beacon::beacon_socket().map_err(ServeError::Beacon)?;
+        Ok(Self {
+            listeners: listeners.into_iter().map(|(l, _)| l).collect(),
+            responders: bound_udp.into_responders(),
+            cfg,
+            beacon,
+            tcp_port: bound_tcp,
+            udp_port,
+        })
+    }
+}
+
+impl BlockingCaServing {
+    /// [`BlockingRsrvSockets::bind`], then [`Self::serve`].
+    pub fn start(
+        udp_port: u16,
+        tcp_port: u16,
+        db: Arc<PvDatabase>,
+        acf: SharedAcf,
+        stats: Arc<ServerStats>,
+    ) -> Result<Self, ServeError> {
+        Self::serve(
+            BlockingRsrvSockets::bind(udp_port, tcp_port)?,
+            db,
+            acf,
+            stats,
+        )
+    }
+
+    /// Serve `db` on `sockets`. Every listener counts into `stats`, so a
+    /// reader built before the serving starts (a status PV) reads the live
+    /// numbers.
+    pub fn serve(
+        sockets: BlockingRsrvSockets,
+        db: Arc<PvDatabase>,
+        acf: SharedAcf,
+        stats: Arc<ServerStats>,
+    ) -> Result<Self, ServeError> {
+        let BlockingRsrvSockets {
+            listeners,
+            responders,
+            cfg,
+            beacon: socket,
+            tcp_port: bound_tcp,
+            udp_port,
+        } = sockets;
+        let tcp_err = move |cause| ServeError::Tcp {
+            port: bound_tcp,
+            cause,
+        };
+        let _ = stats.started_at.set(std::time::Instant::now());
+        let mut servers = Vec::with_capacity(listeners.len());
+        let mut sockets = Vec::with_capacity(listeners.len());
+        for (listener, responder) in listeners.into_iter().zip(responders) {
+            let server =
+                BlockingCaServer::from_listener(listener, db.clone(), acf.clone(), stats.clone())
+                    .map_err(tcp_err)?;
+            servers.push(Arc::new(server));
+            sockets.push(responder);
+        }
 
         iocsh::publish_casr_source(
             stats.clone(),
@@ -199,7 +246,6 @@ impl BlockingCaServing {
         let beacon_stop = Arc::new(BeaconStop::default());
         let stop = beacon_stop.clone();
         let (beacon_addrs, period) = (cfg.beacon_addrs.clone(), cfg.beacon_period);
-        let socket = crate::server::beacon::beacon_socket().map_err(ServeError::Beacon)?;
         let beacon = serving_thread("CAS-beacon", move || {
             crate::server::blocking::serve_beacons(socket, bound_tcp, &beacon_addrs, period, |d| {
                 stop.sleep(d)

@@ -308,7 +308,15 @@ impl ReactorPvaServer {
         source: DynSource,
         config: PvaServerConfig,
     ) -> io::Result<Self> {
-        let listeners = ServListeners::bind(addr, &config)?;
+        Self::from_listeners(ServListeners::bind(addr, &config)?, source, config)
+    }
+
+    /// [`bind`](Self::bind) on listeners bound already.
+    pub(crate) fn from_listeners(
+        listeners: ServListeners,
+        source: DynSource,
+        config: PvaServerConfig,
+    ) -> io::Result<Self> {
         // One GUID per server, stamped at construction so the UDP responder
         // and the TCP-circuit SEARCH handler cannot advertise two identities;
         // `?` rather than a fallback because every consumer of a GUID

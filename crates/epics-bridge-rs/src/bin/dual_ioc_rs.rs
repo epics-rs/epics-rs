@@ -191,7 +191,7 @@ async fn run() -> ExitCode {
         };
     }
 
-    // Flag > EPICS environment > compiled default. `RsrvSockets::bind` takes a
+    // Flag > EPICS environment > compiled default. `rsrv_init` takes a
     // literal port, so its fallback is resolved here;
     // `PvaServer::from_parts` resolves its own from `None`.
     let ca_port = args
@@ -199,17 +199,15 @@ async fn run() -> ExitCode {
         .unwrap_or_else(epics_base_rs::runtime::net::cas_server_port);
     let pva_port = args.pva_port;
 
-    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`. The exec RSRV
-    // binds at `RsrvServing::start`.
-    #[cfg(tokio_backend)]
+    // C `rsrv_init`, at `dbInitServers()` inside `iocInit`.
     if !args.no_ca {
         builder = builder.register_server_init(
-            epics_ca_rs::server::ca_server::RSRV_SERVER,
+            epics_ca_rs::server::RSRV_SERVER,
             epics_base_rs::server::ioc_app::ServerInitArgs {
                 port: ca_port,
                 tcp_port: None,
             },
-            epics_ca_rs::server::ca_server::RsrvSockets::bind,
+            epics_ca_rs::server::rsrv_init,
         );
     }
 

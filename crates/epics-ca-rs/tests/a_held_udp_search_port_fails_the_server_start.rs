@@ -3,14 +3,13 @@
 //! (`caservertask.c:135-141`, `:752`); the difference is a signed-off
 //! deviation (docs/differences.md).
 
-#![cfg(tokio_backend)]
-
-use epics_base_rs::server::database::PvDatabase;
-use epics_ca_rs::server::CaServer;
-use std::sync::Arc;
-
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn a_held_udp_search_port_fails_from_parts_instead_of_hanging() {
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_ca_rs::server::CaServer;
+    use std::sync::Arc;
+
     // Held for the whole test, with no reuse flag, so the server's bind cannot
     // share it. On the server's own address: Windows lets a `SO_REUSEADDR`
     // bind on a specific address share a port held on the wildcard.
@@ -33,8 +32,9 @@ async fn a_held_udp_search_port_fails_from_parts_instead_of_hanging() {
 }
 
 /// Under `iocInit` the bind is RSRV's `dbInitServers()` init, so the held port
-/// fails the script's `iocInit` line and the runner is never started.
-#[tokio::test]
+/// fails the script's `iocInit` line and the runner is never started, on
+/// either backend.
+#[epics_macros_rs::epics_test]
 async fn a_held_udp_search_port_fails_ioc_init() {
     let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("take a UDP port");
     let port = held.local_addr().unwrap().port();

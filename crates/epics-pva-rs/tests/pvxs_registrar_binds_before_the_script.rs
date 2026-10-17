@@ -3,8 +3,7 @@
 //! (`:374-379`). Measured on softIocPVX 1.5.3: a held TCP 5075 falls back and
 //! `PVXS_SERVER_PORT` names the fallback port from the script's first line; a
 //! held UDP 5076 prints `Error in pvxsBaseRegistrar` before `Starting iocInit`
-//! and the IOC runs without pvAccess.
-#![cfg(tokio_backend)]
+//! and the IOC runs without pvAccess. On either backend.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,7 +41,7 @@ fn pvas_env(udp: u16) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[epics_macros_rs::epics_test]
 async fn the_script_sees_the_port_the_registrar_holds() {
     pvas_env(0);
     let seen = Arc::new(Mutex::new(None));
@@ -68,8 +67,7 @@ async fn the_script_sees_the_port_the_registrar_holds() {
             .expect("the registrar hands its server to the runner");
         // The listener the registrar bound queues the connection although
         // nothing serves it yet.
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
+        std::net::TcpStream::connect(("127.0.0.1", port))
             .expect("the registrar's listener holds the port");
         epics_base_rs::server::db_server::announce_serving();
         Ok(())
@@ -78,7 +76,7 @@ async fn the_script_sees_the_port_the_registrar_holds() {
     .expect("the IOC runs");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[epics_macros_rs::epics_test]
 async fn a_held_search_port_leaves_the_ioc_without_pvaccess() {
     let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("take a UDP port");
     pvas_env(held.local_addr().unwrap().port());
@@ -97,7 +95,7 @@ async fn a_held_search_port_leaves_the_ioc_without_pvaccess() {
         // Serving nothing is pending until the runner ends; a server that
         // bound for itself here would fail on the held port at once.
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), server.run())
+            epics_base_rs::runtime::task::timeout(Duration::from_millis(300), server.run())
                 .await
                 .is_err(),
             "the runner tried to serve pvAccess the registrar could not bind"

@@ -14,7 +14,7 @@ pub struct Iface {
     pub name: String,
     /// 0 where the OS reports none.
     pub index: u32,
-    /// In [`pvxs_v4_order`], pvxs's `addrs` order, so the first is
+    /// In `pvxs_v4_order`, pvxs's `addrs` order, so the first is
     /// `address_of`'s.
     pub v4: Vec<Ipv4Addr>,
     /// The v4 broadcast addresses; pvxs's `byAddr` names the interface by

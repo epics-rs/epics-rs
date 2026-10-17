@@ -907,7 +907,7 @@ impl AsyncDbHandle {
         self.db()?.parsed_link_target_field_type(link)
     }
 
-    /// See [`PvDatabase::link_check_classified`].
+    /// See `PvDatabase::link_check_classified`.
     pub fn link_check_classified(
         &self,
         record: impl AsRef<[u8]>,

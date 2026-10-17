@@ -2610,7 +2610,9 @@ impl PortDriver for PluginPortDriver {
         let addr = match self.base.parse_user(user) {
             Ok(addr) => addr,
             Err(e) => {
-                let _ = self.base.call_param_callbacks(user.addr);
+                // getAddress's resolved list, in or out of range.
+                let addr = asyn_rs::port::param_list(self.base.flags.multi_device, user.addr);
+                let _ = self.base.call_param_callbacks(addr);
                 let line = self.int32_error_line(reason, value, e.c_status_code())?;
                 self.base
                     .trace_print(TraceMask::ERROR, format_args!("{line}"));
@@ -5574,6 +5576,44 @@ mod tests {
                 "NDPluginDriver::writeInt32 ERROR, status=3, function={number}, paramName=FILE_NUMBER, value=4, connectedToArrayPort_=1"
             )),
             "{text}"
+        );
+    }
+
+    /// NDPluginDriver.cpp:702-703, :764: `done:` calls back the list getAddress
+    /// resolved, so a bad reason on a single-device port flushes list 0
+    /// whatever the record's address.
+    #[test]
+    fn a_refused_plugin_reason_calls_back_the_resolved_list() {
+        let wiring = test_wiring();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            "ADDRLIST",
+            "Passthrough",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            PassthroughProcessor,
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        assert!(!drv.base.flags.multi_device);
+        drv.base.interrupts = asyn_rs::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        drv.base.params.take_changed(0).unwrap();
+        let number = drv.ndarray_params.file_number;
+        drv.base.params.mark_changed(number, 0).unwrap();
+        let bogus = drv.base.params.len() + 5;
+        assert!(
+            drv.io_write_int32(&mut AsynUser::new(bogus).with_addr(1), 4)
+                .is_err()
+        );
+        assert_eq!(
+            drv.base.params.take_changed(0).unwrap(),
+            Vec::<usize>::new()
         );
     }
 

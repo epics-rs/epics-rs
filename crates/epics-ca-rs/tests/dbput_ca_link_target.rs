@@ -86,6 +86,7 @@ async fn a_ca_out_link_writes_a_local_target_and_alarms_on_an_unresolved_one() {
     // C opens every CA link at `dbCaAddLink`, so the first put through an
     // unresolved one is already refused (`dbCa.c:558-560`).
     db.setup_external_link_opens().await;
+    db.process_cp_links_on_connect().await;
     let _server = tokio::spawn(async move { server.run().await });
 
     put_until(&db, "SC", 5.0, "TT", 5.0).await;

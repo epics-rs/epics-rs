@@ -52,6 +52,7 @@ async fn two_lnkn_rows_naming_one_pv_put_twice() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     db.register_link_set("ca", Arc::new(Remote { puts: puts.clone() }))
         .await;
+    db.process_cp_links_on_connect().await;
     db.process_record_with_links("F", &mut ProcStack::new())
         .await
         .unwrap();

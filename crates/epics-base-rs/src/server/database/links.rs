@@ -5748,6 +5748,7 @@ mod nonlocal_db_link_write_tests {
         let puts = Arc::new(Mutex::new(Vec::new()));
         db.register_link_set("ca", Arc::new(RecordingLset { puts: puts.clone() }))
             .await;
+        db.process_cp_links_on_connect().await;
 
         // "OTHER:PV" is never added as a local record -> non-local.
         let link = DbLink::new(
@@ -6181,6 +6182,7 @@ mod nonlocal_db_link_read_tests {
     pub(super) async fn serve_network(db: &PvDatabase, serve: fn(&[u8]) -> Option<EpicsValue>) {
         db.register_link_set("ca", Arc::new(NetworkStub(serve)))
             .await;
+        db.process_cp_links_on_connect().await;
     }
 
     /// C `dbInitLink` (`dbLink.c:118-128`, the call being `dbCaAddLink` at

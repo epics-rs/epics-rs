@@ -60,6 +60,7 @@ async fn ioc() -> Arc<PvDatabase> {
         .await
         .unwrap();
     db.register_link_set("ca", Arc::new(Slow)).await;
+    db.process_cp_links_on_connect().await;
     db
 }
 

@@ -7658,6 +7658,7 @@ mod tests {
         let lset = Arc::new(StubCaLset::default());
         ctx.block_on(db.register_link_set("ca", lset.clone()));
         ctx.block_on(db.ioc_init());
+        ctx.block_on(db.process_cp_links_on_connect());
         (db, ctx, lset, dir)
     }
 

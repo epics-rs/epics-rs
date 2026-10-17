@@ -8,7 +8,7 @@
 //! only to choose the init-callback hint. That CA subscription is taken with
 //! `DBE_VALUE | DBE_ALARM` (`dbCa.c:1225-1229` → `cadef.h:2010-2011`), and
 //! `CA_DBPROCESS` is added only from its `eventCallback` (`dbCa.c:955-963`),
-//! run as a bare `db_process` by the worker (`dbCa.c:1249-1257`). A source
+//! run as a bare `db_process` by the worker (`dbCa.c:1314-1321`). A source
 //! cycle that publishes nothing therefore leaves the holder alone.
 //!
 //! The port makes the same link, served in-process by the calink `dbContext`

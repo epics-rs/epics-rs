@@ -1504,7 +1504,8 @@ impl PvDatabase {
     pub fn new() -> Self {
         Self {
             inner: Arc::new_cyclic(|weak| {
-                let ca_links = Arc::new(ca_link::CaLinks::new(weak.clone()));
+                let ca_run: Arc<processing::CaRunGate> = Default::default();
+                let ca_links = Arc::new(ca_link::CaLinks::new(weak.clone(), ca_run.clone()));
                 let mut link_sets = link_set::LinkSetRegistry::new();
                 link_sets.register("ca", ca_links.clone());
                 PvDatabaseInner {
@@ -1527,7 +1528,7 @@ impl PvDatabase {
                     scan_index: scan_index::ScanIndex::new(),
                     load_order_counter: std::sync::atomic::AtomicU64::new(0),
                     external_cp_links: SnapshotCell::new(CpRegistry::default()),
-                    ca_run: Default::default(),
+                    ca_run,
                     aliases: RecursiveReadLock::new(HashMap::new()),
                     registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(
                         (),
@@ -1990,135 +1991,6 @@ impl PvDatabase {
         let mut s = self.inner.link_sets.load().schemes();
         s.sort();
         s
-    }
-
-    /// Wait for the CA links to local records to report
-    /// `init_ready() == true` — connected, first monitor event cached,
-    /// attribute fetch complete. Mirrors `dbCa: iocInit wait for local CA
-    /// links to connect` (epics-base PR #768) as extended by #856's
-    /// `testInitReady` all-conditions gate. The working set is
-    /// exactly `Self::external_link_targets`: only the CA facility's
-    /// local-target links — `pva://` links and non-local CA links connect
-    /// in the background and are never waited on (pvxs parity).
-    ///
-    /// Polls every 100 ms. Returns:
-    /// * `Ok(connected_count)` — the number of links that ended up
-    ///   connected. May be smaller than the total when the timeout
-    ///   expired before everyone was ready.
-    /// * The total link count — i.e. the size of the working set
-    ///   that was checked. `(connected, total)` lets the caller log
-    ///   "M/N CA links connected".
-    ///
-    /// Pure no-op when no CA link set is registered, or when its
-    /// `link_names()` has no local-target link yet (e.g. lazy-open lsets
-    /// that haven't observed any record link — record processing creates
-    /// the entries on first read, after iocInit returns).
-    pub async fn wait_for_external_links(&self, timeout: std::time::Duration) -> (usize, usize) {
-        // Collect (lset, name) pairs once. `link_names()` may grow
-        // as record processing opens new links, but iocInit's wait
-        // is bounded by the records loaded *before* Phase 3 — every
-        // such link is already opened by the time wire_device_support
-        // and setup_cp_links return.
-        let targets = self.external_link_targets().await;
-        let total = targets.len();
-        if total == 0 {
-            return (0, 0);
-        }
-        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep
-        // below is the background timer, which measures on std's clock on both
-        // backends. Reading the deadline off tokio's clock made the two
-        // disagree — under `start_paused` tokio's clock advances only when the
-        // runtime decides to, while the timer thread follows the real one, so
-        // the loop could sleep against one clock and expire against another.
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let mut connected = 0usize;
-            for (lset, name) in &targets {
-                // `init_ready`, not `is_connected`: C `testInitReady`
-                // (`dbCa.c:835` at `ef4829829`, epics-base #856 — post-
-                // `R7.0.10` and in no tag) releases iocInit only when the
-                // link's monitor AND attribute-fetch actions have all
-                // completed, not on the bare connection edge.
-                if lset.init_ready(name) {
-                    connected += 1;
-                }
-            }
-            if connected == total {
-                return (connected, total);
-            }
-            if std::time::Instant::now() >= deadline {
-                return (connected, total);
-            }
-            crate::runtime::task::sleep_background(std::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Snapshot the `(lset, link_name)` pairs the iocInit external-link
-    /// wait reasons over. Shared by [`Self::wait_for_external_links`] and
-    /// [`Self::unconnected_external_links`] so both see the identical
-    /// working set.
-    ///
-    /// C parity: the iocInit connection-wait is a property of the CA link
-    /// facility (dbCa) alone. The whole connection-wait is post-`R7.0.10`
-    /// and in no tag, so these numbers are `717d69e1f`'s, not the pin's —
-    /// at the pin `dbCaRun` is `dbCa.c:357-363` and does not spin at all.
-    /// `dbCaRun` (`dbCa.c:370-380`) spins at `:376-378` on
-    /// `initOutstanding`, which `dbCaAddLinkCallbackOpt` increments
-    /// (`dbCa.c:408-409`) for every link that arrives carrying the
-    /// `DBCA_CALLBACK_INIT_WAITING` bit. `dbInitLink` passes that bit — as
-    /// part of `DBCA_CALLBACK_INIT_START` (0xf, `dbCaPvt.h:118`) — only for
-    /// a CA link whose target is a LOCAL record (dbLink.c:128, :130):
-    ///   int isLocal = dbChannelTest(pvname) == 0;
-    ///   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_START : 0)
-    ///
-    /// **Unreleased upstream.** None of that exists at the reference pin.
-    /// R7.0.10 carries the REVERT of the first attempt (3f382f6b6), so its
-    /// `dbLink.c:128` is a bare `dbCaAddLink(NULL, plink, dbfType);` and its
-    /// `dbCa.c` has no `initOutstanding` at all; the wait re-landed in
-    /// 717d69e1f and ef4829829, which are in no tag. This function
-    /// therefore tracks epics-base HEAD, not the pin — a C IOC built from
-    /// R7.0.10 does not wait for local CA links.
-    ///
-    /// No other external facility waits: pvxs pvalink's `linkGlobal_t::init`
-    /// (ioc/pvalink.cpp) only calls `chan->open()` per channel — it opens
-    /// in the background and never blocks iocInit. So the wait targets
-    /// exactly the CA link set's local-target links; a non-local CA link
-    /// (e.g. areaDetector's `ShutterStatusEPICS_RBV.INP = "test CP MS"`
-    /// placeholder) and every `pva://` link connect asynchronously and are
-    /// never held by iocInit, like C.
-    async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, RecordName)> {
-        // Only the CA facility participates — look it up directly rather
-        // than iterating every registered scheme. `has_name_no_resolve`
-        // is the `dbChannelTest` twin (target is a local record).
-        let Some(ca_lset) = self.inner.link_sets.load().get("ca") else {
-            return Vec::new();
-        };
-        let mut targets: Vec<(link_set::DynLinkSet, RecordName)> = Vec::new();
-        for n in ca_lset.link_names() {
-            if self.has_name_no_resolve(&n) {
-                targets.push((ca_lset.clone(), n));
-            }
-        }
-        targets
-    }
-
-    /// Names of the waited-on CA links (local-target, per
-    /// `Self::external_link_targets`) that are opened but not yet
-    /// connected. iocInit calls this after
-    /// [`Self::wait_for_external_links`] times out so the
-    /// "M/N connected" diagnostic can name the `N-M` it proceeded
-    /// without, instead of leaving the operator to run `dbcar`.
-    /// `pva://` links are not in this set — they never block iocInit.
-    pub async fn unconnected_external_links(&self) -> Vec<RecordName> {
-        let mut names = Vec::new();
-        for (lset, name) in self.external_link_targets().await {
-            // Same predicate as the wait loop, so the M/N accounting and
-            // this diagnostic agree on which links held iocInit.
-            if !lset.init_ready(&name) {
-                names.push(name);
-            }
-        }
-        names
     }
 
     /// Every link field the record HAS, with its raw text and the link-field
@@ -4689,8 +4561,7 @@ mod tests {
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 
-    /// Lset that flips to "connected" after a configurable delay.
-    /// Drives the wait_for_external_links time-budget tests below.
+    /// Lset that flips to "connected" at `connect_at`.
     struct DelayedConnectLset {
         names: Vec<String>,
         connect_at: crate::runtime::task::Instant,
@@ -4710,146 +4581,6 @@ mod tests {
         fn link_names(&self) -> Vec<crate::types::RecordName> {
             self.names.iter().map(|n| n.as_str().into()).collect()
         }
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_returns_zero_zero_when_no_lsets() {
-        let db = PvDatabase::new();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(50))
-            .await;
-        assert_eq!((c, t), (0, 0));
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_connected_quickly() {
-        let db = PvDatabase::new();
-        // Local-target forced-CA links (dbChannelTest==0 → isLocal): these
-        // get DBCA_CALLBACK_INIT_START, so iocInit waits for them.
-        db.add_pv("pv:A", EpicsValue::Long(0)).await.unwrap();
-        db.add_pv("pv:B", EpicsValue::Long(0)).await.unwrap();
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["pv:A".to_string(), "pv:B".to_string()],
-            connect_at: crate::runtime::task::Instant::now(),
-        });
-        // Registered under "ca": the iocInit wait is CA-facility only, so
-        // the working set comes from the "ca" link set (these forced-CA
-        // local-target links), never from a "pva" set.
-        db.register_link_set("ca", lset).await;
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_secs(1))
-            .await;
-        assert_eq!((c, t), (2, 2));
-    }
-
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_returns_partial_on_timeout() {
-        let db = PvDatabase::new();
-        // Local target so the link is in the init-wait set (dbLink.c:130);
-        // connect-time well past the budget below, so the wait must return
-        // (0, 1) instead of blocking.
-        db.add_pv("slow:pv", EpicsValue::Long(0)).await.unwrap();
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["slow:pv".to_string()],
-            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
-        });
-        db.register_link_set("ca", lset).await;
-        let started = crate::runtime::task::Instant::now();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(250))
-            .await;
-        let elapsed = started.elapsed();
-        assert_eq!((c, t), (0, 1));
-        assert!(
-            elapsed >= std::time::Duration::from_millis(200),
-            "wait must consume at least the configured budget, got {:?}",
-            elapsed
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "wait must not exceed the budget by much, got {:?}",
-            elapsed
-        );
-    }
-
-    /// C parity (dbLink.c:130): a link whose target is NOT a local record
-    /// (`dbChannelTest != 0`) gets no DBCA_CALLBACK_INIT_START, so iocInit
-    /// must not block on it. An areaDetector `test CP MS` placeholder — a CP
-    /// link to a PV that exists nowhere — must drop straight through, leaving
-    /// the link to connect (or dangle) asynchronously and silently, like C.
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_skips_nonlocal_targets() {
-        let db = PvDatabase::new();
-        // "test" has no local record and would never connect.
-        let lset = Arc::new(DelayedConnectLset {
-            names: vec!["test".to_string()],
-            connect_at: crate::runtime::task::Instant::now() + std::time::Duration::from_secs(60),
-        });
-        db.register_link_set("ca", lset).await;
-        let started = crate::runtime::task::Instant::now();
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_secs(10))
-            .await;
-        // Non-local target is excluded from the wait set entirely, so the
-        // call returns (0, 0) immediately rather than blocking the budget.
-        assert_eq!((c, t), (0, 0));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "non-local link must not be waited on, got {:?}",
-            started.elapsed()
-        );
-        // And it is reported as unconnected by neither path (silent, like C).
-        assert!(db.unconnected_external_links().await.is_empty());
-    }
-
-    /// Lset that is connected but whose post-connect init actions (the
-    /// metadata fetch) never complete: `init_ready` stays false.
-    struct ConnectedMetaPendingLset {
-        names: Vec<String>,
-    }
-
-    #[async_trait::async_trait]
-    impl link_set::LinkSet for ConnectedMetaPendingLset {
-        fn is_connected(&self, _: &[u8]) -> bool {
-            true
-        }
-        fn init_ready(&self, _: &[u8]) -> bool {
-            false
-        }
-        fn get_cached_value(&self, _: &[u8]) -> Option<EpicsValue> {
-            None
-        }
-        async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
-            self.get_cached_value(name)
-        }
-        fn link_names(&self) -> Vec<crate::types::RecordName> {
-            self.names.iter().map(|n| n.as_str().into()).collect()
-        }
-    }
-
-    /// epics-base #856 (ef4829829, "dbCa: iocInit wait for all
-    /// conditions"): a connected link whose attribute fetch has not
-    /// completed still holds iocInit — the wait polls `init_ready`
-    /// (C `testInitReady`'s three-bit gate), not `is_connected` alone,
-    /// and the timeout diagnostic names the link it proceeded without.
-    #[epics_macros_rs::epics_test]
-    async fn wait_for_external_links_holds_until_init_ready() {
-        let db = PvDatabase::new();
-        db.add_pv("meta:pending", EpicsValue::Long(0))
-            .await
-            .unwrap();
-        let lset = Arc::new(ConnectedMetaPendingLset {
-            names: vec!["meta:pending".to_string()],
-        });
-        db.register_link_set("ca", lset).await;
-        let (c, t) = db
-            .wait_for_external_links(std::time::Duration::from_millis(250))
-            .await;
-        assert_eq!((c, t), (0, 1));
-        assert_eq!(
-            db.unconnected_external_links().await,
-            vec!["meta:pending".to_string()]
-        );
     }
 
     // epics-base PR #336 — alias parsing + lookup integration tests.

@@ -171,6 +171,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(FailingLset)).await;
+    db.process_cp_links_on_connect().await;
 
     add_ao_with_out(&db, "AO_RECOVER", "ca://REMOTE:OUT").await;
 
@@ -193,6 +194,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     let mut visited = epics_base_rs::server::database::ProcStack::new();
     db.process_record_with_links("AO_RECOVER", &mut visited)

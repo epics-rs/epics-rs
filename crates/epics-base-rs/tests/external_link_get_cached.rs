@@ -192,6 +192,7 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
         )),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     add_ai_with_inp(&db, "AI_WARM", "ca://REMOTE:IN").await;
     process(&db, "AI_WARM").await; // stages the open

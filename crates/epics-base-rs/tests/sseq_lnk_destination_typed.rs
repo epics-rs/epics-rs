@@ -354,6 +354,7 @@ async fn resolved_external_string_destination_takes_the_string_view() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("SRC_E", Box::new(AiRecord::new(4.5)))
         .await
         .unwrap();

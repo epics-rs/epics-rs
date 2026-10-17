@@ -6,7 +6,7 @@
 //! has `scan == 0`), adds `CA_DBPROCESS` whenever the rights are not fully
 //! held while connected (`dbCa.c:1029` skips only when
 //! `hasReadAccess && hasWriteAccess`). The `dbCaTask` worker then runs
-//! `db_process(prec)` (`dbCa.c:1249-1257`); that process calls `dbGetLink`
+//! `db_process(prec)` (`dbCa.c:1314-1321`); that process calls `dbGetLink`
 //! → `dbCaGetLink`, which returns `-1` with `pca->sevr = INVALID_ALARM;
 //! pca->stat = LINK_ALARM` because `!pca->hasReadAccess` (`dbCa.c:430-434`)
 //! even though `pca->isConnected` is still TRUE, and the record commits

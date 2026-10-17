@@ -265,6 +265,7 @@ record(ai, "DST") {
     )
     .await;
     db.register_link_set("ca", Arc::new(RemoteLset)).await;
+    db.process_cp_links_on_connect().await;
     proc(&db, "DST").await;
 
     assert_eq!(

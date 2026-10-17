@@ -43,7 +43,7 @@
 //! This port keeps that shape exactly, because it is also what makes the
 //! suspension legal here. Record processing below
 //! `PvDatabase::process_record_with_links` is a *synchronous* recursion —
-//! `process_record_with_links_recursive` runs the FLNK/OUT chain as plain calls
+//! `process_record_with_links_recursive_at` runs the FLNK/OUT chain as plain calls
 //! inside the entry record's gate-held region and must not suspend — so a
 //! mid-chain stop cannot be an `.await`; it can only be a parked thread.
 //! Parking a runtime worker would be unacceptable, so the chain runs on the

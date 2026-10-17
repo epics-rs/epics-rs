@@ -276,6 +276,7 @@ async fn an_external_array_target_gets_the_array_buffer() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
         .await
         .unwrap();
@@ -303,6 +304,7 @@ async fn an_unresolved_external_target_defaults_to_the_scalar_buffer() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("AC", Box::new(invalid_ivov_record(1, 3, "ca://EXT")))
         .await
         .unwrap();

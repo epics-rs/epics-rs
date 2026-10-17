@@ -3785,16 +3785,12 @@ impl PvDatabase {
     /// record's advisory write gate. The gate-held body — no `.await`.
     pub fn put_driven_process_already_locked(&self, record_name: impl AsRef<[u8]>) -> CaResult<()> {
         let record_name = record_name.as_ref();
-        {
-            let Some(rec) = self.get_record(record_name) else {
-                return Ok(());
-            };
-            let mut instance = rec.write();
-            if instance.is_processing() {
-                instance.common.rpro = 1;
-                return Ok(());
-            }
-            instance.common.putf = true;
+        let Some(rec) = self.get_record(record_name) else {
+            return Ok(());
+        };
+        let gate = super::FrameGate::of_held(rec.lock_record());
+        if !db_process_claim(&rec, gate.set()) {
+            return Ok(());
         }
         let mut visited = crate::server::database::ProcStack::new();
         self.process_record_with_links_already_locked(record_name, &mut visited)
@@ -6234,4 +6230,22 @@ record(ai, "SRC") {}
             "re-seeded"
         );
     }
+}
+
+/// C `db_process`'s PACT split (`db_access.c:1046-1057`), shared by every
+/// put-driven process and every CA CP/CPP update (`dbCa.c:1320`): an active
+/// record takes RPRO and is not processed; an idle one takes PUTF. Returns
+/// whether the caller goes on to process it. `held` is the record's lock
+/// set, which C holds from the claim to the end of the process.
+pub(crate) fn db_process_claim(
+    rec: &crate::server::record::RecordCell,
+    held: &super::SetGuard,
+) -> bool {
+    let mut instance = rec.write_in(held);
+    if instance.is_processing() {
+        instance.common.rpro = 1;
+        return false;
+    }
+    instance.common.putf = true;
+    true
 }

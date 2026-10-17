@@ -84,6 +84,7 @@ async fn rig_on(scheme: &str, admission: PutAdmission) -> Rig {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     Rig {
         db,
         writes,

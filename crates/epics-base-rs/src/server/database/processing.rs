@@ -2775,7 +2775,7 @@ impl PvDatabase {
     /// same record blocks a foreign scan/event/FLNK-dispatch caller
     /// here, and vice versa — restoring the `DBManyLock` exclusion. The
     /// recursive FLNK / OUT / CP fan-out within one chain does NOT
-    /// re-acquire the gate (`process_record_with_links_recursive`),
+    /// re-acquire the gate (`process_record_with_links_recursive_at`),
     /// mirroring C `processTarget` (`dbDbLink.c:436`) which asserts the
     /// target's lock set is already owned by the calling thread; the
     /// `visited` cycle guard prevents re-processing the entry record.
@@ -2979,7 +2979,7 @@ impl PvDatabase {
         // transaction owner already holds the gate via `lock_records`
         // (`process_record_with_links_already_locked`), or this is a
         // recursive FLNK/OUT/CP call within one chain
-        // (`process_record_with_links_recursive`) — C `processTarget`
+        // (`process_record_with_links_recursive_at`) — C `processTarget`
         // processes a link target under the lock set the caller already
         // owns, and re-acquiring would deadlock the non-reentrant gate.
         let record_gate = if acquire_gate {
@@ -3093,25 +3093,6 @@ impl PvDatabase {
     /// Synchronous, and recursive as a plain call: the chain runs inside the
     /// entry record's gate-held region, so it must not suspend. C's
     /// `processTarget` is likewise a direct call under the caller's lock set.
-    pub(crate) fn process_record_with_links_recursive(
-        &self,
-        name: &[u8],
-        visited: &mut ProcStack,
-    ) -> CaResult<()> {
-        // The target may park in a breakpoint hook with the set given up, and a
-        // borrow of any record in the set held across that park would be read
-        // by another thread (`RecordCell::unheld`). Every frame therefore
-        // drops its borrows before it dispatches.
-        debug_assert_eq!(
-            crate::server::record::record_instance::live_borrows::count(),
-            0,
-            "a frame dispatched a FLNK/OUT/CP target with a record borrow live"
-        );
-        self.run_process_frame(ProcessTarget::Name(name), visited, false, false, false)
-    }
-
-    /// [`Self::process_record_with_links_recursive`] for a target already
-    /// resolved — a link's address, whose `name` is the canonical one.
     pub(crate) fn process_record_with_links_recursive_at(
         &self,
         name: &[u8],
@@ -9037,12 +9018,10 @@ impl PvDatabase {
 
     /// Process a single CP/CPP target edge, applying the CPP passive gate.
     ///
-    /// The passive gate is the ONLY thing decided here. C's `CA_DBPROCESS`
-    /// worker (`dbCa.c:1249-1257`) is bare `dbScanLock` / `db_process` /
-    /// `dbScanUnlock`, so an active target is handled by `dbProcess` itself —
-    /// which the port models once, in the PACT entry guard of
-    /// [`Self::process_record_with_links_body`]. Deciding PACT a second time
-    /// here is what let this path diverge from that owner.
+    /// C's `CA_DBPROCESS` worker (`dbCa.c:1314-1321`) is `dbScanLock` /
+    /// `db_process` / `dbScanUnlock` (epics-base a4bc0db6e), so the target
+    /// takes `db_process`'s PACT split: RPRO on an active one, PUTF on an
+    /// idle one, through [`super::field_io::db_process_claim`].
     fn process_one_cp_target(&self, target: &super::CpTarget, visited: &mut ProcStack) {
         let target_rec = self.lookup_record(&target.record);
         let skip = match &target_rec {
@@ -9051,11 +9030,6 @@ impl PvDatabase {
             // non-Passive target is reached by its own periodic/event scan, so
             // it is not dispatched here. A CP link (`passive_only == false`)
             // never takes this branch and always dispatches.
-            //
-            // epics-base PR #3fb10b6: PUTF must remain false on CP-driven
-            // targets — only the record directly receiving the dbPut reports
-            // PUTF=1 to dbNotify/onChange observers, so we deliberately do NOT
-            // set PUTF here.
             Some((_, t)) => {
                 if visited.holds(t) {
                     return;
@@ -9068,12 +9042,14 @@ impl PvDatabase {
         if skip {
             return;
         }
-        // recursive CP-target fan-out within one chain —
-        // gate already held by the foreign entry record.
-        let _ = match &target_rec {
-            Some((name, rec)) => self.process_record_with_links_recursive_at(name, rec, visited),
-            None => self.process_record_with_links_recursive(&target.record, visited),
+        let Some((name, rec)) = &target_rec else {
+            return;
         };
+        // `dbScanLock` before `db_process`, given up after it (`dbCa.c:1319-1321`).
+        let gate = self.lock_instance(rec);
+        if super::field_io::db_process_claim(rec, gate.set()) {
+            let _ = self.process_record_with_links_recursive_at(name, rec, visited);
+        }
     }
 
     /// Process every holder of a CP/CPP link to `external_pv`, the channel a
@@ -9081,7 +9057,7 @@ impl PvDatabase {
     /// calink/pvalink monitor callback, this is C `dbCa.c eventCallback`
     /// adding `CA_DBPROCESS` for a CP (or Passive CPP) link
     /// (`dbCa.c:958-962`) and the worker running `db_process(prec)`
-    /// (`dbCa.c:1255`) — the only trigger a CP holder has.
+    /// (`dbCa.c:1314-1321`) — the only trigger a CP holder has.
     ///
     /// A fresh `visited` set starts a new process chain —
     /// the monitor event is an independent external trigger, like a scan,
@@ -11273,6 +11249,9 @@ impl ExternalCpProcess {
 #[derive(Default)]
 pub(crate) struct CaRunGate {
     state: parking_lot::Mutex<GateState>,
+    /// `dbCaRun` has been called: `GateState::running`, readable on every
+    /// link call without the mutex.
+    started: std::sync::atomic::AtomicBool,
     notify: crate::runtime::sync::Notify,
     settled: crate::runtime::sync::Notify,
 }
@@ -11287,6 +11266,8 @@ impl CaRunGate {
     /// `dbCaRun`.
     pub(crate) async fn run(&self) {
         self.state.lock().running = true;
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
         loop {
             let settled = self.settled.notified();
@@ -11297,6 +11278,11 @@ impl CaRunGate {
             }
             settled.await;
         }
+    }
+
+    /// `dbCaRun` has been called.
+    pub(crate) fn has_run(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) async fn reached(&self) {

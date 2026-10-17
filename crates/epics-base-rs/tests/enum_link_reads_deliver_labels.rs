@@ -254,6 +254,7 @@ async fn stringin_inp_at_external_enum_renders_via_cached_choices() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     process(&db, "SIX").await;
     assert_eq!(
         field_str(&db, "SIX", "VAL"),
@@ -276,6 +277,7 @@ async fn stringin_inp_at_external_enum_without_choices_falls_back_to_digits() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     process(&db, "SIY").await;
     assert_eq!(field_str(&db, "SIY", "VAL"), "1");
 }

@@ -130,6 +130,7 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
 async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission) {
     db.register_link_set("ca", Arc::new(AdmissionLset { admission }))
         .await;
+    db.process_cp_links_on_connect().await;
     db.add_record(&format!("{prefix}_T2"), Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();

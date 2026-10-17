@@ -4,7 +4,7 @@
 //! C reference. `connectionCallback` (`dbCa.c:804-829`) clears
 //! `pca->isConnected` and, for a `pvlOptCP` link (or a `pvlOptCPP` link
 //! whose holder has `scan == 0`), sets `link_action |= CA_DBPROCESS`. The
-//! `dbCaTask` worker then runs `db_process(prec)` (`dbCa.c:1255`). That
+//! `dbCaTask` worker then runs `db_process(prec)` (`dbCa.c:1314-1321`). That
 //! process calls `dbGetLink` → `dbCaGetLink`, which returns `-1` with
 //! `pca->sevr = INVALID_ALARM; pca->stat = LINK_ALARM` because
 //! `!pca->isConnected` (`dbCa.c:430-434`), and the record commits

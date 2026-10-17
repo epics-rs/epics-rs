@@ -66,6 +66,7 @@ async fn relink_with_a_put_staged(new_out: &str) -> (Vec<(String, f64)>, Vec<(St
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
 
     put(&db, "VAL", EpicsValue::Double(1.0)).await;
     while puts.lock().unwrap().is_empty() {

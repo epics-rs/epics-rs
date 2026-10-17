@@ -95,6 +95,7 @@ async fn a_long_string_over_ca_puts_one_string_unless_the_channel_is_char() {
     let puts = Arc::new(Mutex::new(Vec::new()));
     db.register_link_set("ca", Arc::new(Remote { puts: puts.clone() }))
         .await;
+    db.process_cp_links_on_connect().await;
     for (rec, s) in [("LA", "12.5"), ("LW", "hello"), ("LD", "1")] {
         db.put_record_field_from_ca(rec, "VAL$", chars(s))
             .await

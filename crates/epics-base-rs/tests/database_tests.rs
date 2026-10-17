@@ -2082,6 +2082,7 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(ValueCaLset(73.0)))
         .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
@@ -2126,6 +2127,7 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();
@@ -3455,22 +3457,17 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
     assert_eq!(inst.common.lcnt, 0, "lcnt must reset when PACT clears");
 }
 
-// D-A: a CP/CPP burst onto a PACT target. C's `CA_DBPROCESS` worker is bare
-// `dbScanLock`/`db_process`/`dbScanUnlock` (`dbCa.c:1249-1257`), so an active
-// target lands in `dbProcess`'s own PACT branch (`dbAccess.c:536-556`): count
-// `lcnt`, and after `MAX_LOCK` raise SCAN_ALARM/INVALID with AMSG "Async in
-// progress". That branch never writes `precord->rpro`.
+// D-A: a CP/CPP burst onto a PACT target. C's `CA_DBPROCESS` worker calls
+// `db_process` (`dbCa.c:1314-1321`, epics-base a4bc0db6e), which on an active
+// record sets RPRO and does not enter `dbProcess` (`db_access.c:1046-1057`):
+// the burst neither counts `lcnt` nor raises SCAN_ALARM, and the release
+// reprocesses once with the latest source value.
 //
-// The port used to decide PACT a second time in `process_one_cp_target`,
-// setting RPRO and skipping — so the starved target got an extra device write
-// on PACT release and never raised the alarm that is how an operator sees the
-// starvation at all.
-//
-// Boundaries, one assertion each: RPRO on a blocked dispatch; the device-write
-// count while blocked; `lcnt` at MAX_LOCK and at MAX_LOCK+1; the device-write
-// count after the async completes; and `lcnt` reset once the target is idle.
+// Boundaries, one assertion each: RPRO on a blocked dispatch; `lcnt` and the
+// alarm past MAX_LOCK; the device-write count while blocked; the one reprocess
+// write on PACT release; and `lcnt` once the target is idle.
 #[epics_macros_rs::epics_test]
-async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
+async fn test_cp_burst_on_a_pact_target_sets_rpro() {
     let db = PvDatabase::new();
     let writes: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     db.add_record("CPB_SRC", Box::new(AoRecord::new(0.0)))
@@ -3552,28 +3549,27 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
         "one device write so far"
     );
 
-    // Bursts 2..=11: the target is PACT. MAX_LOCK = 10 of them bail silently.
-    for i in 1..=10 {
+    // Bursts 2..=12: the target is PACT, past MAX_LOCK = 10. Each takes RPRO.
+    for i in 1..=11 {
+        {
+            let tgt = db.get_record("CPB_TGT").unwrap();
+            tgt.write().common.rpro = 0;
+        }
         burst(db.clone(), 1.0 + i as f64).await;
         let tgt = db.get_record("CPB_TGT").unwrap();
-        calink_ioc::until(&format!("burst {i} lands on the PACT target"), || {
-            tgt.read().common.lcnt == i as i16
+        calink_ioc::until(&format!("burst {i} marks the PACT target"), || {
+            tgt.read().common.rpro == 1
         })
         .await;
-        let inst = db.get_record("CPB_TGT").unwrap();
-        let inst = inst.read();
+        let inst = tgt.read();
         assert_eq!(
-            inst.common.rpro, 0,
-            "dbCa.c's CA_DBPROCESS never sets RPRO (burst {i})"
-        );
-        assert_eq!(
-            inst.common.lcnt, i as i16,
-            "lcnt counts the blocked dispatch"
+            inst.common.lcnt, 0,
+            "db_process skips dbProcess (burst {i})"
         );
         assert_eq!(
             inst.common.sevr,
             AlarmSeverity::NoAlarm,
-            "no SCAN_ALARM before MAX_LOCK (burst {i})"
+            "no SCAN_ALARM (burst {i})"
         );
         assert_eq!(
             writes.lock().unwrap().len(),
@@ -3582,46 +3578,17 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
         );
     }
 
-    // Burst 12: lcnt is MAX_LOCK before the increment, so the alarm fires.
-    burst(db.clone(), 12.0).await;
-    let tgt = db.get_record("CPB_TGT").unwrap();
-    calink_ioc::until("burst 12 raises the alarm", || {
-        tgt.read().common.sevr == AlarmSeverity::Invalid
-    })
-    .await;
-    {
-        let inst = db.get_record("CPB_TGT").unwrap();
-        let inst = inst.read();
-        assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
-        assert_eq!(
-            inst.common.stat,
-            epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
-        );
-        assert_eq!(inst.common.amsg, "Async in progress");
-        assert_eq!(inst.common.rpro, 0, "the alarm arm writes no RPRO either");
-    }
-
-    // The device round trip finally completes. No RPRO was ever set, so the
-    // completion tail queues no reprocess and the device sees no second write.
+    // The release reprocesses once, reading burst 12's source value.
     db.complete_async_record("CPB_TGT").await.unwrap();
-    assert_eq!(
-        *writes.lock().unwrap(),
-        vec![1.0],
-        "no RPRO means no extra device write on PACT release"
-    );
-
-    // The target is idle again: the next CP dispatch runs the body and resets
-    // lcnt, C's `else { precord->lcnt = 0; }`. It leaves the target PACT, so a
-    // reprocess queued by the release could no longer write either.
-    burst(db.clone(), 13.0).await;
-    calink_ioc::until("burst 13 reaches the device", || {
+    calink_ioc::until("the RPRO reprocess reaches the device", || {
         writes.lock().unwrap().len() == 2
     })
     .await;
-    assert_eq!(*writes.lock().unwrap(), vec![1.0, 13.0]);
+    assert_eq!(*writes.lock().unwrap(), vec![1.0, 12.0]);
     let inst = db.get_record("CPB_TGT").unwrap();
     let inst = inst.read();
     assert_eq!(inst.common.lcnt, 0, "an idle target resets lcnt");
+    assert_eq!(inst.common.rpro, 0, "the reprocess consumed RPRO");
 }
 
 // Regression: when a record returns `AsyncPending` paired with a
@@ -6970,6 +6937,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     db.add_record("TS_CADST", Box::new(AiRecord::new(0.0)))
         .await
         .unwrap();
@@ -7048,6 +7016,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     // TSE_SRC is never added locally -> the bare Db TSEL .TIME is non-local.
     db.add_record("TS_NLDST", Box::new(AiRecord::new(0.0)))
         .await
@@ -8582,6 +8551,7 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         }),
     )
     .await;
+    db.process_cp_links_on_connect().await;
     // pv_b is local; REMOTE:A is never added → non-local CA input.
     db.add_record("pv_b", Box::new(AiRecord::new(5.0)))
         .await
@@ -9399,6 +9369,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
             }),
         )
         .await;
+        db.process_cp_links_on_connect().await;
         db.add_record("CADST", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();

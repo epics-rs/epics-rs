@@ -289,6 +289,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     // Register the CA link set on the database.
     let resolver = CaLinkResolver::with_client(client);
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
+    db.process_cp_links_on_connect().await;
 
     // Pre-open the link and wait so the synchronous lset read serves
     // from cache (the C `dbCaAddLink` + iocInit-wait analogue).
@@ -332,7 +333,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
 ///
 /// This is the exact C `dbCa.c` path: `eventCallback` refreshes the
 /// cached value and adds `CA_DBPROCESS` for a CP link (`dbCa.c:891`, `:958-962`),
-/// and the worker thread runs `db_process(prec)` (`dbCa.c:1255`).
+/// and the worker thread runs `db_process(prec)` (`dbCa.c:1314-1321`).
 ///
 /// The holder is Passive on purpose: a Passive record never self-scans,
 /// so its CA link never opens lazily and the monitor that drives the

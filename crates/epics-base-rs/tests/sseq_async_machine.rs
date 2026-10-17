@@ -134,6 +134,7 @@ async fn ca_hold(db: &PvDatabase) -> Arc<CaHoldState> {
     let state = Arc::new(CaHoldState::default());
     db.register_link_set("ca", Arc::new(CaHoldLset(state.clone())))
         .await;
+    db.process_cp_links_on_connect().await;
     state
 }
 

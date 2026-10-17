@@ -1627,10 +1627,9 @@ impl LinkSet for PvaLinkResolver {
     fn link_names(&self) -> Vec<epics_base_rs::types::RecordName> {
         // The [`LinkSet::link_names`] enumeration contract: surface one
         // identity per opened INP monitor variant, for link introspection.
-        // NOT consumed by the iocInit external-link wait — that wait is
-        // CA-facility only (`PvDatabase::external_link_targets` looks up
-        // the `"ca"` set alone), and pvalink never blocks iocInit (pvxs
-        // parity). A `pva://` monitor connects in the background.
+        // NOT consumed by `dbCaRun`'s wait, which is CA-facility only;
+        // pvalink never blocks iocInit (pvxs parity). A `pva://` monitor
+        // connects in the background.
         //
         // Each name is a canonical link string that round-trips back to
         // the same `(pv_name, pipeline, queue_size)` variant when fed to

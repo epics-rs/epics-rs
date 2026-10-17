@@ -68,6 +68,7 @@ fn console_of(name: &str) -> Vec<String> {
 async fn put_once(lset: Lset) -> (u16, AlarmSeverity) {
     let db = PvDatabase::new();
     db.register_link_set("ca", Arc::new(lset)).await;
+    db.process_cp_links_on_connect().await;
     db.add_record("R1", Box::new(AoRecord::new(1.0)))
         .await
         .unwrap();

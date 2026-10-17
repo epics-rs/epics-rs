@@ -60,14 +60,22 @@ pub(crate) struct CaLinks {
     db: Weak<PvDatabaseInner>,
     routes: RwLock<HashMap<RecordName, Route>>,
     network: RwLock<Option<DynLinkSet>>,
+    /// `dbCaTask` connects no channel before `dbCaRun` (`dbCa.c:1171-1173`),
+    /// so until then every link, local or network, reads as unconnected
+    /// (`dbCa.c:459`), whatever its channel has already delivered.
+    ca_run: Arc<super::processing::CaRunGate>,
 }
 
 impl CaLinks {
-    pub(crate) fn new(db: Weak<PvDatabaseInner>) -> Self {
+    pub(crate) fn new(
+        db: Weak<PvDatabaseInner>,
+        ca_run: Arc<super::processing::CaRunGate>,
+    ) -> Self {
         Self {
             db,
             routes: RwLock::new(HashMap::new()),
             network: RwLock::new(None),
+            ca_run,
         }
     }
 
@@ -114,8 +122,22 @@ impl CaLinks {
     }
 
     /// `local` over the name's local link, else `net` over the network half
-    /// (`None` with none registered).
+    /// (`None` with none registered, or before `dbCaRun`).
     fn answer<R>(
+        &self,
+        name: &[u8],
+        local: impl FnOnce(&LocalLink) -> R,
+        net: impl FnOnce(&dyn LinkSet) -> Option<R>,
+    ) -> Option<R> {
+        if !self.ca_run.has_run() {
+            return None;
+        }
+        self.answer_paused(name, local, net)
+    }
+
+    /// [`Self::answer`] before `dbCaRun` too: for the wait `dbCaRun` itself
+    /// makes on the links' first events.
+    fn answer_paused<R>(
         &self,
         name: &[u8],
         local: impl FnOnce(&LocalLink) -> R,
@@ -182,11 +204,14 @@ impl LinkSet for CaLinks {
     }
 
     fn init_ready(&self, name: &[u8]) -> bool {
-        self.answer(name, LocalLink::is_connected, |n| Some(n.init_ready(name)))
+        self.answer_paused(name, LocalLink::is_connected, |n| Some(n.init_ready(name)))
             .unwrap_or(false)
     }
 
     async fn get_value(&self, name: &[u8]) -> Option<EpicsValue> {
+        if !self.ca_run.has_run() {
+            return None;
+        }
         let name = strip_ca_scheme(name);
         match self.open(name).await {
             Some(link) => link.read(),
@@ -241,6 +266,9 @@ impl LinkSet for CaLinks {
     /// (`cacChannel::accessRights`). An unopened name is staged, and its
     /// put performs the open.
     fn put_admission(&self, name: &[u8]) -> PutAdmission {
+        if !self.ca_run.has_run() {
+            return PutAdmission::Refused;
+        }
         let name = strip_ca_scheme(name);
         match self.routes.read().get(name) {
             Some(Route::Local(link)) if link.is_connected() => return PutAdmission::Connected,
@@ -256,6 +284,12 @@ impl LinkSet for CaLinks {
 
     async fn put_value(&self, name: &[u8], value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let name = strip_ca_scheme(name);
+        if !self.ca_run.has_run() {
+            return Err(format!(
+                "CA link {} not connected",
+                String::from_utf8_lossy(name)
+            ));
+        }
         match self.open(name).await {
             Some(link) => link.write(value, op).await,
             None => match self.network() {

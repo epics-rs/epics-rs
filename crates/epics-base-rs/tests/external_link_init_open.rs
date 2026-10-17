@@ -150,6 +150,7 @@ async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
     db.register_link_set("ca", lset.clone()).await;
+    db.process_cp_links_on_connect().await;
 
     // No `CP` / `CPP` modifier — `setup_cp_links` ignores this link entirely.
     add_ai(&db, "AI_PLAIN", "ca://REMOTE:IN").await;
@@ -277,6 +278,7 @@ async fn plain_non_local_db_link_converts_and_opens_at_init() {
     let lset = CountingLset::new(&reads);
     let db = PvDatabase::new();
     db.register_link_set("ca", lset.clone()).await;
+    db.process_cp_links_on_connect().await;
 
     // No modifier at all — `setup_cp_links` never looked at this link, and
     // pre-fix nothing else converted or opened it either.

@@ -1717,44 +1717,6 @@ impl IocBuild {
         setup_property_posts(db.clone()).await;
         init_links(&db).await;
 
-        // Phase 2b.5: wait for the CA links to local records to connect
-        // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit
-        // wait`). This is a CA-facility wait only: `pva://` links and
-        // non-local CA links open in the background and never block
-        // iocInit (pvxs parity — pvalink `linkGlobal_t::init` just opens
-        // channels). Default 10s timeout, override via
-        // `EPICS_RS_INIT_LINK_TIMEOUT` (seconds, fractional accepted).
-        // Pass-through when no CA link set is registered.
-        let link_wait_secs = crate::runtime::env::get_lossy("EPICS_RS_INIT_LINK_TIMEOUT")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(10.0)
-            .max(0.0);
-        if link_wait_secs > 0.0 {
-            let (connected, total) = db
-                .wait_for_external_links(crate::runtime::time::duration_from_secs(link_wait_secs))
-                .await;
-            if total > 0 {
-                if connected == total {
-                    tracing::debug!("iocInit: {connected}/{total} external links connected");
-                } else {
-                    let unconnected = db.unconnected_external_links().await;
-                    // C's iocInit has no link wait and prints nothing here.
-                    tracing::debug!(
-                        target: "epics_base_rs::ioc_app",
-                        connected,
-                        total,
-                        link_wait_secs,
-                        unconnected = %unconnected
-                            .iter()
-                            .map(|n| n.to_str_lossy())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        "iocInit: proceeding without unconnected external links"
-                    );
-                }
-            }
-        }
-
         // C: initDatabase() then initHookAfterInitDatabase (autosave
         // pass 1). The registered hook performs pass-1 + SaveSetConfig
         // restore.

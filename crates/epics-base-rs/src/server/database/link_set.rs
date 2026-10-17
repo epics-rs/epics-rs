@@ -431,7 +431,7 @@ pub trait LinkSet: Send + Sync {
     fn is_connected(&self, name: &[u8]) -> bool;
 
     /// True iff `name` has completed every post-connect init action
-    /// iocInit's external-link wait holds for — C `testInitReady`
+    /// `dbCaRun`'s wait holds for — C `testInitReady`
     /// (`dbCa.c:835-845` at `ef4829829`, epics-base #856 "dbCa: iocInit
     /// wait for all conditions" — post-`R7.0.10` and in no tag, so this
     /// is the one citation here that is not pin-relative): connected with

@@ -96,7 +96,7 @@ async fn sync_zero_release_processes_with_implicit_get_info() {
     );
     let actions = state.lock().unwrap().pending_actions.take();
     assert!(
-        actions.is_some_and(|a| a.status_refresh),
+        actions.is_some_and(|a| a.commands.contains(&motor_rs::flags::MotorCommand::Poll)),
         "the implicit GET_INFO requests a device status refresh"
     );
 }

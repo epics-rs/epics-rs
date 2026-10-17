@@ -937,7 +937,7 @@ pub(crate) fn motor_put_field(
                     if rec.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
                         let forward = !rec.ctrl.jogr;
                         let dial_forward = forward != (rec.conv.dir == MotorDir::Neg);
-                        rec.send_special(vec![MotorCommand::MoveVelocity {
+                        let jog = MotorCommand::MoveVelocity {
                             min_velocity: rec.raw_rate(rec.effective_vbas()),
                             velocity: rec.raw_position(if dial_forward {
                                 rec.vel.jvel
@@ -945,7 +945,8 @@ pub(crate) fn motor_put_field(
                                 -rec.vel.jvel
                             }),
                             acceleration: rec.raw_rate(rec.jog_accel_egu()),
-                        }]);
+                        };
+                        rec.send_special(jog.after_speeds(SpeedWrites::JOG_RETUNE));
                     }
                 }
                 Ok(())

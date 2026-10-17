@@ -105,6 +105,11 @@ impl MotorBuilder {
         let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(self.poll_channel_capacity);
         let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
         let subscribers = AxisSubscribers::new();
+        let controller = match &self.user {
+            TraceUser::Asyn { port, addr } => Some((port.clone(), *addr)),
+            _ => None,
+        };
+        let model1 = matches!(self.user, TraceUser::Model1 { .. });
         let axis = MotorAxis::new(
             self.user,
             self.timeout,
@@ -112,17 +117,26 @@ impl MotorBuilder {
             motor_cmd_tx,
             subscribers.clone(),
         );
-        let poll_loop = MotorPollLoop::new(
-            PollerInbox {
-                poll: poll_cmd_rx,
-                commands: motor_cmd_rx,
-            },
-            self.motor,
-            subscribers,
-            self.moving_poll_interval,
-            self.idle_poll_interval,
-            self.forced_fast_polls,
-        );
+        let inbox = PollerInbox {
+            poll: poll_cmd_rx,
+            commands: motor_cmd_rx,
+        };
+        // A model-1 driver's task scans at its moving period alone.
+        let mut poll_loop = if model1 {
+            MotorPollLoop::motor_task(inbox, self.motor, subscribers, self.moving_poll_interval)
+        } else {
+            MotorPollLoop::new(
+                inbox,
+                self.motor,
+                subscribers,
+                self.moving_poll_interval,
+                self.idle_poll_interval,
+                self.forced_fast_polls,
+            )
+        };
+        if let Some((port, addr)) = controller {
+            poll_loop.mirror_to(&port, addr);
+        }
         AxisSetup {
             axis,
             poll_loop,

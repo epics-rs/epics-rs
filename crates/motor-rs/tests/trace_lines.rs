@@ -539,3 +539,177 @@ async fn status_callback_and_update_values_print_under_traceio_device() {
         "{moved:#?}"
     );
 }
+
+/// An axis whose driver refuses a deferred move with a param-library status.
+struct UndefinedParam;
+
+impl AsynMotor for UndefinedParam {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_deferred_moves(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Err(AsynError::ParamUndefined(11))
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        Ok(MotorStatus::default())
+    }
+}
+
+#[test]
+fn a_param_library_refusal_prints_its_own_status_code() {
+    let port = "traceLinesParam";
+    let lines = traced_by(port, || {
+        let trace = MotorTrace::new(port, 0);
+        let commands = [MotorCommand::DeferMoves { defer: true }];
+        execute_commands(&mut UndefinedParam, &trace, &commands, &mut |_| {});
+    });
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    // asynParamUndefined is 10; AsynStatus has no such value.
+    assert!(
+        lines[0].ends_with(
+            "asynMotorController:writeInt32 error, status=10 axis=0, function=11, value=1"
+        ),
+        "{lines:#?}"
+    );
+}
+
+/// An axis whose every write succeeds.
+struct Quiet;
+
+impl AsynMotor for Quiet {
+    fn move_absolute(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_closed_loop(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+        Ok(())
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        Ok(MotorStatus::default())
+    }
+}
+
+/// The `asynCallback` lines, past `pmsg=<address>`, of a record's speed,
+/// move, closed-loop and GET_INFO writes on a `user` axis of `port`.
+fn async_callback_lines(port: &str, user: TraceUser) -> Vec<String> {
+    use asyn_rs::trace::TraceMask;
+    use motor_rs::device_state::AxisSubscribers;
+    use motor_rs::poll_loop::{CommandBatch, MotorPollLoop, PollerInbox};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    PortManager::global()
+        .trace_manager()
+        .set_trace_mask(Some(port), TraceMask::FLOW);
+    let lines = traced_by(port, || {
+        let (_poll_tx, poll) = mpsc::channel(4);
+        let (tx, commands) = mpsc::unbounded_channel();
+        let mut poll_loop = MotorPollLoop::new(
+            PollerInbox { poll, commands },
+            Arc::new(Mutex::new(Quiet)),
+            AxisSubscribers::new(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            0,
+        );
+        let trace = MotorTrace::with_user(user);
+        trace.set_record("TL:m1");
+        tx.send(CommandBatch {
+            trace: Arc::new(trace),
+            record: Some(0),
+            commands: vec![
+                MotorCommand::SetVelocity { velocity: 4.0 },
+                MotorCommand::MoveAbsolute {
+                    position: 5.0,
+                    min_velocity: 0.0,
+                    velocity: 4.0,
+                    acceleration: 0.0,
+                },
+                MotorCommand::SetClosedLoop { enable: true },
+                MotorCommand::Poll,
+            ],
+        })
+        .unwrap();
+        poll_loop.run_queued_commands();
+    });
+    lines
+        .iter()
+        .filter_map(|l| {
+            let at = l.find("devMotorAsyn::asynCallback")?;
+            let size = l.find(", sizeof(*pmsg)").unwrap();
+            assert!(l[..size].contains(" pmsg=0x"), "{l}");
+            Some(format!(
+                "{}{}",
+                &l[at..l.find("pmsg=").unwrap()],
+                &l[size..]
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn each_record_write_prints_async_callbacks_flow_line() {
+    #[repr(C)]
+    struct Message(i32, i32, i32, f64);
+    let size = std::mem::size_of::<Message>();
+    let line = |command, interface, ivalue, dvalue: f64, reason| {
+        format!(
+            "devMotorAsyn::asynCallback: TL:m1 , sizeof(*pmsg)={size}, pmsg->command={command},pmsg->interface={interface}, pmsg->ivalue={ivalue}, pmsg->dvalue={dvalue:.6}, pasynUser->reason={reason}"
+        )
+    };
+    let model3 = async_callback_lines(
+        "traceLinesCallback3",
+        TraceUser::Asyn {
+            port: "traceLinesCallback3".into(),
+            addr: 0,
+        },
+    );
+    assert_eq!(
+        model3,
+        [
+            line(5, 1, 0, 4.0, 5),
+            line(0, 1, 0, 5.0, 1),
+            line(16, 0, 1, 0.0, 20),
+            line(18, 0, 0, 0.0, 27)
+        ]
+    );
+    let model2 = async_callback_lines(
+        "traceLinesCallback2",
+        TraceUser::Model2 {
+            port: "traceLinesCallback2".into(),
+            addr: 0,
+        },
+    );
+    assert_eq!(
+        model2,
+        [
+            line(5, 1, 0, 4.0, 100),
+            line(0, 1, 0, 5.0, 104),
+            line(16, 0, 1, 0.0, 8),
+            line(18, 0, 0, 0.0, 109)
+        ]
+    );
+}

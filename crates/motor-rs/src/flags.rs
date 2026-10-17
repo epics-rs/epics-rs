@@ -347,6 +347,11 @@ pub enum MotorCommand {
     InitPosition {
         position: f64,
     },
+    /// MOTOR_ENCODER_POSITION written to the controller port
+    /// (asynMotorController.cpp:367-372); no record command sends it.
+    SetEncoderPosition {
+        position: f64,
+    },
     /// do_work's SET_ENC_RATIO (motorRecord.cc:1973-1978).
     SetEncoderRatio {
         ratio: f64,
@@ -383,6 +388,11 @@ pub enum MotorCommand {
     ProfileInitialize {
         max_points: usize,
     },
+    /// The axis's profile in controller units, as a C `defineProfile`
+    /// override has it once the base has converted it.
+    ProfileDefine {
+        positions: Vec<f64>,
+    },
     ProfileBuild,
     ProfileExecute,
     ProfileAbort,
@@ -404,6 +414,68 @@ pub enum MotorCommand {
     SetLowLimit {
         position: f64,
     },
+    /// The record's SET_VELOCITY: stored on the axis for its next move
+    /// (devMotorAsyn.c:549-552).
+    SetVelocity {
+        velocity: f64,
+    },
+    /// The record's SET_VEL_BASE (devMotorAsyn.c:545-548).
+    SetVelBase {
+        velocity: f64,
+    },
+    /// The record's SET_ACCEL (devMotorAsyn.c:553-556).
+    SetAccel {
+        acceleration: f64,
+    },
+}
+
+/// Which of SET_VELOCITY, SET_VEL_BASE and SET_ACCEL a motorRecord call site
+/// writes ahead of its move or jog.
+#[derive(Debug, Clone, Copy)]
+pub struct SpeedWrites {
+    velocity: bool,
+    vel_base: bool,
+    /// SET_ACCEL only at a positive acceleration, else always.
+    accel_if_positive: bool,
+}
+
+impl SpeedWrites {
+    /// A move, a home, and the jog backlash take-out leg (motorRecord.cc:
+    /// 872-876, :938-942, :2052-2056, :2527-2531).
+    pub const MOVE: Self = Self {
+        velocity: true,
+        vel_base: true,
+        accel_if_positive: true,
+    };
+    /// A backlash final leg, which writes no SET_VEL_BASE (:955-958,
+    /// :1004-1007).
+    pub const BACKLASH: Self = Self {
+        velocity: true,
+        vel_base: false,
+        accel_if_positive: true,
+    };
+    /// A jog start (:2140-2142).
+    pub const JOG: Self = Self {
+        velocity: false,
+        vel_base: true,
+        accel_if_positive: false,
+    };
+    /// A JVEL write retuning a running jog (:3068-3069).
+    pub const JOG_RETUNE: Self = Self {
+        velocity: false,
+        vel_base: false,
+        accel_if_positive: false,
+    };
+}
+
+/// The speeds an axis moves on: what the record's speed writes stored
+/// last, C's `motorVelBase_` / `motorVelocity_` / `motorAccel_` parameters
+/// or drvMotorAsyn's `min_velocity` / `max_velocity` / `accel`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StoredSpeeds {
+    pub min_velocity: f64,
+    pub velocity: f64,
+    pub acceleration: f64,
 }
 
 impl MotorCommand {
@@ -420,6 +492,132 @@ impl MotorCommand {
                 | Self::SetPosition { .. }
         )
     }
+
+    /// The record's STOP_AXIS, which carries no SET_ACCEL (motorRecord.cc:
+    /// 1337, :1886, :1909, :2031, :2114, :2156): the axis stops on its
+    /// stored acceleration.
+    pub const fn stop_axis() -> Self {
+        Self::Stop { acceleration: 0.0 }
+    }
+
+    /// `self` preceded by the speed writes its call site makes, valued from
+    /// its own fields, in motorRecord.cc's order.
+    pub fn after_speeds(self, writes: SpeedWrites) -> Vec<MotorCommand> {
+        let (min_velocity, velocity, acceleration) = match self {
+            Self::MoveAbsolute {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::MoveRelative {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::Home {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            } => (min_velocity, Some(velocity), acceleration),
+            // A jog's velocity is its own message's value.
+            Self::MoveVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            } => (min_velocity, None, acceleration),
+            _ => return vec![self],
+        };
+        let mut commands = Vec::with_capacity(4);
+        if let (true, Some(velocity)) = (writes.velocity, velocity) {
+            commands.push(Self::SetVelocity { velocity });
+        }
+        if writes.vel_base {
+            commands.push(Self::SetVelBase {
+                velocity: min_velocity,
+            });
+        }
+        if !writes.accel_if_positive || acceleration > 0.0 {
+            commands.push(Self::SetAccel { acceleration });
+        }
+        commands.push(self);
+        commands
+    }
+
+    /// This move or stop on `speeds` in place of its own; a jog keeps its
+    /// velocity, which is its message's value.
+    pub fn on_speeds(&self, speeds: StoredSpeeds) -> Self {
+        let mut command = self.clone();
+        match &mut command {
+            Self::MoveAbsolute {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::MoveRelative {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            }
+            | Self::Home {
+                min_velocity,
+                velocity,
+                acceleration,
+                ..
+            } => {
+                *min_velocity = speeds.min_velocity;
+                *velocity = speeds.velocity;
+                *acceleration = speeds.acceleration;
+            }
+            Self::MoveVelocity {
+                min_velocity,
+                acceleration,
+                ..
+            } => {
+                *min_velocity = speeds.min_velocity;
+                *acceleration = speeds.acceleration;
+            }
+            Self::Stop { acceleration } => *acceleration = speeds.acceleration,
+            _ => {}
+        }
+        command
+    }
+
+    /// A move or stop, which an axis with a speed store runs on its stored
+    /// speeds.
+    pub fn runs_on_speeds(&self) -> bool {
+        matches!(
+            self,
+            Self::MoveAbsolute { .. }
+                | Self::MoveRelative { .. }
+                | Self::MoveVelocity { .. }
+                | Self::Home { .. }
+                | Self::Stop { .. }
+        )
+    }
+
+    /// The record's SET_VELOCITY, SET_VEL_BASE or SET_ACCEL.
+    pub fn is_speed_write(&self) -> bool {
+        matches!(
+            self,
+            Self::SetVelocity { .. } | Self::SetVelBase { .. } | Self::SetAccel { .. }
+        )
+    }
+
+    /// Store this speed write in `speeds`; whether it is one.
+    pub fn store_speed(&self, speeds: &mut StoredSpeeds) -> bool {
+        match *self {
+            Self::SetVelocity { velocity } => speeds.velocity = velocity,
+            Self::SetVelBase { velocity } => speeds.min_velocity = velocity,
+            Self::SetAccel { acceleration } => speeds.acceleration = acceleration,
+            _ => return false,
+        }
+        true
+    }
 }
 
 /// Effects returned by process logic.
@@ -427,13 +625,14 @@ impl MotorCommand {
 pub struct ProcessEffects {
     pub commands: Vec<MotorCommand>,
     pub schedule_delay: Option<std::time::Duration>,
+    /// A forced poll no C GET_INFO asks for: it prints nothing and posts
+    /// even an unchanged status. A C GET_INFO is a [`MotorCommand::Poll`].
     pub request_poll: bool,
     /// Not consulted: FLNK is gated solely on DMOV at process exit
     /// (C motorRecord.cc:1509-1510, `if (dmov != 0) recGblFwdLink`) —
     /// the record core neither sets nor reads this. Retained only so
     /// the public struct shape is unchanged.
     pub suppress_forward_link: bool,
-    pub status_refresh: bool,
 }
 
 /// Retarget action when a new target arrives during motion.

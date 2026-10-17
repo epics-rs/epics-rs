@@ -266,6 +266,13 @@ pub trait AsynMotor: Send + Sync {
     /// Set the current position without moving.
     fn set_position(&mut self, user: &AsynUser, position: f64) -> AsynResult<()>;
 
+    /// Set the encoder position without moving (C
+    /// `asynMotorAxis::setEncoderPosition`, a no-op unless the driver
+    /// overrides it).
+    fn set_encoder_position(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     /// Set the encoder ratio, motor steps per encoder count (C
     /// `asynMotorAxis::setEncoderRatio`, a no-op unless the driver needs it).
     fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {

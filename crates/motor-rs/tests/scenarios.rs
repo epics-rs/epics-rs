@@ -13,6 +13,20 @@ use std::time::Duration;
 const MRES: f64 = 0.001;
 
 /// Helper: create a default motor record with typical settings.
+/// The commands of `effects` past the speed writes ahead of them.
+/// Whether `commands` carry a GET_INFO.
+fn sends_get_info(commands: &[MotorCommand]) -> bool {
+    commands.contains(&MotorCommand::Poll)
+}
+
+fn motion(effects: &ProcessEffects) -> Vec<&MotorCommand> {
+    effects
+        .commands
+        .iter()
+        .filter(|c| !c.is_speed_write())
+        .collect()
+}
+
 fn make_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.conv.mres = MRES;
@@ -71,9 +85,9 @@ fn absolute_move_reaches_target_and_sets_dmov() {
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
-    assert_eq!(effects.commands.len(), 1);
+    assert_eq!(motion(&effects).len(), 1);
     assert!(matches!(
-        effects.commands[0],
+        motion(&effects)[0],
         MotorCommand::MoveAbsolute { position, .. } if (position - 50_000.0).abs() < 1e-6
     ));
 
@@ -113,7 +127,7 @@ fn cdir_uses_fresh_diff_not_stale_pos_diff() {
 
     // The move must be issued in the negative direction.
     assert!(rec.stat.mip.contains(MipFlags::MOVE));
-    assert_eq!(effects.commands.len(), 1);
+    assert_eq!(motion(&effects).len(), 1);
 
     // CDIR must reflect the fresh diff (dval - drbv = -30 - 0 < 0),
     // i.e. negative direction. With MRES > 0, cdir = (diff >= 0).
@@ -157,8 +171,8 @@ fn backlash_generates_two_phase_move() {
 
     // First command should go to pretarget (dval - bdst = -10 - 1 = -11),
     // in steps at MRES 0.001.
-    assert_eq!(effects.commands.len(), 1);
-    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+    assert_eq!(motion(&effects).len(), 1);
+    if let MotorCommand::MoveAbsolute { position, .. } = motion(&effects)[0] {
         assert!(
             (*position - (-11_000.0)).abs() < 1e-6,
             "pretarget should be -11000 steps, got {position}"
@@ -175,10 +189,18 @@ fn backlash_generates_two_phase_move() {
     assert_eq!(rec.stat.phase, MotionPhase::BacklashFinal);
     assert!(rec.stat.mip.contains(MipFlags::MOVE_BL));
     assert!(!rec.internal.backlash_pending);
-    assert_eq!(effects.commands.len(), 1);
+    // C 955-968: the final leg writes no SET_VEL_BASE.
+    assert!(matches!(
+        effects.commands[..],
+        [
+            MotorCommand::SetVelocity { .. },
+            MotorCommand::SetAccel { .. },
+            MotorCommand::MoveAbsolute { .. }
+        ]
+    ));
     if let MotorCommand::MoveAbsolute {
         position, velocity, ..
-    } = &effects.commands[0]
+    } = motion(&effects)[0]
     {
         assert!((*position - (-10_000.0)).abs() < 1e-6);
         assert_eq!(*velocity, rec.vel.bvel / rec.conv.mres);
@@ -218,7 +240,7 @@ fn retry_reissues_move_when_error_exceeds_rdbd() {
     assert_eq!(rec.retry.rcnt, 1);
     assert!(!rec.retry.miss);
     assert!(matches!(
-        effects.commands[0],
+        motion(&effects)[0],
         MotorCommand::MoveAbsolute { .. }
     ));
 
@@ -251,7 +273,7 @@ fn retry_modes_arithmetic_geometric_inposition() {
     // C Arithmetic: factor = (rtry - rcnt + 1) / rtry = (5 - 1 + 1) / 5 = 1.0
     // retry_target = 10.0 (= dval), use_rel=false:
     // position = dval + frac*(retry_target - dval) = 10.0 + 0.5*0 = 10.0
-    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+    if let MotorCommand::MoveAbsolute { position, .. } = motion(&effects)[0] {
         assert!((position - 10_000.0).abs() < 1e-6);
     } else {
         panic!("expected MoveAbsolute");
@@ -298,8 +320,8 @@ fn jog_start_stop_backlash_sequence() {
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(rec.stat.mip.contains(MipFlags::JOGF));
     assert!(matches!(
-        effects.commands[0],
-        MotorCommand::MoveVelocity { velocity, .. } if velocity > 0.0
+        motion(&effects)[0],
+        MotorCommand::MoveVelocity { velocity, .. } if *velocity > 0.0
     ));
 
     // Stop jog
@@ -340,7 +362,7 @@ fn home_forward_reverse_marks_homed() {
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
     assert!(rec.ctrl.homf); // stays latched until home completion (C 893-906)
     assert!(matches!(
-        effects.commands[0],
+        motion(&effects)[0],
         MotorCommand::Home { forward: true, .. }
     ));
 
@@ -382,7 +404,7 @@ fn dly_delays_final_dmov_assertion() {
     // Delay expires — C: sets DELAY_ACK, requests fresh poll
     rec.set_event(MotorEvent::DelayExpired);
     let effects = rec.do_process();
-    assert!(effects.status_refresh);
+    assert!(sends_get_info(&effects.commands));
     assert!(!rec.stat.dmov); // not yet finalized
 
     // Fresh poll arrives — evaluate position error, finalize
@@ -699,7 +721,10 @@ fn stup_protocol_round_trip_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "GET_INFO equivalent requested");
+    assert!(
+        sends_get_info(&actions.commands),
+        "GET_INFO equivalent requested"
+    );
 
     // The driver's status callback acknowledges the request.
     {
@@ -1030,7 +1055,10 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "implicit GET_INFO requested");
+    assert!(
+        sends_get_info(&actions.commands),
+        "implicit GET_INFO requested"
+    );
 
     // The data callback acknowledges and must not re-trigger.
     state.lock().unwrap().latest_status = Some(idle_status_at(2, 0.0));
@@ -1038,7 +1066,7 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
     let ack = state.lock().unwrap().pending_actions.take();
     assert!(
-        ack.is_none_or(|a| !a.status_refresh),
+        ack.is_none_or(|a| !sends_get_info(&a.commands)),
         "CALLBACK_DATA pass does not re-fire the refresh"
     );
 
@@ -1047,7 +1075,7 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
     rec.process().unwrap();
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)));
     let poll = state.lock().unwrap().pending_actions.take();
-    assert!(poll.is_none_or(|a| !a.status_refresh));
+    assert!(poll.is_none_or(|a| !sends_get_info(&a.commands)));
 }
 
 #[test]
@@ -1184,7 +1212,10 @@ fn coalesced_put_and_delay_expiry_keeps_watchdog() {
     rec.process().unwrap(); // the expiry's own pass
     assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.status_refresh, "DELAY_ACK requests the fresh poll");
+    assert!(
+        sends_get_info(&actions.commands),
+        "DELAY_ACK requests the fresh poll"
+    );
 
     // The fresh poll finalizes the motion.
     state.lock().unwrap().latest_status = Some(idle_status_at(3, 10.0));
@@ -1281,7 +1312,7 @@ fn sim_motor_end_to_end() {
         min_velocity,
         acceleration,
         ..
-    } = &effects.commands[0]
+    } = motion(&effects)[0]
     {
         motor
             .move_absolute(&user, *position, *min_velocity, 1.0e8, *acceleration)
@@ -1811,7 +1842,7 @@ fn give_up_no_button_finalizes_quietly() {
         effects.commands
     );
     assert!(
-        !effects.status_refresh,
+        !sends_get_info(&effects.commands),
         "CALLBACK_DATA give-up must not fire the implicit GET_INFO"
     );
 }

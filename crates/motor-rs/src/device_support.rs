@@ -13,6 +13,17 @@ use crate::flags::MotorCommand;
 use crate::poll_loop::{CommandBatch, MissingAxis, MotorCommandSender, PollCommand};
 use crate::trace::{MotorTrace, TraceUser};
 
+/// An axis subclass's C `report(fp, level)`, which its controller's
+/// `asynMotorController::report` calls for each axis; an axis with none
+/// is `asynMotorAxis::report`, which prints nothing.
+///
+/// It reads what it prints without the driver's lock, as C reads its
+/// members unlocked: the controller report runs on the port thread, which
+/// a poller holding that lock may be waiting on.
+pub trait AxisReport: Send + Sync {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32);
+}
+
 /// One axis as its create command registers it: the poller's queues and the
 /// records bound to it. Each record binding gets its own
 /// [`MotorDeviceSupport`] from [`Self::attach`], as each C devMotorAsyn
@@ -24,6 +35,7 @@ pub struct MotorAxis {
     poll_cmd_tx: mpsc::Sender<PollCommand>,
     motor_cmd_tx: MotorCommandSender,
     subscribers: AxisSubscribers,
+    report: Option<Arc<dyn AxisReport>>,
 }
 
 impl MotorAxis {
@@ -41,6 +53,20 @@ impl MotorAxis {
             poll_cmd_tx,
             motor_cmd_tx,
             subscribers,
+            report: None,
+        }
+    }
+
+    /// The driver's [`AxisReport`], C's `asynMotorAxis::report` override.
+    pub fn with_report(mut self, report: Arc<dyn AxisReport>) -> Self {
+        self.report = Some(report);
+        self
+    }
+
+    /// C `pAxis->report(fp, level)`.
+    pub(crate) fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if let Some(report) = &self.report {
+            report.report(out, level);
         }
     }
 
@@ -65,12 +91,22 @@ impl MotorAxis {
         let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll);
     }
 
+    /// C `wakeupPoller`.
+    pub(crate) fn wakeup(&self) {
+        let _ = self.poll_cmd_tx.try_send(PollCommand::Wakeup);
+    }
+
     /// Bind one more record: its own mailbox, seeded from the axis' cache,
     /// its own trace, and a place on the subscriber list.
     pub fn attach(&self) -> MotorDeviceSupport {
         let device_state = new_shared_state();
         let (io_intr_tx, io_intr_rx) = mpsc::channel(16);
         let trace = Arc::new(MotorTrace::with_user(self.user.clone()));
+        if trace.is_model1()
+            && let Ok(mut ds) = device_state.lock()
+        {
+            ds.set_motordevcom();
+        }
         let record =
             self.subscribers
                 .attach(device_state.clone(), io_intr_tx.clone(), trace.clone());

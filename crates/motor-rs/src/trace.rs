@@ -96,6 +96,11 @@ impl MotorTrace {
         matches!(self.user, TraceUser::Asyn { .. })
     }
 
+    /// Whether the axis is a model-1 card signal, with no asyn driver layer.
+    pub fn is_model1(&self) -> bool {
+        matches!(self.user, TraceUser::Model1 { .. })
+    }
+
     /// Whether the driver layer is `drvMotorAsyn.c` (model 2) rather than
     /// `asynMotorController`.
     pub fn is_model2(&self) -> bool {

@@ -360,9 +360,7 @@ impl MotorRecord {
                             self.internal.pending_retarget = Some(self.pos.dval);
                             self.stat.mip.insert(MipFlags::STOP);
                             self.mark(m::MIP);
-                            effects.commands.push(MotorCommand::Stop {
-                                acceleration: self.raw_rate(self.move_accel_egu()),
-                            });
+                            effects.commands.push(MotorCommand::stop_axis());
                             return effects;
                         }
                         RetargetAction::ExtendMove => {
@@ -908,9 +906,7 @@ impl MotorRecord {
         // case"): the driver may still be settling even when the record
         // considers itself idle (e.g. after an InPosition retry, which
         // finalizes the record but leaves the servo moving).
-        effects.commands.push(MotorCommand::Stop {
-            acceleration: self.raw_rate(self.move_accel_egu()),
-        });
+        effects.commands.push(MotorCommand::stop_axis());
     }
 
     /// Start jogging.
@@ -939,9 +935,7 @@ impl MotorRecord {
             self.internal.pp = true;
             self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
-            effects.commands.push(MotorCommand::Stop {
-                acceleration: self.raw_rate(self.move_accel_egu()),
-            });
+            effects.commands.push(MotorCommand::stop_axis());
             return true;
         }
 
@@ -1017,7 +1011,7 @@ impl MotorRecord {
         self.internal.jog_was_forward = forward;
         let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
         self.stat.cdir = dial_forward != (self.conv.mres < 0.0);
-        effects.commands.push(MotorCommand::MoveVelocity {
+        let jog = MotorCommand::MoveVelocity {
             min_velocity: self.raw_rate(self.effective_vbas()),
             velocity: self.raw_position(if dial_forward {
                 self.vel.jvel
@@ -1025,7 +1019,8 @@ impl MotorRecord {
                 -self.vel.jvel
             }),
             acceleration: self.raw_rate(self.jog_accel_egu()),
-        });
+        };
+        effects.commands.extend(jog.after_speeds(SpeedWrites::JOG));
     }
 
     /// Stop jogging.
@@ -1042,9 +1037,7 @@ impl MotorRecord {
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
         self.set_phase(MotionPhase::JogStopping);
-        effects.commands.push(MotorCommand::Stop {
-            acceleration: self.raw_rate(self.jog_accel_egu()),
-        });
+        effects.commands.push(MotorCommand::stop_axis());
     }
 
     /// Whether the limit switch in the (user-direction-adjusted) home
@@ -1231,10 +1224,10 @@ impl MotorRecord {
         // returns STUP to OFF (here: never enters BUSY, like the
         // explicit driverless STUP put). determine_event's stup==2
         // clear + ack on the next fresh status closes the cycle.
-        if put_pass && self.stat.stup == 0 && self.device_state.is_some() {
+        if put_pass && self.stat.stup == 0 && self.can_get_info() {
             self.stat.stup = 2;
             self.mark(m::STUP);
-            effects.status_refresh = true;
+            effects.commands.push(MotorCommand::Poll);
         }
     }
 
@@ -1258,9 +1251,7 @@ impl MotorRecord {
             self.internal.queued_motion = Some(QueuedMotion::Home { forward });
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
-            effects.commands.push(MotorCommand::Stop {
-                acceleration: self.raw_rate(self.move_accel_egu()),
-            });
+            effects.commands.push(MotorCommand::stop_axis());
             return;
         }
 
@@ -1302,12 +1293,15 @@ impl MotorRecord {
             !forward
         };
 
-        effects.commands.push(MotorCommand::Home {
+        let home = MotorCommand::Home {
             forward: hw_forward,
             min_velocity: self.raw_rate(self.effective_vbas()),
             velocity: self.raw_rate(self.vel.hvel),
             acceleration: self.raw_rate(self.home_accel_egu()),
-        });
+        };
+        effects
+            .commands
+            .extend(home.after_speeds(SpeedWrites::MOVE));
     }
 
     /// Handle tweak (TWF/TWR).
@@ -1434,9 +1428,7 @@ impl MotorRecord {
                     self.stat.mip = MipFlags::STOP;
                     self.mark(m::MIP);
                 }
-                effects.commands.push(MotorCommand::Stop {
-                    acceleration: self.raw_rate(self.move_accel_egu()),
-                });
+                effects.commands.push(MotorCommand::stop_axis());
             }
             SpmgMode::Go => {
                 // C top-block Go branch (1909-1925) runs UNGATED — there
@@ -1531,21 +1523,22 @@ impl MotorRecord {
         acceleration: f64,
     ) {
         let min_velocity = self.effective_vbas();
-        if use_rel {
-            effects.commands.push(MotorCommand::MoveRelative {
+        let leg = if use_rel {
+            MotorCommand::MoveRelative {
                 distance: self.raw_position(rel_distance),
                 min_velocity: self.raw_rate(min_velocity),
                 velocity: self.raw_rate(velocity),
                 acceleration: self.raw_rate(acceleration),
-            });
+            }
         } else {
-            effects.commands.push(MotorCommand::MoveAbsolute {
+            MotorCommand::MoveAbsolute {
                 position: self.raw_position(abs_position),
                 min_velocity: self.raw_rate(min_velocity),
                 velocity: self.raw_rate(velocity),
                 acceleration: self.raw_rate(acceleration),
-            });
-        }
+            }
+        };
+        effects.commands.extend(leg.after_speeds(SpeedWrites::MOVE));
     }
 
     /// A dial position or distance in the driver's units, C's raw steps
@@ -1588,11 +1581,8 @@ impl MotorRecord {
     /// `(vmax - vmin) / accl`, or `vmax / accl` when `vmax <= vmin`
     /// (C: `b201e40e`, PR #75).
     ///
-    /// Deviation from C: the result is floored to a strictly positive value.
-    /// C lets a 0 acceleration through and the driver layer skips SET_ACCEL;
-    /// motor-rs always carries an acceleration in the MotorCommand, so a 0
-    /// (unconfigured axis, or ACCU=Accs with ACCS<=0) is replaced by a
-    /// nominal positive rate.
+    /// A result `<= 0` is C's skipped SET_ACCEL (motorRecord.cc:940, :2529);
+    /// the poller turns it into the axis's stored acceleration.
     pub(crate) fn move_accel_egu(&self) -> f64 {
         let accl = if self.vel.accl > 0.0 {
             self.vel.accl
@@ -1601,22 +1591,17 @@ impl MotorRecord {
         };
         let vmax = self.vel.velo.abs();
         let vmin = self.effective_vbas();
-        let rate = if self.vel.accu == AccsUsed::Accs {
+        if self.vel.accu == AccsUsed::Accs {
             self.vel.accs
         } else if vmax > vmin {
             (vmax - vmin) / accl
         } else {
             vmax / accl
-        };
-        if rate > 0.0 {
-            rate
-        } else {
-            vmax.max(1.0) / accl
         }
     }
 
-    /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC.
-    /// Always strictly positive (see `move_accel_egu`).
+    /// Acceleration for a backlash move, EGU/sec². Uses BVEL/BACC; `<= 0`
+    /// is C's skipped SET_ACCEL (:956, :1005), as in `move_accel_egu`.
     pub(crate) fn backlash_accel_egu(&self) -> f64 {
         let bacc = if self.vel.bacc > 0.0 {
             self.vel.bacc
@@ -1624,23 +1609,18 @@ impl MotorRecord {
             0.1
         };
         let span = self.vel.bvel - self.effective_vbas();
-        let rate = if span > 0.0 {
+        if span > 0.0 {
             span / bacc
         } else {
             self.vel.bvel / bacc
-        };
-        if rate > 0.0 {
-            rate
-        } else {
-            self.vel.bvel.abs().max(1.0) / bacc
         }
     }
 
     /// Acceleration for a home, EGU/sec². C derives it from HVEL, not
     /// VELO — both the direct dispatch (motorRecord.cc:2046-2048) and the
     /// queued-home re-fire (859-862) compute
-    /// `(hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl`.
-    /// Always strictly positive (see `move_accel_egu`).
+    /// `(hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl`; `<= 0`
+    /// is C's skipped SET_ACCEL (:874, :2054), as in `move_accel_egu`.
     pub(crate) fn home_accel_egu(&self) -> f64 {
         let accl = if self.vel.accl > 0.0 {
             self.vel.accl
@@ -1648,15 +1628,10 @@ impl MotorRecord {
             0.1
         };
         let span = self.vel.hvel - self.effective_vbas();
-        let rate = if span > 0.0 {
+        if span > 0.0 {
             span / accl
         } else {
             self.vel.hvel / accl
-        };
-        if rate > 0.0 {
-            rate
-        } else {
-            self.vel.hvel.abs().max(1.0) / accl
         }
     }
 
@@ -1749,7 +1724,7 @@ impl MotorRecord {
             position: self.raw_position(self.pos.dval),
         });
         // C sends GET_INFO after LOAD_POS (motorRecord.cc:3814-3816).
-        effects.request_poll = true;
+        effects.commands.push(MotorCommand::Poll);
     }
 
     /// C do_work resolution block (motorRecord.cc:1937-1991): a runtime
@@ -1790,7 +1765,7 @@ impl MotorRecord {
         }
         if self.conv.set && !self.conv.igset {
             self.internal.pp = true;
-            effects.request_poll = true;
+            effects.commands.push(MotorCommand::Poll);
         } else if !self.stat.mip.contains(MipFlags::LOAD_P) {
             self.load_pos(effects);
         }
@@ -2079,16 +2054,26 @@ impl MotorRecord {
         // the BUSY->OFF callback never arrives, so a stuck BUSY would
         // refuse every later STUP put (special before-write, 2615-2617).
         let stup_requested = self.stat.stup == 1;
-        let stup_fired = stup_requested && self.device_state.is_some();
+        let stup_fired = stup_requested && self.can_get_info();
         if stup_requested {
             self.stat.stup = if stup_fired { 2 } else { 0 };
             self.mark(m::STUP);
         }
         let mut effects = self.do_process_inner();
         if stup_fired {
-            effects.status_refresh = true;
+            // Sent before the rest of the pass, as C's do_work top does.
+            effects.commands.insert(0, MotorCommand::Poll);
         }
         effects
+    }
+
+    /// Whether `build_trans` would queue a GET_INFO: it returns ERROR with
+    /// no device, or, devMotorAsyn's, with the record in COMM_ALARM
+    /// (devMotorAsyn.c:530-532).
+    fn can_get_info(&self) -> bool {
+        self.device_state.as_ref().is_some_and(|state| {
+            !self.internal.comm_alarm || state.lock().is_ok_and(|ds| !ds.refuses_in_comm_alarm())
+        })
     }
 
     fn do_process_inner(&mut self) -> ProcessEffects {
@@ -2213,7 +2198,7 @@ impl MotorRecord {
                 if self.stat.mip.contains(MipFlags::DELAY_REQ) {
                     self.stat.mip.remove(MipFlags::DELAY_REQ);
                     self.stat.mip.insert(MipFlags::DELAY_ACK);
-                    effects.status_refresh = true;
+                    effects.commands.push(MotorCommand::Poll);
                 }
                 effects
             }

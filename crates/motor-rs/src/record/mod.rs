@@ -808,7 +808,8 @@ impl Record for MotorRecord {
     /// divergence that both fabricates UDF on a transient NaN VAL and, on a
     /// no-DOL-read pass, clobbers the legitimate closed-loop DOL outcome.
     /// Opt out so motor UDF is owned solely by the DOL channel
-    /// (`dol_udf` → check_alarms) and the init clear in `initial_readback`.
+    /// (`dol_udf` → check_alarms) and the init clear in
+    /// `post_init_finalize_undef`.
     fn clears_udf(&self) -> bool {
         false
     }
@@ -1221,25 +1222,16 @@ mod tests {
         );
     }
 
-    // An explicit refresh request (request_poll / status_refresh — STUP,
-    // implicit GET_INFO, settle-resume) forces the post (C motorUpdateStatus_
-    // forces statusChanged_=1); otherwise STUP=BUSY strands on a stationary
-    // axis whose status never changes. A settled pass asks for nothing.
+    // A request_poll forces the post; otherwise a held button strands on a
+    // stationary axis whose status never changes. A settled pass asks for
+    // nothing.
     #[test]
-    fn refresh_request_forces_poll_directive() {
+    fn request_poll_forces_poll_directive() {
         let mut rec = MotorRecord::new();
         rec.stat.dmov = true;
         assert!(
             !rec.effects_to_actions(&ProcessEffects::default())
                 .force_poll
-        );
-        let status_refresh = ProcessEffects {
-            status_refresh: true,
-            ..Default::default()
-        };
-        assert!(
-            rec.effects_to_actions(&status_refresh).force_poll,
-            "status_refresh must force a poll"
         );
         let request_poll = ProcessEffects {
             request_poll: true,
@@ -1293,6 +1285,24 @@ mod tests {
         rec.post_init_finalize_undef(&mut udf).unwrap();
         assert!(udf);
         assert!(!rec.init_resets_alarms());
+    }
+
+    // C init_record's closing monitor() copies EA_POSITION into CNEN for a
+    // GAIN_SUPPORT axis (3541-3548), so an idle axis shows it unprocessed.
+    #[test]
+    fn init_copies_cnen_from_msta() {
+        let mut rec = MotorRecord::new();
+        rec.init_record(1).unwrap();
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            done: true,
+            powered: true,
+            gain_support: true,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        rec.post_init_finalize_undef(&mut true).unwrap();
+        assert!(rec.ctrl.cnen, "CNEN follows EA_POSITION at init");
+        assert_eq!(rec.internal.mmap, 0, "init monitor() drains the marks");
     }
 
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for

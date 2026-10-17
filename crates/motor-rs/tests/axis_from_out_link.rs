@@ -659,6 +659,58 @@ record(motor, "C:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(COMM,0)") fiel
     assert!(sent.is_err(), "nothing reaches the driver in COMM_ALARM");
 }
 
+/// motordevCom has no COMM_ALARM check: a model-1 record in COMM_ALARM
+/// still sends its move, as C retries on a dead line until RTRY runs out.
+#[tokio::test]
+async fn a_model1_record_in_comm_alarm_still_sends_its_move() {
+    let subscribers = AxisSubscribers::new();
+    subscribers.store(StampedStatus {
+        seq: 1,
+        status: MotorStatus {
+            done: true,
+            comms_error: true,
+            ..MotorStatus::default()
+        },
+    });
+    let (poll_tx, _poll_rx) = mpsc::channel(16);
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    register_axis(MotorAxis::new(
+        TraceUser::Model1 {
+            device: MODEL1.choice,
+            card: 9,
+            signal: 0,
+        },
+        Duration::from_secs(1),
+        poll_tx,
+        cmd_tx,
+        subscribers,
+    ))
+    .unwrap();
+    let db = boot(
+        r##"
+record(motor, "C1:m") { field(DTYP, "TestModel1") field(OUT, "#C9 S0 @") field(MRES, "0.001") field(VELO, "1") }
+"##,
+    )
+    .await;
+    db.scan_control().run();
+    while cmd_rx.try_recv().is_ok() {}
+
+    db.put_record_field_from_ca("C1:m", "PROC", EpicsValue::Char(1))
+        .await
+        .unwrap();
+    assert_eq!(field(&db, "C1:m.STAT"), EpicsValue::Short(9), "COMM_ALARM");
+    while cmd_rx.try_recv().is_ok() {}
+
+    db.put_record_field_from_ca("C1:m", "VAL", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    let sent = tokio::time::timeout(Duration::from_millis(200), cmd_rx.recv())
+        .await
+        .expect("the move reaches the driver")
+        .unwrap();
+    assert!(sent.commands.iter().any(|c| c.is_move()), "{sent:?}");
+}
+
 /// motorRecord.cc:1503-1507: process_exit runs alarm_sub and monitor()'s
 /// recGblResetAlarms on the move-start pass too, not only once DMOV is back.
 /// alarm_sub clears the MSTA comm bit it raises on, so a move start as the

@@ -20,7 +20,7 @@ use epics_base_rs::server::record::{
 use asyn_rs::port_handle::PortHandle;
 use epics_base_rs::runtime::interrupt_accept::InterruptGate;
 
-use crate::controller_port::ControllerParams;
+use crate::controller_port::{ControllerParams, WriteHook};
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::MissingAxis;
 use crate::trace::{MotorTrace, TraceUser};
@@ -119,9 +119,38 @@ pub fn register_controller_port<P: ControllerParams>(
     if lock(ports()).contains_key(port) {
         return Err(format!("motor port {port} is already registered"));
     }
-    let handle = crate::controller_port::publish(owner, port, num_axes, params)?;
+    let published = crate::controller_port::publish(owner, port, num_axes, params)?;
     register_port(port, PortDriver::Controller, num_axes)?;
+    let handle = published.handle.clone();
+    lock(controller_ports()).insert(port.to_owned(), published);
     Ok(handle)
+}
+
+/// What a controller port's axes' pollers need of it for the base calls
+/// they run.
+fn controller_ports() -> &'static Mutex<HashMap<String, crate::controller_port::Published>> {
+    static PORTS: OnceLock<Mutex<HashMap<String, crate::controller_port::Published>>> =
+        OnceLock::new();
+    PORTS.get_or_init(Default::default)
+}
+
+/// Controller port `port`'s [`WriteHook`].
+pub(crate) fn write_hook(port: &str) -> Option<Arc<dyn WriteHook>> {
+    lock(controller_ports()).get(port)?.hook.clone()
+}
+
+/// Controller port `port`'s store for a [`WriteHook`]'s sets.
+pub(crate) fn param_store(port: &str) -> Option<crate::controller_port::ParamStore> {
+    lock(controller_ports())
+        .get(port)
+        .map(|entry| entry.store.clone())
+}
+
+/// Controller port `port` itself.
+pub(crate) fn controller_port_handle(port: &str) -> Option<PortHandle> {
+    lock(controller_ports())
+        .get(port)
+        .map(|entry| entry.handle.clone())
 }
 
 /// Make `drvMotorAsyn` port `port` reachable from a record's OUT, with axes
@@ -195,7 +224,30 @@ pub fn register_axis(axis: MotorAxis) -> Result<(), String> {
         ));
     }
     axes.insert(addr, (axis, false));
+    drop(controllers);
+    if let Controller::Port(port) = &controller {
+        if let Some(handle) = controller_port_handle(port) {
+            init_axis_params(&handle, addr);
+        }
+    }
     Ok(())
+}
+
+/// The parameters C's `asynMotorAxis` constructor sets on its axis address
+/// (asynMotorAxis.cpp:65-67); its `setIntegerParam` also sets MOTOR_STATUS
+/// to 0 (:267).
+fn init_axis_params(handle: &PortHandle, addr: i32) {
+    use crate::controller_port::index;
+    use asyn_rs::param::ParamValue;
+    use asyn_rs::request::ParamSetValue;
+    let updates = vec![
+        ParamSetValue::new(index::POWER_AUTO_ONOFF, addr, ParamValue::Int32(0)),
+        ParamSetValue::new(index::STATUS, addr, ParamValue::Int32(0)),
+        ParamSetValue::new(index::POWER_OFF_DELAY, addr, ParamValue::Float64(0.0)),
+        ParamSetValue::new(index::POWER_ON_DELAY, addr, ParamValue::Float64(0.0)),
+    ];
+    // C ignores the status of these sets.
+    let _ = handle.set_params_and_notify_blocking(addr, updates);
 }
 
 /// The motor DTYPs' device support: `asynMotor` and every registered model-1

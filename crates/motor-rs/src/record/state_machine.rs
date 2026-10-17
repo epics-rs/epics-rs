@@ -34,9 +34,7 @@ impl MotorRecord {
             // An error stop post-processes like a commanded stop (sync at
             // completion), not like a Pause (resume armed).
             self.internal.pp = true;
-            effects.commands.push(MotorCommand::Stop {
-                acceleration: self.raw_rate(self.move_accel_egu()),
-            });
+            effects.commands.push(MotorCommand::stop_axis());
             return effects;
         }
 
@@ -97,9 +95,7 @@ impl MotorRecord {
                 self.stat.mip.insert(MipFlags::STOP);
                 self.mark(m::MIP);
                 self.internal.pp = false;
-                effects.commands.push(MotorCommand::Stop {
-                    acceleration: self.raw_rate(self.move_accel_egu()),
-                });
+                effects.commands.push(MotorCommand::stop_axis());
                 return effects;
             }
             // C enter_do_work (1463-1484) re-evaluates LVIO on every
@@ -186,12 +182,15 @@ impl MotorRecord {
                             !forward
                         };
                         self.stat.cdir = hw_forward;
-                        effects.commands.push(MotorCommand::Home {
+                        let home = MotorCommand::Home {
                             forward: hw_forward,
                             min_velocity: self.raw_rate(self.effective_vbas()),
                             velocity: self.raw_rate(self.vel.hvel),
                             acceleration: self.raw_rate(self.home_accel_egu()),
-                        });
+                        };
+                        effects
+                            .commands
+                            .extend(home.after_speeds(SpeedWrites::MOVE));
                     }
                     QueuedMotion::Jog { forward } => {
                         self.set_phase(MotionPhase::Jog);
@@ -854,12 +853,15 @@ impl MotorRecord {
             let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
             // C 973: CDIR follows the (frac-scaled) raw-unit stroke.
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
-            effects.commands.push(MotorCommand::MoveRelative {
-                distance: self.raw_position(rel_distance),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
-                acceleration: self.raw_rate(self.backlash_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveRelative {
+                    distance: self.raw_position(rel_distance),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                    acceleration: self.raw_rate(self.backlash_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::BACKLASH),
+            );
         } else {
             // C absolute: position = pretarget + frac * (dval - pretarget)
             // = (dval - bdst) + frac * bdst = dval - bdst*(1-frac)
@@ -869,12 +871,15 @@ impl MotorRecord {
             // RVAL; 973 derives CDIR from the unscaled raw error.
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
-            effects.commands.push(MotorCommand::MoveAbsolute {
-                position: self.raw_position(position),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
-                acceleration: self.raw_rate(self.backlash_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveAbsolute {
+                    position: self.raw_position(position),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                    acceleration: self.raw_rate(self.backlash_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::BACKLASH),
+            );
         }
     }
 
@@ -906,19 +911,25 @@ impl MotorRecord {
         // at C 960. Only JOG_STOP keys CDIR on the value it just zeroed.
         self.stat.cdir = (pretarget - self.pos.drbv) / self.conv.mres >= 0.0;
         if self.use_relative_moves() {
-            effects.commands.push(MotorCommand::MoveRelative {
-                distance: self.raw_position(pretarget - self.pos.drbv),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
-                acceleration: self.raw_rate(self.move_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveRelative {
+                    distance: self.raw_position(pretarget - self.pos.drbv),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
+                    acceleration: self.raw_rate(self.move_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::MOVE),
+            );
         } else {
-            effects.commands.push(MotorCommand::MoveAbsolute {
-                position: self.raw_position(pretarget),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
-                acceleration: self.raw_rate(self.move_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveAbsolute {
+                    position: self.raw_position(pretarget),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.velo)),
+                    acceleration: self.raw_rate(self.move_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::MOVE),
+            );
         }
     }
 
@@ -939,24 +950,30 @@ impl MotorRecord {
             let rel_distance = self.retry.bdst * frac;
             // C 1020: CDIR follows the scaled raw-unit stroke.
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
-            effects.commands.push(MotorCommand::MoveRelative {
-                distance: self.raw_position(rel_distance),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
-                acceleration: self.raw_rate(self.backlash_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveRelative {
+                    distance: self.raw_position(rel_distance),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                    acceleration: self.raw_rate(self.backlash_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::BACKLASH),
+            );
         } else {
             let position = pretarget + frac * (self.pos.dval - pretarget);
             // C 1016: the FRAC-scaled commanded raw position is posted to
             // RVAL; 1020 derives CDIR from the unscaled raw error.
             self.pos.rval = coordinate::to_long((position / self.conv.mres).round());
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
-            effects.commands.push(MotorCommand::MoveAbsolute {
-                position: self.raw_position(position),
-                min_velocity: self.raw_rate(self.effective_vbas()),
-                velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
-                acceleration: self.raw_rate(self.backlash_accel_egu()),
-            });
+            effects.commands.extend(
+                MotorCommand::MoveAbsolute {
+                    position: self.raw_position(position),
+                    min_velocity: self.raw_rate(self.effective_vbas()),
+                    velocity: self.raw_rate(self.backlash_leg_velocity(self.vel.bvel)),
+                    acceleration: self.raw_rate(self.backlash_accel_egu()),
+                }
+                .after_speeds(SpeedWrites::BACKLASH),
+            );
         }
     }
 }

@@ -23,28 +23,24 @@ pub struct DelayRequest {
 #[derive(Debug, Default)]
 pub struct DeviceActions {
     pub commands: Vec<crate::flags::MotorCommand>,
-    /// Poll now and post even an unchanged status: C `motorUpdateStatus_`
-    /// forcing `statusChanged_ = 1` (asynMotorController.cpp:217-222), for
-    /// `request_poll` / `status_refresh`, so STUP=BUSY clears on a
-    /// stationary axis.
+    /// Poll now and post even an unchanged status, for
+    /// [`ProcessEffects::request_poll`](crate::flags::ProcessEffects).
     pub force_poll: bool,
     pub schedule_delay: Option<DelayRequest>,
-    pub status_refresh: bool,
 }
 
 impl DeviceActions {
     /// Fold a newer batch into `self` when a previous batch has not yet been
     /// consumed by DeviceSupport.write(). Commands are appended (FIFO order
-    /// preserved); a forced poll from either survives; schedule_delay and
-    /// status_refresh take the newer value if present. Prevents a dropped move command when two process()
-    /// cycles run without an intervening write().
+    /// preserved); a forced poll from either survives; schedule_delay takes
+    /// the newer value if present. Prevents a dropped move command when two
+    /// process() cycles run without an intervening write().
     pub fn merge_newer(&mut self, newer: DeviceActions) {
         self.commands.extend(newer.commands);
         self.force_poll |= newer.force_poll;
         if newer.schedule_delay.is_some() {
             self.schedule_delay = newer.schedule_delay;
         }
-        self.status_refresh |= newer.status_refresh;
     }
 }
 
@@ -98,6 +94,9 @@ pub struct Callbacks {
     accepting: bool,
     /// `pmr->stat == COMM_ALARM` as the record's last pass committed it.
     comm_alarm: bool,
+    /// The record's device support is model-1 motordevCom, whose
+    /// `build_trans` has no COMM_ALARM check and no pending-move count.
+    motordevcom: bool,
     queued: std::collections::VecDeque<Callback>,
 }
 
@@ -119,18 +118,24 @@ impl MotorDeviceState {
     }
 
     /// C `build_trans` queuing a move-class command (devMotorAsyn.c:547,
-    /// :565, :582).
+    /// :565, :582). motordevCom's `motor_end_trans_com` counts nothing.
     pub fn move_queued(&mut self) {
-        self.callbacks.move_request_pending += 1;
+        if !self.callbacks.motordevcom {
+            self.callbacks.move_request_pending += 1;
+        }
     }
 
     /// C `asynCallback`'s tail for a move-class command, whatever the write
     /// returned (devMotorAsyn.c:717-728): the last move to finish processes
     /// the record with the last status posted. Before the gate a
     /// SET_POSITION clears the count instead. True when the caller must
-    /// pulse io_intr.
+    /// pulse io_intr. motordevCom has no `asynCallback`: only the driver's
+    /// `motor_callback` processes its record (motordevCom.cc:534-556).
     pub fn move_done(&mut self, command: &crate::flags::MotorCommand) -> bool {
         let callbacks = &mut self.callbacks;
+        if callbacks.motordevcom {
+            return false;
+        }
         if !callbacks.accepting {
             if matches!(command, crate::flags::MotorCommand::SetPosition { .. }) {
                 callbacks.move_request_pending = 0;
@@ -163,10 +168,21 @@ impl MotorDeviceState {
         self.callbacks.comm_alarm = comm_alarm;
     }
 
-    /// C `build_trans` (devMotorAsyn.c:529-532): a record in COMM_ALARM
-    /// queues nothing, so counts no move pending either.
+    /// The record's device support is model-1 motordevCom.
+    pub fn set_motordevcom(&mut self) {
+        self.callbacks.motordevcom = true;
+    }
+
+    /// Whether `build_trans` refuses a record whose stat is COMM_ALARM
+    /// (devMotorAsyn.c:529-532); motordevCom queues regardless.
+    pub(crate) fn refuses_in_comm_alarm(&self) -> bool {
+        !self.callbacks.motordevcom
+    }
+
+    /// C `build_trans` refusing a record in COMM_ALARM: it queues nothing,
+    /// so counts no move pending either.
     pub(crate) fn comm_alarm(&self) -> bool {
-        self.callbacks.comm_alarm
+        self.callbacks.comm_alarm && self.refuses_in_comm_alarm()
     }
 
     /// `finishDevSup` ran: callbacks process the record from now on.
@@ -508,6 +524,21 @@ mod tests {
         assert_eq!(pass(&state), Some(6.0));
     }
 
+    // motordevCom: a move processes nothing itself, and every driver
+    // callback processes the record (motordevCom.cc:534-556).
+    #[test]
+    fn a_motordevcom_move_waits_for_the_driver_callback() {
+        let state = accepting();
+        let mut ds = state.lock().unwrap();
+        ds.set_motordevcom();
+        ds.move_queued();
+        assert!(!ds.move_done(&move_to()));
+        assert!(ds.status_callback(&at(1.0)));
+        drop(ds);
+        assert_eq!(pass(&state), Some(1.0));
+        assert_eq!(pass(&state), None);
+    }
+
     #[test]
     fn before_the_gate_only_a_set_position_clears_the_pending_count() {
         let state = new_shared_state();
@@ -566,18 +597,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_newer_takes_newer_delay_and_refresh() {
+    fn merge_newer_takes_newer_delay() {
         let mut a = DeviceActions::default();
         let b = DeviceActions {
             schedule_delay: Some(DelayRequest {
                 id: 7,
                 duration: Duration::from_millis(5),
             }),
-            status_refresh: true,
             ..Default::default()
         };
         a.merge_newer(b);
         assert_eq!(a.schedule_delay.as_ref().unwrap().id, 7);
-        assert!(a.status_refresh);
     }
 }

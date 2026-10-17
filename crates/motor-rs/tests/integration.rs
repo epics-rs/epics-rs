@@ -1514,7 +1514,7 @@ async fn the_axis_polls_with_no_record_request() {
 /// C `motorUpdateStatus_` polls on the port thread (asynMotorController.cpp:
 /// 217-222) and leaves the poller alone: only `wakeupPoller` — a move, here —
 /// reloads `forcedFastPolls_` (:636-642). A ForcePoll on an idle axis is one
-/// poll, and the idle period continues.
+/// poll, and the idle period continues; a Wakeup reloads them as a move does.
 #[tokio::test(flavor = "multi_thread")]
 async fn force_poll_does_not_reload_the_forced_fast_polls() {
     use asyn_rs::error::AsynError;
@@ -1616,6 +1616,10 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
         .unwrap();
     // The move wakes the poller: one poll and 5 forced fast polls.
     settled(13).await;
+
+    // A driver thread's wakeupPoller does the same.
+    poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
+    settled(19).await;
 
     let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
     let _ = poll_handle.await;

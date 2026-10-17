@@ -77,14 +77,6 @@ impl MotorRecord {
 
     /// Convert ProcessEffects to DeviceActions for the shared mailbox.
     pub(crate) fn effects_to_actions(&mut self, effects: &ProcessEffects) -> DeviceActions {
-        // An explicit poll request (move dispatch, LOAD_POS readback,
-        // retarget) or a status refresh (STUP / implicit GET_INFO /
-        // DELAY_ACK settle-resume) forces a post of even an unchanged
-        // status, as C's motorUpdateStatus_ does (asynMotorController.cpp:
-        // 217-222), so STUP=BUSY clears on a stationary axis. Nothing a
-        // record does stops the timed polls.
-        let force_poll = effects.request_poll || effects.status_refresh;
-
         let schedule_delay = effects.schedule_delay.map(|dur| {
             let id = self.next_delay_id;
             self.next_delay_id += 1;
@@ -93,9 +85,8 @@ impl MotorRecord {
 
         DeviceActions {
             commands: self.transaction(effects.commands.clone()),
-            force_poll,
+            force_poll: effects.request_poll,
             schedule_delay,
-            status_refresh: effects.status_refresh,
         }
     }
 

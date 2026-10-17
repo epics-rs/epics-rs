@@ -118,7 +118,7 @@ impl WriteTail {
                 site.file(),
                 site.line(),
                 format_args!(
-                    "{}status={} function={reason}, value={value}",
+                    "{}status={} function={reason}, value={value}\n",
                     self.error,
                     e.c_status_code()
                 ),
@@ -127,7 +127,7 @@ impl WriteTail {
                 TraceMask::IO_DRIVER,
                 site.file(),
                 site.line(),
-                format_args!("{}function={reason}, value={value}", self.done),
+                format_args!("{}function={reason}, value={value}\n", self.done),
             ),
         }
         status

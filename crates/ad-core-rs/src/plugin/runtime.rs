@@ -2380,7 +2380,7 @@ impl PluginPortDriver {
         let connected = !port.is_empty() && self.unresolved(&port, nd_addr).is_none();
         let name = self.base.params.param_name(reason).unwrap_or("");
         Ok(format!(
-            "NDPluginDriver::writeInt32 ERROR, status={status}, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}",
+            "NDPluginDriver::writeInt32 ERROR, status={status}, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}\n",
             connected as i32
         ))
     }

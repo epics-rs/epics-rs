@@ -198,9 +198,26 @@ pub(crate) fn controller_port_handle(port: &str) -> Option<PortHandle> {
 }
 
 /// Make `drvMotorAsyn` port `port` reachable from a record's OUT, with axes
-/// `0..num_axes`; see [`register_controller_port`].
-pub fn register_drv_motor_asyn_port(port: &str, num_axes: i32) -> Result<(), String> {
-    register_port(port, PortDriver::DrvMotorAsyn, num_axes)
+/// `0..num_axes`; see [`register_controller_port`]. `handle` is the port
+/// itself, which a record's writes go through.
+pub fn register_drv_motor_asyn_port(
+    port: &str,
+    num_axes: i32,
+    handle: PortHandle,
+) -> Result<(), String> {
+    register_port(port, PortDriver::DrvMotorAsyn, num_axes)?;
+    lock(drv_motor_asyn_ports()).insert(port.to_owned(), handle);
+    Ok(())
+}
+
+fn drv_motor_asyn_ports() -> &'static Mutex<HashMap<String, PortHandle>> {
+    static PORTS: OnceLock<Mutex<HashMap<String, PortHandle>>> = OnceLock::new();
+    PORTS.get_or_init(Default::default)
+}
+
+/// `drvMotorAsyn` port `port` itself.
+pub(crate) fn drv_motor_asyn_port_handle(port: &str) -> Option<PortHandle> {
+    lock(drv_motor_asyn_ports()).get(port).cloned()
 }
 
 /// The axis registered at `addr` of asyn port `port`.

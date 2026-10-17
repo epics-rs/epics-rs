@@ -177,9 +177,9 @@ pub(crate) struct Axis {
     ///
     /// [`MotorAxis`]: crate::device_support::MotorAxis
     params: Model2Params,
-    /// A model-2 axis's `min_velocity` / `max_velocity` / `accel`, which
-    /// the record's speed writes store (drvMotorAsyn.c:722-733). 0 until
-    /// one is: drvMotorAsyn's axis is calloc'd.
+    /// The speeds a model-1 card keeps, or devMotorSim's `min_vel` /
+    /// `max_vel` / `acc` (devMotorSim.c:70-72, 251-259), which the record's
+    /// speed writes store. 0 until one is: the private struct is calloc'd.
     speeds: StoredSpeeds,
     /// The io_intr pulses owed for processes the callbacks queued.
     pulses: Pulses,
@@ -191,9 +191,6 @@ pub(crate) struct Axis {
     mirrored_word: Option<u32>,
     /// [`AsynMotor::param_owned_msta_bits`]: bit params the driver owns.
     owned_bits: u32,
-    /// [`AsynMotor::take_poll_params`] of the last poll or write, which the
-    /// next `callParamCallbacks` on the axis posts.
-    poll_params: Vec<(usize, asyn_rs::param::ParamValue)>,
     power: Power,
 }
 
@@ -330,7 +327,6 @@ impl Axis {
             controller: None,
             mirrored_word: None,
             owned_bits: 0,
-            poll_params: Vec::new(),
             power: Power::Idle,
         }
     }
@@ -414,9 +410,11 @@ impl Axis {
     /// :355).
     fn execute(&mut self, batch: &CommandBatch, controller_poll: &mut Option<ControllerPoll>) {
         let motor = self.motor.clone();
-        let Ok(mut motor) = motor.lock() else {
-            return;
-        };
+        let drv_port = batch
+            .trace
+            .is_model2()
+            .then(|| crate::devices::drv_motor_asyn_port_handle(batch.trace.port()))
+            .flatten();
         let mut cdir = None;
         let mut accel = None;
         for command in &batch.commands {
@@ -435,6 +433,39 @@ impl Axis {
             if batch.record.is_some() {
                 async_callback_flow(&batch.trace, command);
             }
+            if let Some(port) = &drv_port
+                && let Some(write) = drv_motor_asyn_write(command)
+            {
+                // The port's write takes the axis lock itself.
+                let result = write_drv_motor_asyn(port, &batch.trace, write);
+                let Ok(mut motor) = motor.lock() else {
+                    return;
+                };
+                self.post_writes(drvset_axis_write(
+                    &mut *motor,
+                    command,
+                    Some(write),
+                    result.is_ok(),
+                ));
+                drop(motor);
+                let failure = result.err().map(|e| e.message_display().to_string());
+                dev_motor_asyn_reply(
+                    &batch.trace,
+                    command,
+                    write.0,
+                    failure.as_ref().map(|e| e as &dyn std::fmt::Display),
+                );
+                if command.is_move()
+                    && let Some(record) = batch.record
+                {
+                    self.pulses
+                        .extend(self.subscribers.move_done(record, command));
+                }
+                continue;
+            }
+            let Ok(mut motor) = motor.lock() else {
+                return;
+            };
             let stored;
             // The port route already moves on the port's own parameters.
             let command = match batch
@@ -477,8 +508,9 @@ impl Axis {
             if !matches!(command, MotorCommand::SetPosition { .. }) {
                 match &mut self.pacing {
                     // drvMotorSim's motorProcTask keeps its period: nothing
-                    // wakes it (drvMotorSim.c:660-690).
-                    Pacing::Poller => self.woken = !batch.trace.is_motor_interface(),
+                    // wakes it (drvMotorSim.c:660-690). A drvMotorAsyn port
+                    // wakes its poller itself.
+                    Pacing::Poller => self.woken = batch.trace.is_controller(),
                     // A MOTION or VELOCITY message replaces the held move
                     // and clears its count (motordrvCom.cc:415-437).
                     Pacing::MotorTask { held, .. } => {
@@ -494,8 +526,9 @@ impl Axis {
 
     /// What the axis's speed store makes of a record's `command`: a speed
     /// write is stored, and a move or stop runs on the stored speeds, as
-    /// asynMotorController and drvMotorAsyn read them
-    /// (asynMotorController.cpp:208, :297-350; drvMotorAsyn.c:606, :706-733).
+    /// asynMotorController and devMotorSim read them
+    /// (asynMotorController.cpp:208, :297-350; devMotorSim.c:251-296). A
+    /// model-2 axis's are its port's.
     /// On a model-1 card a SET_* only appends to the message string: the
     /// card keeps the velocities a later move leaves unwritten, as a
     /// backlash leg's SET_VEL_BASE (motorRecord.cc do_work). Its
@@ -533,8 +566,10 @@ impl Axis {
             return controller_speeds(trace)
                 .map(|speeds| Speeds::Resolved(command.on_speeds(speeds)));
         }
+        if !trace.is_motor_interface() {
+            return None;
+        }
         if command.store_speed(&mut self.speeds) {
-            // drvMotorAsyn's writeFloat64 prints the write it stores.
             return None;
         }
         command
@@ -555,7 +590,6 @@ impl Axis {
             .fold(false, |changed, (reason, value)| {
                 self.params.set(reason, value) | changed
             });
-        self.poll_params.extend(write.poll_params);
         if let Some(polled) = write.polled {
             self.publish_info(polled);
             return;
@@ -570,9 +604,7 @@ impl Axis {
                 return;
             }
         }
-        if !self.poll_params.is_empty() {
-            self.call_param_callbacks();
-        }
+        self.call_param_callbacks();
     }
 
     /// Post `status` to every bound record's `statusCallback` under a new
@@ -594,32 +626,28 @@ impl Axis {
     /// MOTOR_STATUS is the whole word on every set: C writes it as 0 when a
     /// non-status integer is set (`status` stays 0 at :253, :267), a bug.
     fn hold(&mut self, status: &MotorStatus) {
+        self.stage(status);
+        self.call_param_callbacks();
+    }
+
+    /// [`Self::hold`]'s sets without its `callParamCallbacks`, as a C poll
+    /// leaves them when it returns early.
+    fn stage(&mut self, status: &MotorStatus) {
         self.last_status = Some(status.clone());
-        let poll_params = std::mem::take(&mut self.poll_params);
-        let Some((port, addr)) = &self.controller else {
+        if self.controller.is_none() {
             return;
-        };
-        let Some(handle) = crate::devices::controller_port_handle(port) else {
-            return;
-        };
+        }
         use crate::controller_port::index;
         use asyn_rs::param::ParamValue;
-        use asyn_rs::request::ParamSetValue;
-        let addr = *addr;
         let word = crate::flags::MstaFlags::from_status(status).bits();
         let mut updates = Vec::from([
-            ParamSetValue::new(index::POSITION, addr, ParamValue::Float64(status.position)),
-            ParamSetValue::new(
+            (index::POSITION, ParamValue::Float64(status.position)),
+            (
                 index::ENCODER_POSITION,
-                addr,
                 ParamValue::Float64(status.encoder_position),
             ),
-            ParamSetValue::new(
-                index::ACT_VELOCITY,
-                addr,
-                ParamValue::Float64(status.velocity),
-            ),
-            ParamSetValue::new(index::STATUS, addr, ParamValue::Int32(word as i32)),
+            (index::ACT_VELOCITY, ParamValue::Float64(status.velocity)),
+            (index::STATUS, ParamValue::Int32(word as i32)),
         ]);
         // C sets a MOTOR_STATUS_* bit only when a driver calls
         // setIntegerParam on it. The word here is the driver's whole status,
@@ -630,36 +658,35 @@ impl Axis {
         self.mirrored_word = Some(word);
         updates.extend((0..15).filter(|bit| changed >> bit & 1 != 0).map(|bit| {
             let value = ((word >> bit) & 1) as i32;
-            ParamSetValue::new(
-                index::STATUS_DIRECTION + bit,
-                addr,
-                ParamValue::Int32(value),
-            )
+            (index::STATUS_DIRECTION + bit, ParamValue::Int32(value))
         }));
-        updates.extend(
-            poll_params
-                .into_iter()
-                .map(|(reason, value)| ParamSetValue::new(reason, addr, value)),
-        );
-        // C drivers ignore the status of setXxxParam and callParamCallbacks.
-        let _ = handle.set_params_and_notify_blocking(addr, updates);
+        self.set_params(updates);
+    }
+
+    /// C `setXxxParam` on the axis: a read sees each value at once, and the
+    /// next [`Self::call_param_callbacks`] posts it.
+    fn set_params(&self, updates: Vec<(usize, asyn_rs::param::ParamValue)>) {
+        if updates.is_empty() {
+            return;
+        }
+        let Some((port, addr)) = &self.controller else {
+            return;
+        };
+        if let Some(handle) = crate::devices::controller_port_handle(port) {
+            // C drivers ignore the status of setXxxParam and callParamCallbacks.
+            let _ = handle.set_params_blocking(*addr, axis_sets(*addr, updates));
+        }
     }
 
     /// C's `callParamCallbacks` on the axis with no status to set: posts
     /// whatever was set on it since the last one, such as a
     /// [`WriteHook`](crate::controller_port::WriteHook)'s sets.
-    fn call_param_callbacks(&mut self) {
-        let poll_params = std::mem::take(&mut self.poll_params);
+    fn call_param_callbacks(&self) {
         let Some((port, addr)) = &self.controller else {
             return;
         };
-        let addr = *addr;
-        let updates = poll_params
-            .into_iter()
-            .map(|(reason, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
-            .collect();
         if let Some(handle) = crate::devices::controller_port_handle(port) {
-            let _ = handle.set_params_and_notify_blocking(addr, updates);
+            let _ = handle.set_params_and_notify_blocking(*addr, Vec::new());
         }
     }
 
@@ -673,7 +700,7 @@ impl Axis {
         if let Some(left) = failed.left
             && self.last_status.as_ref() != Some(&left)
         {
-            self.hold(&left);
+            self.stage(&left);
             self.status_changed = true;
         }
         let mut status = self.last_status.clone().unwrap_or_else(status_before_poll);
@@ -713,7 +740,7 @@ impl Axis {
         match self.motor.lock() {
             Ok(mut motor) => {
                 let polled = poll_driver(&mut *motor, &user);
-                self.poll_params.extend(motor.take_poll_params());
+                self.set_params(motor.take_poll_params());
                 // A model-2 driver's update sets its paramLib
                 // (drvMotorSim.c:646-653); the poll's status posts them.
                 for write in motor.take_status_writes() {
@@ -841,11 +868,10 @@ impl Axis {
         let status = match self.poll_result(polled) {
             Ok(status) => status,
             // A driver returning before callParamCallbacks posts nothing,
-            // whatever it left set.
+            // whatever it left set, and C's poller adds none
+            // (asynMotorController.cpp:658).
             Err(failed) if failed.bits == PollFailure::NONE && !force => {
-                let status = self.failed_poll_status(failed);
-                self.call_param_callbacks();
-                return status.moving;
+                return self.failed_poll_status(failed).moving;
             }
             Err(failed) => self.failed_poll_status(failed),
         };
@@ -1308,6 +1334,79 @@ fn is_driver_param(reason: i32) -> bool {
     (1..100).contains(&reason)
 }
 
+/// The drvMotorAsyn reason and value of a record's `cmd`: what devMotorAsyn
+/// writes to a model-2 port.
+fn drv_motor_asyn_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
+    let (_, value) = c_write(cmd)?;
+    Some((drv_motor_asyn_reason(cmd)?, value))
+}
+
+/// devMotorAsyn's `pasynFloat64->write` / `pasynInt32->write` of `write` to
+/// the model-2 port on the record's axis (devMotorAsyn.c:689-708).
+fn write_drv_motor_asyn(
+    port: &asyn_rs::port_handle::PortHandle,
+    trace: &MotorTrace,
+    (reason, value): (i32, WriteValue),
+) -> asyn_rs::error::AsynResult<()> {
+    let reason = reason as usize;
+    match value {
+        WriteValue::Float64(v) => port.write_float64_blocking(reason, trace.addr(), v),
+        WriteValue::Int32(v) => port.write_int32_blocking(reason, trace.addr(), v),
+    }
+}
+
+/// The position a SET_POSITION or encoder-position write sets.
+fn position_write(cmd: &MotorCommand) -> Option<StatusWrite> {
+    match *cmd {
+        MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {
+            Some(StatusWrite::Position(position))
+        }
+        MotorCommand::SetEncoderPosition { position } => {
+            Some(StatusWrite::EncoderPosition(position))
+        }
+        _ => None,
+    }
+}
+
+/// The DONE=0 a move sets.
+fn move_start_write(cmd: &MotorCommand) -> Option<StatusWrite> {
+    matches!(
+        cmd,
+        MotorCommand::MoveAbsolute { .. }
+            | MotorCommand::MoveRelative { .. }
+            | MotorCommand::MoveVelocity { .. }
+            | MotorCommand::JogVelocity { .. }
+            | MotorCommand::Home { .. }
+    )
+    .then_some(StatusWrite::Done(false))
+}
+
+/// What a `motorAxisDrvSET_t` driver's write `c` of `cmd` set: its own
+/// status fields, then the position or DONE=0 a write that succeeded sets,
+/// and the parameter it stored, which it stores only on success
+/// (drvMotorSim.c:364-368, 424-428).
+fn drvset_axis_write(
+    motor: &mut dyn AsynMotor,
+    cmd: &MotorCommand,
+    c: Option<(i32, WriteValue)>,
+    ok: bool,
+) -> AxisWrite {
+    let mut fields = motor.take_status_writes();
+    if ok {
+        fields.extend(position_write(cmd).or(move_start_write(cmd)));
+    }
+    let param = c.filter(|&(reason, _)| ok && is_driver_param(reason));
+    AxisWrite {
+        params: fields
+            .iter()
+            .map(|&w| model2_param(w))
+            .chain(param)
+            .collect(),
+        fields,
+        polled: None,
+    }
+}
+
 /// The paramLib parameter a model-2 driver's `write` sets, by its
 /// `motorAxisParam_t` index (motor_interface.h:278-307).
 fn model2_param(write: StatusWrite) -> (i32, WriteValue) {
@@ -1337,8 +1436,16 @@ pub struct AxisWrite {
     params: Vec<(i32, WriteValue)>,
     /// The driver poll a GET_INFO ran.
     polled: Option<Result<MotorStatus, FailedPoll>>,
-    /// The poll's or the write's [`AsynMotor::take_poll_params`].
-    poll_params: Vec<(usize, asyn_rs::param::ParamValue)>,
+}
+
+fn axis_sets(
+    axis: i32,
+    updates: Vec<(usize, asyn_rs::param::ParamValue)>,
+) -> Vec<asyn_rs::request::ParamSetValue> {
+    updates
+        .into_iter()
+        .map(|(reason, value)| asyn_rs::request::ParamSetValue::new(reason, axis, value))
+        .collect()
 }
 
 /// A failed driver poll: the bits its error label raises and the status it
@@ -1612,7 +1719,7 @@ fn execute_commands_after(
         .flatten();
     for cmd in commands {
         let c = if drvset {
-            c_write(cmd).and_then(|(_, value)| Some((drv_motor_asyn_reason(cmd)?, value)))
+            drv_motor_asyn_write(cmd)
         } else {
             c_write(cmd)
         };
@@ -1623,16 +1730,6 @@ fn execute_commands_after(
                 trace.print(TraceMask::FLOW, function, args)
             }
         };
-        if let (true, Some((_, WriteValue::Float64(_)))) = (model2, c) {
-            trace.print(
-                TraceMask::FLOW,
-                function,
-                format_args!(
-                    "drvMotorAsyn::writeFloat64, reason={function}, pasynUser={:p} pAxis={:p}\n",
-                    &user, motor as *const dyn AsynMotor as *const (),
-                ),
-            );
-        }
         let refusal = match (&hook, c) {
             (Some(hook), Some((function, _))) => hook.check(axis, function as usize).err(),
             _ => None,
@@ -1820,7 +1917,7 @@ fn execute_commands_after(
                 r.map(|_| ())
                     .or_else(|e| if controller { Err(e) } else { Ok(()) })
             }
-            // The base only stores them; a model-2 axis's store is the
+            // The base only stores them; devMotorSim's store is the
             // poller's.
             MotorCommand::SetVelocity { .. }
             | MotorCommand::SetVelBase { .. }
@@ -1837,74 +1934,31 @@ fn execute_commands_after(
             let set = asyn_rs::request::ParamSetValue::new(function as usize, axis, value);
             let _ = params.set_params_and_notify_blocking(axis, vec![set]);
         }
-        let poll_params = motor.take_poll_params();
-        let position = match *cmd {
-            MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {
-                Some(StatusWrite::Position(position))
+        // The poll's or the write's own sets land at once, as C's paramLib.
+        if let Some(params) = &params {
+            let _ = params.set_params_blocking(axis, axis_sets(axis, motor.take_poll_params()));
+        }
+        let write = if controller {
+            let mut fields = Vec::from_iter(position_write(cmd));
+            fields.extend(motor.take_status_writes());
+            fields.extend(move_start_write(cmd));
+            AxisWrite {
+                fields,
+                ..AxisWrite::default()
             }
-            MotorCommand::SetEncoderPosition { position } => {
-                Some(StatusWrite::EncoderPosition(position))
-            }
-            _ => None,
-        };
-        let moved = matches!(
-            cmd,
-            MotorCommand::MoveAbsolute { .. }
-                | MotorCommand::MoveRelative { .. }
-                | MotorCommand::MoveVelocity { .. }
-                | MotorCommand::JogVelocity { .. }
-                | MotorCommand::Home { .. }
-        )
-        .then_some(StatusWrite::Done(false));
-        let mut writes = Vec::new();
-        if controller {
-            writes.extend(position);
-            writes.extend(motor.take_status_writes());
-            writes.extend(moved);
         } else if drvset {
-            writes.extend(motor.take_status_writes());
-            if result.is_ok() {
-                writes.extend(position.or(moved));
-            }
+            drvset_axis_write(motor, cmd, c, result.is_ok())
         } else {
             // Model 1: motordrvCom `process_messages` sends a MOTION or
             // VELOCITY message with no callback (motordrvCom.cc:396-438);
             // only `query_axis` on the held move calls the record back.
             let _ = motor.take_status_writes();
-        }
-        // A model-2 driver stores a parameter only once the write succeeded
-        // (drvMotorSim.c:364-368, 424-428).
-        let param = c.filter(|&(reason, _)| drvset && result.is_ok() && is_driver_param(reason));
-        let params = match drvset {
-            true => writes
-                .iter()
-                .map(|&w| model2_param(w))
-                .chain(param)
-                .collect(),
-            false => Vec::new(),
+            AxisWrite::default()
         };
-        on_write(AxisWrite {
-            fields: writes,
-            params,
-            polled,
-            poll_params,
-        });
+        on_write(AxisWrite { polled, ..write });
 
-        if let (true, Some((_, value))) = (model2, c) {
-            // drvMotorAsyn prints the write whatever its status.
-            match value {
-                WriteValue::Float64(v) => trace.print(
-                    TraceMask::IO_DRIVER,
-                    function,
-                    format_args!("drvMotorAsyn::writeFloat64, reason={function}, value={v:.6}\n"),
-                ),
-                WriteValue::Int32(v) => trace.print(
-                    TraceMask::IO_DRIVER,
-                    function,
-                    format_args!("drvMotorAsyn::writeInt32, reason={function}, value={v}\n"),
-                ),
-            }
-        } else if let Some((_, value)) = c {
+        // drvMotorAsyn's port prints its own writes.
+        if let (false, Some((_, value))) = (model2, c) {
             let status = write_status.unwrap_or_else(|| match &result {
                 Ok(()) => 0,
                 Err(e) => e.c_status_code(),
@@ -2074,6 +2128,100 @@ fn dev_motor_asyn_reply(
     }
 }
 
+/// A model-2 port for tests: drvMotorAsyn's writes (drvMotorAsyn.c:576-752)
+/// on one axis's driver.
+#[cfg(test)]
+pub(crate) mod drv_motor_asyn_stand_in {
+    use std::sync::{Arc, Mutex};
+
+    use asyn_rs::error::AsynResult;
+    use asyn_rs::interfaces::motor::AsynMotor;
+    use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+    use asyn_rs::port_handle::PortHandle;
+    use asyn_rs::registry::claim_port;
+    use asyn_rs::runtime::config::RuntimeConfig;
+    use asyn_rs::runtime::port::create_port_runtime;
+    use asyn_rs::user::AsynUser;
+
+    use crate::device_support::MotorAxis;
+    use crate::flags::StoredSpeeds;
+
+    struct Port {
+        base: PortDriverBase,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        axis: MotorAxis,
+        speeds: StoredSpeeds,
+    }
+
+    impl PortDriver for Port {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+            let s = self.speeds;
+            let mut motor = self.motor.lock().unwrap();
+            match user.reason {
+                107 => motor.stop(user, s.acceleration),
+                106 => {
+                    let r =
+                        motor.home(user, s.min_velocity, s.velocity, s.acceleration, value != 0);
+                    self.axis.wakeup();
+                    r
+                }
+                109 => {
+                    motor.force_callback(user);
+                    self.axis.force_poll();
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+            let s = self.speeds;
+            match user.reason {
+                100 => self.speeds.velocity = value,
+                101 => self.speeds.min_velocity = value,
+                102 => self.speeds.acceleration = value,
+                reason @ 103..=106 => {
+                    let mut motor = self.motor.lock().unwrap();
+                    let (min, max, acc) = (s.min_velocity, s.velocity, s.acceleration);
+                    let r = match reason {
+                        103 => motor.move_relative(user, value, min, max, acc),
+                        104 => motor.move_absolute(user, value, min, max, acc),
+                        105 => motor.move_velocity(user, min, value, acc),
+                        _ => motor.home(user, min, max, acc, value != 0.0),
+                    };
+                    self.axis.wakeup();
+                    return r;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    /// Model-2 port `port` with `motor` on axis 0, whose poller is `axis`'s.
+    pub(crate) fn port(
+        port: &str,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+        axis: MotorAxis,
+    ) -> PortHandle {
+        let claim = claim_port(port).unwrap();
+        let driver = Port {
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            motor,
+            axis,
+            speeds: StoredSpeeds::default(),
+        };
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        runtime.port_handle().clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
@@ -2129,8 +2277,26 @@ mod tests {
         }
     }
 
-    /// A started poller on axis 0 of model-2 port `port`, the axis's
-    /// record half and its parameter library.
+    /// A started poller on `motor` at axis 0 of model-2 port `port`, and the
+    /// axis's record half.
+    fn model2_axis(
+        port: &str,
+        motor: Arc<Mutex<dyn AsynMotor>>,
+    ) -> (MotorPollLoop, crate::device_support::MotorAxis) {
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let user = TraceUser::Model2 {
+            port: port.into(),
+            addr: 0,
+        };
+        let axis = controller.axis(motor.clone(), user).axis;
+        let record_half = axis.at(axis.address().clone());
+        let handle = super::drv_motor_asyn_stand_in::port(port, motor, record_half.clone());
+        crate::devices::register_drv_motor_asyn_port(port, 1, handle).unwrap();
+        crate::devices::register_axis(axis).unwrap();
+        (controller.build(SCAN, SCAN, 0), record_half)
+    }
+
+    /// [`model2_axis`] on a [`Sim`], and the axis's parameter library.
     fn model2_sim(
         port: &str,
         created: Vec<StatusWrite>,
@@ -2140,20 +2306,11 @@ mod tests {
         crate::device_support::MotorAxis,
         Model2Params,
     ) {
-        crate::devices::register_drv_motor_asyn_port(port, 1).unwrap();
-        let mut controller = crate::builder::ControllerBuilder::new();
         let sim = Sim {
             writes: created,
             updated,
         };
-        let user = TraceUser::Model2 {
-            port: port.into(),
-            addr: 0,
-        };
-        let axis = controller.axis(Arc::new(Mutex::new(sim)), user).axis;
-        let record_half = axis.at(axis.address().clone());
-        crate::devices::register_axis(axis).unwrap();
-        let poll_loop = controller.build(SCAN, SCAN, 0);
+        let (poll_loop, record_half) = model2_axis(port, Arc::new(Mutex::new(sim)));
         let params = crate::devices::model2_params(port, 0).unwrap();
         (poll_loop, record_half, params)
     }
@@ -2234,6 +2391,63 @@ mod tests {
         });
         poll_loop.run_queued_commands();
         assert_eq!(params.get(12), Some(WriteValue::Int32(0)));
+    }
+
+    /// A motor recording the speeds of each absolute move and stop.
+    struct Speeds(Vec<(f64, f64, f64)>);
+
+    impl AsynMotor for Speeds {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            min_velocity: f64,
+            velocity: f64,
+            acceleration: f64,
+        ) -> AsynResult<()> {
+            self.0.push((min_velocity, velocity, acceleration));
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, acceleration: f64) -> AsynResult<()> {
+            self.0.push((0.0, 0.0, acceleration));
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            Ok(MotorStatus::default())
+        }
+    }
+
+    /// A model-2 axis's speeds are its port's (drvMotorAsyn.c:722-733): the
+    /// record's speed writes reach the port, and a move and a stop run on
+    /// what the port stored, not on the command's own speeds.
+    #[test]
+    fn a_model2_move_runs_on_the_speeds_its_port_stored() {
+        let motor = Arc::new(Mutex::new(Speeds(Vec::new())));
+        let (mut poll_loop, axis) = model2_axis("PLM2SPEEDS", motor.clone());
+        axis.send(MotorCommand::SetVelBase { velocity: 0.5 });
+        axis.send(MotorCommand::SetVelocity { velocity: 3.0 });
+        axis.send(MotorCommand::SetAccel { acceleration: 0.25 });
+        axis.send(MotorCommand::MoveAbsolute {
+            position: 2.0,
+            min_velocity: 9.0,
+            velocity: 9.0,
+            acceleration: 9.0,
+        });
+        axis.send(MotorCommand::Stop { acceleration: 9.0 });
+        poll_loop.run_queued_commands();
+        assert_eq!(
+            motor.lock().unwrap().0,
+            [(0.5, 3.0, 0.25), (0.0, 0.0, 0.25)]
+        );
     }
 
     /// Answers each poll from the script in turn; `None` is `set_status`
@@ -2364,6 +2578,128 @@ mod tests {
                 asyn_rs::param::ParamValue::Float64(limit),
             )]
         }
+    }
+
+    /// Polls `polls` in turn; an `Err` returns early having left that status
+    /// and set HIGH_LIMIT to `limit`.
+    struct EarlyReturn {
+        polls: std::collections::VecDeque<Result<MotorStatus, MotorStatus>>,
+        left: Option<MotorStatus>,
+        limit: f64,
+    }
+
+    impl AsynMotor for EarlyReturn {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+        fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+            self.left.take()
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            self.limit += 1.0;
+            self.polls.pop_front().unwrap().map_err(|left| {
+                self.left = Some(left);
+                AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "failed".into(),
+                }
+            })
+        }
+        fn take_poll_params(&mut self) -> Vec<(usize, asyn_rs::param::ParamValue)> {
+            vec![(
+                crate::controller_port::index::HIGH_LIMIT,
+                asyn_rs::param::ParamValue::Float64(self.limit),
+            )]
+        }
+    }
+
+    /// C's poller makes no callParamCallbacks of its own (asynMotorController
+    /// .cpp:658): a poll returning before its own leaves what it set, status
+    /// and parameters alike, to the next one.
+    #[test]
+    fn a_poll_returning_early_leaves_its_sets_to_the_next_callback() {
+        use crate::controller_port::index;
+        let port = "PLEARLY";
+        let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::opened();
+        let handle = crate::devices::register_controller_port(&gate, port, 1, ()).unwrap();
+        let motor = EarlyReturn {
+            polls: [Ok(at(0.0)), Ok(at(0.0)), Err(at(2.0)), Ok(at(2.0))].into(),
+            left: None,
+            limit: 0.0,
+        };
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let user = TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        };
+        let axis = controller.axis(Arc::new(Mutex::new(motor)), user).axis;
+        crate::devices::register_axis(axis).unwrap();
+        let mut poll_loop = controller.build(SCAN, SCAN, 0);
+        let read = |reason| handle.read_float64_blocking(reason, 0).unwrap();
+        let (_sub, mut limits) = handle.interrupts().register_interrupt_user(
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(index::HIGH_LIMIT),
+                addr: Some(0),
+                ..Default::default()
+            },
+            16,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // The mailbox keeps the latest post; none within the wait is `None`.
+        let mut posted = || {
+            rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(50), limits.recv()).await
+            })
+            .ok()
+            .flatten()
+            .map(|iv| match iv.value {
+                asyn_rs::param::ParamValue::Float64(v) => v,
+                other => panic!("{other:?}"),
+            })
+        };
+        // After the startup poll's.
+        now(poll_loop.poller_pass(false));
+        assert_eq!(read(index::HIGH_LIMIT), 2.0);
+        assert_eq!(read(index::POSITION), 0.0);
+        assert!(posted().is_some());
+        now(poll_loop.poller_pass(false));
+        assert_eq!(
+            read(index::POSITION),
+            2.0,
+            "C getDoubleParam reads the status it left"
+        );
+        assert_eq!(
+            read(index::HIGH_LIMIT),
+            3.0,
+            "C getDoubleParam reads the failed poll's own"
+        );
+        assert_eq!(posted(), None, "and no callback posts it");
+        now(poll_loop.poller_pass(false));
+        assert_eq!(read(index::HIGH_LIMIT), 4.0);
+        assert_eq!(read(index::POSITION), 2.0);
+        assert_eq!(posted(), Some(4.0));
     }
 
     /// A poll's or a write's own parameters post with its status when it
@@ -3581,32 +3917,34 @@ mod tests {
         }
     }
 
-    /// drvMotorAsyn's GET_INFO calls the driver's forceCallback
-    /// (drvMotorAsyn.c:617-619); asynMotorController's only polls
-    /// (asynMotorController.cpp:217-221).
+    /// drvMotorAsyn's GET_INFO is its port's writeInt32, which calls the
+    /// driver's forceCallback (drvMotorAsyn.c:617-619); the poll is the
+    /// poller's, after it.
     #[test]
-    fn a_model2_get_info_calls_force_callback_before_the_poll() {
-        for (user, want) in [
-            (
-                TraceUser::Model2 {
-                    port: "PLM2FORCE".into(),
-                    addr: 0,
-                },
-                &["force_callback", "poll"][..],
-            ),
-            (
-                TraceUser::Asyn {
-                    port: "PLM3FORCE".into(),
-                    addr: 0,
-                },
-                &["poll"][..],
-            ),
-        ] {
-            let mut motor = ForceCallbackOrder(Vec::new());
-            let trace = MotorTrace::with_user(user);
-            execute_commands(&mut motor, &trace, &[MotorCommand::Poll], &mut |_| {});
-            assert_eq!(motor.0, want);
-        }
+    fn a_model2_get_info_calls_force_callback_through_its_port() {
+        let motor = Arc::new(Mutex::new(ForceCallbackOrder(Vec::new())));
+        let (mut poll_loop, axis) = model2_axis("PLM2FORCE", motor.clone());
+        motor.lock().unwrap().0.clear();
+        axis.send(MotorCommand::Poll);
+        poll_loop.run_queued_commands();
+        assert_eq!(motor.lock().unwrap().0, ["force_callback"]);
+        assert!(matches!(
+            poll_loop.axes[0].cmd_rx.try_recv(),
+            Ok(PollCommand::ForcePoll)
+        ));
+    }
+
+    /// asynMotorController's GET_INFO only polls (asynMotorController.cpp:
+    /// 217-221).
+    #[test]
+    fn a_controller_get_info_polls_without_force_callback() {
+        let mut motor = ForceCallbackOrder(Vec::new());
+        let trace = MotorTrace::with_user(TraceUser::Asyn {
+            port: "PLM3FORCE".into(),
+            addr: 0,
+        });
+        execute_commands(&mut motor, &trace, &[MotorCommand::Poll], &mut |_| {});
+        assert_eq!(motor.0, ["poll"]);
     }
 
     /// GET_INFO is `needUpdate = 1` on the status last called back: no

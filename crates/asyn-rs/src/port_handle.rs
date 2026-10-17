@@ -1249,6 +1249,22 @@ impl PortHandle {
         )
     }
 
+    /// C `setXxxParam` of each update without the `callParamCallbacks`: the
+    /// values are in the store for any request queued after this one, and
+    /// marked changed until a [`Self::call_param_callbacks_blocking`] on
+    /// their list posts them. Blocks only until the inbox accepts it, as
+    /// [`Self::set_params_and_notify_blocking`].
+    pub fn set_params_blocking(
+        &self,
+        addr: i32,
+        updates: Vec<crate::request::ParamSetValue>,
+    ) -> AsynResult<()> {
+        self.blocking(
+            "set_params_blocking",
+            self.enqueue(RequestOp::SetParams { updates }, addr),
+        )
+    }
+
     /// Enqueue-only async helper: guaranteed delivery, no reply wait.
     async fn enqueue(&self, op: RequestOp, addr: i32) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);

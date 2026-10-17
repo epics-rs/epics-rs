@@ -117,6 +117,7 @@ impl From<&RequestOp> for PortCommand {
                 iface: req.iface.map(|i| i.asyn_name().to_string()),
             },
             RequestOp::CallParamCallbacks { addr, .. } => Self::CallParamCallbacks { addr: *addr },
+            RequestOp::SetParams { .. } => Self::SetParams,
             RequestOp::GetOption { key } => Self::GetOption { key: key.clone() },
             RequestOp::SetOption { key, value } => Self::SetOption {
                 key: key.clone(),
@@ -271,6 +272,7 @@ impl From<&PortCommand> for RequestOp {
                 updates: vec![],
                 time_stamp: None,
             },
+            PortCommand::SetParams => Self::SetParams { updates: vec![] },
             PortCommand::GetOption { key } => Self::GetOption { key: key.clone() },
             PortCommand::SetOption { key, value } => Self::SetOption {
                 key: key.clone(),

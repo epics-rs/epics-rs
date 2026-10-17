@@ -402,8 +402,10 @@ fn move_and_stop_traced(port: &str, user: TraceUser) -> Vec<String> {
         .collect()
 }
 
+/// drvMotorAsyn's own lines are its port's (drvMotorAsyn.c:576-752): a
+/// model-2 axis prints devMotorAsyn's alone, and no asynMotorController line.
 #[test]
-fn a_model2_axis_prints_drv_motor_asyn_write_lines_and_no_controller_line() {
+fn a_model2_axis_prints_neither_drv_motor_asyn_nor_controller_lines() {
     let model3 = move_and_stop_traced(
         "traceLinesModel3",
         TraceUser::Asyn {
@@ -423,23 +425,8 @@ fn a_model2_axis_prints_drv_motor_asyn_write_lines_and_no_controller_line() {
             addr: 0,
         },
     );
-    assert_eq!(lines.len(), 5, "{lines:#?}");
-    assert!(
-        lines[0].starts_with("drvMotorAsyn::writeFloat64, reason=104, pasynUser=0x"),
-        "{}",
-        lines[0]
-    );
-    assert!(lines[0].contains(" pAxis=0x"), "{}", lines[0]);
     let refused = "devMotorAsyn::asynCallback: MM4000:m1 pasyn{Float64,Int32}->write returned ";
-    assert_eq!(
-        lines[1..],
-        [
-            "drvMotorAsyn::writeFloat64, reason=104, value=5.000000",
-            refused,
-            "drvMotorAsyn::writeInt32, reason=107, value=0",
-            refused,
-        ]
-    );
+    assert_eq!(lines, [refused, refused]);
 }
 
 /// The device-support half of a move under ASYN_TRACEIO_DEVICE, as C

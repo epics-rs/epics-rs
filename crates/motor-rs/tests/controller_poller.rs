@@ -154,9 +154,11 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
     tokio::time::sleep(PERIOD * 8).await;
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
+    // A pass may be under way when the add returns; count from the next.
     let names: Vec<_> = log.lock().unwrap()[joined..]
         .iter()
         .map(|(name, _)| *name)
+        .skip_while(|&name| name != "C")
         .collect();
     assert!(names.len() >= 6, "{names:?}");
     let whole = names.len() / 3 * 3;

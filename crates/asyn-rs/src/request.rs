@@ -1005,6 +1005,12 @@ pub enum RequestOp {
         /// (NDPluginDriver.cpp:232); `None` keeps the port's timestamp.
         time_stamp: Option<std::time::SystemTime>,
     },
+    /// C `setIntegerParam`/`setDoubleParam` alone: the values land in the
+    /// store and are marked changed, and only a later `CallParamCallbacks`
+    /// on their list posts them (asynPortDriver.cpp:1785-1794).
+    SetParams {
+        updates: Vec<ParamSetValue>,
+    },
     /// Get a port/driver option by key.
     GetOption {
         key: String,

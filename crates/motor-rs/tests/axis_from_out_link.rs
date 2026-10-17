@@ -30,6 +30,30 @@ use tokio::sync::mpsc;
 static MODEL1: DevSup = model1_device("devTestModel1", "TestModel1");
 static SIM: DevSup = motor_interface_device("devTestSim", "TestSim");
 
+/// A model-2 port with no axis open: a record on it never reaches a write.
+fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandle {
+    use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+
+    struct Axisless(PortDriverBase);
+    impl PortDriver for Axisless {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+    let claim = asyn_rs::registry::claim_port(name).unwrap();
+    let driver = Axisless(PortDriverBase::new(name, num_axes, PortFlags::default()));
+    let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
+        &claim,
+        driver,
+        asyn_rs::runtime::config::RuntimeConfig::default(),
+    )
+    .unwrap();
+    runtime.port_handle().clone()
+}
+
 fn sim(card: i32, signal: i32) -> TraceUser {
     TraceUser::MotorInterface {
         device: SIM.choice,
@@ -491,7 +515,7 @@ record(motor, "I:m") { field(DTYP, "asynMotor") field(OUT, "@asyn(SHORT,2)") }
 /// drvUserCreate; its reads and writes name the axis they refuse.
 #[tokio::test]
 async fn a_model2_record_on_a_missing_axis_is_kept_with_the_drivers_message() {
-    register_drv_motor_asyn_port("DRV2", 2).unwrap();
+    register_drv_motor_asyn_port("DRV2", 2, axisless_port("DRV2", 2)).unwrap();
     let trace = Capture::of("DRV2");
     let db = boot(
         r##"
@@ -593,7 +617,7 @@ record(motor, "K:b") { field(DTYP, "asynMotor") field(OUT, "@asyn(TWIN,0)") fiel
 /// its init_record still ends in monitor()'s alarm reset.
 #[tokio::test]
 async fn a_record_on_a_missing_axis_is_initialised_without_a_process() {
-    register_drv_motor_asyn_port("NOPASS", 2).unwrap();
+    register_drv_motor_asyn_port("NOPASS", 2, axisless_port("NOPASS", 2)).unwrap();
     let trace = Capture::of("NOPASS");
     PortManager::global()
         .trace_manager()

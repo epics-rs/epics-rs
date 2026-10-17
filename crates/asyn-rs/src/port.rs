@@ -1814,6 +1814,16 @@ impl PortDriverBase {
         self.params.create_param(name, param_type)
     }
 
+    /// See [`ParamList::create_param_in_list`].
+    pub fn create_param_in_list(
+        &mut self,
+        list: i32,
+        name: &str,
+        param_type: ParamType,
+    ) -> AsynResult<usize> {
+        self.params.create_param_in_list(list, name, param_type)
+    }
+
     pub fn find_param(&self, name: &str) -> Option<usize> {
         self.params.find_param(name)
     }
@@ -1823,7 +1833,7 @@ impl PortDriverBase {
     /// drvInfo falls back here, as C subclasses call the base class.
     pub fn drv_user_create(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let addr = self.get_address(req.addr, 0)?;
-        let Some(reason) = self.params.find_param(&req.drv_info) else {
+        let Some(reason) = self.params.find_param_in(addr, &req.drv_info) else {
             self.trace_print_at(
                 req.addr,
                 0,
@@ -3879,6 +3889,26 @@ mod tests {
         );
         assert!(
             drv.drv_user_create(&DrvUserRequest::new("NOPE", 0))
+                .is_err()
+        );
+    }
+
+    /// asynPortDriver::drvUserCreate finds the name in the user's own list
+    /// (asynPortDriver.cpp:3569-3570).
+    #[test]
+    fn drv_user_create_finds_a_list_only_parameter_in_its_list_alone() {
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("list_only", 2, flags);
+        let own = base
+            .create_param_in_list(0, "OWN", ParamType::Int32)
+            .unwrap();
+        let found = base.drv_user_create(&DrvUserRequest::new("OWN", 0));
+        assert_eq!(found.unwrap().reason, own);
+        assert!(
+            base.drv_user_create(&DrvUserRequest::new("OWN", 1))
                 .is_err()
         );
     }

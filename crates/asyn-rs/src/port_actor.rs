@@ -1202,6 +1202,8 @@ impl PortActor {
             // publishes the status parameter announcing it — gating this op
             // discarded exactly the updates that matter most (R13-47).
             | RequestOp::CallParamCallbacks { .. }
+            // `setXxxParam` is as plain a method as `callParamCallbacks`.
+            | RequestOp::SetParams { .. }
             // `asynDrvUser->create` is called straight off the interface pointer,
             // at record init and at connect time: asynRecord.c:1243-1257 and
             // devAsynInt32.c:264-277. No `queueRequest` is anywhere in either
@@ -2298,52 +2300,8 @@ impl PortActor {
                 if let Some(ts) = time_stamp {
                     base.set_time_stamp(*ts);
                 }
-                // One dispatch for every parameter type (`ParamList::set_value`),
-                // so this carrier and the store cannot support different type sets.
-                let mut failed: Option<AsynError> = None;
-                for u in updates {
-                    let outcome = match u {
-                        crate::request::ParamSetValue::Value {
-                            reason,
-                            addr,
-                            value,
-                        } => base.set_param_value(*reason, *addr, value.clone()),
-                        crate::request::ParamSetValue::UInt32Digital {
-                            reason,
-                            addr,
-                            value,
-                            mask,
-                            interrupt_mask,
-                        } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
-                        crate::request::ParamSetValue::Status {
-                            reason,
-                            addr,
-                            status,
-                            alarm_status,
-                            alarm_severity,
-                        } => base.set_param_status(
-                            *reason,
-                            *addr,
-                            *status,
-                            *alarm_status,
-                            *alarm_severity,
-                        ),
-                    };
-                    // A set that fails (a value the parameter cannot hold) is
-                    // reported, not swallowed: C `asynPortDriver::setIntegerParam`
-                    // asynPrints the paramList error at ASYN_TRACE_ERROR and
-                    // returns the status. The remaining updates still land and the
-                    // callbacks still fire — one bad update must not strand the
-                    // good ones — and the first error is returned to whoever waits
-                    // on the reply.
-                    if let Err(e) = outcome {
-                        base.trace_print(
-                            crate::trace::TraceMask::ERROR,
-                            format_args!("callParamCallbacks: param set failed: {e}\n"),
-                        );
-                        failed.get_or_insert(e);
-                    }
-                }
+                // A failed set does not strand the good ones: they still post.
+                let mut failed = set_params(base, updates);
                 // Flush every address list this batch wrote, not just the
                 // request's. C has no bundled set-then-flush: a driver calls
                 // `setXxxParam` per list and then `callParamCallbacks(addr)`
@@ -2376,6 +2334,10 @@ impl PortActor {
                     None => Ok(RequestResult::write_ok()),
                 }
             }
+            RequestOp::SetParams { updates } => match set_params(self.driver.base_mut(), updates) {
+                Some(e) => Err(e),
+                None => Ok(RequestResult::write_ok()),
+            },
             RequestOp::GetOption { key } => {
                 // The request's own AsynUser, as `SetOption` below.
                 let val = self.driver.get_option(user, key)?;
@@ -2542,6 +2504,47 @@ impl PortCalls for ActorCalls<'_> {
         self.0.link_user(&mut user);
         self.0.dispatch_io(&mut user, op)
     }
+}
+
+/// C `setXxxParam` of each update: one dispatch for every parameter type
+/// (`ParamList::set_value`), so the carriers and the store cannot support
+/// different type sets. A set that fails (a value the parameter cannot hold)
+/// is reported, not swallowed, as C `asynPortDriver::setIntegerParam`
+/// asynPrints the paramList error at ASYN_TRACE_ERROR; the remaining updates
+/// still land, and the first error is returned.
+fn set_params(
+    base: &mut crate::port::PortDriverBase,
+    updates: &[crate::request::ParamSetValue],
+) -> Option<AsynError> {
+    let mut failed = None;
+    for u in updates {
+        let outcome = match u {
+            crate::request::ParamSetValue::Value {
+                reason,
+                addr,
+                value,
+            } => base.set_param_value(*reason, *addr, value.clone()),
+            crate::request::ParamSetValue::UInt32Digital {
+                reason,
+                addr,
+                value,
+                mask,
+                interrupt_mask,
+            } => base.set_uint32_param(*reason, *addr, *value, *mask, *interrupt_mask),
+            crate::request::ParamSetValue::Status {
+                reason,
+                addr,
+                status,
+                alarm_status,
+                alarm_severity,
+            } => base.set_param_status(*reason, *addr, *status, *alarm_status, *alarm_severity),
+        };
+        // The setter printed C's reportSetParamErrors line.
+        if let Err(e) = outcome {
+            failed.get_or_insert(e);
+        }
+    }
+    failed
 }
 
 /// An array read into the caller's buffer: the driver sees its contents, as
@@ -5204,6 +5207,54 @@ mod tests {
             "a status transition fires with the prior value intact, and so \
              does the recovery back to Success"
         );
+    }
+
+    /// C `setIntegerParam` alone writes the store, so a read sees the value
+    /// at once, and only the next `callParamCallbacks` posts it
+    /// (asynPortDriver.cpp:1785-1794). Neither goes through `queueRequest`,
+    /// so a disconnected port takes the set too.
+    #[test]
+    fn a_set_alone_is_read_at_once_and_posted_by_the_next_callback() {
+        let mut base = PortDriverBase::new("set_alone", 1, PortFlags::default());
+        base.interrupts = crate::interrupt::InterruptManager::owned_by(
+            epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
+        );
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let _sub = base.interrupts.register_sync_callback(
+            InterruptFilter {
+                reason: Some(val),
+                ..InterruptFilter::default()
+            },
+            move |iv| recorder.lock().push(iv.value.as_int32().unwrap()),
+        );
+        let tx = spawn_actor(TestDriverBase(base));
+        let user = || AsynUser::new(val).with_timeout(Duration::from_secs(1));
+        let set = |n| RequestOp::SetParams {
+            updates: vec![crate::request::ParamSetValue::new(
+                val,
+                0,
+                crate::param::ParamValue::Int32(n),
+            )],
+        };
+        send_and_wait(&tx, set(7), user()).unwrap();
+        let read = send_and_wait(&tx, RequestOp::Int32Read, user()).unwrap();
+        assert_eq!(read.int_val, Some(7));
+        assert!(seen.lock().is_empty(), "a set alone posts nothing");
+        let flush = RequestOp::CallParamCallbacks {
+            addr: 0,
+            updates: vec![],
+            time_stamp: None,
+        };
+        send_and_wait(&tx, flush, user()).unwrap();
+        assert_eq!(*seen.lock(), vec![7]);
+
+        let mut drv = TestDriver::new();
+        drv.base.init_auto_connect(false);
+        drv.base.set_connected(false);
+        let tx = spawn_actor(drv);
+        send_and_wait(&tx, set(8), user()).unwrap();
     }
 
     /// R13-48: `asynDrvUser->create` is a direct interface call — asynRecord's

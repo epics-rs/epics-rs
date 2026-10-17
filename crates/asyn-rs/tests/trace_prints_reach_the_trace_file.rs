@@ -607,6 +607,31 @@ fn a_write_the_store_refuses_succeeds_and_prints_the_io_line() {
     assert!(!log.contains("\n\n"), "{log}");
 }
 
+/// A refused set from a driver thread prints reportSetParamErrors' line
+/// (asynPortDriver.cpp:1099-1115) once, as C's `set*Param` does, and no
+/// line of its own.
+#[test]
+fn a_refused_set_prints_c_s_line_alone() {
+    use asyn_rs::param::ParamValue;
+    use asyn_rs::request::ParamSetValue;
+    let fx = fixture("TRSETP");
+    let set = ParamSetValue::new(0, 0, ParamValue::Int32(1));
+    fx.handle
+        .set_params_and_notify_blocking(0, vec![set])
+        .unwrap();
+    // The set is enqueue-only; a read answers after it ran.
+    let _ = fx.handle.read_float64_blocking(0, 0);
+
+    let log = fx.log();
+    let line = "asynPortDriver:setIntegerParam: port=TRSETP error setting parameter 0 in list 0, wrong type\n";
+    assert_eq!(log.matches(line).count(), 1, "{log}");
+    assert_eq!(
+        log.lines().filter(|l| l.contains("set")).count(),
+        1,
+        "{log}"
+    );
+}
+
 /// A port whose writeInt64 fails, as a driver's override can.
 struct RefusingPort {
     base: PortDriverBase,

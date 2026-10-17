@@ -329,6 +329,10 @@ pub struct ParamList {
     /// at creation (`createParam`, :135) so a set never allocates.
     flags: Vec<FlagList>,
     name_to_index: HashMap<String, usize>,
+    /// Per index, the lists a [`Self::create_param_in_list`] parameter lives
+    /// in; `None` is every list. The entry exists at every address so
+    /// indices stay aligned, but no other list answers for it.
+    only_list: Vec<Option<Vec<usize>>>,
 }
 
 impl ParamList {
@@ -339,6 +343,7 @@ impl ParamList {
             params: (0..max_addr).map(|_| Vec::new()).collect(),
             flags: (0..max_addr).map(|_| FlagList::default()).collect(),
             name_to_index: HashMap::new(),
+            only_list: Vec::new(),
         }
     }
 
@@ -359,8 +364,25 @@ impl ParamList {
         Ok(addr as usize)
     }
 
-    fn get_entry(&self, index: usize, addr: i32) -> AsynResult<&ParamEntry> {
+    /// Whether list `a` has parameter `index`: C's per-list `paramList`
+    /// bounds check (asynParamBadIndex).
+    fn in_list(&self, index: usize, a: usize) -> bool {
+        self.only_list
+            .get(index)
+            .is_some_and(|only| only.as_ref().is_none_or(|lists| lists.contains(&a)))
+    }
+
+    /// [`Self::validate_addr`], then the list's own parameter count.
+    fn validate_entry(&self, index: usize, addr: i32) -> AsynResult<usize> {
         let a = self.validate_addr(addr)?;
+        if !self.in_list(index, a) {
+            return Err(AsynError::ParamIndexOutOfRange(index));
+        }
+        Ok(a)
+    }
+
+    fn get_entry(&self, index: usize, addr: i32) -> AsynResult<&ParamEntry> {
+        let a = self.validate_entry(index, addr)?;
         self.params[a]
             .get(index)
             .ok_or(AsynError::ParamIndexOutOfRange(index))
@@ -373,7 +395,7 @@ impl ParamList {
         index: usize,
         addr: i32,
     ) -> AsynResult<(&mut ParamEntry, &mut FlagList)> {
-        let a = self.validate_addr(addr)?;
+        let a = self.validate_entry(index, addr)?;
         let entry = self.params[a]
             .get_mut(index)
             .ok_or(AsynError::ParamIndexOutOfRange(index))?;
@@ -381,7 +403,7 @@ impl ParamList {
     }
 
     fn get_entry_mut(&mut self, index: usize, addr: i32) -> AsynResult<&mut ParamEntry> {
-        let a = self.validate_addr(addr)?;
+        let a = self.validate_entry(index, addr)?;
         self.params[a]
             .get_mut(index)
             .ok_or(AsynError::ParamIndexOutOfRange(index))
@@ -429,8 +451,41 @@ impl ParamList {
         self.append_param(name, param_type)
     }
 
+    /// C `asynPortDriver::createParam(int list, ...)` (asynPortDriver.cpp:
+    /// 991-1012): a parameter of list `list`. Every other address fails to
+    /// find, read or set it, as C's lists that lack it do. C may repeat the
+    /// name for another list (omsMAXvEncFunc.cpp:71-72); here the repeat
+    /// joins that list under the same index, so its type must match.
+    pub fn create_param_in_list(
+        &mut self,
+        list: i32,
+        name: &str,
+        param_type: ParamType,
+    ) -> AsynResult<usize> {
+        let list = self.validate_addr(list)?;
+        let Some(&index) = self.name_to_index.get(name) else {
+            let index = self.append_param(name, param_type)?;
+            self.only_list[index] = Some(vec![list]);
+            return Ok(index);
+        };
+        let existing = self.params[0][index].param_type;
+        if existing != param_type {
+            let name_of = |t| ParamEntry::new(String::new(), t).value.type_name();
+            return Err(AsynError::TypeMismatch {
+                expected: name_of(existing),
+                actual: name_of(param_type),
+            });
+        }
+        match &mut self.only_list[index] {
+            Some(lists) if !lists.contains(&list) => lists.push(list),
+            _ => return Err(AsynError::ParamAlreadyExists(name.to_string())),
+        }
+        Ok(index)
+    }
+
     fn append_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
         let index = self.params[0].len();
+        self.only_list.push(None);
         for addr_params in &mut self.params {
             addr_params.push(ParamEntry::new(name.to_string(), param_type));
         }
@@ -446,6 +501,14 @@ impl ParamList {
     /// Find parameter index by name.
     pub fn find_param(&self, name: &str) -> Option<usize> {
         self.name_to_index.get(name).copied()
+    }
+
+    /// C `findParam(list, name)` (asynPortDriver.cpp:1046-1051): the index
+    /// only where list `addr` has the parameter.
+    pub fn find_param_in(&self, addr: i32, name: &str) -> Option<usize> {
+        let index = self.find_param(name)?;
+        let a = self.validate_addr(addr).ok()?;
+        self.in_list(index, a).then_some(index)
     }
 
     /// Get parameter name by index.
@@ -1296,13 +1359,18 @@ impl ParamList {
     /// [`crate::port::PortDriverBase::report_params`]'s decision, and stays there.
     pub fn report(&self, out: &mut dyn std::fmt::Write, addr: i32) {
         use std::fmt::Write as _;
-        let _ = writeln!(out, "Number of parameters is: {}", self.len());
         // A port whose `max_addr` outruns its list count (single-device, so every
         // addr collapses onto list 0) reports list 0 again, exactly as C does with
         // its `maxAddr` copies of the same values.
         let a = self.validate_addr(addr).unwrap_or(0);
-        for (i, entry) in self.params[a].iter().enumerate() {
-            entry.report(out, i);
+        let count = (0..self.len()).filter(|&i| self.in_list(i, a)).count();
+        let _ = writeln!(out, "Number of parameters is: {count}");
+        // C numbers a list's parameters by their place in that list
+        // (asynPortDriver.cpp:888-891), not by the port-wide index.
+        let entries = self.params[a].iter().enumerate();
+        let own = entries.filter(|&(i, _)| self.in_list(i, a));
+        for (id, (_, entry)) in own.enumerate() {
+            entry.report(out, id);
         }
     }
 }
@@ -1648,6 +1716,68 @@ mod libc_g_differential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `createParam(0, ...)` puts the parameter in list 0 alone: other
+    /// lists neither find, set nor read it (asynPortDriver.cpp:991-1012,
+    /// 1046-1051), and a later every-list parameter still answers on all.
+    #[test]
+    fn a_list_only_parameter_exists_in_its_list_alone() {
+        let mut list = ParamList::new(2);
+        let own = list
+            .create_param_in_list(0, "OWN", ParamType::Int32)
+            .unwrap();
+        let all = list.create_param("ALL", ParamType::Int32).unwrap();
+        list.set_int32(own, 0, 5).unwrap();
+        assert_eq!(list.get_int32(own, 0).unwrap(), 5);
+        assert!(matches!(
+            list.set_int32(own, 1, 5),
+            Err(AsynError::ParamIndexOutOfRange(_))
+        ));
+        assert!(list.get_int32(own, 1).is_err());
+        assert_eq!(list.find_param_in(0, "OWN"), Some(own));
+        assert_eq!(list.find_param_in(1, "OWN"), None);
+        for addr in [0, 1] {
+            list.set_int32(all, addr, addr).unwrap();
+            assert_eq!(list.find_param_in(addr, "ALL"), Some(all));
+        }
+        assert!(matches!(
+            list.create_param_in_list(0, "OWN", ParamType::Int32),
+            Err(AsynError::ParamAlreadyExists(_))
+        ));
+        assert!(matches!(
+            list.create_param_in_list(1, "OWN", ParamType::Float64),
+            Err(AsynError::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            list.create_param_in_list(1, "ALL", ParamType::Int32),
+            Err(AsynError::ParamAlreadyExists(_))
+        ));
+        assert!(list.create_param_in_list(2, "X", ParamType::Int32).is_err());
+        let mut out = String::new();
+        list.report(&mut out, 1);
+        assert!(out.starts_with("Number of parameters is: 1\n"), "{out}");
+        assert!(!out.contains("OWN"), "{out}");
+        assert!(
+            out.contains("Parameter 0 type=asynInt32, name=ALL"),
+            "{out}"
+        );
+    }
+
+    /// C repeats `createParam(list, ...)` for several lists
+    /// (omsMAXvEncFunc.cpp:71-72); each named list then has the parameter.
+    #[test]
+    fn a_name_created_in_two_lists_exists_in_both_alone() {
+        let mut list = ParamList::new(3);
+        let a = list
+            .create_param_in_list(0, "AUX_ENC_POSITION", ParamType::Float64)
+            .unwrap();
+        let b = list
+            .create_param_in_list(1, "AUX_ENC_POSITION", ParamType::Float64)
+            .unwrap();
+        assert_eq!(list.find_param_in(0, "AUX_ENC_POSITION"), Some(a));
+        assert_eq!(list.find_param_in(1, "AUX_ENC_POSITION"), Some(b));
+        assert_eq!(list.find_param_in(2, "AUX_ENC_POSITION"), None);
+    }
 
     /// C `%g` (paramVal.cpp:322 prints a Float64 with it): six significant
     /// digits, `%e` form when the decimal exponent is < -4 or >= 6, trailing

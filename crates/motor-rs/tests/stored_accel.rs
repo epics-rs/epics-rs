@@ -1,7 +1,7 @@
 //! The record's SET_VELOCITY, SET_VEL_BASE and SET_ACCEL store the speeds
-//! an asyn axis moves and stops on, as asynMotorController and drvMotorAsyn
-//! read them; a move with no SET_ACCEL ahead of it (C skips it at
-//! `acc <= 0`) runs on the last stored one. On an asynMotorController axis
+//! an asynMotorController axis moves and stops on; a move with no SET_ACCEL
+//! ahead of it (C skips it at `acc <= 0`) runs on the last stored one. A
+//! model-2 axis's are its drvMotorAsyn port's. On an asynMotorController axis
 //! they are the controller port's MOTOR_VELOCITY / MOTOR_VEL_BASE /
 //! MOTOR_ACCEL, which the speed writes set through the port. On a model-1
 //! card the velocities are the card's own registers, which a SET_* string
@@ -148,13 +148,6 @@ fn controller(port: &str) -> (TraceUser, PortHandle) {
     controller_with(port, ())
 }
 
-fn model2() -> TraceUser {
-    TraceUser::Model2 {
-        port: "storedAccel2".into(),
-        addr: 0,
-    }
-}
-
 fn model1() -> TraceUser {
     TraceUser::Model1 {
         device: "devStoredAccel",
@@ -165,25 +158,24 @@ fn model1() -> TraceUser {
 
 #[test]
 fn a_skipped_acceleration_runs_on_the_last_stored_one() {
-    for user in [controller("storedAccel").0, model2()] {
-        let seen = run(
-            user,
-            vec![
-                set_accel(2.0),
-                move_with(2.0),
-                home_with(0.0),
-                set_accel(3.0),
-                move_with(3.0),
-                home_with(-1.0),
-            ],
-        );
-        assert_eq!(seen, [2.0, 2.0, 3.0, 3.0]);
-    }
+    let user = controller("storedAccel").0;
+    let seen = run(
+        user,
+        vec![
+            set_accel(2.0),
+            move_with(2.0),
+            home_with(0.0),
+            set_accel(3.0),
+            move_with(3.0),
+            home_with(-1.0),
+        ],
+    );
+    assert_eq!(seen, [2.0, 2.0, 3.0, 3.0]);
 }
 
 #[test]
 fn a_skipped_acceleration_before_any_is_stored_is_zero() {
-    for user in [controller("storedAccelNone").0, model2(), model1()] {
+    for user in [controller("storedAccelNone").0, model1()] {
         let seen = run(user, vec![home_with(-1.0), MotorCommand::stop_axis()]);
         assert_eq!(seen, [0.0, 0.0]);
     }
@@ -247,18 +239,17 @@ fn a_model1_move_gets_only_the_acceleration_written_ahead_of_it() {
 
 #[test]
 fn a_record_stop_runs_on_the_last_stored_acceleration() {
-    for user in [controller("storedAccelStop").0, model2()] {
-        let seen = run(
-            user,
-            vec![
-                set_accel(2.0),
-                move_with(2.0),
-                MotorCommand::stop_axis(),
-                home_with(0.0),
-            ],
-        );
-        assert_eq!(seen, [2.0, 2.0, 2.0]);
-    }
+    let user = controller("storedAccelStop").0;
+    let seen = run(
+        user,
+        vec![
+            set_accel(2.0),
+            move_with(2.0),
+            MotorCommand::stop_axis(),
+            home_with(0.0),
+        ],
+    );
+    assert_eq!(seen, [2.0, 2.0, 2.0]);
 }
 
 /// Counts the MOTOR_ACCEL writes reaching the port.
@@ -301,7 +292,7 @@ fn move_then_backlash_leg() -> Vec<MotorCommand> {
 
 #[test]
 fn a_move_runs_on_the_stored_velocities() {
-    for user in [controller("storedSpeeds").0, model2(), model1()] {
+    for user in [controller("storedSpeeds").0, model1()] {
         let (_, speeds) = run_from(Some(0), user, move_then_backlash_leg());
         assert_eq!(speeds, [(1.0, 4.0), (1.0, 6.0)]);
     }

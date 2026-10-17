@@ -516,18 +516,21 @@ mod tests {
     /// port and address.
     #[test]
     fn a_model2_axis_s_stored_parameters_read_by_port_and_address() {
-        crate::devices::register_drv_motor_asyn_port("builderParams2", 1).unwrap();
         let mut controller = ControllerBuilder::new();
-        let card = Card {
+        let card: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Card {
             name: "P",
             log: Log::default(),
             delay: Duration::ZERO,
-        };
+        }));
         let user = TraceUser::Model2 {
             port: "builderParams2".into(),
             addr: 0,
         };
-        let ControllerAxis { axis, .. } = controller.axis(Arc::new(Mutex::new(card)), user);
+        let ControllerAxis { axis, .. } = controller.axis(card.clone(), user);
+        let record_half = axis.at(axis.address().clone());
+        let handle =
+            crate::poll_loop::drv_motor_asyn_stand_in::port("builderParams2", card, record_half);
+        crate::devices::register_drv_motor_asyn_port("builderParams2", 1, handle).unwrap();
         axis.send(MotorCommand::SetHighLimit { position: 2.5 });
         crate::devices::register_axis(axis).unwrap();
         controller.build(SLOW, SLOW, 0).run_queued_commands();

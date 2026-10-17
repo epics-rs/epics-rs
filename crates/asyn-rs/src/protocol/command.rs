@@ -151,6 +151,8 @@ pub enum PortCommand {
     CallParamCallbacks {
         addr: i32,
     },
+    /// The wire carries no updates, as [`Self::CallParamCallbacks`]'s.
+    SetParams,
     GetOption {
         key: String,
     },
@@ -304,6 +306,7 @@ mod tests {
                 iface: Some("asynFloat64".into()),
             },
             PortCommand::CallParamCallbacks { addr: 0 },
+            PortCommand::SetParams,
             PortCommand::GetOption { key: "baud".into() },
             PortCommand::SetOption {
                 key: "baud".into(),

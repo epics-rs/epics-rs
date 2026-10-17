@@ -275,10 +275,12 @@ for facility tooling.
 
 ### `EPICS_CAS_DRAIN_GRACE_SECS` (rust-only)
 
-Seconds to keep existing CA connections alive after drain is
-triggered (SIGTERM or POST /drain). After this elapses the process
-exits cleanly. Default: 30. Set to bracket your Kubernetes
-`terminationGracePeriodSeconds`.
+Opt-in SIGTERM drain. When set, a SIGTERM stops new CA connections
+and keeps the existing ones for this many seconds; the process then
+runs its exit callbacks and ends killed by SIGTERM. Unset (the
+default), SIGTERM ends the IOC at once, as it does a C IOC. A value
+that does not parse means 30. POST /drain only stops new connections.
+Set to bracket your Kubernetes `terminationGracePeriodSeconds`.
 
 ### `EPICS_CAS_TLS_MODE` (rust-only)
 

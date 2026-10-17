@@ -17,6 +17,7 @@ pub mod recgbl;
 pub mod record;
 pub mod records;
 pub mod scan;
+pub mod shutdown_signal;
 pub mod snapshot;
 pub mod snl;
 pub mod status_pv;

@@ -62,9 +62,9 @@ pub struct CaServerBuilder {
     audit: Option<crate::audit::AuditLogger>,
     /// Optional bind address for the HTTP introspection listener.
     introspection_addr: Option<std::net::SocketAddr>,
-    /// Grace period (seconds) for graceful drain on signal or admin
-    /// request.
-    drain_grace_secs: u64,
+    /// Grace (seconds) of the opt-in SIGTERM drain; `None` when
+    /// `EPICS_CAS_DRAIN_GRACE_SECS` is unset and SIGTERM has no drain.
+    drain_grace_secs: Option<u64>,
     /// Optional capability-token verifier. When set, the CLIENT_NAME
     /// payload is treated as a `cap:<token>` and verified before its
     /// resolved subject is used for ACF matching. Unset = legacy
@@ -630,13 +630,12 @@ pub struct CaServer {
     audit: Option<crate::audit::AuditLogger>,
     /// Optional HTTP introspection bind address.
     introspection_addr: Option<std::net::SocketAddr>,
-    /// Grace period in seconds applied when drain is requested.
-    /// Default 30 s; configurable via EPICS_CAS_DRAIN_GRACE_SECS.
-    /// Only consumed by the Unix SIGTERM handler — kept on the
-    /// struct for both cfgs so the constructor signature stays
-    /// stable across platforms.
+    /// Grace (seconds) of the opt-in SIGTERM drain, `None` without
+    /// EPICS_CAS_DRAIN_GRACE_SECS. Only consumed by the Unix signal
+    /// task — kept on the struct for both cfgs so the constructor
+    /// signature stays stable across platforms.
     #[cfg_attr(not(unix), allow(dead_code))]
-    drain_grace_secs: u64,
+    drain_grace_secs: Option<u64>,
     /// Optional capability-token verifier; threaded into per-client
     /// state at accept time so CLIENT_NAME `cap:<token>` payloads
     /// resolve to a verified subject before ACF lookup.
@@ -1349,40 +1348,55 @@ impl CaServer {
             }
         };
 
-        // Signal-driven drain: SIGTERM (and SIGINT on unix) flips the
-        // drain flag. The accept loop will exit; existing connections
-        // continue until the grace period elapses, after which run()
-        // returns and the rest of the spawned tasks are aborted.
+        // SIGTERM/SIGINT end the process as they end a C IOC, which has no
+        // handler, once the exit callbacks have run: under an `IocApplication` that is its to
+        // do and nothing is installed here; run alone, this task does it. The
+        // rust-only drain is opt-in (`EPICS_CAS_DRAIN_GRACE_SECS` set): it
+        // takes SIGTERM from either owner, stops accepting, keeps the existing
+        // clients for the grace and then leaves the same way. The exit
+        // callbacks running are the one difference from C left (user decision
+        // 2026-10-17).
         #[cfg(unix)]
         let signal_handle = {
+            use epics_base_rs::server::shutdown_signal::{
+                self as sig, ShutdownSignal, TerminateClaim,
+            };
+            let standalone = !sig::application_owns();
+            let drain_grace = self.drain_grace_secs;
+            // Taken before the spawn, so a SIGTERM racing the task's first
+            // poll is still the drain's.
+            let claim = drain_grace.map(|grace| (TerminateClaim::new(), grace));
             let drain = drain.clone();
-            let grace = self.drain_grace_secs;
-            Some(reactor.spawn(async move {
-                let mut sigterm =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "drain: cannot install SIGTERM handler");
-                            return;
+            (standalone || claim.is_some()).then(|| {
+                reactor.spawn(async move {
+                    let drained = async {
+                        let Some((claim, grace)) = &claim else {
+                            return std::future::pending().await;
+                        };
+                        sig::recv_claimed(claim).await;
+                        tracing::info!(grace_secs = grace, "SIGTERM received; entering drain mode");
+                        drain.store(true, std::sync::atomic::Ordering::Release);
+                        metrics::counter!("ca_server_drain_total").increment(1);
+                        tokio::time::sleep(std::time::Duration::from_secs(*grace)).await;
+                        tracing::info!("drain grace expired; exiting");
+                        ShutdownSignal::Terminate
+                    };
+                    let direct = async {
+                        if !standalone {
+                            return std::future::pending().await;
+                        }
+                        tokio::select! {
+                            () = sig::recv(ShutdownSignal::Terminate) => ShutdownSignal::Terminate,
+                            () = sig::recv(ShutdownSignal::Interrupt) => ShutdownSignal::Interrupt,
                         }
                     };
-                if sigterm.recv().await.is_some() {
-                    tracing::info!(grace_secs = grace, "SIGTERM received; entering drain mode");
-                    drain.store(true, std::sync::atomic::Ordering::Release);
-                    metrics::counter!("ca_server_drain_total").increment(1);
-                    tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-                    tracing::info!("drain grace expired; exiting");
-                    // The one exit that leaves the process from inside a
-                    // running IOC, so it is the one that would otherwise skip
-                    // the shutdown callbacks `IocApplication::run` owns —
-                    // ports would never stop and no driver's `Drop` would run.
-                    // C reaches `exit()` the same way everywhere, through
-                    // `epicsExit` (`epicsExit.c:172-177`), never through a bare
-                    // `exit()`.
-                    epics_base_rs::runtime::exit::exit(0);
-                }
-            }))
+                    let by = tokio::select! {
+                        by = drained => by,
+                        by = direct => by,
+                    };
+                    sig::exit_by(by);
+                })
+            })
         };
         #[cfg(not(unix))]
         let signal_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -1679,14 +1693,14 @@ fn introspection_from_env() -> Option<std::net::SocketAddr> {
         .and_then(|s| s.parse().ok())
 }
 
-/// Drain grace seconds from the env. Default 30 — long enough for a
-/// rolling restart to finish active monitor batches, short enough
-/// that a Kubernetes terminationGracePeriodSeconds of 60 still leaves
-/// headroom for SIGKILL.
-fn drain_grace_from_env() -> u64 {
+/// Drain grace seconds from the env; `None` (no drain, as C) when unset.
+/// A value that does not parse keeps the former default of 30 — long
+/// enough for a rolling restart to finish active monitor batches, short
+/// enough that a Kubernetes terminationGracePeriodSeconds of 60 still
+/// leaves headroom for SIGKILL.
+fn drain_grace_from_env() -> Option<u64> {
     epics_base_rs::runtime::env::get_lossy("EPICS_CAS_DRAIN_GRACE_SECS")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
+        .map(|s| s.trim().parse().unwrap_or(30))
 }
 
 #[cfg(test)]

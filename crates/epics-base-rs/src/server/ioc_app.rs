@@ -2331,6 +2331,9 @@ impl IocApplication {
     /// `:251`, `:265`, `:270`, `:277`), and `epicsExit` runs the list first
     /// (`epicsExit.c:172-177`).
     ///
+    /// A SIGTERM or SIGINT does not return: once the callbacks have run, the
+    /// process is killed by that signal, as a C IOC with no handler is.
+    ///
     /// This wrapper is where that becomes structural rather than remembered:
     /// the whole lifecycle sits in `Self::run_to_completion`, whose every
     /// `?` returns *here*, so no exit path can be added later that skips the
@@ -2364,8 +2367,10 @@ impl IocApplication {
         Fut: std::future::Future<Output = CaResult<()>> + Send + 'static,
     {
         crate::runtime::task::adopt_current_runtime();
+        super::shutdown_signal::set_application_owns();
         let result = self.run_to_completion(protocol_runner).await;
         crate::runtime::exit::call_at_exits();
+        super::shutdown_signal::exit_if_received();
         result
     }
 
@@ -2753,41 +2758,12 @@ impl IocApplication {
         // runner's own tail, which for `run_ca_ioc` and `run_pva_ioc` is the
         // interactive `iocsh(NULL)` of `softMain.cpp:250`.
         //
-        // epics-base PR #671 parity: race it against SIGTERM/SIGINT so a `kill`
-        // (or Ctrl+C on the controlling terminal) cleanly returns Ok(()) instead
-        // of leaving the future suspended forever. The CA/PVA runners already
-        // wire their own signal handlers when used standalone; this one covers
-        // the `IocApplication::run` entry point where the runner closure may
-        // not (e.g., a custom user runner that only sleeps on `pending()`).
-        // SIGINT/SIGTERM racing needs a tokio REACTOR, which is what
-        // `tokio_backend` names — not merely a non-embedded target.
-        // `tokio::signal` registers with the runtime's signal driver and
-        // PANICS ("there is no reactor running") when none is entered; it does
-        // not report that as the `Err` the `sigterm` arm below handles. On
-        // `exec_backend` these futures are polled on the park loop or a
-        // callback-band worker, neither of which enters a runtime, so both
-        // arms must be `pending()` there — including on a host build, where
-        // `cfg(unix)` holds and `epics_embedded_target` does not. `run` then
-        // simply awaits the runner; process-signal shutdown is the exec
-        // driver's concern (a later increment).
-        #[cfg(tokio_backend)]
-        let ctrl_c = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
-        #[cfg(not(tokio_backend))]
-        let ctrl_c = std::future::pending::<()>();
-        #[cfg(all(unix, tokio_backend))]
-        let sigterm = async {
-            if let Ok(mut sig) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            {
-                let _ = sig.recv().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        #[cfg(not(all(unix, tokio_backend)))]
-        let sigterm = std::future::pending::<()>();
+        // Race it against SIGTERM/SIGINT so a `kill` stops the servers and
+        // reaches the exit callbacks; `run_phased` then re-raises the signal so
+        // the process ends killed by it, as a C IOC does.
+        use super::shutdown_signal::{ShutdownSignal, recv};
+        let sigterm = recv(ShutdownSignal::Terminate);
+        let ctrl_c = recv(ShutdownSignal::Interrupt);
 
         let outcome = tokio::select! {
             biased;

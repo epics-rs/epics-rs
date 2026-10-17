@@ -8,7 +8,8 @@ use crate::server::record::{
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, LinkStatusPosts, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
@@ -190,9 +191,9 @@ pub struct ScalcoutRecord {
     /// `special()` on any INPx/INxx/OUT put (`:508-569`). Written only by
     /// [`Self::refresh_link_status`] (through `post_fields`), never by a
     /// client: the fields are `special(SPC_NOMOD)`.
-    in_status: [i16; 12],
-    str_status: [i16; 12],
-    out_status: i16,
+    /// In `SCALCOUT_LINK_CHECK` order, C's `plinkValid` walk.
+    link_status: [i16; 25],
+    link_check: LinkCheckState,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/transform use (see `link_status::post_link_status`).
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
@@ -241,9 +242,8 @@ impl Default for ScalcoutRecord {
             str_inp_links: Default::default(),
             // C's post-`init_record` value for a default record: every link is
             // CONSTANT, so every status is `scalcoutINAV_CON`.
-            in_status: [LINK_CON; 12],
-            str_status: [LINK_CON; 12],
-            out_status: LINK_CON,
+            link_status: [LINK_CON; 25],
+            link_check: LinkCheckState::default(),
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             put_report: None,
@@ -627,22 +627,74 @@ impl ScalcoutRecord {
     /// mirroring C `sCalcoutRecord.c::init_record` (254-288) and the
     /// `special()` re-classification (508-569). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, PvString, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
-            links.push((SCALCOUT_INAV_NAMES[i], self.inp_links[i].clone()));
-            links.push((SCALCOUT_IAAV_NAMES[i], self.str_inp_links[i].clone()));
+            links.push((
+                SCALCOUT_INAV_NAMES[i],
+                self.inp_links[i].clone(),
+                LinkRole::Input,
+            ));
+            links.push((
+                SCALCOUT_IAAV_NAMES[i],
+                self.str_inp_links[i].clone(),
+                LinkRole::Input,
+            ));
         }
-        links.push(("OUTV", self.out.clone()));
+        links.push(("OUTV", self.out.clone(), LinkRole::Output));
         // C `sCalcoutRecord.c:287`, `:569`, `:1015`, `:1045`.
         post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE,
+            LinkRule::Locality,
+            SCALCOUT_LINK_CHECK.mask,
             posts,
         );
     }
+
+    /// The `link_status` slot of a status field.
+    fn status_index(name: &str) -> Option<usize> {
+        SCALCOUT_LINK_CHECK
+            .links
+            .iter()
+            .position(|&(_, status)| status == name)
+    }
 }
+
+/// C `checkLinks`' walk from `&pcalc->inpa`/`&pcalc->inav`: INPA..INPL,
+/// INAA..INLL, OUT (sCalcoutRecord.c:982-1050).
+static SCALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
+    links: &[
+        ("INPA", "INAV"),
+        ("INPB", "INBV"),
+        ("INPC", "INCV"),
+        ("INPD", "INDV"),
+        ("INPE", "INEV"),
+        ("INPF", "INFV"),
+        ("INPG", "INGV"),
+        ("INPH", "INHV"),
+        ("INPI", "INIV"),
+        ("INPJ", "INJV"),
+        ("INPK", "INKV"),
+        ("INPL", "INLV"),
+        ("INAA", "IAAV"),
+        ("INBB", "IBBV"),
+        ("INCC", "ICCV"),
+        ("INDD", "IDDV"),
+        ("INEE", "IEEV"),
+        ("INFF", "IFFV"),
+        ("INGG", "IGGV"),
+        ("INHH", "IHHV"),
+        ("INII", "IIIV"),
+        ("INJJ", "IJJV"),
+        ("INKK", "IKKV"),
+        ("INLL", "ILLV"),
+        ("OUT", "OUTV"),
+    ],
+    rule: LinkRule::Locality,
+    // C `sCalcoutRecord.c:1015`, `:1045`.
+    mask: crate::server::recgbl::EventMask::VALUE,
+};
 
 /// INAV..INLV — numeric-input connection-status field names (channel A..L).
 static SCALCOUT_INAV_NAMES: [&str; 12] = [
@@ -735,7 +787,17 @@ impl Record for ScalcoutRecord {
     }
 
     fn cycle_hooks(&self) -> crate::server::record::CycleHooks {
-        crate::server::record::CycleHooks::ALL.union(crate::server::record::CycleHooks::PUT_REPORT)
+        crate::server::record::CycleHooks::ALL
+            .union(crate::server::record::CycleHooks::PUT_REPORT)
+            .union(crate::server::record::CycleHooks::LINK_CHECK)
+    }
+
+    fn link_check(&mut self) -> Option<LinkCheck<'_>> {
+        Some(LinkCheck {
+            spec: &SCALCOUT_LINK_CHECK,
+            statuses: &mut self.link_status,
+            state: &mut self.link_check,
+        })
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {
@@ -1240,16 +1302,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_inp_index(name) {
                     return Some(EpicsValue::String(self.str_inp_links[idx].clone().into()));
                 }
-                if name == "OUTV" {
-                    return Some(EpicsValue::Enum(self.out_status as u16));
-                }
-                if let Some(idx) = SCALCOUT_INAV_NAMES.iter().position(|&n| n == name) {
-                    return Some(EpicsValue::Enum(self.in_status[idx] as u16));
-                }
-                if let Some(idx) = SCALCOUT_IAAV_NAMES.iter().position(|&n| n == name) {
-                    return Some(EpicsValue::Enum(self.str_status[idx] as u16));
-                }
-                None
+                Self::status_index(name).map(|i| EpicsValue::Enum(self.link_status[i] as u16))
             }
         }
     }
@@ -1464,18 +1517,11 @@ impl Record for ScalcoutRecord {
                 // The link-status menus are `special(SPC_NOMOD)` to clients;
                 // this arm exists for the link-status refresh (`post_fields`
                 // -> `put_field_internal`), their only writer.
-                if Self::is_link_status_field(name) {
-                    let status = value
+                if let Some(idx) = Self::status_index(name) {
+                    self.link_status[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?
                         as i16;
-                    if name == "OUTV" {
-                        self.out_status = status;
-                    } else if let Some(idx) = SCALCOUT_INAV_NAMES.iter().position(|&n| n == name) {
-                        self.in_status[idx] = status;
-                    } else if let Some(idx) = SCALCOUT_IAAV_NAMES.iter().position(|&n| n == name) {
-                        self.str_status[idx] = status;
-                    }
                     return Ok(());
                 }
                 Err(CaError::FieldNotFound(name.to_string()))

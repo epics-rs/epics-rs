@@ -898,6 +898,25 @@ impl AsyncDbHandle {
         }
     }
 
+    /// [`Self::link_target_field_type`] of a link already parsed for its field.
+    pub fn parsed_link_target_field_type(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<crate::types::DbFieldType> {
+        self.db()?.parsed_link_target_field_type(link)
+    }
+
+    /// See [`PvDatabase::link_check_classified`].
+    pub fn link_check_classified(
+        &self,
+        record: impl AsRef<[u8]>,
+        recheck: Option<std::time::Duration>,
+    ) {
+        if let Some(db) = self.db() {
+            db.link_check_classified(record.as_ref(), recheck);
+        }
+    }
+
     /// Schedule a record's link-status classification — see
     /// `PvDatabase::schedule_record_init`. This is the ONE owner every
     /// record's `refresh_link_status` goes through: during the LOAD phase the
@@ -3637,9 +3656,16 @@ impl PvDatabase {
     /// client-side introspection of a remote field's type, so the caller
     /// renders those as the `DBF_unknown` sentinel.
     pub(crate) fn link_target_field_type(&self, link: &[u8]) -> Option<crate::types::DbFieldType> {
-        let db = match crate::server::record::parse_link_v2(link) {
-            crate::server::record::ParsedLink::Db(db) => db,
-            _ => return None,
+        self.parsed_link_target_field_type(&crate::server::record::parse_link_v2(link))
+    }
+
+    /// [`Self::link_target_field_type`] of a link already parsed.
+    pub(crate) fn parsed_link_target_field_type(
+        &self,
+        link: &crate::server::record::ParsedLink,
+    ) -> Option<crate::types::DbFieldType> {
+        let crate::server::record::ParsedLink::Db(db) = link else {
+            return None;
         };
         // Through the split: a filtered link's raw halves name a record that
         // does not exist (`SRC.VAL[0]` whole, field `VAL`), so `get_record`
@@ -3652,7 +3678,7 @@ impl PvDatabase {
         } else {
             addressed.field.as_str()
         };
-        crate::server::record::record_instance::declared_field_type_of(inst.record.as_ref(), field)
+        crate::server::record::record_instance::addressed_field_type_of(inst.record.as_ref(), field)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is
@@ -4828,6 +4854,12 @@ impl PvDatabase {
             // their own immediately after this one for a list that is empty on
             // all but compress, histogram, scalcout, sseq and waveform.
             instance.push_process_context();
+            if plan
+                .hooks
+                .has(crate::server::record::CycleHooks::LINK_CHECK)
+            {
+                self.check_links_in_cycle(name, instance);
+            }
             let pre_input_actions = if plan.hooks.has(crate::server::record::CycleHooks::PRE_INPUT)
             {
                 // `!dbLinkIsConstant(&prec->dol)`, from the link the put cache

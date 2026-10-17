@@ -3705,16 +3705,10 @@ impl PvDatabase {
                         None => UNADDRESSED,
                     };
                 }
-                let field_type = crate::server::record::record_instance::declared_field_type_of(
+                let field_type = crate::server::record::record_instance::addressed_field_type_of(
                     guard.record.as_ref(),
                     &addressed.field,
-                )
-                .or_else(|| {
-                    guard
-                        .record
-                        .get_field(&addressed.field)
-                        .map(|v| v.db_field_type())
-                });
+                );
                 let element_count = match guard.record.get_field(&addressed.field) {
                     Some(v) if v.is_array() => guard
                         .record

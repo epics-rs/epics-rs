@@ -3,11 +3,11 @@
 //! Several records expose a `menu(...)` field per link that mirrors the C
 //! `checkLinks` / `init_record` connection diagnostics. `sseq`
 //! (`menu(sseqLNKV)`, `DOLnV`/`LNKnV`) and `calcout` (`menu(calcoutINAV)`,
-//! `INAV`..`INUV`/`OUTV`) carry the identical four-choice menu and the
-//! identical classification rule, so the choice table, the menu indices and
-//! the `classify_link` helper live here once rather than being duplicated
-//! per record (C `sseqRecord.dbd:20` and `calcoutRecord.dbd.pod:45-50` are
-//! byte-for-byte the same choice set).
+//! `INAV`..`INUV`/`OUTV`) carry the identical four-choice menu, so the
+//! choice table, the menu indices and the `classify_link` helper live here
+//! once rather than being duplicated per record (C `sseqRecord.dbd:20` and
+//! `calcoutRecord.dbd.pod:45-50` are byte-for-byte the same choice set). The
+//! classification rule is not shared: see [`LinkRule`].
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -155,14 +155,10 @@ impl PostItem for ForcedPost<'_> {
 /// 3=Constant.
 pub const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
-/// Link-status menu indices. Index 1 (`EXT`, external PV connected) is a
-/// valid menu value that this port never *produces*: epics-base-rs has no
-/// CA/PVA client to confirm a remote link is connected, so an external link
-/// always reports `EXT_NC` (see [`classify_link`]). It is still named here
-/// because a record reading the status back must treat BOTH external indices
-/// as C's `CA_LINK` (see [`link_is_external`]).
+/// Link-status menu indices. A record reading the status back must treat
+/// BOTH external indices as C's `CA_LINK` (see [`link_is_external`]).
 pub const LINK_EXT_NC: i16 = 0; // external PV, not connected
-pub const LINK_EXT_OK: i16 = 1; // external PV, connected (never produced here)
+pub const LINK_EXT_OK: i16 = 1; // external PV, connected
 pub const LINK_LOC: i16 = 2; // local PV (this IOC's database)
 pub const LINK_CON: i16 = 3; // constant / unset link
 
@@ -227,35 +223,116 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
     }
 }
 
+/// What a record's `init_record` makes of a link that names a PV, and which
+/// links its `checkLinks` re-reads. The C records do not agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRule {
+    /// Base `calcoutRecord.c:169-189`, `:744-760`: `dbLinkIsVolatile` — every
+    /// CA or PVA link reports its `dbIsLinkConnected`, a local name included
+    /// when the link carries `CA`/`CP`/`CPP`. `init_record` schedules no
+    /// re-check; `process()` does.
+    Volatile,
+    /// synApps `sCalcoutRecord.c:264`, `aCalcoutRecord.c:219`,
+    /// `transformRecord.c:450`, std `throttleRecord.c:194`: `dbNameToAddr`
+    /// of the PV name — a name this IOC holds is `Local PV` whatever its
+    /// modifier, and `checkLinks` re-reads only the CA links left. An
+    /// `Ext PV NC` re-checks after 1 s from `init_record`, 0.5 s from
+    /// `special()`.
+    Locality,
+    /// `sseqRecord.c:208`, `:227`: only a DB link to a local name is
+    /// `Local PV`; a CA link is external.
+    DbLink,
+}
+
+impl LinkRule {
+    /// Whether this rule's `checkLinks` visits `link`, the field's link after
+    /// `dbInitLink`: `dbLinkIsVolatile` for base, `plink->type == CA_LINK`
+    /// for synApps.
+    pub(crate) fn visits(self, link: &crate::server::record::ParsedLink) -> bool {
+        match self {
+            Self::Volatile => link.external().is_some(),
+            Self::Locality | Self::DbLink => {
+                matches!(link, crate::server::record::ParsedLink::Ca(_))
+            }
+        }
+    }
+
+    /// The `callbackRequestDelayed` `init_record` makes for an `Ext PV NC`.
+    pub fn init_recheck(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Volatile => None,
+            Self::Locality | Self::DbLink => Some(std::time::Duration::from_secs(1)),
+        }
+    }
+}
+
+/// C `checkLinksCallback`'s re-arm, and synApps `special()`'s first arm.
+pub const LINK_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A type's `checkLinks`: link field `i` of `links` and its status field.
+pub struct LinkCheckSpec {
+    /// In C's `plink++`/`plinkValid++` order.
+    pub links: &'static [(&'static str, &'static str)],
+    pub rule: LinkRule,
+    /// The record's own `db_post_events` mask for a status.
+    pub mask: crate::server::recgbl::EventMask,
+}
+
+/// C's `caLinkStat != NO_CA_LINKS` and `cbScheduled`.
+#[derive(Default)]
+pub struct LinkCheckState {
+    pub(crate) ca_links: bool,
+    pub(crate) scheduled: bool,
+}
+
+/// What `checkLinks` reads and writes on one record: the status of
+/// `spec.links[i]` at `statuses[i]`.
+pub struct LinkCheck<'a> {
+    pub spec: &'static LinkCheckSpec,
+    pub statuses: &'a mut [i16],
+    pub state: &'a mut LinkCheckState,
+}
+
 /// Classify one DOL/LNK/INP/OUT link string into its connection-status menu
-/// index and the target field type, mirroring C `checkLinks`/`init_record`
-/// (sseqRecord.c:863-950,203-240; calcoutRecord.c:160-189).
+/// index and the target field type, as `init_record` and `special()` do
+/// under `rule` (sseqRecord.c:203-240; calcoutRecord.c:160-189;
+/// sCalcoutRecord.c:254-285). `role` parses it as its field does: an output
+/// drops `CP`/`CPP`, so `OUT "X CP"` is a DB link.
 ///
-/// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
-/// not-connected: epics-base-rs has no client to confirm a remote field's
-/// connection state or type.
 /// The database this reads is always the COMPLETE one: a classification issued
 /// while records are still being created is queued by
 /// [`AsyncDbHandle::schedule_record_init`] and only polled by `iocInit`, so a
 /// forward reference — within one `.db` or across two `dbLoadRecords` calls —
-/// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does. There is
-/// no gate to observe here because there is no way to run this against a
-/// half-built database.
-pub fn classify_link(handle: &AsyncDbHandle, link: impl AsRef<[u8]>) -> (i16, i16) {
-    let link = link.as_ref();
-    match parse_link_v2(link).link_type() {
-        // Empty / constant link: C → CON, no target type.
-        LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),
-        // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
-        // type. A DB-syntax link whose target is not on this IOC resolves to
-        // `None` and falls through to EXT_NC (C `init_record` else branch).
-        LinkType::Db => match handle.link_target_field_type(link) {
-            Some(ft) => (LINK_LOC, dbf_static_code(ft)),
-            None => (LINK_EXT_NC, DBF_UNKNOWN),
-        },
-        // CA/PVA/other external link: epics-base-rs cannot introspect a
-        // remote field's connection state or type — report not-connected.
-        LinkType::Ca | LinkType::Other => (LINK_EXT_NC, DBF_UNKNOWN),
+/// resolves LOCAL, exactly as C's `iocInit`-time `init_record` does.
+pub fn classify_link(
+    handle: &AsyncDbHandle,
+    link: impl AsRef<[u8]>,
+    role: LinkRole,
+    rule: LinkRule,
+) -> (i16, i16) {
+    use crate::server::record::{LinkFieldType, ParsedLink, parse_link_field};
+    let ftype = match role {
+        LinkRole::Input => LinkFieldType::In,
+        LinkRole::Output => LinkFieldType::Out,
+    };
+    let parsed = parse_link_field(link.as_ref(), ftype);
+    if matches!(parsed.link_type(), LinkType::Empty | LinkType::Constant) {
+        return (LINK_CON, DBF_UNKNOWN);
+    }
+    let local = match &parsed {
+        ParsedLink::Db(_) => handle.parsed_link_target_field_type(&parsed),
+        // `dbNameToAddr(pvname)`, the modifier aside.
+        ParsedLink::Ca(ca) if rule == LinkRule::Locality => {
+            handle.link_target_field_type(ca.pv.as_bytes())
+        }
+        _ => None,
+    };
+    // An external link is never connected here: `init_record` runs while
+    // dbCaTask is paused until `dbCaRun` (dbCa.c:1173, iocInit.c:260), and
+    // `special()` does not ask. Only `checkLinks` reads the connection.
+    match local {
+        Some(ft) => (LINK_LOC, dbf_static_code(ft)),
+        None => (LINK_EXT_NC, DBF_UNKNOWN),
     }
 }
 
@@ -268,7 +345,8 @@ pub fn classify_link(handle: &AsyncDbHandle, link: impl AsRef<[u8]>) -> (i16, i1
 /// set the `lset` (dbAccess.c:1181-1208), so a runtime put reads Constant
 /// whatever the target and nothing is classified.
 ///
-/// `links` pairs each status FIELD with the link string it describes. Every caller passes its complete set, so a refresh is
+/// `links` pairs each status FIELD with the link string it describes and the
+/// link's role, classified under `rule`. Every caller passes its complete set, so a refresh is
 /// always a whole-record classification, never a per-field patch — which is
 /// what makes the [`LinkStatusGen`] gate sufficient to keep "only the latest
 /// classification is published" true.
@@ -298,14 +376,19 @@ pub fn classify_link(handle: &AsyncDbHandle, link: impl AsRef<[u8]>) -> (i16, i1
 pub fn post_link_status(
     ctx: Option<&(crate::types::RecordName, AsyncDbHandle)>,
     generation: &LinkStatusGen,
-    links: Vec<(&'static str, PvString)>,
+    links: Vec<(&'static str, PvString, LinkRole)>,
+    rule: LinkRule,
     mask: crate::server::recgbl::EventMask,
     posts: LinkStatusPosts,
 ) {
     let Some((name, handle)) = ctx else {
         return;
     };
-    let forced = posts.bits(links.iter().map(|&(f, _)| f));
+    let forced = posts.bits(links.iter().map(|&(f, _, _)| f));
+    let recheck = match posts {
+        LinkStatusPosts::All => rule.init_recheck(),
+        LinkStatusPosts::Put(_) => Some(LINK_RECHECK),
+    };
     let name = name.clone();
     let handle = handle.clone();
     // Stamp before the spawn, on the caller's thread, under the record's
@@ -316,14 +399,15 @@ pub fn post_link_status(
     sched.schedule_record_init(&init_key, async move {
         let fields: Vec<(String, EpicsValue)> = links
             .into_iter()
-            .map(|(field, link)| {
-                let (status, _ft) = classify_link(&handle, &link);
+            .map(|(field, link, role)| {
+                let (status, _ft) = classify_link(&handle, &link, role, rule);
                 (field.to_string(), EpicsValue::Enum(status as u16))
             })
             .collect();
         #[cfg(test)]
         tests::hold_before_post().await;
         token.post_forced(&handle, &name, fields, mask);
+        handle.link_check_classified(&name, recheck);
     });
 }
 

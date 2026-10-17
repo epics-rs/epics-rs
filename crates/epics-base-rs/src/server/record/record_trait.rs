@@ -2476,6 +2476,9 @@ impl CycleHooks {
     /// type whose C `monitor()` calls `recGblResetAlarms` only on some cycles
     /// (`scanparmRecord.c:280`).
     pub const MONITOR_RESET: Self = Self(16384);
+    /// [`Record::link_check`]: C `checkLinks` at the top of `process()`.
+    /// Outside [`Self::ALL`]: a type declares it.
+    pub const LINK_CHECK: Self = Self(32768);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);
     /// Every per-cycle hook is asked — the default, so a type that never says
@@ -2527,6 +2530,7 @@ const _: () = {
         CycleHooks::CONTINUATION.0,
         CycleHooks::STAMP_REQUEST.0,
         CycleHooks::MONITOR_RESET.0,
+        CycleHooks::LINK_CHECK.0,
     ];
     let mut seen = 0;
     let mut i = 0;
@@ -7051,6 +7055,13 @@ pub trait Record: Send + Sync + 'static {
     /// records never need common state during `process()`.
     fn set_process_context(&mut self, _ctx: &ProcessContext) {}
 
+    /// C `checkLinks`' view of this record — the links it re-reads, their
+    /// status fields, and `caLinkStat`/`cbScheduled` — for a type whose
+    /// link-status fields follow their links' connection.
+    fn link_check(&mut self) -> Option<crate::server::records::link_status::LinkCheck<'_>> {
+        None
+    }
+
     /// Called by the framework immediately before `process()` to say whether
     /// this cycle is the record's OWN scheduled re-entry — the
     /// [`ProcessAction::ReprocessAfter`] timer firing, or a put-notify
@@ -8737,7 +8748,8 @@ pub(crate) mod tests {
                 .union(CycleHooks::PUT_REPORT)
                 .union(CycleHooks::INPUT_FETCH)
                 .union(CycleHooks::CONTINUATION)
-                .union(CycleHooks::OUTPUT_HOOKS),
+                .union(CycleHooks::OUTPUT_HOOKS)
+                .union(CycleHooks::LINK_CHECK),
             "mbbiDirect" | "mbboDirect" | "seq" => CycleHooks::CYCLE_POSTED,
             "calcout" => CycleHooks::WRITE_POSTED
                 .union(CycleHooks::PUT_REPORT)
@@ -8745,7 +8757,8 @@ pub(crate) mod tests {
                 .union(CycleHooks::INPUT_FETCH)
                 .union(CycleHooks::CONTINUATION)
                 .union(CycleHooks::MONITOR_SETS)
-                .union(CycleHooks::OUTPUT_HOOKS),
+                .union(CycleHooks::OUTPUT_HOOKS)
+                .union(CycleHooks::LINK_CHECK),
             "swait" => CycleHooks::WRITE_POSTED
                 .union(CycleHooks::PUT_REPORT)
                 .union(CycleHooks::INPUT_FETCH)
@@ -8755,7 +8768,8 @@ pub(crate) mod tests {
                 .union(CycleHooks::WRITE_POSTED)
                 .union(CycleHooks::CONTEXT)
                 .union(CycleHooks::PUT_REPORT)
-                .union(CycleHooks::INPUT_FETCH),
+                .union(CycleHooks::INPUT_FETCH)
+                .union(CycleHooks::LINK_CHECK),
             "printf" => CycleHooks::INPUT_FETCH
                 .union(CycleHooks::CONTINUATION)
                 .union(CycleHooks::STAMP_REQUEST),
@@ -8763,7 +8777,9 @@ pub(crate) mod tests {
             "aSub" => CycleHooks::MONITOR_SETS,
             "longout" => CycleHooks::OUTPUT_HOOKS,
             "sseq" => CycleHooks::ALL,
-            "scalcout" => CycleHooks::ALL.union(CycleHooks::PUT_REPORT),
+            "scalcout" => CycleHooks::ALL
+                .union(CycleHooks::PUT_REPORT)
+                .union(CycleHooks::LINK_CHECK),
             _ => CycleHooks::NONE,
         };
         for record_type in RECORD_TYPES {
@@ -8797,6 +8813,9 @@ pub(crate) mod tests {
             if !hooks.has(CycleHooks::OUTPUT_HOOKS) {
                 assert!(r.should_output(), "{record_type}");
                 assert!(r.output_event().is_none(), "{record_type}");
+            }
+            if !hooks.has(CycleHooks::LINK_CHECK) {
+                assert!(r.link_check().is_none(), "{record_type}");
             }
         }
     }

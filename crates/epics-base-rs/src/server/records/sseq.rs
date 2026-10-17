@@ -1,7 +1,7 @@
 use super::link_status::{
     DBF_NOACCESS, DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_EXT_NC as LNKV_EXT_NC,
-    LINK_LOC as LNKV_LOC, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen, classify_link,
-    link_is_external,
+    LINK_LOC as LNKV_LOC, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkRole, LinkRule,
+    LinkStatusGen, classify_link, link_is_external,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::{AsyncDbHandle, PostRule};
@@ -1092,8 +1092,8 @@ impl SseqRecord {
             let class: Vec<(i16, i16, i16, i16)> = groups
                 .iter()
                 .map(|(dol, lnk, _)| {
-                    let (ds, dt) = classify_link(&handle, dol);
-                    let (ls, lt) = classify_link(&handle, lnk);
+                    let (ds, dt) = classify_link(&handle, dol, LinkRole::Input, LinkRule::DbLink);
+                    let (ls, lt) = classify_link(&handle, lnk, LinkRole::Output, LinkRule::DbLink);
                     (ds, dt, ls, lt)
                 })
                 .collect();

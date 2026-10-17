@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, LinkStatusPosts, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
@@ -32,6 +33,38 @@ const CALCOUT_LINK_VALUE_FIELDS: [&str; 22] = [
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
     "T", "U", "OVAL",
 ];
+
+/// C `checkLinks`' walk from `&prec->inpa`/`&prec->inav`: INPA..INPU, then
+/// OUT (calcoutRecord.c:741-760).
+static CALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
+    links: &[
+        ("INPA", "INAV"),
+        ("INPB", "INBV"),
+        ("INPC", "INCV"),
+        ("INPD", "INDV"),
+        ("INPE", "INEV"),
+        ("INPF", "INFV"),
+        ("INPG", "INGV"),
+        ("INPH", "INHV"),
+        ("INPI", "INIV"),
+        ("INPJ", "INJV"),
+        ("INPK", "INKV"),
+        ("INPL", "INLV"),
+        ("INPM", "INMV"),
+        ("INPN", "INNV"),
+        ("INPO", "INOV"),
+        ("INPP", "INPV"),
+        ("INPQ", "INQV"),
+        ("INPR", "INRV"),
+        ("INPS", "INSV"),
+        ("INPT", "INTV"),
+        ("INPU", "INUV"),
+        ("OUT", "OUTV"),
+    ],
+    rule: LinkRule::Volatile,
+    // C `calcoutRecord.c:752`, `:757`.
+    mask: crate::server::recgbl::EventMask::VALUE,
+};
 
 /// Where CLCV's post sits in calcout's put-post table, after every link's.
 const CLCV_POST: usize = 2 * CALCOUT_LINK_VALUE_FIELDS.len();
@@ -227,11 +260,12 @@ pub struct CalcoutRecord {
     pub clcv: i32,
     pub oclv: i32,
     // Per-input link connection status INAV..INUV and the OUT-link status
-    // OUTV, menu(calcoutINAV). C `calcoutRecord.c::init_record`
-    // (calcoutRecord.c:160-189) classifies each INPA..INPU input link and
-    // the OUT link into these. Index 0..21 maps to inputs A..U.
-    in_status: [i16; 21],
-    out_status: i16,
+    // OUTV, menu(calcoutINAV), in `CALCOUT_LINK_CHECK` order. C
+    // `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) classifies
+    // each INPA..INPU input link and the OUT link into these; `checkLinks`
+    // moves them as their CA links connect.
+    link_status: [i16; 22],
+    link_check: LinkCheckState,
     // The common OUT-link text as `init_links` saw it at load, for the init
     // classification; a runtime OUT put classifies nothing.
     out: Box<[u8]>,
@@ -358,8 +392,8 @@ impl Default for CalcoutRecord {
             // C `init_record` leaves an empty/unconfigured link CON
             // (calcoutRecord.c:166-167); the refresh re-classifies once the
             // async context exists.
-            in_status: [LINK_CON; 21],
-            out_status: LINK_CON,
+            link_status: [LINK_CON; 22],
+            link_check: LinkCheckState::default(),
             out: Box::default(),
             put_posts: 0,
             async_ctx: None,
@@ -595,6 +629,14 @@ impl CalcoutRecord {
         }
     }
 
+    /// The `link_status` slot of `INAV`..`INUV` or `OUTV`.
+    fn status_index(name: &str) -> Option<usize> {
+        match name {
+            "OUTV" => Some(21),
+            _ => Self::input_status_index(name),
+        }
+    }
+
     /// C's `lnkIndex = fieldIndex - calcoutRecordINPA` (calcoutRecord.c:368)
     /// for the 22 link fields `special()` handles: INPA..INPU are 0..=20 and
     /// OUT, which follows INPU in the record, is 21.
@@ -616,19 +658,20 @@ impl CalcoutRecord {
     /// (`set_async_context`, `init_links`): a runtime link put is `special()`'s,
     /// which C answers without classifying. No-op without an async context.
     fn refresh_link_status(&self) {
-        let mut links: Vec<(&'static str, PvString)> = self
+        let mut links: Vec<(&'static str, PvString, LinkRole)> = self
             .input_links()
             .into_iter()
             .enumerate()
-            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link))
+            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
             .collect();
-        links.push(("OUTV", PvString::from(&*self.out)));
+        links.push(("OUTV", PvString::from(&*self.out), LinkRole::Output));
         // C `calcoutRecord.c:404`, `:752`, `:757`.
         post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE,
+            LinkRule::Volatile,
+            CALCOUT_LINK_CHECK.mask,
             LinkStatusPosts::All,
         );
     }
@@ -798,6 +841,15 @@ impl Record for CalcoutRecord {
             .union(crate::server::record::CycleHooks::CONTINUATION)
             .union(crate::server::record::CycleHooks::MONITOR_SETS)
             .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+            .union(crate::server::record::CycleHooks::LINK_CHECK)
+    }
+
+    fn link_check(&mut self) -> Option<LinkCheck<'_>> {
+        Some(LinkCheck {
+            spec: &CALCOUT_LINK_CHECK,
+            statuses: &mut self.link_status,
+            state: &mut self.link_check,
+        })
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {
@@ -1178,6 +1230,7 @@ impl Record for CalcoutRecord {
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "POVL" => Some(EpicsValue::Double(self.povl)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
             "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
@@ -1246,15 +1299,7 @@ impl Record for CalcoutRecord {
             // INAV..INUV / OUTV link-status menus (menu(calcoutINAV),
             // calcoutRecord.dbd.pod:865-1012), served as DBR_ENUM; labels
             // from menu_field_choices. Live status from refresh_link_status.
-            _ => {
-                if let Some(idx) = Self::input_status_index(name) {
-                    Some(EpicsValue::Enum(self.in_status[idx] as u16))
-                } else if name == "OUTV" {
-                    Some(EpicsValue::Enum(self.out_status as u16))
-                } else {
-                    None
-                }
-            }
+            _ => Self::status_index(name).map(|i| EpicsValue::Enum(self.link_status[i] as u16)),
         }
     }
 
@@ -1412,6 +1457,13 @@ impl Record for CalcoutRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
+            },
+            "POVL" => match value {
+                EpicsValue::Double(v) => {
+                    self.povl = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("POVL".into())),
             },
             "IVOA" => match value {
                 EpicsValue::Short(v) => {
@@ -1610,21 +1662,14 @@ impl Record for CalcoutRecord {
                 // clients (SPC_NOMOD, calcoutRecord.dbd.pod:867); the
                 // link-status refresh (`post_fields` → `put_field_internal`)
                 // lands here to store the connection status it just computed.
-                if let Some(idx) = Self::input_status_index(name) {
-                    self.in_status[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    Ok(())
-                } else if name == "OUTV" {
-                    self.out_status = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    Ok(())
-                } else {
-                    Err(CaError::FieldNotFound(name.to_string()))
-                }
+                let Some(idx) = Self::status_index(name) else {
+                    return Err(CaError::FieldNotFound(name.to_string()));
+                };
+                self.link_status[idx] = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                    as i16;
+                Ok(())
             }
         }
     }
@@ -1804,10 +1849,7 @@ impl Record for CalcoutRecord {
         // whatever the target, and `recGblInitConstantLink` loads nothing.
         // Bumping the generation drops any classification still in flight.
         if let Some(idx) = Self::link_index(field) {
-            match self.in_status.get_mut(idx) {
-                Some(status) => *status = LINK_CON,
-                None => self.out_status = LINK_CON,
-            }
+            self.link_status[idx] = LINK_CON;
             self.link_gen.next();
             self.put_posts = 0b11 << (2 * idx);
         }

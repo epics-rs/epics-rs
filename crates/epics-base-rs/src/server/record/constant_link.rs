@@ -67,12 +67,7 @@ fn load_constant_link<R: Record + ?Sized>(
     // `dbLink.c:238`). A runtime-typed target (`mbbo.VAL`, whose type C's
     // `cvt_dbaddr` derives from SDEF) has no type in its declaration, so the
     // variant it currently holds is the type C would load into.
-    let target_type = super::record_instance::declared_field_type_of(record, seed.target_field)
-        .or_else(|| {
-            record
-                .get_field(seed.target_field)
-                .map(|v| v.db_field_type())
-        })?;
+    let target_type = super::record_instance::addressed_field_type_of(record, seed.target_field)?;
     // A refused load leaves the field and UDF alone; a success that stores
     // nothing (`[]`, `cvt_st_UInt32`'s silent miss) is still a success.
     let value = match constant_load_scalar(constant, target_type)? {

@@ -10,12 +10,58 @@ use crate::calc::{Rpcl, StringInputs, scalc_perform};
 
 use super::calc_compile;
 use super::link_status::{
-    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, LinkStatusPosts, post_link_status,
+    LINK_CON, LINK_STATUS_CHOICES, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule,
+    LinkStatusGen, LinkStatusPosts, post_link_status,
 };
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
 
 const NUM_CHANNELS: usize = 16; // A-P
+
+/// C `checkLinks`' walk from `&ptran->inpa`/`&ptran->iav`: INPA..INPP, then
+/// OUTA..OUTP (transformRecord.c:846-866).
+static TRANSFORM_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
+    links: &[
+        ("INPA", "IAV"),
+        ("INPB", "IBV"),
+        ("INPC", "ICV"),
+        ("INPD", "IDV"),
+        ("INPE", "IEV"),
+        ("INPF", "IFV"),
+        ("INPG", "IGV"),
+        ("INPH", "IHV"),
+        ("INPI", "IIV"),
+        ("INPJ", "IJV"),
+        ("INPK", "IKV"),
+        ("INPL", "ILV"),
+        ("INPM", "IMV"),
+        ("INPN", "INV"),
+        ("INPO", "IOV"),
+        ("INPP", "IPV"),
+        ("OUTA", "OAV"),
+        ("OUTB", "OBV"),
+        ("OUTC", "OCV"),
+        ("OUTD", "ODV"),
+        ("OUTE", "OEV"),
+        ("OUTF", "OFV"),
+        ("OUTG", "OGV"),
+        ("OUTH", "OHV"),
+        ("OUTI", "OIV"),
+        ("OUTJ", "OJV"),
+        ("OUTK", "OKV"),
+        ("OUTL", "OLV"),
+        ("OUTM", "OMV"),
+        ("OUTN", "ONV"),
+        ("OUTO", "OOV"),
+        ("OUTP", "OPV"),
+    ],
+    rule: LinkRule::Locality,
+    // C `transformRecord.c:741`, `:858`, `:863`.
+    mask: crate::server::recgbl::EventMask::from_bits(
+        crate::server::recgbl::EventMask::VALUE.bits()
+            | crate::server::recgbl::EventMask::LOG.bits(),
+    ),
+};
 
 /// `transformRecord.c:208` `POSTFIX_SIZE`, `SCALC_INFIX_TO_POSTFIX_SIZE(120)`.
 const TRANSFORM_RPC_SIZE: usize = 2 + 120 * 21 / 6;
@@ -138,8 +184,9 @@ pub struct TransformRecord {
     /// `special()` on any INPx/OUTx put (`:709-742`). Written only by
     /// [`Self::refresh_link_status`] (through `post_fields`), never by a
     /// client: the fields are `special(SPC_NOMOD)`.
-    in_status: [i16; NUM_CHANNELS],
-    out_status: [i16; NUM_CHANNELS],
+    /// IAV..IPV then OAV..OPV, `TRANSFORM_LINK_CHECK` order.
+    link_status: [i16; 2 * NUM_CHANNELS],
+    link_check: LinkCheckState,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/scalcout/acalcout use (see `link_status::post_link_status`).
     /// sseq and swait own link-status fields too but post them from their own
@@ -189,8 +236,8 @@ impl Default for TransformRecord {
             calc_failed: false,
             // C's post-`init_record` value for a default record: every link is
             // CONSTANT, so every status is `transformIAV_CON`.
-            in_status: [LINK_CON; NUM_CHANNELS],
-            out_status: [LINK_CON; NUM_CHANNELS],
+            link_status: [LINK_CON; 2 * NUM_CHANNELS],
+            link_check: LinkCheckState::default(),
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             put_report: None,
@@ -430,21 +477,38 @@ impl TransformRecord {
         Self::link_status_index(name).is_some()
     }
 
+    /// The `link_status` slot of `IAV..IPV` / `OAV..OPV`.
+    fn link_status_slot(name: &str) -> Option<usize> {
+        Self::link_status_index(name).map(|(role, idx)| match role {
+            LinkRole::Input => idx,
+            LinkRole::Output => NUM_CHANNELS + idx,
+        })
+    }
+
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
     /// `transformRecord.c::init_record` (444-473) and the `special()`
     /// re-classification (709-742). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(2 * NUM_CHANNELS);
+        let mut links: Vec<(&'static str, PvString, LinkRole)> =
+            Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
-            links.push((IAV_FIELD_NAMES[i], self.inp_links[i].clone()));
-            links.push((OAV_FIELD_NAMES[i], self.out_links[i].clone()));
+            links.push((
+                IAV_FIELD_NAMES[i],
+                self.inp_links[i].clone(),
+                LinkRole::Input,
+            ));
+            links.push((
+                OAV_FIELD_NAMES[i],
+                self.out_links[i].clone(),
+                LinkRole::Output,
+            ));
         }
-        // C `transformRecord.c:741`, `:858`, `:863`.
         post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            LinkRule::Locality,
+            TRANSFORM_LINK_CHECK.mask,
             posts,
         );
     }
@@ -589,6 +653,15 @@ impl Record for TransformRecord {
             .union(crate::server::record::CycleHooks::CONTEXT)
             .union(crate::server::record::CycleHooks::PUT_REPORT)
             .union(crate::server::record::CycleHooks::INPUT_FETCH)
+            .union(crate::server::record::CycleHooks::LINK_CHECK)
+    }
+
+    fn link_check(&mut self) -> Option<LinkCheck<'_>> {
+        Some(LinkCheck {
+            spec: &TRANSFORM_LINK_CHECK,
+            statuses: &mut self.link_status,
+            state: &mut self.link_check,
+        })
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {
@@ -901,12 +974,8 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::last_value_index(name) {
             return Some(EpicsValue::Double(self.lvals[idx]));
         }
-        if let Some((role, idx)) = Self::link_status_index(name) {
-            let status = match role {
-                LinkRole::Input => self.in_status[idx],
-                LinkRole::Output => self.out_status[idx],
-            };
-            return Some(EpicsValue::Enum(status as u16));
+        if let Some(slot) = Self::link_status_slot(name) {
+            return Some(EpicsValue::Enum(self.link_status[slot] as u16));
         }
         None
     }
@@ -1013,14 +1082,11 @@ impl Record for TransformRecord {
         // IAV..IPV / OAV..OPV are `special(SPC_NOMOD)` to clients; this arm
         // exists for the link-status refresh (`post_fields` ->
         // `put_field_internal`), which is their only writer.
-        if let Some((role, idx)) = Self::link_status_index(name) {
-            let status = value
+        if let Some(slot) = Self::link_status_slot(name) {
+            self.link_status[slot] = value
                 .to_f64()
-                .ok_or_else(|| CaError::TypeMismatch(name.into()))? as i16;
-            match role {
-                LinkRole::Input => self.in_status[idx] = status,
-                LinkRole::Output => self.out_status[idx] = status,
-            }
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                as i16;
             return Ok(());
         }
         Err(CaError::FieldNotFound(name.to_string()))

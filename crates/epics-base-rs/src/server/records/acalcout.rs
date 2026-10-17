@@ -105,7 +105,10 @@ use super::calc_compile;
 use crate::calc::{ArrayInputs, Rpcl, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
-use super::link_status::{LINK_CON, LinkStatusGen, LinkStatusPosts, post_link_status};
+use super::link_status::{
+    LINK_CON, LinkCheck, LinkCheckSpec, LinkCheckState, LinkRole, LinkRule, LinkStatusGen,
+    LinkStatusPosts, post_link_status,
+};
 use crate::server::database::AsyncDbHandle;
 use crate::server::recgbl::PutReport;
 
@@ -189,6 +192,41 @@ const INAV_NAMES: [&str; 12] = [
 const IAAV_NAMES: [&str; 12] = [
     "IAAV", "IBBV", "ICCV", "IDDV", "IEEV", "IFFV", "IGGV", "IHHV", "IIIV", "IJJV", "IKKV", "ILLV",
 ];
+
+/// C `checkLinks`' walk from `&pcalc->inpa`/`&pcalc->inav`: INPA..INPL,
+/// INAA..INLL, OUT (aCalcoutRecord.c:1150-1200).
+static ACALCOUT_LINK_CHECK: LinkCheckSpec = LinkCheckSpec {
+    links: &[
+        ("INPA", "INAV"),
+        ("INPB", "INBV"),
+        ("INPC", "INCV"),
+        ("INPD", "INDV"),
+        ("INPE", "INEV"),
+        ("INPF", "INFV"),
+        ("INPG", "INGV"),
+        ("INPH", "INHV"),
+        ("INPI", "INIV"),
+        ("INPJ", "INJV"),
+        ("INPK", "INKV"),
+        ("INPL", "INLV"),
+        ("INAA", "IAAV"),
+        ("INBB", "IBBV"),
+        ("INCC", "ICCV"),
+        ("INDD", "IDDV"),
+        ("INEE", "IEEV"),
+        ("INFF", "IFFV"),
+        ("INGG", "IGGV"),
+        ("INHH", "IHHV"),
+        ("INII", "IIIV"),
+        ("INJJ", "IJJV"),
+        ("INKK", "IKKV"),
+        ("INLL", "ILLV"),
+        ("OUT", "OUTV"),
+    ],
+    rule: LinkRule::Locality,
+    // C `aCalcoutRecord.c:1157`.
+    mask: crate::server::recgbl::EventMask::VALUE,
+};
 const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
 ];
@@ -449,9 +487,9 @@ pub struct AcalcoutRecord {
     ina_links: [PvString; 12],
 
     // --- link status, derived from the links by `refresh_link_status` ---
-    inav: [i16; 12], // INAV..INLV
-    iaav: [i16; 12], // IAAV..ILLV
-    outv: i16,
+    /// INAV..INLV, IAAV..ILLV, OUTV: `ACALCOUT_LINK_CHECK` order.
+    link_status: [i16; 25],
+    link_check: LinkCheckState,
     /// Async surface + generation gate for `refresh_link_status`, the shape
     /// calcout/scalcout/transform use (see `link_status::post_link_status`).
     async_ctx: Option<(crate::types::RecordName, AsyncDbHandle)>,
@@ -567,9 +605,8 @@ impl Default for AcalcoutRecord {
             // (aCalcoutRecord.c:210-216,242), and a default record has all
             // links constant. The dbd `1` is never observed. Matches sibling
             // `calcout` (`in_status: [LINK_CON; 21]`).
-            inav: [LINK_CON; 12],
-            iaav: [LINK_CON; 12],
-            outv: LINK_CON,
+            link_status: [LINK_CON; 25],
+            link_check: LinkCheckState::default(),
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
             put_report: None,
@@ -1089,20 +1126,29 @@ impl AcalcoutRecord {
     /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
     /// `special()` re-classification (528-569). No-op without an async context.
     fn refresh_link_status(&self, posts: LinkStatusPosts) {
-        let mut links: Vec<(&'static str, PvString)> = Vec::with_capacity(25);
+        let mut links: Vec<(&'static str, PvString, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
-            links.push((INAV_NAMES[i], self.inp_links[i].clone()));
-            links.push((IAAV_NAMES[i], self.ina_links[i].clone()));
+            links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
+            links.push((IAAV_NAMES[i], self.ina_links[i].clone(), LinkRole::Input));
         }
-        links.push(("OUTV", self.out.clone()));
+        links.push(("OUTV", self.out.clone(), LinkRole::Output));
         // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
         post_link_status(
             self.async_ctx.as_ref(),
             &self.link_gen,
             links,
-            crate::server::recgbl::EventMask::VALUE,
+            LinkRule::Locality,
+            ACALCOUT_LINK_CHECK.mask,
             posts,
         );
+    }
+
+    /// The `link_status` slot of a status field.
+    fn status_index(name: &str) -> Option<usize> {
+        ACALCOUT_LINK_CHECK
+            .links
+            .iter()
+            .position(|&(_, status)| status == name)
     }
 
     fn pa_index(name: &str) -> Option<usize> {
@@ -1177,6 +1223,15 @@ impl Record for AcalcoutRecord {
             .union(crate::server::record::CycleHooks::INPUT_FETCH)
             .union(crate::server::record::CycleHooks::CONTINUATION)
             .union(crate::server::record::CycleHooks::OUTPUT_HOOKS)
+            .union(crate::server::record::CycleHooks::LINK_CHECK)
+    }
+
+    fn link_check(&mut self) -> Option<LinkCheck<'_>> {
+        Some(LinkCheck {
+            spec: &ACALCOUT_LINK_CHECK,
+            statuses: &mut self.link_status,
+            state: &mut self.link_check,
+        })
     }
 
     fn take_put_report(&mut self) -> Option<PutReport> {
@@ -1756,7 +1811,6 @@ impl Record for AcalcoutRecord {
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
-            "OUTV" => Some(EpicsValue::Enum(self.outv as u16)),
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
@@ -1796,11 +1850,8 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::ina_index(name) {
                     return Some(EpicsValue::String(self.ina_links[idx].clone().into()));
                 }
-                if let Some(idx) = Self::inav_index(name) {
-                    return Some(EpicsValue::Enum(self.inav[idx] as u16));
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    return Some(EpicsValue::Enum(self.iaav[idx] as u16));
+                if let Some(idx) = Self::status_index(name) {
+                    return Some(EpicsValue::Enum(self.link_status[idx] as u16));
                 }
                 if let Some(idx) = Self::pa_index(name) {
                     return Some(EpicsValue::Double(self.pa[idx]));
@@ -2038,7 +2089,7 @@ impl Record for AcalcoutRecord {
             // SPC_NOMOD fields share; this arm is the link-status refresh's
             // write (`post_fields` -> `put_field_internal`), its only writer.
             "OUTV" => {
-                self.outv = value
+                self.link_status[24] = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("OUTV".into()))?
                     as i16;
@@ -2254,15 +2305,8 @@ impl Record for AcalcoutRecord {
                 // INAV..INLV / IAAV..ILLV are `special(SPC_NOMOD)`
                 // (aCalcoutRecord.dbd:246-413): DERIVED from the link, refused
                 // to clients by `is_no_mod` — see the `OUTV` arm above.
-                if let Some(idx) = Self::inav_index(name) {
-                    self.inav[idx] = value
-                        .to_f64()
-                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
-                        as i16;
-                    return Ok(());
-                }
-                if let Some(idx) = Self::iaav_index(name) {
-                    self.iaav[idx] = value
+                if let Some(idx) = Self::status_index(name) {
+                    self.link_status[idx] = value
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?
                         as i16;

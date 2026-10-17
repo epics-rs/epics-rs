@@ -6409,6 +6409,17 @@ pub(crate) fn declared_field_type_of<R: Record + ?Sized>(
     (!desc.runtime_typed).then_some(desc.dbf_type)
 }
 
+/// The `DBF_*` type a link to `field` addresses — C `dbNameToAddr`'s
+/// `field_type` once `cvt_dbaddr` has run: the declaration, or, for a
+/// runtime-typed field, the variant the record holds.
+pub(crate) fn addressed_field_type_of<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+) -> Option<DbFieldType> {
+    declared_field_type_of(record, field)
+        .or_else(|| record.get_field(field).map(|v| v.db_field_type()))
+}
+
 /// The source record's part of a `DBR_STRING` link read — C's
 /// `[field_type][DBR_STRING]` conversion state — captured by
 /// [`RecordInstance::source_render_of`] under the read's hold and applied

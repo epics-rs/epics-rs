@@ -9,6 +9,7 @@ pub mod db_access;
 pub mod dbr_delivery;
 mod field_io;
 pub mod filters;
+mod link_check;
 mod link_put_queue;
 mod link_set;
 mod links;

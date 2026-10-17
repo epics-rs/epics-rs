@@ -205,6 +205,9 @@ pub struct ScalcoutRecord {
     /// POSV — C `field(POSV,DBF_STRING)`, `SPC_NOMOD`: the OSV `monitor()`
     /// last posted (`sCalcoutRecord.c:847-851`).
     posv: PvString,
+    /// POVL — C `prec->povl`: the OVAL `monitor()` last compared and posted
+    /// (`sCalcoutRecord.c:866-869`). `init_record` leaves it 0.
+    povl: f64,
     /// SVAL (bit 0), OSV (bit 1) and AA..LL (bits 2..) posts the last
     /// `monitor()` made, each against the record's own previous copy.
     string_posts: u64,
@@ -246,6 +249,7 @@ impl Default for ScalcoutRecord {
             put_report: None,
             calc_posts: 0,
             posv: PvString::new(),
+            povl: 0.0,
             string_posts: 0,
             input_changes: 0,
             num_vals: [0.0; 12],
@@ -893,8 +897,30 @@ impl Record for ScalcoutRecord {
     /// copies, never from a change the framework sees.
     fn fields_posted_only_when_marked(&self) -> &'static [&'static str] {
         &[
-            "SVAL", "OSV", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL",
+            "SVAL", "OSV", "OVAL", "AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ",
+            "KK", "LL",
         ]
+    }
+
+    /// C `sCalcoutRecord.c:866-869` posts OVAL with `monitor_mask | DBE_VALUE |
+    /// DBE_LOG` outside the `if (monitor_mask)` that gates VAL.
+    fn fields_posted_with_value_mask(
+        &self,
+    ) -> &'static [(&'static str, crate::server::record::ValuePostGate)] {
+        &[("OVAL", crate::server::record::ValuePostGate::OnChangeForced)]
+    }
+
+    /// C `if (pcalc->povl != pcalc->oval) { ...; pcalc->povl = pcalc->oval; }`
+    /// (`sCalcoutRecord.c:866-869`), minus the post. Outside a POVL put this
+    /// is the only writer of `povl`, so an OVAL put posts again from its cycle
+    /// unless the cycle sets back the value `povl` holds.
+    fn take_secondary_value_changes(
+        &mut self,
+        _value_mask: crate::server::recgbl::EventMask,
+    ) -> crate::server::record::SecondaryTake {
+        crate::server::record::SecondaryTake::unguarded(u64::from(
+            crate::server::record::SecondaryTake::advance(&mut self.povl, self.oval),
+        ))
     }
 
     /// C's post carries a literal `DBE_VALUE`, not `DBE_VALUE | DBE_LOG`.
@@ -1184,6 +1210,8 @@ impl Record for ScalcoutRecord {
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OSV" => Some(EpicsValue::String(self.osv.clone())),
+            "POSV" => Some(EpicsValue::String(self.posv.clone())),
+            "POVL" => Some(EpicsValue::Double(self.povl)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
@@ -1324,6 +1352,12 @@ impl Record for ScalcoutRecord {
                 self.oval = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("OVAL".into()))?;
+                Ok(())
+            }
+            "POVL" => {
+                self.povl = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("POVL".into()))?;
                 Ok(())
             }
             "OSV" => match value {

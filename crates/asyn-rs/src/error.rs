@@ -199,16 +199,7 @@ pub enum AsynError {
 
     /// C parity: `asynParamAlreadyExists` —
     /// `paramList::createParam` (`asynPortDriver.cpp:126-138`) returns
-    /// this status when a second `createParam(name, ...)` arrives with
-    /// the same name. The `asynPortDriver::createParam` wrapper
-    /// (`asynPortDriver.cpp:991-1012`) translates it to `asynError`
-    /// with an `asynPrint(ASYN_TRACE_ERROR, ...)` log line. The lax
-    /// Rust [`ParamList::create_param`](crate::param::ParamList::create_param) silently returns the existing
-    /// index to match the idempotent build pattern used by
-    /// `ad-core-rs`/`ad-plugins-rs` (e.g. `ADDriverParams::create`
-    /// after `NDArrayDriverParams::create`); use
-    /// [`ParamList::create_param_strict`](crate::param::ParamList::create_param_strict) when you need C parity for
-    /// the duplicate-name error.
+    /// this status when a list already has the name.
     #[error("param already exists: {0}")]
     ParamAlreadyExists(String),
 

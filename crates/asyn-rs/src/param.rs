@@ -320,7 +320,8 @@ impl FlagList {
 /// Supports multiple addresses (addr 0..max_addr).
 pub struct ParamList {
     max_addr: usize,
-    /// `params[addr][index] = ParamEntry`
+    /// `params[addr][index] = ParamEntry`: C's one `paramList` per address,
+    /// each indexed by its own creation order.
     params: Vec<Vec<ParamEntry>>,
     /// C `paramList::flags` (asynPortDriver.cpp): per address, the indices of
     /// the parameters changed since the last flush, in the order they were
@@ -328,11 +329,8 @@ pub struct ParamList {
     /// flag to disagree with it. Capacity is reserved to the parameter count
     /// at creation (`createParam`, :135) so a set never allocates.
     flags: Vec<FlagList>,
-    name_to_index: HashMap<String, usize>,
-    /// Per index, the lists a [`Self::create_param_in_list`] parameter lives
-    /// in; `None` is every list. The entry exists at every address so
-    /// indices stay aligned, but no other list answers for it.
-    only_list: Vec<Option<Vec<usize>>>,
+    /// Per address, C `paramList::findParam`'s name lookup.
+    names: Vec<HashMap<String, usize>>,
 }
 
 impl ParamList {
@@ -342,8 +340,7 @@ impl ParamList {
             max_addr,
             params: (0..max_addr).map(|_| Vec::new()).collect(),
             flags: (0..max_addr).map(|_| FlagList::default()).collect(),
-            name_to_index: HashMap::new(),
-            only_list: Vec::new(),
+            names: (0..max_addr).map(|_| HashMap::new()).collect(),
         }
     }
 
@@ -367,9 +364,7 @@ impl ParamList {
     /// Whether list `a` has parameter `index`: C's per-list `paramList`
     /// bounds check (asynParamBadIndex).
     fn in_list(&self, index: usize, a: usize) -> bool {
-        self.only_list
-            .get(index)
-            .is_some_and(|only| only.as_ref().is_none_or(|lists| lists.contains(&a)))
+        index < self.params[a].len()
     }
 
     /// [`Self::validate_addr`], then the list's own parameter count.
@@ -409,106 +404,65 @@ impl ParamList {
             .ok_or(AsynError::ParamIndexOutOfRange(index))
     }
 
-    /// Create a parameter. Returns its index.
-    /// The parameter is created at all addresses.
-    ///
-    /// Lax variant — when `name` already exists this returns the
-    /// existing index silently (`asynSuccess`). That matches the
-    /// idempotent build pattern used by `ad-core-rs::ADDriverParams`
-    /// and `ad-plugins-rs::NDArrayDriverParams` (the latter create the
-    /// shared `ACQUIRE`/`ACQUIRE_BUSY`/`WAIT_FOR_PLUGINS` params, then
-    /// `ADDriverParams::create` re-issues `create_param` on the same
-    /// names).
-    ///
-    /// Use [`Self::create_param_strict`] when you need C parity for
-    /// `asynParamAlreadyExists` — `paramList::createParam`
-    /// (`asynPortDriver/asynPortDriver.cpp:126-138`) returns that
-    /// status on duplicate and the wrapper at
-    /// `asynPortDriver::createParam(int list, ...)` (lines 991-1011)
-    /// translates it to `asynError` with an `ASYN_TRACE_ERROR` log.
+    /// C `asynPortDriver::createParam(name, ...)` (asynPortDriver.cpp:972-982):
+    /// a parameter of every list. A name a list already has is refused with
+    /// [`AsynError::ParamAlreadyExists`], C's `asynParamAlreadyExists`.
     pub fn create_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
-        if let Some(&idx) = self.name_to_index.get(name) {
-            return Ok(idx);
-        }
-        self.append_param(name, param_type)
+        self.create_in_every_list(name, param_type)
+            .map_err(|(_, e)| e)
     }
 
-    /// Strict variant of [`Self::create_param`] — surfaces
-    /// [`AsynError::ParamAlreadyExists`] on duplicate, matching the C
-    /// `asynParamAlreadyExists` status returned by
-    /// `paramList::createParam` (`asynPortDriver.cpp:126-138`).
-    ///
-    /// Use this from new callers that should match the C semantics.
-    /// Existing callers (`ad-core-rs`, `ad-plugins-rs`) keep using the
-    /// lax [`Self::create_param`] until they migrate; switching them
-    /// requires teaching the duplicate-name shared-base-class build
-    /// to look up the existing index instead of re-issuing
-    /// `create_param`.
-    pub fn create_param_strict(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
-        if self.name_to_index.contains_key(name) {
-            return Err(AsynError::ParamAlreadyExists(name.to_string()));
+    /// [`Self::create_param`]: `createParam(list, ...)` on every list in turn,
+    /// stopping at the first refusal, which is returned with its list; the
+    /// index is the last list's.
+    pub(crate) fn create_in_every_list(
+        &mut self,
+        name: &str,
+        param_type: ParamType,
+    ) -> Result<usize, (i32, AsynError)> {
+        let mut index = 0;
+        for list in 0..self.max_addr as i32 {
+            index = self
+                .create_param_in_list(list, name, param_type)
+                .map_err(|e| (list, e))?;
         }
-        self.append_param(name, param_type)
+        Ok(index)
     }
 
-    /// C `asynPortDriver::createParam(int list, ...)` (asynPortDriver.cpp:
-    /// 991-1012): a parameter of list `list`. Every other address fails to
-    /// find, read or set it, as C's lists that lack it do. C may repeat the
-    /// name for another list (omsMAXvEncFunc.cpp:71-72); here the repeat
-    /// joins that list under the same index, so its type must match.
+    /// C `paramList::createParam` (asynPortDriver.cpp:126-138) on list
+    /// `list` alone: appended at that list's end, so its index is its place
+    /// in that list. A name the list has is refused; another list may hold
+    /// the same name at another index and type (omsMAXvEncFunc.cpp:71-72).
     pub fn create_param_in_list(
         &mut self,
         list: i32,
         name: &str,
         param_type: ParamType,
     ) -> AsynResult<usize> {
-        let list = self.validate_addr(list)?;
-        let Some(&index) = self.name_to_index.get(name) else {
-            let index = self.append_param(name, param_type)?;
-            self.only_list[index] = Some(vec![list]);
-            return Ok(index);
-        };
-        let existing = self.params[0][index].param_type;
-        if existing != param_type {
-            let name_of = |t| ParamEntry::new(String::new(), t).value.type_name();
-            return Err(AsynError::TypeMismatch {
-                expected: name_of(existing),
-                actual: name_of(param_type),
-            });
+        let a = self.validate_addr(list)?;
+        if self.names[a].contains_key(name) {
+            return Err(AsynError::ParamAlreadyExists(name.to_string()));
         }
-        match &mut self.only_list[index] {
-            Some(lists) if !lists.contains(&list) => lists.push(list),
-            _ => return Err(AsynError::ParamAlreadyExists(name.to_string())),
-        }
-        Ok(index)
-    }
-
-    fn append_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
-        let index = self.params[0].len();
-        self.only_list.push(None);
-        for addr_params in &mut self.params {
-            addr_params.push(ParamEntry::new(name.to_string(), param_type));
-        }
+        let index = self.params[a].len();
+        self.params[a].push(ParamEntry::new(name.to_string(), param_type));
         // C `createParam` (:135): flags.reserve(vals.size()) — a set never grows
         // the list, so it never allocates.
-        for list in &mut self.flags {
-            list.0.reserve((index + 1).saturating_sub(list.0.len()));
-        }
-        self.name_to_index.insert(name.to_string(), index);
+        let flags = &mut self.flags[a].0;
+        flags.reserve((index + 1).saturating_sub(flags.len()));
+        self.names[a].insert(name.to_string(), index);
         Ok(index)
     }
 
-    /// Find parameter index by name.
+    /// C `findParam(name)` (asynPortDriver.cpp:1036-1039): list 0's index.
     pub fn find_param(&self, name: &str) -> Option<usize> {
-        self.name_to_index.get(name).copied()
+        self.names[0].get(name).copied()
     }
 
     /// C `findParam(list, name)` (asynPortDriver.cpp:1046-1051): the index
     /// only where list `addr` has the parameter.
     pub fn find_param_in(&self, addr: i32, name: &str) -> Option<usize> {
-        let index = self.find_param(name)?;
         let a = self.validate_addr(addr).ok()?;
-        self.in_list(index, a).then_some(index)
+        self.names[a].get(name).copied()
     }
 
     /// Get parameter name by index.
@@ -1339,7 +1293,7 @@ impl ParamList {
         status
     }
 
-    /// Number of parameters.
+    /// C `getNumParams()` (asynPortDriver.cpp:1017-1020): list 0's count.
     pub fn len(&self) -> usize {
         self.params[0].len()
     }
@@ -1352,7 +1306,7 @@ impl ParamList {
     /// every parameter through `ParamEntry::report`.
     ///
     /// C has one `paramList` per address and reports the one it was handed; here
-    /// one list holds every address, so the address is the argument. It takes no
+    /// one `ParamList` holds every address's, so the address is the argument. It takes no
     /// detail level because C's does not use it: `paramVal::report` prints the
     /// same line whatever `details` says (paramVal.cpp:296-372), and the only
     /// thing the level decides is *how many* lists are printed — which is
@@ -1363,14 +1317,9 @@ impl ParamList {
         // addr collapses onto list 0) reports list 0 again, exactly as C does with
         // its `maxAddr` copies of the same values.
         let a = self.validate_addr(addr).unwrap_or(0);
-        let count = (0..self.len()).filter(|&i| self.in_list(i, a)).count();
-        let _ = writeln!(out, "Number of parameters is: {count}");
-        // C numbers a list's parameters by their place in that list
-        // (asynPortDriver.cpp:888-891), not by the port-wide index.
-        let entries = self.params[a].iter().enumerate();
-        let own = entries.filter(|&(i, _)| self.in_list(i, a));
-        for (id, (_, entry)) in own.enumerate() {
-            entry.report(out, id);
+        let _ = writeln!(out, "Number of parameters is: {}", self.params[a].len());
+        for (i, entry) in self.params[a].iter().enumerate() {
+            entry.report(out, i);
         }
     }
 }
@@ -1719,14 +1668,14 @@ mod tests {
 
     /// C `createParam(0, ...)` puts the parameter in list 0 alone: other
     /// lists neither find, set nor read it (asynPortDriver.cpp:991-1012,
-    /// 1046-1051), and a later every-list parameter still answers on all.
+    /// 1046-1051). A later every-list parameter is appended to each list and
+    /// its index is the last list's (:972-982).
     #[test]
     fn a_list_only_parameter_exists_in_its_list_alone() {
         let mut list = ParamList::new(2);
         let own = list
             .create_param_in_list(0, "OWN", ParamType::Int32)
             .unwrap();
-        let all = list.create_param("ALL", ParamType::Int32).unwrap();
         list.set_int32(own, 0, 5).unwrap();
         assert_eq!(list.get_int32(own, 0).unwrap(), 5);
         assert!(matches!(
@@ -1736,17 +1685,13 @@ mod tests {
         assert!(list.get_int32(own, 1).is_err());
         assert_eq!(list.find_param_in(0, "OWN"), Some(own));
         assert_eq!(list.find_param_in(1, "OWN"), None);
-        for addr in [0, 1] {
-            list.set_int32(all, addr, addr).unwrap();
-            assert_eq!(list.find_param_in(addr, "ALL"), Some(all));
-        }
+        let all = list.create_param("ALL", ParamType::Int32).unwrap();
+        assert_eq!(all, 0);
+        assert_eq!(list.find_param_in(0, "ALL"), Some(1));
+        assert_eq!(list.find_param_in(1, "ALL"), Some(0));
         assert!(matches!(
             list.create_param_in_list(0, "OWN", ParamType::Int32),
             Err(AsynError::ParamAlreadyExists(_))
-        ));
-        assert!(matches!(
-            list.create_param_in_list(1, "OWN", ParamType::Float64),
-            Err(AsynError::TypeMismatch { .. })
         ));
         assert!(matches!(
             list.create_param_in_list(1, "ALL", ParamType::Int32),
@@ -1759,6 +1704,33 @@ mod tests {
         assert!(!out.contains("OWN"), "{out}");
         assert!(
             out.contains("Parameter 0 type=asynInt32, name=ALL"),
+            "{out}"
+        );
+    }
+
+    /// C's lists are independent (asynPortDriver.cpp:126-138): a name joins a
+    /// second list at that list's end, with its own type, and that list's
+    /// report numbers it there (:888-891).
+    #[test]
+    fn a_name_joins_another_list_at_its_end_with_its_own_type() {
+        let mut list = ParamList::new(2);
+        list.create_param_in_list(0, "X", ParamType::Int32).unwrap();
+        list.create_param("Y", ParamType::Int32).unwrap();
+        let x1 = list
+            .create_param_in_list(1, "X", ParamType::Float64)
+            .unwrap();
+        assert_eq!(list.find_param_in(0, "X"), Some(0));
+        assert_eq!(list.find_param_in(1, "X"), Some(x1));
+        assert_eq!(x1, 1);
+        list.set_int32(0, 0, 3).unwrap();
+        list.set_float64(x1, 1, 2.5).unwrap();
+        assert_eq!(list.get_float64(x1, 1).unwrap(), 2.5);
+        let mut out = String::new();
+        list.report(&mut out, 1);
+        assert!(out.starts_with("Number of parameters is: 2\n"), "{out}");
+        assert!(out.contains("Parameter 0 type=asynInt32, name=Y"), "{out}");
+        assert!(
+            out.contains("Parameter 1 type=asynFloat64, name=X"),
             "{out}"
         );
     }
@@ -1816,43 +1788,30 @@ mod tests {
         assert_eq!(pl.find_param("TEMP"), Some(0));
         assert_eq!(pl.find_param("COUNT"), Some(1));
         assert_eq!(pl.find_param("NOPE"), None);
-        // Duplicate create returns same index
-        assert_eq!(pl.create_param("TEMP", ParamType::Float64).unwrap(), 0);
+        assert!(matches!(
+            pl.create_param("TEMP", ParamType::Float64),
+            Err(AsynError::ParamAlreadyExists(_))
+        ));
     }
 
     #[test]
-    fn test_create_param_strict_duplicate_returns_already_exists() {
-        // C parity: paramList::createParam (asynPortDriver.cpp:130) —
-        // a second createParam with an already-known name returns
-        // `asynParamAlreadyExists`; the asynPortDriver wrapper
-        // (asynPortDriver.cpp:991-1012) translates that to
-        // `asynError` with a TRACE_ERROR log. The lax `create_param`
-        // intentionally absorbs the duplicate for `ad-core-rs` /
-        // `ad-plugins-rs` idempotent build chains; the strict
-        // variant is what C-parity-sensitive callers reach for.
+    fn test_create_param_duplicate_returns_already_exists() {
+        // C parity: paramList::createParam (asynPortDriver.cpp:130) refuses a
+        // name the list has with `asynParamAlreadyExists`.
         let mut pl = ParamList::new(1);
-        let idx = pl.create_param_strict("VAL", ParamType::Int32).unwrap();
+        let idx = pl.create_param("VAL", ParamType::Int32).unwrap();
         assert_eq!(idx, 0);
-        match pl.create_param_strict("VAL", ParamType::Int32) {
+        match pl.create_param("VAL", ParamType::Int32) {
             Err(AsynError::ParamAlreadyExists(name)) => assert_eq!(name, "VAL"),
             other => panic!("expected ParamAlreadyExists, got {other:?}"),
         }
-        // Strict and lax variants share the registry: a name created
-        // via the lax path must still be visible to strict and
-        // produce ParamAlreadyExists.
-        match pl.create_param_strict("VAL", ParamType::Int32) {
-            Err(AsynError::ParamAlreadyExists(_)) => {}
-            other => panic!("strict must observe lax-created names, got {other:?}"),
-        }
-        // ...and vice versa.
-        assert_eq!(pl.create_param("VAL", ParamType::Int32).unwrap(), 0);
     }
 
     #[test]
-    fn test_create_param_strict_distinct_names_succeed() {
+    fn test_create_param_distinct_names_succeed() {
         let mut pl = ParamList::new(1);
-        let a = pl.create_param_strict("A", ParamType::Int32).unwrap();
-        let b = pl.create_param_strict("B", ParamType::Float64).unwrap();
+        let a = pl.create_param("A", ParamType::Int32).unwrap();
+        let b = pl.create_param("B", ParamType::Float64).unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(pl.find_param("A"), Some(0));
@@ -1868,9 +1827,7 @@ mod tests {
         // overwrites them together. clear strips bits from BOTH
         // masks. get(Both) returns rising | falling.
         let mut pl = ParamList::new(1);
-        let idx = pl
-            .create_param_strict("BITS", ParamType::UInt32Digital)
-            .unwrap();
+        let idx = pl.create_param("BITS", ParamType::UInt32Digital).unwrap();
 
         pl.set_uint32_interrupt(idx, 0, 0xF0, InterruptReason::ZeroToOne)
             .unwrap();
@@ -2371,17 +2328,17 @@ mod tests {
     }
 
     #[test]
-    fn asyn_param_set_duplicate_name_returns_existing_index() {
-        // ParamList::create_param returns the existing index on dup
-        // (silent dedup); AsynParamSet inherits that — two add()
-        // calls with the same name resolve to the same final index.
-        // Matches C asyn where createParam dedupes via name_to_index.
+    fn asyn_param_set_duplicate_name_aborts() {
+        // C createParams stops at the first refused createParam
+        // (asynPortDriver.cpp:4116-4126).
         let mut set = AsynParamSet::new();
         set.add("X", ParamType::Int32);
         set.add("X", ParamType::Int32);
         let mut pl = ParamList::new(1);
-        let idx = set.create_all(&mut pl).unwrap();
-        assert_eq!(idx, vec![0, 0]);
+        assert!(matches!(
+            set.create_all(&mut pl),
+            Err(AsynError::ParamAlreadyExists(_))
+        ));
     }
 
     // ------------------------------------------------------------------

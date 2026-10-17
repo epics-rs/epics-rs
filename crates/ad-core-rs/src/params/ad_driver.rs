@@ -68,6 +68,10 @@ impl ADDriverParams {
     pub fn create(port_base: &mut PortDriverBase) -> AsynResult<(Self, Arc<ArrayOwner>)> {
         let (base, owner) = NDArrayDriverParams::create(port_base)?;
         let first_ad_param = port_base.params.len();
+        // asynNDArrayDriver creates these (asynNDArrayDriver.cpp:897-899);
+        // ADDriver.cpp does not create them again.
+        let (acquire, acquire_busy, wait_for_plugins) =
+            (base.acquire, base.acquire_busy, base.wait_for_plugins);
 
         let params = Self {
             base,
@@ -99,9 +103,9 @@ impl ADDriverParams {
             status_message: port_base.create_param("STATUS_MESSAGE", ParamType::Octet)?,
             string_to_server: port_base.create_param("STRING_TO_SERVER", ParamType::Octet)?,
             string_from_server: port_base.create_param("STRING_FROM_SERVER", ParamType::Octet)?,
-            acquire: port_base.create_param("ACQUIRE", ParamType::Int32)?,
-            acquire_busy: port_base.create_param("ACQUIRE_BUSY", ParamType::Int32)?,
-            wait_for_plugins: port_base.create_param("WAIT_FOR_PLUGINS", ParamType::Int32)?,
+            acquire,
+            acquire_busy,
+            wait_for_plugins,
             read_status: port_base.create_param("READ_STATUS", ParamType::Int32)?,
 
             // Detector
@@ -131,6 +135,17 @@ impl ADDriverParams {
 mod tests {
     use super::*;
     use asyn_rs::port::PortFlags;
+
+    /// Each parameter is created once, where C creates it: a second
+    /// `createParam` of a name is refused (asynPortDriver.cpp:999-1003).
+    #[test]
+    fn ad_driver_params_create_each_name_once() {
+        let mut base = PortDriverBase::new("adonce", 1, PortFlags::default());
+        let (params, _) = ADDriverParams::create(&mut base).unwrap();
+        assert_eq!(params.acquire, params.base.acquire);
+        assert_eq!(params.wait_for_plugins, params.base.wait_for_plugins);
+        assert_eq!(base.params.len(), params.first_ad_param + 34);
+    }
 
     #[test]
     fn test_create_ad_driver_params() {

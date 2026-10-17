@@ -1358,6 +1358,12 @@ impl PortDriver for DrvAsynIPServerPort {
         caps
     }
 
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (drvAsynIPServerPort.c:662-665).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         user.print(
             TraceMask::FLOW,
@@ -2137,6 +2143,12 @@ mod tests {
             read_timeout: None,
         };
         assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let srv = DrvAsynIPServerPort::new("srv_bounds", "127.0.0.1:0").unwrap();
+        assert_eq!(srv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     /// A port another listener holds fails the bind in C's words, naming the

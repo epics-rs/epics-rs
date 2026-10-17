@@ -235,8 +235,8 @@ pub fn gpib_port_capabilities() -> Vec<super::Capability> {
 /// C's asynInt32Base default WRITE for a port that registered `asynInt32` with a
 /// NULL vtable — `writeDefault` (asynInt32Base.c:52-68) sets `errorMessage` to
 /// "write is not supported" and returns `asynError`. `getBounds` is the one
-/// default that succeeds (low = high = 0), which is already
-/// [`crate::port::PortDriver::get_bounds_int32`]'s default.
+/// default that succeeds (low = high = 0), which a GPIB port overrides
+/// [`crate::port::PortDriver::get_bounds_int32`] to return.
 pub fn int32_write_not_supported() -> crate::error::AsynError {
     crate::error::AsynError::Status {
         status: crate::error::AsynStatus::Error,

@@ -327,6 +327,12 @@ impl PortDriver for DrvAsynUsbtmcPort {
         ]
     }
 
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (drvAsynUSBTMC.c:1303-1306).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     /// C `asynOctetSetInputEos` (`drvAsynUSBTMC.c:963-985`). The terminator is
     /// the device's, not a software scan: it rides in the `REQUEST_DEV_DEP_MSG_IN`
     /// header and the device stops the transfer on it. So this overrides the
@@ -617,6 +623,12 @@ mod tests {
             }
             _ => panic!("expected Status error"),
         }
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let drv = DrvAsynUsbtmcPort::configure("usbtmc0", 0x0957, 0x0407, "", 0, 0).unwrap();
+        assert_eq!(drv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     #[test]

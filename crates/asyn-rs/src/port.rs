@@ -1067,6 +1067,7 @@ impl PortDriverBase {
     /// handle itself.
     pub fn write_int32_param(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
         let addr = self.parse_user(user)?;
+        // C drops the set's status for callParamCallbacks' (asynPortDriver.cpp:2029/2032).
         let _ = self.set_int32_param(user.reason, addr, value);
         self.call_param_callbacks(addr).map_err(|e| {
             param_access_error(
@@ -1810,8 +1811,17 @@ impl PortDriverBase {
         self.time_stamp = ts;
     }
 
+    /// See [`ParamList::create_param`].
     pub fn create_param(&mut self, name: &str, param_type: ParamType) -> AsynResult<usize> {
-        self.params.create_param(name, param_type)
+        let created = self.params.create_in_every_list(name, param_type);
+        // Any refusal is asynError (asynPortDriver.cpp:979).
+        created.map_err(|(list, e)| {
+            let e = self.create_param_refused(e, name, list);
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: e.to_string(),
+            }
+        })
     }
 
     /// See [`ParamList::create_param_in_list`].
@@ -1821,7 +1831,30 @@ impl PortDriverBase {
         name: &str,
         param_type: ParamType,
     ) -> AsynResult<usize> {
-        self.params.create_param_in_list(list, name, param_type)
+        let created = self.params.create_param_in_list(list, name, param_type);
+        created.map_err(|e| self.create_param_refused(e, name, list))
+    }
+
+    /// C `asynPortDriver::createParam(int list, ...)`'s refusal: an existing
+    /// name prints its line and is asynError (asynPortDriver.cpp:999-1004); an
+    /// invalid list stays asynParamInvalidList (:997). Its "too many
+    /// parameters" line (:1005-1009) is unreachable: `paramList::createParam`
+    /// never returns asynParamBadIndex.
+    fn create_param_refused(&self, e: AsynError, name: &str, list: i32) -> AsynError {
+        if !matches!(e, AsynError::ParamAlreadyExists(_)) {
+            return e;
+        }
+        self.trace_print(
+            crate::trace::TraceMask::ERROR,
+            format_args!(
+                "asynPortDriver:createParam: port={} error adding parameter {name} to list {list}, parameter already exists.\n",
+                self.port_name
+            ),
+        );
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: e.to_string(),
+        }
     }
 
     pub fn find_param(&self, name: &str) -> Option<usize> {
@@ -2928,17 +2961,30 @@ pub trait PortDriver: Any + Send + Sync {
         self.base_mut().write_int64_param(user, value)
     }
 
-    /// C `asynInt32Base.c:99` default: report `low = high = 0` so a
-    /// driver that does not implement getBounds makes convertAi/convertAo
-    /// skip the LINEAR ESLO/EOFF computation (`devAsynInt32.c:444`).
-    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
-        Ok((0, 0))
+    /// C `asynPortDriver::getBounds` (asynPortDriver.cpp:2068-2079): 0..65535.
+    /// A port that is an asynInt32Base driver in C overrides this with
+    /// `(0, 0)` (asynInt32Base.c:99), which makes LINEAR skip ESLO/EOFF.
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        let (low, high) = (0, 65535);
+        user.print(
+            crate::trace::TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("asynPortDriver::getBounds,low={low}, high={high}\n"),
+        );
+        Ok((low, high))
     }
 
-    /// C `asynInt64Base.c:99` default: report `low = high = 0` (see
-    /// `get_bounds_int32`).
-    fn get_bounds_int64(&self, _user: &AsynUser) -> AsynResult<(i64, i64)> {
-        Ok((0, 0))
+    /// C `asynPortDriver::getBounds64` (asynPortDriver.cpp:2207-2218).
+    fn get_bounds_int64(&self, user: &AsynUser) -> AsynResult<(i64, i64)> {
+        let (low, high) = (0, 65535);
+        user.print(
+            crate::trace::TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("asynPortDriver::getBounds64,low={low}, high={high}\n"),
+        );
+        Ok((low, high))
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
@@ -4703,10 +4749,9 @@ mod tests {
         }
         let drv = BoundsDriver { base };
         let (lo, hi) = drv.get_bounds_int64(&AsynUser::default()).unwrap();
-        // C asynInt64Base.c:99 default: *low = *high = 0 (so a driver
-        // that does not implement getBounds skips LINEAR ESLO/EOFF).
+        // C asynPortDriver::getBounds64 (asynPortDriver.cpp:2212-2213).
         assert_eq!(lo, 0);
-        assert_eq!(hi, 0);
+        assert_eq!(hi, 65535);
     }
 
     #[test]
@@ -5898,6 +5943,55 @@ mod tests {
                 "asynReport {level} must print no options block: {out}"
             );
         }
+    }
+
+    /// A refused `createParam` prints C's refusal line
+    /// (asynPortDriver.cpp:999-1003) once per refusal.
+    #[test]
+    fn a_repeated_create_in_a_list_prints_c_s_line() {
+        use crate::trace::{TraceFile, TraceMask};
+
+        let services = crate::services::PortServices::new();
+        let mut base = PortDriverBase::new("tcreate", 2, PortFlags::default());
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("tcreate", true);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("tcreate.log");
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("tcreate"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("tcreate"), TraceMask::ERROR);
+
+        base.create_param_in_list(1, "OWN", ParamType::Int32)
+            .unwrap();
+        assert!(
+            base.create_param_in_list(1, "OWN", ParamType::Int32)
+                .is_err()
+        );
+        // Every-list createParam stops at the list that has the name (:977-980).
+        assert!(base.create_param("OWN", ParamType::Int32).is_err());
+        assert_eq!(base.params.find_param_in(0, "OWN"), Some(0));
+        base.create_param("ALL", ParamType::Int32).unwrap();
+        let refused = base.create_param("ALL", ParamType::Int32).unwrap_err();
+        assert_eq!(refused.c_status_code(), AsynStatus::Error as i32);
+        let refused = base
+            .create_param_in_list(0, "ALL", ParamType::Int32)
+            .unwrap_err();
+        assert_eq!(refused.c_status_code(), AsynStatus::Error as i32);
+        assert!(matches!(
+            base.create_param_in_list(2, "X", ParamType::Int32),
+            Err(AsynError::ParamInvalidList(2))
+        ));
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        let line = "asynPortDriver:createParam: port=tcreate error adding parameter OWN to list 1, parameter already exists.\n";
+        assert_eq!(log.matches(line).count(), 2, "{log:?}");
+        let line = "asynPortDriver:createParam: port=tcreate error adding parameter ALL to list 0, parameter already exists.\n";
+        assert_eq!(log.matches(line).count(), 2, "{log:?}");
+        assert_eq!(log.lines().count(), 4, "{log:?}");
     }
 
     /// `trace_print` formats nothing while its mask is off, and with it on

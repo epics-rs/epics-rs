@@ -349,6 +349,12 @@ impl PortDriver for DrvVxi11Port {
         Err(crate::interfaces::gpib::int32_write_not_supported())
     }
 
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (asynGpib.c:594-608).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {
@@ -547,6 +553,12 @@ mod tests {
 
         let cfg = Vxi11Config::from_positional("h", 0, "10", "inst0", 0);
         assert_eq!(cfg.default_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "gpib0", 0, false).unwrap();
+        assert_eq!(drv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     #[test]

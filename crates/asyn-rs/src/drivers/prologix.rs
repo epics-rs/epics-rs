@@ -411,6 +411,12 @@ impl PortDriver for DrvAsynPrologixPort {
         Err(crate::interfaces::gpib::int32_write_not_supported())
     }
 
+    /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
+    /// leaves it NULL (asynGpib.c:594-608).
+    fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
+        Ok((0, 0))
+    }
+
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         // Reset addressing state — fresh TCP connection means the
         // bridge's last-sent address is unknown, so the next write
@@ -881,6 +887,13 @@ mod tests {
             let _ = tx.send(acc);
         });
         (port, rx)
+    }
+
+    #[test]
+    fn get_bounds_is_asyn_int32_base_s() {
+        let (port, _rx) = start_mock_bridge();
+        let drv = DrvAsynPrologixPort::new("p", &format!("127.0.0.1:{port}"), false).unwrap();
+        assert_eq!(drv.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
     }
 
     /// DRV-52: a **device-level** connect/disconnect must not move the port's

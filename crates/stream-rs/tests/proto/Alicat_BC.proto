@@ -1,0 +1,88 @@
+# Alicat_PCD.proto
+
+# stream protocol file for Alicat PCD pressure controller
+
+# Mark Rivers
+# February 28, 2026
+
+ExtraInput = Ignore;
+
+setGas {
+   out "\$1 GS %d";
+   in  "\$1";
+   @init {
+       out "\$1 GS";
+       in  "\$1 %d";
+   }
+}
+
+getRamp {
+   out "\$1 SR";
+   in  "\$1%f";
+}
+setRamp {
+   out "\$1 SR %f 4";
+   @init {
+       out "\$1 SR";
+       in  "\$1%f";
+   }
+}
+
+getTemperature {
+   out "\$1";
+   in  "\$1 %f %(\$2)f %(\$3)f %(\$4)f %(\$5)f %(\$6)s%(\$7)40c";
+}
+
+setSetpoint {
+   out "\$1 S %f";
+   in  "\$1";
+   @init {
+       out "\$1";
+       in  "\$1 %*f %*f %*f %f";
+   }
+}
+
+setSetpointSource {
+   out "\$1 LSS %{U|A}";
+   in  "\$1";
+}
+
+getSetpointSource {
+   out "\$1 LSS";
+   in  "\$1 %{U|A}";
+}
+
+setValve {
+   out "\$1 HPUR %f";
+   in  "\$1";
+}
+
+setTotal {
+   out "\$1 TB %f";
+   in  "\$1";
+}
+
+resetTotal {
+   out "\$1 T";
+   in  "\$1";
+}
+
+setRun {
+   out "\$1 C";
+   in  "\$1";
+}
+
+getFirmware {
+   out "\$1 VE";
+   in  "\$1 %80c";
+}
+
+getSerialNumber {
+   out "\$1 SN";
+   in  "\$1 %80c";
+}
+
+getMaxFlow {
+   out "\$1 FPF 0";
+   in  "\$1 %f %(\$2)s";
+}

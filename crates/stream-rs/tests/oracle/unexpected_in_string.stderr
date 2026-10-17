@@ -1,0 +1,2 @@
+_main_ unexpected_in_string.proto line 1: Unexpected 'foo' in string
+_main_ in string variable 'terminator' in protocol file 'unexpected_in_string.proto' line 1

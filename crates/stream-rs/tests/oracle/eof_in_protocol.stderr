@@ -1,0 +1,2 @@
+_main_ eof_in_protocol.proto line 3: Unexpected end of file (looking for '}')
+_main_ eof_in_protocol.proto line 1: in protocol 'p'

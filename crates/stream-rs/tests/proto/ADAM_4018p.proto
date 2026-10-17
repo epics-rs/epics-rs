@@ -1,0 +1,65 @@
+# Protocol file for the ADAM 4018+ thermocouple module
+
+OutTerminator = CR;
+InTerminator = CR;
+# This is needed because the RS-485 adapter is slow
+ReadTimeout = 1000;
+
+queryAll {
+  out "#\$1";
+  in ">%(\$2:all_tc0)f%(\$2:all_tc1)f%(\$2:all_tc2)f%(\$2:all_tc3)f%(\$2:all_tc4)f%(\$2:all_tc5)f%(\$2:all_tc6)f%(\$2:all_tc7)f";
+}
+
+queryChan {
+  out "#\$1";
+  in ">%f";
+}
+
+# Read module name
+# $01M
+# !01408
+queryModel {
+  out "$\$1M";
+  in "!\$1%s";
+}
+
+# Read firmware version
+#  $01F
+#  !01D1.8
+queryFW {
+  out "$\$1F";
+  in "!\$1%#s";
+}
+
+# Read baud
+queryBaud {
+  out "$\$12";
+  in "!\$1%*2s%{03|04|05|06|07|08}%*2s"
+}
+
+# Read input type
+queryChanType {
+  out "$\$18C\$2";
+  in "!\$1C\$2R%{06|0E|0F|10|11|12|13|14}"
+}
+
+# Set input type
+setChanType {
+  out "$\$17C\$2R%{06|0E|0F|10|11|12|13|14}"
+}
+
+### Features not implemented
+
+# Read full configuration status
+# $012
+# !01000600
+
+# The last 8 bits of the configuration status have the following meaning:
+# bit 0: \ Data format (11=unused for model 4018)
+# bit 1: /  00=Engineering units, 01=% of FSR, 10=2's complement of hexadecimal
+# bit 2: not used
+# bit 3: not used
+# bit 4: not used
+# bit 5: not used
+# bit 6: Checksum status (0= disabled, 1=enabled)
+# bit 7: Integration time (0=50ms for 60 Hz power, 1=60ms for 50 Hz power)

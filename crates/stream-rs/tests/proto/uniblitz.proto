@@ -1,0 +1,38 @@
+# Protocol file for the Uniblitz shutter controllers
+# Developed and tested with the VDM1000
+
+############  SVN Repository information  #############
+# $Date$
+# $Author$
+# $Revision$
+# $HeadURL$
+# $Id$
+#######################################################
+
+Terminator = LF;
+
+checkSync {
+  out "?"; 
+  in "%{K|J}";
+}
+
+setShutter {
+  out "%{A|@}";
+  @init { checkSync; }
+}
+
+setGate {
+  out "%{F|G}";
+}
+
+setAuxOut {
+  out "%{D|E}";
+}
+
+setTrigger {
+  out "B";
+}
+
+setReset {
+  out "C";
+}

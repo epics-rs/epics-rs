@@ -1,0 +1,226 @@
+InTerminator = CR LF;
+OutTerminator = CR;
+
+grabWelcomeText {
+	in "%\$1[^\r\n]";
+	ExtraInput = Ignore;
+}
+#grabDeviceID {
+#	in "%\$1[^\r\n]";
+#	ExtraInput = Ignore;
+#}
+#grabSerialNum {
+#	in "%\$1[^\r\n]";
+#	ExtraInput = Ignore;
+#}
+queryVer {
+	out "$VER";
+	in  "$VER%(\$1:version1M.VAL)[^;];"
+            "%(\$1:version2M.VAL)[^OK]OK";
+	ExtraInput = Ignore;
+}
+
+querySampleTime {
+	out "$STI?";
+	in  "$STI?%dOK";
+	ExtraInput = Ignore;
+
+}
+
+setSampleTime {
+	out "$STI%d";
+	in  "$STI%d,%dOK";
+	ExtraInput = Ignore;
+
+}
+queryTrigMode {
+	out "$TRG?";
+	in  "$TRG?%dOK";
+	ExtraInput = Ignore;
+}
+
+setTrigMode {
+	out "$TRG%d";
+	in  "$TRG%dOK";
+	ExtraInput = Ignore;
+}
+
+queryAvgTypeMode {
+	out "$AVT?";
+	in  "$AVT?%dOK";
+	ExtraInput = Ignore;
+}
+
+setAvgTypeMode {
+	out "$AVT%d";
+	in  "$AVT%dOK";
+	ExtraInput = Ignore;
+}
+
+queryAvgNumMode {
+	out "$AVN?";
+	in  "$AVN?%dOK";
+	ExtraInput = Ignore;
+}
+
+setAvgNumMode {
+	out "$AVN%d";
+	in  "$AVN%dOK";
+	ExtraInput = Ignore;
+}
+
+queryChanStatus {
+	out "$CHS";
+	in  "$CHS%(\$1:chan1StatM.VAL)d,"
+	    "%(\$1:chan2StatM.VAL)d,"
+	    "%(\$1:chan3StatM.VAL)d,"
+	    "%(\$1:chan4StatM.VAL)dOK";
+	ExtraInput = Ignore;
+}
+
+queryChan1Info {
+	out "$CHI1";
+	in  "$CHI1:ANO%(\$1:chan1ANO.VAL)d,"
+	    "NAM%(\$1:chan1NAM.VAL)[^,\s],"
+	    "SNO%(\$1:chan1SNO.VAL)d,"
+	    "OFS%(\$1:chan1OFS.VAL)d,"
+	    "RNG%(\$1:chan1RNG.VAL)d,"
+	    "UNT%(\$1:chan1UNT.VAL)[^OK]";
+	ExtraInput = Ignore;
+}
+
+queryChan2Info {
+	out "$CHI2";
+	in  "$CHI2:ANO%(\$1:chan2ANO.VAL)d,"
+	    "NAM%(\$1:chan2NAM.VAL)[^,\s],"
+	    "SNO%(\$1:chan2SNO.VAL)d,"
+	    "OFS%(\$1:chan2OFS.VAL)d,"
+	    "RNG%(\$1:chan2RNG.VAL)d,"
+	    "UNT%(\$1:chan2UNT.VAL)[^OK]";
+	ExtraInput = Ignore;
+}
+
+queryChan3Info {
+	out "$CHI3";
+	in  "$CHI3:ANO%(\$1:chan3ANO.VAL)d,"
+	    "NAM%(\$1:chan3NAM.VAL)[^,\s],"
+	    "SNO%(\$1:chan3SNO.VAL)d,"
+	    "OFS%(\$1:chan3OFS.VAL)d,"
+	    "RNG%(\$1:chan3RNG.VAL)d,"
+	    "UNT%(\$1:chan3UNT.VAL)[^OK]";
+	ExtraInput = Ignore;
+}
+
+queryChan4Info {
+	out "$CHI4";
+	in  "$CHI4:ANO%(\$1:chan4ANO.VAL)d,"
+	    "NAM%(\$1:chan4NAM.VAL)[^,\s],"
+	    "SNO%(\$1:chan4SNO.VAL)d,"
+	    "OFS%(\$1:chan4OFS.VAL)d,"
+	    "RNG%(\$1:chan4RNG.VAL)d,"
+	    "UNT%(\$1:chan4UNT.VAL)[^OK]";
+	ExtraInput = Ignore;
+}
+
+queryLinMode {
+	out "$LIN?";
+	in  "$LIN?%(\$1:chan1LinModeM.VAL)d,"
+	    "%(\$1:chan2LinModeM.VAL)d,"
+	    "%(\$1:chan3LinModeM.VAL)d,"
+	    "%(\$1:chan4LinModeM.VAL)dOK";
+	ExtraInput = Ignore;
+}
+
+setCh1LinearMode {
+	out "$LIN1:%d";
+	in  "$LIN1:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh2LinearMode {
+	out "$LIN2:%d";
+	in  "$LIN2:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh3LinearMode {
+	out "$LIN3:%d";
+	in  "$LIN3:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh4LinearMode {
+	out "$LIN4:%d";
+	in  "$LIN4:%dOK";
+	ExtraInput = Ignore;
+}
+
+clearMathFunc {
+	out "$CMF%d";
+	in  "$CMF%dOK";
+	ExtraInput = Ignore;
+}
+
+queryStatus {
+	out "$STS";
+	in  "$STS%(\$1:chan1StatM.VAL)d,"
+	    "%(\$1:chan2StatM.VAL)d,"
+	    "%(\$1:chan3StatM.VAL)d,"
+	    "%(\$1:chan4StatM.VAL)dOK";
+	ExtraInput = Ignore;
+}
+
+queryDataPort {
+	out "$GDP";
+	in  "$GDP%dOK";
+	ExtraInput = Ignore;
+}
+
+setDataPort {
+	out "$SDP%d";
+	in  "$SDP%dOK";
+	ExtraInput = Ignore;
+}
+
+queryMeasData {
+	out "$GMD";
+	in  "$GMDOK%d";
+	ExtraInput = Ignore;
+}
+
+setCh1LinearPoint {
+	out "$SLP1:%d";
+	in  "$SLP1:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh2LinearPoint {
+	out "$SLP2:%d";
+	in  "$SLP2:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh3LinearPoint {
+	out "$SLP3:%d";
+	in  "$SLP3:%dOK";
+	ExtraInput = Ignore;
+}
+
+setCh4LinearPoint {
+	out "$SLP4:%d";
+	in  "$SLP4:%dOK";
+	ExtraInput = Ignore;
+}
+
+queryAnalogFilter {
+	out "$ALP?";
+	in  "$ALP?%dOK";
+	ExtraInput = Ignore;
+}
+
+setAnalogFilter {
+	out "$ALP%d";
+	in  "$ALP%dOK";
+	ExtraInput = Ignore;
+}
+

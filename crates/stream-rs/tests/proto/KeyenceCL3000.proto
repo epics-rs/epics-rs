@@ -1,0 +1,97 @@
+Terminator = CR;
+
+emission_ctrl {
+	out "LC,%i";
+	in "LC";
+	@mismatch {in "%(\$1:errorString)s";}
+}
+
+setMode {
+	out "%s";
+	in "%(\$1:mode_RBV)s";
+	@mismatch {in "%(\$1:errorString)s";}
+}
+
+autoZero {
+	out "ZS,%i,\$1";
+	in "ZS";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+setOffset {
+	out "SW,OF,\$1,%+08.4f";
+	in "SW,OF";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+setOffsetStr {
+	out "SW,OF,\$1,%s";
+	in "SW,OF";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+getOffset {
+	out "SR,OF,\$1";
+	in "SR,OF,\$1,%f";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+setScaling {
+	out "SW,SC,\$1,+00.0000,+00.0000,+01.0000,%+08.4f";
+	in "SW,SC";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+setScalingStr {
+	out "SW,SC,\$1,%s";
+	in "SW,SC";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+	
+
+getScaling {
+	out "SR,SC,\$1";
+	in "SR,SC,\$1,%*f,%*f,%*f,%f";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+# Measurement value get request options.
+#  0: Measurement value only
+#  1: Measurement value + Measurement result information
+#  2: Measurement value + Judgment result
+#  3: Measurement value + Measurement result information + Judgment result
+#  4: Count value + Measurement value
+#  5: Count value + Measurement value + Measurement result information
+#  6: Count value + Measurement value + Judgment result
+#  7: Count value + Measurement value + Measurement result information + Judgment result
+
+
+getMeas {
+	out "MS,%(\$2:\$1:measType)i,\$1";
+	in "MS,%(\$2:\$1:measString)s";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+# generic send/receive a command. Note that it requires the first two chars of
+# the send string to be the length, so external formatting is required. 
+sendCmd {
+   out "%s";
+   in "%(\$2:\$1:replyString)s";
+}
+
+# Unused/not fully tested or troubleshot
+
+
+startAuto {
+	out "NS,%(\$2:\$1:measType),\$1";
+	in "NS";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+stopAuto {
+	out "NT";
+	in "NT";
+	@mismatch {in "%(\$2:\$1:errorString)s";}
+}
+
+

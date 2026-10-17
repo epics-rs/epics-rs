@@ -1,0 +1,2 @@
+Terminator = CR foo;
+p { out "a"; }

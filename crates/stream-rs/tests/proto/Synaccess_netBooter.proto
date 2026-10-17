@@ -1,0 +1,87 @@
+# Protocol file for Synaccess networked power strips
+# Additional documentation can be found at https://www.synaccess-net.com/
+
+OutTerminator = CR LF;
+InTerminator = "";
+
+
+reboot
+{
+  ExtraInput=Ignore;
+  out "$A4 \$1";
+  in "%*s";
+}
+
+
+setall
+{
+  ExtraInput=Ignore;
+  out "$A7 \$1";
+  in "%*s";
+}
+
+
+set
+{
+  ExtraInput=Ignore;
+  out "$A3 \$1 %d";
+  in "%*s";
+}
+
+
+get_status5
+{
+  ExtraInput=Ignore;
+
+  out "$A5";
+
+  @mismatch {
+      in
+        "%*1c" # sometimes it sends a <00> ?
+        "$A5\r\n"
+        "%*4c"
+        "%(\$1\$2status5.RVAL)1b"
+        "%(\$1\$2status4.RVAL)1b"
+        "%(\$1\$2status3.RVAL)1b"
+        "%(\$1\$2status2.RVAL)1b"
+        "%(\$1\$2status1.RVAL)1b";
+  }
+
+  in 
+    "$A5\r\n"   # from echoed input
+    "%*4c"      # ignore return status ($A0)
+    "%(\$1\$2status5.RVAL)1b"
+    "%(\$1\$2status4.RVAL)1b"       
+    "%(\$1\$2status3.RVAL)1b"       
+    "%(\$1\$2status2.RVAL)1b"
+    "%(\$1\$2status1.RVAL)1b";
+
+}
+
+
+get_status16
+{
+  ExtraInput=Ignore;
+
+  out "$A5";
+
+  in 
+    "$A5\r\r\n"   # from echoed input
+    "%*4c"      # ignore return status ($A0)
+    "%(\$1\$2status16.RVAL)1b"
+    "%(\$1\$2status15.RVAL)1b"       
+    "%(\$1\$2status14.RVAL)1b"       
+    "%(\$1\$2status13.RVAL)1b"
+    "%(\$1\$2status12.RVAL)1b"
+    "%(\$1\$2status11.RVAL)1b"
+    "%(\$1\$2status10.RVAL)1b"       
+    "%(\$1\$2status9.RVAL)1b"       
+    "%(\$1\$2status8.RVAL)1b"
+    "%(\$1\$2status7.RVAL)1b"
+    "%(\$1\$2status6.RVAL)1b"
+    "%(\$1\$2status5.RVAL)1b"
+    "%(\$1\$2status4.RVAL)1b"
+    "%(\$1\$2status3.RVAL)1b"
+    "%(\$1\$2status2.RVAL)1b"
+    "%(\$1\$2status1.RVAL)1b";
+}

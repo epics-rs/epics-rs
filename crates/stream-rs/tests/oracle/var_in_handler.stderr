@@ -1,0 +1,3 @@
+_main_ var_in_handler.proto line 3: Variables are not allowed in handlers: x
+_main_ var_in_handler.proto line 2: in handler '@init'
+_main_ var_in_handler.proto line 1: in protocol 'p'

@@ -1,0 +1,21 @@
+ExtraInput=Ignore;
+
+# set a short timeout since we don't have an input terminator
+ReadTimeout=17;
+
+sync {
+   out "\x80";
+   in "%(\$1:sync.VAL)1r";
+}
+reg69_raw {
+   out "\x80\x51\x04\x04\x00\x00\x69\x00\x42\x01";
+   in "%*4r%(\$1:reg69_raw.VAL)#2r%*2r";
+}
+reg68_raw {
+   out "\x80\x51\x04\x04\x00\x00\x68\x00\x41\x01";
+   in "%*4r%(\$1:reg68_raw.VAL)#2r%*2r";
+}
+reg27_raw {
+   out "\x80\x51\x04\x04\x00\x00\x27\x00\x00\x01";
+   in "%*4r%(\$1:reg27_raw.VAL)#2r%*2r";
+}

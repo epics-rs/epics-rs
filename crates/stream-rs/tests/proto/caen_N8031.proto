@@ -1,0 +1,128 @@
+OutTerminator = CR LF;
+InTerminator = CR LF;
+
+read_voltages {
+    out "$CMD:MON,CH:8,PAR:VMON";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:Voltage_RBV)f;"
+        "%(\$1CH1:Voltage_RBV)f;"
+        "%(\$1CH2:Voltage_RBV)f;"
+        "%(\$1CH3:Voltage_RBV)f;"
+        "%(\$1CH4:Voltage_RBV)f;"
+        "%(\$1CH5:Voltage_RBV)f;"
+        "%(\$1CH6:Voltage_RBV)f;"
+        "%(\$1CH7:Voltage_RBV)f";
+}
+
+read_currents {
+    out "$CMD:MON,CH:8,PAR:IMON";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:Current_RBV)f;"
+        "%(\$1CH1:Current_RBV)f;"
+        "%(\$1CH2:Current_RBV)f;"
+        "%(\$1CH3:Current_RBV)f;"
+        "%(\$1CH4:Current_RBV)f;"
+        "%(\$1CH5:Current_RBV)f;"
+        "%(\$1CH6:Current_RBV)f;"
+        "%(\$1CH7:Current_RBV)f";
+}
+
+read_power_states {
+    out "$CMD:MON,CH:8,PAR:PW";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:Power_RBV){OFF|ON};"
+        "%(\$1CH1:Power_RBV){OFF|ON};"
+        "%(\$1CH2:Power_RBV){OFF|ON};"
+        "%(\$1CH3:Power_RBV){OFF|ON};"
+        "%(\$1CH4:Power_RBV){OFF|ON};"
+        "%(\$1CH5:Power_RBV){OFF|ON};"
+        "%(\$1CH6:Power_RBV){OFF|ON};"
+        "%(\$1CH7:Power_RBV){OFF|ON}";
+}
+
+read_ramp_up_rates {
+    out "$CMD:MON,CH:8,PAR:RUP";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:RampUpRate_RBV)d;"
+        "%(\$1CH1:RampUpRate_RBV)d;"
+        "%(\$1CH2:RampUpRate_RBV)d;"
+        "%(\$1CH3:RampUpRate_RBV)d;"
+        "%(\$1CH4:RampUpRate_RBV)d;"
+        "%(\$1CH5:RampUpRate_RBV)d;"
+        "%(\$1CH6:RampUpRate_RBV)d;"
+        "%(\$1CH7:RampUpRate_RBV)d";
+}
+
+read_ramp_down_rates {
+    out "$CMD:MON,CH:8,PAR:RDWN";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:RampDownRate_RBV)d;"
+        "%(\$1CH1:RampDownRate_RBV)d;"
+        "%(\$1CH2:RampDownRate_RBV)d;"
+        "%(\$1CH3:RampDownRate_RBV)d;"
+        "%(\$1CH4:RampDownRate_RBV)d;"
+        "%(\$1CH5:RampDownRate_RBV)d;"
+        "%(\$1CH6:RampDownRate_RBV)d;"
+        "%(\$1CH7:RampDownRate_RBV)d";
+}
+
+read_power_down_modes {
+    out "$CMD:MON,CH:8,PAR:PDWN";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH1:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH2:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH3:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH4:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH5:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH6:PowerDownMode_RBV){RAMP|KILL};"
+        "%(\$1CH7:PowerDownMode_RBV){RAMP|KILL}";
+}
+
+read_imon_ranges {
+    out "$CMD:MON,CH:8,PAR:IMRANGE";
+    in
+        "#CMD:OK,VAL:"
+        "%(\$1CH0:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH1:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH2:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH3:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH4:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH5:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH6:IMonRange_RBV){HIGH|LOW};"
+        "%(\$1CH7:IMonRange_RBV){HIGH|LOW}";
+}
+
+set_power {
+    out "$CMD:SET,CH:\$1,PAR:PW,VAL:%{OFF|ON}";
+}
+
+set_voltage {
+    out "$CMD:SET,CH:\$1,PAR:VSET,VAL:%f";
+}
+
+set_current {
+    out "$CMD:SET,CH:\$1,PAR:VSET,VAL:%f";
+}
+
+set_ramp_up {
+    out "$CMD:SET,CH:\$1,PAR:RUP,VAL:%d";
+}
+
+set_ramp_down {
+    out "$CMD:SET,CH:\$1,PAR:RDWN,VAL:%d";
+}
+
+set_power_down_mode {
+    out "$CMD:SET,CH:\$1,PAR:PDWN,VAL:%{RAMP|KILL}";
+}
+
+set_imon_range {
+    out "$CMD:SET,CH:\$1,PAR:IMRANGE,VAL:%{HIGH|LOW}";
+}

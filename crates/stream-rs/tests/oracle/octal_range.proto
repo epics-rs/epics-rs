@@ -1,0 +1,2 @@
+Terminator = "\0777";
+p { out "a"; }

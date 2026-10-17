@@ -1,0 +1,97 @@
+#
+# Support for the SRS SG390
+#
+# Abridged Index of Commands: page 127 of SG390m.pdf
+# Detailed Command List: page 130 of SG390m.pdf
+# Network configuration: Page 124 of SG390m.pdf
+#   Port 5025 = raw socket access (Bare enabled in menu)
+#   Port 5024 = telnet access (Telnet enabled in menu)
+
+InTerminator = CR LF;
+OutTerminator = LF;
+ReadTimeout = 500;
+
+getIdString
+{
+  out "*IDN?";
+  # Example input:
+  #    "Stanford Research Systems,SG394,s/n004025,ver1.00.0B"
+  in "%120c";
+}
+
+getFreq
+{
+  out "FREQ?";
+  in "%f";
+}
+
+setFreq
+{
+  out "FREQ %f";
+}
+
+setFreqMHz
+{
+  out "FREQ %f MHz";
+}
+
+getFreqMHz
+{
+  out "FREQ? MHz";
+  in "%f";
+}
+
+getAmp
+{
+  out "AMPR?";
+  in "%f";
+}
+
+setAmp
+{
+  out "AMPR %f";
+}
+
+getAmpRMS
+{
+  out "AMPR? RMS";
+  in "%f";
+}
+
+setAmpRMS
+{
+  out "AMPR %f RMS";
+}
+
+getPhase
+{
+  out "PHAS?";
+  in "%f";
+}
+
+setPhase
+{
+  out "PHAS %f";
+}
+
+getRF
+{
+  out "ENBR?";
+  in "%d";
+}
+
+setRF
+{
+  out "ENBR %d";
+}
+
+getLF
+{
+  out "ENBL?";
+  in "%d";
+}
+
+setLF
+{
+  out "ENBL %d";
+}

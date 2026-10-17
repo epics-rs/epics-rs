@@ -1,0 +1,109 @@
+# Agilent PS 66xxA Streams Protocol File 
+#
+#####
+# Interface: SCPI based ASCII 
+#
+#       Function         Commands (SCPI)
+#      --------------   ---------------
+#       ID            - *IDN?
+#       setVolt       - VOLT ##.##
+#       getVolt       - VOLT?
+#       getOutVolt    - MEAS:VOLT?
+#       setCurrent    - CURR ##.##
+#       getCurrent    - CURR?
+#       getOutCurrent - MEAS:CURR?
+#       setOnOff      - OUTP [1,0]
+#       setVoltLimit  - VOLT:PROT ##.##
+#       Reset PS3xx   - *RST
+#    
+
+ExtraInput = Ignore;
+ReplyTimeout = 1000;
+#Terminator = LF;
+
+getOutVolt {
+  out "MEAS:VOLT?";
+  in "%E";
+  @init {out "MEAS:VOLT?"; in "%E";}
+}
+
+setVoltLevel {
+  out "VOLT:LEVEL %.3E";
+  @init {out "VOLT:LEVEL?"; in "%E";}
+}
+
+getVoltLevel {
+  out "VOLT:LEVEL?";
+  in "%E";
+  @init {out "VOLT:LEVEL?"; in "%E";}
+}
+
+setVoltProt {
+  out "VOLT:PROT %.2E";
+  @init {out "VOLT:PROT? "; in "%E";}
+}
+
+getVoltProt {
+  out "VOLT:PROT?";
+  in "%E";
+  @init {out "VOLT:PROT?"; in "%E";}
+}
+
+getOutCurrent {
+  out "MEAS:CURR?";
+  in "%E";
+  @init {out "MEAS:CURR?"; in "%E";}
+}
+
+setCurrentLevel {
+  out "CURR:LEVEL %.2E";
+  @init {out "CURR:LEVEL?"; in "%E";}
+}
+
+getCurrentLevel {
+  out "CURR:LEVEL?";
+  in "%E";
+  @init {out "CURR:LEVEL?"; in "%E";}
+}
+
+setOnOff {
+  out "OUTP %{OFF|ON}";
+  @init {out "OUTP?"; in "%d";}
+}
+
+getOnOff {
+  out "OUTP?";
+  in "%d";
+  @init {out "OUTP?"; in "%d";}
+}
+
+getID {
+  out "*IDN?"; in "%s";
+  @init {out "*IDN?"; in "%s";}
+}
+
+setReset {
+  out "*RST";
+}
+
+setErrClr {
+  out "*CLS";
+  out "OUTP:PROT:CLE";
+}
+
+getStatus {
+  out "STAT:QUES:COND?";
+  in "%d";
+  @init {out "STAT:QUES:COND?"; in "%d";}
+}
+
+setOverCurrOnOff {
+  out "CURR:PROT:STAT %d";
+  @init {out "CURR:PROT:STAT?"; in "%d";}
+}
+
+getOverCurrOnOff {
+  out "CURR:PROT:STAT?";
+  in "%d";
+  @init {out "CURR:PROT:STAT?"; in "%d";}
+}

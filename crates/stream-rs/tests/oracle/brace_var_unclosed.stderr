@@ -1,0 +1,3 @@
+_main_ brace_var_unclosed.proto line 2: Expect '}' instead of ';' after: $x
+_main_ brace_var_unclosed.proto line 2: after command 'out'
+_main_ brace_var_unclosed.proto line 1: in protocol 'p'

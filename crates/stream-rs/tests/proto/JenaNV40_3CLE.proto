@@ -1,0 +1,65 @@
+# Protocol file for Piezosystem Jena NV 40/3 CLE
+
+############  SVN Repository information  #############
+# $Date$
+# $Author$
+# $Revision$
+# $HeadURL$
+# $Id$
+#######################################################
+
+### Default serial settings
+# Baud		19200
+# Data bits	8
+# Stop bits	1
+# Parity	no
+# Flow Control  IXON = Yes
+
+OutTerminator = CR;
+InTerminator = CR;
+
+#versionRead {
+#  out "ver";
+#  in "ver,%s";
+#}
+
+#errorRead {
+#  out "ERR?";
+#  in "ERROR,%s";
+#}
+
+remoteSet {
+  out "setk,\$1,%{0|1}";
+}
+
+#remoteRead {
+#  out "setk,\$1";
+#  in "%i";
+#}
+
+cloopSet {
+  out "cloop,\$1,%{0|1}";
+}
+
+cloopRead {
+  out "cloop,\$1";
+  in "cloop,\$1,%i";
+}
+
+piezoMove {
+  out "set,\$1,%f";
+}
+
+piezoRead {
+  out "rk,\$1";
+  in "rk,\$1,%f";
+}
+
+monModeSet {
+  out "monwpa,\$1,%{0|1|2}";
+}
+
+monModeRead {
+  out "monwpa,\$1";
+  in "monwpa,\$1,%i";
+}

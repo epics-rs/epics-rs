@@ -1,0 +1,125 @@
+########################################################################
+# Protocol file for the Thorlabs SC10 shutter controller
+#
+# Author: M. Wyman (APS)
+# Date: July 2023
+########################################################################
+
+
+ExtraInput = Ignore;
+timeout = 2000;
+ReadTimeout = 500;
+
+#Terminator set to be \r for output and \r> for input in asyn options
+#Terminator = CR;
+
+
+#######################################
+getID {
+	out "id?";
+	in "id?\x0d%s"
+}
+
+#######################################
+
+setEnable{
+	out "ens";
+	in "ens";
+}
+
+getEnable{
+	out "ens?";
+	in "ens?\x0d%{0|1}";
+}
+
+setTrig{
+	out "trig=%{0|1}";
+	in "trig=%{0|1}";
+}
+
+getTrig{
+	out "trig?";
+	in "trig?\x0d%{0|1}";
+}
+
+setXTO{
+	out "xto=%{0|1}";
+	in "xto=%{0|1}";
+}
+
+getXTO{
+	out "xto?";
+	in "xto?\x0d%{0|1}";
+}
+
+getClosed{
+	out "closed?";
+	in "closed?\x0d%{0|1}";
+}
+
+getInterlock{
+	out "interlock?";
+	in "interlock?\x0d%{0|1}";
+}
+
+#######################################
+#multi-bit binary
+
+setMode{
+	out "mode=%i";
+	in "mode=%i";
+}
+
+getMode{
+	out "mode?";
+	in "mode?\x0d%i";
+}
+
+#######################################
+
+setRep{
+	out "rep=%i";
+	in "rep=%i";
+}
+
+getRep{
+	out "rep?";
+	in "rep?\x0d%i";
+}
+
+setOpen{
+	out "open=%i";
+	in "open=%i";
+}
+
+getOpen{
+	out "open?";
+	in "open?\x0d%i";
+}
+
+setShut{
+	out "shut=%i";
+	in "shut=%i";
+}
+
+getShut{
+	out "shut?";
+	in "shut?\x0d%i";
+}
+
+#######################################
+
+saveComm{
+	out "save";
+	in "save";
+}
+
+saveProg{
+	out "savp";
+	in "savp";
+}
+  
+restoreProg{
+	out "resp";
+	in "resp";
+} 

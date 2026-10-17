@@ -1,0 +1,2 @@
+_main_ hex_expected.proto line 1: Hex digit expected after \x: "\x""
+_main_ in string variable 'terminator' in protocol file 'hex_expected.proto' line 1

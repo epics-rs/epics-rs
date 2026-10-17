@@ -1,0 +1,267 @@
+# Omega_DP41.proto
+
+# stream protocol file for Omega DP41 series meters
+
+# Mark Rivers
+# May 4, 2007
+
+OutTerminator = CR;
+InTerminator = CR;
+PREFIX = *;
+
+readUnfiltered {
+   out "\${PREFIX}X01";
+   in "X01%f";
+}
+
+readFiltered {
+   out "\${PREFIX}X04";
+   in "X04%f";
+}
+
+readPeak {
+   out "\${PREFIX}X02";
+   in "X02%f";
+}
+
+readValley {
+   out "\${PREFIX}X03";
+   in "X03%f";
+}
+
+readSetpointStatus {
+   out "\${PREFIX}U01";
+   in "U01%(AA)1c";
+}
+
+readPeakValleyStatus {
+   out "\${PREFIX}U02";
+   in "U02%x";
+}
+
+readMicrocodeRevision {
+   out "\${PREFIX}U03";
+   in "U03%x";
+}
+
+readLockout1 {
+   out "\${PREFIX}R01";
+   in "R01%x";
+}
+
+readLockout2 {
+   out "\${PREFIX}R02";
+   in "R02%x";
+}
+
+readLockout3 {
+   out "\${PREFIX}R03";
+   in "R03%x";
+}
+
+readLockout4 {
+   out "\${PREFIX}R04";
+   in "R04%x";
+}
+
+readInputType {
+   out "\${PREFIX}R05";
+   in "R05%x";
+}
+
+readReadConfig {
+   out "\${PREFIX}R07";
+   in "R07%x";
+}
+
+readReadScale {
+   out "\${PREFIX}R08";
+   in "R08%x";
+}
+
+readReadOffset {
+   out "\${PREFIX}R09";
+   in "R09%x";
+}
+readInputConfig {
+   out "\${PREFIX}R0A";
+   in "R0A%x";
+}
+
+readInputScale {
+   out "\${PREFIX}R0B";
+   in "R0B%x";
+}
+
+readDecimalPoint {
+   out "\${PREFIX}R0C";
+   in "R0C%x";
+}
+
+readFilter {
+   out "\${PREFIX}R0E";
+   in "R0E%x";
+}
+
+readSPConfig {
+   out "\${PREFIX}R10";
+   in "R10%x";
+}
+
+readALConfig {
+   out "\${PREFIX}R11";
+   in "R11%x";
+}
+
+readALFunction {
+   out "\${PREFIX}R12";
+   in "R12%x";
+}
+
+readALReading {
+   out "\${PREFIX}R13";
+   in "R13%x";
+}
+
+readSPHyteresis {
+   out "\${PREFIX}R14";
+   in "R14%x";
+}
+
+readALHyteresis {
+   out "\${PREFIX}R15";
+   in "R15%x";
+}
+
+readOutputConfig {
+   out "\${PREFIX}R16";
+   in "R16%x";
+}
+
+readOutputScale {
+   out "\${PREFIX}R17";
+   in "R17%x";
+}
+
+readSerialConfig {
+   out "\${PREFIX}R18";
+   in "R18%x";
+}
+
+readAddress {
+   out "\${PREFIX}R1A";
+   in "R1A%x";
+}
+
+readDataFormat {
+   out "\${PREFIX}R1B";
+   in "R1B%x";
+}
+
+readBusFormat {
+   out "\${PREFIX}R1C";
+   in "R1C%x";
+}
+
+readSerialCount {
+   out "\${PREFIX}R1D";
+   in "R1D%x";
+}
+
+readSerialRecog {
+   out "\${PREFIX}R1E";
+   in "R1E%x";
+}
+
+readSerialUnit {
+   out "\${PREFIX}R1F";
+   in "R1F%x";
+}
+
+readSerialDelay {
+   out "\${PREFIX}R20";
+   in "R20%x";
+}
+
+readSP1Value {
+   out "\${PREFIX}R21";
+   in "R21%x";
+}
+
+readSP2Value {
+   out "\${PREFIX}R22";
+   in "R22%x";
+}
+
+readSP3Value {
+   out "\${PREFIX}R23";
+   in "R23%x";
+}
+
+readSP4Value {
+   out "\${PREFIX}R24";
+   in "R24%x";
+}
+
+readInputOffset {
+   out "\${PREFIX}R25";
+   in "R25%x";
+}
+
+readOutputOffset {
+   out "\${PREFIX}R26";
+   in "R26%x";
+}
+
+resetLatchedAlarms {
+   out "\${PREFIX}Z01";
+   in "Z01";
+}
+
+resetAveragingFilter {
+   out "\${PREFIX}Z02";
+   in "Z02";
+}
+
+resetSoft {
+   out "\${PREFIX}Z03";
+   in "Z03";
+}
+
+resetHard {
+   out "\${PREFIX}Z04";
+   in "Z04";
+}
+
+resetPeakValley {
+   out "\${PREFIX}Z05";
+   in "Z05";
+}
+
+writeSP1Value {
+   out "\${PREFIX}W21%6.6X";
+   in "W21";
+   out "\${PREFIX}P21%6.6X";
+   in "P21";
+}
+
+writeSP2Value {
+   out "\${PREFIX}W22%6.6X";
+   in "W22";
+   out "\${PREFIX}P22%6.6X";
+   in "P22";
+}
+
+writeSP3Value {
+   out "\${PREFIX}W23%6.6X";
+   in "W23";
+   out "\${PREFIX}P23%6.6X";
+   in "P23";
+}
+
+writeSP4Value {
+   out "\${PREFIX}W24%6.6X";
+   in "W24";
+   out "\${PREFIX}P24%6.6X";
+   in "P24";
+}

@@ -1,0 +1,45 @@
+# This is the streamDevice protocol file for the Omega iSeries
+# Monitor/Controller 
+InTerminator = CR;
+OutTerminator = CR;
+ReadTimeout = 400;
+WriteTimeout = 100;
+RGCmd{
+	out "*\$3\$1";in "\$3\$1%\$2";
+}
+
+RCmd {
+	out "*R\$1";in "R\$1%\$2";
+}
+
+XCmd {
+	out "*\$2\$1";in "\$2\$1%f";
+}
+
+U01Cmd {
+	out "*\$1U01";in "\$1U01%{@|A|B|C}";
+}
+
+U03Cmd {
+	out "*\$1U03";in "\$1U03%s";
+}
+
+WCmd {
+	out "*\$3W\$1%0\$2";in "\$3W\$1";
+}
+
+DCmd {
+	out "*\$2D\$1";in "\$2D\$1";
+}
+
+ECmd {
+	out "*\$2E\$1";in "\$2E\$1";
+}
+
+EDCmd {
+	out "*\$2%{D|E}\$1"; in "\$2%{D|E}\$1";
+	}
+
+ZCmd {
+	out "*\$1Z02"; in "\$1Z02";
+}

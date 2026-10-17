@@ -1,0 +1,2 @@
+OutTerminator = "a\999";
+p { out "a"; }

@@ -1,0 +1,62 @@
+# Tabor8024.proto
+
+# StreamDevice protocol file for Tabor 8024 Arbitrary Waveform Generator
+# Most of the protocols are generic to many commands, but a few are for specific commands.
+
+# Mark Rivers
+# November 16, 2013
+
+# Some commands can take a long time to reply
+ReplyTimeout = 3000;
+WriteTimeout = 3000;
+# Many records have PINI=YES, so there can be many operations in the queue
+# Need at least 15 seconds LockTimeout to prevent queue timeout
+LockTimeout = 30000;
+
+getString {
+   out "\$1?";
+   in  "%s";
+}
+
+setString {
+   out "\$1 %s";
+}
+
+getInt {
+   out "\$1?";
+   in  "%d";
+   ExtraInput = Ignore;
+}
+
+setInt {
+   out "\$1 %d";
+}
+
+getFloat {
+   out "\$1?";
+   in  "%f";
+}
+
+setFloat {
+   out "\$1 %f";
+}
+
+setNone {
+   out "\$1";
+}
+
+setWaveform {
+   out ":TRAC:DATA #0%.2r\n";
+   WriteTimeout = 10000;
+}
+
+setUserWfSize {
+   out ":TRAC:DEL \$1";
+   out ":TRAC:DEF \$1,%d";
+   WriteTimeout = 5000;
+}
+
+getError {
+   out ":SYST:ERR?";
+   in  "%40c";
+}

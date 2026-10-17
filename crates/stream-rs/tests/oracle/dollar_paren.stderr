@@ -1,0 +1,3 @@
+_main_ dollar_paren.proto line 1: Unexpected '(' after '$'
+,_main_ dollar_paren.proto line 1: after command 'out'
+_main_ dollar_paren.proto line 1: in protocol 'p'

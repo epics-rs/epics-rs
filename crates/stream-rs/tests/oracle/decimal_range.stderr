@@ -1,0 +1,2 @@
+_main_ decimal_range.proto line 1: Decimal number 999 does not fit in byte: "\999""
+_main_ in string variable 'outterminator' in protocol file 'decimal_range.proto' line 1

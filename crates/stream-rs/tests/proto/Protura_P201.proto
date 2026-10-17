@@ -1,0 +1,9 @@
+InTerminator = CR;
+OutTerminator = ;
+
+ReplyTimeout = 1000;
+
+getPos {
+   out "?";
+   in  "%\$1b%*s";
+}

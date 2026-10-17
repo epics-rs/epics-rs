@@ -1,0 +1,11 @@
+--- a/src/StreamBuffer.cc
++++ b/src/StreamBuffer.cc
+@@ -373,7 +373,7 @@
+     for (i = start; i < end; i++)
+     {
+         c = buffer[i];
+-        if (c < 0x20 || c >= 0x7f)
++        if (c < 0x20 || c >= 0x7f || c == '<')
+             result.print("%s<%02x>%s",
+                          ansiEscape(ANSI_REVERSE_VIDEO),
+                          c & 0xff,

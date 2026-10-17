@@ -1,0 +1,2 @@
+_main_ handler_brace.proto line 2: Expect handler name before '{'
+_main_ handler_brace.proto line 1: in protocol 'p'

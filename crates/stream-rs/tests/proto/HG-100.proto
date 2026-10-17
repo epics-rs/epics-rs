@@ -1,0 +1,26 @@
+# HG-100.proto
+
+# stream protocol file for L&C HG-100 humidity controller
+# It actually is communicating with the CAL 3300 temperature controller inside the HG-100.
+
+# Mark Rivers
+# February 19, 2018
+
+ExtraInput=Ignore;
+
+setSetPoint {
+   out "\x01\x06\x03\x00\x00\x05%#<modbus>";
+    in "\x01\x06\x03\x00\x00\x05%#<modbus>";
+   out "\x01\x06\x15\x00\x00\x00%#<modbus>";
+    in "\x01\x06\x15\x00\x00\x00%#<modbus>";
+   out "\x01\x06\x00\x7f%.2r%#<modbus>";
+    in "\x01\x06\x00\x7f";
+   out "\x01\x06\x03\x00\x00\x06%#<modbus>";
+    in "\x01\x06\x03\x00\x00\x06%#<modbus>";
+   out "\x01\x06\x16\x00\x00\x00%#<modbus>";
+    in "\x01\x06\x16\x00\x00\x00%#<modbus>";
+}
+
+
+
+

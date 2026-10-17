@@ -1,0 +1,102 @@
+# Stream Protocol File for the following power supplies 
+# - Advanced Energy iLS series
+# - Versatile Power XR series
+#####
+# Interface: ASCII (LAN, port 8003)
+#
+
+getIDN { 
+  out "*IDN?";
+  in "%80c";
+}
+
+getError { 
+  out "SYST:ERR:COND?";
+  in "%d";
+}
+
+getVoltMeas {
+  out "MEAS:VOLT?";
+  in "%f";
+}
+
+getCurrentMeas {
+  out "MEAS:CURR?";
+  in "%f";
+}
+
+getVoltSet {
+  out "VOLT?";
+  in "%f";
+}
+
+getCurrentSet {
+  out "CURR?";
+  in "%f";
+}
+
+getPowerSet {
+  out "POW?";
+  in "%f";
+}
+
+getOutState {
+  out "OUTP?";
+  in "%s";
+}
+
+setOutState {
+  out "OUTP:STAT %s";
+}
+
+setVolt {
+  out "VOLT %f";
+}
+
+setCurrent {
+  out "CURR %f";
+}
+
+setPower {
+  out "POW %f";
+}
+
+getOVPValue  {
+  out "VOLT:PROT?";
+  in "%f";
+}
+
+getOCPValue  {
+  out "CURR:PROT?";
+  in "%f";
+}
+
+getOPPValue  {
+  out "POW:PROT?";
+  in "%f";
+}
+
+setOVPValue  {
+  out "VOLT:PROT %f";
+}
+
+setOCPValue  {
+  out "CURR:PROT %f";
+}
+
+setOPPValue  {
+  out "POW:PROT %f";
+}
+
+getMode  {
+  out "SYST:MODE?";
+  in "%s";
+}
+
+setMode  {
+  out "SYST:MODE %s";
+}
+
+clearError  {
+  out "SYST:ERR:CLE";
+}

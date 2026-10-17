@@ -1,0 +1,2 @@
+Terminator = "a	b";
+p { out "a"; }

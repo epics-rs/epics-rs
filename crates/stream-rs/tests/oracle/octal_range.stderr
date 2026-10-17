@@ -1,0 +1,2 @@
+_main_ octal_range.proto line 1: Octal number 0777 does not fit in byte: "\0777""
+_main_ in string variable 'terminator' in protocol file 'octal_range.proto' line 1

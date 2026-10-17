@@ -1,0 +1,3 @@
+_main_ wait_garbage.proto line 0: Garbage after numeric value: 5x
+_main_ wait_garbage.proto line 2: in command 'wait'
+_main_ wait_garbage.proto line 1: in protocol 'p'

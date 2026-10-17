@@ -1,0 +1,87 @@
+Terminator = CR;
+#
+# \$1, first parameter to all protocols, is destination unit number of 
+# controller, a single digit
+# \$2, second parameter in some, is A,B,or C, which pump on controller. 
+#
+
+#
+# Controller communication
+#
+ping {
+   out "\r\$1R %0<nsum>";
+   in "R %0<nsum>";
+}
+getModel {
+   out "\$1R008IDENTIFY%0<nsum>";
+   in "R0\?\?%#s";
+}
+setRem {
+   out "\$1R006REMOTE%0<nsum>";
+   in "R %0<nsum>";
+}
+setLoc {
+   out "\$1R005LOCAL%0<nsum>";
+   in "R %0<nsum>";
+}
+#
+# Pump communication
+#
+setRun {
+   out "\$1R004RUN\$2%0<nsum>";
+   in "R %0<nsum>";
+}
+setStop {
+   out "\$1R005STOP\$2%0<nsum>";
+   in "R %0<nsum>";
+}
+getVol {
+   out "\$1R004VOL\$2%0<nsum>";
+   in "R0\?\?VOL\$2=%f %0<nsum>";
+}
+# get pressure setpoint
+getSetPress {
+   out "\$1R009SETPRESS\$2%0<nsum>";
+   in "R0\?\?PRESS\$2=%f %0<nsum>";
+}
+setPress {
+   out "\$1R00FPRESS\$2=%08.4f%0<nsum>";
+   in "R %0<nsum>";
+   @init { getSetPress; };
+}
+# get pressure reading
+getPress {
+   out "\$1R006PRESS\$2%0<nsum>";
+   in "R0\?\?PRESS\$2=%f %0<nsum>";
+}
+# get flow reading
+getFlow {
+   out "\$1R005FLOW\$2%0<nsum>";
+   in "R0\?\?FLOW\$2= %f %0<nsum>";
+}
+# get max flow setpoint
+getMFlow {
+   out "\$1R006MFLOW\$2%0<nsum>";
+   in "R0\?\?FLOW\$2= %f %0<nsum>";
+}
+# set max flow
+setMFlow {
+   out "\$1R00FMFLOW\$2=%08.4f%0<nsum>";
+   in "R %0<nsum>";
+   @init { getMFlow; };
+}
+getStatus {
+   out "\$1R007STATUS\$2%0<nsum>";
+   in "R0\?\?STATUS=%#s";
+}
+
+#
+# generic send/receive a command. Note that it requires the first two chars of
+# the send string to be the length, so external formatting is required. 
+sendCmd {
+   out "\$1R0%s%0<nsum>";
+   in "R0\?\?%#s";
+}
+
+
+

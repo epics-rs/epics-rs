@@ -1,0 +1,153 @@
+# LakeShore 336 Series Streams Protocol File 
+#
+#####
+# Interface: ASCII (INET or GPIB)
+# Four Sensor Inputs/Outputs
+# Two PID Loops
+# Two Heater Outputs
+#
+# Commands:
+#       *IDN? 				- ID Query
+#          return: <string>
+#       INTYPE? <input>			- Input Type Parameter Query
+#          return: n,n,n,n,n <sensorType>,<autorange>,<range>,<compensation>,<units>
+#       HTR? <output>  			- Heater Output Query
+#          return: +nnn.n
+#       HTRSET? <output>		- Heater Setup Query
+#          return: n,n,+n.nnn,n <htrResistance>,<maxCurrent>,<maxUserCurrent>,<current/power>
+#       HTRST? <output>			- Heater Status Query
+#          return: n<error code>
+#       <C/K/S>RDG? <input>		- Celcius/Kevin/Sensor Input Reading Query
+#          return: +nnn.n		
+#       RDGST? <input>			- Input Reading Status Query
+#          return: n <status byte> 		
+#       SETP <output>,<value> 		- Control Setpoint Command
+#       SETP? <value>	  		- Control Setpoint Query
+#          return: +nnn.nnn
+#       RANGE <output>,<range> 		- Heater Range Command
+#       RANGE? <value>  		- Heater Range Query
+#          return: <0=Off, 1=Low(On), 2=Medium, 3=High
+#       PID <output>,<P>,<I>,<D>        - Control Loop Parameters Command
+#       PID? <output> 			- Control Loop Query
+#	    return: <nnn.n>,<nnn.n>,<nnn.n>
+#       RAMP <output>,<off(0)/on(1)>,<rate> - Control Setpoint Ramp Cmd
+#       RAMP? <output> 			    - Control Setpoint Ramp Query
+#	    return: <off(0)/on(1)>,<rate>
+#    
+
+ExtraInput = Ignore;
+ReplyTimeout = 100;
+#Terminator = LF;
+
+getID { 
+	out "*IDN?";
+        in "%s";
+	@init {out "*IDN?"; in "%s";}
+	}
+
+setSETP {
+	out "SETP \$1,%f";
+        wait 100;
+	}
+
+getSETP {
+	out "SETP? \$1";
+	in "%f";
+	@init {out "SETP? \$1"; in "%f";}
+	}
+
+
+setMOUT {
+	out "MOUT \$1,%f";
+        wait 100;
+	}
+
+getMOUT {
+	out "MOUT? \$1";
+	in "%f";
+	@init {out "MOUT? \$1"; in "%f";}
+	}
+
+
+setOUTMODE {
+	out "OUTMODE \$1,%(\$2:OUT\$1:Mode.RVAL)d,%(\$2:OUT\$1:Cntrl.VAL)d,0";
+        wait 100;
+	}
+
+
+getOUTMODE {
+	out "OUTMODE? \$1";
+        in "%(\$2:OUT\$1:Mode_RBV.VAL)d,%(\$2:OUT\$1:Cntrl_RBV.VAL)d,%*d";
+	}
+
+setMODE {
+	out "MODE %d";
+        wait 100;
+	}
+
+getMODE {
+	out "MODE?";
+        in "%d";
+	}
+
+setPID {
+	out "PID \$1,%(\$2:P\$1.VAL)f,%(\$2:I\$1.VAL)f,%(\$2:D\$1.VAL)f";
+        wait 100;
+	}
+
+getPID {
+        out "PID? \$1";
+        in "%(\$2:P\$1_RBV.VAL)f,%(\$2:I\$1_RBV.VAL)f,%(\$2:D\$1_RBV.VAL)f";
+	}
+
+setInType {
+        out "INTYPE %(\$2:OUT\$1:Cntrl_RBV.VAL)s,%(\$2:IN\$1:Sensor_RBV.VAL)d,%(\$2:IN\$1:AutoRange_RBV.VAL)d,%(\$2:IN\$1:Range_RBV.VAL)d,%(\$2:IN\$1:Comp_RBV.VAL)d,%(\$2:IN\$1:Units.RVAL)d";
+	}
+
+getInType {
+        out "INTYPE? %(\$2:OUT\$1:Cntrl_RBV.VAL)s";
+        in "%(\$2:IN\$1:Sensor_RBV.VAL)d,%(\$2:IN\$1:AutoRange_RBV.VAL)d,%(\$2:IN\$1:Range_RBV.VAL)d,%(\$2:IN\$1:Comp_RBV.VAL)d,%(\$2:IN\$1:Units_RBV.VAL)d";
+	}
+
+getInput {
+        out "%(\$2:IN\$1:Units_RBV.VAL)s","RDG? ","%(\$2:OUT\$1:Cntrl_RBV.VAL)s";
+        in "%f";
+	}
+
+getInName {
+        out "INNAME? %(\$2:OUT\$1:Cntrl_RBV.VAL)s";
+        in "%[_a-zA-Z0-9 -]";
+	}
+
+getHeater {
+        out "HTR? \$1";
+        in "%f";
+	}
+
+getRange {
+        out "RANGE? \$1";
+        in "%d";
+	}
+
+setRange {
+        out "RANGE \$1,%d";
+        wait 100;
+	}
+
+getAOutput {
+        out "AOUT? \$1";
+        in "%f";
+	}
+
+setRamp {
+	out "RAMP \$1,%(\$2:OnRamp\$1.VAL)d,%(\$2:RampR\$1.VAL)f";
+        wait 100;
+	}
+
+getRamp {
+        out "RAMP? \$1";
+        in "%(\$2:OnRamp\$1_RBV.VAL)d,%(\$2:RampR\$1_RBV.VAL)f";
+	}
+
+
+

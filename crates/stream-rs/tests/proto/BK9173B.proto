@@ -1,0 +1,152 @@
+# BK Precision 9131B Power Supply Streams Protocol File 
+#
+# KG
+#
+#####
+# Interface: ASCII (RS232)
+#
+# Notes:
+#   1.  
+#
+#    
+
+ExtraInput = Ignore;
+
+getIDN { 
+	out "*IDN?";
+        in "%s";
+	@init {out "*IDN?"; in "%s";}
+	}
+
+getError { 
+	out "SYST:ERR?";
+        in "%39c";
+	}
+
+getVmeas1 {
+	out "MEAS:VOLT?";
+	in "%f";
+	}
+
+getVmeas2 {
+	out "MEAS:VOLT2?";
+	in "%f";
+	}
+
+getImeas1 {
+	out "MEAS:CURR?";
+	in "%f";
+	}
+
+getImeas2 {
+	out "MEAS:CURR2?";
+	in "%f";
+	}
+
+getVset1 {
+	out "VOLT?";
+	in "%f";
+	}
+
+getVset2 {
+	out "VOLT2?";
+	in "%f";
+	}
+
+getIset1 {
+	out "CURR?";
+	in "%f";
+	}
+
+getIset2 {
+	out "CURR2?";
+	in "%f";
+	}
+
+getOut1State {
+	out "OUT:STAT?";
+	in "%s";
+	}
+
+getOut2State {
+	out "OUT2:STAT?";
+	in "%s";
+	}
+
+getOut1OnOffState {
+	out "OUT?";
+	in "%s";
+	}
+
+getOut2OnOffState {
+	out "OUT2?";
+	in "%s";
+	}
+	
+getCH1Vlim  {
+        out "OUT:LIM:VOLT?";
+	in "%f";
+	}
+
+getCH2Vlim  {
+        out "OUT:LIM:VOLT2?";
+	in "%f";
+	}
+
+getCH1Ilim  {
+        out "OUT:LIM:CURR?";
+	in "%f";
+	}
+
+getCH2Ilim  {
+        out "OUT:LIM:CURR2?";
+	in "%f";
+	}
+
+setCH1_On {
+	out "OUT 1";
+	}
+
+setCH1_Off {
+	out "OUT 0";
+	}
+
+setCH2_On {
+	out "OUT2 1";
+	}
+
+setCH2_Off {
+	out "OUT2 0";
+	}
+
+setCH1_V {
+	out "VOLT %.3f";
+	}
+
+setCH2_V {
+	out "VOLT2 %.3f";
+	}
+
+setCH1_I {
+	out "CURR %.3f";
+	}
+
+setCH2_I {
+	out "CURR2 %.3f";
+	}
+
+setCH1Vlim {
+        out "OUT:LIM:VOLT %.3f";
+	}
+
+setCH2Vlim {
+        out "OUT:LIM:VOLT2 %.3f";
+	}
+
+setCH1Ilim {
+        out "OUT:LIM:CURR %.3f";
+	}
+
+setCH2Ilim {
+        out "OUT:LIM:CURR2 %.3f";
+	}

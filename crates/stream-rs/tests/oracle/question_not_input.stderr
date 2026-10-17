@@ -1,0 +1,3 @@
+_main_ question_not_input.proto line 2: Use of '?' only allowed in input formats
+_main_ question_not_input.proto line 2: in command 'out'
+_main_ question_not_input.proto line 1: in protocol 'p'

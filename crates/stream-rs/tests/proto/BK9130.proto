@@ -1,0 +1,107 @@
+# BK Precision 9130 Power Supply Streams Protocol File 
+#
+# KG
+#
+#####
+# Interface: ASCII (RS232)
+#
+# Notes:
+#   1.  
+#
+#    
+
+ExtraInput = Ignore;
+
+getIDN { 
+	out "*IDN?";
+        in "%s";
+	@init {out "*IDN?"; in "%s";}
+	}
+
+getError { 
+	out "SYST:ERR?";
+        in "%39c";
+	}
+
+getVmeas {
+	out "MEAS:VOLT:ALL?";
+	in "%(\$1:CH1_Vmeas.VAL)f,%(\$1:CH2_Vmeas.VAL)f,%(\$1:CH3_Vmeas.VAL)f";
+	}
+
+getImeas {
+	out "MEAS:CURR:ALL?";
+	in "%(\$1:CH1_Imeas.VAL)f,%(\$1:CH2_Imeas.VAL)f,%(\$1:CH3_Imeas.VAL)f";
+	}
+
+getVset {
+	out "APP:VOLT?";
+	in "%(\$1:CH1_Vset_rbk.VAL)f,%(\$1:CH2_Vset_rbk.VAL)f,%(\$1:CH3_Vset_rbk.VAL)f";
+	}
+
+getIset {
+	out "APP:CURR?";
+	in "%(\$1:CH1_Iset_rbk.VAL)f,%(\$1:CH2_Iset_rbk.VAL)f,%(\$1:CH3_Iset_rbk.VAL)f";
+	}
+
+getOutState {
+	out "APP:OUT:STAT?";
+	in "%(\$1:CH1_State.VAL)d,%(\$1:CH2_State.VAL)d,%(\$1:CH3_State.VAL)d";
+	}
+
+setLocal {
+	out "SYST:LOC";
+	}
+
+setRemote {
+	out "SYST:REM";
+	}
+
+setCH1_On {
+	out "INST:NSEL 1;OUTP:STAT 1";
+	}
+
+setCH1_Off {
+	out "INST:NSEL 1;OUTP:STAT 0";
+	}
+
+setCH2_On {
+	out "INST:NSEL 2;OUTP:STAT 1";
+	}
+
+setCH2_Off {
+	out "INST:NSEL 2;OUTP:STAT 0";
+	}
+
+setCH3_On {
+	out "INST:NSEL 3;OUTP:STAT 1";
+	}
+
+setCH3_Off {
+	out "INST:NSEL 3;OUTP:STAT 0";
+	}
+
+setCH1_V {
+	out "INST:NSEL 1;VOLT %.3f";
+	}
+
+setCH2_V {
+	out "INST:NSEL 2;VOLT %.3f";
+	}
+
+setCH3_V {
+	out "INST:NSEL 3;VOLT %.3f";
+	}
+
+setCH1_I {
+	out "INST:NSEL 1;CURR %.3f";
+	}
+
+setCH2_I {
+	out "INST:NSEL 2;CURR %.3f";
+	}
+
+setCH3_I {
+	out "INST:NSEL 3;CURR %.3f";
+	}
+
+

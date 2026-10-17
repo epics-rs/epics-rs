@@ -10,10 +10,9 @@
 //!   from ([`iface_v4`]). No socket, no `tokio`, no `socket2` — compiles for
 //!   every target, RTEMS and VxWorks included. [`iface_v4`] reaches the two
 //!   embedded targets where `iface_map` cannot because it goes through
-//!   `getifaddrs`, which both of them ship, rather than through the `if-addrs`
-//!   crate, which builds for neither.
+//!   `getifaddrs`, which both of them ship.
 //! * **Socket-bearing modules** — `async_udp_v4`, `iface_map`,
-//!   `loopback_mcast`. Built on `tokio::net` / `socket2` / `if-addrs`, none
+//!   `loopback_mcast`. Built on `tokio::net` / `socket2`, neither
 //!   of which cross to `armv7-rtems-eabihf` or the `*-wrs-vxworks*` triples.
 //!   They take two different predicates, and the difference is not
 //!   cosmetic: `async_udp_v4` awaits on `tokio::net`, so it is
@@ -70,6 +69,8 @@ pub mod mcast_prep;
 pub mod search_udp;
 #[cfg(all(not(epics_embedded_target), any(unix, windows)))]
 pub mod udp_rx;
+#[cfg(windows)]
+mod win_adapters;
 
 /// pvxs ORIGIN_TAG forwarding multicast group. Mirrors the literal in
 /// `udp_collector.cpp:127`: `"224.0.0.128,1@127.0.0.1"` — TTL=1,

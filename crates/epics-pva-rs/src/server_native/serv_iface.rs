@@ -5,12 +5,13 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use super::config::PvaServerConfig;
 use super::search_engine::ServerInterfaces;
 use crate::error::{PvaError, PvaResult};
 use crate::pvxs_log::{self, Level, TCP_SETUP};
+use crate::sock_attach::can_ipv6;
 
 /// Resolve the TCP listener bind addresses from the server interface
 /// list.
@@ -61,40 +62,6 @@ pub(crate) fn tcp_bind_addresses(
         addrs.push(SocketAddr::new(bind_ip, 0));
     }
     addrs
-}
-
-/// pvxs `evsocket::canIPv6` (`evhelper.cpp:696-726`), probed once:
-/// `PVXS_ENABLE_IPV6=NO` disables it, otherwise a UDP socket must bind
-/// `[::1]`.
-pub(crate) fn can_ipv6() -> bool {
-    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CAN.get_or_init(|| {
-        if let Some(ena6) = epics_base_rs::runtime::env::get_lossy("PVXS_ENABLE_IPV6") {
-            if ena6.eq_ignore_ascii_case("NO") {
-                info!("IPv6 support disabled");
-                return false;
-            } else if !ena6.eq_ignore_ascii_case("YES") {
-                warn!("PVXS_ENABLE_IPV6={ena6} ignoring unrecognized");
-            }
-        }
-        match std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)) {
-            Ok(_) => true,
-            Err(e) => {
-                // EAFNOSUPPORT: no IPv6 in the kernel; EADDRNOTAVAIL: no [::1].
-                #[cfg(unix)]
-                let no_family = e.raw_os_error() == Some(libc::EAFNOSUPPORT);
-                #[cfg(windows)]
-                let no_family = e.raw_os_error() == Some(10047); // WSAEAFNOSUPPORT
-                if !no_family && e.kind() != io::ErrorKind::AddrNotAvailable {
-                    warn!(
-                        "Unexpected errno {} while probing IPv6: {e}",
-                        e.raw_os_error().unwrap_or(0)
-                    );
-                }
-                false
-            }
-        }
-    })
 }
 
 /// Bind one listener per address, pvxs `server.cpp:476-486`: an address

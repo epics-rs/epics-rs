@@ -1,7 +1,7 @@
 //! IPv4 network interface enumeration with periodic refresh.
 //!
-//! The up interfaces of [`super::iface_v4::enumerate`] (`if-addrs` on
-//! Windows) as an [`IfaceMap`] keyed by `ifindex`. Built once at startup and
+//! The up interfaces of [`super::iface_v4::enumerate`] (`GetAdaptersAddresses`
+//! on Windows) as an [`IfaceMap`] keyed by `ifindex`. Built once at startup and
 //! refreshable on demand — multi-NIC environments where interfaces
 //! come and go (USB Ethernet, hot-plug iface) need a fresh snapshot
 //! per search burst, but the cost is small.
@@ -268,22 +268,22 @@ fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
         .collect())
 }
 
-/// Windows: `if-addrs` reports no flags, so every adapter it lists counts as
-/// up, the same approximation [`super::iface_v4::enumerate`] makes there.
+/// Windows: the up adapters of pvxs's `IfaceMap::_refresh` walk, which
+/// carries the index the unix path asks `if_nametoindex` for.
 #[cfg(not(unix))]
 fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
     let mut out = Vec::new();
-    for iface in if_addrs::get_if_addrs()? {
-        let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+    for a in super::win_adapters::up_adapter_addrs()? {
+        let std::net::IpAddr::V4(ip) = a.ip else {
             continue;
         };
         out.push(IfaceInfo {
-            index: iface.index.unwrap_or(0),
-            name: iface.name.clone(),
-            ip: v4.ip,
-            netmask: v4.netmask,
-            broadcast: v4.broadcast,
-            up_non_loopback: !iface.is_loopback(),
+            index: a.index,
+            netmask: a.netmask_v4(),
+            broadcast: a.broadcast_v4(),
+            up_non_loopback: !a.loopback && !ip.is_loopback(),
+            name: a.name,
+            ip,
         });
     }
     Ok(out)
@@ -309,9 +309,8 @@ pub struct ExternalIface {
 
 /// pvxs `IfaceMap::all_external()` (`evhelper.cpp:898-905`): every up
 /// interface with an IPv4 or IPv6 address, loopback included, in name
-/// order (`osdSockExt.cpp:259-315`). Walks `getifaddrs` itself on unix,
-/// because `if-addrs` drops `fe80::` addresses and with them every
-/// interface that has only a link-local one.
+/// order (`osdSockExt.cpp:259-315`). Walks `getifaddrs` itself on unix so
+/// that an interface with only an `fe80::` address is kept.
 pub fn all_external() -> io::Result<Vec<ExternalIface>> {
     let mut by_name = std::collections::BTreeMap::<String, ExternalIface>::new();
     let mut add = |name: &str, index: u32, ip: std::net::IpAddr| {
@@ -370,8 +369,8 @@ pub fn all_external() -> io::Result<Vec<ExternalIface>> {
         libc::freeifaddrs(head);
     }
     #[cfg(not(unix))]
-    for iface in if_addrs::get_if_addrs()? {
-        add(&iface.name, iface.index.unwrap_or(0), iface.ip());
+    for a in super::win_adapters::up_adapter_addrs()? {
+        add(&a.name, a.index, a.ip);
     }
     Ok(by_name.into_values().collect())
 }

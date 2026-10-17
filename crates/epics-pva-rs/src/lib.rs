@@ -92,6 +92,7 @@ pub mod pvxs_log;
 pub mod server;
 pub mod server_native;
 pub mod service;
+pub mod sock_attach;
 pub mod util;
 
 pub use error::{PvaError, PvaResult};

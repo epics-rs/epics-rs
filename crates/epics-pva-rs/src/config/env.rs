@@ -318,9 +318,9 @@ fn split_tokens(
 
 /// pvxs `split_addr_into` for a list it reads with `required=false`
 /// (`config.cpp:175`): an invalid entry is logged on `pvxs.config` and
-/// skipped.
+/// skipped, the rest come back in [`split_order`].
 pub(crate) fn split_addr_list(name: &str, raw: &str, default_port: u16) -> Vec<Endpoint> {
-    split_tokens(raw, default_port)
+    let eps = split_tokens(raw, default_port)
         .filter_map(|(token, ep)| match ep {
             Ok(ep) => Some(ep),
             Err(what) => {
@@ -332,19 +332,52 @@ pub(crate) fn split_addr_list(name: &str, raw: &str, default_port: u16) -> Vec<E
                 None
             }
         })
-        .collect()
+        .collect();
+    split_order(eps, default_port)
 }
 
 /// pvxs `split_addr_into` for a list it reads with `required=true`, the
 /// server's interface and ignore lists (`config.cpp:418-424`): the first
 /// invalid entry fails the whole configuration (`config.cpp:172-173`).
+/// `default_port` goes into the [`split_order`] key only: an entry naming no
+/// port keeps 0, so the server's resolved port still reaches the bind.
 pub(crate) fn split_addr_list_required(
     raw: &str,
     default_port: u16,
 ) -> Result<Vec<Endpoint>, String> {
-    split_tokens(raw, default_port)
+    let eps = split_tokens(raw, 0)
         .map(|(token, ep)| ep.map_err(|what| format!("invalid endpoint \"{token}\" {what}")))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(split_order(eps, default_port))
+}
+
+/// The tail of pvxs `split_addr_into` (`config.cpp:166-182`): each endpoint
+/// printed with `default_port` filled in, the list sorted and deduped by
+/// those strings. Order is load-bearing on the server, whose first interface
+/// is the one that may fall back (`server.cpp:476-486`), and a duplicate
+/// entry is a duplicate search, beacon or name-server connection.
+fn split_order(eps: Vec<Endpoint>, default_port: u16) -> Vec<Endpoint> {
+    let mut printed: Vec<(String, Endpoint)> = eps
+        .into_iter()
+        .map(|ep| {
+            let mut key = ep.clone();
+            if key.addr.port() == 0 {
+                key.addr.set_port(default_port);
+            }
+            (sock_endpoint_text(&key), ep)
+        })
+        .collect();
+    printed.sort_by(|a, b| a.0.cmp(&b.0));
+    printed.dedup_by(|a, b| a.0 == b.0);
+    printed.into_iter().map(|(_, ep)| ep).collect()
+}
+
+/// `split_addr_into` onto a list that already holds entries, as
+/// `Config::applyEnv` does with a caller's (`config.cpp:151-183`): `add` is
+/// appended and the whole list put in [`split_order`].
+pub(crate) fn split_addr_into(out: &mut Vec<Endpoint>, add: Vec<Endpoint>, default_port: u16) {
+    out.extend(add);
+    *out = split_order(std::mem::take(out), default_port);
 }
 
 /// Collapse duplicate beacon endpoints, mirroring pvxs
@@ -516,72 +549,92 @@ pub fn parse_timeout_env(name: &str, raw: &str) -> Option<f64> {
     }
 }
 
-/// Parse a PVA port env value the way pvxs does. pvxs `_fromDefs` parses
-/// every `EPICS_PVA*_{SERVER,BROADCAST}_PORT` with `parseTo<uint64_t>`
-/// (`util.cpp:786-800` — `std::stoull` with leading/trailing whitespace
-/// tolerance) and then ASSIGNS the `uint64_t` into the `unsigned short`
-/// port field (`src/pvxs/server.h:168/170`, `src/pvxs/client.h:1030/1033`), truncating to
-/// the low 16 bits; a parse error logs and leaves the port at its
-/// prior/default value (`config.cpp:402-416, 556-570`).
-///
-/// So `EPICS_PVAS_SERVER_PORT=70000` becomes TCP port `4464`
-/// (`70000 & 0xFFFF`) under pvxs, and `" 5076 "` is accepted. A direct
-/// `parse::<u16>()` rejected both (out of range / surrounding whitespace)
-/// and fell back to the default, putting a Rust client/server on a
-/// different port than a C IOC in the same environment. This helper is
-/// the single owner of that rule; every scalar port getter routes
-/// through it, then applies its own zero-normalization on the result.
-/// Returns the truncated `u16`, or `None` when the value is not a
-/// base-10 integer (caller keeps its default).
-///
-/// pvxs `stoull(.., 0)` additionally accepts `0x`/`0`-prefixed
-/// hex/octal and wraps a leading `-`; those pathological config inputs
-/// are intentionally not reproduced (decimal only), so this is strictly
-/// narrower than pvxs on non-decimal text while matching it on every
-/// realistic decimal port value.
-pub fn parse_port_env(raw: &str) -> Option<u16> {
-    raw.trim().parse::<u64>().ok().map(|v| v as u16)
+/// A port value as pvxs `_fromDefs` parses it: `parseTo<uint64_t>`
+/// assigned into the `unsigned short` port field (`src/pvxs/server.h:168/170`,
+/// `src/pvxs/client.h:1030/1033`), so `70000` is `4464`. The error is
+/// `parseTo`'s `what()`.
+pub fn parse_port_env(raw: &str) -> Result<u16, String> {
+    crate::pvdata::convert::parse_to_u64(raw)
+        .map(|v| v as u16)
+        .map_err(|e| e.to_string())
 }
 
-/// Effective **client** UDP search/broadcast port from
-/// `EPICS_PVA_BROADCAST_PORT` (default 5076).
-///
-/// pvxs (config.cpp:556-566) parses this into the client `udp_port` and
-/// then explicitly rejects `udp_port == 0`: it logs "ignoring
-/// EPICS_PVA_BROADCAST_PORT=0" and restores 5076, because a client SEARCH
-/// targeting UDP port 0 can never reach a server. This helper is the
-/// single owner of that rule for every client search destination —
-/// limited broadcast, per-NIC broadcast, the `EPICS_PVA_ADDR_LIST`
-/// default port, and the beacon-listener bind all read it. The
-/// server-side `EPICS_PVAS_BROADCAST_PORT` path
-/// ([`server_broadcast_port`]) keeps port 0 (pvxs allows a server random
-/// bind/readback), so the zero rule lives here, not in the shared parse.
-/// An unparseable value also falls back to 5076 (pvxs leaves `udp_port` at
-/// its default on a parse error).
-pub fn broadcast_port() -> u16 {
-    match getenv("EPICS_PVA_BROADCAST_PORT").and_then(|s| parse_port_env(&s)) {
-        Some(0) => {
-            crate::pvxs_log::log(
-                crate::pvxs_log::CLIENT_SETUP,
-                crate::pvxs_log::Level::Warn,
-                format_args!("ignoring EPICS_PVA_BROADCAST_PORT=0"),
-            );
+/// pvxs `PickOne` (`config.cpp:229-255`) over port variables: the first of
+/// `names` that is set, parsed by [`parse_port_env`]. The error is the
+/// `"<name> invalid integer : <what>"` line the `fromEnv` owners log.
+pub(crate) fn pick_port(names: &[&'static str]) -> Option<Result<u16, String>> {
+    let (name, raw) = names.iter().find_map(|n| getenv(n).map(|v| (*n, v)))?;
+    Some(parse_port_env(&raw).map_err(|what| format!("{name} invalid integer : {what}")))
+}
+
+/// pvxs client `_fromDefs` ports (`config.cpp:556-578`) and the zero
+/// `tcp_port` `Config::expand` restores (`config.cpp:631-632`), as
+/// `(udp_port, tcp_port)`. `warn` gets each line pvxs logs at WARN on
+/// `pvxs.client.setup`, which only the `fromEnv` owners log
+/// ([`client_ports_logged`]).
+pub(crate) fn client_ports(mut warn: impl FnMut(&str)) -> (u16, u16) {
+    let udp = match pick_port(&["EPICS_PVA_BROADCAST_PORT"]) {
+        Some(Ok(0)) => {
+            warn("ignoring EPICS_PVA_BROADCAST_PORT=0");
             5076
         }
-        Some(p) => p,
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            warn(&e);
+            5076
+        }
         None => 5076,
+    };
+    // pvxs's `tcp_port==0 && !nameServers.empty()` warning cannot fire
+    // here: `fromEnv` reads the name servers after the port.
+    let tcp = match pick_port(&["EPICS_PVA_SERVER_PORT", "EPICS_PVAS_SERVER_PORT"]) {
+        Some(Ok(p)) if p != 0 => p,
+        Some(Err(e)) => {
+            warn(&e);
+            5075
+        }
+        _ => 5075,
+    };
+    (udp, tcp)
+}
+
+/// [`client_ports`] as a client `fromEnv` reads them, logging.
+pub(crate) fn client_ports_logged() -> (u16, u16) {
+    client_ports(|line| {
+        crate::pvxs_log::log(
+            crate::pvxs_log::CLIENT_SETUP,
+            crate::pvxs_log::Level::Warn,
+            format_args!("{line}"),
+        )
+    })
+}
+
+/// One server port as server `_fromDefs` reads it (`config.cpp:402-416`):
+/// set from the first of `names` set, or logged at ERR and left as it was.
+pub(crate) fn server_port_logged(names: &[&'static str], port: &mut u16) {
+    match pick_port(names) {
+        Some(Ok(v)) => *port = v,
+        Some(Err(line)) => crate::pvxs_log::log(
+            crate::pvxs_log::SERVER_SETUP,
+            crate::pvxs_log::Level::Err,
+            format_args!("{line}"),
+        ),
+        None => {}
     }
 }
 
+/// The client UDP search/beacon port, `client_ports`'s `udp_port`:
+/// `EPICS_PVA_BROADCAST_PORT`, 5076 when unset, invalid or zero.
+pub fn broadcast_port() -> u16 {
+    client_ports(|_| ()).0
+}
+
 /// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`,
-/// returning `None` when neither variable is set. The presence-aware form
-/// lets [`crate::server_native::PvaServerConfig::with_env`] preserve a
-/// caller-supplied port when the env is silent (pvxs `PickOne`,
-/// `config.cpp:397-437`).
+/// `None` when neither is set or the picked one is invalid, so
+/// [`crate::server_native::PvaServerConfig::with_env`] keeps a
+/// caller-supplied port (pvxs `PickOne`, `config.cpp:410-416`).
 pub fn server_broadcast_port_opt() -> Option<u16> {
-    getenv("EPICS_PVAS_BROADCAST_PORT")
-        .or_else(|| getenv("EPICS_PVA_BROADCAST_PORT"))
-        .and_then(|s| parse_port_env(&s))
+    pick_port(SERVER_BROADCAST_PORT_VARS)?.ok()
 }
 
 /// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`.
@@ -589,48 +642,30 @@ pub fn server_broadcast_port() -> u16 {
     server_broadcast_port_opt().unwrap_or(5076)
 }
 
-/// Effective **client** default TCP destination port — the port a bare
-/// (port-less) `EPICS_PVA_NAME_SERVERS` / address-list token resolves to.
-///
-/// pvxs `config.cpp:568-578` lets the client TCP port come from
-/// `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not set, so a
-/// site that only configured the server-specific var still has a coherent
-/// default. `Config::expand()` then normalizes an effective client TCP
-/// port of zero back to the protocol default 5075 (`config.cpp:631-632`):
-/// zero is a valid *server* ephemeral-bind request but never a usable
-/// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
-/// bare name-server token to `host:0`. The server bind port keeps zero —
-/// see [`pvas_server_port`]. An explicit `host:0` in a name-server list is
-/// likewise normalized to this effective port by `resolve_token_addr`
-/// (pvxs `split_addr_into` `config.cpp:167-168`), so both the bare token and
-/// `host:0` resolve to `5075`.
+/// The server's `PickOne` order for its TCP port (`config.cpp:402`).
+pub(crate) const SERVER_PORT_VARS: &[&str] = &["EPICS_PVAS_SERVER_PORT", "EPICS_PVA_SERVER_PORT"];
+/// The server's `PickOne` order for its UDP port (`config.cpp:410`).
+pub(crate) const SERVER_BROADCAST_PORT_VARS: &[&str] =
+    &["EPICS_PVAS_BROADCAST_PORT", "EPICS_PVA_BROADCAST_PORT"];
+
+/// The client default TCP destination port, `client_ports`'s `tcp_port`:
+/// the port a port-less `EPICS_PVA_NAME_SERVERS` entry takes. Zero is a
+/// server's ephemeral bind but never a client destination, so it is 5075.
 pub fn server_port() -> u16 {
-    let parsed = getenv("EPICS_PVA_SERVER_PORT")
-        .or_else(|| getenv("EPICS_PVAS_SERVER_PORT"))
-        .and_then(|s| parse_port_env(&s))
-        .unwrap_or(5075);
-    // pvxs Config::expand(): a zero effective client TCP port → 5075.
-    if parsed == 0 { 5075 } else { parsed }
+    client_ports(|_| ()).1
 }
 
-/// server-side TCP port helper that mirrors pvxs
-/// `config.cpp:402-408` `PickOne` precedence — server-specific
-/// `EPICS_PVAS_SERVER_PORT` first, then shared `EPICS_PVA_SERVER_PORT`,
-/// finally the compiled default. Pre-fix Rust read only the shared
-/// variable for the server, so a pvxs-style deployment that set
-/// `EPICS_PVAS_SERVER_PORT` was silently ignored and the Rust server
-/// bound to 5075.
+/// The server TCP port: `EPICS_PVAS_SERVER_PORT`, then
+/// `EPICS_PVA_SERVER_PORT`, then 5075 (pvxs `config.cpp:402-408`).
 pub fn pvas_server_port() -> u16 {
     pvas_server_port_opt().unwrap_or(5075)
 }
 
-/// Presence-aware [`pvas_server_port`] — `None` when neither
-/// `EPICS_PVAS_SERVER_PORT` nor `EPICS_PVA_SERVER_PORT` is set, so
-/// `with_env` preserves a caller-supplied `tcp_port`.
+/// Presence-aware [`pvas_server_port`] — `None` when neither variable is
+/// set or the picked one is invalid, so `with_env` keeps a caller-supplied
+/// `tcp_port`.
 pub fn pvas_server_port_opt() -> Option<u16> {
-    getenv("EPICS_PVAS_SERVER_PORT")
-        .or_else(|| getenv("EPICS_PVA_SERVER_PORT"))
-        .and_then(|s| parse_port_env(&s))
+    pick_port(SERVER_PORT_VARS)?.ok()
 }
 
 /// Presence-aware server **TLS** listen port — `EPICS_PVAS_TLS_PORT`
@@ -646,9 +681,7 @@ pub fn pvas_server_port_opt() -> Option<u16> {
 /// [`crate::server_native::PvaServerConfig::default`], not here, so an absent
 /// variable never overwrites the caller value.
 pub fn pvas_tls_port_opt() -> Option<u16> {
-    getenv("EPICS_PVAS_TLS_PORT")
-        .or_else(|| getenv("EPICS_PVA_TLS_PORT"))
-        .and_then(|s| parse_port_env(&s))
+    pick_port(&["EPICS_PVAS_TLS_PORT", "EPICS_PVA_TLS_PORT"])?.ok()
 }
 
 /// `EPICS_PVA_AUTO_ADDR_LIST` — default YES. When truthy, the search
@@ -972,34 +1005,14 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 /// empty all-NIC default (client search/broadcast) or wildcard bind
 /// (server listener) — a broader exposure than pvxs.
 ///
-/// The list comes back in pvxs's order: `split_addr_into` prints each
-/// endpoint with `default_port` filled in and sorts and dedups those strings
-/// (`config.cpp:166-182`), keyed by `sock_endpoint_text`. That order is
-/// load-bearing on the server, whose first interface is the one that may fall
-/// back (`server.cpp:476-486`). The port stays 0 in the entry itself, so the
-/// bind fills it from the port the server ends up with, an explicit one
-/// included. A multicast entry keeps its `@iface`: the server expands it into
+/// The list comes back in pvxs's `split_addr_into` order, `default_port` in the key
+/// only: the port stays 0 in the entry itself, so the bind fills it from the
+/// port the server ends up with, an explicit one included. A multicast entry keeps its `@iface`: the server expands it into
 /// an interface of its own (`config.cpp:497-509`). An invalid entry is
 /// dropped as [`parse_endpoints_with_port`] drops it; the environment's lists
 /// fail or log as pvxs's do.
 pub fn resolve_intf_addr_list(value: &str, default_port: u16) -> Vec<Endpoint> {
-    intf_order(parse_endpoints_with_port(value, 0), default_port)
-}
-
-fn intf_order(eps: Vec<Endpoint>, default_port: u16) -> Vec<Endpoint> {
-    let mut printed: Vec<(String, Endpoint)> = eps
-        .into_iter()
-        .map(|ep| {
-            let mut key = ep.clone();
-            if key.addr.port() == 0 {
-                key.addr.set_port(default_port);
-            }
-            (sock_endpoint_text(&key), ep)
-        })
-        .collect();
-    printed.sort_by(|a, b| a.0.cmp(&b.0));
-    printed.dedup_by(|a, b| a.0 == b.0);
-    printed.into_iter().map(|(_, ep)| ep).collect()
+    split_order(parse_endpoints_with_port(value, 0), default_port)
 }
 
 /// pvxs `SockEndpoint`'s text (`config.cpp:125-135`): the modifiers print
@@ -1037,7 +1050,7 @@ pub(crate) fn sock_addr_text(addr: SocketAddr) -> String {
 /// client's `Config::interfaces`.
 pub fn client_intf_endpoints() -> Vec<Endpoint> {
     getenv("EPICS_PVA_INTF_ADDR_LIST")
-        .map(|s| intf_order(split_addr_list("EPICS_PVA_INTF_ADDR_LIST", &s, 0), 0))
+        .map(|s| split_addr_list("EPICS_PVA_INTF_ADDR_LIST", &s, 0))
         .unwrap_or_default()
 }
 
@@ -1056,9 +1069,8 @@ pub fn list_intf_addresses() -> Vec<IpAddr> {
 }
 
 /// `EPICS_PVAS_INTF_ADDR_LIST`, the server's interfaces, a port-less entry
-/// left at 0 for the bind to fill from `tcp_port`. `None` when unset or
-/// naming nothing, so `with_env` preserves a caller-supplied `interfaces`;
-/// an invalid entry fails it as pvxs's `required=true` does
+/// left at 0 for the bind to fill from `tcp_port`. `None` when unset; an
+/// invalid entry fails it as pvxs's `required=true` does
 /// (`config.cpp:418-419`). The server has no `EPICS_PVA_INTF_ADDR_LIST`
 /// fallback: pvxs reads that one for the client only (`config.cpp:418` vs
 /// `592`), and softIocPVX 1.5.3 with only `EPICS_PVA_INTF_ADDR_LIST=10.99.99.99`
@@ -1067,7 +1079,7 @@ pub fn server_intf_addr_list_opt() -> Result<Option<Vec<Endpoint>>, String> {
     // The server reads `EPICS_PVAS_SERVER_PORT` before the interface list
     // (`config.cpp:402-419`), so that port is in the strings it sorts.
     match getenv("EPICS_PVAS_INTF_ADDR_LIST") {
-        Some(raw) => resolve_server_intf_addr_list(&raw, pvas_server_port()),
+        Some(raw) => split_addr_list_required(&raw, pvas_server_port()).map(Some),
         None => Ok(None),
     }
 }
@@ -1086,26 +1098,25 @@ pub fn resolve_server_intf_addr_list(
     raw: &str,
     default_port: u16,
 ) -> Result<Option<Vec<Endpoint>>, String> {
-    let eps = split_addr_list_required(raw, 0)?;
-    Ok((!eps.is_empty()).then(|| intf_order(eps, default_port)))
+    let eps = split_addr_list_required(raw, default_port)?;
+    Ok((!eps.is_empty()).then_some(eps))
 }
 
 /// `EPICS_PVAS_IGNORE_ADDR_LIST`, the peers whose connections (TCP) and
 /// searches (UDP) the server drops, pvxs `Config::ignoreAddrs`: each entry an
-/// IP and a port, 0 matching any port from that IP. `None` when unset or
-/// naming nothing, so `with_env` preserves a caller-supplied `ignore_addrs`;
-/// an invalid entry fails it as pvxs's `required=true` does
+/// IP and a port, 0 matching any port from that IP. `None` when unset; an
+/// invalid entry fails it as pvxs's `required=true` does
 /// (`config.cpp:422-423`).
 pub fn server_ignore_addr_list_opt() -> Result<Option<Vec<(IpAddr, u16)>>, String> {
     let Some(raw) = getenv("EPICS_PVAS_IGNORE_ADDR_LIST") else {
         return Ok(None);
     };
     let eps = split_addr_list_required(&raw, 0)?;
-    Ok((!eps.is_empty()).then(|| {
+    Ok(Some(
         eps.into_iter()
             .map(|e| (e.addr.ip(), e.addr.port()))
-            .collect()
-    }))
+            .collect(),
+    ))
 }
 
 /// [`server_ignore_addr_list_opt`], empty when unset.
@@ -1140,10 +1151,16 @@ pub fn server_beacon_addr_list_opt() -> Option<Vec<SocketAddr>> {
 /// (`evhelper.cpp:556-592`). Same env source + fallback
 /// (`EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST`, `config.cpp:426-432`).
 pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
+    server_beacon_endpoints_on(server_broadcast_port())
+}
+
+/// [`server_beacon_endpoints_opt`] with a port-less entry taking
+/// `default_port`, a configuration's own `udp_port` (`config.cpp:427`).
+pub(crate) fn server_beacon_endpoints_on(default_port: u16) -> Option<Vec<Endpoint>> {
     let (name, raw) = ["EPICS_PVAS_BEACON_ADDR_LIST", "EPICS_PVA_ADDR_LIST"]
         .into_iter()
         .find_map(|name| getenv(name).map(|raw| (name, raw)))?;
-    Some(split_addr_list(name, &raw, server_broadcast_port()))
+    Some(split_addr_list(name, &raw, default_port))
 }
 
 /// Discover per-NIC IPv4 broadcast addresses. Used to fan SEARCH
@@ -1159,61 +1176,10 @@ pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
 /// configured-but-down NIC contributed a destination and a VPN tunnel
 /// contributed none.
 pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
-    let mut out: Vec<SocketAddr> = epics_base_rs::net::iface_v4::broadcast_addrs()
+    epics_base_rs::net::iface_v4::broadcast_addrs()
         .into_iter()
         .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
-        .collect();
-    // Always include limited broadcast as a fallback.
-    out.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
-    out
-}
-
-/// Like [`list_broadcast_addresses`] but restricted to the interfaces in
-/// `interfaces` — the directed broadcast of each listed interface only.
-///
-/// This is the `EPICS_PVA*_INTF_ADDR_LIST` constraint on auto address
-/// expansion: pvxs runs `expandAddrList` over `Config::interfaces`
-/// (`config.cpp:624-651`), so a client constrained to a subset of
-/// interfaces broadcasts only on those subnets. Rules:
-///
-/// * Empty `interfaces` → delegate to [`list_broadcast_addresses`] (the
-///   all-interface default).
-/// * A wildcard entry (`0.0.0.0`) means "every interface", so it also
-///   delegates to the all-NIC enumeration.
-/// * Otherwise: each listed interface contributes its own subnet
-///   broadcast (looked up in the live interface table). The limited-
-///   broadcast `255.255.255.255` fallback is appended **only** when at
-///   least one listed interface is a real (non-loopback) NIC — so a
-///   loopback-only list (`127.0.0.1`) yields an empty set and no
-///   broadcast traffic leaves the host.
-///
-/// Enumerates through [`epics_base_rs::net::iface_v4`], so it exists on every
-/// target.
-pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
-    if interfaces.is_empty() || interfaces.iter().any(|ip| ip.is_unspecified()) {
-        return list_broadcast_addresses(port);
-    }
-    let mut out = Vec::new();
-    let mut any_non_loopback = false;
-    if let Ok(ifaces) = epics_base_rs::net::iface_v4::enumerate() {
-        for want in interfaces {
-            if want.is_loopback() {
-                continue;
-            }
-            for iface in &ifaces {
-                if &iface.ip == want {
-                    any_non_loopback = true;
-                    if let Some(dest) = iface.search_destination() {
-                        out.push(SocketAddr::new(IpAddr::V4(dest), port));
-                    }
-                }
-            }
-        }
-    }
-    if any_non_loopback {
-        out.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), port));
-    }
-    out
+        .collect()
 }
 
 /// pvxs `expandAddrList` (`config.cpp:284-308`): C
@@ -1369,7 +1335,7 @@ fn dedup_ignore_addrs(addrs: &mut Vec<(IpAddr, u16)>) {
 /// use. Closing this for real means an embedded interface enumerator
 /// (libbsd `getifaddrs` via a `-sys` binding, or an ioctl walk against BSP
 /// headers, on whichever target grows one) behind
-/// [`list_broadcast_addresses_on`] — owed with the blocking PVA driver,
+/// [`expand_addr_list`] — owed with the blocking PVA driver,
 /// design doc §8.1 / §9 phase 6 item 7.
 #[cfg(not(epics_embedded_target))]
 #[derive(Debug, Clone, PartialEq)]
@@ -1418,13 +1384,13 @@ impl Config {
     /// parsed against the UDP port, and the timeout is scaled. Call
     /// [`Self::expand`] before use.
     pub fn from_client_env() -> Self {
-        let udp_port = broadcast_port();
+        let (udp_port, tcp_port) = client_ports_logged();
         let address_list = getenv("EPICS_PVA_ADDR_LIST")
             .map(|s| split_addr_list("EPICS_PVA_ADDR_LIST", &s, udp_port))
             .unwrap_or_default();
         Self {
             udp_port,
-            tcp_port: server_port(),
+            tcp_port,
             auto_addr_list: auto_addr_list_enabled(),
             auto_beacon: false,
             interfaces: intf_endpoints(list_intf_addresses()),
@@ -1441,19 +1407,22 @@ impl Config {
     /// (`config.cpp:397-443`), failing with the `what()` of an invalid
     /// interface or ignore entry. Call [`Self::expand`] before use.
     pub fn from_server_env() -> Result<Self, String> {
-        // pvxs's read order: an invalid interface stops it before the
-        // beacon list logs anything.
+        // pvxs's read order: the ports, then an invalid interface stops it
+        // before the beacon list logs anything.
+        let (mut tcp_port, mut udp_port) = (5075, 5076);
+        server_port_logged(SERVER_PORT_VARS, &mut tcp_port);
+        server_port_logged(SERVER_BROADCAST_PORT_VARS, &mut udp_port);
         let interfaces = server_intf_addr_list()?;
         let ignore_addrs = server_ignore_addr_list()?;
         Ok(Self {
-            udp_port: server_broadcast_port(),
-            tcp_port: pvas_server_port(),
+            udp_port,
+            tcp_port,
             auto_addr_list: false,
             auto_beacon: auto_beacon_addr_list_enabled(),
             interfaces,
             address_list: Vec::new(),
             name_servers: Vec::new(),
-            beacon_destinations: server_beacon_endpoints_opt().unwrap_or_default(),
+            beacon_destinations: server_beacon_endpoints_on(udp_port).unwrap_or_default(),
             ignore_addrs,
             tcp_timeout: conn_timeout_secs() * TMO_SCALE,
         })
@@ -1490,7 +1459,7 @@ impl Config {
         // each interface's directed broadcast to the SEARCH targets, then
         // clear the flag so a re-`expand()` does not duplicate them.
         if self.auto_addr_list {
-            for sa in list_broadcast_addresses_on(&v4_ifaces, self.udp_port) {
+            for sa in expand_addr_list(&v4_ifaces, self.udp_port) {
                 self.address_list.push(Endpoint::from(sa));
             }
             self.auto_addr_list = false;
@@ -1499,7 +1468,7 @@ impl Config {
         // Auto beacon expansion (server, config.cpp:512-519): the same
         // broadcast fan-out into the beacon destinations.
         if self.auto_beacon {
-            for sa in list_broadcast_addresses_on(&v4_ifaces, self.udp_port) {
+            for sa in expand_addr_list(&v4_ifaces, self.udp_port) {
                 self.beacon_destinations.push(Endpoint::from(sa));
             }
             self.auto_beacon = false;
@@ -1523,7 +1492,7 @@ impl Config {
 
     /// The IPv4 addresses of [`Self::interfaces`], used as the interface
     /// constraint for broadcast auto-expansion. The wildcard `0.0.0.0`
-    /// entry maps to itself, so [`list_broadcast_addresses_on`] expands it
+    /// entry maps to itself, so [`expand_addr_list`] expands it
     /// to every NIC.
     fn interface_v4_addrs(&self) -> Vec<Ipv4Addr> {
         self.interfaces
@@ -1800,23 +1769,25 @@ mod tests {
     fn parse_port_env_matches_pvxs_uint64_truncation() {
         // pvxs parseTo<uint64_t> then assigns to `unsigned short`:
         // EPICS_PVAS_SERVER_PORT=70000 -> 70000 & 0xFFFF = 4464.
-        assert_eq!(parse_port_env("70000"), Some(4464));
-        // 65536 truncates to 0 (caller then applies its own zero rule).
-        assert_eq!(parse_port_env("65536"), Some(0));
-        // leading/trailing whitespace accepted (stoull skips it).
-        assert_eq!(parse_port_env(" 5076 "), Some(5076));
-        assert_eq!(parse_port_env("\t5075\n"), Some(5075));
-        // ordinary in-range values pass through unchanged.
-        assert_eq!(parse_port_env("5075"), Some(5075));
-        assert_eq!(parse_port_env("0"), Some(0));
-        // non-integer / extraneous trailing chars / internal space / empty
-        // -> None, so the caller keeps its default (pvxs logs + keeps default).
-        assert_eq!(parse_port_env("garbage"), None);
-        assert_eq!(parse_port_env("5076x"), None);
-        assert_eq!(parse_port_env("50 76"), None);
-        assert_eq!(parse_port_env(""), None);
-        // beyond u64 range -> None (pvxs throws out_of_range -> default kept).
-        assert_eq!(parse_port_env("999999999999999999999999999"), None);
+        assert_eq!(parse_port_env("70000"), Ok(4464));
+        assert_eq!(parse_port_env("65536"), Ok(0));
+        assert_eq!(parse_port_env(" 5076 "), Ok(5076));
+        assert_eq!(parse_port_env("\t5075\n"), Ok(5075));
+        assert_eq!(parse_port_env("5075"), Ok(5075));
+        assert_eq!(parse_port_env("0"), Ok(0));
+        // stoull base 0.
+        assert_eq!(parse_port_env("0x13c4"), Ok(5060));
+        assert_eq!(parse_port_env("010"), Ok(8));
+        assert_eq!(
+            parse_port_env("[::1"),
+            Err("Invalid input : \"[::1\"".to_string())
+        );
+        assert_eq!(
+            parse_port_env("5076x"),
+            Err("Extraneous characters after integer: \"5076x\"".to_string())
+        );
+        assert!(parse_port_env("").is_err());
+        assert!(parse_port_env("999999999999999999999999999").is_err());
     }
 
     #[test]
@@ -2057,10 +2028,11 @@ mod tests {
     }
 
     #[test]
-    fn list_broadcast_addresses_includes_limited_broadcast() {
+    fn list_broadcast_addresses_has_no_limited_broadcast() {
+        // `osiSockDiscoverBroadcastAddresses` names NICs, never 255.255.255.255.
         let bcasts = list_broadcast_addresses(5076);
         assert!(
-            bcasts
+            !bcasts
                 .iter()
                 .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::BROADCAST))
         );
@@ -2208,6 +2180,25 @@ mod tests {
         assert_eq!(got, (Ok(None), Ok(Vec::new()), vec![client]));
     }
 
+    /// Every list comes back sorted and deduped by its printed text, the
+    /// default port filled in, as `split_addr_into` leaves it; a required
+    /// list keeps an entry's absent port 0.
+    #[test]
+    fn split_lists_sort_and_dedup_by_printed_text() {
+        let addrs = |eps: Vec<Endpoint>| eps.iter().map(|e| e.addr.to_string()).collect::<Vec<_>>();
+        // "10.0.0.10:5076" < "10.0.0.1:5076": ':' sorts after '0'.
+        let got = split_addr_list("T", "10.0.0.2 10.0.0.1 10.0.0.10 10.0.0.1:5076", 5076);
+        assert_eq!(
+            addrs(got),
+            ["10.0.0.10:5076", "10.0.0.1:5076", "10.0.0.2:5076"]
+        );
+        let got = split_addr_list_required("10.0.0.2 10.0.0.1 10.0.0.10 10.0.0.1:5075", 5075);
+        assert_eq!(
+            addrs(got.unwrap()),
+            ["10.0.0.10:0", "10.0.0.1:0", "10.0.0.2:0"]
+        );
+    }
+
     /// The server's interface and ignore lists are pvxs `required=true`
     /// lists (`config.cpp:418-424`): unset or blank leaves the caller's value,
     /// and one invalid entry fails the list, the valid ones beside it
@@ -2235,7 +2226,7 @@ mod tests {
                 got
             };
             assert_eq!(with(None), Ok(None), "{var}");
-            assert_eq!(with(Some("   ")), Ok(None), "{var}");
+            assert_eq!(with(Some("   ")), Ok(Some(0)), "{var}");
             assert_eq!(with(Some("127.0.0.1 localhost:7")), Ok(Some(2)), "{var}");
             assert_eq!(
                 with(Some("127.0.0.1 127.0.0.2@lo,5")),
@@ -2296,13 +2287,14 @@ mod tests {
         unsafe {
             std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
+        // In `split_order`: "10.0.0.1:5075" < "127.0.0.1" < "127.0.0.1:5076".
         let ports: Vec<u16> = list.iter().map(|(_, port)| *port).collect();
-        assert_eq!(ports, [0, 5076, 5075, 0], "{list:?}");
+        assert_eq!(ports, [5075, 0, 5076, 0], "{list:?}");
+        assert_eq!(list[0].0, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(
-            list[0].0.is_loopback() && list[1].0.is_loopback(),
+            list[1].0.is_loopback() && list[2].0.is_loopback(),
             "{list:?}"
         );
-        assert_eq!(list[2].0, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(list[3].0, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
     }
 
@@ -2902,11 +2894,11 @@ mod tests {
             !c.auto_addr_list,
             "auto_addr_list must be cleared after expand"
         );
-        let bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076);
-        assert!(
-            c.address_list.iter().any(|e| e.addr == bcast),
-            "auto expansion must add the limited broadcast: {:?}",
-            c.address_list
+        let want: Vec<SocketAddr> = expand_addr_list(&[Ipv4Addr::UNSPECIFIED], 5076);
+        let got: Vec<SocketAddr> = c.address_list.iter().map(|e| e.addr).collect();
+        assert_eq!(
+            got, want,
+            "auto expansion is expandAddrList over the wildcard"
         );
         let n = c.address_list.len();
         c.expand();

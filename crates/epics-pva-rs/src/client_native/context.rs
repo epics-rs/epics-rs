@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -328,6 +327,8 @@ impl PvaClientBuilder {
     }
 
     pub fn build(self) -> PvaClient {
+        // pvxs `ContextImpl`'s `SockAttach` (`clientimpl.h:234`).
+        crate::sock_attach::can_ipv6();
         let pool = ConnectionPool::new();
         if self.tls.is_some() {
             pool.set_tls(self.tls.clone());
@@ -348,7 +349,7 @@ impl PvaClientBuilder {
                 pipeline_size: self.pipeline_size,
                 pool,
                 channels: RwLock::new(HashMap::new()),
-                search: OnceLock::new(),
+                search: tokio::sync::OnceCell::new(),
                 cache_cleaner: std::sync::Once::new(),
                 name_servers: self.name_servers,
                 priority: self.priority,
@@ -378,7 +379,7 @@ struct ClientInner {
     pool: Arc<ConnectionPool>,
     channels: RwLock<HashMap<String, CacheEntry>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
-    search: OnceLock<SearchEngine>,
+    search: tokio::sync::OnceCell<SearchEngine>,
     /// Spawns the periodic [`cache_clean_loop`] exactly once, on the first
     /// channel cached. Deferred to the first cache insert (rather than
     /// `build()`) so the sync builder never requires a Tokio runtime, mirroring
@@ -698,26 +699,28 @@ impl PvaClient {
                 .await?;
             return Ok(engine);
         }
-        if self.inner.search.get().is_none() {
-            // Per-client engine carries the CA credentials so TCP name-server
-            // handshakes authenticate as this client's user/host (pvxs has no
-            // name-server auth exception, clientconn.cpp:215-263) and the
-            // per-client UDP-search config so a caller's `addr_list` / ports
-            // drive the SEARCH path instead of the process environment. The
-            // shared engine above never has either, so it needs neither.
-            let engine = SearchEngine::spawn_with_config(
-                &reactor,
-                self.inner.search_config.clone(),
-                Vec::new(),
-                self.inner.name_servers.clone(),
-                self.inner.user.clone(),
-                self.inner.host.clone(),
-                self.inner.tcp_timeout,
-            )
-            .await?;
-            let _ = self.inner.search.set(engine);
-        }
-        Ok(self.inner.search.get().unwrap())
+        // Per-client engine carries the CA credentials so TCP name-server
+        // handshakes authenticate as this client's user/host (pvxs has no
+        // name-server auth exception, clientconn.cpp:215-263) and the
+        // per-client UDP-search config so a caller's `addr_list` / ports
+        // drive the SEARCH path instead of the process environment. The
+        // shared engine above never has either, so it needs neither. One
+        // spawn per client, as pvxs's one `ContextImpl`: concurrent first
+        // callers wait on it rather than each binding sockets.
+        self.inner
+            .search
+            .get_or_try_init(|| {
+                SearchEngine::spawn_with_config(
+                    &reactor,
+                    self.inner.search_config.clone(),
+                    Vec::new(),
+                    self.inner.name_servers.clone(),
+                    self.inner.user.clone(),
+                    self.inner.host.clone(),
+                    self.inner.tcp_timeout,
+                )
+            })
+            .await
     }
 
     async fn channel(&self, pv_name: &str) -> PvaResult<Arc<Channel>> {
@@ -3619,6 +3622,47 @@ mod tests {
             client.inner.search.get().is_some(),
             "per-client engine must be populated"
         );
+    }
+
+    /// Concurrent first callers get one per-client engine: each spawn binds
+    /// sockets and, with nowhere to search, logs the empty-destination line.
+    /// Workers in parallel, as pvget's op task and `hurry_up` are; a
+    /// current-thread executor never interleaves the two spawns.
+    #[cfg(tokio_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_callers_spawn_one_engine() {
+        use epics_base_rs::runtime::log;
+        let client = PvaClient::builder()
+            .auto_addr_list(false)
+            .addr_list(Vec::new())
+            .build();
+        let heard = Arc::new(std::sync::Mutex::new(0usize));
+        let sink = heard.clone();
+        let id = log::errlog_add_listener(move |m| {
+            if m.contains("no search destinations") {
+                *sink.lock().unwrap() += 1;
+            }
+        });
+        let reactor = epics_base_rs::runtime::task::Reactor::current().expect("executor");
+        let mut set = epics_base_rs::runtime::task::TaskSet::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            set.spawn(&reactor, async move {
+                client
+                    .search_engine()
+                    .await
+                    .map(|e| e as *const SearchEngine as usize)
+            });
+        }
+        let mut engines = Vec::new();
+        while let Some(r) = set.join_next().await {
+            engines.push(r.expect("task").expect("engine"));
+        }
+        log::errlog_flush();
+        log::errlog_remove_listener(id);
+        engines.dedup();
+        assert_eq!(engines.len(), 1);
+        assert_eq!(*heard.lock().unwrap(), 1);
     }
 
     // Control: `share_udp(true)` with no name servers still shares the

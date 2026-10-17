@@ -473,43 +473,34 @@ mod sys {
 
 #[cfg(not(unix))]
 mod sys {
-    //! Windows: no `getifaddrs`, so the `if-addrs` crate — which is what the
-    //! host enumeration used before this module existed, and which C mirrors by
-    //! giving Windows its own `os/WIN32/osdNetIntf.c` rather than including
-    //! either shared file.
-    //!
-    //! `if-addrs` does not surface `ifa_flags`, so the flags are reconstructed
-    //! from what it does report: an interface it lists is treated as up, and a
-    //! reported broadcast address is what `IFF_BROADCAST` means. That is the
-    //! same approximation the pre-existing host path made, and it is confined
-    //! to the one platform that cannot do better.
+    //! Windows: no `getifaddrs`; C has its own `os/WIN32/osdNetIntf.c`. The
+    //! walk is [`crate::net::win_adapters`], which lists up adapters only, so
+    //! every entry is `IFF_UP`, and `IFF_BROADCAST` is a v4 subnet broadcast
+    //! — C's `(addr & mask) | (bcast & ~mask)` (`osdNetIntf.c:233-238`).
 
     use super::{IfaceV4, flags};
     use std::io;
     use std::net::IpAddr;
 
     pub(super) fn enumerate() -> io::Result<Vec<IfaceV4>> {
-        let ifs = if_addrs::get_if_addrs()?;
         let mut out = Vec::new();
-        for iface in ifs {
-            let if_addrs::IfAddr::V4(v4) = &iface.addr else {
+        for a in crate::net::win_adapters::up_adapter_addrs()? {
+            let IpAddr::V4(ip) = a.ip else {
                 continue;
             };
-            let IpAddr::V4(ip) = iface.ip() else {
-                continue;
-            };
+            let dest = a.broadcast_v4();
             let mut f = flags::IFF_UP;
-            if iface.is_loopback() {
+            if a.loopback {
                 f |= flags::IFF_LOOPBACK;
             }
-            if v4.broadcast.is_some() {
+            if dest.is_some() {
                 f |= flags::IFF_BROADCAST;
             }
             out.push(IfaceV4 {
-                name: iface.name.clone(),
+                netmask: Some(a.netmask_v4()),
+                name: a.name,
                 ip,
-                netmask: Some(v4.netmask),
-                dest: v4.broadcast,
+                dest,
                 flags: f,
             });
         }

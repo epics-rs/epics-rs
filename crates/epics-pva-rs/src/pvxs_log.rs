@@ -23,6 +23,7 @@ pub const TCP_IO: &str = "pvxs.tcp.io";
 pub const CLIENT_SETUP: &str = "pvxs.client.setup";
 pub const CLIENT_IO: &str = "pvxs.client.io";
 pub const CLIENT_DUP: &str = "pvxs.client.dup";
+pub const SOCK: &str = "pvxs.sock";
 
 /// pvxs `Level` (`pvxs/log.h`): lower is more severe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

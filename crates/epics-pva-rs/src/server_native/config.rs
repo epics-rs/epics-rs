@@ -426,27 +426,23 @@ impl PvaServerConfig {
     /// environment (ports stay ephemeral, `auto_beacon` stays off) instead
     /// of silently reverting to the LAN-facing defaults.
     ///
+    /// An address list is appended to the caller's, as `split_addr_into`
+    /// appends to the `Config` it fills (`config.cpp:151-183`).
+    ///
     /// An invalid interface or ignore entry fails it with pvxs's `what()`,
     /// as `required=true` throws out of `Config::fromEnv`
     /// (`config.cpp:172-173`), so no server binds a configuration pvxs
     /// refuses.
     pub fn with_env(mut self) -> std::io::Result<Self> {
         use crate::config::env;
-        // server respects EPICS_PVAS_SERVER_PORT first, then
-        // falls back to EPICS_PVA_SERVER_PORT (pvxs config.cpp:
-        // 402-408 PickOne precedence).
-        if let Some(v) = env::pvas_server_port_opt() {
-            self.tcp_port = v;
-        }
+        env::server_port_logged(env::SERVER_PORT_VARS, &mut self.tcp_port);
+        env::server_port_logged(env::SERVER_BROADCAST_PORT_VARS, &mut self.udp_port);
         // Server TLS listen port: EPICS_PVAS_TLS_PORT first, then the shared
         // EPICS_PVA_TLS_PORT (pvxs config.cpp:495-501 PickOne, `tls`
         // `b3a10bf0`). Only takes effect when `tls` is configured (see
         // `tls_port`).
         if let Some(v) = env::pvas_tls_port_opt() {
             self.tls_port = v;
-        }
-        if let Some(v) = env::server_broadcast_port_opt() {
-            self.udp_port = v;
         }
         // Anti-downgrade: `disable_plaintext=true` in the TLS options makes
         // the server refuse plaintext (parseTLSOptions, config.cpp:453-460 on
@@ -479,16 +475,24 @@ impl PvaServerConfig {
                 .max(self.beacon_period + Duration::from_secs(1));
         }
         // pvxs reads the interfaces, the ignore list, then the beacons
-        // (`config.cpp:418-432`).
+        // (`config.cpp:418-432`), each appended to the caller's list, keyed
+        // by this config's ports.
         let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidInput, what);
         if let Some(v) = env::server_intf_addr_list_opt().map_err(invalid)? {
-            self.interfaces = v;
+            env::split_addr_into(&mut self.interfaces, v, self.tcp_port);
         }
         if let Some(v) = env::server_ignore_addr_list_opt().map_err(invalid)? {
-            self.ignore_addrs = v;
+            let ep =
+                |(ip, port)| crate::config::Endpoint::from(std::net::SocketAddr::new(ip, port));
+            let mut ignore: Vec<_> = self.ignore_addrs.iter().copied().map(ep).collect();
+            env::split_addr_into(&mut ignore, v.into_iter().map(ep).collect(), 0);
+            self.ignore_addrs = ignore
+                .iter()
+                .map(|e| (e.addr.ip(), e.addr.port()))
+                .collect();
         }
-        if let Some(v) = env::server_beacon_endpoints_opt() {
-            self.beacon_destinations = v;
+        if let Some(v) = env::server_beacon_endpoints_on(self.udp_port) {
+            env::split_addr_into(&mut self.beacon_destinations, v, self.udp_port);
         }
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {
             self.auto_beacon = v;

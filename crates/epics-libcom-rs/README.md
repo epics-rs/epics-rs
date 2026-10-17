@@ -62,7 +62,7 @@ it.
 
 The `net` module's socket-bearing submodules — `async_udp_v4` and
 `loopback_mcast` (`tokio_backend` only) and `iface_map` (off every embedded
-target) — are host-only — `socket2`/`if-addrs` do not build for
+target) — are host-only — `socket2` does not build for
 `armv7-rtems-eabihf`, and the RTEMS CA server uses the separate raw-libc socket
 driver. The wire constants beside them stay on every target, because the PVA
 SEARCH decoder has to embed them on RTEMS too.

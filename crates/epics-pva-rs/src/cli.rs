@@ -430,14 +430,9 @@ pub fn effective_config_string() -> String {
 /// Keys and order mirror pvxs's sorted server def map. `EPICS_PVA_CONN_TMO`
 /// is intentionally absent: pvxs sets it in `updateDefs` but its server
 /// `operator<<` filters to the `EPICS_PVAS_` prefix, so it never appears in
-/// the server section. Values come from the same resolved
-/// [`crate::config`] server getters the PVA server itself reads — the
-/// server-precedence `EPICS_PVAS_*`-first variants (`pvas_server_port`,
-/// `server_broadcast_port`, `server_intf_addr_list`,
-/// `server_beacon_addr_list`, `server_ignore_addr_list`,
-/// `auto_beacon_addr_list_enabled`), not the client `server_port` whose
-/// `EPICS_PVA_SERVER_PORT`-first precedence is the opposite
-/// (`config.cpp:402-432` vs `568-578`).
+/// the server section. Values come from
+/// [`crate::config::env::Config::from_server_env`], which reads (and logs)
+/// the environment as `server::Config::fromEnv` does.
 ///
 /// Known gap (shared with the client block): the address lists are shown
 /// as configured, not pvxs's post-`expand()` auto-beacon fan-out; that
@@ -445,24 +440,26 @@ pub fn effective_config_string() -> String {
 /// module, which this CLI-scoped readback does not own.
 ///
 /// An invalid interface or ignore entry is pvxs `Config::fromEnv`'s throw,
-/// returned as its `what()`.
+/// returned as its `what()`. Host-only, as [`effective_config_string`].
+#[cfg(not(epics_embedded_target))]
 pub fn effective_server_config_string() -> Result<String, String> {
     use crate::config;
     use std::fmt::Write;
-    let interfaces = config::server_intf_addr_list()?;
-    let ignore = config::env::server_ignore_addr_list()?;
-    let beacon = config::server_beacon_addr_list()
+    let cfg = config::env::Config::from_server_env()?;
+    let beacon = cfg
+        .beacon_destinations
         .iter()
-        .map(|a| a.to_string())
+        .map(|ep| ep.addr.to_string())
         .collect::<Vec<_>>()
         .join(" ");
     // pvxs prints each entry with the server port filled in.
-    let interfaces = interfaces
-        .into_iter()
+    let interfaces = cfg
+        .interfaces
+        .iter()
         .map(|ep| {
             let mut a = ep.addr;
             if a.port() == 0 {
-                a.set_port(config::env::pvas_server_port());
+                a.set_port(cfg.tcp_port);
             }
             config::env::sock_addr_text(a)
         })
@@ -470,7 +467,8 @@ pub fn effective_server_config_string() -> Result<String, String> {
         .join(" ");
     // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is
     // the wildcard "any port from this IP" match.
-    let ignore = ignore
+    let ignore = cfg
+        .ignore_addrs
         .iter()
         .map(|(ip, port)| format!("{ip}:{port}"))
         .collect::<Vec<_>>()
@@ -480,28 +478,13 @@ pub fn effective_server_config_string() -> Result<String, String> {
     let _ = writeln!(
         s,
         "  EPICS_PVAS_AUTO_BEACON_ADDR_LIST={}",
-        if config::auto_beacon_addr_list_enabled() {
-            "YES"
-        } else {
-            "NO"
-        }
+        if cfg.auto_beacon { "YES" } else { "NO" }
     );
     let _ = writeln!(s, "  EPICS_PVAS_BEACON_ADDR_LIST={beacon}");
-    let _ = writeln!(
-        s,
-        "  EPICS_PVAS_BROADCAST_PORT={}",
-        config::server_broadcast_port()
-    );
+    let _ = writeln!(s, "  EPICS_PVAS_BROADCAST_PORT={}", cfg.udp_port);
     let _ = writeln!(s, "  EPICS_PVAS_IGNORE_ADDR_LIST={ignore}");
     let _ = writeln!(s, "  EPICS_PVAS_INTF_ADDR_LIST={interfaces}");
-    // Server bind port uses pvxs server precedence (`EPICS_PVAS_SERVER_PORT`
-    // first), distinct from the client block's `EPICS_PVA_SERVER_PORT`-first
-    // `server_port`.
-    let _ = writeln!(
-        s,
-        "  EPICS_PVAS_SERVER_PORT={}",
-        config::env::pvas_server_port()
-    );
+    let _ = writeln!(s, "  EPICS_PVAS_SERVER_PORT={}", cfg.tcp_port);
     Ok(s)
 }
 

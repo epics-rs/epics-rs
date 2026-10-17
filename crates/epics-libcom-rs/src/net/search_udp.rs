@@ -14,8 +14,8 @@
 //! the address list, not through a socket per NIC — the per-NIC bundle is an
 //! epics-rs elaboration over libca that buys accurate `RecvMeta.iface_ip` and
 //! a `255.255.255.255` fanout. Neither is a parity requirement, and neither is
-//! reachable on the embedded targets anyway: `tokio::net`, `socket2` and
-//! `if-addrs` build for none of them.
+//! reachable on the embedded targets anyway: `tokio::net` and `socket2`
+//! build for neither of them.
 //!
 //! The one thing the bundle bought that the target still needs is *reaching
 //! every subnet's broadcast address*. That comes from

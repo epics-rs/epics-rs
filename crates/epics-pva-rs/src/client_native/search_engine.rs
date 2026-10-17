@@ -331,6 +331,9 @@ pub struct ClientSearchConfig {
     /// the default connect port for an advertised server endpoint. Carried
     /// on the per-client config so a gateway can pin it per upstream.
     pub server_port: u16,
+    /// `EPICS_PVA_INTF_ADDR_LIST` (pvxs `interfaces`): the interfaces the
+    /// auto address list expands over and the address-list groups join on.
+    pub interfaces: Vec<crate::config::Endpoint>,
 }
 
 impl ClientSearchConfig {
@@ -338,15 +341,16 @@ impl ClientSearchConfig {
     /// [`crate::client_native::context::PvaClientBuilder`] starts from. The address list is parsed against
     /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
     pub fn from_env() -> Self {
-        let broadcast_port = crate::config::env::broadcast_port();
+        let (broadcast_port, server_port) = crate::config::env::client_ports_logged();
         let addr_list = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST")
-            .map(|s| crate::config::env::parse_endpoints_with_port(&s, broadcast_port))
+            .map(|s| crate::config::env::split_addr_list("EPICS_PVA_ADDR_LIST", &s, broadcast_port))
             .unwrap_or_default();
         Self {
             addr_list,
             auto_addr_list: crate::config::env::auto_addr_list_enabled(),
             broadcast_port,
-            server_port: crate::config::env::server_port(),
+            server_port,
+            interfaces: crate::config::env::client_intf_endpoints(),
         }
     }
 }
@@ -442,9 +446,8 @@ impl SearchTransport {
     /// `broadcast_port`, never TCP name servers).
     fn bind_udp(config: &ClientSearchConfig, extra: Vec<SocketAddr>) -> PvaResult<Self> {
         // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the
-        // auto-broadcast address expansion (in `search_targets`) and the
-        // limited-broadcast fanout egress (in `broadcast`) to the listed
-        // interfaces. It does NOT reduce the active-search
+        // auto-broadcast address expansion (in `search_targets`) to the
+        // listed interfaces. It does NOT reduce the active-search
         // socket bundle: pvxs binds the search socket to wildcard
         // (`src/client.cpp:578-590`) and applies `client::Config::interfaces`
         // only to `expandAddrList` / `addGroups` (`config.cpp:624-651`)
@@ -452,13 +455,14 @@ impl SearchTransport {
         // unicast target through the wildcard socket via the OS route.
         // Constraining the bundle forced an explicit non-loopback target
         // onto a loopback-only socket under `INTF_ADDR_LIST=127.0.0.1`.
-        let client_interfaces: Vec<Ipv4Addr> = crate::config::env::list_intf_addresses()
-            .into_iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            })
-            .collect();
+        let mut client_interfaces: Vec<Ipv4Addr> = Vec::new();
+        for ep in &config.interfaces {
+            if let IpAddr::V4(v4) = ep.addr.ip()
+                && !client_interfaces.contains(&v4)
+            {
+                client_interfaces.push(v4);
+            }
+        }
 
         let search_socket = bind_ephemeral_udp()?;
         // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
@@ -467,11 +471,8 @@ impl SearchTransport {
         let search_socket_v6 = bind_search_udp_v6();
         // pvxs `Config::expand` (`config.cpp:640-643`): the address list's
         // groups join only under `autoAddrList`, on every external interface.
-        let joins = McastJoins::resolve(
-            &crate::config::env::client_intf_endpoints(),
-            &config.addr_list,
-            config.auto_addr_list,
-        );
+        let joins =
+            McastJoins::resolve(&config.interfaces, &config.addr_list, config.auto_addr_list);
         let beacon_socket = bind_beacon_udp(config.broadcast_port, &joins.v4); // Optional.
         // pvxs `client.cpp:640-651` pairs the wildcard beacon listener with
         // one on `[::]`. None when the host has no v6.
@@ -2098,19 +2099,6 @@ fn maybe_poke(
     true
 }
 
-/// Build the deduplicated UDP SEARCH destination list for one broadcast
-/// tick.
-///
-/// pvxs sends SEARCH only to the effective address list: the configured
-/// `addressList` (here `extra_targets`, parsed and DNS-resolved once at
-/// `SearchEngine::spawn`) plus auto-added broadcast destinations ONLY when
-/// `EPICS_PVA_AUTO_ADDR_LIST` is enabled. pvxs skips `expandAddrList()`
-/// entirely when `autoAddrList` is false (config.cpp:640-644) and sends
-/// only to `effective.addressList` (src/client.cpp:601-619) — there is NO
-/// unconditional `255.255.255.255` fallback. So with `AUTO_ADDR_LIST=NO`
-/// and an empty address list this returns an EMPTY list and no SEARCH is
-/// emitted, instead of leaking limited-broadcast traffic onto a LAN the
-/// operator intentionally restricted.
 /// A resolved SEARCH destination tagged with pvxs's per-destination Unicast
 /// classification (`src/client.cpp:608-616`: `isucast = !isMCast()`, cleared for a
 /// known interface broadcast address). `unicast == true` means the SEARCH
@@ -2124,115 +2112,64 @@ struct SearchTarget {
     unicast: bool,
 }
 
-impl SearchTarget {
-    fn broadcast(addr: SocketAddr) -> Self {
-        Self {
-            ep: addr.into(),
-            unicast: false,
-        }
-    }
-    fn unicast(addr: SocketAddr) -> Self {
-        Self {
-            ep: addr.into(),
-            unicast: true,
-        }
-    }
-}
-
+/// Build the deduplicated UDP SEARCH destination list for one broadcast
+/// tick.
+///
+/// pvxs sends SEARCH only to the effective address list: the configured
+/// `addressList` (here `extra_targets`, parsed and DNS-resolved once at
+/// `SearchEngine::spawn`) plus auto-added broadcast destinations ONLY when
+/// `EPICS_PVA_AUTO_ADDR_LIST` is enabled. pvxs skips `expandAddrList()`
+/// entirely when `autoAddrList` is false (config.cpp:640-644) and sends
+/// only to `effective.addressList` (src/client.cpp:601-619) — there is NO
+/// unconditional `255.255.255.255` fallback. So with `AUTO_ADDR_LIST=NO`
+/// and an empty address list this returns an EMPTY list and no SEARCH is
+/// emitted, instead of leaking limited-broadcast traffic onto a LAN the
+/// operator intentionally restricted.
 fn search_targets(
     bport: u16,
     auto_addr_list: bool,
     extra_targets: &[Endpoint],
     client_interfaces: &[Ipv4Addr],
 ) -> Vec<SearchTarget> {
-    let mut targets: Vec<SearchTarget> = Vec::with_capacity(8);
-
-    // Auto-expansion destinations — gated on AUTO_ADDR_LIST, matching
-    // pvxs's `expandAddrList()` which only runs when autoAddrList is true.
-    if auto_addr_list && client_interfaces.is_empty() {
-        // All-NIC default (`EPICS_PVA_INTF_ADDR_LIST` unset).
-        // Limited broadcast. pvxs uses per-interface directed broadcasts;
-        // the 255.255.255.255 + per-NIC fanout below is the Rust
-        // cross-NIC equivalent. On multi-NIC hosts (and macOS) the kernel
-        // may not translate 255.255.255.255 to every NIC's per-subnet
-        // broadcast, so we also enumerate each up-non-loopback NIC's IPv4
-        // broadcast address (otherwise local IOCs on `192.168.X.255:5076`
-        // are never reached).
-        targets.push(SearchTarget::broadcast(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::BROADCAST),
-            bport,
-        )));
-        for sa in crate::config::env::list_broadcast_addresses(bport) {
-            // The helper appends 255.255.255.255 too — the dedup below
-            // collapses the duplicate.
-            targets.push(SearchTarget::broadcast(sa));
-        }
-        // No implicit loopback unicast here. pvxs's auto-address expansion
-        // (config.cpp:624-651 → expandAddrList → evhelper.cpp:625-661)
-        // returns only discovered broadcast addresses, never a hard-coded
-        // 127.0.0.1 target. Loopback-only discovery requires an explicit
-        // operator entry: EPICS_PVA_ADDR_LIST=127.0.0.1 (flows into
-        // `extra_targets` below) or loopback in EPICS_PVA_INTF_ADDR_LIST
-        // (the gated push in the branch below). Injecting loopback by
-        // default let a Rust client reach loopback-only IOCs that pvxs
-        // would not, breaking isolation on shared hosts.
-    } else if auto_addr_list {
-        // `EPICS_PVA_INTF_ADDR_LIST` set: pvxs expands the auto address
-        // list over the configured interfaces only (`config.cpp:624-651`),
-        // so the directed-broadcast set is restricted to the listed
-        // interfaces' subnets. `list_broadcast_addresses_on` adds the
-        // limited-broadcast 255.255.255.255 fallback iff a non-loopback
-        // interface is listed — a loopback-only list contributes none, so
-        // no broadcast leaves the host.
-        for sa in crate::config::env::list_broadcast_addresses_on(client_interfaces, bport) {
-            targets.push(SearchTarget::broadcast(sa));
-        }
-        // Loopback unicast only when loopback is an explicitly-listed
-        // interface (the all-NIC path adds it unconditionally as a
-        // zero-config convenience; here the operator chose the set).
-        if client_interfaces.iter().any(|ip| ip.is_loopback()) {
-            targets.push(SearchTarget::unicast(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                bport,
-            )));
-        }
+    let wildcard = [Ipv4Addr::UNSPECIFIED];
+    let mut eps: Vec<Endpoint> = extra_targets.to_vec();
+    // pvxs `expandAddrList` over the client's interfaces, the wildcard when
+    // none are listed, appended after the configured list
+    // (`config.cpp:637-643`): each NIC's directed broadcast, `127.0.0.1`
+    // itself for a listed loopback, and no limited broadcast.
+    if auto_addr_list {
+        let ifaces = if client_interfaces.is_empty() {
+            &wildcard[..]
+        } else {
+            client_interfaces
+        };
+        eps.extend(
+            crate::config::env::expand_addr_list(ifaces, bport)
+                .into_iter()
+                .map(Endpoint::from),
+        );
     }
 
-    // pvxs's `bcasts` set: the (auto-expanded) interface broadcast addresses.
-    // An explicit addr-list entry that names one of these is classified
-    // broadcast, not unicast (src/client.cpp:614-615 clears `isucast`).
-    let bcast_ips: std::collections::HashSet<IpAddr> = targets
-        .iter()
-        .filter(|t| !t.unicast)
-        .map(|t| t.ep.addr.ip())
-        .collect();
+    // pvxs's `bcasts` is every NIC's broadcast whatever the interface list
+    // (`client.cpp:570-574`), and an entry is unicast unless it is multicast
+    // or one of those (`client.cpp:612-615`) — a loopback or `255.255.255.255`
+    // entry included.
+    let bcasts: std::collections::HashSet<IpAddr> =
+        crate::config::env::expand_addr_list(&wildcard, 0)
+            .into_iter()
+            .map(|sa| sa.ip())
+            .collect();
 
-    // Explicitly configured / programmatic targets are always sent — they
-    // are the `addressList` itself, present regardless of autoAddrList. pvxs
-    // classifies each by address: `isucast = !isMCast()`, cleared for a known
-    // interface broadcast. With autoAddrList off the interface-broadcast set
-    // is empty here, so a directed broadcast placed manually in the addr list
-    // is treated as unicast — a wire-flag-only divergence with no functional
-    // effect (the datagram still reaches the subnet, and the Unicast bit only
-    // governs a re-broadcast trigger that is moot for an already-broadcast
-    // packet).
-    for ep in extra_targets {
-        let ip = ep.addr.ip();
-        let is_broadcastish = ip.is_multicast()
-            || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
-            || bcast_ips.contains(&ip);
-        targets.push(SearchTarget {
-            ep: ep.clone(),
-            unicast: !is_broadcastish,
-        });
-    }
-
-    // Dedup by `(address, interface)` while preserving insertion order (first
-    // classification wins, so an auto broadcast entry shadows a duplicate
-    // extra).
+    // First sighting of an `(address, interface)` wins, as `removeDups`.
     let mut seen = std::collections::HashSet::new();
-    targets.retain(|t| seen.insert((t.ep.addr, t.ep.iface.clone())));
-    targets
+    eps.into_iter()
+        .filter(|ep| seen.insert((ep.addr, ep.iface.clone())))
+        .map(|ep| {
+            let ip = ep.addr.ip();
+            let unicast = !ip.is_multicast() && !bcasts.contains(&ip);
+            SearchTarget { ep, unicast }
+        })
+        .collect()
 }
 
 impl UdpTransport {
@@ -2272,19 +2209,12 @@ impl UdpTransport {
             let pkt_v4: &[u8] = if st.unicast { &ucast_v4 } else { packet_v4 };
             let pkt_v6: &[u8] = if st.unicast { &ucast_v6 } else { packet_v6 };
             // A multicast group is one send with its endpoint's TTL and
-            // `@iface`, pvxs `mcast_prep_sendto` (`client.cpp:1182-1194`).
-            // The limited broadcast is the auto-list stand-in for pvxs's
-            // per-interface directed broadcasts, so it fans out per NIC,
-            // constrained to `EPICS_PVA_INTF_ADDR_LIST` when set. A v6
+            // `@iface`, pvxs `mcast_prep_sendto` (`client.cpp:1182-1194`). A v6
             // destination reaching here without a v6 socket was let through
             // by a programmatic list; it errs for visibility.
             let result = match t {
                 SocketAddr::V4(v4) if v4.ip().is_multicast() => socket
                     .send_multicast_v4(pkt_v4, v4, ep.mcast_ttl(), ep.mcast_iface_v4(&ifmap))
-                    .await
-                    .map(|_| ()),
-                SocketAddr::V4(v4) if v4.ip().is_broadcast() => socket
-                    .fanout_to(pkt_v4, t, client_interfaces)
                     .await
                     .map(|_| ()),
                 SocketAddr::V4(_) => socket.send_to(pkt_v4, t).await.map(|_| ()),
@@ -6252,9 +6182,9 @@ mod tests {
         );
     }
 
-    /// EPICS_PVA_INTF_ADDR_LIST=127.0.0.1 with AUTO_ADDR_LIST=YES must
-    /// produce no non-loopback broadcast target — the interface list
-    /// constrains auto address expansion (pvxs `config.cpp:624-651`).
+    /// EPICS_PVA_INTF_ADDR_LIST=127.0.0.1 with AUTO_ADDR_LIST=YES expands to
+    /// `127.0.0.1` alone, which is not among pvxs's `bcasts` and so goes with
+    /// the Unicast bit set (`client.cpp:570-574, 612-615`).
     #[cfg(tokio_backend)]
     #[test]
     fn search_targets_loopback_only_interface_list_no_broadcast() {
@@ -6272,12 +6202,10 @@ mod tests {
                 .any(|t| matches!(t.ep.addr, SocketAddr::V4(v4) if v4.ip().is_broadcast())),
             "loopback-only interface list must not emit limited broadcast: {targets:?}"
         );
-        // The loopback unicast convenience is still present (loopback is
-        // the explicitly-listed interface) and is classified unicast.
         let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5076);
         assert!(
             targets.iter().any(|t| t.ep.addr == lo && t.unicast),
-            "loopback unicast expected (flag set) when loopback is the listed interface"
+            "loopback is the listed interface's expansion: {targets:?}"
         );
     }
 
@@ -6323,23 +6251,23 @@ mod tests {
         );
     }
 
-    /// AUTO_ADDR_LIST=YES (the default) still includes the limited
-    /// broadcast destination, and the configured extras are appended.
+    /// AUTO_ADDR_LIST=YES (the default) adds each NIC's directed broadcast,
+    /// never the limited broadcast pvxs's `expandAddrList` has no part in,
+    /// and the configured extras are appended.
     #[cfg(tokio_backend)]
     #[test]
-    fn search_targets_auto_on_includes_limited_broadcast_and_extras() {
+    fn search_targets_auto_on_is_expand_addr_list_and_extras() {
         let extra: SocketAddr = "10.0.0.5:5076".parse().unwrap();
         let targets = search_targets(5076, true, &[extra.into()], &[]);
-        let limited = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076);
+        let mut want = vec![extra];
+        want.extend(crate::config::env::expand_addr_list(
+            &[Ipv4Addr::UNSPECIFIED],
+            5076,
+        ));
+        assert_eq!(target_addrs(&targets), want);
         assert!(
-            target_addrs(&targets).contains(&limited),
-            "AUTO_ADDR_LIST=YES must add the limited broadcast destination"
-        );
-        // PVX-81 classification: the limited broadcast is non-unicast (flag
-        // clear); the explicit host extra is unicast (flag set).
-        assert!(
-            targets.iter().any(|t| t.ep.addr == limited && !t.unicast),
-            "the limited broadcast must be classified non-unicast"
+            targets.iter().all(|t| t.unicast == (t.ep.addr == extra)),
+            "auto entries go bit-clear, the host extra unicast: {targets:?}"
         );
         assert!(
             targets.iter().any(|t| t.ep.addr == extra && t.unicast),
@@ -6371,6 +6299,52 @@ mod tests {
         );
     }
 
+    /// Each `fromEnv` owner logs an invalid port once, at pvxs's level and
+    /// logger: WARN on `pvxs.client.setup`, ERR on `pvxs.server.setup`.
+    #[test]
+    #[serial(epics_env)]
+    fn invalid_ports_log_once_per_from_env() {
+        use epics_base_rs::runtime::log;
+        let logged = |f: &dyn Fn()| {
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let sink = heard.clone();
+            let id = log::errlog_add_listener(move |m| {
+                if let Some((_time, line)) = m.split_once(' ') {
+                    sink.lock().unwrap().push_str(line);
+                }
+            });
+            f();
+            log::errlog_flush();
+            log::errlog_remove_listener(id);
+            heard.lock().unwrap().clone()
+        };
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_BROADCAST_PORT", "0"),
+            ("EPICS_PVA_SERVER_PORT", "[::1"),
+        ]);
+        let client = logged(&|| {
+            let cfg = ClientSearchConfig::from_env();
+            assert_eq!((cfg.broadcast_port, cfg.server_port), (5076, 5075));
+        });
+        assert_eq!(
+            client,
+            "WARN pvxs.client.setup\n     ignoring EPICS_PVA_BROADCAST_PORT=0\n\
+             WARN pvxs.client.setup\n     EPICS_PVA_SERVER_PORT invalid integer : \
+             Invalid input : \"[::1\"\n"
+        );
+        let server = logged(&|| {
+            let cfg = crate::server_native::PvaServerConfig::isolated()
+                .with_env()
+                .unwrap();
+            assert_eq!(cfg.udp_port, 0);
+        });
+        assert_eq!(
+            server,
+            "ERR pvxs.server.setup\n     EPICS_PVA_SERVER_PORT invalid integer : \
+             Invalid input : \"[::1\"\n"
+        );
+    }
+
     /// `ClientSearchConfig::from_env` seeds every UDP-discovery field from
     /// the `EPICS_PVA_*` environment — the default a `PvaClientBuilder`
     /// starts from (pvxs `Config::fromEnv`, `config.cpp`). The address list
@@ -6383,8 +6357,15 @@ mod tests {
             ("EPICS_PVA_SERVER_PORT", "5098"),
             ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
             ("EPICS_PVA_ADDR_LIST", "10.0.0.7 192.168.1.9:5080"),
+            ("EPICS_PVA_INTF_ADDR_LIST", "127.0.0.1"),
         ]);
         let cfg = ClientSearchConfig::from_env();
+        assert_eq!(
+            cfg.interfaces,
+            vec![crate::config::Endpoint::from(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap()
+            )]
+        );
         assert_eq!(cfg.broadcast_port, 5099, "broadcast_port from env");
         assert_eq!(cfg.server_port, 5098, "server_port from env");
         assert!(!cfg.auto_addr_list, "AUTO_ADDR_LIST=NO disables auto");
@@ -6630,6 +6611,7 @@ mod tests {
                 auto_addr_list: false,
                 broadcast_port: port,
                 server_port: 5075,
+                interfaces: Vec::new(),
             },
             Vec::new(),
             Vec::new(),

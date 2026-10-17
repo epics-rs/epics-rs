@@ -118,6 +118,8 @@ fn target_information_string() -> Result<String, (String, String)> {
     // allocation-free std analogue without libc FFI; the Host line already
     // carries arch/OS.)
     let _ = writeln!(s, "Runtime");
+    // `SockAttach attach;` (`describe.cpp:89`).
+    epics_pva_rs::sock_attach::can_ipv6();
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "unknown".to_string());

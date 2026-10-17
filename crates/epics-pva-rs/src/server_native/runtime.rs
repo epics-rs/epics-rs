@@ -8,9 +8,10 @@ use std::sync::Arc;
 use crate::error::{PvaError, PvaResult};
 
 use super::search_engine::ServerInterfaces;
-use super::serv_iface::{can_ipv6, tcp_bind_addresses};
+use super::serv_iface::tcp_bind_addresses;
 use super::source::{ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource};
 use super::udp::{UdpServe, random_guid, serve_udp};
+use crate::sock_attach::can_ipv6;
 
 // The config record moved to [`super::config`] so the protocol layer can name
 // it without inheriting this module's host-only gate. Re-exported here so
@@ -1105,6 +1106,25 @@ mod tcp_fallback_tests {
         (out, logged)
     }
 
+    /// `init_canIPv6`'s lines are `pvxs.sock`'s, Info for `NO` (below the
+    /// default Warn) and Warn for a value it does not know.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn ipv6_probe_logs_on_pvxs_sock() {
+        let probe = |v: &str| {
+            unsafe { std::env::set_var("PVXS_ENABLE_IPV6", v) };
+            let got = pvxs_logged(crate::sock_attach::probe_ipv6);
+            unsafe { std::env::remove_var("PVXS_ENABLE_IPV6") };
+            got
+        };
+        assert_eq!(probe("NO"), (false, String::new()));
+        let (_, logged) = probe("maybe");
+        assert_eq!(
+            logged,
+            "WARN pvxs.sock PVXS_ENABLE_IPV6=maybe ignoring unrecognized\n"
+        );
+    }
+
     /// `PvaServer::report_handle()` produces a detached handle whose
     /// `report()` mirrors `PvaServer::report()` field-for-field on a live
     /// server. This is the property the iocsh `pvxsr` command rides on:
@@ -1924,6 +1944,57 @@ mod with_env_preserve_tests {
             assert_eq!(
                 cfg.tls_port, 5078,
                 "EPICS_PVAS_TLS_PORT must win over EPICS_PVA_TLS_PORT"
+            );
+        });
+    }
+
+    /// `applyEnv` appends each list to the caller's and orders the whole list,
+    /// keyed by the config's own ports.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn with_env_appends_address_lists_to_the_callers() {
+        let vars = [
+            "EPICS_PVAS_INTF_ADDR_LIST",
+            "EPICS_PVAS_IGNORE_ADDR_LIST",
+            "EPICS_PVAS_BEACON_ADDR_LIST",
+            "EPICS_PVA_ADDR_LIST",
+            "EPICS_PVAS_SERVER_PORT",
+            "EPICS_PVA_SERVER_PORT",
+            "EPICS_PVAS_BROADCAST_PORT",
+            "EPICS_PVA_BROADCAST_PORT",
+        ];
+        with_cleared_env(&vars, || {
+            unsafe {
+                std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "10.0.0.1 10.0.0.3");
+                std::env::set_var("EPICS_PVAS_IGNORE_ADDR_LIST", "10.0.0.1");
+                std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "10.0.0.1 10.0.0.3:7");
+            }
+            let sa = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+            let cfg = PvaServerConfig {
+                udp_port: 6000,
+                interfaces: vec![sa("10.0.0.2:0").into(), sa("10.0.0.1:0").into()],
+                ignore_addrs: vec![(sa("10.0.0.2:0").ip(), 0)],
+                beacon_destinations: vec![sa("10.0.0.2:6000").into()],
+                ..Default::default()
+            }
+            .with_env()
+            .unwrap();
+            let addrs = |eps: &[crate::config::Endpoint]| {
+                eps.iter().map(|e| e.addr.to_string()).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                addrs(&cfg.interfaces),
+                ["10.0.0.1:0", "10.0.0.2:0", "10.0.0.3:0"]
+            );
+            let ignore: Vec<_> = cfg
+                .ignore_addrs
+                .iter()
+                .map(|(ip, _)| ip.to_string())
+                .collect();
+            assert_eq!(ignore, ["10.0.0.1", "10.0.0.2"]);
+            assert_eq!(
+                addrs(&cfg.beacon_destinations),
+                ["10.0.0.1:6000", "10.0.0.2:6000", "10.0.0.3:7"]
             );
         });
     }

@@ -79,7 +79,8 @@ pub fn build_search_targets(extra: &[SocketAddr]) -> Vec<SocketAddr> {
 fn search_endpoints(extra: &[SocketAddr]) -> Vec<Endpoint> {
     let mut targets: Vec<Endpoint> = extra.iter().copied().map(Endpoint::from).collect();
     if let Some(env) = epics_base_rs::runtime::env::get_lossy("EPICS_PVA_ADDR_LIST") {
-        targets.extend(crate::config::env::parse_endpoints_with_port(
+        targets.extend(crate::config::env::split_addr_list(
+            "EPICS_PVA_ADDR_LIST",
             &env,
             default_broadcast_port(),
         ));

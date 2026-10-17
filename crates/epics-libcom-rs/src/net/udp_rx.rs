@@ -238,8 +238,8 @@ pub fn enable(sock: &impl AsSock, is_v6: bool) -> io::Result<()> {
     let rc = unsafe {
         setsockopt(
             raw,
-            level as i32,
-            name as i32,
+            level,
+            name,
             &on as *const i32 as *const u8,
             std::mem::size_of_val(&on) as i32,
         )
@@ -375,12 +375,12 @@ mod win {
             // `WSARecvMsg` filled.
             let hdr = unsafe { &*cmsg };
             let data = unsafe { wsa_cmsg_data(cmsg) };
-            if hdr.cmsg_level == IPPROTO_IPV6 as i32 && hdr.cmsg_type == IPV6_PKTINFO as i32 {
+            if hdr.cmsg_level == IPPROTO_IPV6 && hdr.cmsg_type == IPV6_PKTINFO {
                 // SAFETY: an IPV6_PKTINFO cmsg payload is an in6_pktinfo.
                 let info = unsafe { read_unaligned(data as *const IN6_PKTINFO) };
                 out.dest = Some(IpAddr::V6(Ipv6Addr::from(unsafe { info.ipi6_addr.u.Byte })));
                 out.ifindex = info.ipi6_ifindex;
-            } else if hdr.cmsg_level == IPPROTO_IP as i32 && hdr.cmsg_type == IP_PKTINFO as i32 {
+            } else if hdr.cmsg_level == IPPROTO_IP && hdr.cmsg_type == IP_PKTINFO {
                 // SAFETY: an IP_PKTINFO cmsg payload is an in_pktinfo.
                 let info = unsafe { read_unaligned(data as *const IN_PKTINFO) };
                 out.dest = Some(IpAddr::V4(Ipv4Addr::from(unsafe {

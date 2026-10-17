@@ -755,3 +755,266 @@ record(sscan, "S") {
         assert_eq!(arr(&db, "S.D02DA", 4), sum);
     }
 }
+
+// The record's scanOnce sites (sscanRecord.c's 15 calls), one case each
+// where a missing call or a wrong condition hangs or retimes the scan.
+// Reached by every step scan above: the trigger notify (2498) and the
+// positioner notify (2547); by start_pos_returns_.. the retrace (2538).
+// doPuts' DO_PUTS_TRIG (4403) shares the trigger tail with 2498 and needs
+// every trigger put to fail or complete inside doPuts, which a connected
+// local trigger never does.
+
+const NO_TRIG: &str = r#"record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "M")
+}"#;
+
+/// No trigger PV: a step scan falls through to the read and never waits
+/// DDLY (contScan, 3388-3395); a fly scan's first point goes through doPuts,
+/// which schedules the read itself (4336), at once with DDLY 0 and through
+/// delayCallback (2431) after DDLY otherwise.
+#[epics_base_rs::epics_test]
+async fn with_no_trigger_only_a_fly_start_waits_ddly() {
+    for (fly, ddly) in [(false, 0.3f32), (true, 0.0), (true, 0.3)] {
+        let db = ioc(NO_TRIG).await;
+        connected(&db, "S", &["P1NV", "D01NV"]).await;
+        if fly {
+            put(&db, "S.P1SM", EpicsValue::Enum(2)).await;
+        }
+        put(&db, "S.DDLY", EpicsValue::Float(ddly)).await;
+        let t0 = std::time::Instant::now();
+        start(&db, "S").await;
+        finished(&db, "S").await;
+        let took = t0.elapsed().as_secs_f64();
+        let waits = fly && ddly > 0.0;
+        assert_eq!(took >= 0.3, waits, "fly {fly} DDLY {ddly}: took {took}");
+    }
+}
+
+/// The trigger's notify with DDLY set goes through delayCallback (2498's
+/// delayed branch, then 2431).
+#[epics_base_rs::epics_test]
+async fn a_trigger_notify_with_ddly_reads_after_the_delay() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.NPTS", EpicsValue::Long(3)).await;
+    put(&db, "S.DDLY", EpicsValue::Float(0.3)).await;
+    let t0 = std::time::Instant::now();
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert!(t0.elapsed().as_secs_f64() >= 0.9);
+    assert_eq!(arr(&db, "S.D01DA", 3), [10.0, 30.0, 50.0]);
+}
+
+/// AWCT holds each point for a client (WTNG); the client's WAIT=0 is what
+/// moves the scan on (special WAIT, 1651).
+#[epics_base_rs::epics_test]
+async fn a_client_wait_holds_each_point_until_the_client_releases_it() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.NPTS", EpicsValue::Long(2)).await;
+    put_field(&db, "S", "AWCT", EpicsValue::Short(1)).await;
+    start(&db, "S").await;
+    for point in 1..=2 {
+        wait_until("S.WTNG", || f64_of(&db, "S.WTNG") == 1.0).await;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(f64_of(&db, "S.CPT"), f64::from(point - 1), "held");
+        put_field(&db, "S", "WAIT", EpicsValue::Short(0)).await;
+        wait_until("S.CPT", || f64_of(&db, "S.CPT") == f64::from(point)).await;
+    }
+    finished(&db, "S").await;
+}
+
+/// AWAIT holds the end of the scan in SAVE_DATA_WAIT; clearing it ends the
+/// scan (special AWAIT, 1663).
+#[epics_base_rs::epics_test]
+async fn await_holds_the_scan_end_until_cleared() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.NPTS", EpicsValue::Long(2)).await;
+    put_field(&db, "S", "AWAIT", EpicsValue::Short(1)).await;
+    start(&db, "S").await;
+    wait_until("S.CPT", || f64_of(&db, "S.CPT") == 2.0).await;
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(f64_of(&db, "S.BUSY"), 1.0, "held for the client");
+    put_field(&db, "S", "AWAIT", EpicsValue::Short(0)).await;
+    finished(&db, "S").await;
+}
+
+/// A pause rescinded with RDLY resumes through delayCallback after RDLY,
+/// not at once (special PAUS, 1529's delayed branch).
+#[epics_base_rs::epics_test]
+async fn a_rescinded_pause_waits_rdly_before_resuming() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.PDLY", EpicsValue::Float(0.2)).await;
+    put(&db, "S.RDLY", EpicsValue::Float(0.8)).await;
+    start(&db, "S").await;
+    wait_until("S.CPT >= 1", || f64_of(&db, "S.CPT") >= 1.0).await;
+    put_field(&db, "S", "PAUS", EpicsValue::Short(1)).await;
+    sleep(Duration::from_millis(500)).await;
+    let held = f64_of(&db, "S.CPT");
+    put_field(&db, "S", "PAUS", EpicsValue::Short(0)).await;
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(f64_of(&db, "S.CPT"), held, "RDLY not yet out");
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 5), [10.0, 20.0, 30.0, 40.0, 50.0]);
+}
+
+/// The array-read trigger's notify ends the scan (2518).
+#[epics_base_rs::epics_test]
+async fn an_array_read_trigger_notify_ends_the_scan() {
+    let db = ioc(&format!(
+        r#"{ONE_D}
+record(ao, "AR") {{}}"#
+    ))
+    .await;
+    put(&db, "S.A1PV", EpicsValue::String("AR".into())).await;
+    put(&db, "S.A1CD", EpicsValue::Float(7.0)).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV", "A1NV"]).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(f64_of(&db, "AR"), 7.0);
+}
+
+/// An after-scan link with ASWAIT=Wait ends the scan from its notify (2543).
+#[epics_base_rs::epics_test]
+async fn a_waited_after_scan_link_ends_the_scan_from_its_notify() {
+    let db = ioc(&format!(
+        r#"{ONE_D}
+record(ao, "AS") {{}}"#
+    ))
+    .await;
+    put(&db, "S.ASPV", EpicsValue::String("AS".into())).await;
+    put(&db, "S.ASCD", EpicsValue::Float(3.0)).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV", "ASNV"]).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(f64_of(&db, "AS"), 3.0);
+}
+
+/// An after-scan link with ASWAIT=NoWait leaves doPuts nothing to wait
+/// for: doPuts itself ends the scan (4514).
+#[epics_base_rs::epics_test]
+async fn an_unwaited_after_scan_link_ends_the_scan_from_do_puts() {
+    let db = ioc(&format!(
+        r#"{ONE_D}
+record(ao, "AS") {{}}"#
+    ))
+    .await;
+    put(&db, "S.ASPV", EpicsValue::String("AS".into())).await;
+    put(&db, "S.ASCD", EpicsValue::Float(3.0)).await;
+    put(&db, "S.ASWAIT", EpicsValue::Enum(1)).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV", "ASNV"]).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    wait_until("AS", || f64_of(&db, "AS") == 3.0).await;
+}
+
+/// A scan started while its trigger link connects is pending; the
+/// trigger's search callback starts it (pvSearchCallback, 2939).
+#[epics_base_rs::epics_test]
+async fn a_scan_pending_its_trigger_starts_from_the_search_callback() {
+    let db = ioc(r#"record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "D")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "D01NV"]).await;
+    put(&db, "S.T1PV", EpicsValue::String("D.PROC".into())).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 3), [10.0, 20.0, 30.0]);
+}
+
+/// A scan started while its positioner connects is pending until the
+/// positioner's confirming get lands (posMonCallbackGetCB, 3070).
+#[epics_base_rs::epics_test]
+async fn a_scan_pending_its_positioner_starts_from_the_monitor_get() {
+    let db = ioc(ONE_D).await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    put(&db, "S.NPTS", EpicsValue::Long(3)).await;
+    put(&db, "S.P1PV", EpicsValue::String("M2".into())).await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 3), [1.0, 3.0, 5.0]);
+}
+
+/// A detector the database does not resolve by name (a filtered channel)
+/// is an array read through its link; the get's callback ends the scan
+/// (userGetCallback, 2612).
+#[epics_base_rs::epics_test]
+async fn a_linked_array_detector_ends_the_scan_from_its_get_callback() {
+    let db = ioc(r#"record(waveform, "W") {
+  field(FTVL, "DOUBLE")
+  field(NELM, "5")
+}
+record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "5")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "5")
+}"#)
+    .await;
+    put(
+        &db,
+        "S.D01PV",
+        EpicsValue::String(r#"W.VAL{"arr":{}}"#.into()),
+    )
+    .await;
+    connected(&db, "S", &["P1NV", "D01NV"]).await;
+    put(
+        &db,
+        "W",
+        EpicsValue::DoubleArray(vec![7.0, 6.0, 5.0, 4.0, 3.0].into()),
+    )
+    .await;
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert_eq!(arr(&db, "S.D01DA", 5), [7.0, 6.0, 5.0, 4.0, 3.0]);
+}
+
+/// A trigger still busy with a killed scan's put-callback refuses this one,
+/// so no notify will count the triggers down: doPuts schedules the read
+/// itself (DO_PUTS_TRIG, 4403) and the scan runs on without the trigger.
+#[epics_base_rs::epics_test]
+async fn a_busy_trigger_leaves_do_puts_to_schedule_the_read() {
+    let db = ioc(r#"record(calcout, "TR") {
+  field(CALC, "1")
+  field(ODLY, "2")
+}
+record(sscan, "S") {
+  field(MPTS, "10")
+  field(NPTS, "3")
+  field(P1PV, "M")
+  field(P1SP, "1")
+  field(P1EP, "3")
+  field(D01PV, "D")
+  field(T1PV, "TR.PROC")
+}"#)
+    .await;
+    connected(&db, "S", &["P1NV", "D01NV", "T1NV"]).await;
+    start(&db, "S").await;
+    // The first point's trigger put waits on TR's two-second ODLY. An abort
+    // waits for it; a second EXSC=0 kills the scan without waiting.
+    wait_until("TR.PACT", || f64_of(&db, "TR.PACT") == 1.0).await;
+    put_field(&db, "S", "EXSC", EpicsValue::Short(0)).await;
+    put_field(&db, "S", "EXSC", EpicsValue::Short(0)).await;
+    wait_until("S.BUSY", || f64_of(&db, "S.BUSY") == 0.0).await;
+    assert_eq!(f64_of(&db, "TR.PACT"), 1.0, "TR still owes its callback");
+    let t0 = std::time::Instant::now();
+    start(&db, "S").await;
+    finished(&db, "S").await;
+    assert!(t0.elapsed() < Duration::from_millis(1500), "waited for TR");
+    assert_eq!(f64_of(&db, "S.CPT"), 3.0);
+    assert_eq!(f64_of(&db, "TR.PACT"), 1.0, "TR never took this scan's put");
+}

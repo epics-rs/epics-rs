@@ -36,7 +36,7 @@ pub struct MotorAxis {
     motor_cmd_tx: MotorCommandSender,
     subscribers: AxisSubscribers,
     report: Option<Arc<dyn AxisReport>>,
-    /// The driver's [`AsynMotor::disables_ntm`].
+    /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
     disables_ntm: bool,
 }
 

@@ -220,7 +220,7 @@ fn controller_speeds(trace: &MotorTrace) -> Option<StoredSpeeds> {
     })
 }
 
-/// [`MotorPollLoop::speeds_for`]'s verdict on a record command.
+/// [`Axis::speeds_for`]'s verdict on a record command.
 enum Speeds {
     /// A speed write the store took; no driver call follows.
     Stored,

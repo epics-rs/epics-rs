@@ -522,7 +522,7 @@ impl PortHandle {
     /// Record the port's multi-device capability, address count and
     /// `getAddress`. Called by the runtime layer at handle construction so
     /// they reflect the driver's `PortFlags::multi_device`,
-    /// `PortDriverBase::max_addr` and [`PortDriverBase::get_address_rule`].
+    /// `PortDriverBase::max_addr` and [`crate::port::PortDriverBase::get_address_rule`].
     pub fn set_capabilities(
         &mut self,
         multi_device: bool,

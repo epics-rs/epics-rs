@@ -79,6 +79,10 @@ pub struct MotorPollLoop {
     /// period. A forced poll (ForcePoll, or a GET_INFO) bypasses this and
     /// always notifies.
     last_status: Option<MotorStatus>,
+    /// C `statusChanged_` left set: `last_status` is a status a failed poll
+    /// left that no post has carried yet, so the next post goes out even if
+    /// it equals it.
+    status_changed: bool,
     /// A model-2 driver's parameter library, by drvMotorAsyn reason: what
     /// the axis's `setDouble` / `setInteger` stored last.
     params: std::collections::HashMap<i32, WriteValue>,
@@ -218,6 +222,7 @@ impl MotorPollLoop {
             pacing,
             status_seq: 1, // starts at 1 (init already wrote seq=1)
             last_status: None,
+            status_changed: false,
             params: Default::default(),
             speeds: StoredSpeeds::default(),
             pulses: Pulses::new(),
@@ -268,6 +273,7 @@ impl MotorPollLoop {
             return;
         };
         let mut cdir = None;
+        let mut accel = None;
         for command in &batch.commands {
             if let MotorCommand::MoveDirection { forward } = *command {
                 cdir = Some(forward);
@@ -280,7 +286,7 @@ impl MotorPollLoop {
             // The port route already moves on the port's own parameters.
             let command = match batch
                 .record
-                .and_then(|_| self.speeds_for(&batch.trace, command))
+                .and_then(|_| self.speeds_for(&batch.trace, command, &mut accel))
             {
                 Some(Speeds::Stored) => continue,
                 Some(Speeds::Resolved(c)) => {
@@ -322,14 +328,31 @@ impl MotorPollLoop {
     /// write is stored, and a move or stop runs on the stored speeds, as
     /// asynMotorController and drvMotorAsyn read them
     /// (asynMotorController.cpp:208, :297-350; drvMotorAsyn.c:606, :706-733).
-    /// A model-1 driver has no store: its messages carry the speeds, and it
-    /// skips a speed write the record sends ahead of them.
-    fn speeds_for(&mut self, trace: &MotorTrace, command: &MotorCommand) -> Option<Speeds> {
-        if trace.is_model1() && command.store_speed(&mut self.speeds) {
-            // A model-1 SET_* only appends to the card string: the card keeps
-            // the speeds a later move or stop leaves unwritten, as a backlash
-            // leg's SET_VEL_BASE (motorRecord.cc do_work).
-            return Some(Speeds::Stored);
+    /// On a model-1 card a SET_* only appends to the message string: the
+    /// card keeps the velocities a later move leaves unwritten, as a
+    /// backlash leg's SET_VEL_BASE (motorRecord.cc do_work). Its
+    /// acceleration is the SET_ACCEL written since the last move, `accel`,
+    /// or 0 when none was: the record skips SET_ACCEL at acc <= 0 and a
+    /// driver appends its acceleration only above 0 (motorRecord.cc:874).
+    fn speeds_for(
+        &mut self,
+        trace: &MotorTrace,
+        command: &MotorCommand,
+        accel: &mut Option<f64>,
+    ) -> Option<Speeds> {
+        if trace.is_model1() {
+            if let MotorCommand::SetAccel { acceleration } = *command {
+                *accel = Some(acceleration);
+            }
+            if command.store_speed(&mut self.speeds) {
+                return Some(Speeds::Stored);
+            }
+            return command.runs_on_speeds().then(|| {
+                Speeds::Resolved(command.on_speeds(StoredSpeeds {
+                    acceleration: accel.take().unwrap_or(0.0),
+                    ..self.speeds
+                }))
+            });
         }
         if trace.is_controller() {
             if command.is_speed_write() {
@@ -381,6 +404,7 @@ impl MotorPollLoop {
     /// sequence number.
     fn publish(&mut self, status: MotorStatus) {
         self.hold(&status);
+        self.status_changed = false;
         self.status_seq += 1;
         let pulses = self.subscribers.post(StampedStatus {
             seq: self.status_seq,
@@ -457,10 +481,16 @@ impl MotorPollLoop {
     /// bit posts only on a forced poll, as C's `motorUpdateStatus_` path
     /// forces `statusChanged_` (asynMotorController.cpp:217-221) while the
     /// background poller ignores the poll status (:658).
-    fn failed_poll_status(&self, failure: PollFailure) -> MotorStatus {
+    fn failed_poll_status(&mut self, failed: FailedPoll) -> MotorStatus {
+        if let Some(left) = failed.left
+            && self.last_status.as_ref() != Some(&left)
+        {
+            self.hold(&left);
+            self.status_changed = true;
+        }
         let mut status = self.last_status.clone().unwrap_or_else(status_before_poll);
-        status.problem |= failure.problem;
-        status.comms_error |= failure.comms_error;
+        status.problem |= failed.bits.problem;
+        status.comms_error |= failed.bits.comms_error;
         status
     }
 
@@ -481,7 +511,7 @@ impl MotorPollLoop {
             .unwrap_or_else(|failure| self.failed_poll_status(failure))
     }
 
-    fn poll_result(&mut self) -> Result<MotorStatus, PollFailure> {
+    fn poll_result(&mut self) -> Result<MotorStatus, FailedPoll> {
         let user = AsynUser::new(0);
         // An `Err` is the C driver poll bailing to its error label, which
         // raises what `poll_failure` names. A poisoned driver mutex has no C
@@ -491,7 +521,7 @@ impl MotorPollLoop {
         // (asynMotorController.cpp:658), so a failure prints nothing.
         match self.motor.lock() {
             Ok(mut motor) => poll_driver(&mut *motor, &user),
-            Err(_) => Err(PollFailure::PROBLEM_AND_COMMS_ERROR),
+            Err(_) => Err(FailedPoll::POISONED),
         }
     }
 
@@ -505,8 +535,11 @@ impl MotorPollLoop {
     fn query_held(&mut self, mut held: Held) -> Option<Held> {
         let status = match self.poll_in_motion(&mut held.mover) {
             Ok(status) => status,
-            Err(PollFailure::NONE) => return Some(held),
-            Err(failure) => self.failed_poll_status(failure),
+            Err(failed) if failed.bits == PollFailure::NONE => {
+                self.failed_poll_status(failed);
+                return Some(held);
+            }
+            Err(failed) => self.failed_poll_status(failed),
         };
         let still = self
             .last_status
@@ -537,16 +570,17 @@ impl MotorPollLoop {
     fn poll_in_motion(
         &mut self,
         mover: &mut Option<(RecordId, bool)>,
-    ) -> Result<MotorStatus, PollFailure> {
+    ) -> Result<MotorStatus, FailedPoll> {
         let Some((record, cdir)) = mover else {
             return self.poll_result();
         };
         let before = *cdir;
         let polled = match self.motor.lock() {
-            Ok(mut motor) => motor
-                .poll_in_motion(&AsynUser::new(0), cdir)
-                .map_err(|_| motor.poll_failure()),
-            Err(_) => Err(PollFailure::PROBLEM_AND_COMMS_ERROR),
+            Ok(mut motor) => {
+                let polled = motor.poll_in_motion(&AsynUser::new(0), cdir);
+                polled.map_err(|_| FailedPoll::of(&mut *motor))
+            }
+            Err(_) => Err(FailedPoll::POISONED),
         };
         if *cdir != before {
             self.subscribers.set_driver_cdir(*record, *cdir);
@@ -558,7 +592,7 @@ impl MotorPollLoop {
     /// motorUpdateStatus_ forces statusChanged_ (asynMotorController.cpp:
     /// 217-222). motor_task's INFO reports RA_DONE as whether no move is
     /// held, whatever the driver read (motordrvCom.cc:470-481).
-    fn publish_info(&mut self, polled: Result<MotorStatus, PollFailure>) {
+    fn publish_info(&mut self, polled: Result<MotorStatus, FailedPoll>) {
         let mut status = polled.unwrap_or_else(|failure| self.failed_poll_status(failure));
         if let Pacing::MotorTask { held, .. } = self.pacing {
             status.done = held.is_none();
@@ -609,7 +643,17 @@ impl MotorPollLoop {
     /// last one delivered — the analogue of C's `statusChanged_` gate, so a
     /// settled, unchanging axis does not re-post DIFF/RDIF every idle period.
     fn poll_and_notify(&mut self, force: bool) -> bool {
-        let status = self.poll_status();
+        let status = match self.poll_result() {
+            Ok(status) => status,
+            // A driver returning before callParamCallbacks posts nothing,
+            // whatever it left set.
+            Err(failed) if failed.bits == PollFailure::NONE && !force => {
+                let status = self.failed_poll_status(failed);
+                self.call_param_callbacks();
+                return status.moving;
+            }
+            Err(failed) => self.failed_poll_status(failed),
+        };
         let moving = status.moving;
         self.notify(status, force);
         moving
@@ -618,7 +662,7 @@ impl MotorPollLoop {
     /// C `asynMotorAxis::callParamCallbacks` with `status` set: posted to
     /// the records when `force`d or when it changed the last one.
     fn notify(&mut self, status: MotorStatus, force: bool) {
-        if !force && self.last_status.as_ref() == Some(&status) {
+        if !force && !self.status_changed && self.last_status.as_ref() == Some(&status) {
             // Autonomous idle poll, status unchanged → no record pass (C posts
             // nothing when statusChanged_ stays 0). A *repeated* comms failure
             // lands here too, and correctly so: the COMM_ERR flag is already
@@ -826,7 +870,8 @@ fn c_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
         | MotorCommand::OutParm { .. }
         | MotorCommand::Primitive { .. }
         | MotorCommand::MoveStrings { .. }
-        | MotorCommand::MoveDirection { .. } => return None,
+        | MotorCommand::MoveDirection { .. }
+        | MotorCommand::RecordVelocity { .. } => return None,
     };
     Some((function as i32, value))
 }
@@ -867,7 +912,8 @@ fn drv_motor_asyn_reason(cmd: &MotorCommand) -> Option<i32> {
         | MotorCommand::OutParm { .. }
         | MotorCommand::Primitive { .. }
         | MotorCommand::MoveStrings { .. }
-        | MotorCommand::MoveDirection { .. } => return None,
+        | MotorCommand::MoveDirection { .. }
+        | MotorCommand::RecordVelocity { .. } => return None,
     })
 }
 
@@ -886,12 +932,35 @@ pub struct AxisWrite {
     /// The model-2 parameter it stored, by drvMotorAsyn reason.
     param: Option<(i32, WriteValue)>,
     /// The driver poll a GET_INFO ran.
-    polled: Option<Result<MotorStatus, PollFailure>>,
+    polled: Option<Result<MotorStatus, FailedPoll>>,
+}
+
+/// A failed driver poll: the bits its error label raises and the status it
+/// left before bailing.
+#[derive(Debug, Clone)]
+struct FailedPoll {
+    bits: PollFailure,
+    left: Option<MotorStatus>,
+}
+
+impl FailedPoll {
+    /// A poisoned driver mutex has no C counterpart; it raises both bits.
+    const POISONED: Self = Self {
+        bits: PollFailure::PROBLEM_AND_COMMS_ERROR,
+        left: None,
+    };
+
+    fn of(motor: &mut dyn AsynMotor) -> Self {
+        Self {
+            bits: motor.poll_failure(),
+            left: motor.take_failed_poll_status(),
+        }
+    }
 }
 
 /// The driver's poll, an `Err` raising what its `poll_failure` names.
-fn poll_driver(motor: &mut dyn AsynMotor, user: &AsynUser) -> Result<MotorStatus, PollFailure> {
-    motor.poll(user).map_err(|_| motor.poll_failure())
+fn poll_driver(motor: &mut dyn AsynMotor, user: &AsynUser) -> Result<MotorStatus, FailedPoll> {
+    motor.poll(user).map_err(|_| FailedPoll::of(motor))
 }
 
 /// Whether a failed `cmd` prints C `devMotorAsyn::asynCallback`'s write line
@@ -1306,13 +1375,17 @@ pub fn execute_commands(
             MotorCommand::MoveStrings { ref prem, ref post } => {
                 motor.set_move_strings(&user, prem.as_bytes(), post.clone())
             }
+            MotorCommand::RecordVelocity { velocity } => motor.set_record_velocity(&user, velocity),
             // The motor task holds it with the move it precedes.
             MotorCommand::MoveDirection { .. } => Ok(()),
             // GET_INFO polls inside the write, before its closing line
             // (asynMotorController.cpp:217-222; drvMotorAsyn.c:617-619).
             MotorCommand::Poll => {
                 let r = motor.poll(&user);
-                polled = Some(r.as_ref().map_err(|_| motor.poll_failure()).cloned());
+                polled = Some(match &r {
+                    Ok(status) => Ok(status.clone()),
+                    Err(_) => Err(FailedPoll::of(&mut *motor)),
+                });
                 // drvMotorAsyn returns forceCallback's status, not the poll's.
                 r.map(|_| ())
                     .or_else(|e| if controller { Err(e) } else { Ok(()) })
@@ -1565,6 +1638,7 @@ mod tests {
     use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 
     use super::*;
+    use crate::flags::MstaFlags;
     use crate::trace::TraceUser;
 
     /// Answers each poll from the script in turn; `None` is `set_status`
@@ -1848,12 +1922,15 @@ mod tests {
     /// A model-1 axis at rest at 0 whose driver answers from `script`, and
     /// the script's handle to count the polls left.
     fn model1_task(script: Vec<Option<MotorStatus>>) -> (MotorPollLoop, Arc<Mutex<Script>>) {
-        let (_poll_tx, poll) = mpsc::channel(1);
-        let (_tx, commands) = mpsc::unbounded_channel();
         // The constructor's startup poll answers first.
         let script = std::iter::once(Some(MotorStatus::default())).chain(script);
         let script = Arc::new(Mutex::new(Script(script.collect())));
-        let motor: Arc<Mutex<dyn AsynMotor>> = script.clone();
+        (model1_task_on(script.clone()), script)
+    }
+
+    fn model1_task_on(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorPollLoop {
+        let (_poll_tx, poll) = mpsc::channel(1);
+        let (_tx, commands) = mpsc::unbounded_channel();
         let mut poll_loop = MotorPollLoop::motor_task(
             PollerInbox { poll, commands },
             motor,
@@ -1861,7 +1938,145 @@ mod tests {
             SCAN,
         );
         poll_loop.last_status = Some(MotorStatus::default());
-        (poll_loop, script)
+        poll_loop
+    }
+
+    /// Answers each poll from its list; an `Err` fails the poll raising
+    /// those bits, having left that status.
+    struct Failing {
+        polls: std::collections::VecDeque<Result<MotorStatus, (PollFailure, Option<MotorStatus>)>>,
+        failure: PollFailure,
+        left: Option<MotorStatus>,
+    }
+
+    impl AsynMotor for Failing {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            self.failure
+        }
+        fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+            self.left.take()
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            match self.polls.pop_front().unwrap() {
+                Ok(status) => Ok(status),
+                Err((failure, left)) => {
+                    self.failure = failure;
+                    self.left = left;
+                    Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "failed".into(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn failing_poller(
+        polls: Vec<Result<MotorStatus, (PollFailure, Option<MotorStatus>)>>,
+    ) -> MotorPollLoop {
+        let polls = std::iter::once(Ok(MotorStatus::default())).chain(polls);
+        poller_on(Arc::new(Mutex::new(Failing {
+            polls: polls.collect(),
+            failure: PollFailure::NONE,
+            left: None,
+        })))
+    }
+
+    /// An asyn poll returning before callParamCallbacks posts nothing, but
+    /// what it set leaves `statusChanged_` set: the next poll posts even an
+    /// equal status (asynMotorAxis.cpp:255-264, :316-322).
+    #[test]
+    fn a_status_left_by_an_early_return_posts_with_the_next_poll() {
+        let fresh = MotorStatus {
+            home: true,
+            ..MotorStatus::default()
+        };
+        let mut poll_loop = failing_poller(vec![
+            Err((PollFailure::NONE, Some(fresh.clone()))),
+            Ok(fresh.clone()),
+        ]);
+        let seq = poll_loop.status_seq;
+        poll_loop.poller_pass(false);
+        assert_eq!(poll_loop.status_seq, seq, "the early return posts nothing");
+        poll_loop.poller_pass(false);
+        assert_eq!(poll_loop.status_seq, seq + 1);
+        assert_eq!(poll_loop.last_status, Some(fresh));
+    }
+
+    #[test]
+    fn a_left_status_equal_to_the_last_sets_nothing_to_post() {
+        let mut poll_loop = failing_poller(vec![
+            Err((PollFailure::NONE, Some(MotorStatus::default()))),
+            Ok(MotorStatus::default()),
+        ]);
+        let seq = poll_loop.status_seq;
+        poll_loop.poller_pass(false);
+        poll_loop.poller_pass(false);
+        assert_eq!(poll_loop.status_seq, seq);
+    }
+
+    #[test]
+    fn a_failure_raising_bits_posts_them_over_what_it_left() {
+        let fresh = MotorStatus {
+            home: true,
+            ..MotorStatus::default()
+        };
+        let mut poll_loop =
+            failing_poller(vec![Err((PollFailure::COMMS_ERROR, Some(fresh.clone())))]);
+        let seq = poll_loop.status_seq;
+        poll_loop.poller_pass(false);
+        assert_eq!(poll_loop.status_seq, seq + 1);
+        let posted = poll_loop.last_status.clone().unwrap();
+        assert!(posted.home && posted.comms_error && !posted.problem);
+    }
+
+    /// C MM3000: MS answers and TP misses (RETRY, nothing posted), then MS
+    /// misses (COMM_ERR); the COMM_ERR post carries the RETRY pass's MS bits
+    /// from `motor_info->status` (drvMM3000.cc:247-266, :379-381).
+    #[test]
+    fn a_comm_err_post_carries_what_the_retry_pass_left() {
+        let fresh = MotorStatus {
+            home: true,
+            ..at(0.0)
+        };
+        let polls = [
+            Ok(MotorStatus::default()),
+            Err((PollFailure::NONE, Some(fresh.clone()))),
+            Err((PollFailure::PROBLEM_AND_COMMS_ERROR, None)),
+        ];
+        let mut poll_loop = model1_task_on(Arc::new(Mutex::new(Failing {
+            polls: polls.into(),
+            failure: PollFailure::NONE,
+            left: None,
+        })));
+        send_move(&mut poll_loop);
+        let seq = poll_loop.status_seq;
+        poll_loop.timed_pass();
+        assert_eq!(poll_loop.status_seq, seq, "RETRY posts nothing");
+        poll_loop.timed_pass();
+        assert_eq!(poll_loop.status_seq, seq + 1);
+        let posted = poll_loop.last_status.clone().unwrap();
+        assert!(posted.home, "{posted:?}");
+        assert!(posted.comms_error && posted.problem && posted.done);
     }
 
     fn send_move(poll_loop: &mut MotorPollLoop) {
@@ -2033,7 +2248,7 @@ mod tests {
     #[test]
     fn a_held_move_scans_on_without_ra_moving() {
         let unflagged = MotorStatus {
-            moving: false,
+            msta_moving: false,
             ..at(1.0)
         };
         let (mut poll_loop, _) = model1_task(vec![Some(unflagged)]);
@@ -2042,11 +2257,84 @@ mod tests {
         assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
 
+    /// A poller at rest whose polls answer from `script`, with distinct
+    /// moving and idle periods.
+    fn poller(script: Vec<MotorStatus>) -> MotorPollLoop {
+        let script = std::iter::once(MotorStatus::default()).chain(script);
+        poller_on(Arc::new(Mutex::new(Script(script.map(Some).collect()))))
+    }
+
+    fn poller_on(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorPollLoop {
+        let (_poll_tx, poll) = mpsc::channel(1);
+        let (_tx, commands) = mpsc::unbounded_channel();
+        MotorPollLoop::new(
+            PollerInbox { poll, commands },
+            motor,
+            AxisSubscribers::new(),
+            MOVING_PERIOD,
+            IDLE_PERIOD,
+            0,
+        )
+    }
+
+    const MOVING_PERIOD: Duration = Duration::from_millis(100);
+    const IDLE_PERIOD: Duration = Duration::from_secs(60);
+
+    /// The period of one poller pass over `status`, and the MSTA it posts.
+    fn pace_and_msta(status: MotorStatus) -> (Duration, MstaFlags) {
+        let mut poll_loop = poller(vec![status]);
+        let due = poll_loop.poller_pass(false).unwrap();
+        let period = due.saturating_duration_since(Instant::now());
+        let msta = MstaFlags::from_status(poll_loop.last_status.as_ref().unwrap());
+        (period, msta)
+    }
+
+    /// C asynMotorPoller paces on the driver's own `*moving` (:660); MSTA
+    /// RA_MOVING is set only by a driver that sets motorStatusMoving_
+    /// (asynMotorAxis.cpp:255-264), which SMC100 and most others never do.
+    #[test]
+    fn a_moving_poll_runs_fast_without_posting_ra_moving() {
+        let (period, msta) = pace_and_msta(MotorStatus {
+            moving: true,
+            ..MotorStatus::default()
+        });
+        assert!(period <= MOVING_PERIOD, "moving pace: {period:?}");
+        assert!(!msta.contains(MstaFlags::MOVING), "{msta:?}");
+    }
+
+    #[test]
+    fn ra_moving_posts_without_pacing_the_poller() {
+        let (period, msta) = pace_and_msta(MotorStatus {
+            msta_moving: true,
+            ..MotorStatus::default()
+        });
+        assert!(period > MOVING_PERIOD, "idle pace: {period:?}");
+        assert!(msta.contains(MstaFlags::MOVING), "{msta:?}");
+    }
+
+    #[test]
+    fn moving_and_ra_moving_both_set_post_and_pace() {
+        let (period, msta) = pace_and_msta(MotorStatus {
+            moving: true,
+            msta_moving: true,
+            ..MotorStatus::default()
+        });
+        assert!(period <= MOVING_PERIOD, "moving pace: {period:?}");
+        assert!(msta.contains(MstaFlags::MOVING), "{msta:?}");
+    }
+
+    #[test]
+    fn a_status_that_sets_neither_idles_without_ra_moving() {
+        let (period, msta) = pace_and_msta(MotorStatus::default());
+        assert!(period > MOVING_PERIOD, "idle pace: {period:?}");
+        assert!(!msta.contains(MstaFlags::MOVING), "{msta:?}");
+    }
+
     #[test]
     fn ra_moving_does_not_hold_a_done_move() {
         let done = MotorStatus {
             done: true,
-            moving: true,
+            msta_moving: true,
             ..at(1.0)
         };
         let (mut poll_loop, _) = model1_task(vec![Some(done)]);

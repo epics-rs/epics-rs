@@ -56,8 +56,12 @@ pub struct MotorStatus {
     pub velocity: f64,
     /// True if the last move has completed.
     pub done: bool,
-    /// True if the motor is currently moving.
+    /// True if the motor is currently moving: the poller's pace (C
+    /// `poll(&moving)`), not a status bit.
     pub moving: bool,
+    /// MSTA bit 10 RA_MOVING, C `motorStatusMoving_`. Off by default: C
+    /// starts it at 0 and only drivers that set that parameter raise it.
+    pub msta_moving: bool,
     /// True if a positive (raw) limit switch is active.
     pub high_limit: bool,
     /// True if a negative (raw) limit switch is active.
@@ -102,6 +106,7 @@ impl Default for MotorStatus {
             velocity: 0.0,
             done: true,
             moving: false,
+            msta_moving: false,
             high_limit: false,
             low_limit: false,
             home: false,
@@ -339,6 +344,14 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
+    /// A model-1 record's VELO in steps/s, given ahead of each transaction
+    /// that moves: C devices read `mr->velo` in `build_trans`, so a
+    /// faulhaber HOME runs at VELO where the record sent HVEL
+    /// (devMCDC2805.cc:224).
+    fn set_record_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     /// Poll the motor for current status.
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
 
@@ -357,6 +370,15 @@ pub trait AsynMotor: Send + Sync {
     /// SMC100 raises only `motorStatusProblem_`, an XPS axis also
     /// `motorStatusCommsError_`), and the bits reach the record as MSTA.
     fn poll_failure(&self) -> PollFailure;
+
+    /// After a failed poll, the status it had set before it bailed, without
+    /// [`AsynMotor::poll_failure`]'s bits: C `set_status` storing
+    /// `motor_info->status` at its exit on RETRY (drvMM3000.cc:313-334), or
+    /// an asyn poll's `setIntegerParam` calls before its error label. The
+    /// next post carries it. None leaves the last status.
+    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
+        None
+    }
 
     /// The status fields the write method just called set, in order. The
     /// poller drains this after every write and posts the result when it

@@ -60,7 +60,7 @@ impl MstaFlags {
         if status.done {
             msta |= Self::DONE;
         }
-        if status.moving {
+        if status.msta_moving {
             msta |= Self::MOVING;
         }
         if status.high_limit {
@@ -391,6 +391,12 @@ pub enum MotorCommand {
     /// driver polling that move reads as `mr->cdir`.
     MoveDirection {
         forward: bool,
+    },
+    /// The record's VELO in steps/s, ahead of a transaction that moves:
+    /// what a model-1 device reads as `mr->velo` in `build_trans`
+    /// (devMCDC2805.cc:224 homes at it, not at HVEL).
+    RecordVelocity {
+        velocity: f64,
     },
     ProfileInitialize {
         max_points: usize,

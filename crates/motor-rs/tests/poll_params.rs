@@ -97,6 +97,7 @@ fn a_poll_sets_the_axis_status_in_the_controller_ports_params() {
     *status.lock().unwrap() = MotorStatus {
         position: -2.0,
         moving: true,
+        msta_moving: true,
         done: false,
         low_limit: true,
         ..MotorStatus::default()

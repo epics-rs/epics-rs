@@ -4,7 +4,8 @@
 //! `acc <= 0`) runs on the last stored one. On an asynMotorController axis
 //! they are the controller port's MOTOR_VELOCITY / MOTOR_VEL_BASE /
 //! MOTOR_ACCEL, which the speed writes set through the port. On a model-1
-//! card they are the card's own registers, which a SET_* string sets.
+//! card the velocities are the card's own registers, which a SET_* string
+//! sets; its acceleration is only the SET_ACCEL its message carries.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -164,7 +165,7 @@ fn model1() -> TraceUser {
 
 #[test]
 fn a_skipped_acceleration_runs_on_the_last_stored_one() {
-    for user in [controller("storedAccel").0, model2(), model1()] {
+    for user in [controller("storedAccel").0, model2()] {
         let seen = run(
             user,
             vec![
@@ -225,9 +226,28 @@ fn a_refused_set_accel_leaves_the_move_on_the_stored_one() {
     assert_eq!(port.read_float64_blocking(index::ACCEL, 0).unwrap(), 3.0);
 }
 
+/// A model-1 message carries a SET_ACCEL only when the record wrote one
+/// ahead of its move; a home at acc 0 sends none (motorRecord.cc:874), and
+/// the driver then appends no acceleration.
+#[test]
+fn a_model1_move_gets_only_the_acceleration_written_ahead_of_it() {
+    let seen = run(
+        model1(),
+        vec![
+            set_accel(2.0),
+            move_with(2.0),
+            home_with(0.0),
+            MotorCommand::stop_axis(),
+            set_accel(3.0),
+            move_with(3.0),
+        ],
+    );
+    assert_eq!(seen, [2.0, 0.0, 0.0, 3.0]);
+}
+
 #[test]
 fn a_record_stop_runs_on_the_last_stored_acceleration() {
-    for user in [controller("storedAccelStop").0, model2(), model1()] {
+    for user in [controller("storedAccelStop").0, model2()] {
         let seen = run(
             user,
             vec![

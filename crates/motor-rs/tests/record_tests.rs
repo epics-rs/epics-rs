@@ -4878,6 +4878,7 @@ fn test_external_move_detected_when_driver_moves_while_idle() {
         encoder_position: 5.0,
         velocity: 0.0,
         moving: true,
+        msta_moving: true,
         done: false,
         direction: true,
         high_limit: false,
@@ -4908,6 +4909,7 @@ fn test_external_move_idempotent_on_repeat_poll() {
         encoder_position: 5.0,
         velocity: 0.0,
         moving: true,
+        msta_moving: true,
         done: false,
         direction: true,
         high_limit: false,
@@ -4941,6 +4943,7 @@ fn test_external_move_completion_syncs_and_clears_mip() {
         encoder_position: 0.0,
         velocity: 0.0,
         moving: true,
+        msta_moving: true,
         done: false,
         direction: true,
         high_limit: false,
@@ -4965,6 +4968,7 @@ fn test_external_move_completion_syncs_and_clears_mip() {
         encoder_position: 7.0,
         velocity: 0.0,
         moving: false,
+        msta_moving: false,
         done: true,
         direction: true,
         high_limit: false,
@@ -8848,6 +8852,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
+                    MotorCommand::RecordVelocity { .. },
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: true },
                     MotorCommand::MoveVelocity { velocity, .. }
@@ -8868,6 +8873,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
+                    MotorCommand::RecordVelocity { .. },
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }
@@ -8891,6 +8897,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
+                    MotorCommand::RecordVelocity { .. },
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }

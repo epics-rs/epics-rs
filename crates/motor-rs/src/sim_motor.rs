@@ -195,6 +195,7 @@ impl SimMotor {
             encoder_home: p == self.home_position,
             homed: self.homed,
             moving: !done,
+            msta_moving: !done,
             low_limit: p <= self.low_limit,
             ..MotorStatus::default()
         };

@@ -13,10 +13,10 @@
 //! value is written back, so the PV is honest about the accepted value rather
 //! than silently inert.
 
-// RTEMS-EXEC-MODEL-ALLOW(10): checked, not waived — all 10 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(11): checked, not waived — all 11 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
-// --all-features`, 402/402). ad-core-rs became a census subject when its
+// --all-features`, 512/512). ad-core-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.

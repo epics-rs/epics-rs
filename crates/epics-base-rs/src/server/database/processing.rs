@@ -102,6 +102,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult, DbResult, DbStatus};
+use crate::server::recgbl::alarm_status;
 use crate::server::record::record_instance::StampPass;
 use crate::server::record::{
     CycleHooks, CycleLink, InputFetchPolicy, NotifyWaitSet, PactExit, RawSoftEntry, RecordCell,
@@ -6346,6 +6347,7 @@ impl PvDatabase {
                             Ok(_) => dev.read(&mut *instance.record),
                             Err(e) => Err(e),
                         };
+                        let read_failed = read.is_err();
                         match read {
                             Ok(read_outcome) => {
                                 let status = read_outcome.status;
@@ -6382,17 +6384,19 @@ impl PvDatabase {
                             // C prints nothing for a failed `read_ai`
                             // (`aiRecord.c:482`, `dbAccess.c:612`); the device
                             // support says what it has to.
-                            Err(_) => {
-                                use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr};
-                                cycle_status.io(Err(DbStatus::FAILED));
-                                rec_gbl_set_sevr(
-                                    &mut instance.common,
-                                    alarm_status::READ_ALARM,
-                                    crate::server::record::AlarmSeverity::Invalid,
-                                );
-                            }
+                            Err(_) => cycle_status.io(Err(DbStatus::FAILED)),
                         }
                         instance.device = Some(dev);
+                        // An input's device raises its alarm in `readValue`,
+                        // ahead of the record body.
+                        if !plan.output_stage {
+                            raise_transfer_alarm(
+                                instance,
+                                read_failed,
+                                alarm_status::READ_ALARM,
+                                is_soft,
+                            );
+                        }
                     }
                 }
 
@@ -6952,11 +6956,6 @@ impl PvDatabase {
                     if let Some(utag) = dev_utag {
                         instance.common.utag = utag;
                     }
-                    // An input's device raises its alarm in `readValue`, before
-                    // `checkAlarms` and the stamp.
-                    if !plan.output_stage {
-                        apply_device_alarm(instance, is_soft);
-                    }
                 }
 
                 // The soft-channel half of the same override: for a `Soft
@@ -7037,9 +7036,6 @@ impl PvDatabase {
                 // (mbboRecord.c:205) jump to the identical label.
                 let skips_ts_undef = plan.skips_timestamp_when_undefined
                     && (instance.common.udf != 0 || links.is_some_and(|l| l.dol_read_failed));
-                if !plan.output_stage {
-                    apply_device_alarm(instance, is_soft);
-                }
                 // The stamp after `checkAlarms` takes the same `begun`: TIME_LAST
                 // was set before the device time landed.
                 let stamp_after_alarms = if plan.stamps_before_alarms {
@@ -7419,7 +7415,7 @@ impl PvDatabase {
                             // output stage on callback cycles like any other C `dbProcess`:
                             // the motor record's retry / backlash / NTM-stop commands are
                             // emitted on exactly these passes.
-                            raise_write_value_alarm(instance, false, false);
+                            raise_transfer_alarm(instance, false, alarm_status::WRITE_ALARM, false);
                             None
                         } else if !record_should_output {
                             // OOPT gating for hardware outputs (longout DTYP=...).
@@ -7462,7 +7458,12 @@ impl PvDatabase {
                                     cycle_status.io(Err(DbStatus::FAILED));
                                 }
                                 instance.device = Some(dev);
-                                raise_write_value_alarm(instance, write_failed, false);
+                                raise_transfer_alarm(
+                                    instance,
+                                    write_failed,
+                                    alarm_status::WRITE_ALARM,
+                                    false,
+                                );
                             }
                             None
                         }
@@ -8834,7 +8835,12 @@ impl PvDatabase {
                 // The device's alarm is raised inside `writeValue`, after the
                 // test above, and only on a cycle that drives the output.
                 if !skip_out {
-                    raise_write_value_alarm(&mut instance, write_error.is_some(), is_soft);
+                    raise_transfer_alarm(
+                        &mut instance,
+                        write_error.is_some(),
+                        alarm_status::WRITE_ALARM,
+                        is_soft,
+                    );
                 }
 
                 // OEVT: queue the output event when the output fires — same
@@ -10874,21 +10880,21 @@ fn invalid_output_action(instance: &mut RecordInstance, first_pass: bool) -> boo
     }
 }
 
-/// The alarm C's `writeValue` raises through the device's `processXxx`
-/// (a PENDING raise that this cycle's `monitor()` commits). Only a cycle
-/// whose IVOA test let the output through reaches it.
+/// The alarm C's `readValue`/`writeValue` raises through the device's
+/// `processXxx` (a PENDING raise that this cycle's `monitor()` commits).
 ///
-/// C's record raises nothing on a failed `write_ao` (aoRecord.c:565): the
-/// device's own alarm is the failure's, so devAsyn's COMM for an
-/// asynDisconnected write survives. WRITE/INVALID stands in only for a
-/// device that failed and reported none.
+/// C's record raises nothing on a failed `read_ai`/`write_ao` (aiRecord.c:482,
+/// aoRecord.c:565): the device's own alarm is the failure's, so devAsyn's
+/// COMM for asynDisconnected survives. `fallback`/INVALID stands in only for
+/// a device that failed and reported none; raised first, it took
+/// `recGblSetSevr`'s INVALID tie and outranked a lesser device alarm.
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn raise_write_value_alarm(instance: &mut RecordInstance, write_failed: bool, is_soft: bool) {
+fn raise_transfer_alarm(instance: &mut RecordInstance, failed: bool, fallback: u16, is_soft: bool) {
     let reported = apply_device_alarm(instance, is_soft);
-    if write_failed && !reported {
+    if failed && !reported {
         crate::server::recgbl::rec_gbl_set_sevr(
             &mut instance.common,
-            crate::server::recgbl::alarm_status::WRITE_ALARM,
+            fallback,
             crate::server::record::AlarmSeverity::Invalid,
         );
     }

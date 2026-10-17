@@ -336,6 +336,7 @@ pub struct PortHandle {
     can_block: bool,
     multi_device: bool,
     max_addr: i32,
+    get_address: crate::port::GetAddress,
     /// The port's interface registry — the driver's own
     /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
     /// port is registered. C's asynManager keeps the same thing as the list of
@@ -370,6 +371,7 @@ pub struct WeakPortHandle {
     can_block: bool,
     multi_device: bool,
     max_addr: i32,
+    get_address: crate::port::GetAddress,
     interfaces: Arc<[Capability]>,
     trace: Arc<TraceManager>,
     sync_lock: crate::port_actor::SyncLock,
@@ -396,6 +398,7 @@ impl WeakPortHandle {
             can_block: self.can_block,
             multi_device: self.multi_device,
             max_addr: self.max_addr,
+            get_address: self.get_address,
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
@@ -448,6 +451,7 @@ impl PortHandle {
             can_block: false,
             multi_device: false,
             max_addr: 1,
+            get_address: crate::port::port_get_address,
             interfaces: crate::interfaces::default_capabilities().into(),
             trace,
             sync_lock: actor.sync_lock,
@@ -467,6 +471,7 @@ impl PortHandle {
             can_block: self.can_block,
             multi_device: self.multi_device,
             max_addr: self.max_addr,
+            get_address: self.get_address,
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
@@ -514,13 +519,19 @@ impl PortHandle {
         self.can_block
     }
 
-    /// Record the port's multi-device capability and address count.
-    /// Called by the runtime layer at handle construction so the
-    /// flags reflect the driver's `PortFlags::multi_device` /
-    /// `PortDriverBase::max_addr`.
-    pub fn set_capabilities(&mut self, multi_device: bool, max_addr: i32) {
+    /// Record the port's multi-device capability, address count and
+    /// `getAddress`. Called by the runtime layer at handle construction so
+    /// they reflect the driver's `PortFlags::multi_device`,
+    /// `PortDriverBase::max_addr` and [`PortDriverBase::get_address_rule`].
+    pub fn set_capabilities(
+        &mut self,
+        multi_device: bool,
+        max_addr: i32,
+        get_address: crate::port::GetAddress,
+    ) {
         self.multi_device = multi_device;
         self.max_addr = max_addr.max(1);
+        self.get_address = get_address;
     }
 
     /// Whether this port is multi-device. C parity:
@@ -543,9 +554,15 @@ impl PortHandle {
         crate::port::dp_common_key(self.multi_device, addr)
     }
 
-    /// The parameter list a client at `addr` reads: [`crate::port::param_list`].
+    /// The parameter list a client at `addr` reads: the driver's
+    /// [`crate::port::GetAddress`]. C's interrupt match ignores its status
+    /// and compares the address it left (asynPortDriver.cpp:627-630).
     pub fn param_list(&self, addr: i32) -> i32 {
-        crate::port::param_list(self.multi_device, addr)
+        let space = crate::port::AddressSpace {
+            multi_device: self.multi_device,
+            max_addr: self.max_addr as usize,
+        };
+        (self.get_address)(space, addr).unwrap_or_else(|address| address)
     }
 
     /// Maximum sub-device address (exclusive upper bound).
@@ -1112,6 +1129,7 @@ impl PortHandle {
         Ok(DrvUserInfo {
             reason,
             max_octet_len: result.max_octet_len,
+            drv_user: result.drv_user,
         })
     }
 
@@ -2932,14 +2950,14 @@ mod tests {
         assert!(!handle.is_multi_device());
         assert_eq!(handle.max_addr(), 1);
 
-        handle.set_capabilities(true, 8);
+        handle.set_capabilities(true, 8, crate::port::port_get_address);
         assert!(handle.is_multi_device());
         assert_eq!(handle.max_addr(), 8);
 
         // Floor guard: a degenerate `set_capabilities(_, 0)` must
         // still report at least 1 (C asyn enforces the same in
         // `paramList` constructor).
-        handle.set_capabilities(false, 0);
+        handle.set_capabilities(false, 0, crate::port::port_get_address);
         assert!(!handle.is_multi_device());
         assert_eq!(handle.max_addr(), 1);
     }

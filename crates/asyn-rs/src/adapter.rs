@@ -383,9 +383,11 @@ pub struct AsynDeviceSupport {
     /// `modbusDrvUser_t.len` parsed from a `TYPE=N` drvInfo). `Some(n)` caps
     /// `octet_max_size` to `min(octet_max_size, n)` at init, mirroring C
     /// `getStringLen` (drvModbusAsyn.cpp:2367-2377); `None` leaves the buffer
-    /// length alone. Resolved once at bind because per-record driver state is
-    /// not threaded per-I/O in asyn-rs.
+    /// length alone. Resolved once at bind.
     octet_len_cap: Option<usize>,
+    /// The drvUser `drv_user_create` returned, which every request of this
+    /// record carries (C's one `pasynUser` per record).
+    drv_user: Option<crate::port::DrvUser>,
     /// `Some` ⟹ this is `asynOctetCmdResponse`: an escape-translated literal
     /// command (C `initCmdBuffer`, devAsynOctet.c) written before each read so
     /// the reply lands in VAL. `read_op` emits `OctetWriteRead` instead of a
@@ -834,6 +836,7 @@ impl AsynDeviceSupport {
             octet_val_size: 256,
             octet_max_size: 256,
             octet_len_cap: None,
+            drv_user: None,
             octet_cmd: None,
             last_alarm_status: 0,
             last_alarm_severity: 0,
@@ -887,6 +890,7 @@ impl AsynDeviceSupport {
             .with_addr(self.addr)
             .with_timeout_opt(self.timeout)
             .with_priority(priority)
+            .with_drv_user(self.drv_user.clone())
     }
 
     /// Create with a typed interface from a [`PortHandle`].
@@ -3006,6 +3010,7 @@ impl DeviceSupport for AsynDeviceSupport {
                         // Per-record octet cap (C `modbusDrvUser_t.len`); applied to
                         // `octet_max_size` below, after SIZV finalizes the buffer.
                         self.octet_len_cap = info.max_octet_len;
+                        self.drv_user = info.drv_user;
                     }
                     Err(e) => {
                         // Param not found, or the driver rejected the bind (e.g. an
@@ -8673,8 +8678,8 @@ mod tests {
                 _req: &DrvUserRequest,
             ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
                 Ok(crate::port::DrvUserInfo {
-                    reason: 0,
                     max_octet_len: Some(self.cap),
+                    ..crate::port::DrvUserInfo::from_reason(0)
                 })
             }
         }
@@ -8730,6 +8735,82 @@ mod tests {
         let mut rec = LsiRecord::new("");
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.octet_max_size, 256);
+    }
+
+    /// C `drvUserCreate` may hang a drvUser on the record's `pasynUser`
+    /// (SPiiPlusDriver.cpp:306-322), which every later read and write of that
+    /// record carries to the driver.
+    #[test]
+    fn the_drv_user_from_drv_user_create_rides_every_request() {
+        use std::sync::Mutex;
+        type Seen = Arc<Mutex<Vec<Option<String>>>>;
+        struct ProgPort {
+            base: PortDriverBase,
+            seen: Seen,
+        }
+        impl ProgPort {
+            fn see(&self, user: &AsynUser) {
+                let prog = user
+                    .drv_user
+                    .as_ref()
+                    .and_then(|d| d.downcast_ref::<String>())
+                    .cloned();
+                self.seen.lock().unwrap().push(prog);
+            }
+        }
+        impl PortDriver for ProgPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn drv_user_create(
+                &mut self,
+                req: &DrvUserRequest,
+            ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
+                let name = req.drv_info.strip_prefix("START_").unwrap();
+                Ok(crate::port::DrvUserInfo::from_reason(0)
+                    .with_drv_user(Arc::new(name.to_string())))
+            }
+            fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+                self.see(user);
+                self.base.write_int32_param(user, value)
+            }
+            fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+                self.see(user);
+                self.base.read_int32_param(user)
+            }
+        }
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+        use epics_base_rs::server::records::longout::LongoutRecord;
+
+        let seen = Seen::default();
+        let mut base = PortDriverBase::new("progport", 1, PortFlags::default());
+        base.create_param("START_", ParamType::Int32).unwrap();
+        let driver = ProgPort {
+            base,
+            seen: seen.clone(),
+        };
+        let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default()).unwrap();
+        let link = AsynLink {
+            port_name: "progport".into(),
+            addr: 0,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "START_PROG1".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynInt32");
+        ads.set_record_info("TEST:PROG", ScanType::Passive);
+        let mut rec = LongoutRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        seen.lock().unwrap().clear();
+        rec.set_val(EpicsValue::Long(1)).unwrap();
+        ads.write(&mut rec).unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some("PROG1".to_string()), Some("PROG1".to_string())]
+        );
     }
 
     /// R11-48. C device support calls `drvUser->create` only when the port

@@ -1567,8 +1567,8 @@ impl PortDriver for ModbusPortDriver {
             ),
         );
         Ok(DrvUserInfo {
-            reason,
             max_octet_len,
+            ..DrvUserInfo::from_reason(reason)
         })
     }
 

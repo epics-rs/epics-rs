@@ -1380,6 +1380,93 @@ fn a_driver_read_override_answers_its_own_params_and_leaves_the_base_s() {
     );
 }
 
+/// SPiiPlus's shape: a `getAddress` that takes a tag past maxAddr-1 to list
+/// 0, and a `drvUserCreate` that cuts `START_<name>` to the shared START_
+/// parameter with `<name>` as the record's drvUser
+/// (SPiiPlusDriver.cpp:306-322, :342-357).
+/// `(the user's address, the value, its program name)` per START_ write.
+type ProgramWrites = Arc<Mutex<Vec<(i32, i32, Option<String>)>>>;
+
+#[derive(Default)]
+struct Programs {
+    start: usize,
+    seen: ProgramWrites,
+}
+
+fn tag_address(space: asyn_rs::port::AddressSpace, addr: i32) -> Result<i32, i32> {
+    if addr > space.max_addr as i32 - 1 {
+        Ok(0)
+    } else {
+        asyn_rs::port::port_get_address(space, addr)
+    }
+}
+
+impl ControllerParams for Programs {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.start = base.create_param("START_", ParamType::Int32)?;
+        base.set_get_address(tag_address);
+        Ok(())
+    }
+
+    fn drv_user_create(
+        &mut self,
+        base: &mut PortDriverBase,
+        req: &asyn_rs::port::DrvUserRequest,
+    ) -> AsynResult<asyn_rs::port::DrvUserInfo> {
+        let Some(name) = req
+            .drv_info
+            .strip_prefix("START_")
+            .filter(|n| !n.is_empty())
+        else {
+            return base.drv_user_create(req);
+        };
+        let shared = asyn_rs::port::DrvUserRequest::new("START_", req.addr);
+        Ok(base
+            .drv_user_create(&shared)?
+            .with_drv_user(Arc::new(name.to_string())))
+    }
+
+    fn write_int32(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        if user.reason != self.start {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let name = user
+            .asyn()
+            .drv_user
+            .as_ref()
+            .and_then(|d| d.downcast_ref::<String>())
+            .cloned();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((user.asyn().addr, value, name));
+        ParamWrite::Handled(Ok(()))
+    }
+}
+
+#[test]
+fn a_driver_drv_user_create_and_get_address_reach_its_writes() {
+    let params = Programs::default();
+    let seen = params.seen.clone();
+    let port = register_controller_port(&open_owner(), "CPPROG", 2, params).unwrap();
+    let _ax = axis("CPPROG", 0);
+    let info = port
+        .drv_user_create_blocking(&asyn_rs::port::DrvUserRequest::new("START_PROG1", 30))
+        .unwrap();
+    assert_eq!(info.reason, BASE_PARAMS.len());
+    let user = AsynUser::new(info.reason)
+        .with_addr(30)
+        .with_drv_user(info.drv_user);
+    port.submit_blocking(asyn_rs::request::RequestOp::Int32Write { value: 1 }, user)
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), [(30, 1, Some("PROG1".to_string()))]);
+}
+
 /// phytron's controller records: C's subclass `writeInt32` runs at an
 /// address with no axis, and only the base it calls refuses there
 /// (asynMotorController.cpp `getAxis` → asynError; phytronAxisMotor.cpp:365-385).

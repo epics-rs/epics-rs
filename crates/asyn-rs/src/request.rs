@@ -1158,6 +1158,8 @@ pub struct RequestResult {
     /// Per-record octet length cap (from DrvUserCreate; C `modbusDrvUser_t.len`).
     /// `None` when the drvInfo carried no cap.
     pub max_octet_len: Option<usize>,
+    /// The drvUser (from DrvUserCreate).
+    pub drv_user: Option<crate::port::DrvUser>,
     /// Enum index (from EnumRead).
     pub enum_index: Option<usize>,
     /// Driver enum string/value/severity table (from EnumRead). C asyn
@@ -1222,6 +1224,7 @@ impl RequestResult {
             uint_val: None,
             reason: None,
             max_octet_len: None,
+            drv_user: None,
             enum_index: None,
             enum_entries: None,
             int32_array: None,
@@ -1306,10 +1309,11 @@ impl RequestResult {
         }
     }
 
-    pub fn drv_user_create(reason: usize, max_octet_len: Option<usize>) -> Self {
+    pub fn drv_user_create(info: crate::port::DrvUserInfo) -> Self {
         Self {
-            reason: Some(reason),
-            max_octet_len,
+            reason: Some(info.reason),
+            max_octet_len: info.max_octet_len,
+            drv_user: info.drv_user,
             ..Self::base()
         }
     }

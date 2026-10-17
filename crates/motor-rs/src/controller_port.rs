@@ -19,7 +19,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::claim_port;
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -414,6 +414,17 @@ pub trait ControllerParams: Send + Sync + 'static {
         _value: f64,
     ) -> ParamWrite {
         ParamWrite::PassToBase(Ok(()))
+    }
+
+    /// The subclass `drvUserCreate`, as SPiiPlusController's `START_<name>`;
+    /// an override calls [`PortDriverBase::drv_user_create`] as C calls the
+    /// base. asynMotorController has none.
+    fn drv_user_create(
+        &mut self,
+        base: &mut PortDriverBase,
+        req: &DrvUserRequest,
+    ) -> AsynResult<DrvUserInfo> {
+        base.drv_user_create(req)
     }
 
     /// The subclass `readInt32`; an override calls
@@ -1195,6 +1206,10 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
         let this: &Self = self;
         this.params
             .report(&ControllerReport { port: this }, out, level);
+    }
+
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        self.params.drv_user_create(&mut self.base, req)
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {

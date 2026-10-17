@@ -504,6 +504,9 @@ pub struct AsynRecord {
     // --- Runtime state (not EPICS fields) ---
     device_user: crate::manager::DeviceUser,
     resolved_reason: usize,
+    /// C `pasynUser->drvUser`: written only by a successful
+    /// `drvUser->create` (asynRecord.c:1250), as C's is.
+    drv_user: Option<crate::port::DrvUser>,
 
     // The record's canonical name plus a cycle-free handle to its own
     // database, handed over by the framework at `add_record` via
@@ -878,6 +881,7 @@ impl Default for AsynRecord {
             aqr: 0,
             device_user: crate::manager::DeviceUser::default(),
             resolved_reason: 0,
+            drv_user: None,
             async_ctx: None,
             trace_name: String::new(),
             callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
@@ -1057,6 +1061,7 @@ struct IoPlan {
     // every phase consumes a fresh user by value (`io_user`/`flush_user`).
     reason: usize,
     addr: i32,
+    drv_user: Option<crate::port::DrvUser>,
     /// `None` is C's negative TMOT — wait forever; see
     /// [`crate::user::AsynUser::timeout`].
     timeout: Option<std::time::Duration>,
@@ -1090,6 +1095,7 @@ impl Default for IoPlan {
             gpib: None,
             reason: 0,
             addr: 0,
+            drv_user: None,
             timeout: None,
             octet_out: Vec::new(),
             octet_out_len: 0,
@@ -1266,6 +1272,7 @@ fn io_user(plan: &IoPlan) -> AsynUser {
         .with_addr(plan.addr)
         .with_timeout_opt(plan.timeout)
         .with_queue_timeout(QUEUE_TIMEOUT)
+        .with_drv_user(plan.drv_user.clone())
 }
 
 /// Build the `asynUser` for a `Flush` phase. C runs the flush on the record's
@@ -1279,6 +1286,7 @@ fn flush_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason)
         .with_addr(plan.addr)
         .with_queue_timeout(QUEUE_TIMEOUT)
+        .with_drv_user(plan.drv_user.clone())
 }
 
 /// One phase of a record I/O cycle — a `performIO` transfer phase, or one bus
@@ -2097,19 +2105,21 @@ enum QueuedBy {
 /// What a special request's `AsynUser` is built from — the record's
 /// `pasynUser` as `duplicateAsynUser` copies it (asynRecord.c:531-533), taken
 /// under the hold so the port half can build one per request off it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SpecialUser {
     reason: usize,
     addr: i32,
+    drv_user: Option<crate::port::DrvUser>,
     timeout: Option<std::time::Duration>,
     queue: OptionQueue,
 }
 
 impl SpecialUser {
-    fn user(self) -> AsynUser {
+    fn user(&self) -> AsynUser {
         let user = AsynUser::new(self.reason)
             .with_addr(self.addr)
             .with_timeout_opt(self.timeout)
+            .with_drv_user(self.drv_user.clone())
             // C queues every special request, and `connectDevice` its
             // getOption/getEos readbacks, with `QUEUE_TIMEOUT`
             // (asynRecord.c:571-572, :1281, :1297).
@@ -2186,6 +2196,7 @@ impl Default for SpecialRequest {
             user: SpecialUser {
                 reason: 0,
                 addr: 0,
+                drv_user: None,
                 timeout: None,
                 queue: OptionQueue::Normal,
             },
@@ -2216,7 +2227,7 @@ impl SpecialRequest {
 
     /// The port half of C `asynCallbackSpecial`, on the port's thread.
     fn run(&self, port: &mut dyn PortCalls) -> SpecialDone {
-        let user = self.user;
+        let user = &self.user;
         match self.what {
             SpecialWhat::SetOption => {
                 // C `setOption`'s `return` leaves `setOption`, not the
@@ -2418,7 +2429,7 @@ impl From<Result<(String, String), AsynError>> for Readback {
 /// `queueRequest failed` on every attach to a disconnected port.
 fn read_options(
     port: &mut dyn PortCalls,
-    user: SpecialUser,
+    user: &SpecialUser,
 ) -> Result<HashMap<String, String>, AsynError> {
     let mut opts = HashMap::new();
     for key in OPTION_READBACK_KEYS {
@@ -2449,7 +2460,7 @@ fn read_options(
 /// request that never ran is `Err`, as in [`read_options`]: this is the
 /// readback C queues with no not-connected waiver (`asynQueuePriorityLow`,
 /// :1296), so the gate really does refuse it.
-fn read_eos(port: &mut dyn PortCalls, user: SpecialUser) -> Result<(String, String), AsynError> {
+fn read_eos(port: &mut dyn PortCalls, user: &SpecialUser) -> Result<(String, String), AsynError> {
     let mut read = |op| match port.call(&op, user.user()) {
         Ok(RequestResult {
             data: Some(bytes), ..
@@ -3711,6 +3722,7 @@ impl AsynRecord {
                             Ok(info) => {
                                 self.resolved_reason = info.reason;
                                 self.reason = info.reason as i32;
+                                self.drv_user = info.drv_user;
                             }
                             Err(e) => {
                                 // C reports the bare literal — the driver's own text
@@ -3943,6 +3955,7 @@ impl AsynRecord {
         SpecialUser {
             reason: self.resolved_reason,
             addr: self.addr,
+            drv_user: self.drv_user.clone(),
             timeout: self.io_timeout(),
             queue,
         }
@@ -4153,6 +4166,7 @@ impl AsynRecord {
         plan.gpib = gpib;
         plan.reason = self.resolved_reason;
         plan.addr = self.addr;
+        plan.drv_user.clone_from(&self.drv_user);
         plan.timeout = self.io_timeout();
         plan.octet_out_len = octet_out_len;
         plan.ofmt = self.ofmt;
@@ -7323,7 +7337,7 @@ mod tests {
             actor_link,
             trace,
         );
-        handle.set_capabilities(true, 2);
+        handle.set_capabilities(true, 2, crate::port::port_get_address);
         register_port(port_name, handle.clone(), &crate::registry::open_owner()).unwrap();
         let users = |report: &str| {
             report
@@ -7383,7 +7397,7 @@ mod tests {
         let trace = Arc::new(TraceManager::new());
         let mut handle =
             PortHandle::new(tx, port_name.into(), interrupts, actor_link, trace.clone());
-        handle.set_capabilities(true, 4);
+        handle.set_capabilities(true, 4, crate::port::port_get_address);
         register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
 
         let mut rec = AsynRecord::default();
@@ -7461,7 +7475,7 @@ mod tests {
                 actor_link,
                 Arc::new(TraceManager::new()),
             );
-            handle.set_capabilities(multi_device, max_addr as i32);
+            handle.set_capabilities(multi_device, max_addr as i32, crate::port::port_get_address);
             register_port(port_name, handle, &crate::registry::open_owner()).unwrap();
             crate::registry::get_port(port_name).expect("the port is registered")
         }
@@ -13778,6 +13792,60 @@ A.OEOS
             "a stale DRVINFO would have re-resolved REASON back to 1"
         );
         assert_eq!(rec.resolved_reason, 3, "and the I/O user with it");
+    }
+
+    /// The drvUser `drvUserCreate` hangs on the record's `pasynUser`
+    /// (asynRecord.c:1250) rides its transfers and its special requests.
+    #[test]
+    fn a_drv_user_from_drvinfo_rides_the_io_and_special_users() {
+        use crate::param::ParamType;
+        use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+
+        struct ProgDriver(PortDriverBase);
+        impl PortDriver for ProgDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+                Ok(self
+                    .0
+                    .drv_user_create(&DrvUserRequest::new("START_", req.addr))?
+                    .with_drv_user(Arc::new(req.drv_info.clone())))
+            }
+        }
+        let port_name = "drv_user_rides";
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        base.params
+            .create_param("START_", ParamType::Int32)
+            .unwrap();
+        let (rt, _jh) =
+            create_port_runtime_unclaimed(ProgDriver(base), RuntimeConfig::default()).unwrap();
+        register_port(
+            port_name,
+            rt.port_handle().clone(),
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "START_PROG1".to_string();
+        rec.connect_device().unwrap();
+        let prog = |user: &AsynUser| {
+            user.drv_user
+                .as_ref()
+                .and_then(|d| d.downcast_ref::<String>())
+                .cloned()
+        };
+        let plan = rec.build_io_plan();
+        assert_eq!(prog(&io_user(&plan)).as_deref(), Some("START_PROG1"));
+        assert_eq!(prog(&flush_user(&plan)).as_deref(), Some("START_PROG1"));
+        let special = rec.special_user(OptionQueue::Normal).user();
+        assert_eq!(prog(&special).as_deref(), Some("START_PROG1"));
     }
 
     /// R18-89. C assigns the reason only on success:

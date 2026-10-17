@@ -295,6 +295,7 @@ pub fn create_port_runtime_boxed(
     let can_block = driver.base().flags.can_block;
     let multi_device = driver.base().flags.multi_device;
     let max_addr = driver.base().max_addr as i32;
+    let get_address = driver.base().get_address_rule();
     // The driver's interface declaration, taken once here — C's port
     // registration is where `registerInterface` is called too, and the set never
     // changes afterwards (asynManager.c:2104-2140).
@@ -382,7 +383,7 @@ pub fn create_port_runtime_boxed(
         config.services.trace().clone(),
     );
     port_handle.set_can_block(can_block);
-    port_handle.set_capabilities(multi_device, max_addr);
+    port_handle.set_capabilities(multi_device, max_addr, get_address);
     port_handle.set_interfaces(interfaces);
     for hook in runtime_hooks {
         hook(&port_handle);
@@ -671,6 +672,27 @@ mod tests {
         let handle = rx.try_recv().expect("the hook ran during creation");
         assert!(rx.try_recv().is_err(), "the hook ran twice");
         handle.write_int32_blocking(0, 0, 7).unwrap();
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
+    }
+
+    /// C's interrupt match calls the driver's `getAddress` on the client
+    /// (asynPortDriver.cpp:627-630), so the handle's filter list is the
+    /// driver's rule.
+    #[test]
+    fn the_handle_resolves_through_the_drivers_get_address() {
+        let mut port = TestPort::with_flags(
+            "rt_get_address",
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        port.base.set_get_address(crate::port::tests::tag_address);
+        let (runtime, _jh) = create_port_runtime_unclaimed(port, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let handle = runtime.port_handle();
+        assert_eq!(handle.param_list(100), 0);
+        handle.write_int32_blocking(0, 100, 7).unwrap();
         assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 7);
     }
 

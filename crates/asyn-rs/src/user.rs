@@ -153,6 +153,9 @@ pub struct AsynUser {
     pub alarm_severity: u16,
     /// User-defined data.
     pub user_data: Option<Box<dyn Any + Send>>,
+    /// C `pasynUser->drvUser`, from the record's `drvUserCreate`
+    /// ([`crate::port::DrvUserInfo::drv_user`]).
+    pub drv_user: Option<crate::port::DrvUser>,
     /// Token for BlockProcess ownership. When a port is blocked, only requests
     /// with a matching block_token (or UnblockProcess) are dequeued.
     pub block_token: Option<u64>,
@@ -250,6 +253,7 @@ impl Default for AsynUser {
             alarm_status: 0,
             alarm_severity: 0,
             user_data: None,
+            drv_user: None,
             block_token: None,
             trace: None,
             error_message: String::new(),
@@ -333,6 +337,11 @@ impl AsynUser {
     /// passing on the timeout it was itself given. See [`Self::timeout`].
     pub fn with_timeout_opt(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_drv_user(mut self, drv_user: Option<crate::port::DrvUser>) -> Self {
+        self.drv_user = drv_user;
         self
     }
 

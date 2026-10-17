@@ -342,6 +342,32 @@ pub fn param_list(multi_device: bool, addr: i32) -> i32 {
     if multi_device && addr != -1 { addr } else { 0 }
 }
 
+/// What C `getAddress` reads of its port: whether `getAddr` reports the
+/// user's device, and `maxAddr`.
+#[derive(Clone, Copy, Debug)]
+pub struct AddressSpace {
+    pub multi_device: bool,
+    pub max_addr: usize,
+}
+
+/// C's virtual `asynPortDriver::getAddress`: the parameter list for a user
+/// at `addr`, or `Err` with the address it refuses. A driver that overrides
+/// it (SPiiPlusDriver.cpp:342, drvModbusAsyn.cpp:497) installs its own with
+/// [`PortDriverBase::set_get_address`]; requests, binds, connects and
+/// interrupt clients all resolve through it.
+pub type GetAddress = fn(AddressSpace, i32) -> Result<i32, i32>;
+
+/// `asynPortDriver::getAddress` itself (asynPortDriver.cpp:1901-1914),
+/// without its print.
+pub fn port_get_address(space: AddressSpace, addr: i32) -> Result<i32, i32> {
+    let address = param_list(space.multi_device, addr);
+    if address >= 0 && (address as usize) < space.max_addr {
+        Ok(address)
+    } else {
+        Err(address)
+    }
+}
+
 use crate::error::{AsynError, AsynResult, AsynStatus, QueueRefusal};
 use crate::exception::{AsynException, ExceptionCallbackGuard, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
@@ -526,6 +552,8 @@ pub struct PortDriverBase {
     pub port_name: Arc<str>,
     pub max_addr: usize,
     pub flags: PortFlags,
+    /// See [`GetAddress`].
+    get_address: GetAddress,
     pub params: ParamList,
     pub interrupts: InterruptManager,
     /// Whether the port's transport is up — read it with [`Self::is_connected`],
@@ -787,6 +815,7 @@ impl PortDriverBase {
             port_name: port_name.into(),
             max_addr,
             flags,
+            get_address: port_get_address,
             params: ParamList::new(max_addr),
             interrupts: InterruptManager::new(),
             // C `dpCommonInit` (asynManager.c:523): every port starts down and
@@ -1898,17 +1927,28 @@ impl PortDriverBase {
     /// carries the refused one, for the caller to print where C's
     /// `getAddress` call sits.
     pub fn resolve_address(&self, addr: i32) -> Result<i32, i32> {
-        let address = param_list(self.flags.multi_device, addr);
-        if address >= 0 && (address as usize) < self.max_addr {
-            Ok(address)
-        } else {
-            Err(address)
+        (self.get_address)(self.address_space(), addr)
+    }
+
+    pub fn address_space(&self) -> AddressSpace {
+        AddressSpace {
+            multi_device: self.flags.multi_device,
+            max_addr: self.max_addr,
         }
     }
 
-    /// C `asynPortDriver::getAddress` (asynPortDriver.cpp:1901-1914): the
-    /// parameter list `addr` selects ([`param_list`]), printing a refused one
-    /// through the device's trace.
+    /// Override `getAddress`, as a C subclass does; see [`GetAddress`].
+    pub fn set_get_address(&mut self, get_address: GetAddress) {
+        self.get_address = get_address;
+    }
+
+    pub fn get_address_rule(&self) -> GetAddress {
+        self.get_address
+    }
+
+    /// The driver's `getAddress` ([`GetAddress`], by default
+    /// [`port_get_address`]), printing a refused address through the
+    /// device's trace as asynPortDriver.cpp:1907-1912 does.
     pub fn get_address(&self, addr: i32, reason: usize) -> AsynResult<i32> {
         let address = match self.resolve_address(addr) {
             Ok(address) => return Ok(address),
@@ -2551,7 +2591,14 @@ pub struct DrvUserInfo {
     /// when the drvInfo carried no cap; the binding then uses the record buffer
     /// length alone. The binding applies `min(buffer_len, cap)`.
     pub max_octet_len: Option<usize>,
+    /// C `pasynUser->drvUser`: what the driver hangs on this record's user,
+    /// carried by its every request as [`AsynUser::drv_user`].
+    pub drv_user: Option<DrvUser>,
 }
+
+/// A driver's per-record state, C `pasynUser->drvUser`. Dropped with the
+/// last user that carries it, as C's `drvUserDestroy` frees it.
+pub type DrvUser = Arc<dyn std::any::Any + Send + Sync>;
 
 impl DrvUserInfo {
     /// A resolution carrying only the shared reason and no per-record cap — the
@@ -2561,6 +2608,11 @@ impl DrvUserInfo {
             reason,
             ..Self::default()
         }
+    }
+
+    pub fn with_drv_user(mut self, drv_user: DrvUser) -> Self {
+        self.drv_user = Some(drv_user);
+        self
     }
 }
 
@@ -3599,7 +3651,7 @@ pub(crate) fn octet_flush_chain(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// C `waitConnect` adds its handler on the port's own `dpCommon`
@@ -5675,6 +5727,34 @@ mod tests {
         assert!(matches!(e, AsynError::AddressOutOfRange(1)));
         // getAddress returns asynError, not the param library's InvalidList.
         assert_eq!(e.c_status_code(), 3);
+    }
+
+    /// SPiiPlusDriver.cpp:342-357: past maxAddr-1 the address is a tag on
+    /// list 0.
+    pub(crate) fn tag_address(space: AddressSpace, addr: i32) -> Result<i32, i32> {
+        if addr > space.max_addr as i32 - 1 {
+            Ok(0)
+        } else {
+            port_get_address(space, addr)
+        }
+    }
+
+    /// C calls the virtual `getAddress` from parseAsynUser, drvUserCreate
+    /// and connect (asynPortDriver.cpp:1930, :3569, :3772).
+    #[test]
+    fn an_overridden_get_address_resolves_every_base_path() {
+        let mut drv = errmsg_drv();
+        drv.base.set_get_address(tag_address);
+        let tag = |reason| AsynUser::new(reason).with_addr(100);
+
+        assert_eq!(drv.base.parse_user(&tag(F64)).unwrap(), 0);
+        drv.write_float64(&mut tag(F64), 2.5).unwrap();
+        assert_eq!(drv.base.params.get_float64(F64, 0).unwrap(), 2.5);
+        let req = DrvUserRequest::new("F64", 100);
+        assert_eq!(drv.base.drv_user_create(&req).unwrap().reason, F64);
+        drv.connect(&tag(0)).unwrap();
+        // -1 still falls to the port's rule.
+        assert_eq!(drv.base.parse_user(&AsynUser::new(F64)).unwrap(), 0);
     }
 
     #[test]

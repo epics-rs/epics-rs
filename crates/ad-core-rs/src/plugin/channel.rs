@@ -22,6 +22,10 @@ pub struct QueuedArrayCounter {
     /// The port's `NDNumQueuedArrays` updater, unparked on every change —
     /// C's `queuedArrayEvent_` (asynNDArrayDriver.cpp:812, :828).
     updater: OnceLock<Thread>,
+    /// The event's latch: set by a change, consumed by the updater, so a
+    /// wake without a change (a spurious `park` return, the start-up wake)
+    /// posts nothing, as `epicsEventWait` returns only on a signal.
+    signalled: AtomicBool,
 }
 
 impl QueuedArrayCounter {
@@ -32,13 +36,14 @@ impl QueuedArrayCounter {
             mutex: parking_lot::Mutex::new(()),
             condvar: parking_lot::Condvar::new(),
             updater: OnceLock::new(),
+            signalled: AtomicBool::new(false),
         }
     }
 
     /// Increment the queued count (called before send).
     pub fn increment(&self) {
         self.count.fetch_add(1, Ordering::AcqRel);
-        self.wake_updater();
+        self.signal_updater();
     }
 
     /// Decrement the queued count. Notifies waiters when reaching zero.
@@ -48,7 +53,7 @@ impl QueuedArrayCounter {
             let _guard = self.mutex.lock();
             self.condvar.notify_all();
         }
-        self.wake_updater();
+        self.signal_updater();
     }
 
     /// Make `updater` the thread every change unparks. Set once.
@@ -57,6 +62,16 @@ impl QueuedArrayCounter {
             // A change made before the updater existed is published now.
             self.wake_updater();
         }
+    }
+
+    /// Consume the latch; `false` means the wake carried no change.
+    pub(crate) fn take_signal(&self) -> bool {
+        self.signalled.swap(false, Ordering::AcqRel)
+    }
+
+    fn signal_updater(&self) {
+        self.signalled.store(true, Ordering::Release);
+        self.wake_updater();
     }
 
     fn wake_updater(&self) {

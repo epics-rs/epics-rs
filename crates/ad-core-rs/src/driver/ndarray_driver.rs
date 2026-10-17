@@ -1214,6 +1214,9 @@ fn queued_count_updater(
                     let Some(queued) = counter.upgrade() else {
                         break;
                     };
+                    if !queued.take_signal() {
+                        continue;
+                    }
                     let count = queued.get() as i32;
                     drop(queued);
                     let Some(handle) = port_handle.upgrade() else {
@@ -1822,6 +1825,54 @@ pub(crate) mod tests {
         drv.owner.queued().decrement();
         drv.port_base.set_int32_param(queued, 0, 0).unwrap();
         assert_eq!(read(&drv), 0);
+    }
+
+    /// C's updater waits on `queuedArrayEvent_`, which only a change
+    /// signals (asynNDArrayDriver.cpp:785-792): a port that queues nothing
+    /// never runs its callbacks from the updater.
+    #[test]
+    fn the_updater_posts_only_after_a_change() {
+        use asyn_rs::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
+        use asyn_rs::registry::PortRegistry;
+        use asyn_rs::runtime::config::RuntimeConfig;
+        use asyn_rs::runtime::port::create_port_runtime;
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+
+        struct Port(NDArrayDriverBase);
+        impl asyn_rs::port::PortDriver for Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let mut drv = NDArrayDriverBase::new("NDQUEUEDIDLE", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        drv.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let _sub = drv.port_base.interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |iv: &InterruptValue| seen_cb.lock().push(iv.reason),
+        );
+        let num_queued_arrays = drv.params.num_queued_arrays;
+        let queued = drv.owner.queued().clone();
+        let claim = PortRegistry::new().claim("NDQUEUEDIDLE").unwrap();
+        let (_runtime, _actor) =
+            create_port_runtime(&claim, Port(drv), RuntimeConfig::default()).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(seen.lock().is_empty(), "{:?}", seen.lock());
+
+        queued.increment();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.lock().contains(&num_queued_arrays) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(seen.lock().contains(&num_queued_arrays));
     }
 
     /// The updater stores the live count, so a stop under WaitForPlugins

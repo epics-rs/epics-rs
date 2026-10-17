@@ -7,9 +7,9 @@
 //! it was made with ([`Record::take_cycle_posted_value`]), because a scan
 //! posts one field several times in a pass (`DATA`, `CPT`, `FAZE`).
 //!
-//! The scan logic is split as C's file is: [`scan`] (process and the scan
-//! state machine), [`special`] (field-write handling and the linear-scan
-//! parameter algebra) and [`links`] (the `recDynLink` callbacks).
+//! The scan logic is split as C's file is: `scan` (process and the scan
+//! state machine), `special` (field-write handling and the linear-scan
+//! parameter algebra) and `links` (the `recDynLink` callbacks).
 
 mod links;
 mod scan;

@@ -48,8 +48,8 @@ pub struct MotorRecord {
     port: Option<crate::device_support::CommandPort>,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
-    /// Whether `init_record`'s device half ran, which in C ends in
-    /// `monitor()` and its alarm reset.
+    /// Whether C `init_record` reaches its tail: it returns before it with
+    /// no dset or a failed dset init (motorRecord.cc:612-651).
     initialized: bool,
     /// Monotonic counter for delay request IDs
     next_delay_id: u64,
@@ -366,6 +366,35 @@ impl MotorRecord {
         self.internal.mmap &= !bits;
     }
 
+    /// C init_record's tail (motorRecord.cc:720-746), after the device
+    /// readback it reads DRBV from, ending in `monitor()`: no client hears
+    /// that post, but it derives CNEN from MSTA and clears every mark.
+    pub(crate) fn init_tail(&mut self) {
+        // C 721-723: `dmov = TRUE; movn = FALSE` — DMOV starts done
+        // no matter what the load wrote. In particular this
+        // neutralizes any `special()` pass-0 blink a load-time /
+        // restore write to a drive field may have left behind.
+        self.stat.dmov = true;
+        self.stat.movn = false;
+        self.mark(m::DMOV | m::MOVN | m::SPMG | m::DIFF | m::RDIF | m::MSTA);
+        // C 734-743: LVIO starts clear; with soft limits enabled
+        // (the dial pair not both 0), an initial dial readback
+        // outside the dial window by more than one MRES, or an
+        // inverted pair, raises it. The slop is the SIGNED
+        // resolution (C verbatim — a negative MRES narrows the
+        // window).
+        self.limits.lvio = false;
+        let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
+        if !limits_disabled
+            && (self.pos.drbv > self.limits.dhlm + self.conv.mres
+                || self.pos.drbv < self.limits.dllm - self.conv.mres
+                || self.limits.dllm > self.limits.dhlm)
+        {
+            self.limits.lvio = true;
+        }
+        let _ = self.take_monitor_marks();
+    }
+
     /// The marks `monitor()` posts from, cleared as its `UNMARK_ALL` does
     /// (motorRecord.cc:3645), with each switch mark carrying the raw switch
     /// `monitor()` posts beside it (3576-3589).
@@ -663,28 +692,6 @@ impl Record for MotorRecord {
             if self.conv.eres == 0.0 {
                 self.conv.eres = self.conv.mres;
             }
-            // C 721-723: `dmov = TRUE; movn = FALSE` — DMOV starts done
-            // no matter what the load wrote. In particular this
-            // neutralizes any `special()` pass-0 blink a load-time /
-            // restore write to a drive field may have left behind.
-            self.stat.dmov = true;
-            self.stat.movn = false;
-            self.mark(m::DMOV | m::MOVN | m::SPMG | m::DIFF | m::RDIF | m::MSTA);
-            // C 734-743: LVIO starts clear; with soft limits enabled
-            // (the dial pair not both 0), an initial dial readback
-            // outside the dial window by more than one MRES, or an
-            // inverted pair, raises it. The slop is the SIGNED
-            // resolution (C verbatim — a negative MRES narrows the
-            // window).
-            self.limits.lvio = false;
-            let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
-            if !limits_disabled
-                && (self.pos.drbv > self.limits.dhlm + self.conv.mres
-                    || self.pos.drbv < self.limits.dllm - self.conv.mres
-                    || self.limits.dllm > self.limits.dhlm)
-            {
-                self.limits.lvio = true;
-            }
             self.internal.init_invariants_synced = true;
         }
         Ok(())
@@ -804,6 +811,25 @@ impl Record for MotorRecord {
     /// (`dol_udf` → check_alarms) and the init clear in `initial_readback`.
     fn clears_udf(&self) -> bool {
         false
+    }
+
+    /// The rest of C init_record after the device's init, when it gets
+    /// there: its tail and `monitor()` ([`MotorRecord::init_tail`]), and
+    /// 677-681: a CONSTANT .dol, an unset one included, leaves the record
+    /// defined. A DB_LINK / CA DOL stays undefined until the closed-loop
+    /// collection's first read (1994-2005).
+    fn post_init_finalize_undef(&mut self, udf: &mut bool) -> CaResult<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        self.init_tail();
+        if matches!(
+            parse_link_v2(&self.links.dol),
+            ParsedLink::None | ParsedLink::Constant(_)
+        ) {
+            *udf = false;
+        }
+        Ok(())
     }
 
     /// C `init_record` ends in `monitor()`, whose `recGblResetAlarms`
@@ -1253,14 +1279,20 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        assert_eq!(
-            rec.internal.dol_udf,
-            Some(false),
-            "init arms the UDF clear for a CONSTANT DOL"
-        );
-        let mut common = CommonFields::default(); // udf == true (dbCommon default)
-        rec.check_alarms(&mut common);
-        assert!(common.udf == 0, "CONSTANT DOL motor is defined after init");
+        let mut udf = CommonFields::default().udf != 0; // dbCommon default
+        rec.post_init_finalize_undef(&mut udf).unwrap();
+        assert!(!udf, "CONSTANT DOL motor is defined after init");
+    }
+
+    // C init_record returns before its tail with no dset or a failed dset
+    // init (612-651): no UDF clear.
+    #[test]
+    fn a_record_whose_init_returns_early_stays_undefined() {
+        let mut rec = MotorRecord::new();
+        let mut udf = true;
+        rec.post_init_finalize_undef(&mut udf).unwrap();
+        assert!(udf);
+        assert!(!rec.init_resets_alarms());
     }
 
     // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
@@ -1280,15 +1312,10 @@ mod tests {
             ..Default::default()
         };
         rec.initial_readback(&status);
-        assert_ne!(
-            rec.internal.dol_udf,
-            Some(false),
-            "a DB_LINK DOL is not cleared at init"
-        );
-        let mut common = CommonFields::default(); // udf == true
-        rec.check_alarms(&mut common);
+        let mut udf = CommonFields::default().udf != 0;
+        rec.post_init_finalize_undef(&mut udf).unwrap();
         assert!(
-            common.udf != 0,
+            udf,
             "DB_LINK DOL motor stays undefined until the first DOL read"
         );
     }

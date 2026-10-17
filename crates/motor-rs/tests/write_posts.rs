@@ -137,7 +137,7 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         Bound { io_intr, state }
     };
     let (record, observer) = (bind(), bind());
-    let mut poll_loop = MotorPollLoop::new(
+    let poll_loop = MotorPollLoop::new(
         PollerInbox {
             poll,
             commands: commands_rx,
@@ -148,7 +148,6 @@ fn rig(user: TraceUser, encoder: f64) -> Rig {
         Duration::from_secs(1),
         0,
     );
-    poll_loop.prime_cache();
     Rig {
         poll_loop,
         commands,

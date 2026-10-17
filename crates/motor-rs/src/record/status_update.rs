@@ -258,6 +258,7 @@ impl MotorRecord {
         let msta = MstaFlags::from_status(status);
         let msta_changed = msta != self.stat.msta;
         self.stat.msta = msta;
+        self.stat.vbas_unsupported = !status.vbas_supported;
         // C process() 1277-1278, right after update_values.
         if msta_changed {
             self.mark(m::MSTA);
@@ -365,23 +366,6 @@ impl MotorRecord {
         if status.moving {
             // At startup, the poll loop may not be active yet — request it.
             effects.request_poll = true;
-        }
-
-        // C init_record (motorRecord.cc:677-681): a CONSTANT .dol clears UDF
-        // at init (`pmr->udf = FALSE`) and seeds VAL from the constant. The
-        // motor never derives UDF from VAL otherwise — clears_udf() returns
-        // false so the framework's value_is_undefined() path is off — so this
-        // is the only init UDF clear for the common (no-DOL / literal-DOL)
-        // axis. A DB_LINK / CA DOL is left undefined until the closed-loop
-        // collection's first successful read clears it (1994-2005), exactly
-        // like C leaving udf TRUE for a non-CONSTANT .dol. An unset DOL has
-        // C link type CONSTANT (recGblInitConstantLink is a no-op leaving VAL
-        // at 0), so ParsedLink::None counts alongside a literal Constant.
-        if matches!(
-            parse_link_v2(&self.links.dol),
-            ParsedLink::None | ParsedLink::Constant(_)
-        ) {
-            self.internal.dol_udf = Some(false);
         }
 
         // motordevCom sends INIT before anything else (motordevCom.cc:

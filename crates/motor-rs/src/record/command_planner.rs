@@ -1572,12 +1572,10 @@ impl MotorRecord {
         }
     }
 
-    /// Effective base velocity for acceleration math. Drivers that do not
-    /// support a base velocity advertise it via MSTA bit 15
-    /// (`VBAS_UNSUPPORTED`, epics-modules/motor #76); for those VBAS is
-    /// treated as 0.
+    /// Effective base velocity for acceleration math: 0 for a driver that
+    /// does not support a base velocity (epics-modules/motor #76).
     pub(crate) fn effective_vbas(&self) -> f64 {
-        if self.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED) {
+        if self.stat.vbas_unsupported {
             0.0
         } else {
             self.vel.vbas

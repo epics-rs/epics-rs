@@ -104,7 +104,7 @@ impl MotorPollLoop {
         idle_poll_interval: Duration,
         forced_fast_polls: u32,
     ) -> Self {
-        Self {
+        let mut poll_loop = Self {
             cmd_rx: inbox.poll,
             motor_cmd_rx: inbox.commands,
             motor,
@@ -118,7 +118,9 @@ impl MotorPollLoop {
             params: Default::default(),
             pulses: Pulses::new(),
             woken: false,
-        }
+        };
+        poll_loop.prime_cache();
+        poll_loop
     }
 
     /// Run the commands queued so far on the calling thread: for a harness
@@ -220,9 +222,11 @@ impl MotorPollLoop {
 
     /// C asynMotorPoller's "Force on poll at startup": fills the cache
     /// `MotorDeviceSupport::init` reads, as readGenericPointer reads the
-    /// parameter library. No record is woken.
-    /// [`Self::run`] does this first; a harness calls it before init.
-    pub fn prime_cache(&mut self) {
+    /// parameter library. No record is woken. C's poller holds the
+    /// controller lock across this poll, so init_record's read waits for it
+    /// (asynMotorController.cpp:505-525, :630); taken while the poller is
+    /// built, before the creating command returns, init reads it too.
+    fn prime_cache(&mut self) {
         let status = self.poll_status();
         self.last_status = Some(status.clone());
         self.subscribers.store(StampedStatus { seq: 1, status });
@@ -323,7 +327,6 @@ impl MotorPollLoop {
     }
 
     async fn serve(mut self) {
-        self.prime_cache();
         // The startup poll is a wakeup (asynMotorController.cpp:630).
         self.forced_fast_polls_remaining = self.forced_fast_polls_config;
         let moving = self.last_status.as_ref().is_some_and(|s| s.moving);

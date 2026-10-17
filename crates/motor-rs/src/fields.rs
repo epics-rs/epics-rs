@@ -284,6 +284,10 @@ pub struct StatusFields {
     /// C: `motorRecord.dbd` `field(RVEL,DBF_LONG)` "Raw Velocity"; devMotorAsyn
     /// fills it with `floor(status.velocity)`.
     pub rvel: i32,
+    /// The driver ignores a base velocity, so accel math drops VBAS
+    /// (epics-modules/motor #76, unmerged). Not on MSTA: C never sets
+    /// bit 15.
+    pub vbas_unsupported: bool,
 }
 
 impl Default for StatusFields {
@@ -299,6 +303,7 @@ impl Default for StatusFields {
             athm: false,
             stup: 0,
             rvel: 0,
+            vbas_unsupported: false,
         }
     }
 }

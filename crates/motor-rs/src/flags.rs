@@ -46,11 +46,6 @@ bitflags! {
         const COMM_ERR        = 0x1000; // bit 12: CNTRL_COMM_ERR
         const MINUS_LS        = 0x2000; // bit 13: RA_MINUS_LS
         const HOMED           = 0x4000; // bit 14: RA_HOMED
-        /// Driver does not support a base velocity (VBAS).
-        /// epics-modules/motor issue #76 (proposal PR #80/#81, unmerged).
-        /// When set, record-level acceleration calculations should treat
-        /// VBAS as effectively 0.
-        const VBAS_UNSUPPORTED = 0x8000; // bit 15
     }
 }
 
@@ -97,11 +92,6 @@ impl MstaFlags {
         }
         if status.has_encoder {
             msta |= Self::ENCODER_PRESENT;
-        }
-        // epics-modules/motor #76 — drivers that don't honor VBAS expose it
-        // via MSTA bit 15 so the record can drop VBAS from accel math.
-        if !status.vbas_supported {
-            msta |= Self::VBAS_UNSUPPORTED;
         }
         // RA_HOMED (bit 14) mirrors the driver status word like every
         // other MSTA bit. C copies pmr->msta wholesale from the driver

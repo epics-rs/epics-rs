@@ -3898,10 +3898,11 @@ fn test_move_accel_vbas_unsupported_treats_vbas_as_zero() {
     assert_eq!(accel, Some(5.0));
 }
 
-// --- VBAS not supported MSTA bit (issue #76, unmerged PR #80/#81) ---
+// --- VBAS not supported (issue #76, unmerged PR #80/#81) ---
 
+/// C never sets MSTA bit 15, so the flag stays off the field.
 #[test]
-fn test_vbas_unsupported_bit_set_when_driver_reports_false() {
+fn test_vbas_unsupported_kept_off_msta() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     let status = MotorStatus {
@@ -3909,16 +3910,17 @@ fn test_vbas_unsupported_bit_set_when_driver_reports_false() {
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    assert!(rec.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED));
+    assert!(rec.stat.vbas_unsupported);
+    assert_eq!(rec.stat.msta.bits() & 0x8000, 0);
 }
 
 #[test]
-fn test_vbas_unsupported_bit_clear_by_default() {
+fn test_vbas_unsupported_clear_by_default() {
     use asyn_rs::interfaces::motor::MotorStatus;
     let mut rec = MotorRecord::new();
     let status = MotorStatus::default(); // vbas_supported defaults to true
     rec.process_motor_info(&status);
-    assert!(!rec.stat.msta.contains(MstaFlags::VBAS_UNSUPPORTED));
+    assert!(!rec.stat.vbas_unsupported);
 }
 
 // --- moveToHome (C: a6f64591 + 5f421e9a 2011-07) ---
@@ -6231,6 +6233,23 @@ fn test_runtime_srev_nonpositive_clamped_to_200() {
 
 // --- Initial LVIO (C init_record, motorRecord.cc:734-743) ---
 
+/// The device's init and the rest of C init_record after it.
+fn init_device_half(rec: &mut MotorRecord, status: &asyn_rs::interfaces::motor::MotorStatus) {
+    rec.initial_readback(status);
+    rec.post_init_finalize_undef(&mut true).unwrap();
+}
+
+/// A done driver status whose readback is `drbv`, a whole step at MRES
+/// 0.5, for the
+/// init tail, which reads DRBV after the readback (C 720-743).
+fn readback_at(drbv: f64) -> asyn_rs::interfaces::motor::MotorStatus {
+    asyn_rs::interfaces::motor::MotorStatus {
+        position: drbv / 0.5,
+        done: true,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn test_initial_lvio_clear_when_limits_disabled() {
     // C 734-737: LVIO is explicitly cleared at init and the violation
@@ -6238,9 +6257,9 @@ fn test_initial_lvio_clear_when_limits_disabled() {
     // 0). Regression: the Rust default was lvio: true, so a
     // never-processed record served LVIO = 1.
     let mut rec = MotorRecord::new();
-    rec.pos.drbv = 5.0;
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    init_device_half(&mut rec, &readback_at(5.0));
     assert!(!rec.limits.lvio);
 }
 
@@ -6252,10 +6271,10 @@ fn test_initial_lvio_set_when_drbv_outside_limits() {
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.pos.drbv = 10.6;
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
-    assert!(rec.limits.lvio, "DRBV=10.6 > DHLM+MRES=10.5 must set LVIO");
+    init_device_half(&mut rec, &readback_at(11.0));
+    assert!(rec.limits.lvio, "DRBV=11.0 > DHLM+MRES=10.5 must set LVIO");
 }
 
 #[test]
@@ -6266,12 +6285,12 @@ fn test_initial_lvio_respects_mres_slop() {
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.pos.drbv = 10.4;
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    init_device_half(&mut rec, &readback_at(10.5));
     assert!(
         !rec.limits.lvio,
-        "DRBV=10.4 <= DHLM+MRES=10.5 must not set LVIO"
+        "DRBV=10.5 <= DHLM+MRES=10.5 must not set LVIO"
     );
 }
 
@@ -6282,10 +6301,35 @@ fn test_initial_lvio_set_on_inverted_limits() {
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
     rec.put_field("DHLM", EpicsValue::Double(-5.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(0.0)).unwrap();
-    rec.pos.drbv = -2.0;
     rec.init_record(0).unwrap();
     rec.init_record(1).unwrap();
+    init_device_half(&mut rec, &readback_at(-2.0));
     assert!(rec.limits.lvio);
+}
+
+/// C init_record ends in MARK(M_MSTA); monitor() (744-745), whose MSTA
+/// block sets CNEN from EA_POSITION on a GAIN_SUPPORT axis (3541-3548).
+#[test]
+fn test_init_monitor_derives_cnen_from_msta() {
+    for powered in [true, false] {
+        let mut rec = MotorRecord::new();
+        rec.ctrl.cnen = !powered;
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        init_device_half(
+            &mut rec,
+            &asyn_rs::interfaces::motor::MotorStatus {
+                done: true,
+                powered,
+                gain_support: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            rec.get_field("CNEN"),
+            Some(EpicsValue::Short(i16::from(powered)))
+        );
+    }
 }
 
 #[test]
@@ -9617,8 +9661,12 @@ fn test_init_record_pass1_restores_dmov_after_load_time_blink() {
     rec.put_field("VAL", EpicsValue::Double(1.0)).unwrap();
     assert!(!rec.stat.dmov, "load-time blink left DMOV low");
     rec.init_record(1).unwrap();
-    assert!(rec.stat.dmov, "init pass 1 restores DMOV=1 (C 721)");
-    assert!(!rec.stat.movn, "init pass 1 clears MOVN (C 723)");
+    init_device_half(
+        &mut rec,
+        &asyn_rs::interfaces::motor::MotorStatus::default(),
+    );
+    assert!(rec.stat.dmov, "init restores DMOV=1 (C 721)");
+    assert!(!rec.stat.movn, "init clears MOVN (C 723)");
 }
 
 #[test]

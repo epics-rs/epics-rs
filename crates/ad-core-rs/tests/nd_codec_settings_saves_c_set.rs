@@ -7,6 +7,10 @@ use std::path::Path;
 use epics_base_rs::server::autosave::macros::MacroContext;
 use epics_base_rs::server::autosave::request::load_request_file_with_search_paths;
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// ad-core-rs --all-features`); it builds no CA server, and its reactor is
+// `#[tokio::test]`'s own, which the backend does not remove.
 #[tokio::test]
 async fn nd_codec_settings_saves_c_set() {
     let paths = [Path::new(ad_core_rs::AD_CORE_DIR).join("db")];

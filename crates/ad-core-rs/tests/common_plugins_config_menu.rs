@@ -40,6 +40,10 @@ fn autosave_loads(autosave: &Path) -> Vec<(PathBuf, HashMap<String, String>)> {
         .collect()
 }
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// ad-core-rs --all-features`); it builds no CA server, and its reactor is
+// `#[tokio::test]`'s own, which the backend does not remove.
 #[tokio::test]
 async fn ad_autosave_menu_saves_records_common_plugins_loads() {
     // SAFETY: nextest gives each test its own process, and this runs before

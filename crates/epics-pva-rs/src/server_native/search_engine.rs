@@ -173,7 +173,7 @@ fn fill_entropy(_buf: &mut [u8; 12]) -> io::Result<()> {
 /// address field with the resolved `reply_dest` (a fully concrete
 /// destination) AND clears the Unicast flag before sending. Returns
 /// `None` when the frame doesn't open with a SEARCH. Whether to forward is the
-/// caller's, by destination ([`IfaceRoutes::classify`]); the flag is only
+/// caller's, by destination (`IfaceRoutes::classify`); the flag is only
 /// cleared, as pvxs clears it (`udp_collector.cpp:390`).
 ///
 /// SEARCH payload layout (after the 8-byte PVA header):
@@ -382,7 +382,7 @@ pub(crate) fn send_from_v4<S: std::os::fd::AsFd>(
 /// item 7 stage B.
 ///
 /// `forward` is pvxs `Forwarding`: the datagram was sent to an address of
-/// the interface it arrived on ([`IfaceRoutes::classify`]) and the caller
+/// the interface it arrived on (`IfaceRoutes::classify`) and the caller
 /// can reach the ORIGIN_TAG group. Such a SEARCH is forwarded, flagged or
 /// not, and answered only when the forward loops back
 /// (`udp_collector.cpp:385-396`).

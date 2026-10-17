@@ -10037,3 +10037,47 @@ fn test_driver_sees_raw_steps_at_negative_mres() {
         effects.commands
     );
 }
+
+#[test]
+fn test_ls_bits_on_the_first_poll_off_the_limit_do_not_end_the_move() {
+    // XPS END_OF_RUN sets both limit bits and the first poll after a move
+    // off the limit can still carry them. C 1367-1380 takes that poll as
+    // the LS-error update: DMOV stays FALSE unposted, GET_INFO, MIP_DONE.
+    // The axis then moves on (movn) with DMOV FALSE, and only the stop
+    // ends it — no DMOV=1 and no VAL sync mid-move.
+    use asyn_rs::interfaces::motor::MotorStatus;
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 200.0;
+    rec.limits.dllm = -200.0;
+    let at = |position: f64, moving: bool, limits: bool| MotorStatus {
+        position,
+        done: !moving,
+        moving,
+        high_limit: limits,
+        low_limit: limits,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(at(50.0, false, false)));
+    rec.do_process();
+    rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    rec.do_process();
+    assert!(!rec.stat.dmov);
+
+    rec.set_event(MotorEvent::DeviceUpdate(at(49.5, true, true)));
+    let ls = rec.do_process();
+    assert!(sends_get_info(&ls), "C 1373: GET_INFO");
+    assert!(!rec.stat.dmov, "C 1371: DMOV stays FALSE");
+
+    for position in [40.0, 20.0, -5.0] {
+        rec.set_event(MotorEvent::DeviceUpdate(at(position, true, false)));
+        rec.do_process();
+        assert!(!rec.stat.dmov, "still moving at {position}");
+        assert_eq!(rec.pos.val, -10.0, "no mid-move VAL sync at {position}");
+    }
+
+    rec.set_event(MotorEvent::DeviceUpdate(at(-10.0, false, false)));
+    rec.do_process();
+    assert!(rec.stat.dmov, "the stop ends the move");
+    assert_eq!(rec.pos.val, -10.0);
+}

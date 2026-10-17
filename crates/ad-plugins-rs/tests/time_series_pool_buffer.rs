@@ -56,6 +56,10 @@ fn the_circular_buffer_is_counted_on_the_plugin_pool() {
 /// A frame of another type or width reallocates the buffer (:414-422) from
 /// the pool the frame brought (NDPluginDriver.cpp:419); the old one goes back
 /// to the plugin's own pool.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed on the
+// exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// ad-plugins-rs --all-features`); it builds no CA server, and its reactor is
+// the sender thread's own current-thread runtime.
 #[test]
 fn a_new_frame_shape_reallocates_from_the_frame_s_pool() {
     let wiring = Arc::new(WiringRegistry::new());

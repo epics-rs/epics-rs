@@ -7971,7 +7971,7 @@ impl RecordInstance {
     /// enum strings, DESC): a cache already built is rebuilt now rather than
     /// cleared, so a reader that cannot rebuild it — one inside this record's
     /// own processing — never finds it stale. One not yet built stays
-    /// unbuilt; [`Self::seed_metadata_cache`] builds it once init has written
+    /// unbuilt; `seed_metadata_cache` builds it once init has written
     /// the record.
     pub fn refresh_metadata_cache(&self) {
         if self.cold.metadata_cache.load().is_some() {

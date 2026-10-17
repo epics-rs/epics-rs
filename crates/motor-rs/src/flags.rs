@@ -1,7 +1,7 @@
 use bitflags::bitflags;
 use epics_base_rs::types::PvString;
 
-pub use asyn_rs::interfaces::motor::{PidGainKind, PostMessage};
+pub use asyn_rs::interfaces::motor::{PidGainKind, PostMessage, RecordFields};
 
 bitflags! {
     /// MIP (Motion In Progress) flags — exposed as a PV field.
@@ -392,12 +392,9 @@ pub enum MotorCommand {
     MoveDirection {
         forward: bool,
     },
-    /// The record's VELO in steps/s, ahead of a transaction that moves:
-    /// what a model-1 device reads as `mr->velo` in `build_trans`
-    /// (devMCDC2805.cc:224 homes at it, not at HVEL).
-    RecordVelocity {
-        velocity: f64,
-    },
+    /// The record's fields a model-1 device reads in `build_trans`, ahead
+    /// of a transaction that moves.
+    RecordFields(RecordFields),
     ProfileInitialize {
         max_points: usize,
     },

@@ -36,6 +36,8 @@ pub struct MotorAxis {
     motor_cmd_tx: MotorCommandSender,
     subscribers: AxisSubscribers,
     report: Option<Arc<dyn AxisReport>>,
+    /// The driver's [`AsynMotor::disables_ntm`].
+    disables_ntm: bool,
 }
 
 impl MotorAxis {
@@ -54,7 +56,13 @@ impl MotorAxis {
             motor_cmd_tx,
             subscribers,
             report: None,
+            disables_ntm: false,
         }
+    }
+
+    pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
+        self.disables_ntm = disables_ntm;
+        self
     }
 
     /// The driver's [`AxisReport`], C's `asynMotorAxis::report` override.
@@ -110,7 +118,7 @@ impl MotorAxis {
         let record =
             self.subscribers
                 .attach(device_state.clone(), io_intr_tx.clone(), trace.clone());
-        MotorDeviceSupport::with_link(
+        let mut support = MotorDeviceSupport::with_link(
             trace,
             self.timeout,
             AxisLink::Bound {
@@ -120,7 +128,9 @@ impl MotorAxis {
             },
             device_state,
             (io_intr_tx, io_intr_rx),
-        )
+        );
+        support.disables_ntm = self.disables_ntm;
+        support
     }
 }
 
@@ -164,6 +174,7 @@ pub struct MotorDeviceSupport {
     _timeout: Duration,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     initialized: bool,
+    disables_ntm: bool,
 }
 
 impl MotorDeviceSupport {
@@ -220,6 +231,7 @@ impl MotorDeviceSupport {
             _timeout: timeout,
             io_intr_rx: Some(io_intr_rx),
             initialized: false,
+            disables_ntm: false,
         }
     }
 
@@ -376,6 +388,9 @@ impl DeviceSupport for MotorDeviceSupport {
             motor_rec.set_device_state(self.port.device_state.clone());
             motor_rec.set_trace(self.port.trace.clone());
             motor_rec.set_command_port(self.port.clone());
+            if self.disables_ntm {
+                motor_rec.timing.ntm = false;
+            }
         }
 
         if let AxisLink::Missing(missing) = self.port.link {

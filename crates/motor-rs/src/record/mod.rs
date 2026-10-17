@@ -255,7 +255,7 @@ impl MotorRecord {
     }
 
     /// `commands` as C `build_trans` builds them from the record: led by
-    /// the record's VELO, which a device reads at any of them, and each move
+    /// the record's fields, which a device reads at any of them, and each move
     /// preceded by the record's CDIR and by the PREM and POST it reads
     /// (devIM483PL.cc:191-205), when either is set. A record's process and
     /// `special()` puts both send through it.
@@ -278,9 +278,10 @@ impl MotorRecord {
         }
         let strings = !prem.is_empty() || post.is_some();
         let mut out = Vec::with_capacity(commands.len() + 3);
-        out.push(MotorCommand::RecordVelocity {
+        out.push(MotorCommand::RecordFields(crate::flags::RecordFields {
             velocity: self.raw_rate(self.vel.velo),
-        });
+            srev: self.conv.srev,
+        }));
         for command in commands {
             if built(&command) {
                 out.push(MotorCommand::MoveDirection {

@@ -8852,7 +8852,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
-                    MotorCommand::RecordVelocity { .. },
+                    MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: true },
                     MotorCommand::MoveVelocity { velocity, .. }
@@ -8873,7 +8873,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
-                    MotorCommand::RecordVelocity { .. },
+                    MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }
@@ -8897,7 +8897,7 @@ mod jvel_live_retune {
             matches!(
                 commands.as_slice(),
                 [
-                    MotorCommand::RecordVelocity { .. },
+                    MotorCommand::RecordFields(_),
                     MotorCommand::SetAccel { .. },
                     MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }

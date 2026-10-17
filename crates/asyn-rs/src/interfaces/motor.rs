@@ -197,6 +197,17 @@ impl StatusWrite {
 
 /// Motor interface trait.
 ///
+/// The motor record fields a C model-1 device reads through `mr` in
+/// `build_trans`: a faulhaber HOME runs at VELO, not at the HVEL the record
+/// sent, and counts revolutions in SREV (devMCDC2805.cc:224-227).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecordFields {
+    /// VELO, in steps/s.
+    pub velocity: f64,
+    /// SREV, steps per revolution.
+    pub srev: i32,
+}
+
 /// Provides motor axis control for motor-capable drivers.
 ///
 /// Units are C `asynMotorAxis`'s: positions in steps, velocities in
@@ -344,11 +355,9 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
-    /// A model-1 record's VELO in steps/s, given ahead of each transaction
-    /// that moves: C devices read `mr->velo` in `build_trans`, so a
-    /// faulhaber HOME runs at VELO where the record sent HVEL
-    /// (devMCDC2805.cc:224).
-    fn set_record_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+    /// A model-1 record's [`RecordFields`], given ahead of each transaction
+    /// that moves.
+    fn set_record_fields(&mut self, _user: &AsynUser, _fields: &RecordFields) -> AsynResult<()> {
         Ok(())
     }
 
@@ -363,6 +372,21 @@ pub trait AsynMotor: Send + Sync {
     fn poll_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
         let _ = cdir;
         self.poll(user)
+    }
+
+    /// Whether the model-1 device support forces the record's NTM to NO at
+    /// init_record because the device does its own backlash
+    /// (devEMC18011.cc:127-129, devPIE816.cc:130, devMDT695.cc:129).
+    fn disables_ntm(&self) -> bool {
+        false
+    }
+
+    /// Whether a model-1 `set_status` counts a pass whose position did not
+    /// change as no motion (`no_motion_count++`), which motor_task does not
+    /// call back. drvEMC18011.cc:356-358 disables it, so every pass of a
+    /// held move is called back.
+    fn no_motion_test(&self) -> bool {
+        true
     }
 
     /// What the C driver's `poll()` posts when it fails, i.e. when

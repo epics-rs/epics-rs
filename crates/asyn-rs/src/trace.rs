@@ -293,12 +293,12 @@ impl TraceFile {
     /// writes a trace print of any length: nothing is added, so a line ends
     /// where the caller's format ends it. Staged in a stack buffer that
     /// spills when full, so nothing is allocated.
-    fn write_streamed(&self, body: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result) {
+    fn write_streamed(&self, body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result) {
         fn stream(
             out: &mut dyn std::io::Write,
-            body: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result,
+            body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
         ) {
-            let mut spill = Spill {
+            let mut spill = TraceOut {
                 out,
                 buf: [0; 512],
                 len: 0,
@@ -318,26 +318,25 @@ impl TraceFile {
     }
 }
 
-/// A [`std::fmt::Write`] over an [`std::io::Write`] staged through a fixed
-/// buffer.
-struct Spill<'a> {
+/// The trace sink a print body writes into: text through [`std::fmt::Write`]
+/// (`write!`), and bytes as they are through [`Self::write_bytes`], as C's
+/// `fprintf` writes a `%s` of device bytes. Staged in a fixed buffer.
+pub struct TraceOut<'a> {
     out: &'a mut dyn std::io::Write,
     buf: [u8; 512],
     len: usize,
 }
 
-impl Spill<'_> {
+impl TraceOut<'_> {
     fn flush(&mut self) -> std::fmt::Result {
         let n = std::mem::take(&mut self.len);
         self.out
             .write_all(&self.buf[..n])
             .map_err(|_| std::fmt::Error)
     }
-}
 
-impl std::fmt::Write for Spill<'_> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let s = s.as_bytes();
+    /// Write `s` untouched: invalid UTF-8 and control bytes included.
+    pub fn write_bytes(&mut self, s: &[u8]) -> std::fmt::Result {
         if self.len + s.len() > self.buf.len() {
             self.flush()?;
         }
@@ -347,6 +346,12 @@ impl std::fmt::Write for Spill<'_> {
         self.buf[self.len..self.len + s.len()].copy_from_slice(s);
         self.len += s.len();
         Ok(())
+    }
+}
+
+impl std::fmt::Write for TraceOut<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write_bytes(s.as_bytes())
     }
 }
 
@@ -837,13 +842,44 @@ impl TraceManager {
         mask: TraceMask,
         args: std::fmt::Arguments<'_>,
     ) {
+        self.print_source(port, addr, reason, mask, ("", 0), args);
+    }
+
+    /// [`Self::print`] with the caller's `__FILE__`/`__LINE__`, which the
+    /// `ASYN_TRACEINFO_SOURCE` prefix prints (asynManager.c:3090-3115).
+    pub fn print_source(
+        &self,
+        port: Option<&str>,
+        addr: Option<i32>,
+        reason: i32,
+        mask: TraceMask,
+        source: (&str, u32),
+        args: std::fmt::Arguments<'_>,
+    ) {
+        self.print_with(port, addr, reason, mask, source, |out| {
+            std::fmt::Write::write_fmt(out, args)
+        });
+    }
+
+    /// [`Self::print_source`] with a body that writes the message itself, so
+    /// it can carry raw bytes ([`TraceOut::write_bytes`]). Runs only when
+    /// `mask` is enabled.
+    pub fn print_with(
+        &self,
+        port: Option<&str>,
+        addr: Option<i32>,
+        reason: i32,
+        mask: TraceMask,
+        source: (&str, u32),
+        body: impl FnOnce(&mut TraceOut<'_>) -> std::fmt::Result,
+    ) {
         let emit = |cfg: &TraceConfig, addr: Option<i32>| {
             if !cfg.trace_mask.intersects(mask) {
                 return;
             }
-            cfg.file.write_streamed(|mut out| {
-                write_prefix(&mut out, port, addr, reason, ("", 0), cfg)?;
-                out.write_fmt(args)
+            cfg.file.write_streamed(|out| {
+                write_prefix(out, port, addr, reason, source, cfg)?;
+                body(out)
             });
         };
         match port {

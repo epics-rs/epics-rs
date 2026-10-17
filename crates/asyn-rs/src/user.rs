@@ -193,8 +193,9 @@ impl UserTrace {
     /// device `addr` on this port, if `mask` is enabled there. `file`/`line`
     /// are the caller's, as for [`AsynUser::print_io`].
     ///
-    /// The message is formatted only when the mask is enabled, so a print
-    /// on a hot path costs one config lookup while tracing is off.
+    /// The message is formatted only when the mask is enabled, onto the
+    /// stack, so a print on a hot path costs one config lookup while tracing
+    /// is off and allocates nothing while it is on.
     pub fn print(
         &self,
         addr: i32,
@@ -204,17 +205,14 @@ impl UserTrace {
         line: u32,
         args: std::fmt::Arguments<'_>,
     ) {
-        if self.manager.is_enabled_device(&self.port, addr, mask) {
-            self.manager.output_device_with_source(
-                &self.port,
-                Some(addr),
-                reason,
-                mask,
-                file,
-                line,
-                &args.to_string(),
-            );
-        }
+        self.manager.print_source(
+            Some(&self.port),
+            Some(addr),
+            reason,
+            mask,
+            (file, line),
+            args,
+        );
     }
 }
 

@@ -955,6 +955,53 @@ impl PortDriverBase {
             .print(Some(&self.port_name), Some(0), 0, mask, args);
     }
 
+    /// C `asynPrint(pasynUser, …)` in a driver method: the line goes through
+    /// the trace config of the caller's device `addr` and carries its `addr`
+    /// and `reason` in the `ASYN_TRACEINFO_PORT` prefix. [`Self::trace_print`]
+    /// is the `pasynUserSelf` form. Pass `file!()`/`line!()`, which C's macro
+    /// captures. Formatted only when `mask` is enabled, onto the stack.
+    pub fn trace_print_at(
+        &self,
+        addr: i32,
+        reason: i32,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        args: std::fmt::Arguments<'_>,
+    ) {
+        self.trace.print_source(
+            Some(&self.port_name),
+            Some(addr),
+            reason,
+            mask,
+            (file, line),
+            args,
+        );
+    }
+
+    /// [`Self::trace_print_at`] for a message that carries device bytes:
+    /// `body` writes it, text with `write!` and a reply's bytes as they are
+    /// with [`TraceOut::write_bytes`](crate::trace::TraceOut::write_bytes),
+    /// as C's `%s` of a reply does. Runs only when `mask` is enabled.
+    pub fn trace_write_at(
+        &self,
+        addr: i32,
+        reason: i32,
+        mask: crate::trace::TraceMask,
+        file: &str,
+        line: u32,
+        body: impl FnOnce(&mut crate::trace::TraceOut<'_>) -> std::fmt::Result,
+    ) {
+        self.trace.print_with(
+            Some(&self.port_name),
+            Some(addr),
+            reason,
+            mask,
+            (file, line),
+            body,
+        );
+    }
+
     /// The `ASYN_TRACEIO_DRIVER` line C's `asynPortDriver::read*` and
     /// `write*` print on success (asynPortDriver.cpp:1988, :2127, :2267,
     /// :2516, :2626; :2038, :2177, :2318, :2565, :2681): `driverName:
@@ -1751,9 +1798,11 @@ impl PortDriverBase {
     pub fn drv_user_create(&self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let addr = self.get_address(req.addr, 0)?;
         let Some(reason) = self.params.find_param(&req.drv_info) else {
-            self.print_device(
+            self.trace_print_at(
                 req.addr,
+                0,
                 crate::trace::TraceMask::ERROR,
+                file!(),
                 line!(),
                 format_args!(
                     "asynPortDriver:drvUserCreate: addr={addr}, cannot find parameter {}\n",
@@ -1762,9 +1811,11 @@ impl PortDriverBase {
             );
             return Err(AsynError::ParamNotFound(req.drv_info.clone()));
         };
-        self.print_device(
+        self.trace_print_at(
             req.addr,
+            0,
             crate::trace::TraceMask::FLOW,
+            file!(),
             line!(),
             format_args!(
                 "asynPortDriver:drvUserCreate: drvInfo={}, index={reason}\n",
@@ -1772,28 +1823,6 @@ impl PortDriverBase {
             ),
         );
         Ok(DrvUserInfo::from_reason(reason))
-    }
-
-    /// C `asynPrint(pasynUser, …)` for a user on device `addr` of this port.
-    fn print_device(
-        &self,
-        addr: i32,
-        mask: crate::trace::TraceMask,
-        line: u32,
-        args: std::fmt::Arguments<'_>,
-    ) {
-        let trace = &self.trace;
-        if trace.is_enabled_device(&self.port_name, addr, mask) {
-            trace.output_device_with_source(
-                &self.port_name,
-                Some(addr),
-                0,
-                mask,
-                file!(),
-                line,
-                &args.to_string(),
-            );
-        }
     }
 
     /// C `asynPortDriver::getAddress` (asynPortDriver.cpp:1901-1914): the
@@ -1804,23 +1833,18 @@ impl PortDriverBase {
         if address >= 0 && (address as usize) < self.max_addr {
             return Ok(address);
         }
-        let mask = crate::trace::TraceMask::ERROR;
-        let trace = &self.trace;
-        if trace.is_enabled_device(&self.port_name, addr, mask) {
-            trace.output_device_with_source(
-                &self.port_name,
-                Some(addr),
-                reason as i32,
-                mask,
-                file!(),
-                line!(),
-                &format!(
-                    "asynPortDriver:getAddress: {} invalid address={address}, must be in range 0 to {}\n",
-                    self.port_name,
-                    self.max_addr as i64 - 1
-                ),
-            );
-        }
+        self.trace_print_at(
+            addr,
+            reason as i32,
+            crate::trace::TraceMask::ERROR,
+            file!(),
+            line!(),
+            format_args!(
+                "asynPortDriver:getAddress: {} invalid address={address}, must be in range 0 to {}\n",
+                self.port_name,
+                self.max_addr as i64 - 1
+            ),
+        );
         Err(AsynError::AddressOutOfRange(address))
     }
 
@@ -5811,5 +5835,77 @@ mod tests {
         assert_eq!(n.load(Ordering::Relaxed), 1);
         let log = std::fs::read_to_string(&path).unwrap();
         assert_eq!(log.matches("failed: why\n").count(), 1, "{log:?}");
+    }
+
+    /// `trace_print_at` prints through the caller's device and names its
+    /// addr, reason and source line, where `trace_print` is device 0's.
+    #[test]
+    fn trace_print_at_prints_as_the_callers_device() {
+        use crate::trace::{TraceFile, TraceInfoMask, TraceMask};
+
+        let services = crate::services::PortServices::new();
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("tpat", 4, flags);
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("tpat", true);
+        trace.set_trace_mask(Some("tpat"), TraceMask::empty());
+        trace.set_device_trace_mask("tpat", 2, TraceMask::ERROR);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("tpat.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let file = TraceFile::File(Arc::new(std::sync::Mutex::new(file)));
+        trace.set_device_trace_file("tpat", 2, file);
+        trace.set_trace_info_mask(Some("tpat"), TraceInfoMask::PORT | TraceInfoMask::SOURCE);
+
+        base.trace_print(TraceMask::ERROR, format_args!("self\n"));
+        let line = line!() + 1;
+        base.trace_print_at(
+            2,
+            7,
+            TraceMask::ERROR,
+            file!(),
+            line,
+            format_args!("caller\n"),
+        );
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(log, format!("[tpat,2,7] [port.rs:{line}] caller\n"));
+    }
+
+    /// `trace_write_at` writes a reply's bytes as they are, where a
+    /// `format_args!` of them would have to go through UTF-8.
+    #[test]
+    fn trace_write_at_writes_raw_bytes() {
+        use crate::trace::{TraceFile, TraceInfoMask, TraceMask};
+        use std::fmt::Write as _;
+
+        let services = crate::services::PortServices::new();
+        let mut base = PortDriverBase::new("traw", 1, PortFlags::default());
+        services.bind(&mut base);
+        let trace = services.trace();
+        trace.register_port("traw", false);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let path = dir.path().join("traw.log");
+        let file = std::fs::File::create(&path).unwrap();
+        trace.set_trace_file(
+            Some("traw"),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        trace.set_trace_mask(Some("traw"), TraceMask::ERROR);
+        trace.set_trace_info_mask(Some("traw"), TraceInfoMask::empty());
+        let reply = b"\xff\x01ok";
+
+        base.trace_write_at(0, 0, TraceMask::FLOW, file!(), line!(), |_| {
+            panic!("ran with FLOW off")
+        });
+        base.trace_write_at(0, 0, TraceMask::ERROR, file!(), line!(), |out| {
+            write!(out, "reply={} ", reply.len())?;
+            out.write_bytes(reply)?;
+            out.write_bytes(b"\n")
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"reply=4 \xff\x01ok\n");
     }
 }

@@ -18,7 +18,6 @@ scopeSimulatorConfig("$(PORT)")
 # Load the scope database
 dbLoadRecords("$(SCOPE_IOC)/db/scopeSimulator.db", "P=$(PREFIX),R=$(PORT):,PORT=$(PORT)")
 
-# iocInit is called automatically by IocApplication after this script completes.
 iocInit()
 
 # After init, the interactive iocsh shell starts.

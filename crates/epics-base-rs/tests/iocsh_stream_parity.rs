@@ -89,6 +89,26 @@ fn run(script: &str) -> (String, String) {
 type Case = (&'static str, &'static str, &'static str, &'static str);
 
 const CASES: &[Case] = &[
+    // --- a line of separators only ends the body (`iocsh.cpp:1225-1227`) ---
+    (
+        "k40.cmd",
+        "echo one\n,\necho two\n",
+        "echo one\none\n,\n",
+        "",
+    ),
+    (
+        "k41.cmd",
+        "echo one\n()\necho two\n",
+        "echo one\none\n()\n",
+        "",
+    ),
+    // --- `exit` inside `iocshCmd` ends only that body ---
+    (
+        "k42.cmd",
+        "iocshCmd exit\necho a1\niocshCmd \"()\"\necho a2\n",
+        "iocshCmd exit\necho a1\na1\niocshCmd \"()\"\necho a2\na2\n",
+        "",
+    ),
     // --- an unknown command ---
     (
         "k01.cmd",
@@ -275,6 +295,14 @@ const CASES: &[Case] = &[
         "iocshCmd \"dbpr A1 notanumber\"\necho \"after\"\nafter\n",
         "Invalid integer 'notanumber'.\niocsh Error: Break\n",
     ),
+    // --- a redirect with no target: `split` refuses the line, so even
+    // `<` alone runs nothing (`iocsh.cpp:351-355`) ---
+    (
+        "k33.cmd",
+        "<\ndbl >\necho after\n",
+        "<\ndbl >\necho after\nafter\n",
+        "ERROR k33.cmd line 1: Invalid redirection.\nERROR k33.cmd line 2: Invalid redirection.\n",
+    ),
     // --- `iocshLoad`'s pathname up against the separator set: the `,` is
     // a separator like any other (`iocsh.cpp:271`), so the file opened is
     // `inner.iocsh` and not `inner.iocsh,`. The inner script's line is
@@ -319,6 +347,283 @@ async fn our_streams_match_the_bytes_c_wrote() {
             wrong.push(format!(
                 "{name} stderr\n     C: {want_err:?}\n  ours: {got_err:?}"
             ));
+        }
+    }
+
+    std::env::set_current_dir(saved_cwd).expect("cwd");
+    assert!(
+        wrong.is_empty(),
+        "the two shells wrote different bytes:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// `(script name, contents, C's stdout, C's stderr, the redirect target,
+/// what C left in it)`.
+type RedirectCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// Measured the same way as [`CASES`], plus the redirect target's bytes.
+/// C's `split` lifts the redirect off every line before `argv[0]` is looked
+/// at, so the commands the port dispatches itself (`iocshLoad`, `iocshCmd`,
+/// `iocshRun`, `on`) are redirected like any other; and what C frames
+/// before it calls the function (`cvtArg`, a registry miss) is printed
+/// before `startRedirect`, on the console.
+const REDIRECT_CASES: &[RedirectCase] = &[
+    (
+        "r1.cmd",
+        "iocshLoad inner.iocsh > r1.txt\n",
+        "iocshLoad inner.iocsh > r1.txt\n",
+        "",
+        "r1.txt",
+        "echo \"inner ran\"\ninner ran\n",
+    ),
+    (
+        "r2.cmd",
+        "iocshCmd \"echo cmdran\" > r2.txt\n",
+        "iocshCmd \"echo cmdran\" > r2.txt\n",
+        "",
+        "r2.txt",
+        "cmdran\n",
+    ),
+    (
+        "r3.cmd",
+        "iocshRun \"echo runran\" > r3.txt\n",
+        "iocshRun \"echo runran\" > r3.txt\n",
+        "",
+        "r3.txt",
+        "runran\n",
+    ),
+    (
+        "r4.cmd",
+        "on error bogus 2> r4.txt\n",
+        "on error bogus 2> r4.txt\n",
+        "",
+        "r4.txt",
+        "Usage: on error [continue | break | halt | wait <delay>]\n",
+    ),
+    (
+        "r5.cmd",
+        "iocshCmd \"dbpr A1 notanumber\" 2> r5.txt\n",
+        "iocshCmd \"dbpr A1 notanumber\" 2> r5.txt\n",
+        "",
+        "r5.txt",
+        "Invalid integer 'notanumber'.\niocsh Error: Break\n",
+    ),
+    // The inner body frames its own miss on the stderr it was handed.
+    (
+        "r6.cmd",
+        "iocshLoad bad.iocsh 2> r6.txt\n",
+        "iocshLoad bad.iocsh 2> r6.txt\nnosuchcmd\n",
+        "",
+        "r6.txt",
+        "ERROR bad.iocsh line 1: Command 'nosuchcmd' not registered.\n",
+    ),
+    (
+        "r8.cmd",
+        "dbpr A1 notanumber 2> r8.txt\n",
+        "dbpr A1 notanumber 2> r8.txt\n",
+        "ERROR r8.cmd line 1: Invalid integer 'notanumber'.\n",
+        "r8.txt",
+        "",
+    ),
+    (
+        "r9.cmd",
+        "nosuchcmd 2> r9.txt\n",
+        "nosuchcmd 2> r9.txt\n",
+        "ERROR r9.cmd line 1: Command 'nosuchcmd' not registered.\n",
+        "r9.txt",
+        "",
+    ),
+    (
+        "r10.cmd",
+        "on error wait 2> r10.txt\n",
+        "on error wait 2> r10.txt\n",
+        "",
+        "r10.txt",
+        "Usage: on error [continue | break | halt | wait <delay>]\n",
+    ),
+    // --- the loaders write C's raw `stdout`/`stderr` (`dbAccess.c`,
+    // `dbLexRoutines.c` and `dbLoadTemplate.y` do not include
+    // `epicsStdio.h`), which no redirect swaps: the console has every
+    // line and the target is created empty ---
+    (
+        "r11.cmd",
+        "dbLoadRecords nosuch.db 2> r11.txt\n",
+        "dbLoadRecords nosuch.db 2> r11.txt\n",
+        "ERROR: Can't open file 'nosuch.db'\nERROR: Failed to load 'nosuch.db'\n",
+        "r11.txt",
+        "",
+    ),
+    (
+        "r12.cmd",
+        "dbLoadRecords badfield.db 2> r12.txt\n",
+        "dbLoadRecords badfield.db 2> r12.txt\n",
+        "ERROR: ai record 'C1' doesn't have a field 'NOSUCHFLD'\n    Did you mean \"DESC\"?  (Descriptor)\nERROR:  at or before ')' in path \".\"  file \"badfield.db\" line 1\n\n 1 | record(ai,\"C1\"){ field(NOSUCHFLD,\"1\") }\n\nERROR: Failed to load 'badfield.db'\n",
+        "r12.txt",
+        "",
+    ),
+    (
+        "r13.cmd",
+        "dbLoadRecords > r13.txt\n",
+        "dbLoadRecords > r13.txt\nUsage: dbLoadRecords \"file\", \"subs\"\n",
+        "",
+        "r13.txt",
+        "",
+    ),
+    (
+        "r14.cmd",
+        "dbLoadDatabase > r14.txt\n",
+        "dbLoadDatabase > r14.txt\nUsage: dbLoadDatabase \"file\", \"path\", \"subs\"\n",
+        "",
+        "r14.txt",
+        "",
+    ),
+    (
+        "r15.cmd",
+        "dbLoadTemplate 2> r15.txt\n",
+        "dbLoadTemplate 2> r15.txt\n",
+        "must specify variable substitution file\n",
+        "r15.txt",
+        "",
+    ),
+    (
+        "r16.cmd",
+        "dbLoadTemplate nosuch.substitutions 2> r16.txt\n",
+        "dbLoadTemplate nosuch.substitutions 2> r16.txt\n",
+        "dbLoadTemplate: error opening sub file nosuch.substitutions: No such file or directory\n",
+        "r16.txt",
+        "",
+    ),
+    (
+        "r17.cmd",
+        "dbLoadTemplate s1.substitutions 2> r17.txt\n",
+        "dbLoadTemplate s1.substitutions 2> r17.txt\n",
+        "ERROR: Can't open file 'nosuchtmpl.db'\nERROR: Failed to load 'nosuchtmpl.db'\ndbLoadRecords(\"nosuchtmpl.db\", P=1)\nSubstitution file error: Error while reading included file\nline 1: '}'\n",
+        "r17.txt",
+        "",
+    ),
+    // --- `exit` ends the body before `openRedirect` (`iocsh.cpp:1240`),
+    // so its target is never created ---
+    (
+        "r18.cmd",
+        "exit > r18.txt\necho notreached\n",
+        "exit > r18.txt\n",
+        "",
+        "r18.txt",
+        "<not created>",
+    ),
+    // --- C `split`: a redirect anywhere, several per line, one word each ---
+    (
+        "p1.cmd",
+        "echo hi > p1a.txt 2> p1b.txt\n",
+        "echo hi > p1a.txt 2> p1b.txt\n",
+        "",
+        "p1a.txt",
+        "hi\n",
+    ),
+    (
+        "p1b.cmd",
+        "echo hi > p1c.txt 2> p1d.txt\n",
+        "echo hi > p1c.txt 2> p1d.txt\n",
+        "",
+        "p1d.txt",
+        "",
+    ),
+    (
+        "p2.cmd",
+        "> p2.txt echo hi\n",
+        "> p2.txt echo hi\n",
+        "",
+        "p2.txt",
+        "hi\n",
+    ),
+    (
+        "p3.cmd",
+        "echo > p3.txt hi\n",
+        "echo > p3.txt hi\n",
+        "",
+        "p3.txt",
+        "hi\n",
+    ),
+    (
+        "p4.cmd",
+        "echo hi >\n",
+        "echo hi >\n",
+        "ERROR p4.cmd line 1: Invalid redirection.\n",
+        "p4.txt",
+        "<not created>",
+    ),
+    (
+        "p5.cmd",
+        "echo hi > \"p 5.txt\"\n",
+        "echo hi > \"p 5.txt\"\n",
+        "",
+        "p 5.txt",
+        "hi\n",
+    ),
+    (
+        "p6.cmd",
+        "> p6.txt exit\necho notreached\n",
+        "> p6.txt exit\n",
+        "",
+        "p6.txt",
+        "<not created>",
+    ),
+    (
+        "p7.cmd",
+        "< inner.iocsh > p7.txt\n",
+        "< inner.iocsh > p7.txt\n",
+        "",
+        "p7.txt",
+        "echo \"inner ran\"\ninner ran\n",
+    ),
+    (
+        "p8.cmd",
+        "echo a1>p8.txt\n",
+        "echo a1>p8.txt\n",
+        "",
+        "p8.txt",
+        "a\n",
+    ),
+];
+
+#[epics_macros_rs::epics_test]
+#[serial_test::serial(iocsh_stream_parity)]
+async fn redirect_targets_hold_the_bytes_c_wrote() {
+    let dir = tempfile::tempdir().expect("script root");
+    let saved_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(dir.path()).expect("cwd");
+    std::fs::write("inner.iocsh", "echo \"inner ran\"\n").expect("script");
+    std::fs::write("bad.iocsh", "nosuchcmd\n").expect("script");
+    std::fs::write(
+        "badfield.db",
+        "record(ai,\"C1\"){ field(NOSUCHFLD,\"1\") }\n",
+    )
+    .expect("db");
+    std::fs::write("s1.substitutions", "file nosuchtmpl.db { {P=1} }\n").expect("subs");
+
+    let mut wrong = Vec::new();
+    for (name, body, want_out, want_err, target, want_file) in REDIRECT_CASES {
+        std::fs::write(name, body).expect("script");
+        let (got_out, got_err) = run(name);
+        let got_file = std::fs::read_to_string(target)
+            .map(|s| strip_ansi(&s))
+            .unwrap_or_else(|_| "<not created>".into());
+        for (what, want, got) in [
+            ("stdout", *want_out, got_out),
+            ("stderr", *want_err, got_err),
+            (*target, *want_file, got_file),
+        ] {
+            if got != want {
+                wrong.push(format!("{name} {what}\n     C: {want:?}\n  ours: {got:?}"));
+            }
         }
     }
 

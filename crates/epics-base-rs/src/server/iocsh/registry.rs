@@ -305,6 +305,13 @@ pub struct CommandContext {
     /// listing. Every shell diagnostic goes through [`Self::eprintln`]; a bare
     /// `eprintln!` would bypass the swap and is what made `2>` inert.
     error: std::cell::RefCell<Box<dyn std::io::Write>>,
+    /// C's raw `stdout`/`stderr`: what a C file that does not include
+    /// `epicsStdio.h` writes — `dbAccess.c`, `dbLexRoutines.c`,
+    /// `dbLoadTemplate.y` among them. No iocsh redirect swaps these
+    /// (measured: `dbLoadRecords nosuch.db 2> f` leaves `f` empty), so they
+    /// are cells of their own rather than [`Self::output`]/[`Self::error`].
+    console_out: std::cell::RefCell<Box<dyn std::io::Write>>,
+    console_err: std::cell::RefCell<Box<dyn std::io::Write>>,
     /// Input reader — defaults to stdin, redirected by `<`.
     ///
     /// C's `epicsSetThreadStdin` (`iocsh.cpp:412`). No built-in command reads
@@ -357,6 +364,8 @@ impl CommandContext {
             acf,
             output: std::cell::RefCell::new(Box::new(std::io::stdout())),
             error: std::cell::RefCell::new(Box::new(std::io::stderr())),
+            console_out: std::cell::RefCell::new(Box::new(std::io::stdout())),
+            console_err: std::cell::RefCell::new(Box::new(std::io::stderr())),
             input: std::cell::RefCell::new(Box::new(std::io::BufReader::new(std::io::stdin()))),
             commands: std::cell::RefCell::new(std::sync::Weak::new()),
         }
@@ -436,6 +445,16 @@ impl CommandContext {
         let _ = writeln!(err, "{msg}");
     }
 
+    /// A line on C's raw `stdout`, which no iocsh redirect swaps.
+    pub fn console_println(&self, msg: &str) {
+        let _ = writeln!(self.console_out.borrow_mut(), "{msg}");
+    }
+
+    /// A line on C's raw `stderr`, which no iocsh redirect swaps.
+    pub fn console_eprintln(&self, msg: &str) {
+        let _ = writeln!(self.console_err.borrow_mut(), "{msg}");
+    }
+
     /// Fail the line as C's iocsh fails a command that threw
     /// (`iocsh.cpp:1275-1285`): `C++ error: <what>` in red on the diagnostic
     /// stream.
@@ -450,6 +469,25 @@ impl CommandContext {
     pub fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
         let mut input = self.input.borrow_mut();
         input.read_line(buf)
+    }
+
+    /// Swap both console cells for the length of `f`, so a test can read
+    /// what a command wrote past every redirect.
+    #[cfg(test)]
+    pub(crate) fn with_console<O: std::io::Write + 'static, E: std::io::Write + 'static, R>(
+        &self,
+        out: O,
+        err: E,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let prev_out = self.console_out.replace(Box::new(out));
+        let prev_err = self.console_err.replace(Box::new(err));
+        let result = f();
+        let _ = self.console_out.borrow_mut().flush();
+        let _ = self.console_err.borrow_mut().flush();
+        self.console_out.replace(prev_out);
+        self.console_err.replace(prev_err);
+        result
     }
 
     /// Temporarily redirect the DIAGNOSTIC stream, run a closure, then
@@ -553,6 +591,29 @@ impl CommandRegistry {
     }
 }
 
+/// [`split`]'s words, for tests that read only those.
+#[cfg(test)]
+pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
+    split(line).map(|s| s.argv).unwrap_or_default()
+}
+
+/// One line's redirect: C `iocshRedirect`'s name and mode for one fd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Redirect {
+    /// Already expanded once, as C's `split` sees a `macDefExpand`ed line.
+    pub(crate) path: Vec<u8>,
+    pub(crate) append: bool,
+}
+
+/// C `split()`'s result: the words, and each fd's redirect in C's
+/// `std::map` order (`iocsh.cpp:223`), which is the order `openRedirect`
+/// opens them in.
+#[derive(Debug, Default)]
+pub(crate) struct Split {
+    pub(crate) argv: Vec<IocshString>,
+    pub(crate) redirects: std::collections::BTreeMap<u8, Redirect>,
+}
+
 /// Break a command line into words the way C `split()` does
 /// (`iocsh.cpp:255-376`).
 ///
@@ -571,10 +632,8 @@ impl CommandRegistry {
 /// backslashes and `epicsEnvSet X "hello \"world\""` is an unbalanced
 /// quote rather than an escaped one (both measured).
 ///
-/// The state behind all of that is [`ShellScan`], the same instance
-/// shape [`lint_line`] and [`super::parse_redirect`] run: C keeps one
-/// `quote`/`backslash` pair and answers every question from it, so a
-/// second implementation here could only disagree with them.
+/// The state behind all of that is [`ShellScan`]: C keeps one
+/// `quote`/`backslash` pair and answers every question from it.
 ///
 /// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
 /// macros are expanded across the WHOLE line *before* it is split into
@@ -584,41 +643,118 @@ impl CommandRegistry {
 /// position resolves before the command name is taken. The caller
 /// ([`super::IocShell::execute_line`]) owns that one expansion; this
 /// function must not perform a second one.
-pub(crate) fn tokenize(line: &[u8]) -> Vec<IocshString> {
-    let mut tokens: Vec<IocshString> = Vec::new();
-    let mut current = Vec::new();
-    let mut inword = false;
+///
+/// Words and redirects come out of the one pass, as in C. A redirect may
+/// sit anywhere and names exactly one word; `<`, `>`, `>>` and `N>`/`N>>` (any `1`-`9` directly before `>`, even inside a word) are
+/// separators. A second operator before the first has its word ends the
+/// scan (`:280-281`, `:293-294`); a second name for one fd ends it too and
+/// keeps the first (`:336-337`).
+pub(crate) fn split(line: &[u8]) -> Result<Split, &'static str> {
+    enum Into {
+        Argv,
+        Fd(u8),
+    }
+    let mut out = Split::default();
     let mut scan = ShellScan::default();
+    // The fd whose operator still waits for its name, and the word being
+    // built with where it goes.
+    let mut pending: Option<u8> = None;
+    let mut word: Option<(Into, Vec<u8>)> = None;
+    let mut modes: std::collections::BTreeMap<u8, bool> = Default::default();
 
-    for &byte in line {
-        match scan.feed(byte) {
-            // C `:275-278` `continue`s past the word builder, so the
-            // backslash neither starts a word nor ends one.
-            SplitRole::Escape => {}
-            // C `:312-317`: a separator closes an open word and, when
-            // none is open (`:331`), is simply skipped — which is why a
-            // run of them yields no empty tokens.
-            SplitRole::Separator => {
-                if inword {
-                    tokens.push(std::mem::take(&mut current).into());
-                    inword = false;
-                }
+    fn close(
+        out: &mut Split,
+        modes: &std::collections::BTreeMap<u8, bool>,
+        word: Option<(Into, Vec<u8>)>,
+    ) {
+        match word {
+            Some((Into::Argv, w)) => out.argv.push(w.into()),
+            Some((Into::Fd(fd), path)) => {
+                out.redirects.insert(
+                    fd,
+                    Redirect {
+                        path,
+                        append: modes[&fd],
+                    },
+                );
             }
-            // C `:345-346` writes nothing for the quote itself, but the
-            // word has begun: `epicsEnvSet X ""` passes an empty token,
-            // not an absent one.
-            SplitRole::Quote => inword = true,
-            SplitRole::Data => {
-                current.push(byte);
-                inword = true;
-            }
+            None => {}
         }
     }
-    // C `:353-354` terminates the word the end of the line leaves open.
-    if inword {
-        tokens.push(current.into());
+
+    let mut i = 0;
+    'scan: while i < line.len() {
+        let mut c = line[i];
+        i += 1;
+        if scan.is_syntax() {
+            let mut op = None;
+            if c == b'<' {
+                op = Some((0, false));
+            } else {
+                let mut fd = 1;
+                if (b'1'..=b'9').contains(&c) && line.get(i) == Some(&b'>') {
+                    fd = c - b'0';
+                    c = b'>';
+                    i += 1;
+                }
+                if c == b'>' {
+                    let append = line.get(i) == Some(&b'>');
+                    if append {
+                        i += 1;
+                    }
+                    op = Some((fd, append));
+                }
+            }
+            if let Some((fd, append)) = op {
+                if pending.is_some() {
+                    break 'scan;
+                }
+                pending = Some(fd);
+                // C sets the mode on the map entry at the operator, so a
+                // second operator for an fd that keeps its first name still
+                // changes how that name opens.
+                modes.insert(fd, append);
+                close(&mut out, &modes, word.take());
+                if let Some(r) = out.redirects.get_mut(&fd) {
+                    r.append = append;
+                }
+                continue;
+            }
+        }
+        let role = scan.feed(c);
+        if matches!(role, SplitRole::Escape) {
+            continue;
+        }
+        if matches!(role, SplitRole::Separator) {
+            close(&mut out, &modes, word.take());
+            continue;
+        }
+        if word.is_none() {
+            let into = match pending.take() {
+                // C `:336-337`: `return false`, the line as split so far.
+                Some(fd) if out.redirects.contains_key(&fd) => break 'scan,
+                Some(fd) => Into::Fd(fd),
+                None => Into::Argv,
+            };
+            word = Some((into, Vec::new()));
+        }
+        if let (SplitRole::Data, Some((_, w))) = (role, word.as_mut()) {
+            w.push(c);
+        }
     }
-    tokens
+    close(&mut out, &modes, word.take());
+
+    // C `:357-371`, in C's order.
+    if pending.is_some() {
+        return Err("Invalid redirection.");
+    }
+    if scan.unbalanced_quote() {
+        return Err("Unbalanced quote.");
+    }
+    if scan.trailing_backslash() {
+        return Err("Trailing backslash.");
+    }
+    Ok(out)
 }
 
 /// `arg` as line text that [`super::IocShell::execute_line`]'s expansion and
@@ -647,20 +783,9 @@ pub fn escape_arg(arg: &str) -> String {
 /// diagnostic for the first problem found, or `None` if the line is
 /// well-formed. L-5: C marks such a line errored; the Rust tokenizer
 /// previously consumed them silently.
+#[cfg(test)]
 pub(crate) fn lint_line(line: &[u8]) -> Option<&'static str> {
-    let mut scan = ShellScan::default();
-    for &b in line {
-        scan.feed(b);
-    }
-    // C reports these after the same loop, from the same two pieces of
-    // state (`iocsh.cpp:362-371`).
-    if scan.unbalanced_quote() {
-        return Some("Unbalanced quote.");
-    }
-    if scan.trailing_backslash() {
-        return Some("Trailing backslash.");
-    }
-    None
+    split(line).err()
 }
 
 /// The one owner of C `split()`'s quote/backslash state

@@ -72,7 +72,7 @@ const STRFTIME_PREFIX_BUF: usize = 256;
 /// a date. Saturating pinned it to `0` — C's *uninitialized* value — so a
 /// running IOC whose RTC never started answered `<undefined>` where C answers
 /// a date, and the `ai` path read `0.0` where C reads ~4.29e9.
-fn epics_time_parts(ts: WallTime) -> (u32, u32) {
+pub(crate) fn epics_time_parts(ts: WallTime) -> (u32, u32) {
     // C's uninitialized `epicsTimeStamp` is the literal `{0, 0}`; this port
     // carries it as `UNIX_EPOCH`, and the `secPastEpoch == 0 && nsec == 0`
     // test below is C's own check for it (`epicsTime.cpp:176`). A sentinel,

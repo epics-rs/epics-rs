@@ -22,7 +22,7 @@ use super::registry::*;
 use super::vars::{VarAccess, VarDef};
 use crate::runtime::log::ERL_ERROR;
 use crate::server::access_security::{
-    AccessLevel, AccessSecurityConfig, as_check_client_ip, parse_acf, set_as_check_client_ip,
+    AccessLevel, AccessSecurityConfig, as_check_client_ip, set_as_check_client_ip,
 };
 
 /// Process-global access-security shell state. Mirrors the
@@ -237,7 +237,13 @@ impl AsInitOutcome {
 /// Infallible from the caller's side, as C's `asInitCommon` is: the file
 /// being unreadable or unparseable is [`AsInitOutcome::LoadFailed`], and
 /// [`as_init_file`] has already written the reason where C writes it.
-pub(crate) fn as_init(acf: &crate::server::access_security::AcfCell) -> AsInitOutcome {
+///
+/// `report` is the thread's stderr of whoever called: the shell command's
+/// redirected stream, or `iocInit`'s.
+pub(crate) fn as_init(
+    acf: &crate::server::access_security::AcfCell,
+    report: &dyn Fn(&str),
+) -> AsInitOutcome {
     // Snapshot the deferred config under the lock, release it before file
     // I/O so the lock is not held across syscalls. The `firstTime` flip goes
     // with that snapshot, as C's `epicsThreadOnce` does.
@@ -261,7 +267,7 @@ pub(crate) fn as_init(acf: &crate::server::access_security::AcfCell) -> AsInitOu
             AsInitOutcome::BadConfig
         };
     };
-    let Some(config) = as_init_file(&filename, substitutions.as_deref()) else {
+    let Some(config) = as_init_file(&filename, substitutions.as_deref(), report) else {
         return AsInitOutcome::LoadFailed;
     };
     // Publish into the IOC's live policy cell — the store fires the
@@ -284,9 +290,14 @@ pub(crate) fn as_init(acf: &crate::server::access_security::AcfCell) -> AsInitOu
 /// invented a sentence C never writes.
 ///
 /// `None` is C's `S_asLib_badConfig`, already reported.
-fn as_init_file(filename: &[u8], substitutions: Option<&[u8]>) -> Option<AccessSecurityConfig> {
-    // C `asLibRoutines.c:179-182`: `fopen` failed. Straight to stderr and
-    // not through errlog, as C's `fprintf(stderr, ...)` is — that is what
+fn as_init_file(
+    filename: &[u8],
+    substitutions: Option<&[u8]>,
+    report: &dyn Fn(&str),
+) -> Option<AccessSecurityConfig> {
+    // C `asLibRoutines.c:179-182`: `fopen` failed. On the thread's stderr
+    // (the file includes `epicsStdio.h`) and not through errlog, as C's
+    // `fprintf(stderr, ...)` is — that is what
     // keeps `ERL_ERROR`'s escapes on the stream whether or not it is a
     // terminal (see [`ERL_ERROR`]) — and with no OS error appended, because
     // C prints none.
@@ -312,7 +323,7 @@ fn as_init_file(filename: &[u8], substitutions: Option<&[u8]>) -> Option<AccessS
     let raw = match read {
         Ok(raw) => raw,
         Err(_) => {
-            eprintln!("{}", cant_open_file(&String::from_utf8_lossy(filename)));
+            report(&cant_open_file(&String::from_utf8_lossy(filename)));
             return None;
         }
     };
@@ -338,20 +349,8 @@ fn as_init_file(filename: &[u8], substitutions: Option<&[u8]>) -> Option<AccessS
         }
         _ => raw,
     };
-    match parse_acf(&content) {
-        Ok(config) => Some(config),
-        Err(e) => {
-            // C's parse diagnostics come from the parser itself, on stderr
-            // and behind `ERL_ERROR` (`asLib.y:336-344`, `asLib_lex.l`), not
-            // from `asInitFile`. `parse_acf` reports nothing, so its message
-            // stands in for `yyerror`'s body here: the prefix and the stream
-            // are C's, the sentence and its `ACF line N:` location are this
-            // port's — more specific than C's bare `syntax error`, and kept
-            // for that reason.
-            eprintln!("{ERL_ERROR} {e}");
-            None
-        }
-    }
+    // The parser says its own diagnostics, as C's does; `asInitFile` adds none.
+    crate::server::access_security::parse_acf_reporting(&content, report).ok()
 }
 
 /// The exact bytes C `asInitFile` writes when `fopen` fails
@@ -376,7 +375,7 @@ fn cmd_as_init() -> CommandDef {
             // is marked failed and the command prints nothing beyond what
             // `asInitCommon` printed for itself — `CommandOutcome::Failed`,
             // never `Err`, which would make the shell say it a second time.
-            let outcome = as_init(ctx.acf());
+            let outcome = as_init(ctx.acf(), &|line| ctx.eprintln(line));
             if let Some(message) = outcome.message() {
                 ctx.println(message);
             }
@@ -906,7 +905,10 @@ mod tests {
             b"UAG(ops) { \"op\xff\" }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(ops) } }\n",
         )
         .unwrap();
-        let cfg = as_init_file(tmp.path().to_str().unwrap().as_bytes(), None).expect("C loads it");
+        let cfg = as_init_file(tmp.path().to_str().unwrap().as_bytes(), None, &|l| {
+            eprintln!("{l}")
+        })
+        .expect("C loads it");
         assert_eq!(cfg.uag[b"ops".as_slice()], [b"op\xff".to_vec()]);
     }
 
@@ -1043,7 +1045,7 @@ mod tests {
             let cell = acf.clone();
             // A plain thread, as iocsh's.
             let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || tx.send(as_init(&cell)));
+            std::thread::spawn(move || tx.send(as_init(&cell, &|l| eprintln!("{l}"))));
             let outcome = rx.await.unwrap();
             assert!(matches!(outcome, AsInitOutcome::Loaded));
             assert_eq!(
@@ -1104,6 +1106,7 @@ mod tests {
         let cfg = as_init_file(
             tmp.path().to_str().unwrap().as_bytes(),
             Some("M=\"b\u{e9}\"".as_bytes()),
+            &|l| eprintln!("{l}"),
         )
         .unwrap();
         assert_eq!(
@@ -1447,7 +1450,7 @@ mod tests {
         let a = parse_args(&["/no/such/directory/nope.acf".into()], &set.args).unwrap();
         set.handler.call(&a, &ctx).unwrap();
 
-        let outcome = as_init(ctx.acf());
+        let outcome = as_init(ctx.acf(), &|l| ctx.eprintln(l));
         assert_eq!(outcome, AsInitOutcome::LoadFailed);
         assert!(outcome.failed());
         assert_eq!(outcome.message(), None);
@@ -1455,5 +1458,66 @@ mod tests {
             ctx.acf().load().is_none(),
             "a refused file must not activate access security"
         );
+    }
+
+    /// `asLibRoutines.c` includes `epicsStdio.h`, and `asLib.y` compiles it
+    /// into the same unit, so `asInitFile`'s open failure and the parser's
+    /// `yyerror`/`yywarn` all go to the thread's stderr — the stream a `2>`
+    /// swaps. Measured on `softIoc` R7.0.10: `asInit 2> f` leaves each in
+    /// `f`, and `iocInit 2> f` does the same for the one `iocBuild` reaches.
+    #[test]
+    fn as_init_reports_on_the_redirected_stderr() {
+        let _guard = as_state_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let syntax = "ASG(DEFAULT) { RULE(1,READ) \n";
+        let missing = dir.path().join("nosuch.acf");
+        let cases = [
+            (
+                None,
+                missing.clone(),
+                format!(
+                    "{ERL_ERROR} asInitFile: Can't open file '{}'\n",
+                    missing.display()
+                ),
+            ),
+            (
+                Some(syntax),
+                dir.path().join("syn.acf"),
+                format!("{ERL_ERROR} syntax error at line 2\n"),
+            ),
+            (
+                Some("ASG(DEFAULT) {\n  RULE(1, READ)\n  RULE(2, EXECUTE)\n}\n"),
+                dir.path().join("warn.acf"),
+                format!(
+                    "{} Ignoring RULE that contains an unsupported keyword at line 3: EXECUTE\n",
+                    crate::runtime::log::ERL_WARNING
+                ),
+            ),
+        ];
+        for (body, path, want) in cases {
+            reset_as_state_for_test();
+            if let Some(body) = body {
+                std::fs::write(&path, body).unwrap();
+            }
+            let (_db, ctx) = make_ctx();
+            let mut reg = CommandRegistry::new();
+            register(&mut reg);
+            let set = reg.get("asSetFilename").unwrap();
+            let a = parse_args(&[path.to_string_lossy().into()], &set.args).unwrap();
+            set.handler.call(&a, &ctx).unwrap();
+
+            let err = tempfile::NamedTempFile::new().unwrap();
+            let init = reg.get("asInit").unwrap();
+            let a = parse_args(&[], &init.args).unwrap();
+            ctx.with_error(err.reopen().unwrap(), || {
+                init.handler.call(&a, &ctx).unwrap()
+            });
+            assert_eq!(
+                std::fs::read_to_string(err.path()).unwrap(),
+                want,
+                "{}",
+                path.display()
+            );
+        }
     }
 }

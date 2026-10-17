@@ -465,7 +465,9 @@ pub(crate) async fn install_records<H: InstallHost>(
                     let mut reads = reached.then(|| host.db().read_init_links(&rec_arc));
                     let mut inst = rec_arc.write();
                     if let Some(reads) = &mut reads {
-                        inst.run_init_pass1(&def.name.to_str_lossy(), reads);
+                        inst.run_init_pass1(&def.name.to_str_lossy(), reads, &|line| {
+                            eprintln!("{line}")
+                        });
                     }
                     rec_arc.settle_addr_facts(&inst);
                 }

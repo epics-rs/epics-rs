@@ -7577,9 +7577,9 @@ impl RecordInstance {
     /// over — an iocsh `dbLoadRecords` merge re-running the passes on a record
     /// that already resolved. Nothing to look up again, and C's tail is
     /// reached.
-    fn resolve_init_subroutine(&mut self, name: &str) -> bool {
+    fn resolve_init_subroutine(&mut self, name: &str, err: &dyn Fn(&str)) -> bool {
         match self.cold.init_subroutines.take() {
-            Some(registry) => crate::server::ioc_app::wire_subroutine(self, name, &registry),
+            Some(registry) => crate::server::ioc_app::wire_subroutine(self, name, &registry, err),
             None => true,
         }
     }
@@ -7691,6 +7691,7 @@ impl RecordInstance {
         &mut self,
         name: &str,
         reads: &mut crate::server::record::InitLinkReads,
+        err: &dyn Fn(&str),
     ) {
         let _init = crate::server::database::InitPass::enter();
         if let Err(e) = self.record.init_record_with_links(reads) {
@@ -7713,7 +7714,7 @@ impl RecordInstance {
         // the SNAM lookup, also inside pass 1. `false` is C's early return
         // (`S_db_BadSub`, or the empty-SNAM `pact = TRUE; return 0`), so the
         // tail below is skipped exactly where C skips it.
-        if !self.resolve_init_subroutine(name) {
+        if !self.resolve_init_subroutine(name, err) {
             return;
         }
         // The UDF tail of pass 1. `init_record` cannot reach UDF (a common

@@ -445,7 +445,10 @@ impl IocBuilder {
     pub async fn build_ioc(mut self) -> CaResult<BareIoc> {
         let server_inits = std::mem::take(&mut self.server_inits);
         let (db, autosave_config, build) = self
-            .build_through(crate::server::ioc_app::BareBuild::begin, LinkInit::Build)
+            .build_through(
+                || crate::server::ioc_app::BareBuild::begin(|line| println!("{line}")),
+                LinkInit::Build,
+            )
             .await?;
         crate::server::ioc_app::initial_process(&db);
         let mut servers = crate::server::ioc_app::InitializedServers::default();
@@ -586,7 +589,7 @@ impl IocBuilder {
         // load time so a record's device-support port could be configured first.
         // Before `setup_io_intr` (C's `scanInit`), so a dset is bound before I/O
         // Intr wiring reads it.
-        db.drain_deferred_record_inits();
+        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
 
         // 5. I/O Intr setup — through the single owner shared with the
         // `IocApplication` iocInit path, so C `scanAdd`'s failure exits

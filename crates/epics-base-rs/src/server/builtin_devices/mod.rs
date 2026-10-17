@@ -12,12 +12,14 @@
 //! applies to.
 
 pub mod dbstate;
+pub mod general_time;
 pub mod getenv;
 pub mod soft_callback;
 pub mod stdio;
 pub mod timestamp;
 
 pub use dbstate::DbStateDeviceSupport;
+pub use general_time::GeneralTimeDeviceSupport;
 pub use getenv::GetenvDeviceSupport;
 pub use stdio::StdioDeviceSupport;
 pub use timestamp::SoftTimestampDeviceSupport;
@@ -32,7 +34,8 @@ use crate::server::ioc_app::DeviceSupportContext;
 /// format string, `stdio` (base `devStdio.c`) needs its INST_IO `OUT` stream
 /// name, `Db State` (base `devBiDbState.c` / `devBoDbState.c`) needs its
 /// INST_IO `INP` (bi) / `OUT` (bo) state name, and `getenv` (base
-/// `devSiEnviron.c` / `devLsiEnviron.c`) needs its INST_IO `INP` env-var name —
+/// `devSiEnviron.c` / `devLsiEnviron.c`) needs its INST_IO `INP` env-var name,
+/// and `General Time` (base `devGeneralTime.c`) its INST_IO channel name —
 /// none of which a context-free static `Fn() -> Box<dyn DeviceSupport>` factory
 /// can see. The inner typed record handed to `init`/`read` does NOT expose
 /// `INP`/`OUT` either (those live on the `RecordInstance` common header, not the
@@ -52,6 +55,14 @@ pub fn builtin_dynamic_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn Dev
             ctx.inp, ctx.out,
         ))),
         "getenv" => Some(Box::new(getenv::GetenvDeviceSupport::new(ctx.inp))),
+        "General Time" if general_time::serves(ctx.record_type) => {
+            let link = if ctx.record_type == "bo" {
+                ctx.out
+            } else {
+                ctx.inp
+            };
+            Some(Box::new(general_time::GeneralTimeDeviceSupport::new(link)))
+        }
         _ => None,
     }
 }

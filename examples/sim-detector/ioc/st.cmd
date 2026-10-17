@@ -42,8 +42,8 @@ set_pass1_restoreFile("simDetector_settings.req", "P=$(PREFIX),R=$(CAM)")
 # Autosave monitor sets (after all records are loaded)
 create_monitor_set("simDetector_settings.req", 5, "P=$(PREFIX),R=$(CAM)")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
 # After init, the interactive iocsh shell starts.
 #
 # Example interactive commands:

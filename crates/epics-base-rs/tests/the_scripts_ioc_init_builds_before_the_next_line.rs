@@ -119,11 +119,12 @@ async fn the_build_runs_once_however_many_times_the_script_asks() {
 }
 
 /// The path the six `CaServerBuilder` binaries take, and every application that
-/// never writes a script: nothing spells `iocInit`, so the turn after Phase 1
-/// performs the same build. Unchanged by the owner, and the reason the owner is
-/// consumed rather than guarded.
+/// never writes a script: its queued lines are a programmatic `main`'s own
+/// calls, and `run` is that `main`'s `iocInit()`, so the turn after Phase 1
+/// performs the same build. The reason the owner is consumed rather than
+/// guarded.
 #[epics_macros_rs::epics_test]
-async fn a_script_that_never_spells_ioc_init_still_builds() {
+async fn an_application_without_a_script_is_built_by_run() {
     let builds = Arc::new(Mutex::new(0usize));
     let counter = builds.clone();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -191,8 +192,8 @@ async fn a_script_can_build_and_run_in_two_lines() {
 
 /// `iocRun` before anything is built refuses and says something true — C
 /// `iocInit.c:252-256`, `iocRun: WARNING IOC not paused`, which it is not. The
-/// refusal must not consume the build: the post-script turn still performs it,
-/// which is why the hook fires exactly once at the end.
+/// refusal must not consume the build: the script's later `iocInit` still
+/// performs it, which is why the hook fires exactly once.
 #[epics_macros_rs::epics_test]
 async fn ioc_run_before_anything_is_built_refuses_and_keeps_the_build() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -202,7 +203,10 @@ async fn ioc_run_before_anything_is_built_refuses_and_keeps_the_build() {
         .port(0)
         .register_after_init(move || *counter.lock().unwrap() += 1)
         .register_startup_command(probe_pair(seen.clone(), hooks.clone()))
-        .startup_script(&st_cmd("run-first.cmd", &["iocRun", "probeBuiltState"]))
+        .startup_script(&st_cmd(
+            "run-first.cmd",
+            &["iocRun", "probeBuiltState", "iocInit"],
+        ))
         .run(|_config| async move {
             assert_eq!(get_ioc_state(), IocState::Running);
             Ok(())
@@ -218,35 +222,29 @@ async fn ioc_run_before_anything_is_built_refuses_and_keeps_the_build() {
     assert_eq!(*hooks.lock().unwrap(), 1);
 }
 
-/// A script that builds and never runs. C's `softMain` would call `iocInit()`,
-/// watch `iocBuild_1` refuse from a state that is not `iocVoid`
-/// (`iocInit.c:116-121`), and leave the IOC quiescent — bound to no port and
-/// serving nothing, which is the defect this owner exists to remove. The port
-/// finishes the transition the script started, and announces that it did.
+/// A script that builds and never runs. C's `iocInit()` after it would see
+/// `iocBuild_1` refuse from a state that is not `iocVoid`
+/// (`iocInit.c:116-121`), so the IOC stays built and quiescent: no
+/// `initHookAfterIocRunning`, and no protocol runner to hand it to.
 #[epics_macros_rs::epics_test]
-async fn a_script_that_builds_without_running_is_finished_after_the_script() {
+async fn a_script_that_builds_without_running_stays_built() {
     let hooks = Arc::new(Mutex::new(0usize));
     let counter = hooks.clone();
+    let served = Arc::new(Mutex::new(false));
+    let flag = served.clone();
     IocApplication::new()
         .port(0)
         .register_after_init(move || *counter.lock().unwrap() += 1)
         .startup_line("iocBuild")
         .run(|_config| async move {
-            assert_eq!(
-                get_ioc_state(),
-                IocState::Running,
-                "the protocol runner must be handed a running IOC"
-            );
+            *flag.lock().unwrap() = true;
             Ok(())
         })
         .await
         .unwrap();
 
-    assert_eq!(
-        *hooks.lock().unwrap(),
-        1,
-        "the run half happens once, after the script rather than in it"
-    );
+    assert_eq!(*hooks.lock().unwrap(), 0);
+    assert!(!*served.lock().unwrap(), "a built IOC is not served");
 }
 
 /// The build half is exactly once too, and by ownership: a second `iocBuild`

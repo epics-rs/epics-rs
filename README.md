@@ -145,8 +145,8 @@ and [docs.rs/epics-pva-rs](https://docs.rs/epics-pva-rs).
 
 ### IOC library
 
-`st.cmd` uses the same syntax as C EPICS (`iocInit()` runs automatically after
-the script), and the protocol runner is pluggable:
+`st.cmd` uses the same syntax as C EPICS (an IOC the script never `iocInit`s
+stays uninitialised, as in C), and the protocol runner is pluggable:
 
 ```rust
 use epics_rs::base::server::ioc_app::IocApplication;

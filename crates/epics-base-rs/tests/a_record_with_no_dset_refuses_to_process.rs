@@ -127,3 +127,41 @@ async fn a_record_type_with_no_dset_check_still_processes() {
     );
     assert_eq!(db.get_pv("T:C.PACT").unwrap(), EpicsValue::Char(0));
 }
+
+const CHILD: &str = "NO_DSET_CONSOLE_CHILD";
+
+/// The build's console for an `ai` whose DTYP no one registered. softIoc
+/// R7.0.10 on `device(ai,INST_IO,devFoo,"foo")` with nothing behind it prints
+/// `recGblRecordError: ai: init_record Error (514,3) PV: R1` for the record
+/// and no other line about it.
+#[test]
+fn the_build_says_only_cs_line_for_a_record_with_no_dset() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_builds_a_record_with_no_dset",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let lines: Vec<_> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains("T:N"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        ["recGblRecordError: ai: init_record Error (514,3) PV: T:N"]
+    );
+}
+
+#[epics_macros_rs::epics_test]
+async fn child_builds_a_record_with_no_dset() {
+    if std::env::var_os(CHILD).is_none() {
+        return;
+    }
+    ioc("record(ai, \"T:N\") { field(DTYP,\"nobodyRegisteredThis\") }\n").await;
+    epics_base_rs::runtime::log::errlog_flush();
+}

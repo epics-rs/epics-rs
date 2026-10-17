@@ -1227,9 +1227,10 @@ static LIFECYCLE_OWNER: Mutex<Option<IocLifecycle>> = Mutex::new(None);
 type CannotProceed = crate::runtime::sync::oneshot::Sender<()>;
 
 /// Resolves when a shell's build has failed; never when the build succeeded
-/// or ran off the shell, which drop the sender.
+/// or ran off the shell, which drop the sender. Callable again after the
+/// startup phase's select already saw the channel close.
 async fn cannot_proceed(rx: &mut crate::runtime::sync::oneshot::Receiver<()>) {
-    if rx.await.is_err() {
+    if rx.is_terminated() || rx.await.is_err() {
         std::future::pending::<()>().await;
     }
 }
@@ -1261,35 +1262,53 @@ pub(crate) enum ShellTransition {
 }
 
 /// The iocsh `iocBuild` line, and the build half of `iocInit`.
-pub(crate) fn build_from_shell(bridge: &crate::runtime::task::BlockingBridge) -> ShellTransition {
+pub(crate) fn build_from_shell(
+    bridge: &crate::runtime::task::BlockingBridge,
+    out: &dyn Fn(&str),
+    err: &dyn Fn(&str),
+) -> ShellTransition {
     match take_lifecycle() {
         None => ShellTransition::NotOurs,
-        Some(IocLifecycle::Armed(build, signal)) => match bridge.block_on(build.perform_build()) {
-            Ok(BuildOutcome::Built(built)) => {
-                put_lifecycle(IocLifecycle::Built(built));
-                ShellTransition::Done
-            }
-            Ok(BuildOutcome::AsInitFailed) => {
-                put_lifecycle(IocLifecycle::AsInitFailed);
-                ShellTransition::Failed
-            }
-            Err(e) => {
-                put_lifecycle(IocLifecycle::Failed(e));
-                let _ = signal.send(());
-                // C `cantProceed` (`rsrv_init`, `caservertask.c:752`); the
-                // lifecycle owner returns the error instead of hanging (user
-                // sign-off 2026-10-14). `epicsThreadResume` must not let the
-                // script run on.
-                loop {
-                    crate::runtime::task::suspend_self();
+        Some(IocLifecycle::Armed(build, signal)) => {
+            match bridge.block_on(build.perform_build(out, err)) {
+                Ok(BuildOutcome::Built(built)) => {
+                    put_lifecycle(IocLifecycle::Built(built));
+                    ShellTransition::Done
+                }
+                Ok(BuildOutcome::AsInitFailed) => {
+                    put_lifecycle(IocLifecycle::AsInitFailed);
+                    ShellTransition::Failed
+                }
+                Err(e) => {
+                    put_lifecycle(IocLifecycle::Failed(e));
+                    let _ = signal.send(());
+                    // C `cantProceed` (`rsrv_init`, `caservertask.c:752`); the
+                    // lifecycle owner returns the error instead of hanging (user
+                    // sign-off 2026-10-14). `epicsThreadResume` must not let the
+                    // script run on.
+                    loop {
+                        crate::runtime::task::suspend_self();
+                    }
                 }
             }
-        },
+        }
         Some(other) => {
             put_lifecycle(other);
             ShellTransition::Refused
         }
     }
+}
+
+/// softMain's line for a non-zero `iocInit()` it called itself
+/// (`softMain.cpp:241-243`); a script's failed `iocInit` line prints none.
+fn soft_main_ioc_init_failed() {
+    eprintln!("{} during iocInit()", crate::runtime::log::ERL_ERROR);
+}
+
+/// softMain's `iocInit()` on an IOC the script already took past `iocVoid`.
+fn soft_main_ioc_init_refused() {
+    crate::runtime::log::errlog_printf(&build_refusal());
+    soft_main_ioc_init_failed();
 }
 
 /// C `iocBuild_1`'s refusal (`iocInit.c:117-120`), which every caller of the
@@ -1333,7 +1352,7 @@ impl BareBuild {
     /// `iocVoid`; otherwise `Starting iocInit` on the errlog (`:129`), then
     /// `coreRelease()`, whose `printf` (`misc/epicsRelease.c:23-27`) is the
     /// build's only stdout write (`:147`), then `iocBuilding`.
-    pub(crate) fn begin() -> Option<Self> {
+    pub(crate) fn begin(out: impl Fn(&str)) -> Option<Self> {
         if get_ioc_state() != IocState::Void {
             crate::runtime::log::errlog_printf(&build_refusal());
             return None;
@@ -1342,7 +1361,7 @@ impl BareBuild {
         crate::runtime::task::set_thread_ok_to_block(true);
         crate::runtime::log::errlog_printf("Starting iocInit\n");
         for line in crate::server::iocsh::misc_commands::core_release_block() {
-            println!("{line}");
+            out(&line);
         }
         set_ioc_state(IocState::Building);
         Some(Self(()))
@@ -1454,9 +1473,9 @@ pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> bool {
 
 /// C `iocBuild` for the bare shell's `iocBuild`/`iocInit`: the record-load
 /// close, then [`initial_process`], inside [`BareBuild`]. False when
-/// `iocBuild_1` refused.
-pub(crate) async fn build_without_application(db: &Arc<PvDatabase>) -> bool {
-    let Some(build) = BareBuild::begin() else {
+/// `iocBuild_1` refused. `out` is the building thread's stdout.
+pub(crate) async fn build_without_application(db: &Arc<PvDatabase>, out: impl Fn(&str)) -> bool {
+    let Some(build) = BareBuild::begin(out) else {
         return false;
     };
     db.ioc_init().await;
@@ -1490,7 +1509,11 @@ impl IocBuild {
     /// [`IocState::Built`], the quiescent state [`BuiltIoc::run`] is legal
     /// from. `initHookAfterIocBuilt` is announced on this half, as
     /// `iocBuild_3` announces it (`iocInit.c:201-207`).
-    async fn perform_build(self) -> CaResult<BuildOutcome> {
+    ///
+    /// `out` and `err` are the building thread's stdout and stderr, where the
+    /// epicsStdio files C's build runs (`coreRelease`, `asDbLib`,
+    /// `asInitFile`) write: the shell's, redirected, for an `iocInit` line.
+    async fn perform_build(self, out: impl Fn(&str), err: impl Fn(&str)) -> CaResult<BuildOutcome> {
         let Self {
             db,
             acf,
@@ -1635,7 +1658,7 @@ impl IocBuild {
         // (`misc/epicsRelease.c:23-27`). The wording is the iocsh command's,
         // which is C's arrangement too: one function, two callers.
         for line in crate::server::iocsh::misc_commands::core_release_block() {
-            println!("{line}");
+            out(&line);
         }
 
         // iocBuild begins.
@@ -1712,7 +1735,7 @@ impl IocBuild {
         // fires before the startup script's `iocInit` line, and the records it
         // restores were loaded before that.
         announce!(InitHookState::AfterInitDevSup);
-        db.drain_deferred_record_inits();
+        db.drain_deferred_record_inits(&err);
         setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
         init_links(&db).await;
@@ -1743,9 +1766,9 @@ impl IocBuild {
         // itself, on stderr, and hands `asInitCommon` only a status
         // (`asLibRoutines.c:174-190`), which is why `as_init` returns an
         // outcome and not a message.
-        let as_init = crate::server::iocsh::as_init(&acf);
+        let as_init = crate::server::iocsh::as_init(&acf, &err);
         if let Some(message) = as_init.message() {
-            println!("{message}");
+            out(message);
         }
         if as_init.failed() {
             crate::runtime::log::errlog_printf(&as_init_failed_message(
@@ -1963,7 +1986,8 @@ pub struct IocApplication {
     /// ([`Self::register_after_init_database`]).
     after_init_database_hooks: Vec<AfterInitDatabaseHook>,
     /// C softMain's own turn between the startup script and `iocInit`
-    /// ([`Self::before_ioc_init`]). `None` is [`IocInitDecision::run`].
+    /// ([`Self::before_ioc_init`]). `None` is a custom `main`: the script's
+    /// own `iocInit` is the only build, or `run` builds when there is no script.
     ioc_init_gate: Option<Box<dyn FnOnce() -> IocInitDecision + Send>>,
     /// [`Self::register_server_init`].
     server_inits: Vec<(&'static str, ServerInit)>,
@@ -2214,9 +2238,10 @@ impl IocApplication {
     /// The one instant at which a caller can both observe that the script
     /// has finished and decide whether the IOC initialises at all — C has
     /// it because `iocsh(st.cmd)` and `iocInit()` are two statements in its
-    /// `main`, and this port had collapsed them into one call. Unset means
-    /// [`IocInitDecision::run`], so an application that never had C's
-    /// `loadedDb` question boots exactly as it did before.
+    /// `main`, and this port had collapsed them into one call. Unset is C's
+    /// custom `main` (`iocsh(st.cmd); iocsh(NULL)`): a startup script that
+    /// never says `iocInit` leaves the IOC uninitialised at the prompt, and
+    /// an application with no script is built by `run`.
     ///
     /// The gate runs on the lifecycle's own task, after the startup shell
     /// has been joined, so anything it prints lands between the script's
@@ -2534,8 +2559,8 @@ impl IocApplication {
         // one meaning: the script's own `iocInit` line performs this build, so
         // the line after it — a `dbpf`, a `dbl`, an `asSetFilename` — runs
         // against an IOC that has device support, scan threads and PINI behind
-        // it. When the script never spells `iocInit`, the turn after Phase 1
-        // performs the same build instead.
+        // it. When the script never spells `iocInit`, only the gate's
+        // `IocInitDecision::run` — or having no script at all — builds.
         let (cannot_proceed_tx, mut cannot_proceed_rx) = crate::runtime::sync::oneshot::channel();
         arm_build(
             IocBuild {
@@ -2580,7 +2605,8 @@ impl IocApplication {
         // `dbLoadRecords` from `-d` and one from the script are the same
         // call, so a `dbPutAttribute` or `dbLoadTemplate` queued here must
         // be visible to the script exactly as it is to a later script line.
-        if startup_script.is_some() || !startup_lines.is_empty() {
+        let has_script = startup_script.is_some();
+        if has_script || !startup_lines.is_empty() {
             // C's `iocsh(pathname)` returns before `iocsh(NULL)` is reached
             // (`softMain.cpp:231`, `:250`). The script's `iocInit` line now
             // starts the protocol runner, whose interactive shell is a thread
@@ -2638,6 +2664,13 @@ impl IocApplication {
         // protocol runner is the whole of its tail. It therefore gets a
         // failed build as an `Err` rather than a shell it never asked for.
         let decision = ioc_init_gate.map(|gate| gate());
+        // With no gate this is the `main` of every IOC but softIoc:
+        // `iocsh(st.cmd)` then `iocsh(NULL)`, which builds nothing the script
+        // did not. Without a script it is a programmatic `main` — queued
+        // lines are its own `dbLoadRecords()` calls — whose `iocInit()` is
+        // this `run`.
+        let gate_run = decision.map_or(!has_script, |d| d.run);
+        let interactive = decision.is_none_or(|d| d.interactive);
         // Finish whatever the startup script left undone. Each arm is a state
         // the script could have stopped in, and the value it carries is this
         // `run`'s only claim on the transition out of it.
@@ -2645,45 +2678,60 @@ impl IocApplication {
             // The script spelled neither `iocInit` nor `iocBuild`, so this is
             // the turn that decides whether the IOC is built at all.
             Some(IocLifecycle::Armed(build, signal)) => {
-                if let Some(decision) = decision
-                    && !decision.run
-                {
+                if !gate_run {
                     // Still armed: an `iocInit` typed at the tail's prompt is
                     // C's same `iocInit()`, and starts RSRV through this build.
                     put_lifecycle(IocLifecycle::Armed(build, signal));
-                    return run_uninitialized_tail(
-                        db,
-                        bridge,
-                        acf,
-                        decision.interactive,
-                        cannot_proceed_rx,
-                    )
-                    .await;
+                    return run_uninitialized_tail(db, bridge, acf, interactive, cannot_proceed_rx)
+                        .await;
                 }
-                match build.perform_build().await? {
+                match build
+                    .perform_build(
+                        |line: &str| println!("{line}"),
+                        |line: &str| eprintln!("{line}"),
+                    )
+                    .await?
+                {
                     BuildOutcome::Built(built) => Ok(built.run().await),
-                    BuildOutcome::AsInitFailed => Err(()),
+                    BuildOutcome::AsInitFailed => {
+                        if decision.is_some() {
+                            soft_main_ioc_init_failed();
+                        }
+                        Err(())
+                    }
                 }
             }
-            // The script spelled `iocBuild` and never `iocRun`. C's softMain
-            // would call `iocInit()`, watch `iocBuild_1` refuse from a state
-            // that is not `iocVoid`, and leave the IOC quiescent — bound to no
-            // port and serving nothing, which is the failure this whole owner
-            // exists to remove. Finish the transition the script started, and
-            // say so rather than doing it silently.
+            // The script spelled `iocBuild` and never `iocRun`. softMain's
+            // `iocInit()` sees `iocBuild_1` refuse from a state that is not
+            // `iocVoid`, and the IOC stays built and quiescent at the prompt,
+            // where an `iocRun` still runs it.
             Some(IocLifecycle::Built(built)) => {
-                crate::runtime::log::errlog_printf(
-                    "iocInit: startup script built the IOC without running it; running it now\n",
-                );
-                Ok(built.run().await)
+                if decision.is_some_and(|d| d.run) {
+                    soft_main_ioc_init_refused();
+                }
+                put_lifecycle(IocLifecycle::Built(built));
+                return run_uninitialized_tail(db, bridge, acf, interactive, cannot_proceed_rx)
+                    .await;
             }
             // The script's `iocInit`, or its `iocBuild` and `iocRun`, already
             // did it. There is no second build to gate and no second decision
             // to take: the script asked for the IOC to be built and run, which
             // is what makes every line after those — and the protocol runner
             // below — see a running IOC.
-            Some(IocLifecycle::Running(running)) => Ok(running),
-            Some(IocLifecycle::AsInitFailed) => Err(()),
+            // softMain's own `iocInit()` still runs on `-d`, and `iocBuild_1`
+            // refuses it from any state but `iocVoid`.
+            Some(IocLifecycle::Running(running)) => {
+                if decision.is_some_and(|d| d.run) {
+                    soft_main_ioc_init_refused();
+                }
+                Ok(running)
+            }
+            Some(IocLifecycle::AsInitFailed) => {
+                if decision.is_some_and(|d| d.run) {
+                    soft_main_ioc_init_refused();
+                }
+                Err(())
+            }
             Some(IocLifecycle::Failed(e)) => return Err(e.into()),
             None => unreachable!(
                 "the lifecycle owner is armed before the startup script runs and \
@@ -2702,7 +2750,6 @@ impl IocApplication {
             Err(()) => {
                 return match decision {
                     Some(decision) => {
-                        eprintln!("{} during iocInit()", crate::runtime::log::ERL_ERROR);
                         run_uninitialized_tail(
                             db,
                             bridge,
@@ -2908,15 +2955,9 @@ pub(crate) fn attach_device_support(
     };
     let dev_opt = resolve.and_then(|resolve| resolve(&ctx));
     let Some(dev) = dev_opt else {
-        // Two reports, because C makes two and they answer different
-        // questions. This one is deliberately per RECORD, where C's `device
-        // support %s not found` is per DBD ENTRY: C's line names a `device()`
-        // line nobody linked and leaves the operator to find which records
-        // used it, while this names the record that will not work.
-        eprintln!("warning: no device support registered for DTYP '{dtyp}' (record: {name})");
-        // C's own per-record line, the one a site greps for by
-        // `recGblRecordError` and the one that carries the status. Silent for
-        // a record type that needs no device support — the table is the gate.
+        // C's per-record line, the one a site greps for by `recGblRecordError`
+        // and the one that carries the status. Silent for a record type that
+        // needs no device support — the table is the gate.
         crate::server::recgbl::rec_gbl_no_device_support(instance.record.record_type(), name);
         return false;
     };
@@ -2937,8 +2978,10 @@ pub(crate) fn attach_device_support(
 /// whose SNAM names nothing is exactly the same broken record on both.
 ///
 /// Both misses are `fprintf(stderr, "%s.SNAM " ERL_ERROR " function '%s' not
-/// found\n", ...)` in C — the console directly, not the errlog, which is why
-/// this writes `eprintln!` and not [`rec_gbl_record_error`]. The INAM half was
+/// found\n", ...)` in C — stderr, not the errlog, which is why this does not
+/// call [`rec_gbl_record_error`]. Whose stderr differs: aSubRecord.c includes
+/// `epicsStdio.h` (the building thread's, `err`), subRecord.c does not (the
+/// console). The INAM half was
 /// worded `iocInit: <name>.INAM function ... not found` here and the SNAM half
 /// was not written at all, so an IOC that booted with an unresolved SNAM said
 /// nothing and then processed the record as a no-op.
@@ -2955,6 +2998,7 @@ pub(crate) fn wire_subroutine(
     instance: &mut record::RecordInstance,
     name: &str,
     registry: &HashMap<String, Arc<Subroutine>>,
+    err: &dyn Fn(&str),
 ) -> bool {
     // Both `sub` and `aSub` resolve their subroutine from SNAM via the
     // function registry at init (C `registryFunctionFind`).
@@ -2963,6 +3007,15 @@ pub(crate) fn wire_subroutine(
         return true;
     }
     let erl = crate::runtime::log::ERL_ERROR;
+    // aSubRecord.c includes epicsStdio.h, so its misses go to the building
+    // thread's stderr; subRecord.c does not, so its go to the console.
+    let miss = |line: String| {
+        if rt == "aSub" {
+            err(&line)
+        } else {
+            eprintln!("{line}")
+        }
+    };
     // INAM: invoke the init routine exactly once at init, before SNAM
     // resolution (C `init_record`: `registryFunctionFind(inam)` then
     // `(*psubroutine)(prec)`, return value discarded).
@@ -2976,7 +3029,7 @@ pub(crate) fn wire_subroutine(
         let inam = inam_field.as_str_lossy();
         if !inam.is_empty() {
             let Some(init_fn) = registry.get(inam.as_ref()) else {
-                eprintln!("{name}.INAM {erl} function '{inam}' not found");
+                miss(format!("{name}.INAM {erl} function '{inam}' not found"));
                 return false;
             };
             // `subRecord.c:116`, `aSubRecord.c:143`: the status is dropped
@@ -3019,7 +3072,7 @@ pub(crate) fn wire_subroutine(
             // — the second early return past the tail.
             instance.subroutine = registry.get(snam.as_ref()).cloned();
             if instance.subroutine.is_none() {
-                eprintln!("{name}.SNAM {erl} function '{snam}' not found");
+                miss(format!("{name}.SNAM {erl} function '{snam}' not found"));
                 return false;
             }
         }
@@ -4136,7 +4189,7 @@ mod lifecycle_tests {
 
     /// [`build_and_run`] over a database the test already loaded.
     async fn build_and_run_on(db: &Arc<PvDatabase>) {
-        assert!(build_without_application(db).await);
+        assert!(build_without_application(db, |line| println!("{line}")).await);
         assert_eq!(get_ioc_state(), IocState::Built);
         assert_eq!(ioc_run(), 0);
     }
@@ -4147,7 +4200,7 @@ mod lifecycle_tests {
     #[epics_macros_rs::epics_test]
     async fn a_second_bare_build_is_refused() {
         build_and_run().await;
-        assert!(BareBuild::begin().is_none());
+        assert!(BareBuild::begin(|line| println!("{line}")).is_none());
         assert_eq!(get_ioc_state(), IocState::Running);
     }
 
@@ -4155,7 +4208,7 @@ mod lifecycle_tests {
     /// finished leaves the state there, as a failed C `iocBuild` does.
     #[test]
     fn an_unfinished_bare_build_stays_building() {
-        let _unfinished: BareBuild = BareBuild::begin().expect("void");
+        let _unfinished: BareBuild = BareBuild::begin(|line| println!("{line}")).expect("void");
         assert_eq!(get_ioc_state(), IocState::Building);
         assert_eq!(get_ioc_state(), IocState::Building);
         assert_eq!(ioc_run(), -1, "iocRun from iocBuilding is C's -1");
@@ -4205,7 +4258,7 @@ mod lifecycle_tests {
     /// leftovers and the old one's records are freed.
     #[epics_macros_rs::epics_test]
     async fn shutdown_releases_the_published_database() {
-        let build = BareBuild::begin().expect("void");
+        let build = BareBuild::begin(|line| println!("{line}")).expect("void");
         let db = Arc::new(PvDatabase::new());
         initial_process(&db);
         build.finish();

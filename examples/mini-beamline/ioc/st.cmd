@@ -129,3 +129,5 @@ set_pass0_restoreFile("moving_dot_settings.req", "P=mini:dot:,R=cam1:")
 set_pass1_restoreFile("moving_dot_settings.req", "P=mini:dot:,R=cam1:")
 create_monitor_set("mini_positions.req", 5)
 create_monitor_set("moving_dot_settings.req", 5, "P=mini:dot:,R=cam1:")
+
+iocInit()

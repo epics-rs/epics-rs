@@ -45,7 +45,11 @@ fn a_malformed_group_file_aborts_inside_iocbuild_with_pvxs_text() {
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, "{\"G\":{\"a\":{\"+channel\":\"A.VAL\"}}\n").unwrap();
     let stcmd = dir.path().join("st.cmd");
-    std::fs::write(&stcmd, format!("dbLoadGroup(\"{}\")\n", bad.display())).unwrap();
+    std::fs::write(
+        &stcmd,
+        format!("dbLoadGroup(\"{}\")\niocInit\n", bad.display()),
+    )
+    .unwrap();
 
     let log = dir.path().join("stderr");
     let out = std::fs::File::create(&log).unwrap();
@@ -90,7 +94,7 @@ fn a_malformed_group_file_aborts_inside_iocbuild_with_pvxs_text() {
     let echo = format!("\x1b[1mdbLoadGroup(\"{}\")\x1b[0m\n", bad.display());
     let after = stdout.find(&echo).unwrap_or_else(|| panic!("{stdout}")) + echo.len();
     assert!(
-        stdout[after..].starts_with(&format!("{}\n", "#".repeat(76))),
+        stdout[after..].starts_with(&format!("\x1b[1miocInit\x1b[0m\n{}\n", "#".repeat(76))),
         "{stdout}"
     );
 }

@@ -69,3 +69,5 @@ dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=ADSIM:,R=cam1:,PORT
 NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,NDARRAY_PORT=$(PORT),TYPE=$(TYPE=Int8),FTVL=$(FTVL=UCHAR),NELEMENTS=$(NELEMENTS)")
 < $(ADCORE)/iocBoot/commonPlugins.cmd
+
+iocInit()

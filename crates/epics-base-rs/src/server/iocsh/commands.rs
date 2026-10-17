@@ -5367,7 +5367,7 @@ fn cmd_db_load_records() -> CommandDef {
                     // which `dbLoadRecordsCallFunc` hands straight to
                     // `iocshSetError` (`dbIocRegister.c:71-74`) — so the line
                     // FAILED, and under `on error break` a boot stops here.
-                    ctx.println("Usage: dbLoadRecords \"file\", \"subs\"");
+                    ctx.console_println("Usage: dbLoadRecords \"file\", \"subs\"");
                     return Ok(CommandOutcome::Failed);
                 }
             };
@@ -5440,7 +5440,7 @@ fn cmd_db_load_database() -> CommandDef {
             let file = match &args[0] {
                 ArgValue::String(s) => s.to_str()?,
                 _ => {
-                    ctx.println("Usage: dbLoadDatabase \"file\", \"path\", \"subs\"");
+                    ctx.console_println("Usage: dbLoadDatabase \"file\", \"path\", \"subs\"");
                     return Ok(CommandOutcome::Failed);
                 }
             };
@@ -5544,7 +5544,7 @@ fn db_read_database_macros(
         // `macEnvExpand`'s result (`dbLexRoutines.c:274-286`) and so prints
         // `'(null)'` for exactly the case an operator most needs named — a
         // path built from a macro that was never defined.
-        ctx.eprintln(&format!("{ERL_ERROR}: Can't open file '{file}'"));
+        ctx.console_eprintln(&format!("{ERL_ERROR}: Can't open file '{file}'"));
         return Err(DbReadFailure::CannotOpen);
     };
 
@@ -5642,9 +5642,9 @@ fn db_load_records(
     // whatever the read already reported, on every failure alike, and the
     // second line only the load-phase refusal gets.
     if let Err(failure) = &read {
-        ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
+        ctx.console_eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
         if matches!(failure, DbReadFailure::AfterIocInit) {
-            ctx.eprintln("    Records cannot be loaded after iocInit!");
+            ctx.console_eprintln("    Records cannot be loaded after iocInit!");
         }
     }
     read
@@ -5699,10 +5699,10 @@ fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathB
 /// `yyerror(NULL)` writes `Substitution file error.` for the first line.
 fn eprint_substitution_fault(ctx: &CommandContext, fault: &db_loader::SubstitutionFault) {
     match &fault.message {
-        Some(message) => ctx.eprintln(&format!("Substitution file error: {message}")),
-        None => ctx.eprintln("Substitution file error."),
+        Some(message) => ctx.console_eprintln(&format!("Substitution file error: {message}")),
+        None => ctx.console_eprintln("Substitution file error."),
     }
-    ctx.eprintln(&format!("line {}: '{}'", fault.line, fault.yytext));
+    ctx.console_eprintln(&format!("line {}: '{}'", fault.line, fault.yytext));
 }
 
 fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
@@ -5742,7 +5742,7 @@ impl db_loader::InstallHost for IocshInstall<'_> {
     }
 
     fn warn(&self, line: &str) {
-        self.0.eprintln(line);
+        self.0.console_eprintln(line);
     }
 }
 
@@ -5809,7 +5809,7 @@ fn cmd_db_load_template() -> CommandDef {
             let path = match &args[0] {
                 ArgValue::String(s) if !s.is_empty() => s.to_str()?,
                 _ => {
-                    ctx.eprintln("must specify variable substitution file");
+                    ctx.console_eprintln("must specify variable substitution file");
                     return Ok(CommandOutcome::Failed);
                 }
             };
@@ -5829,7 +5829,7 @@ fn cmd_db_load_template() -> CommandDef {
             // `var dbTemplateMaxVars` writes the global unvalidated.
             let max_vars = db_loader::db_template_max_vars();
             if max_vars < 1 {
-                ctx.eprintln(&format!(
+                ctx.console_eprintln(&format!(
                     "{ERL_ERROR}: dbTemplateMaxVars = {max_vars}, must be +ve"
                 ));
                 return Ok(CommandOutcome::Failed);
@@ -5845,7 +5845,7 @@ fn cmd_db_load_template() -> CommandDef {
             let text = match std::fs::read(&file_path) {
                 Ok(text) => text,
                 Err(e) => {
-                    ctx.eprintln(&format!(
+                    ctx.console_eprintln(&format!(
                         "dbLoadTemplate: error opening sub file {path}: {}",
                         super::c_strerror(&e)
                     ));
@@ -5881,7 +5881,7 @@ fn cmd_db_load_template() -> CommandDef {
                     // operator's console like every other line here, not a
                     // log the console never shows.
                     db_loader::SubstitutionEvent::Notice(text) => {
-                        ctx.eprintln(&text);
+                        ctx.console_eprintln(&text);
                         continue;
                     }
                     db_loader::SubstitutionEvent::Load(load) => load,
@@ -5907,7 +5907,7 @@ fn cmd_db_load_template() -> CommandDef {
                     // row that failed, then `yyerror` + `YYABORT`: the rows
                     // after this one are never read, and `yyparse` fails the
                     // command.
-                    ctx.eprintln(&format!(
+                    ctx.console_eprintln(&format!(
                         "dbLoadRecords(\"{}\", {})",
                         load.file,
                         c_sub_collect(&String::from_utf8_lossy(macros_str), &load.macros)
@@ -5995,7 +5995,11 @@ fn cmd_ioc_init() -> CommandDef {
             // `dbpf`, a `dbl`, an `asSetFilename`, runs against an IOC with
             // device support, scan threads and PINI behind it. See
             // [`crate::server::ioc_app::IocLifecycle`] for the invariant.
-            match crate::server::ioc_app::build_from_shell(ctx.bridge()) {
+            match crate::server::ioc_app::build_from_shell(
+                ctx.bridge(),
+                &|line| ctx.println(line),
+                &|line| ctx.eprintln(line),
+            ) {
                 crate::server::ioc_app::ShellTransition::Done => {
                     let _ = crate::server::ioc_app::run_from_shell(ctx.bridge());
                     return Ok(CommandOutcome::Continue);
@@ -6019,7 +6023,10 @@ fn cmd_ioc_init() -> CommandDef {
             // a record loaded by a LATER `dbLoadRecords` in the same `st.cmd`
             // must still classify as a local PV (R18-92), which the build's
             // record-load close runs.
-            if !ctx.block_on(crate::server::ioc_app::build_without_application(ctx.db())) {
+            if !ctx.block_on(crate::server::ioc_app::build_without_application(
+                ctx.db(),
+                |line| ctx.println(line),
+            )) {
                 return Ok(CommandOutcome::Failed);
             }
             if crate::server::ioc_app::ioc_run() == 0 {
@@ -10027,11 +10034,14 @@ record(lso, "SOD") { field(SIZV, "128") }
 
     /// Run `handler` with the context's stdout sink pointed at a temp
     /// file and return what it wrote.
+    /// Stdout as the operator sees it: the shell's stream and C's raw
+    /// `stdout` (a `Usage:` line from `dbAccess.c`) together.
     fn capture(ctx: &CommandContext, f: impl FnOnce()) -> String {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-        ctx.with_output(std::fs::File::create(&path).unwrap(), f);
-        std::fs::read_to_string(&path).unwrap()
+        let out = tmp.reopen().unwrap();
+        let console = out.try_clone().unwrap();
+        ctx.with_console(console, std::io::stderr(), || ctx.with_output(out, f));
+        std::fs::read_to_string(tmp.path()).unwrap()
     }
 
     fn run_cmd(ctx: &CommandContext, name: &str, tokens: &[&str]) -> String {
@@ -14146,15 +14156,34 @@ record(mbboDirect, "MBD0") {{ }}
         let cmd = registry.get(name).unwrap();
         let tokens: Vec<IocshString> = tokens.iter().map(|t| IocshString::from(*t)).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
+        let out_file = tempfile::NamedTempFile::new().unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
-        let err_path = err_file.path().to_path_buf();
         let mut result = Ok(CommandOutcome::Continue);
-        let out = capture(ctx, || {
-            ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
-                result = cmd.handler.call(&args, ctx);
-            });
+        with_console_and_shell_streams(ctx, &out_file, &err_file, || {
+            result = cmd.handler.call(&args, ctx);
         });
-        (out, std::fs::read_to_string(&err_path).unwrap(), result)
+        (
+            std::fs::read_to_string(out_file.path()).unwrap(),
+            std::fs::read_to_string(err_file.path()).unwrap(),
+            result,
+        )
+    }
+
+    /// Point each shell stream and its console twin at one file, in the
+    /// order they are written, for a test that asserts on the bytes and not
+    /// on which cell carried them.
+    fn with_console_and_shell_streams(
+        ctx: &CommandContext,
+        out: &tempfile::NamedTempFile,
+        err: &tempfile::NamedTempFile,
+        f: impl FnOnce(),
+    ) {
+        let out = out.reopen().unwrap();
+        let err = err.reopen().unwrap();
+        let (out2, err2) = (out.try_clone().unwrap(), err.try_clone().unwrap());
+        ctx.with_console(out2, err2, || {
+            ctx.with_output(out, || ctx.with_error(err, f));
+        });
     }
 
     /// C `cvtArg` stores NULL for a string argument the line never
@@ -14825,14 +14854,14 @@ record(ai, "C6") { field(DESC, "ok") }
         let args = parse_args(&tokens, &cmd.args).unwrap();
         // `dbLoadTemplate` writes C's summary itself and answers `Failed`,
         // so the diagnostic is on the stream, not in the return value.
+        let out_file = tempfile::NamedTempFile::new().unwrap();
         let err_file = tempfile::NamedTempFile::new().unwrap();
-        let err_path = err_file.path().to_path_buf();
         let mut result = Ok(CommandOutcome::Continue);
-        ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
+        with_console_and_shell_streams(ctx, &out_file, &err_file, || {
             result = cmd.handler.call(&args, ctx);
         });
         match result {
-            Ok(CommandOutcome::Failed) => Err(std::fs::read_to_string(&err_path).unwrap()),
+            Ok(CommandOutcome::Failed) => Err(std::fs::read_to_string(err_file.path()).unwrap()),
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }

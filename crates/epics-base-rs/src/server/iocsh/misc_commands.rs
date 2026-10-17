@@ -53,7 +53,11 @@ fn cmd_ioc_build() -> CommandDef {
         "iocBuild — Initialize the IOC and leave it in a quiescent state.",
         |_args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::ioc_app::ShellTransition;
-            match crate::server::ioc_app::build_from_shell(ctx.bridge()) {
+            match crate::server::ioc_app::build_from_shell(
+                ctx.bridge(),
+                &|line| ctx.println(line),
+                &|line| ctx.eprintln(line),
+            ) {
                 ShellTransition::Done => Ok(CommandOutcome::Continue),
                 ShellTransition::Failed => Ok(CommandOutcome::Failed),
                 // C `iocBuild_1` (`iocInit.c:116-121`) refuses from any state
@@ -66,7 +70,10 @@ fn cmd_ioc_build() -> CommandDef {
                 // `PvDatabase` shell or a `CaServerBuilder` binary. C runs
                 // `iocBuild` for those too, so this arm does.
                 ShellTransition::NotOurs => {
-                    if ctx.block_on(crate::server::ioc_app::build_without_application(ctx.db())) {
+                    if ctx.block_on(crate::server::ioc_app::build_without_application(
+                        ctx.db(),
+                        |line| ctx.println(line),
+                    )) {
                         Ok(CommandOutcome::Continue)
                     } else {
                         Ok(CommandOutcome::Failed)
@@ -381,7 +388,9 @@ mod tests {
         assert!(run(&ctx, "iocRun", &[]).1, "iocRun from iocVoid fails");
         assert!(run(&ctx, "iocPause", &[]).1, "iocPause from iocVoid fails");
 
-        assert!(ctx.block_on(build_without_application(ctx.db())));
+        assert!(ctx.block_on(build_without_application(ctx.db(), |line| {
+            ctx.println(line)
+        })));
         assert_eq!(ioc_run(), 0);
         assert!(!run(&ctx, "iocPause", &[]).1, "a running IOC pauses");
         assert_eq!(get_ioc_state(), IocState::Paused);

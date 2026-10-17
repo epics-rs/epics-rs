@@ -2437,22 +2437,18 @@ fn push_all(out: &mut Vec<u8>, parts: &[&[u8]]) {
     }
 }
 
-/// The ACF reader, and the single owner of the line counter every rejection
-/// out of this parser carries.
+/// The ACF reader, and the single owner of the line counter every
+/// diagnostic out of this parser carries.
 ///
 /// The counter is the reason this is a type rather than a bare
 /// `Peekable<Chars>`: [`Self::next`] is the ONLY way the input advances, so
 /// `line` cannot drift from the text — no caller can step over a newline
 /// without the counter seeing it. C keeps the same number in
-/// `asLib_lex.l`'s `line_num`; this port keeps its own, more specific
-/// sentences and simply says where they happened, because an ACF that fails
-/// on line 240 of 900 is otherwise unlocatable.
+/// `asLib_lex.l`'s `line_num`.
 struct AcfScanner<'a> {
     /// C lexes bytes: a quoted string takes any byte but `"`, `\n` and `\`.
     src: &'a [u8],
-    /// Byte offset of the next character. The text stays addressable behind
-    /// the cursor so a diagnostic can quote what the operator wrote without
-    /// consuming it.
+    /// Byte offset of the next character.
     pos: usize,
     /// 1-based, counting every `\n` consumed.
     line: u32,
@@ -2460,7 +2456,25 @@ struct AcfScanner<'a> {
     warned: bool,
     /// The line that warning printed.
     warning: Option<String>,
+    /// What asLib.y wrote on the thread's stderr, in order: every `yyerror`
+    /// and the first `yywarn`.
+    said: Vec<String>,
+    /// Each `yyerror`, with the errlog line that explains an empty one, for
+    /// the parse's `Err`. Any entry fails the parse, as `yyFailed` does.
+    errors: Vec<String>,
+    /// `asInitialize`'s errlog lines for a user, then a host, repeated
+    /// within one group, in file order.
+    duplicated_users: Vec<String>,
+    duplicated_hosts: Vec<String>,
 }
+
+/// asLib.y's grammar refusing the token on `line`: bison's `syntax error`,
+/// which ends the parse.
+struct SyntaxError {
+    line: u32,
+}
+
+type Parse<T> = Result<T, SyntaxError>;
 
 impl<'a> AcfScanner<'a> {
     fn new(content: &'a [u8]) -> Self {
@@ -2470,12 +2484,16 @@ impl<'a> AcfScanner<'a> {
             line: 1,
             warned: false,
             warning: None,
+            said: Vec::new(),
+            errors: Vec::new(),
+            duplicated_users: Vec::new(),
+            duplicated_hosts: Vec::new(),
         }
     }
 
-    /// asLib.y `yywarn`, on stderr as C's `fprintf` is. `line` is where C's
-    /// grammar action runs: a construct C must see past to recognise is
-    /// reported at the line of the token after it.
+    /// asLib.y `yywarn`. `line` is where C's grammar action runs: a
+    /// construct C must see past to recognise is reported at the line of
+    /// the token after it.
     fn warn(&mut self, what: &str, line: u32, token: &[u8]) {
         if !self.warned && !token.is_empty() {
             let warning = format!(
@@ -2483,10 +2501,42 @@ impl<'a> AcfScanner<'a> {
                 crate::runtime::log::ERL_WARNING,
                 String::from_utf8_lossy(token)
             );
-            eprintln!("{warning}");
+            self.said.push(warning.clone());
             self.warning = Some(warning);
         }
         self.warned = true;
+    }
+
+    /// asLib.y `yyerror(what)` at the current line: said, and the parse
+    /// goes on.
+    fn error(&mut self, what: &str) {
+        let line = self.line;
+        self.said.push(format!(
+            "{} {what} at line {line}",
+            crate::runtime::log::ERL_ERROR
+        ));
+        self.errors.push(format!("{what} at line {line}"));
+    }
+
+    /// An asLibRoutines.c refusal: its errlog line, then asLib.y's
+    /// `yyerror("")`.
+    fn refuse(&mut self, why: String) {
+        crate::runtime::log::errlog_vprintf(format_args!("{why}\n"));
+        self.error_saying_where(why);
+    }
+
+    /// asLib.y `yyerror("")`, which says only where; `why` is for the `Err`.
+    fn error_saying_where(&mut self, why: String) {
+        let line = self.line;
+        self.said
+            .push(format!("{} at line {line}", crate::runtime::log::ERL_ERROR));
+        self.errors.push(format!("{why} at line {line}"));
+    }
+
+    /// The grammar refusing the lookahead, which the caller has just read
+    /// or stands on.
+    fn reject(&self) -> SyntaxError {
+        SyntaxError { line: self.line }
     }
 
     fn peek(&mut self) -> Option<u8> {
@@ -2503,105 +2553,125 @@ impl<'a> AcfScanner<'a> {
         Some(c)
     }
 
-    /// The body of a quoted token, its opening `"` already consumed:
-    /// asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`, which
-    /// C stores from `yytext+1` with every `\x` pair verbatim. A newline or
-    /// EOF before the closing quote is C's "Newline in quoted string" error.
-    fn quoted(&mut self) -> CaResult<Vec<u8>> {
-        let opened = self.line;
+    /// Step over everything asLib_lex.l reads without returning a token, so
+    /// the cursor stands on a token's first byte or at the end: whitespace,
+    /// comments, and each lexeme C's lexer reports with `yyerror` and drops
+    /// — a byte that starts no token, a quoted string a newline cuts, a
+    /// number that does not parse. Those are said here, so they interleave
+    /// with the grammar's own errors as C's lexer and parser do.
+    fn skip_ws_comments(&mut self) {
+        while let Some(c) = self.peek() {
+            match c {
+                c if is_acf_space(c) => {
+                    self.next();
+                }
+                b'#' => {
+                    while self.peek().is_some_and(|c| c != b'\n') {
+                        self.next();
+                    }
+                }
+                b'(' | b')' | b'{' | b'}' | b',' => return,
+                b'"' => match self.quoted_end() {
+                    QuoteEnd::Closed => return,
+                    QuoteEnd::Newline(newline) => {
+                        self.error("Newline in quoted string, closing quote missing");
+                        while self.pos <= newline {
+                            self.next();
+                        }
+                    }
+                    QuoteEnd::Stray => {
+                        self.error(&invalid_character(b'"'));
+                        self.next();
+                    }
+                },
+                c if is_acf_name_char(c) => {
+                    let run = self.name_run();
+                    let Some(why) = number_error(run) else {
+                        return;
+                    };
+                    self.error(&why);
+                    self.pos += run.len();
+                }
+                c => {
+                    self.error(&invalid_character(c));
+                    self.next();
+                }
+            }
+        }
+    }
+
+    /// The `{name}+` run at the cursor.
+    fn name_run(&self) -> &'a [u8] {
+        let rest = &self.src[self.pos..];
+        let len = rest.iter().take_while(|&&c| is_acf_name_char(c)).count();
+        &rest[..len]
+    }
+
+    /// Which asLib_lex.l rule takes the `"` at the cursor.
+    fn quoted_end(&self) -> QuoteEnd {
+        let mut i = self.pos + 1;
+        loop {
+            match self.src.get(i) {
+                Some(b'"') => return QuoteEnd::Closed,
+                Some(b'\n') => return QuoteEnd::Newline(i),
+                Some(b'\\') if self.src.get(i + 1).is_some_and(|&c| c != b'\n') => i += 2,
+                Some(b'\\') | None => return QuoteEnd::Stray,
+                Some(_) => i += 1,
+            }
+        }
+    }
+
+    /// The body of the quoted token at the cursor: asLib_lex.l
+    /// `{doublequote}({stringchar}|{escape})*{doublequote}`, which C stores
+    /// from `yytext+1` with every `\x` pair verbatim.
+    fn quoted(&mut self) -> Vec<u8> {
+        self.next();
         let mut body = Vec::new();
         loop {
             match self.next() {
-                Some(b'"') => return Ok(body),
-                Some(b'\\') => match self.next() {
-                    Some(c) if c != b'\n' => body.extend([b'\\', c]),
-                    _ => break,
-                },
-                Some(b'\n') | None => break,
+                Some(b'"') | None => return body,
+                Some(b'\\') => body.extend([b'\\', self.next().unwrap_or_default()]),
                 Some(c) => body.push(c),
             }
         }
-        Err(self.reject_at(opened, "unterminated quoted string"))
     }
+}
 
-    /// Whitespace and `#` comments are not tokens; a comment runs to the end
-    /// of its line and the newline that ends it still counts.
-    fn skip_ws_comments(&mut self) {
-        while let Some(c) = self.peek() {
-            if is_acf_space(c) {
-                self.next();
-            } else if c == b'#' {
-                while let Some(c) = self.peek() {
-                    self.next();
-                    if c == b'\n' {
-                        break;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-    }
+/// asLib_lex.l's two quoted-string rules, or neither.
+enum QuoteEnd {
+    /// `{doublequote}({stringchar}|{escape})*{doublequote}`: a token.
+    Closed,
+    /// `…{newline}`, the newline at this offset: `yyerror` and no token.
+    Newline(usize),
+    /// Input ends, or a `\` meets a newline, first: only the `"` itself
+    /// matches, and the `.` rule refuses it.
+    Stray,
+}
 
-    /// Build this parser's rejection: the port's own sentence, prefixed with
-    /// where in the file it happened. Every failure path goes through here,
-    /// so none of them can be written without the location.
-    ///
-    /// Use this only for a complaint about the token under the cursor. A
-    /// complaint about a construct that OPENED earlier — every
-    /// `unterminated …`, and the CALC clause — belongs to [`Self::reject_at`]
-    /// against the line the construct started on.
-    fn reject(&self, what: impl std::fmt::Display) -> CaError {
-        self.reject_at(self.line, what)
+/// The `yyerror` asLib_lex.l's number rules give a `{name}+` run they take
+/// whole and `epicsParseInt64` / `epicsParseDouble` refuse.
+fn number_error(run: &[u8]) -> Option<String> {
+    if !is_acf_number(run) {
+        return None;
     }
+    let text = std::str::from_utf8(run).expect("a number run is ASCII");
+    if !run.contains(&b'.') {
+        return text
+            .parse::<i64>()
+            .is_err()
+            .then(|| format!("Error parsing Int64: {text}"));
+    }
+    // `strtod`'s ERANGE: an overflow, or a result below the normal range.
+    let v: f64 = text.parse().expect("a float run parses");
+    let underflow = v.abs() < f64::MIN_POSITIVE && mantissa_nonzero(run);
+    (v.is_infinite() || underflow).then(|| format!("Error parsing Float64: {text}"))
+}
 
-    /// Reject against a line the caller stamped when it entered the
-    /// construct.
-    ///
-    /// The parser only discovers an unterminated `(`, `{` or `"` at EOF, so
-    /// its own position is the END of the file. On the 900-line ACF this line
-    /// number exists for, that number is worse than useless — it points every
-    /// unterminated construct at the same place. The opening line is the one
-    /// the operator has to edit.
-    fn reject_at(&self, line: u32, what: impl std::fmt::Display) -> CaError {
-        CaError::Protocol(format!("ACF line {line}: {what}"))
-    }
-
-    /// asLib_lex.l's catch-all `.` rule over the whole file. C's lexer
-    /// refuses a byte that starts no token wherever it stands, so the
-    /// refusal runs before the parser and cannot depend on which construct
-    /// the parser happens to be in. Quoted strings and comments are skipped
-    /// as the lexer takes them; their own errors stay with the parser.
-    fn check_tokens(src: &'a [u8]) -> CaResult<()> {
-        let mut sc = Self::new(src);
-        while let Some(c) = sc.next() {
-            match c {
-                b'"' => {
-                    while let Some(c) = sc.peek() {
-                        if c == b'\n' {
-                            break;
-                        }
-                        sc.next();
-                        if c == b'"' {
-                            break;
-                        }
-                        if c == b'\\' && sc.peek().is_some_and(|c| c != b'\n') {
-                            sc.next();
-                        }
-                    }
-                }
-                b'#' => {
-                    while sc.peek().is_some_and(|c| c != b'\n') {
-                        sc.next();
-                    }
-                }
-                b'(' | b')' | b'{' | b'}' | b',' => {}
-                c if is_acf_space(c) || is_acf_name_char(c) => {}
-                c => return Err(sc.reject(invalid_character(c))),
-            }
-        }
-        Ok(())
-    }
+/// A non-zero digit before the exponent.
+fn mantissa_nonzero(run: &[u8]) -> bool {
+    run.iter()
+        .take_while(|&&c| c != b'e' && c != b'E')
+        .any(|c| (b'1'..=b'9').contains(c))
 }
 
 /// asLib_lex.l `whitespace [ \t\r]` plus `newline`; form feed and vertical
@@ -2650,14 +2720,40 @@ pub async fn read_acf(path: impl AsRef<std::path::Path>) -> CaResult<AccessSecur
 }
 
 pub fn parse_acf(content: impl AsRef<[u8]>) -> CaResult<AccessSecurityConfig> {
-    let content = content.as_ref();
-    AcfScanner::check_tokens(content)?;
-    parse_acf_in(&mut AcfScanner::new(content))
+    parse_acf_reporting(content.as_ref(), &|line| eprintln!("{line}"))
 }
 
-/// [`parse_acf`] past the lexer's pass, on a scanner a test can ask what it
-/// warned.
-fn parse_acf_in(sc: &mut AcfScanner) -> CaResult<AccessSecurityConfig> {
+/// [`parse_acf`] with asLib.y's `yyerror` and `yywarn` lines handed to
+/// `report`, in order: C's `fprintf(stderr)` there is the calling thread's
+/// stderr, which `asInit 2> f` swaps. The `Err` carries each error again,
+/// so the caller has nothing left to print.
+pub(crate) fn parse_acf_reporting(
+    content: &[u8],
+    report: &dyn Fn(&str),
+) -> CaResult<AccessSecurityConfig> {
+    let mut sc = AcfScanner::new(content);
+    let parsed = parse_acf_in(&mut sc);
+    if let Err(SyntaxError { line }) = parsed {
+        sc.line = line;
+        sc.error("syntax error");
+    }
+    for line in &sc.said {
+        report(line);
+    }
+    match parsed {
+        Ok(config) if sc.errors.is_empty() => {
+            // `asInitialize` hashes the members only once the parse succeeded.
+            for line in sc.duplicated_users.iter().chain(&sc.duplicated_hosts) {
+                crate::runtime::log::errlog_vprintf(format_args!("{line}"));
+            }
+            Ok(config)
+        }
+        _ => Err(CaError::Protocol(format!("ACF {}", sc.errors.join("; ")))),
+    }
+}
+
+/// [`parse_acf`] on a scanner a test can ask what it said.
+fn parse_acf_in(sc: &mut AcfScanner) -> Parse<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
         hag: HashMap::new(),
@@ -2681,40 +2777,64 @@ fn parse_acf_in(sc: &mut AcfScanner) -> CaResult<AccessSecurityConfig> {
     let mut current: CurrentRule = None;
 
     loop {
-        sc.skip_ws_comments();
-        let at = sc.line;
-        let keyword = match read_token(sc)? {
+        let keyword = match read_token(sc) {
             Some(Token::Keyword(k)) => k,
             Some(Token::Name(k) | Token::Quoted(k)) => {
-                skip_generic_item(sc, at, &k)?;
+                skip_generic_item(sc, &k)?;
                 continue;
             }
-            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
+            Some(Token::Number(_)) => return Err(sc.reject()),
             // An empty or comment-only file is the deliberate divergence
             // from C kept by `empty_acf_denies_all_access`.
             None => match sc.peek() {
-                Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
+                Some(_) => return Err(sc.reject()),
                 None => break,
             },
         };
         match keyword.as_slice() {
+            // `asUagAdd` / `asHagAdd` refuse a name already defined, and the
+            // members that follow go nowhere.
             b"UAG" => {
                 let name = read_paren_name(sc)?;
-                if config.uag.contains_key(&name) {
-                    return Err(duplicate(sc, at, "User Access Group", &name));
+                let fresh = !config.uag.contains_key(&name);
+                if !fresh {
+                    sc.refuse(duplicate("User Access Group", &name));
                 }
                 let members = read_optional_brace_list(sc)?;
+                if !fresh {
+                    continue;
+                }
+                for user in repeated(&members) {
+                    sc.duplicated_users.push(format!(
+                        "Duplicated user '{}' in UAG '{}'\n",
+                        String::from_utf8_lossy(user),
+                        String::from_utf8_lossy(&name)
+                    ));
+                }
                 config.uag.insert(name, members);
             }
             b"HAG" => {
                 let name = read_paren_name(sc)?;
-                if config.hag.contains_key(&name) {
-                    return Err(duplicate(sc, at, "Host Access Group", &name));
+                let fresh = !config.hag.contains_key(&name);
+                if !fresh {
+                    sc.refuse(duplicate("Host Access Group", &name));
                 }
                 let members = read_optional_brace_list(sc)?;
+                if !fresh {
+                    continue;
+                }
                 // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
                 // time and stores names or resolved IPs accordingly.
-                config.hag.insert(name.clone(), hag_members(&members, true));
+                let hosts = hag_members(&members, true);
+                // C compares the stored form: lowercased, or the resolved IP.
+                for host in repeated(&hosts) {
+                    sc.duplicated_hosts.push(format!(
+                        "Duplicated host '{}' in HAG '{}'\n",
+                        String::from_utf8_lossy(host),
+                        String::from_utf8_lossy(&name)
+                    ));
+                }
+                config.hag.insert(name.clone(), hosts);
                 config.hag_raw.insert(name, members);
             }
             b"ASG" => {
@@ -2722,39 +2842,49 @@ fn parse_acf_in(sc: &mut AcfScanner) -> CaResult<AccessSecurityConfig> {
                 let taken = |g: &AccessSecurityGroup| {
                     name != b"DEFAULT" || !g.rules.is_empty() || !g.inp.is_empty()
                 };
-                if config.asg.get(&name).is_some_and(taken) {
-                    return Err(duplicate(sc, at, "Access Security Group", &name));
-                }
                 // `asAsgAdd` makes the group, or hands back the empty DEFAULT,
-                // before the body is read; a bare head leaves it empty.
-                config.asg.entry(name.clone()).or_default();
+                // before the body is read; a bare head leaves it empty. A
+                // refused name leaves `yyAsg` NULL for the body.
+                let asg = if config.asg.get(&name).is_some_and(taken) {
+                    sc.refuse(duplicate("Access Security Group", &name));
+                    None
+                } else {
+                    config.asg.entry(name.clone()).or_default();
+                    Some(name)
+                };
                 sc.skip_ws_comments();
                 if sc.peek() == Some(b'{') {
-                    parse_asg_body(sc, &mut config, &name, &mut current)?;
+                    parse_asg_body(sc, &mut config, asg.as_deref(), &mut current)?;
                 }
             }
             // The other lexer keywords cannot start a `generic_item`.
-            k => return Err(sc.reject_at(at, format!("syntax error at '{}'", shown(k)))),
+            _ => return Err(sc.reject()),
         }
     }
 
     Ok(config)
 }
 
-/// `asUagAdd` / `asHagAdd` / `asAsgAdd` refusing a name already defined.
-fn duplicate(sc: &AcfScanner, at: u32, kind: &str, name: &[u8]) -> CaError {
-    sc.reject_at(at, format!("Duplicate {kind} named '{}'", shown(name)))
+/// Each member a group already holds, once per repeat: the entries C
+/// `gphAdd` refuses, as it keys a name by its group.
+fn repeated(members: &[Vec<u8>]) -> impl Iterator<Item = &[u8]> {
+    let mut seen = std::collections::HashSet::new();
+    members
+        .iter()
+        .map(Vec::as_slice)
+        .filter(move |m| !seen.insert(*m))
+}
+
+/// The errlog line `asUagAdd` / `asHagAdd` / `asAsgAdd` give a name already
+/// defined.
+fn duplicate(kind: &str, name: &[u8]) -> String {
+    format!("Duplicate {kind} named '{}'", String::from_utf8_lossy(name))
 }
 
 /// asLib.y `generic_item`: a `generic_head`, then a `generic_block`, or a
 /// one-element block followed by a `{ generic_list }` (the nested form).
-/// C warns and parses on; anything else is `yyerror`.
-fn skip_generic_item(sc: &mut AcfScanner, at: u32, keyword: &[u8]) -> CaResult<()> {
-    sc.skip_ws_comments();
-    if sc.peek() != Some(b'(') {
-        let e = format!("expected '(' after '{}'", shown(keyword));
-        return Err(sc.reject_at(at, e));
-    }
+/// C warns and parses on; anything else is a syntax error.
+fn skip_generic_item(sc: &mut AcfScanner, keyword: &[u8]) -> Parse<()> {
     read_token_list(sc, b'(', b')', ListKind::Generic)?;
     sc.skip_ws_comments();
     let mut what = "Ignoring unsupported TOP LEVEL bare block";
@@ -2764,7 +2894,7 @@ fn skip_generic_item(sc: &mut AcfScanner, at: u32, keyword: &[u8]) -> CaResult<(
             sc.skip_ws_comments();
             if sc.peek() == Some(b'{') {
                 if read_token_list(sc, b'{', b'}', ListKind::Generic)?.len() < 2 {
-                    return Err(sc.reject("syntax error at '}'"));
+                    return Err(sc.reject());
                 }
                 what = "Ignoring unsupported TOP LEVEL nested block";
             }
@@ -2876,18 +3006,37 @@ fn resolve_hag_host(m: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// asLib.y `'(' tokenSTRING ')'`: a UAG/HAG/ASG head or an `INP*` link.
-fn read_paren_name(sc: &mut AcfScanner) -> CaResult<Vec<u8>> {
-    let mut names = read_token_list(sc, b'(', b')', ListKind::Strings)?;
-    match names.len() {
-        1 => Ok(names.remove(0)),
-        _ => Err(sc.reject("syntax error: expected one name")),
+/// asLib.y `'(' tokenSTRING ')'`: a UAG/HAG/ASG head, an `INP*` link or a
+/// CALC.
+fn read_paren_name(sc: &mut AcfScanner) -> Parse<Vec<u8>> {
+    expect(sc, b'(')?;
+    let name = read_string(sc)?;
+    expect(sc, b')')?;
+    Ok(name)
+}
+
+/// The punctuation byte the grammar requires next.
+fn expect(sc: &mut AcfScanner, want: u8) -> Parse<()> {
+    sc.skip_ws_comments();
+    if sc.peek() == Some(want) {
+        sc.next();
+        Ok(())
+    } else {
+        Err(sc.reject())
+    }
+}
+
+/// asLib.y `tokenSTRING`: a quoted string or a bare run.
+fn read_string(sc: &mut AcfScanner) -> Parse<Vec<u8>> {
+    match read_token(sc) {
+        Some(Token::Name(t) | Token::Quoted(t)) => Ok(t),
+        _ => Err(sc.reject()),
     }
 }
 
 /// asLib.y `tokenUAG uag_head` / `tokenHAG hag_head`: the member list is
 /// optional, and a bare head is a group with no members.
-fn read_optional_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<Vec<u8>>> {
+fn read_optional_brace_list(sc: &mut AcfScanner) -> Parse<Vec<Vec<u8>>> {
     sc.skip_ws_comments();
     if sc.peek() == Some(b'{') {
         read_token_list(sc, b'{', b'}', ListKind::Strings)
@@ -2911,41 +3060,27 @@ fn read_token_list(
     open: u8,
     close: u8,
     kind: ListKind,
-) -> CaResult<Vec<Vec<u8>>> {
-    sc.skip_ws_comments();
-    if sc.next() != Some(open) {
-        return Err(sc.reject(format!("expected '{}'", open as char)));
-    }
-    let opened = sc.line;
+) -> Parse<Vec<Vec<u8>>> {
+    expect(sc, open)?;
     let mut items = Vec::new();
     sc.skip_ws_comments();
     if kind == ListKind::Generic && sc.peek() == Some(close) {
         sc.next();
         return Ok(items);
     }
-    let unterminated =
-        |sc: &AcfScanner| sc.reject_at(opened, format!("unterminated '{}'", open as char));
     loop {
-        sc.skip_ws_comments();
-        match read_token(sc)? {
-            Some(Token::Number(n)) if kind == ListKind::Strings => {
-                return Err(number_error(sc, &n));
-            }
-            Some(Token::Keyword(k)) if kind == ListKind::Strings => {
-                return Err(keyword_error(sc, &k));
+        match read_token(sc) {
+            Some(Token::Number(_) | Token::Keyword(_)) if kind == ListKind::Strings => {
+                return Err(sc.reject());
             }
             Some(token) => items.push(token.into_bytes()),
-            None => match sc.peek() {
-                Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
-                None => return Err(unterminated(sc)),
-            },
+            None => return Err(sc.reject()),
         }
         sc.skip_ws_comments();
         match sc.next() {
             Some(b',') => {}
             Some(c) if c == close => return Ok(items),
-            Some(c) => return Err(sc.reject(format!("syntax error at '{}'", c as char))),
-            None => return Err(unterminated(sc)),
+            _ => return Err(sc.reject()),
         }
     }
 }
@@ -2975,56 +3110,31 @@ fn is_acf_keyword(run: &[u8]) -> bool {
         || run.strip_prefix(b"INP").and_then(parse_inp_index).is_some()
 }
 
-fn keyword_error(sc: &AcfScanner, k: &[u8]) -> CaError {
-    sc.reject(format!("syntax error at '{}'", shown(k)))
-}
-
-/// The token at the cursor; `None` leaves a punctuation byte unread.
-fn read_token(sc: &mut AcfScanner) -> CaResult<Option<Token>> {
-    match sc.peek() {
+/// The next token; `None` leaves a punctuation byte, or the end, unread.
+fn read_token(sc: &mut AcfScanner) -> Option<Token> {
+    sc.skip_ws_comments();
+    match sc.peek()? {
         // `""` is a tokenSTRING, so `asUagAddUser` stores an empty
         // member that an empty user name matches.
-        Some(b'"') => {
-            sc.next();
-            Ok(Some(Token::Quoted(sc.quoted()?)))
-        }
-        Some(c) if is_acf_name_char(c) => {
-            let mut run = Vec::new();
-            while let Some(c) = sc.peek().filter(|&c| is_acf_name_char(c)) {
-                run.push(c);
-                sc.next();
-            }
-            Ok(Some(if is_acf_number(&run) {
+        b'"' => Some(Token::Quoted(sc.quoted())),
+        c if is_acf_name_char(c) => {
+            let run = sc.name_run().to_vec();
+            sc.pos += run.len();
+            Some(if is_acf_number(&run) {
                 Token::Number(run)
             } else if is_acf_keyword(&run) {
                 Token::Keyword(run)
             } else {
                 Token::Name(run)
-            }))
+            })
         }
-        _ => Ok(None),
-    }
-}
-
-fn number_error(sc: &AcfScanner, n: &[u8]) -> CaError {
-    sc.reject(format!(
-        "syntax error at number '{}'",
-        String::from_utf8_lossy(n)
-    ))
-}
-
-/// The byte at the cursor is no token the grammar takes here, or the input
-/// ended inside the construct opened on line `opened`.
-fn unexpected(sc: &mut AcfScanner, opened: u32, what: &str) -> CaError {
-    match sc.peek() {
-        Some(c) => sc.reject(format!("syntax error at '{}'", c as char)),
-        None => sc.reject_at(opened, format!("unterminated {what}")),
+        _ => None,
     }
 }
 
 /// asLib.y `rule_generic_block_elem` after its name: a `generic_head`, then
 /// an optional `generic_block`. Read only to be skipped.
-fn skip_generic_elem(sc: &mut AcfScanner) -> CaResult<()> {
+fn skip_generic_elem(sc: &mut AcfScanner) -> Parse<()> {
     read_token_list(sc, b'(', b')', ListKind::Generic)?;
     sc.skip_ws_comments();
     if sc.peek() == Some(b'{') {
@@ -3036,15 +3146,13 @@ fn skip_generic_elem(sc: &mut AcfScanner) -> CaResult<()> {
 /// asLib.y `generic_block`: `{ e }`, `{ e, e }`, or a run of named elements
 /// `{ X(..) Y(..) {..} }`. True for `{ e }`, which a top-level item may
 /// follow with a `{ generic_list }`.
-fn skip_generic_block(sc: &mut AcfScanner) -> CaResult<bool> {
+fn skip_generic_block(sc: &mut AcfScanner) -> Parse<bool> {
     sc.next();
-    let opened = sc.line;
-    sc.skip_ws_comments();
-    let first = read_token(sc)?.ok_or_else(|| unexpected(sc, opened, "'{'"))?;
+    let first = read_token(sc).ok_or_else(|| sc.reject())?;
     sc.skip_ws_comments();
     if sc.peek() == Some(b'(') {
-        if let Token::Number(n) = first {
-            return Err(number_error(sc, &n));
+        if let Token::Number(_) = first {
+            return Err(sc.reject());
         }
         loop {
             skip_generic_elem(sc)?;
@@ -3053,13 +3161,12 @@ fn skip_generic_block(sc: &mut AcfScanner) -> CaResult<bool> {
                 sc.next();
                 return Ok(false);
             }
-            match read_token(sc)? {
-                Some(Token::Number(n)) => return Err(number_error(sc, &n)),
+            match read_token(sc) {
+                Some(Token::Number(_)) | None => return Err(sc.reject()),
                 Some(_) => sc.skip_ws_comments(),
-                None => return Err(unexpected(sc, opened, "'{'")),
             }
             if sc.peek() != Some(b'(') {
-                return Err(unexpected(sc, opened, "'{'"));
+                return Err(sc.reject());
             }
         }
     }
@@ -3073,11 +3180,10 @@ fn skip_generic_block(sc: &mut AcfScanner) -> CaResult<bool> {
             Some(b',') => {
                 single = false;
                 sc.next();
-                sc.skip_ws_comments();
-                read_token(sc)?.ok_or_else(|| unexpected(sc, opened, "'{'"))?;
+                read_token(sc).ok_or_else(|| sc.reject())?;
                 sc.skip_ws_comments();
             }
-            _ => return Err(unexpected(sc, opened, "'{'")),
+            _ => return Err(sc.reject()),
         }
     }
 }
@@ -3118,14 +3224,15 @@ fn current_rule<'a>(
     asgs.get_mut(asg)?.rules.get_mut(*index)
 }
 
+/// asLib.y `asg_body`. `name` is `yyAsg`: `None` for a group `asAsgAdd`
+/// refused, whose INP and RULE heads then add nothing.
 fn parse_asg_body(
     sc: &mut AcfScanner,
     config: &mut AccessSecurityConfig,
-    name: &[u8],
+    name: Option<&[u8]>,
     current: &mut CurrentRule,
-) -> CaResult<()> {
+) -> Parse<()> {
     sc.next();
-    let opened = sc.line;
 
     // asLib.y `asg_body_list`: one or more `inp_config | rule_config`.
     let mut items = 0;
@@ -3136,12 +3243,8 @@ fn parse_asg_body(
             return Ok(());
         }
         items += 1;
-        let kw = match read_token(sc)? {
-            Some(Token::Keyword(kw)) => kw,
-            Some(Token::Name(n)) => return Err(keyword_error(sc, &n)),
-            Some(Token::Quoted(_)) => return Err(sc.reject("syntax error at quoted string")),
-            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
-            None => return Err(unexpected(sc, opened, "ASG")),
+        let Some(Token::Keyword(kw)) = read_token(sc) else {
+            return Err(sc.reject());
         };
         if kw == b"RULE" {
             parse_rule(sc, config, name, current)?;
@@ -3149,16 +3252,11 @@ fn parse_asg_body(
             // `INP[A-U]` is one token, `tokenINP` (`asLib_lex.l:48-52`), whose
             // payload is the letter index; `asLib.y:237-243` reads the link.
             let link = read_paren_name(sc)?;
-            let asg = config
-                .asg
-                .get_mut(name)
-                .expect("parse_acf adds the ASG first");
-            asg.inp.push(AsgInp { index, link });
+            if let Some(asg) = name.and_then(|name| config.asg.get_mut(name)) {
+                asg.inp.push(AsgInp { index, link });
+            }
         } else {
-            return Err(sc.reject(format!(
-                "syntax error at '{}' (expected RULE or INPA..INPU)",
-                String::from_utf8_lossy(&kw)
-            )));
+            return Err(sc.reject());
         }
     }
 }
@@ -3190,73 +3288,45 @@ fn shown(token: &[u8]) -> String {
     }
 }
 
-/// A `tokenSTRING` in a RULE head.
-fn read_head_string(sc: &mut AcfScanner, opened: u32) -> CaResult<Vec<u8>> {
-    match read_token(sc)? {
-        Some(Token::Name(t) | Token::Quoted(t)) => Ok(t),
-        Some(Token::Number(n)) => Err(number_error(sc, &n)),
-        Some(Token::Keyword(k)) => Err(keyword_error(sc, &k)),
-        None => Err(unexpected(sc, opened, "RULE head")),
-    }
-}
-
-/// The punctuation byte the grammar requires next.
-fn expect_byte(sc: &mut AcfScanner, opened: u32, want: u8) -> CaResult<()> {
-    sc.skip_ws_comments();
-    if sc.peek() == Some(want) {
-        sc.next();
-        Ok(())
-    } else {
-        Err(unexpected(sc, opened, "RULE head"))
-    }
-}
-
 /// asLib.y `rule_config`. Every clause, the head's TRAPWRITE included, goes to
 /// the rule `current` names, as C sends it to `yyAsgRule`.
+///
+/// Each action runs where C's does: one C reduces on its last token says
+/// that token's line, before the next token is lexed.
 fn parse_rule(
     sc: &mut AcfScanner,
     config: &mut AccessSecurityConfig,
-    asg: &[u8],
+    asg: Option<&[u8]>,
     current: &mut CurrentRule,
-) -> CaResult<()> {
+) -> Parse<()> {
     // asLib.y `rule_head`: `'(' tokenINT64 ',' tokenSTRING [',' tokenSTRING] ')'`.
-    sc.skip_ws_comments();
-    if sc.next() != Some(b'(') {
-        return Err(sc.reject("expected '(' after RULE"));
-    }
-    let opened = sc.line;
-    sc.skip_ws_comments();
-    let level_num = match read_token(sc)? {
+    // The lexer refused any integer `epicsParseInt64` cannot take.
+    expect(sc, b'(')?;
+    let level_num = match read_token(sc) {
         Some(Token::Number(n)) if !n.contains(&b'.') => std::str::from_utf8(&n)
             .ok()
             .and_then(|n| n.parse::<i64>().ok())
-            .ok_or_else(|| sc.reject(format!("Error parsing Int64: {}", shown(&n))))?,
-        Some(token) => {
-            return Err(sc.reject(format!(
-                "RULE level must be an integer, got '{}'",
-                shown(&token.into_bytes())
-            )));
-        }
-        None => return Err(unexpected(sc, opened, "RULE head")),
+            .expect("the lexer passes only an Int64 it parsed"),
+        _ => return Err(sc.reject()),
     };
-    if level_num < 0 {
-        return Err(sc.reject(format!("RULE LEVEL must be positive: {level_num}")));
-    }
-    expect_byte(sc, opened, b',')?;
+    expect(sc, b',')?;
 
     // C matches `NONE`/`READ`/`WRITE` with `strcmp` and calls
     // `asAsgAddRule(yyAsg, access, (int)$1)`; any other string only warns,
-    // adds no rule and leaves `yyAsgRule` on the previous one (CBUG-Q1).
-    sc.skip_ws_comments();
-    let access_str = read_head_string(sc, opened)?;
+    // adds no rule and leaves `yyAsgRule` on the previous one (CBUG-Q1), as
+    // a negative LEVEL does.
+    let access_str = read_string(sc)?;
     let access = match access_str.as_slice() {
         b"WRITE" => Some(RuleAccess::Write),
         b"READ" => Some(RuleAccess::Read),
         b"NONE" => Some(RuleAccess::None),
         _ => None,
     };
-    match access {
-        Some(access) => {
+    if level_num < 0 {
+        sc.error(&format!("RULE: LEVEL must be positive: {level_num}"));
+    } else if let Some(access) = access {
+        // `asAsgAddRule(NULL, ...)` returns NULL.
+        *current = asg.map(|asg| {
             let rules = &mut config
                 .asg
                 .get_mut(asg)
@@ -3267,21 +3337,21 @@ fn parse_rule(
                 access,
                 ..AccessRule::default()
             });
-            *current = Some((asg.to_vec(), rules.len() - 1));
-        }
-        None => sc.warn(
+            (asg.to_vec(), rules.len() - 1)
+        });
+    } else {
+        sc.warn(
             "Ignoring RULE that contains an unsupported keyword",
             sc.line,
             &access_str,
-        ),
+        );
     }
 
-    // `rule_log_option`, matched with `strcmp`: anything else fails the load.
+    // `rule_log_option`, matched with `strcmp`.
     sc.skip_ws_comments();
     if sc.peek() == Some(b',') {
         sc.next();
-        sc.skip_ws_comments();
-        let log_opt = read_head_string(sc, opened)?;
+        let log_opt = read_string(sc)?;
         match log_opt.as_slice() {
             b"TRAPWRITE" => {
                 if let Some(rule) = current_rule(&mut config.asg, current) {
@@ -3289,22 +3359,16 @@ fn parse_rule(
                 }
             }
             b"NOTRAPWRITE" => {}
-            _ => {
-                return Err(sc.reject(format!(
-                    "RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{}'",
-                    shown(&log_opt)
-                )));
-            }
+            _ => sc.error("Log options must be TRAPWRITE or NOTRAPWRITE"),
         }
     }
-    expect_byte(sc, opened, b')')?;
+    expect(sc, b')')?;
 
     sc.skip_ws_comments();
     if sc.peek() != Some(b'{') {
         return Ok(());
     }
     sc.next();
-    let opened = sc.line;
     // asLib.y `rule_list`: one or more items, no separator. With no current
     // rule, C's clause helpers return 0 at once: a group is not looked up and
     // a CALC is not compiled.
@@ -3316,30 +3380,36 @@ fn parse_rule(
             return Ok(());
         }
         items += 1;
-        let at = sc.line;
-        let name = match read_token(sc)? {
+        let name = match read_token(sc) {
+            // `asAsgRuleUagAdd` / `asAsgRuleHagAdd`, one name at a time.
             Some(Token::Keyword(kw)) if kw == b"UAG" || kw == b"HAG" => {
-                let names = read_token_list(sc, b'(', b')', ListKind::Strings)?;
-                let (kind, defined) = if kw == b"UAG" {
-                    ("User", &config.uag)
-                } else {
-                    ("Host", &config.hag)
-                };
-                if current.is_some() {
-                    if let Some(n) = names.iter().find(|n| !defined.contains_key(*n)) {
-                        return Err(sc.reject(format!(
-                            "No {kind} Access Group named '{}' defined",
-                            String::from_utf8_lossy(n)
-                        )));
-                    }
-                }
-                if let Some(rule) = current_rule(&mut config.asg, current) {
-                    if kw == b"UAG" {
-                        &mut rule.uag
+                expect(sc, b'(')?;
+                loop {
+                    let name = read_string(sc)?;
+                    let (kind, defined) = if kw == b"UAG" {
+                        ("User", &config.uag)
                     } else {
-                        &mut rule.hag
+                        ("Host", &config.hag)
+                    };
+                    if current.is_some() && !defined.contains_key(&name) {
+                        sc.refuse(format!(
+                            "No {kind} Access Group named '{}' defined",
+                            String::from_utf8_lossy(&name)
+                        ));
+                    } else if let Some(rule) = current_rule(&mut config.asg, current) {
+                        if kw == b"UAG" {
+                            &mut rule.uag
+                        } else {
+                            &mut rule.hag
+                        }
+                        .push(name);
                     }
-                    .extend(names);
+                    sc.skip_ws_comments();
+                    match sc.next() {
+                        Some(b',') => {}
+                        Some(b')') => break,
+                        _ => return Err(sc.reject()),
+                    }
                 }
                 continue;
             }
@@ -3348,10 +3418,14 @@ fn parse_rule(
             Some(Token::Keyword(kw)) if kw == b"CALC" => {
                 let expr = read_paren_name(sc)?;
                 if let Some(rule) = current_rule(&mut config.asg, current) {
-                    let (compiled, used) = compile_rule_calc(sc, at, &expr)?;
-                    rule.calc = Some(expr);
-                    rule.calc_compiled = Some(compiled);
-                    rule.inp_used = used;
+                    match compile_rule_calc(&expr) {
+                        Ok((compiled, used)) => {
+                            rule.calc = Some(expr);
+                            rule.calc_compiled = Some(compiled);
+                            rule.inp_used = used;
+                        }
+                        Err(why) => sc.refuse(why),
+                    }
                 }
                 continue;
             }
@@ -3366,21 +3440,21 @@ fn parse_rule(
                 if sc.peek() == Some(b'{') {
                     skip_generic_block(sc)?;
                 }
-                let rule = current_rule(&mut config.asg, current)
-                    .ok_or_else(|| no_rule_to_disable(sc, at, &kw))?;
-                if kw == b"METHOD" {
-                    &mut rule.method
-                } else {
-                    &mut rule.authority
+                match current_rule(&mut config.asg, current) {
+                    Some(rule) => if kw == b"METHOD" {
+                        &mut rule.method
+                    } else {
+                        &mut rule.authority
+                    }
+                    .extend(items),
+                    None => no_rule_to_disable(sc, &kw),
                 }
-                .extend(items);
                 continue;
             }
             // asLib.y `rule_generic_block_elem_name`: a `non_rule_keyword`
             // or a string.
             Some(Token::Name(name) | Token::Quoted(name) | Token::Keyword(name)) => name,
-            Some(Token::Number(n)) => return Err(number_error(sc, &n)),
-            None => return Err(unexpected(sc, opened, "RULE body")),
+            Some(Token::Number(_)) | None => return Err(sc.reject()),
         };
         // C `asLib.y:300-306`: any other element disables the rule
         // (`asAsgRuleDisable`), which fails on a NULL `yyAsgRule`.
@@ -3390,36 +3464,34 @@ fn parse_rule(
             sc.line,
             &name,
         );
-        current_rule(&mut config.asg, current)
-            .ok_or_else(|| no_rule_to_disable(sc, at, &name))?
-            .ignore = true;
+        match current_rule(&mut config.asg, current) {
+            Some(rule) => rule.ignore = true,
+            None => no_rule_to_disable(sc, &name),
+        }
     }
 }
 
-/// `asAsgRuleDisable(NULL)` returns 1 and asLib.y makes it `yyerror`.
-fn no_rule_to_disable(sc: &AcfScanner, at: u32, keyword: &[u8]) -> CaError {
-    sc.reject_at(
-        at,
-        format!(
-            "unsupported keyword '{}' with no RULE to disable",
-            shown(keyword)
-        ),
-    )
+/// `asAsgRuleDisable(NULL)` returns 1 and asLib.y makes it `yyerror("")`,
+/// with no errlog line to say why.
+fn no_rule_to_disable(sc: &mut AcfScanner, keyword: &[u8]) {
+    sc.error_saying_where(format!(
+        "unsupported keyword '{}' with no RULE to disable",
+        shown(keyword)
+    ));
 }
 
 /// C `asAsgRuleCalc`: `postfix()`, then `calcArgUsage` for the arguments the
-/// expression reads.
-fn compile_rule_calc(
-    sc: &AcfScanner,
-    at: u32,
-    expr: &[u8],
-) -> CaResult<(crate::calc::CompiledExpr, u32)> {
+/// expression reads. `Err` is the errlog line C gives a refusal.
+fn compile_rule_calc(expr: &[u8]) -> Result<(crate::calc::CompiledExpr, u32), String> {
     let shown = String::from_utf8_lossy(expr);
     // A byte that is not UTF-8 is no CALC token, as in C `postfix`.
     let compiled = std::str::from_utf8(expr)
-        .map_err(|e| e.to_string())
-        .and_then(|text| crate::calc::compile(text).map_err(|e| e.to_string()))
-        .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{shown}': {e}")))?;
+        .map_err(|_| crate::calc::CalcError::Syntax)
+        .and_then(crate::calc::compile)
+        .map_err(|e| {
+            let what = crate::calc::calc_error_str(e.code()).unwrap_or("Unknown error");
+            format!("{what} in CALC expression '{shown}'")
+        })?;
     // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) refuses the rule when
     // the expression stores into an argument:
     //
@@ -3428,13 +3500,12 @@ fn compile_rule_calc(
     //
     // `asLib.y:294-299` turns that status into `yyerror("")`, so the WHOLE
     // file is rejected and a running IOC keeps its previous rule set.
-    // `CALC("A:=1")` evaluates to 1 whatever the INP links read, so accepting
-    // it would make the rule an unconditional grant.
+    // `CALC("A:=1;1")` evaluates to 1 whatever the INP links read, so
+    // accepting it would make the rule an unconditional grant.
     let (used, stores) = compiled.arg_usage();
     if stores != 0 {
-        return Err(sc.reject_at(
-            at,
-            format!("assignment operator used in CALC expression '{shown}'"),
+        return Err(format!(
+            "Assignment operator used in CALC expression '{shown}'"
         ));
     }
     Ok((compiled, used))
@@ -3451,6 +3522,173 @@ mod tests {
         let _ = parse_acf_in(&mut sc);
         sc.warning
             .map(|w| w.replacen(crate::runtime::log::ERL_WARNING, "WARNING", 1))
+    }
+
+    /// What the parse of `acf` said on the thread's stderr, and whether it
+    /// failed.
+    fn said(acf: &[u8]) -> (Vec<String>, bool) {
+        let said = std::sync::Mutex::new(Vec::new());
+        let parsed = parse_acf_reporting(acf, &|line| {
+            said.lock().unwrap().push(
+                line.replacen(crate::runtime::log::ERL_ERROR, "ERROR", 1)
+                    .replacen(crate::runtime::log::ERL_WARNING, "WARNING", 1),
+            )
+        });
+        (said.into_inner().unwrap(), parsed.is_err())
+    }
+
+    /// asLib.y `yyerror`, against `ascheck` and softIoc R7.0.10 on the same
+    /// files: a grammar error ends the parse, any other error is said and
+    /// the parse goes on. The line is where C's lexer stands when the action
+    /// runs: the last token of a rule C reduces without a lookahead, else
+    /// the lookahead.
+    #[test]
+    fn errors_say_cs_lines() {
+        let cases: &[(&[u8], &[&str])] = &[
+            (b"UAG(u) {a b}", &["ERROR syntax error at line 1"]),
+            (b"UAG(u) {a}\n@", &["ERROR Invalid character '@' at line 2"]),
+            (
+                b"UAG(u){a @ , b}\nASG(g){RULE(1,READ)}\n",
+                &["ERROR Invalid character '@' at line 1"],
+            ),
+            // C's `Newline in quoted string` rule eats the newline without
+            // counting it, so every later line of C's is one short; this
+            // port counts it.
+            (
+                b"UAG(u) {\"a\n}",
+                &[
+                    "ERROR Newline in quoted string, closing quote missing at line 1",
+                    "ERROR syntax error at line 2",
+                ],
+            ),
+            (
+                b"UAG(u){a}\n\"abc",
+                &[
+                    "ERROR Invalid character '\"' at line 2",
+                    "ERROR syntax error at line 2",
+                ],
+            ),
+            (
+                b"ASG(DEFAULT) {\n RULE(-1, READ)\n}\n",
+                &["ERROR RULE: LEVEL must be positive: -1 at line 2"],
+            ),
+            (
+                b"ASG(DEFAULT) {\n RULE(1, READ, FOO)\n}\n",
+                &["ERROR Log options must be TRAPWRITE or NOTRAPWRITE at line 2"],
+            ),
+            (
+                b"ASG(g) {\nRULE(-1\n,\nREAD\n,\nFOO\n)\n}\n",
+                &[
+                    "ERROR RULE: LEVEL must be positive: -1 at line 4",
+                    "ERROR Log options must be TRAPWRITE or NOTRAPWRITE at line 6",
+                ],
+            ),
+            (
+                b"ASG(g){RULE(-1\nREAD)}\n",
+                &["ERROR syntax error at line 2"],
+            ),
+            (b"ASG(g){RULE(1 READ)}\n", &["ERROR syntax error at line 1"]),
+            (
+                b"UAG(u){a}\nASG(g){RULE(1,READ){UAG(u)}\n",
+                &["ERROR syntax error at line 3"],
+            ),
+            (
+                b"ASG(DEFAULT) {\n RULE(1, READ) {\n  UAG(nouag)\n }\n}\n",
+                &["ERROR at line 3"],
+            ),
+            (
+                b"UAG(u){a}\nASG(g){RULE(1,READ){UAG(\nx\n,\nu\n,\ny\n)}}\n",
+                &["ERROR at line 3", "ERROR at line 7"],
+            ),
+            (
+                b"ASG(g){RULE(1,READ){UAG(x) HAG(y)}}\n",
+                &["ERROR at line 1", "ERROR at line 1"],
+            ),
+            (
+                b"ASG(DEFAULT) {\n INPA(x)\n RULE(1,READ) { CALC(\"A+\") }\n}\n",
+                &["ERROR at line 3"],
+            ),
+            (
+                b"ASG(g){RULE(1,READ){CALC(\n\"A+\"\n)\n}}\n",
+                &["ERROR at line 3"],
+            ),
+            (
+                b"ASG(g){RULE(1,READ){CALC(\"A\xff\")}}\n",
+                &["ERROR at line 1"],
+            ),
+            (b"ASG(g){RULE(1,READ){CALC(\"\")}}\n", &["ERROR at line 1"]),
+            (
+                b"ASG(g){RULE(-1,READ)\nRULE(1,READ,X)\nRULE(1,READ){CALC(\"A:=1;1\")}\n}\n",
+                &[
+                    "ERROR RULE: LEVEL must be positive: -1 at line 1",
+                    "ERROR Log options must be TRAPWRITE or NOTRAPWRITE at line 2",
+                    "ERROR at line 3",
+                ],
+            ),
+            (b"UAG(u){a}\nUAG(\nu\n)\n{b}\n", &["ERROR at line 4"]),
+            (
+                b"HAG(h){x}\nHAG(h){y}\nASG(g){RULE(1,READ)}\n",
+                &["ERROR at line 2"],
+            ),
+            (
+                b"ASG(g){RULE(1,READ)}\nASG(g){RULE(1,WRITE){FOO(x)}}\n",
+                &[
+                    "ERROR at line 2",
+                    "WARNING Ignoring RULE that contains an unsupported keyword at line 2: FOO",
+                    "ERROR at line 2",
+                ],
+            ),
+            (
+                b"FOO(1.0e999)\nASG(g){RULE(1,READ)}\n",
+                &[
+                    "ERROR Error parsing Float64: 1.0e999 at line 1",
+                    "WARNING Ignoring unsupported TOP LEVEL bare block at line 2: FOO",
+                ],
+            ),
+            (
+                b"FOO(1.0e-999)\n",
+                &[
+                    "ERROR Error parsing Float64: 1.0e-999 at line 1",
+                    "WARNING Ignoring unsupported TOP LEVEL bare block at line 2: FOO",
+                ],
+            ),
+            (
+                b"FOO(4.9e-320)\n",
+                &[
+                    "ERROR Error parsing Float64: 4.9e-320 at line 1",
+                    "WARNING Ignoring unsupported TOP LEVEL bare block at line 2: FOO",
+                ],
+            ),
+            // C formats this into a 40-byte buffer and aborts on the
+            // overflow; the line is the one it means to print.
+            (
+                b"ASG(g){RULE(99999999999999999999,READ)}\n",
+                &[
+                    "ERROR Error parsing Int64: 99999999999999999999 at line 1",
+                    "ERROR syntax error at line 1",
+                ],
+            ),
+        ];
+        for (acf, want) in cases {
+            let want = want.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+            assert_eq!(
+                said(acf),
+                (want, true),
+                "{:?}",
+                String::from_utf8_lossy(acf)
+            );
+        }
+        let ok = b"ASG(g) {\n RULE(1,\"READ\x01\")\n}\n";
+        assert_eq!(
+            said(ok),
+            (
+                vec![
+                    "WARNING Ignoring RULE that contains an unsupported keyword at line 2: READ\x01"
+                        .to_string()
+                ],
+                false
+            )
+        );
     }
 
     #[test]
@@ -3690,6 +3928,39 @@ ASG(DEFAULT) {
         );
     }
 
+    /// C `asInitialize` hashes every UAG user, then every HAG host, and
+    /// errlogs each repeat within one group; a failed parse never gets there.
+    #[test]
+    fn duplicated_members_are_c_s_errlog_lines() {
+        use crate::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+        let _guard = lock_as_check_client_ip();
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        let id = errlog_add_listener(move |m| {
+            if m.contains("dupuser-q") || m.contains("duphost-q") {
+                sink.lock().unwrap().push(m.to_string());
+            }
+        });
+        let acf = "HAG(h) {dupHost-q, DUPHOST-Q, other}\n\
+                   UAG(u) {dupuser-q, b, dupuser-q, dupuser-q}\n\
+                   UAG(v) {dupuser-q}\n\
+                   HAG(g) {duphost-q}\n\
+                   ASG(DEFAULT) { RULE(1,READ) }\n";
+        parse_acf(acf).unwrap();
+        parse_acf(format!("{acf}ASG(X) {{\n")).unwrap_err();
+        errlog_flush();
+        errlog_remove_listener(id);
+        // softIoc R7.0.10, `asInit` of each file.
+        assert_eq!(
+            *heard.lock().unwrap(),
+            [
+                "Duplicated user 'dupuser-q' in UAG 'u'\n",
+                "Duplicated user 'dupuser-q' in UAG 'u'\n",
+                "Duplicated host 'duphost-q' in HAG 'h'\n",
+            ]
+        );
+    }
+
     #[test]
     fn hag_unresolvable_name_does_not_abort_parser() {
         let _guard = lock_as_check_client_ip();
@@ -3910,7 +4181,7 @@ ASG(READONLY) {
         ] {
             let err = parse_acf(acf).unwrap_err().to_string();
             assert!(
-                err.contains("ACF line 1: Invalid character 0x0c"),
+                err.contains("Invalid character 0x0c at line 1"),
                 "{acf:?}: {err}"
             );
         }
@@ -3930,7 +4201,7 @@ ASG(READONLY) {
             (b"\xff\n", "Invalid character 0xff"),
         ] {
             let err = parse_acf(acf).unwrap_err().to_string();
-            assert!(err.ends_with(want), "{acf:?}: {err}");
+            assert!(err.contains(&format!("{want} at line 1")), "{acf:?}: {err}");
         }
     }
 
@@ -4516,127 +4787,22 @@ ASG(MIXED_CASE) {
         );
     }
 
-    /// A diagnostic that quotes a token must quote the operator's text.
-    ///
-    /// Every capture in this parser comes from a "consume while it matches"
-    /// loop, which stops BEFORE the character that broke it — so its buffer
-    /// holds what was accepted, which is empty exactly when the input was
-    /// rejected. Quoting the buffer reported `got ''` and sent the reader
-    /// looking for an empty token that is not in their file.
-    ///
-    /// The boundary is whether the loop accepted anything at all, so both
-    /// sides of it are here: a run the loop refused outright, a run it
-    /// accepted in full, and a run it accepted a prefix of.
+    /// A grammar error is said at the lookahead's line, so at the end of the
+    /// input it is the last line: C names where it found out, not where the
+    /// unclosed construct opened. `ascheck` (R7.0.10) on the same files.
     #[test]
-    fn a_rejected_token_is_quoted_as_the_operator_wrote_it() {
-        for (acf, got) in [
-            // Accepted nothing.
-            ("ASG(G) { RULE(abc, READ) }", "abc"),
-            // Accepted the sign, then nothing.
-            ("ASG(G) { RULE(-abc, READ) }", "-abc"),
-            // Accepted nothing; the token is pure punctuation.
-            ("ASG(G) { RULE(1, READ, ;;;) }", ";;;"),
-            // Accepted the whole word — unchanged by the fix.
-            ("ASG(G) { RULE(1, READ, trapwrite) }", "trapwrite"),
-            // Accepted a prefix, then hit a character it could not take.
-            ("ASG(G) { RULE(1, READ, TRAP;WRITE) }", "TRAP;WRITE"),
-        ] {
-            let e = parse_acf(acf).unwrap_err().to_string();
-            assert!(
-                e.contains(&format!("got '{got}'")),
-                "expected got '{got}', of {acf:?}, got {e:?}"
-            );
-        }
-
-        // `%` is no token at all: the lexer refuses it before any rule.
-        let e = parse_acf("ASG(G) { RULE(1, READ, TRAP%WRITE) }")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("Invalid character '%'"), "{e:?}");
-
-        // A pathological run does not put the whole file on the console.
-        let long = "z".repeat(4096);
-        let e = parse_acf(format!("ASG(G) {{ RULE({long}, READ) }}"))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains('…') && e.len() < 200, "uncapped quote: {e:?}");
-    }
-
-    /// Every rejection out of the ACF parser names the line it belongs to.
-    ///
-    /// Site ACFs run to hundreds of lines, and a bare "whitespace inside
-    /// parenthesised name" gives an operator nothing to open the editor on.
-    /// The number is the port's own addition; C has one too but spells the
-    /// sentence far less specifically, so the wording here stays.
-    ///
-    /// The cases are the two boundaries the number has, not a tour of the
-    /// grammar: a complaint about the token under the cursor takes the
-    /// CURRENT line, and a complaint about a construct that opened earlier
-    /// takes the line it OPENED on. The second is the one worth pinning —
-    /// a `{` left unclosed on line 3 is only discovered at EOF, and naming
-    /// EOF sends the operator to the wrong end of the file.
-    #[test]
-    fn every_parse_rejection_names_its_line() {
-        // Boundary 1: the offending token is under the cursor.
-        for (acf, line, needle) in [
-            (
-                "UAG(a) { x }\n\nUAG(my group) { b }\n",
-                3,
-                "syntax error at 'g'",
-            ),
-            ("ASG(G) {\n  RULE(-1, READ)\n}\n", 2, "must be positive"),
-            (
-                "ASG(G) {\n  RULE(1, READ, BOGUS)\n}\n",
-                2,
-                "TRAPWRITE or NOTRAPWRITE",
-            ),
-            ("UAG(a) { x }\n}\n", 2, "syntax error at '}'"),
-        ] {
-            let e = parse_acf(acf).unwrap_err().to_string();
-            assert!(
-                e.contains(&format!("ACF line {line}:")) && e.contains(needle),
-                "expected line {line} and {needle:?}, got {e:?}"
-            );
-        }
-
-        // Boundary 2: the construct opened earlier and the parser only found
-        // out at EOF. Each of these puts five blank lines between the opening
-        // token and the end of the file, so naming the cursor's line would
-        // report 7 where the operator needs 1.
+    fn a_syntax_error_names_the_lookaheads_line() {
         let tail = "\n\n\n\n\n";
-        for (acf, line, needle) in [
-            (format!("UAG(a{tail}"), 1, "unterminated '('"),
-            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted string"),
-            (format!("UAG(a) {{ x{tail}"), 1, "unterminated '{'"),
-            (
-                format!("UAG(a) {{ \"unterminated{tail}"),
-                1,
-                "unterminated quoted string",
-            ),
-            (
-                format!("ASG(G) {{ INPA(\"g\"){tail}"),
-                1,
-                "unterminated ASG",
-            ),
-            (format!("BOGUS{tail}"), 1, "expected '(' after 'BOGUS'"),
-            (
-                // The CALC is on line 3; the rule body closes on line 4 and
-                // the ASG on line 5.
-                "ASG(G) {\n  RULE(1, WRITE) {\n    CALC(\"A:=1;1\")\n  }\n}\n".to_string(),
-                3,
-                "assignment operator",
-            ),
-            (
-                "ASG(G) {\n  RULE(1, WRITE) {\n    CALC(\"A+\")\n  }\n}\n".to_string(),
-                3,
-                "bad CALC expression",
-            ),
+        for (acf, line) in [
+            ("UAG(a) { x }\n\nUAG(my group) { b }\n".to_string(), 3),
+            ("UAG(a) { x }\n}\n".to_string(), 2),
+            (format!("UAG(a{tail}"), 6),
+            (format!("UAG(a) {{ x{tail}"), 6),
+            (format!("ASG(G) {{ INPA(\"g\"){tail}"), 6),
+            (format!("BOGUS{tail}"), 6),
         ] {
-            let e = parse_acf(&acf).unwrap_err().to_string();
-            assert!(
-                e.contains(&format!("ACF line {line}:")) && e.contains(needle),
-                "expected line {line} and {needle:?}, got {e:?}"
-            );
+            let want = vec![format!("ERROR syntax error at line {line}")];
+            assert_eq!(said(acf.as_bytes()), (want, true), "{acf:?}");
         }
     }
 
@@ -4956,9 +5122,9 @@ ASG(DEFAULT) { RULE(1, READ) }
             let parsed = parse_acf(format!("{acf}\n").as_bytes());
             match refused_at {
                 None => assert!(parsed.is_ok(), "{acf}: {parsed:?}"),
-                Some(k) => {
+                Some(_) => {
                     let e = parsed.unwrap_err().to_string();
-                    assert!(e.contains(&format!("syntax error at '{k}'")), "{acf}: {e}");
+                    assert!(e.contains("syntax error at line"), "{acf}: {e}");
                 }
             }
         }
@@ -5037,10 +5203,7 @@ ASG(DEFAULT) { RULE(1, READ) }
                 None => assert!(parsed.is_ok(), "{acf}: {parsed:?}"),
                 Some(e) => {
                     let got = parsed.unwrap_err().to_string();
-                    assert!(
-                        got.contains("ACF line 2:") && got.contains(e),
-                        "{acf}: {got}"
-                    );
+                    assert!(got.contains(&format!("{e} at line 2")), "{acf}: {got}");
                 }
             }
         }

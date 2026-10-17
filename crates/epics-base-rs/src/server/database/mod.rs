@@ -2687,7 +2687,7 @@ impl PvDatabase {
         // bare shell). Idempotent — each record's debt is claimed once. Before
         // `ca_link_init` to keep the order the eager path had, where the init
         // passes ran at load, ahead of the link worker.
-        self.drain_deferred_record_inits();
+        self.drain_deferred_record_inits(&|line| eprintln!("{line}"));
         self.ca_link_init();
         // C's `dbInitRecordLinks`: every link is typed, checked and opened at
         // `iocInit`, not at `dbLoadRecords`. That is where a `{state:"NAME"}`
@@ -3350,7 +3350,9 @@ impl PvDatabase {
         // CA server is already up during that window.
         drop(gate);
         drop(relink);
-        self.init_owed_records(vec![(name.clone(), rec_arc.clone())]);
+        self.init_owed_records(vec![(name.clone(), rec_arc.clone())], &|line| {
+            eprintln!("{line}")
+        });
         // A record added after `iocInit` initialises its own forward links;
         // one added before is swept by the barrier.
         if self.ioc_is_running() {
@@ -3381,9 +3383,12 @@ impl PvDatabase {
     /// [`RecordCell::claim_owed_init`] hands each debt to exactly one caller,
     /// so a second call is a no-op — the build lifecycle calls this BEFORE
     /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
-    pub(crate) fn drain_deferred_record_inits(&self) {
+    ///
+    /// `err` is the building thread's stderr, where aSubRecord.c's epicsStdio
+    /// lines go.
+    pub(crate) fn drain_deferred_record_inits(&self, err: &dyn Fn(&str)) {
         let records = self.iterate_records();
-        self.init_owed_records(records.clone());
+        self.init_owed_records(records.clone(), err);
         for (_, rec_arc) in &records {
             self.open_record_links(rec_arc);
         }
@@ -3391,7 +3396,7 @@ impl PvDatabase {
 
     /// [`Self::drain_deferred_record_inits`] over `records`: the debt of each
     /// one this call claims is paid in C's three walks.
-    fn init_owed_records(&self, records: Vec<(RecordName, Arc<RecordCell>)>) {
+    fn init_owed_records(&self, records: Vec<(RecordName, Arc<RecordCell>)>, err: &dyn Fn(&str)) {
         let resolver = self.inner.device_support_resolver.load();
         let owed: Vec<_> = records
             .into_iter()
@@ -3434,7 +3439,7 @@ impl PvDatabase {
             }
         }
         for (name, rec_arc, reached) in &owed {
-            self.init_deferred_record(name, rec_arc, *reached);
+            self.init_deferred_record(name, rec_arc, *reached, err);
         }
     }
 
@@ -3465,13 +3470,19 @@ impl PvDatabase {
     /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
     /// itself, so it runs after the write lock is dropped, exactly as the eager
     /// arm runs it after its `drop(gate)`.
-    fn init_deferred_record(&self, name: &RecordName, rec_arc: &Arc<RecordCell>, reached: bool) {
+    fn init_deferred_record(
+        &self,
+        name: &RecordName,
+        rec_arc: &Arc<RecordCell>,
+        reached: bool,
+        err: &dyn Fn(&str),
+    ) {
         let mut init_reads = reached.then(|| self.read_init_links(rec_arc));
         let (scan, phas, record_type) = {
             let mut guard = rec_arc.write();
             let instance = &mut *guard;
             if let Some(reads) = &mut init_reads {
-                instance.run_init_pass1(&name.to_str_lossy(), reads);
+                instance.run_init_pass1(&name.to_str_lossy(), reads, err);
             }
             super::database::processing::seed_constant_links(instance);
             rec_arc.settle_addr_facts(instance);
@@ -5247,14 +5258,14 @@ mod tests {
         assert!(!db.record_init_deferred(b"EAGER"));
 
         let owed = db.get_record("OWED").expect("the record is published");
-        db.drain_deferred_record_inits();
+        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
         assert!(!db.record_init_deferred(b"OWED"));
         assert!(
             !owed.claim_owed_init(),
             "the barrier's claim was not the only one"
         );
 
-        db.drain_deferred_record_inits();
+        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
         assert!(!db.record_init_deferred(b"OWED"));
     }
 

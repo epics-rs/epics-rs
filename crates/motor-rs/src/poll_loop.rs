@@ -69,12 +69,38 @@ pub struct PollerInbox {
 /// delays its controller's other axes as in C.
 pub struct MotorPollLoop {
     axes: Vec<Axis>,
+    /// Axes added to the controller once the poller runs.
+    joining: Option<mpsc::UnboundedReceiver<Joining>>,
     schedule: Schedule,
     controller_poll: Option<ControllerPoll>,
 }
 
+/// An axis joining a running poller, and the reply once it has.
+pub(crate) struct Joining {
+    pub(crate) axis: Axis,
+    pub(crate) joined: std::sync::mpsc::SyncSender<()>,
+}
+
 /// C `asynMotorController::poll`, run before the axes on every pass.
 pub type ControllerPoll = Box<dyn FnMut() + Send>;
+
+mod polled {
+    use super::ControllerPoll;
+
+    /// Proof the controller poll has run: C polls an axis only after
+    /// `pC->poll()`, on a poller pass (asynMotorController.cpp:652-656) and
+    /// in `motorUpdateStatus_` (:217-221). Only [`after`] makes one.
+    pub(super) struct Polled(());
+
+    /// Run the controller poll, for the axis polls that follow it.
+    pub(super) fn after(poll: &mut Option<ControllerPoll>) -> Polled {
+        if let Some(poll) = poll {
+            poll();
+        }
+        Polled(())
+    }
+}
+use polled::Polled;
 
 /// When the poll loop runs a pass.
 enum Schedule {
@@ -126,6 +152,18 @@ pub(crate) struct Axis {
     controller: Option<(String, i32)>,
     /// The status word last set in the controller port's parameters.
     mirrored_word: Option<u32>,
+    power: Power,
+}
+
+/// C `asynMotorAxis`'s auto-power flags, `wasMovingFlag_`, `disableFlag_`
+/// and `lastEndOfMoveTime_`, as one state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Power {
+    Idle,
+    /// A move ran or was seen: `wasMovingFlag_`.
+    Moving,
+    /// The move ended under auto power at this time: `disableFlag_`.
+    Ended(Instant),
 }
 
 /// How the loop's pass treats the axis.
@@ -215,7 +253,7 @@ impl Axis {
     }
 
     /// A model-1 axis, whose held move a [`Schedule::MotorTask`] queries.
-    fn task(
+    pub(crate) fn task(
         inbox: PollerInbox,
         motor: Arc<Mutex<dyn AsynMotor>>,
         subscribers: AxisSubscribers,
@@ -249,7 +287,44 @@ impl Axis {
             woken: false,
             controller: None,
             mirrored_word: None,
+            power: Power::Idle,
         }
+    }
+
+    /// The axis's `delay` parameter when its MOTOR_POWER_AUTO_ONOFF is 1,
+    /// read as C's getIntegerParam / getDoubleParam do: 0 when unset.
+    fn auto_power(&self, delay: usize) -> Option<Duration> {
+        use crate::controller_port::index;
+        let (port, addr) = self.controller.as_ref()?;
+        let handle = crate::devices::controller_port_handle(port)?;
+        let on = handle.read_int32_blocking(index::POWER_AUTO_ONOFF, *addr);
+        (on.unwrap_or(0) == 1).then(|| {
+            let secs = handle.read_float64_blocking(delay, *addr).unwrap_or(0.0);
+            Duration::try_from_secs_f64(secs).unwrap_or_default()
+        })
+    }
+
+    /// One axis of C `asynMotorPoller`'s pass (asynMotorController.cpp:
+    /// 652-683): the poll, then an ended move under auto power powers the
+    /// axis off once MOTOR_POWER_OFF_DELAY has passed.
+    fn poller_poll(&mut self, polled: &Polled) -> bool {
+        let off_delay = self.auto_power(crate::controller_port::index::POWER_OFF_DELAY);
+        let moving = self.poll_and_notify(false, polled);
+        self.power = match self.power {
+            _ if moving => Power::Moving,
+            Power::Moving if off_delay.is_some() => Power::Ended(Instant::now()),
+            power => power,
+        };
+        if let (Power::Ended(at), Some(delay)) = (self.power, off_delay)
+            && !moving
+            && at.elapsed() >= delay
+        {
+            if let Ok(mut motor) = self.motor.lock() {
+                let _ = motor.set_closed_loop(&AsynUser::new(0), false);
+            }
+            self.power = Power::Idle;
+        }
+        moving
     }
 
     /// Mirror each status into axis `addr` of controller port `port`.
@@ -262,9 +337,9 @@ impl Axis {
         }
     }
 
-    fn run_queued_commands(&mut self) {
+    fn run_queued_commands(&mut self, controller_poll: &mut Option<ControllerPoll>) {
         while let Ok(batch) = self.motor_cmd_rx.try_recv() {
-            self.execute(&batch);
+            self.execute(&batch, controller_poll);
         }
         for io_intr in self.pulses.drain(..) {
             let _ = io_intr.try_send(());
@@ -283,7 +358,7 @@ impl Axis {
     /// finished move then processes the record (C `asynCallback`), and a
     /// move wakes the poller (asynMotorController.cpp:303, :320, :336,
     /// :355).
-    fn execute(&mut self, batch: &CommandBatch) {
+    fn execute(&mut self, batch: &CommandBatch, controller_poll: &mut Option<ControllerPoll>) {
         let motor = self.motor.clone();
         let Ok(mut motor) = motor.lock() else {
             return;
@@ -311,11 +386,24 @@ impl Axis {
                 }
                 None => command,
             };
-            execute_commands(
+            // C writeFloat64 powers the axis on before a move or home
+            // (asynMotorController.cpp:291-295, :308-312, :325-329, :342-346).
+            if command.is_move() && !matches!(command, MotorCommand::SetPosition { .. }) {
+                let on_delay = self.auto_power(crate::controller_port::index::POWER_ON_DELAY);
+                if let Some(delay) = on_delay {
+                    let _ = motor.set_closed_loop(&AsynUser::new(0), true);
+                    self.power = Power::Moving;
+                    std::thread::sleep(delay);
+                }
+            }
+            execute_commands_after(
                 &mut *motor,
                 &batch.trace,
                 std::slice::from_ref(command),
                 &mut |write| self.post_writes(write),
+                &mut || {
+                    polled::after(controller_poll);
+                },
             );
             if !command.is_move() {
                 continue;
@@ -516,18 +604,21 @@ impl Axis {
     /// controller lock across this poll, so init_record's read waits for it
     /// (asynMotorController.cpp:505-525, :630); taken while the poller is
     /// built, before the creating command returns, init reads it too.
-    fn prime_cache(&mut self) {
-        let status = self.poll_status();
+    fn prime_cache(&mut self, polled: &Polled) {
+        let status = self.poll_status(polled);
+        if status.moving {
+            self.power = Power::Moving;
+        }
         self.hold(&status);
         self.subscribers.store(StampedStatus { seq: 1, status });
     }
 
-    fn poll_status(&mut self) -> MotorStatus {
-        self.poll_result()
+    fn poll_status(&mut self, polled: &Polled) -> MotorStatus {
+        self.poll_result(polled)
             .unwrap_or_else(|failure| self.failed_poll_status(failure))
     }
 
-    fn poll_result(&mut self) -> Result<MotorStatus, FailedPoll> {
+    fn poll_result(&mut self, _: &Polled) -> Result<MotorStatus, FailedPoll> {
         let user = AsynUser::new(0);
         // An `Err` is the C driver poll bailing to its error label, which
         // raises what `poll_failure` names. A poisoned driver mutex has no C
@@ -549,8 +640,8 @@ impl Axis {
     /// [`PollFailure::NONE`]) or the position sat still under the driver's
     /// [`AsynMotor::no_motion_test`]. Returns the move
     /// the axis holds after the pass.
-    fn query_held(&mut self, mut held: Held) -> Option<Held> {
-        let status = match self.poll_in_motion(&mut held.mover) {
+    fn query_held(&mut self, mut held: Held, polled: &Polled) -> Option<Held> {
+        let status = match self.poll_in_motion(&mut held.mover, polled) {
             Ok(status) => status,
             Err(failed) if failed.bits == PollFailure::NONE => {
                 self.failed_poll_status(failed);
@@ -595,9 +686,10 @@ impl Axis {
     fn poll_in_motion(
         &mut self,
         mover: &mut Option<(RecordId, bool)>,
+        polled: &Polled,
     ) -> Result<MotorStatus, FailedPoll> {
         let Some((record, cdir)) = mover else {
-            return self.poll_result();
+            return self.poll_result(polled);
         };
         let before = *cdir;
         let polled = match self.motor.lock() {
@@ -627,14 +719,14 @@ impl Axis {
 
     /// One wake of `motor_task`, before it processes the messages: query
     /// the held move, if any (motordrvCom.cc:244-254).
-    fn query_task(&mut self) {
+    fn query_task(&mut self, polled: &Polled) {
         let Pacing::MotorTask {
             held: Some(held), ..
         } = self.pacing
         else {
             return;
         };
-        let next = self.query_held(held);
+        let next = self.query_held(held, polled);
         if let Pacing::MotorTask { held, .. } = &mut self.pacing {
             *held = next;
         }
@@ -651,8 +743,8 @@ impl Axis {
     /// `force=false` and notifies only when the polled status differs from the
     /// last one delivered — the analogue of C's `statusChanged_` gate, so a
     /// settled, unchanging axis does not re-post DIFF/RDIF every idle period.
-    fn poll_and_notify(&mut self, force: bool) -> bool {
-        let status = match self.poll_result() {
+    fn poll_and_notify(&mut self, force: bool, polled: &Polled) -> bool {
+        let status = match self.poll_result(polled) {
             Ok(status) => status,
             // A driver returning before callParamCallbacks posts nothing,
             // whatever it left set.
@@ -686,6 +778,15 @@ impl Axis {
         self.publish(status);
     }
 
+    /// Where the axis falls in the controller's address order; an axis of
+    /// no port polls after those of one, in the order added.
+    fn order(&self) -> (bool, i32) {
+        match &self.controller {
+            Some((_, addr)) => (false, *addr),
+            None => (true, 0),
+        }
+    }
+
     fn holds_move(&self) -> bool {
         matches!(self.pacing, Pacing::MotorTask { held: Some(_), .. })
     }
@@ -702,6 +803,7 @@ impl MotorPollLoop {
     ) -> Self {
         Self::controller(
             vec![Axis::polled(inbox, motor, subscribers)],
+            None,
             moving_poll_interval,
             idle_poll_interval,
             forced_fast_polls,
@@ -713,6 +815,7 @@ impl MotorPollLoop {
     /// `controller_poll`.
     pub(crate) fn controller(
         axes: Vec<Axis>,
+        joining: Option<mpsc::UnboundedReceiver<Joining>>,
         moving_poll_interval: Duration,
         idle_poll_interval: Duration,
         forced_fast_polls: u32,
@@ -724,46 +827,56 @@ impl MotorPollLoop {
             forced_fast_polls,
             remaining: 0,
         };
-        Self::started(axes, schedule, controller_poll)
+        Self::started(axes, joining, schedule, controller_poll)
     }
 
-    /// A model-1 axis's task, scanning a held move every `scan`.
-    pub fn motor_task(
-        inbox: PollerInbox,
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        subscribers: AxisSubscribers,
-        scan: Duration,
-    ) -> Self {
-        let axes = vec![Axis::task(inbox, motor, subscribers)];
-        Self::started(axes, Schedule::MotorTask { scan }, None)
+    /// A model-1 driver's task over its `axes`, scanning the held moves
+    /// every `scan`.
+    pub(crate) fn motor_task(axes: Vec<Axis>, scan: Duration) -> Self {
+        Self::started(axes, None, Schedule::MotorTask { scan }, None)
     }
 
     /// The loop after its startup pass: the controller poll, then each
     /// axis's [`Axis::prime_cache`] (asynMotorController.cpp:630, :656-661).
     fn started(
         mut axes: Vec<Axis>,
+        joining: Option<mpsc::UnboundedReceiver<Joining>>,
         schedule: Schedule,
         mut controller_poll: Option<ControllerPoll>,
     ) -> Self {
-        if let Some(poll) = &mut controller_poll {
-            poll();
-        }
+        axes.sort_by_key(Axis::order);
+        let polled = polled::after(&mut controller_poll);
         for axis in &mut axes {
-            axis.prime_cache();
+            axis.prime_cache(&polled);
         }
         Self {
             axes,
+            joining,
             schedule,
             controller_poll,
         }
+    }
+
+    /// An axis added to the running controller: its first poll follows a
+    /// controller poll, as on the pass C's poller first finds it.
+    fn join(&mut self, Joining { mut axis, joined }: Joining) {
+        axis.prime_cache(&polled::after(&mut self.controller_poll));
+        let at = self.axes.partition_point(|a| a.order() <= axis.order());
+        self.axes.insert(at, axis);
+        let _ = joined.send(());
     }
 
     /// Run the commands queued so far on the calling thread: for a harness
     /// standing in for the poller thread. The IOC path is [`Self::run`].
     pub fn run_queued_commands(&mut self) {
         for axis in &mut self.axes {
-            axis.run_queued_commands();
+            axis.run_queued_commands(&mut self.controller_poll);
         }
+    }
+
+    /// Run a batch of axis `index`'s commands.
+    fn execute(&mut self, index: usize, batch: &CommandBatch) {
+        self.axes[index].execute(batch, &mut self.controller_poll);
     }
 
     fn is_motor_task(&self) -> bool {
@@ -773,8 +886,9 @@ impl MotorPollLoop {
     /// One wake of `motor_task`, before it processes the messages: query
     /// each held move (motordrvCom.cc:244-254).
     fn query_task(&mut self) {
+        let polled = polled::after(&mut self.controller_poll);
         for axis in &mut self.axes {
-            axis.query_task();
+            axis.query_task(&polled);
         }
     }
 
@@ -797,12 +911,10 @@ impl MotorPollLoop {
         if woken {
             self.reload_forced_fast_polls();
         }
-        if let Some(poll) = &mut self.controller_poll {
-            poll();
-        }
+        let polled = polled::after(&mut self.controller_poll);
         let mut moving = false;
         for axis in &mut self.axes {
-            moving |= axis.poll_and_notify(false);
+            moving |= axis.poller_poll(&polled);
         }
         self.next_pass(moving)
     }
@@ -877,7 +989,11 @@ impl MotorPollLoop {
 
     /// The next queued message of any axis: every axis's driver commands
     /// first, so a ForcePoll sees their effect.
-    fn inbox(axes: &mut [Axis], cx: &mut std::task::Context<'_>) -> std::task::Poll<Wake> {
+    fn inbox(
+        axes: &mut [Axis],
+        joining: &mut Option<mpsc::UnboundedReceiver<Joining>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Wake> {
         use std::task::Poll;
         for (index, axis) in axes.iter_mut().enumerate() {
             if let Poll::Ready(Some(batch)) = axis.motor_cmd_rx.poll_recv(cx) {
@@ -887,6 +1003,14 @@ impl MotorPollLoop {
         for (index, axis) in axes.iter_mut().enumerate() {
             if let Poll::Ready(cmd) = axis.cmd_rx.poll_recv(cx) {
                 return Poll::Ready(Wake::Command(index, cmd));
+            }
+        }
+        if let Some(rx) = joining {
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some(join)) => return Poll::Ready(Wake::Join(Box::new(join))),
+                // The axis list is gone: no axis can join any more.
+                Poll::Ready(None) => *joining = None,
+                Poll::Pending => {}
             }
         }
         Poll::Pending
@@ -910,26 +1034,24 @@ impl MotorPollLoop {
             let wait = due.map(|at| at.saturating_duration_since(Instant::now()));
             let wake = tokio::select! {
                 biased;
-                wake = std::future::poll_fn(|cx| Self::inbox(&mut self.axes, cx)) => wake,
+                wake = std::future::poll_fn(|cx| Self::inbox(&mut self.axes, &mut self.joining, cx)) => wake,
                 _ = sleep_background(wait.unwrap_or_default()), if wait.is_some() => Wake::Due,
             };
             match wake {
                 Wake::Batch(index, batch) if self.is_motor_task() => {
-                    // One wake drains every queued message after the
+                    // One wake drains the driver's whole queue after the
                     // query (motordrvCom.cc:255, :351).
                     let tick = Instant::now();
                     self.query_task();
-                    let axis = &mut self.axes[index];
-                    axis.execute(&batch);
-                    while let Ok(batch) = axis.motor_cmd_rx.try_recv() {
-                        axis.execute(&batch);
+                    self.execute(index, &batch);
+                    for axis in &mut self.axes {
+                        axis.run_queued_commands(&mut self.controller_poll);
                     }
                     due = self.task_due(tick);
                 }
                 Wake::Batch(index, batch) => {
-                    let axis = &mut self.axes[index];
-                    axis.execute(&batch);
-                    if std::mem::take(&mut axis.woken) {
+                    self.execute(index, &batch);
+                    if std::mem::take(&mut self.axes[index].woken) {
                         due = self.poller_pass(true);
                     }
                 }
@@ -937,13 +1059,16 @@ impl MotorPollLoop {
                     Some(PollCommand::ForcePoll) if self.is_motor_task() => {
                         let tick = Instant::now();
                         self.query_task();
+                        let polled = polled::after(&mut self.controller_poll);
                         let axis = &mut self.axes[index];
-                        let polled = axis.poll_result();
-                        axis.publish_info(polled);
+                        let status = axis.poll_result(&polled);
+                        axis.publish_info(status);
                         due = self.task_due(tick);
                     }
+                    // C motorUpdateStatus_ (asynMotorController.cpp:217-221).
                     Some(PollCommand::ForcePoll) => {
-                        self.axes[index].poll_and_notify(true);
+                        let polled = polled::after(&mut self.controller_poll);
+                        self.axes[index].poll_and_notify(true, &polled);
                     }
                     Some(PollCommand::Wakeup) if self.is_motor_task() => {
                         let tick = Instant::now();
@@ -957,6 +1082,7 @@ impl MotorPollLoop {
                     // C shutdownPoller ends the controller's one poller.
                     Some(PollCommand::Shutdown) | None => return,
                 },
+                Wake::Join(join) => self.join(*join),
                 Wake::Due => {
                     due = self.timed_pass();
                 }
@@ -969,6 +1095,7 @@ impl MotorPollLoop {
 enum Wake {
     Batch(usize, CommandBatch),
     Command(usize, Option<PollCommand>),
+    Join(Box<Joining>),
     Due,
 }
 
@@ -1329,6 +1456,19 @@ pub fn execute_commands(
     commands: &[MotorCommand],
     on_write: &mut dyn FnMut(AxisWrite),
 ) {
+    execute_commands_after(motor, trace, commands, on_write, &mut || {});
+}
+
+/// [`execute_commands`] on a controller whose `controller_poll` runs ahead
+/// of a GET_INFO's axis poll, as C `motorUpdateStatus_` runs `pC->poll()`
+/// (asynMotorController.cpp:217-221).
+fn execute_commands_after(
+    motor: &mut dyn AsynMotor,
+    trace: &MotorTrace,
+    commands: &[MotorCommand],
+    on_write: &mut dyn FnMut(AxisWrite),
+    controller_poll: &mut dyn FnMut(),
+) {
     let user = AsynUser::new(0);
     let port = trace.port();
     let axis = trace.addr();
@@ -1536,6 +1676,7 @@ pub fn execute_commands(
             // GET_INFO polls inside the write, before its closing line
             // (asynMotorController.cpp:217-222; drvMotorAsyn.c:617-619).
             MotorCommand::Poll => {
+                controller_poll();
                 let r = motor.poll(&user);
                 polled = Some(match &r {
                     Ok(status) => Ok(status.clone()),
@@ -1880,6 +2021,182 @@ mod tests {
 
     type Gate = Arc<epics_base_rs::runtime::interrupt_accept::InterruptGate>;
 
+    /// Records its closed-loop calls and moves; moving while `moving` is.
+    struct Powered {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        moving: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsynMotor for Powered {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            self.calls.lock().unwrap().push("move");
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_closed_loop(&mut self, _: &AsynUser, enable: bool) -> AsynResult<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(if enable { "on" } else { "off" });
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            let moving = self.moving.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(MotorStatus {
+                moving,
+                done: !moving,
+                ..MotorStatus::default()
+            })
+        }
+    }
+
+    struct PowerRig {
+        poll_loop: MotorPollLoop,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        moving: Arc<std::sync::atomic::AtomicBool>,
+        _handle: asyn_rs::port_handle::PortHandle,
+        _gate: Gate,
+    }
+
+    impl PowerRig {
+        /// Axis 0 of controller port `port`, MOTOR_POWER_AUTO_ONOFF `auto`
+        /// and MOTOR_POWER_OFF_DELAY `off_delay` seconds.
+        fn new(port: &str, auto: i32, off_delay: f64) -> Self {
+            Self::started(port, auto, off_delay, false)
+        }
+
+        /// Auto power on with no delay, the axis moving at the startup pass.
+        fn moving_at_startup(port: &str) -> Self {
+            Self::started(port, 1, 0.0, true)
+        }
+
+        fn started(port: &str, auto: i32, off_delay: f64, moving_at_startup: bool) -> Self {
+            use crate::controller_port::index;
+            let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+            let handle = crate::devices::register_controller_port(&gate, port, 1, ()).unwrap();
+            let calls = Arc::default();
+            let moving = Arc::new(std::sync::atomic::AtomicBool::new(moving_at_startup));
+            let motor = Powered {
+                calls: Arc::clone(&calls),
+                moving: Arc::clone(&moving),
+            };
+            let mut controller = crate::builder::ControllerBuilder::new();
+            let user = TraceUser::Asyn {
+                port: port.into(),
+                addr: 0,
+            };
+            let axis = controller.axis(Arc::new(Mutex::new(motor)), user).axis;
+            crate::devices::register_axis(axis).unwrap();
+            handle
+                .write_int32_blocking(index::POWER_AUTO_ONOFF, 0, auto)
+                .unwrap();
+            handle
+                .write_float64_blocking(index::POWER_OFF_DELAY, 0, off_delay)
+                .unwrap();
+            Self {
+                poll_loop: controller.build(SCAN, SCAN, 0),
+                calls,
+                moving,
+                _handle: handle,
+                _gate: gate,
+            }
+        }
+
+        /// A move written to the port, C `writeFloat64(motorMoveAbs_)`.
+        fn move_axis(&mut self, port: &str) {
+            let trace = Arc::new(MotorTrace::with_user(TraceUser::Asyn {
+                port: port.into(),
+                addr: 0,
+            }));
+            self.poll_loop.execute(
+                0,
+                &CommandBatch {
+                    trace,
+                    record: None,
+                    commands: vec![MotorCommand::MoveAbsolute {
+                        position: 5.0,
+                        min_velocity: 0.0,
+                        velocity: 1.0,
+                        acceleration: 1.0,
+                    }],
+                },
+            );
+        }
+
+        /// A poller pass with the axis `moving`.
+        fn pass(&mut self, moving: bool) {
+            self.moving
+                .store(moving, std::sync::atomic::Ordering::SeqCst);
+            self.poll_loop.poller_pass(false);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    // C writeFloat64 powers the axis on before a move, and the poller powers
+    // it off once the move ends (asynMotorController.cpp:291-295, :655-683).
+    #[test]
+    fn auto_power_powers_on_before_a_move_and_off_after_it_ends() {
+        let mut rig = PowerRig::new("autoPowerOnOff", 1, 0.0);
+        rig.move_axis("autoPowerOnOff");
+        assert_eq!(rig.calls(), ["on", "move"]);
+        rig.pass(true);
+        assert_eq!(rig.calls(), ["on", "move"]);
+        rig.pass(false);
+        assert_eq!(rig.calls(), ["on", "move", "off"]);
+        rig.pass(false);
+        assert_eq!(rig.calls(), ["on", "move", "off"]);
+    }
+
+    #[test]
+    fn auto_power_off_waits_for_the_off_delay_after_the_move_ends() {
+        let mut rig = PowerRig::new("autoPowerDelay", 1, 0.05);
+        rig.pass(true);
+        rig.pass(false);
+        assert!(rig.calls().is_empty());
+        std::thread::sleep(Duration::from_millis(60));
+        rig.pass(false);
+        assert_eq!(rig.calls(), ["off"]);
+    }
+
+    // The startup pass marks a moving axis as C's poller does, whatever the
+    // auto power then (asynMotorController.cpp:660-662).
+    #[test]
+    fn an_axis_moving_at_startup_powers_off_when_its_move_ends() {
+        let mut rig = PowerRig::moving_at_startup("autoPowerStartup");
+        rig.pass(false);
+        assert_eq!(rig.calls(), ["off"]);
+    }
+
+    #[test]
+    fn without_auto_power_the_axis_power_is_left_alone() {
+        let mut rig = PowerRig::new("autoPowerUnset", 0, 0.0);
+        rig.move_axis("autoPowerUnset");
+        rig.pass(true);
+        rig.pass(false);
+        assert_eq!(rig.calls(), ["move"]);
+    }
+
     /// A poller on axis 0 of a [`Hooked`] controller port `port`, at rest,
     /// whose later polls answer from `script`, and the port's interruptAccept,
     /// still closed.
@@ -1907,11 +2224,14 @@ mod tests {
     }
 
     fn write_stop(poll_loop: &mut MotorPollLoop, port: &str) {
-        poll_loop.axes[0].execute(&CommandBatch {
-            trace: Arc::new(MotorTrace::new(port, 0)),
-            record: None,
-            commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
-        });
+        poll_loop.execute(
+            0,
+            &CommandBatch {
+                trace: Arc::new(MotorTrace::new(port, 0)),
+                record: None,
+                commands: vec![MotorCommand::Stop { acceleration: 1.0 }],
+            },
+        );
     }
 
     #[test]
@@ -2086,12 +2406,12 @@ mod tests {
     fn model1_task_on(motor: Arc<Mutex<dyn AsynMotor>>) -> MotorPollLoop {
         let (_poll_tx, poll) = mpsc::channel(1);
         let (_tx, commands) = mpsc::unbounded_channel();
-        let mut poll_loop = MotorPollLoop::motor_task(
+        let axis = Axis::task(
             PollerInbox { poll, commands },
             motor,
             AxisSubscribers::new(),
-            SCAN,
         );
+        let mut poll_loop = MotorPollLoop::motor_task(vec![axis], SCAN);
         poll_loop.axes[0].last_status = Some(MotorStatus::default());
         poll_loop
     }
@@ -2243,16 +2563,19 @@ mod tests {
             card: 0,
             signal: 0,
         }));
-        poll_loop.axes[0].execute(&CommandBatch {
-            trace,
-            record: None,
-            commands: vec![MotorCommand::MoveAbsolute {
-                position: 5.0,
-                min_velocity: 0.0,
-                velocity: 1.0,
-                acceleration: 1.0,
-            }],
-        });
+        poll_loop.execute(
+            0,
+            &CommandBatch {
+                trace,
+                record: None,
+                commands: vec![MotorCommand::MoveAbsolute {
+                    position: 5.0,
+                    min_velocity: 0.0,
+                    velocity: 1.0,
+                    acceleration: 1.0,
+                }],
+            },
+        );
     }
 
     fn held(poll_loop: &MotorPollLoop) -> Held {

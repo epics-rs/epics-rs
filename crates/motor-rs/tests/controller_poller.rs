@@ -15,6 +15,7 @@ use motor_rs::trace::TraceUser;
 type Log = Arc<Mutex<Vec<(&'static str, Instant)>>>;
 
 const SLOW: Duration = Duration::from_millis(40);
+const PERIOD: Duration = Duration::from_millis(5);
 
 struct Axis {
     name: &'static str,
@@ -50,9 +51,8 @@ impl AsynMotor for Axis {
 async fn run_controller() -> Vec<(&'static str, Instant)> {
     let log = Log::default();
     let controller_log = log.clone();
-    let mut controller =
-        ControllerBuilder::new(Duration::from_millis(5), Duration::from_millis(5), 0)
-            .controller_poll(move || controller_log.lock().unwrap().push(("C", Instant::now())));
+    let mut controller = ControllerBuilder::new()
+        .controller_poll(move || controller_log.lock().unwrap().push(("C", Instant::now())));
     let mut senders = Vec::new();
     for (addr, (name, delay)) in [("A0", SLOW), ("A1", Duration::ZERO)]
         .into_iter()
@@ -72,7 +72,7 @@ async fn run_controller() -> Vec<(&'static str, Instant)> {
         );
         senders.push(poll_cmd_tx);
     }
-    let poller = tokio::spawn(controller.build().run());
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
     tokio::time::sleep(SLOW * 4).await;
     senders[1].send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
@@ -113,4 +113,56 @@ async fn a_slow_axis_delays_the_axes_after_it() {
             *a1 - *a0
         );
     }
+}
+
+/// SmarAct and phytron start the poller in the controller's constructor
+/// and create the axes after it: an axis added to the running poller is
+/// polled on every pass, in address order.
+#[tokio::test]
+async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
+    let log = Log::default();
+    let controller_log = log.clone();
+    let mut controller = ControllerBuilder::new()
+        .controller_poll(move || controller_log.lock().unwrap().push(("C", Instant::now())));
+    let axis = |name, addr: i32| {
+        let motor = Axis {
+            name,
+            log: log.clone(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Asyn {
+            port: String::new(),
+            addr,
+        };
+        (
+            Arc::new(Mutex::new(motor)) as Arc<Mutex<dyn AsynMotor>>,
+            user,
+        )
+    };
+    let (motor, user) = axis("A2", 2);
+    let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
+    let axes = controller.axes();
+    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
+    tokio::time::sleep(PERIOD * 4).await;
+    let (motor, user) = axis("A0", 0);
+    // Held: a dropped axis ends the poller.
+    let _a0 = tokio::task::spawn_blocking(move || axes.add(motor, user))
+        .await
+        .unwrap()
+        .unwrap();
+    let joined = log.lock().unwrap().len();
+    tokio::time::sleep(PERIOD * 8).await;
+    poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
+    poller.await.unwrap();
+    let names: Vec<_> = log.lock().unwrap()[joined..]
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(names.len() >= 6, "{names:?}");
+    let whole = names.len() / 3 * 3;
+    assert_eq!(
+        names[..whole],
+        ["C", "A0", "A2"].repeat(whole / 3),
+        "{names:?}"
+    );
 }

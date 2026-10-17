@@ -1148,6 +1148,11 @@ pub trait NDPluginProcess: Send + Sync + 'static {
     /// before the port exists.
     fn bind_attributes(&mut self, _attributes: PluginAttributes) {}
 
+    /// Hands the processor C's `pNDArrayPool`, for arrays it keeps across
+    /// frames (e.g. NDPluginTimeSeries.cpp:132). Called once, after
+    /// `register_params`, with the plugin's own pool in it.
+    fn bind_pool(&mut self, _pool: PluginPool) {}
+
     /// How many `(NDArrayPort, NDArrayAddr)` pairs this plugin reads as its
     /// array sources: the pair at address `a` for every `a` below this.
     /// `NDPluginDriver::connectToArrayPort` reads the pair at address 0
@@ -1248,6 +1253,27 @@ impl ArrayCallbacks {
 
     pub fn get(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+}
+
+/// C `pNDArrayPool`: the plugin's own pool until a frame brings another
+/// (NDPluginDriver.cpp:419). [`Delivery::adopt_pool`] is its only writer;
+/// a processor gets clones that can only read.
+#[derive(Clone)]
+pub struct PluginPool(Arc<parking_lot::Mutex<DriverPool>>);
+
+impl PluginPool {
+    /// A view that holds `pool` until a runtime binds its own in its place.
+    pub fn new(pool: DriverPool) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(pool)))
+    }
+
+    fn adopt(&self, pool: &DriverPool) {
+        *self.0.lock() = pool.clone();
+    }
+
+    pub fn current(&self) -> DriverPool {
+        self.0.lock().clone()
     }
 }
 
@@ -2279,7 +2305,7 @@ impl PluginPortDriver {
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
         max_memory: usize,
         wiring: Arc<WiringRegistry>,
-    ) -> AsynResult<(Self, Arc<P>, DriverPool)> {
+    ) -> AsynResult<(Self, Arc<P>, PluginPool)> {
         let mut base = PortDriverBase::new(port_name, max_addr, P::ASYN_FLAGS);
 
         let (ndarray_params, owner) = NDArrayDriverParams::create(&mut base)?;
@@ -2338,6 +2364,8 @@ impl PluginPortDriver {
         // Let the processor register its plugin-specific params
         processor.register_params(&mut base)?;
         processor.bind_attributes(PluginAttributes(Arc::clone(&owner)));
+        let pool = PluginPool::new(pool);
+        processor.bind_pool(pool.clone());
 
         let processor = Arc::new(processor);
         let driver = Self {
@@ -3167,7 +3195,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     let array_data = processor.array_data_handle();
 
     // Create the port driver for control plane
-    let (driver, processor, own_pool) = PluginPortDriver::new(
+    let (driver, processor, plugin_pool) = PluginPortDriver::new(
         port_name,
         &plugin_type_name,
         queue_size,
@@ -3180,6 +3208,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         wiring.clone(),
     )
     .expect("failed to create plugin port driver");
+    let own_pool = plugin_pool.current();
 
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
@@ -3233,7 +3262,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // that it runs off the data loop, outside this mutex.
     let delivery = Arc::new(Delivery::new(
         array_outputs.clone(),
-        own_pool.clone(),
+        plugin_pool.clone(),
         array_callbacks.clone(),
         std_array_data_param.is_some(),
         port_handle.clone(),
@@ -4199,7 +4228,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     let mut processor = processor;
     processor.bind_array_callbacks(array_callbacks.clone());
     let array_data = processor.array_data_handle();
-    let (driver, processor, own_pool) = PluginPortDriver::new(
+    let (driver, processor, plugin_pool) = PluginPortDriver::new(
         port_name,
         &plugin_type_name,
         queue_size,
@@ -4212,6 +4241,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         wiring.clone(),
     )
     .expect("failed to create plugin port driver");
+    let own_pool = plugin_pool.current();
 
     let ndarray_params = driver.ndarray_params;
     let plugin_params = driver.plugin_params;
@@ -4247,7 +4277,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
     // that it runs off the data loop, outside this mutex.
     let delivery = Arc::new(Delivery::new(
         array_outputs.clone(),
-        own_pool.clone(),
+        plugin_pool.clone(),
         array_callbacks.clone(),
         std_array_data_param.is_some(),
         port_handle.clone(),

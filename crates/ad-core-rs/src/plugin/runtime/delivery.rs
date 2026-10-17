@@ -24,7 +24,7 @@ use crate::params::ndarray_driver::NDArrayDriverParams;
 
 use super::super::channel::NDArrayOutput;
 use super::super::throttler::Throttler;
-use super::{ArrayCallbacks, CopyArray, OutputSenders, SortBuffer};
+use super::{ArrayCallbacks, CopyArray, OutputSenders, PluginPool, SortBuffer};
 
 pub(super) struct Delivery {
     /// One output per port address: what C's asynGenericPointer interrupt
@@ -34,11 +34,12 @@ pub(super) struct Delivery {
     /// NDPluginStdArrays, which routes its waveform with NDArrayCallbacks 0.
     std_arrays: bool,
     port_handle: PortHandle,
+    /// The processor allocates from this same pool ([`super::NDPluginProcess::bind_pool`]).
+    pool: PluginPool,
     state: Mutex<State>,
 }
 
 struct State {
-    pool: DriverPool,
     /// Output byte-rate limit (C++ `MaxByteRate`); 0 disables throttling.
     max_byte_rate: f64,
     /// Token-bucket throttler enforcing `max_byte_rate` on the output path (G7).
@@ -74,7 +75,7 @@ pub(super) struct SortCounters {
 impl Delivery {
     pub(super) fn new(
         outputs: Vec<Arc<Mutex<NDArrayOutput>>>,
-        pool: DriverPool,
+        pool: PluginPool,
         array_callbacks: ArrayCallbacks,
         std_arrays: bool,
         port_handle: PortHandle,
@@ -84,8 +85,8 @@ impl Delivery {
             array_callbacks,
             std_arrays,
             port_handle,
+            pool,
             state: Mutex::new(State {
-                pool,
                 max_byte_rate: 0.0,
                 throttler: Throttler::new(0.0),
                 sort_mode: 0,
@@ -118,7 +119,7 @@ impl Delivery {
         if !callbacks && !self.std_arrays {
             return Vec::new();
         }
-        let arrays = self.publishable_in(&state, arrays, attributes, copy);
+        let arrays = self.publishable(arrays, attributes, copy);
         if callbacks && let Some(last) = arrays.last() {
             state.last_output_array = Some(Arc::clone(last.array()));
         }
@@ -157,16 +158,7 @@ impl Delivery {
         attributes: Option<&NDAttributeList>,
         copy: CopyArray<'_>,
     ) -> Vec<PublishedArray> {
-        self.publishable_in(&self.state.lock(), arrays, attributes, copy)
-    }
-
-    fn publishable_in(
-        &self,
-        state: &State,
-        arrays: Vec<Arc<NDArray>>,
-        attributes: Option<&NDAttributeList>,
-        copy: CopyArray<'_>,
-    ) -> Vec<PublishedArray> {
+        let pool = self.pool.current();
         let mut published = Vec::with_capacity(arrays.len());
         for array in arrays {
             let copied = match copy {
@@ -174,7 +166,7 @@ impl Delivery {
                 CopyArray::Always => true,
                 CopyArray::Never => false,
             };
-            let Ok(array) = state.pool.publishable(array, attributes, copied) else {
+            let Ok(array) = pool.publishable(array, attributes, copied) else {
                 self.port_handle.trace().output(
                     self.port_handle.port_name(),
                     TraceMask::ERROR,
@@ -194,23 +186,22 @@ impl Delivery {
         &self,
         arrays: Vec<(usize, Arc<NDArray>)>,
     ) -> Vec<(usize, PublishedArray)> {
-        let state = self.state.lock();
+        let pool = self.pool.current();
         arrays
             .into_iter()
-            .filter_map(|(addr, arr)| Some((addr, state.pool.publishable(arr, None, false).ok()?)))
+            .filter_map(|(addr, arr)| Some((addr, pool.publishable(arr, None, false).ok()?)))
             .collect()
     }
 
     /// C `this->pNDArrayPool = pArray->pNDArrayPool` (NDPluginDriver.cpp:
     /// 419): the plugin allocates from the pool its frame came from.
     pub(super) fn adopt_pool(&self, pool: &DriverPool) -> Arc<NDArrayPool> {
-        let mut state = self.state.lock();
-        state.pool = pool.clone();
-        Arc::clone(state.pool.pool())
+        self.pool.adopt(pool);
+        Arc::clone(pool.pool())
     }
 
     pub(super) fn empty_free_list(&self) {
-        self.state.lock().pool.empty_free_list();
+        self.pool.current().empty_free_list();
     }
 
     /// C refuses with asynError when no array has been produced yet — there
@@ -218,12 +209,12 @@ impl Delivery {
     pub(super) fn pre_allocate_buffers(&self, count: usize) {
         let state = self.state.lock();
         if let Some(template) = &state.last_output_array {
-            let _ = state.pool.pre_allocate_buffers(template, count);
+            let _ = self.pool.current().pre_allocate_buffers(template, count);
         }
     }
 
     pub(super) fn pool_stats(&self, params: &NDArrayDriverParams) -> Vec<ParamSetValue> {
-        crate::driver::ndarray_driver::pool_stats_values(params, &self.state.lock().pool)
+        crate::driver::ndarray_driver::pool_stats_values(params, &self.pool.current())
     }
 
     /// The downstream senders, cloned so they are used with no lock held;

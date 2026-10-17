@@ -1257,7 +1257,7 @@ impl ArrayCallbacks {
 }
 
 /// C `pNDArrayPool`: the plugin's own pool until a frame brings another
-/// (NDPluginDriver.cpp:419). [`Delivery::adopt_pool`] is its only writer;
+/// (NDPluginDriver.cpp:419). `Delivery::adopt_pool` is its only writer;
 /// a processor gets clones that can only read.
 #[derive(Clone)]
 pub struct PluginPool(Arc<parking_lot::Mutex<DriverPool>>);

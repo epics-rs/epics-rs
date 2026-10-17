@@ -1773,7 +1773,7 @@ impl PortDriverBase {
     /// C `asynPortDriver::parseAsynUser` (asynPortDriver.cpp:1924-1933),
     /// which every default read/write runs first: the address `getAddress`
     /// resolves, then the reason.
-    pub(crate) fn parse_user(&self, user: &AsynUser) -> AsynResult<i32> {
+    pub fn parse_user(&self, user: &AsynUser) -> AsynResult<i32> {
         let addr = self.get_address(user.addr, user.reason)?;
         if self.params.param_name(user.reason).is_none() {
             return Err(AsynError::ParamIndexOutOfRange(user.reason));

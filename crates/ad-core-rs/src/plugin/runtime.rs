@@ -2369,6 +2369,22 @@ impl PluginPortDriver {
 
     /// C `connectToArrayPort` fails when `connectDevice` finds no such port,
     /// with this console line (NDPluginDriver.cpp:605-611).
+    /// NDPluginDriver.cpp:766-769 for a write that never reached the param
+    /// library. C's paramName is unset when parseAsynUser fails; the
+    /// reason's name, or none, is printed instead.
+    fn int32_error_line(&self, reason: usize, value: i32, status: i32) -> AsynResult<String> {
+        let p = &self.plugin_params;
+        let port =
+            String::from_utf8_lossy(self.base.get_string_param(p.nd_array_port, 0)?).into_owned();
+        let nd_addr = self.base.get_int32_param(p.nd_array_addr, 0)?;
+        let connected = !port.is_empty() && self.unresolved(&port, nd_addr).is_none();
+        let name = self.base.params.param_name(reason).unwrap_or("");
+        Ok(format!(
+            "NDPluginDriver::writeInt32 ERROR, status={status}, function={reason}, paramName={name}, value={value}, connectedToArrayPort_={}",
+            connected as i32
+        ))
+    }
+
     fn unresolved(&self, port: &str, addr: i32) -> Option<String> {
         let key = self.wiring.key(port, addr);
         (!port.is_empty() && self.wiring.lookup_output(&key).is_none()).then(|| {
@@ -2590,7 +2606,17 @@ impl PortDriver for PluginPortDriver {
 
     fn io_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
+        // parseAsynUser (NDPluginDriver.cpp:702); a refusal goes to `done:`.
+        let addr = match self.base.parse_user(user) {
+            Ok(addr) => addr,
+            Err(e) => {
+                let _ = self.base.call_param_callbacks(user.addr);
+                let line = self.int32_error_line(reason, value, e.c_status_code())?;
+                self.base
+                    .trace_print(TraceMask::ERROR, format_args!("{line}"));
+                return Err(e);
+            }
+        };
         let base = self.base_int32(reason, value)?;
         for (mask, line) in &base.trace {
             self.base.trace_print(*mask, format_args!("{line}"));
@@ -2638,7 +2664,8 @@ impl PortDriver for PluginPortDriver {
 
     fn io_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
+        // parseAsynUser (NDPluginDriver.cpp:792).
+        let addr = self.base.parse_user(user)?;
         let WriteOutcome {
             verdict,
             side,
@@ -2665,7 +2692,12 @@ impl PortDriver for PluginPortDriver {
 
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        let addr = user.addr;
+        // C ignores parseAsynUser's status here (NDPluginDriver.cpp:829) and
+        // leaves the address for setStringParam to refuse.
+        let addr = self
+            .base
+            .get_address(user.addr, reason)
+            .unwrap_or_else(|_| asyn_rs::port::param_list(self.base.flags.multi_device, user.addr));
         let s = String::from_utf8_lossy(asyn_rs::port::c_str(data));
         // C `writeOctet` ignores connectToArrayPort's status
         // (NDPluginDriver.cpp:834-836): the write succeeds, the line is printed.
@@ -5458,6 +5490,91 @@ mod tests {
         drv.io_write_octet(&mut AsynUser::new(name), b"img\0tail")
             .unwrap();
         assert_eq!(drv.base.get_string_param(name, 0).unwrap(), b"img");
+    }
+
+    /// NDPluginDriver.cpp:702, :792, :829: parseAsynUser makes a
+    /// single-device plugin's address list 0.
+    #[test]
+    fn a_single_device_plugin_write_at_another_address_is_list_zero() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            "ADDRLIST0",
+            "Passthrough",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            PassthroughProcessor,
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        assert!(!drv.base.flags.multi_device);
+        let number = drv.ndarray_params.file_number;
+        drv.io_write_int32(&mut AsynUser::new(number).with_addr(1), 4)
+            .unwrap();
+        assert_eq!(drv.base.get_int32_param(number, 0).unwrap(), 4);
+        let rate = drv.plugin_params.max_byte_rate;
+        drv.io_write_float64(&mut AsynUser::new(rate).with_addr(1), 2.5)
+            .unwrap();
+        assert_eq!(drv.base.get_float64_param(rate, 0).unwrap(), 2.5);
+        let name = drv.ndarray_params.file_name;
+        drv.io_write_octet(&mut AsynUser::new(name).with_addr(1), b"img")
+            .unwrap();
+        assert_eq!(drv.base.get_string_param(name, 0).unwrap(), b"img");
+    }
+
+    /// NDPluginDriver.cpp:702-703, :764-769: a write parseAsynUser refuses
+    /// goes to `done:` and prints the ERROR line with getAddress's status.
+    #[test]
+    fn a_refused_plugin_address_prints_the_write_int32_error_line() {
+        let wiring = test_wiring();
+        wiring.register_output(
+            "UP",
+            Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut drv, _, _) = PluginPortDriver::new(
+            "ADDRDONE",
+            "Passthrough",
+            10,
+            &"UP".into(),
+            1,
+            tx,
+            PassthroughProcessor,
+            None,
+            1_000_000,
+            wiring,
+        )
+        .unwrap();
+        drv.base.flags.multi_device = true;
+        let log = std::env::temp_dir().join(format!("addr-done-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        asyn_rs::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some("ADDRDONE"),
+                asyn_rs::trace::TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        let number = drv.ndarray_params.file_number;
+        let e = drv
+            .io_write_int32(&mut AsynUser::new(number).with_addr(1), 4)
+            .unwrap_err();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(e.c_status_code(), 3);
+        assert!(
+            text.contains(&format!(
+                "NDPluginDriver::writeInt32 ERROR, status=3, function={number}, paramName=FILE_NUMBER, value=4, connectedToArrayPort_=1"
+            )),
+            "{text}"
+        );
     }
 
     /// asynNDArrayDriver.cpp:529-538 inside the write: FilePath gains its

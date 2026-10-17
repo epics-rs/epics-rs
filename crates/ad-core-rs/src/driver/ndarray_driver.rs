@@ -587,10 +587,12 @@ pub fn handle_write_int32(
     user: &AsynUser,
     value: i32,
 ) -> AsynResult<()> {
-    let status = port_base.set_int32_param(user.reason, user.addr, value);
+    let addr = port_base.parse_user(user)?;
+    let status = port_base.set_int32_param(user.reason, addr, value);
     // C keeps only setIntegerParam's status (:682).
     let _ = handle_pool_write_int32(port_base, params, pool, user.reason, template_array);
-    let _ = port_base.call_param_callbacks(user.addr);
+    // C's callParamCallbacks() is list 0 (asynNDArrayDriver.cpp:696).
+    let _ = port_base.call_param_callbacks(0);
     trace_write_int32(port_base, user, "asynNDArrayDriver", &status, value);
     status
 }

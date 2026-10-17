@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::panic::Location;
 
 use asyn_rs::error::AsynResult;
-use asyn_rs::port::PortDriver;
+use asyn_rs::port::{PortDriver, param_list};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 
@@ -64,7 +64,7 @@ impl WriteTail {
         body: impl FnOnce(&mut D, &mut AsynUser, AsynResult<()>) -> AsynResult<()>,
     ) -> AsynResult<()> {
         let site = Location::caller();
-        let addr = self.addr(user);
+        let addr = self.addr(drv, user);
         let status = drv.base_mut().set_int32_param(user.reason, addr, value);
         let status = body(drv, user, status);
         self.close(drv, user, addr, site, value, status)
@@ -81,16 +81,22 @@ impl WriteTail {
         body: impl FnOnce(&mut D, &mut AsynUser, AsynResult<()>) -> AsynResult<()>,
     ) -> AsynResult<()> {
         let site = Location::caller();
-        let addr = self.addr(user);
+        let addr = self.addr(drv, user);
         let status = drv.base_mut().set_float64_param(user.reason, addr, value);
         let status = body(drv, user, status);
         self.close(drv, user, addr, site, CFloat(value), status)
     }
 
-    fn addr(&self, user: &AsynUser) -> i32 {
+    fn addr<D: PortDriver>(&self, drv: &D, user: &AsynUser) -> i32 {
         match self.list {
             OwnList::Zero => 0,
-            OwnList::Addressed => user.addr,
+            // getAddress prints its refusal and leaves the address for the
+            // set to refuse; C ignores its status.
+            OwnList::Addressed => {
+                let base = drv.base();
+                base.get_address(user.addr, user.reason)
+                    .unwrap_or_else(|_| param_list(base.flags.multi_device, user.addr))
+            }
         }
     }
 
@@ -198,6 +204,7 @@ mod tests {
     #[test]
     fn an_addressed_set_past_the_lists_is_invalid_list() {
         let mut d = drv("TAIL_ADDRESSED", 2);
+        d.base.flags.multi_device = true;
         let tail = WriteTail {
             list: OwnList::Addressed,
             ..TAIL
@@ -209,6 +216,20 @@ mod tests {
         let mut user = AsynUser::new(reason).with_addr(2);
         let status = tail.write_int32(&mut d, &mut user, 3, |_, _, s| s);
         assert!(matches!(status, Err(AsynError::ParamInvalidList(2))));
+    }
+
+    /// getAddress: a single-device port's address is list 0.
+    #[test]
+    fn an_addressed_set_on_a_single_device_port_is_list_zero() {
+        let mut d = drv("TAIL_SINGLE", 1);
+        let tail = WriteTail {
+            list: OwnList::Addressed,
+            ..TAIL
+        };
+        let reason = d.int;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        tail.write_int32(&mut d, &mut user, 3, |_, _, s| s).unwrap();
+        assert_eq!(d.base.get_int32_param(reason, 0).unwrap(), 3);
     }
 
     /// The body sees the set's refusal, and the line prints what the body

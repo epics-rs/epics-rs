@@ -301,10 +301,11 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
     /// C++ `ADDriver::writeInt32` (ADDriver.cpp:84-116). A driver's
     /// `write_int32` calls it for every parameter it does not own.
     fn ad_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
-        let mut status =
-            self.ad_base_mut()
-                .port_base
-                .set_int32_param(user.reason, user.addr, value);
+        let addr = self.ad_base().port_base.parse_user(user)?;
+        let mut status = self
+            .ad_base_mut()
+            .port_base
+            .set_int32_param(user.reason, addr, value);
         let params = &self.ad_base().params;
         if user.reason == params.shutter_control {
             self.set_shutter(value != 0);
@@ -312,7 +313,8 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
             status = ADDriver::ndarray_write_int32(self, user, value);
         }
         let ad = self.ad_base_mut();
-        let _ = ad.port_base.call_param_callbacks(user.addr);
+        // C's callParamCallbacks() is list 0 (ADDriver.cpp:105).
+        let _ = ad.port_base.call_param_callbacks(0);
         trace_write_int32(&ad.port_base, user, "ADDriver", &status, value);
         status
     }
@@ -530,6 +532,31 @@ mod tests {
             d.ad_write_int32(&AsynUser::new(usize::MAX >> 1), 1)
                 .is_err()
         );
+    }
+
+    /// parseAsynUser (ADDriver.cpp:92): a single-device port's address is
+    /// list 0, a multi-device one past maxAddr is getAddress's asynError.
+    #[test]
+    fn ad_write_int32_resolves_the_address_as_parse_asyn_user() {
+        let mut d = own_shutter();
+        let image_mode = d.ad.params.image_mode;
+        d.ad_write_int32(&AsynUser::new(image_mode).with_addr(1), 2)
+            .unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(image_mode, 0).unwrap(), 2);
+        // asynNDArrayDriver::writeInt32 parses it again (asynNDArrayDriver.cpp:679).
+        let poll = d.ad.params.base.pool_poll_stats;
+        d.ad_write_int32(&AsynUser::new(poll).with_addr(1), 1)
+            .unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(poll, 0).unwrap(), 1);
+
+        let flags = asyn_rs::port::PortFlags {
+            multi_device: true,
+            ..ASYN_CANBLOCK
+        };
+        let mut d = BaseShutter(ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, flags).unwrap());
+        let status = d.ad_write_int32(&AsynUser::new(image_mode).with_addr(1), 3);
+        assert_eq!(status.unwrap_err().c_status_code(), 3);
+        assert_ne!(d.0.port_base.get_int32_param(image_mode, 0).ok(), Some(3));
     }
 
     #[test]

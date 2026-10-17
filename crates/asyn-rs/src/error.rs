@@ -488,6 +488,36 @@ impl AsynError {
         }
     }
 
+    /// C's `return (asynStatus)status` after `status |= ...` steps, with
+    /// the `errorMessage` the write leaves: [`Self::c_status_code`] gives
+    /// `code` back for 1-11. An OR past asynParamInvalidList (12-15) names no
+    /// status and is returned as asynError. `None` is success.
+    pub fn from_c_status_code(code: i32, message: String) -> Option<AsynError> {
+        let status = match code {
+            0 => return None,
+            1 => AsynStatus::Timeout,
+            2 => AsynStatus::Overflow,
+            4 => AsynStatus::Disconnected,
+            5 => AsynStatus::Disabled,
+            6..=11 => {
+                let source = match code {
+                    6 => AsynError::ParamAlreadyExists(String::new()),
+                    7 => AsynError::ParamNotFound(String::new()),
+                    8 => AsynError::TypeMismatch {
+                        expected: "",
+                        actual: "",
+                    },
+                    9 => AsynError::ParamIndexOutOfRange(0),
+                    10 => AsynError::ParamUndefined(0),
+                    _ => AsynError::ParamInvalidList(0),
+                };
+                return Some(source.in_param_access(message));
+            }
+            _ => AsynStatus::Error,
+        };
+        Some(AsynError::Status { status, message })
+    }
+
     /// Attach a partial octet transfer to a failing read. This is the only way
     /// to build [`AsynError::PartialRead`], so the underlying failure can never
     /// be lost in the conversion — it is wrapped, not copied.
@@ -605,5 +635,22 @@ impl fmt::Display for ErrorMessage<'_> {
             | AsynError::OctetStep { source, .. } => source.message_display().fmt(f),
             other => fmt::Display::fmt(other, f),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_c_status_code_round_trips_with_its_message() {
+        assert!(AsynError::from_c_status_code(0, String::new()).is_none());
+        for code in 1..=11 {
+            let e = AsynError::from_c_status_code(code, format!("m{code}")).unwrap();
+            assert_eq!(e.c_status_code(), code);
+            assert_eq!(e.message(), format!("m{code}"));
+        }
+        let e = AsynError::from_c_status_code(15, String::new()).unwrap();
+        assert_eq!(e.c_status_code(), 3);
     }
 }

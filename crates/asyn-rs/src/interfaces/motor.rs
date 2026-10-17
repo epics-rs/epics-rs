@@ -81,7 +81,9 @@ pub struct MotorStatus {
     pub problem: bool,
     /// Direction of last motion (true = positive).
     pub direction: bool,
-    /// True if encoder slip is detected.
+    /// MSTA bit 4 (EA_SLIP), C's `motorStatusSlip_`.
+    pub slip: bool,
+    /// MSTA bit 6 (EA_SLIP_STALL), C's `motorStatusFollowingError_`.
     pub slip_stall: bool,
     /// True if communication error was detected.
     pub comms_error: bool,
@@ -114,6 +116,7 @@ impl Default for MotorStatus {
             powered: false,
             problem: false,
             direction: false,
+            slip: false,
             slip_stall: false,
             comms_error: false,
             homed: false,
@@ -188,8 +191,10 @@ pub enum StatusWrite {
     /// `motorAxisLowHardLimit`, MSTA bit 13 RA_MINUS_LS.
     LowHardLimit(bool),
     /// `motorStatusCommsError_`, MSTA bit 12 CNTRL_COMM_ERR, which a C
-    /// driver sets when a controller write or read fails
-    /// (smarActMCSMotorDriver.cpp:622-627, ImsMDrivePlusMotorAxis.cpp:86-87).
+    /// axis sets when a controller write fails (smarActMCSMotorDriver.cpp:
+    /// 622-627, smarActSCUMotorDriver.cpp:446-448). A driver that sets the
+    /// param on its controller instead names it in
+    /// [`AsynMotor::param_owned_msta_bits`].
     CommsError(bool),
 }
 
@@ -312,6 +317,14 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
+    /// The MSTA bits (`1 << 12` is CNTRL_COMM_ERR) whose
+    /// `MOTOR_STATUS_*` parameter the driver sets on its controller port
+    /// itself, as IMS sets COMMS_ERROR (ImsMDrivePlusMotorController.cpp:
+    /// 403-406). The poller never mirrors those from the status.
+    fn param_owned_msta_bits(&self) -> u32 {
+        0
+    }
+
     /// Enable or disable closed-loop control.
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
         Ok(())
@@ -428,6 +441,21 @@ pub trait AsynMotor: Send + Sync {
     fn take_status_writes(&mut self) -> Vec<StatusWrite> {
         Vec::new()
     }
+
+    /// The controller port parameters the poll or write method just set on
+    /// the axis's address beyond its status, such as phytron's
+    /// `axisStatus_` (phytronAxisMotor.cpp:2084): the poller posts them in
+    /// the `callParamCallbacks` that ends the poll or the write
+    /// (asynMotorController.cpp:319). None by default.
+    fn take_poll_params(&mut self) -> Vec<(usize, crate::param::ParamValue)> {
+        Vec::new()
+    }
+
+    /// A model-2 driver's `motorAxisforceCallback`, which drvMotorAsyn
+    /// calls for a GET_INFO (drvMotorAsyn.c:617-619) ahead of the poll the
+    /// poller runs for it; a driver prints its FLOW line here
+    /// (drvEnsembleAsyn.cc:676). Nothing by default.
+    fn force_callback(&mut self, _user: &AsynUser) {}
 
     /// Initialize profile move with maximum number of points.
     fn initialize_profile(&mut self, _user: &AsynUser, _max_points: usize) -> AsynResult<()> {

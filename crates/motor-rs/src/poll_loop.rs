@@ -189,6 +189,11 @@ pub(crate) struct Axis {
     controller: Option<(String, i32)>,
     /// The status word last set in the controller port's parameters.
     mirrored_word: Option<u32>,
+    /// [`AsynMotor::param_owned_msta_bits`]: bit params the driver owns.
+    owned_bits: u32,
+    /// [`AsynMotor::take_poll_params`] of the last poll or write, which the
+    /// next `callParamCallbacks` on the axis posts.
+    poll_params: Vec<(usize, asyn_rs::param::ParamValue)>,
     power: Power,
 }
 
@@ -324,6 +329,8 @@ impl Axis {
             woken: false,
             controller: None,
             mirrored_word: None,
+            owned_bits: 0,
+            poll_params: Vec::new(),
             power: Power::Idle,
         }
     }
@@ -375,6 +382,9 @@ impl Axis {
     pub(crate) fn mirror_to(&mut self, port: &str, addr: i32) {
         self.controller = Some((port.to_owned(), addr));
         self.mirrored_word = None;
+        if let Ok(motor) = self.motor.lock() {
+            self.owned_bits = motor.param_owned_msta_bits();
+        }
         // The startup poll ran before the port was known.
         if let Some(status) = self.last_status.clone() {
             self.hold(&status);
@@ -545,19 +555,23 @@ impl Axis {
             .fold(false, |changed, (reason, value)| {
                 self.params.set(reason, value) | changed
             });
+        self.poll_params.extend(write.poll_params);
         if let Some(polled) = write.polled {
             self.publish_info(polled);
             return;
         }
-        if write.fields.is_empty() && !param_changed {
-            return;
+        if !write.fields.is_empty() || param_changed {
+            let mut status = self.last_status.clone().unwrap_or_else(status_before_poll);
+            for field in write.fields {
+                field.apply(&mut status);
+            }
+            if param_changed || self.last_status.as_ref() != Some(&status) {
+                self.publish(status);
+                return;
+            }
         }
-        let mut status = self.last_status.clone().unwrap_or_else(status_before_poll);
-        for field in write.fields {
-            field.apply(&mut status);
-        }
-        if param_changed || self.last_status.as_ref() != Some(&status) {
-            self.publish(status);
+        if !self.poll_params.is_empty() {
+            self.call_param_callbacks();
         }
     }
 
@@ -581,6 +595,7 @@ impl Axis {
     /// non-status integer is set (`status` stays 0 at :253, :267), a bug.
     fn hold(&mut self, status: &MotorStatus) {
         self.last_status = Some(status.clone());
+        let poll_params = std::mem::take(&mut self.poll_params);
         let Some((port, addr)) = &self.controller else {
             return;
         };
@@ -609,8 +624,9 @@ impl Axis {
         // C sets a MOTOR_STATUS_* bit only when a driver calls
         // setIntegerParam on it. The word here is the driver's whole status,
         // so only a bit that changed is one it set to something new; any
-        // other keeps what was set last, such as pmac's COMMS_ERROR.
-        let changed = self.mirrored_word.map_or(!0, |last| last ^ word);
+        // other keeps what was set last, such as pmac's COMMS_ERROR. A bit
+        // the driver sets on its params itself is never mirrored.
+        let changed = self.mirrored_word.map_or(!0, |last| last ^ word) & !self.owned_bits;
         self.mirrored_word = Some(word);
         updates.extend((0..15).filter(|bit| changed >> bit & 1 != 0).map(|bit| {
             let value = ((word >> bit) & 1) as i32;
@@ -620,6 +636,11 @@ impl Axis {
                 ParamValue::Int32(value),
             )
         }));
+        updates.extend(
+            poll_params
+                .into_iter()
+                .map(|(reason, value)| ParamSetValue::new(reason, addr, value)),
+        );
         // C drivers ignore the status of setXxxParam and callParamCallbacks.
         let _ = handle.set_params_and_notify_blocking(addr, updates);
     }
@@ -627,12 +648,18 @@ impl Axis {
     /// C's `callParamCallbacks` on the axis with no status to set: posts
     /// whatever was set on it since the last one, such as a
     /// [`WriteHook`](crate::controller_port::WriteHook)'s sets.
-    fn call_param_callbacks(&self) {
+    fn call_param_callbacks(&mut self) {
+        let poll_params = std::mem::take(&mut self.poll_params);
         let Some((port, addr)) = &self.controller else {
             return;
         };
+        let addr = *addr;
+        let updates = poll_params
+            .into_iter()
+            .map(|(reason, value)| asyn_rs::request::ParamSetValue::new(reason, addr, value))
+            .collect();
         if let Some(handle) = crate::devices::controller_port_handle(port) {
-            let _ = handle.set_params_and_notify_blocking(*addr, Vec::new());
+            let _ = handle.set_params_and_notify_blocking(addr, updates);
         }
     }
 
@@ -686,6 +713,7 @@ impl Axis {
         match self.motor.lock() {
             Ok(mut motor) => {
                 let polled = poll_driver(&mut *motor, &user);
+                self.poll_params.extend(motor.take_poll_params());
                 // A model-2 driver's update sets its paramLib
                 // (drvMotorSim.c:646-653); the poll's status posts them.
                 for write in motor.take_status_writes() {
@@ -1308,6 +1336,8 @@ pub struct AxisWrite {
     params: Vec<(i32, WriteValue)>,
     /// The driver poll a GET_INFO ran.
     polled: Option<Result<MotorStatus, FailedPoll>>,
+    /// The poll's or the write's [`AsynMotor::take_poll_params`].
+    poll_params: Vec<(usize, asyn_rs::param::ParamValue)>,
 }
 
 /// A failed driver poll: the bits its error label raises and the status it
@@ -1771,6 +1801,9 @@ fn execute_commands_after(
             // GET_INFO polls inside the write, before its closing line
             // (asynMotorController.cpp:217-222; drvMotorAsyn.c:617-619).
             MotorCommand::Poll => {
+                if drvset {
+                    motor.force_callback(&user);
+                }
                 controller_poll();
                 let r = motor.poll(&user);
                 polled = Some(match &r {
@@ -1798,6 +1831,7 @@ fn execute_commands_after(
             let set = asyn_rs::request::ParamSetValue::new(function as usize, axis, value);
             let _ = params.set_params_and_notify_blocking(axis, vec![set]);
         }
+        let poll_params = motor.take_poll_params();
         let position = match *cmd {
             MotorCommand::SetPosition { position } | MotorCommand::InitPosition { position } => {
                 Some(StatusWrite::Position(position))
@@ -1846,6 +1880,7 @@ fn execute_commands_after(
             fields: writes,
             params,
             polled,
+            poll_params,
         });
 
         if let (true, Some((_, value))) = (model2, c) {
@@ -2278,6 +2313,115 @@ mod tests {
 
     type Gate = Arc<epics_base_rs::runtime::interrupt_accept::InterruptGate>;
 
+    /// Moving while `moving` is; each poll sets HIGH_LIMIT to `limit`.
+    struct PollSets {
+        moving: Arc<std::sync::atomic::AtomicBool>,
+        limit: Arc<Mutex<f64>>,
+    }
+
+    impl AsynMotor for PollSets {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            let moving = self.moving.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(MotorStatus {
+                moving,
+                done: !moving,
+                ..MotorStatus::default()
+            })
+        }
+        fn take_poll_params(&mut self) -> Vec<(usize, asyn_rs::param::ParamValue)> {
+            let limit = *self.limit.lock().unwrap();
+            vec![(
+                crate::controller_port::index::HIGH_LIMIT,
+                asyn_rs::param::ParamValue::Float64(limit),
+            )]
+        }
+    }
+
+    /// A poll's or a write's own parameters post with its status when it
+    /// changed, and in the bare callParamCallbacks when it did not
+    /// (phytronAxisMotor.cpp:2084-2088, asynMotorController.cpp:319).
+    #[test]
+    fn a_poll_or_write_s_parameters_post_whether_or_not_its_status_changed() {
+        use crate::controller_port::index;
+        let port = "PLPOLLSETS";
+        let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+        let handle = crate::devices::register_controller_port(&gate, port, 1, ()).unwrap();
+        let moving = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limit = Arc::new(Mutex::new(1.0));
+        let motor = PollSets {
+            moving: Arc::clone(&moving),
+            limit: Arc::clone(&limit),
+        };
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let user = TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        };
+        let axis = controller.axis(Arc::new(Mutex::new(motor)), user).axis;
+        crate::devices::register_axis(axis).unwrap();
+        let mut poll_loop = controller.build(SCAN, SCAN, 0);
+        let read = || handle.read_float64_blocking(index::HIGH_LIMIT, 0).unwrap();
+
+        *limit.lock().unwrap() = 3.0;
+        now(poll_loop.poller_pass(false));
+        assert_eq!(read(), 3.0, "unchanged status");
+        *limit.lock().unwrap() = 4.0;
+        moving.store(true, std::sync::atomic::Ordering::SeqCst);
+        now(poll_loop.poller_pass(false));
+        assert_eq!(read(), 4.0, "changed status");
+        *limit.lock().unwrap() = 5.0;
+        let trace = Arc::new(MotorTrace::with_user(TraceUser::Asyn {
+            port: port.into(),
+            addr: 0,
+        }));
+        let batch = CommandBatch {
+            trace,
+            record: None,
+            commands: vec![MotorCommand::Poll],
+        };
+        now(poll_loop.execute(0, &batch));
+        assert_eq!(read(), 5.0, "GET_INFO");
+        let write = |command| CommandBatch {
+            trace: Arc::clone(&batch.trace),
+            record: None,
+            commands: vec![command],
+        };
+        *limit.lock().unwrap() = 6.0;
+        now(poll_loop.execute(0, &write(MotorCommand::Stop { acceleration: 1.0 })));
+        assert_eq!(read(), 6.0, "write leaving the status");
+        *limit.lock().unwrap() = 7.0;
+        let move_to = MotorCommand::MoveAbsolute {
+            position: 1.0,
+            min_velocity: 0.0,
+            velocity: 1.0,
+            acceleration: 1.0,
+        };
+        now(poll_loop.execute(0, &write(move_to)));
+        assert_eq!(read(), 7.0, "write changing the status");
+    }
+
     /// Records its closed-loop calls and moves; moving while `moving` is.
     struct Powered {
         calls: Arc<Mutex<Vec<&'static str>>>,
@@ -2516,6 +2660,85 @@ mod tests {
         now(poll_loop.poller_pass(false));
         now(poll_loop.poller_pass(false));
         assert_eq!(comms(&handle), Some(0), "the driver's own clear");
+    }
+
+    /// IMS's shape: COMMS_ERROR is set on the controller's params by the
+    /// driver (ImsMDrivePlusMotorController.cpp:403-406), never from MSTA.
+    struct OwnsComms(Script);
+
+    impl AsynMotor for OwnsComms {
+        fn move_absolute(
+            &mut self,
+            u: &AsynUser,
+            p: f64,
+            a: f64,
+            b: f64,
+            c: f64,
+        ) -> AsynResult<()> {
+            self.0.move_absolute(u, p, a, b, c)
+        }
+        fn move_relative(
+            &mut self,
+            u: &AsynUser,
+            p: f64,
+            a: f64,
+            b: f64,
+            c: f64,
+        ) -> AsynResult<()> {
+            self.0.move_relative(u, p, a, b, c)
+        }
+        fn home(&mut self, u: &AsynUser, a: f64, b: f64, c: f64, f: bool) -> AsynResult<()> {
+            self.0.home(u, a, b, c, f)
+        }
+        fn stop(&mut self, u: &AsynUser, a: f64) -> AsynResult<()> {
+            self.0.stop(u, a)
+        }
+        fn set_position(&mut self, u: &AsynUser, p: f64) -> AsynResult<()> {
+            self.0.set_position(u, p)
+        }
+        fn poll_failure(&self) -> PollFailure {
+            self.0.poll_failure()
+        }
+        fn poll(&mut self, u: &AsynUser) -> AsynResult<MotorStatus> {
+            self.0.poll(u)
+        }
+        fn param_owned_msta_bits(&self) -> u32 {
+            crate::flags::MstaFlags::COMM_ERR.bits()
+        }
+    }
+
+    #[test]
+    fn a_driver_owned_status_bit_is_never_mirrored_from_the_status() {
+        use crate::controller_port::index::STATUS_COMMS_ERROR;
+        use asyn_rs::param::ParamValue;
+        use asyn_rs::request::ParamSetValue;
+        let port = "PLOWNBIT";
+        let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+        let handle = crate::devices::register_controller_port(&gate, port, 1, ()).unwrap();
+        let set = ParamSetValue::new(STATUS_COMMS_ERROR, 0, ParamValue::Int32(1));
+        handle.set_params_and_notify_blocking(0, vec![set]).unwrap();
+        let (_poll_tx, poll) = mpsc::channel(1);
+        let (_tx, commands) = mpsc::unbounded_channel();
+        let cleared = MotorStatus {
+            comms_error: false,
+            ..at(2.0)
+        };
+        let script = [MotorStatus::default(), at(1.0), cleared].map(Some);
+        let motor: Arc<Mutex<dyn AsynMotor>> =
+            Arc::new(Mutex::new(OwnsComms(Script(script.into_iter().collect()))));
+        let mut poll_loop = MotorPollLoop::new(
+            PollerInbox { poll, commands },
+            motor,
+            AxisSubscribers::new(),
+            SCAN,
+            SCAN,
+            0,
+        );
+        poll_loop.axes[0].mirror_to(port, 0);
+        now(poll_loop.poller_pass(false));
+        assert_eq!(comms(&handle), Some(1), "the first post leaves it");
+        now(poll_loop.poller_pass(false));
+        assert_eq!(comms(&handle), Some(1));
     }
 
     fn comms(handle: &asyn_rs::port_handle::PortHandle) -> Option<i32> {
@@ -3309,6 +3532,69 @@ mod tests {
         assert!(io_intr.try_recv().is_ok());
         assert!(io_intr.try_recv().is_err());
         assert!(!poll_loop.axes[0].woken);
+    }
+
+    /// A motor recording the order of its GET_INFO calls.
+    struct ForceCallbackOrder(Vec<&'static str>);
+
+    impl AsynMotor for ForceCallbackOrder {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+        fn force_callback(&mut self, _: &AsynUser) {
+            self.0.push("force_callback");
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            self.0.push("poll");
+            Ok(MotorStatus::default())
+        }
+    }
+
+    /// drvMotorAsyn's GET_INFO calls the driver's forceCallback
+    /// (drvMotorAsyn.c:617-619); asynMotorController's only polls
+    /// (asynMotorController.cpp:217-221).
+    #[test]
+    fn a_model2_get_info_calls_force_callback_before_the_poll() {
+        for (user, want) in [
+            (
+                TraceUser::Model2 {
+                    port: "PLM2FORCE".into(),
+                    addr: 0,
+                },
+                &["force_callback", "poll"][..],
+            ),
+            (
+                TraceUser::Asyn {
+                    port: "PLM3FORCE".into(),
+                    addr: 0,
+                },
+                &["poll"][..],
+            ),
+        ] {
+            let mut motor = ForceCallbackOrder(Vec::new());
+            let trace = MotorTrace::with_user(user);
+            execute_commands(&mut motor, &trace, &[MotorCommand::Poll], &mut |_| {});
+            assert_eq!(motor.0, want);
+        }
     }
 
     /// GET_INFO is `needUpdate = 1` on the status last called back: no

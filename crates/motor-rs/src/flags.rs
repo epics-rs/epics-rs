@@ -81,6 +81,9 @@ impl MstaFlags {
         if status.problem {
             msta |= Self::PROBLEM;
         }
+        if status.slip {
+            msta |= Self::SLIP;
+        }
         if status.slip_stall {
             msta |= Self::SLIP_STALL;
         }
@@ -679,3 +682,28 @@ impl std::fmt::Display for MotorError {
 }
 
 impl std::error::Error for MotorError {}
+
+#[cfg(test)]
+mod msta_tests {
+    use super::*;
+    use asyn_rs::interfaces::motor::MotorStatus;
+
+    /// asynMotorController's status params are the MSTA bits in order, so
+    /// motorStatusSlip_ is bit 4 and motorStatusFollowingError_ bit 6
+    /// (asynMotorController.cpp:85-99).
+    #[test]
+    fn slip_and_following_error_are_bits_4_and_6() {
+        let slip = MotorStatus {
+            slip: true,
+            done: false,
+            ..MotorStatus::default()
+        };
+        let stall = MotorStatus {
+            slip_stall: true,
+            done: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(MstaFlags::from_status(&slip).bits(), 0x10);
+        assert_eq!(MstaFlags::from_status(&stall).bits(), 0x40);
+    }
+}

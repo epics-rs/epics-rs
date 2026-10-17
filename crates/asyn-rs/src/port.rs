@@ -1853,14 +1853,26 @@ impl PortDriverBase {
         Ok(DrvUserInfo::from_reason(reason))
     }
 
+    /// [`Self::get_address`]'s parameter list without its print: `Err`
+    /// carries the refused one, for the caller to print where C's
+    /// `getAddress` call sits.
+    pub fn resolve_address(&self, addr: i32) -> Result<i32, i32> {
+        let address = param_list(self.flags.multi_device, addr);
+        if address >= 0 && (address as usize) < self.max_addr {
+            Ok(address)
+        } else {
+            Err(address)
+        }
+    }
+
     /// C `asynPortDriver::getAddress` (asynPortDriver.cpp:1901-1914): the
     /// parameter list `addr` selects ([`param_list`]), printing a refused one
     /// through the device's trace.
     pub fn get_address(&self, addr: i32, reason: usize) -> AsynResult<i32> {
-        let address = param_list(self.flags.multi_device, addr);
-        if address >= 0 && (address as usize) < self.max_addr {
-            return Ok(address);
-        }
+        let address = match self.resolve_address(addr) {
+            Ok(address) => return Ok(address),
+            Err(address) => address,
+        };
         self.trace_print_at(
             addr,
             reason as i32,

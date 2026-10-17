@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::error::AsynResult;
+use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriver;
 use asyn_rs::port::PortDriverBase;
@@ -14,7 +14,7 @@ use asyn_rs::user::AsynUser;
 use motor_rs::controller_port::{
     BASE_PARAMS, ControllerCtx, ControllerParams, ControllerPort, ControllerReport, FinishedWrite,
     PROFILE_EXECUTE_DONE, PROFILE_TIME_MODE_FIXED, ParamDelta, ParamWrite, WriteHook, WriteOutcome,
-    WriteValue, index,
+    WriteValue, has_motor_axis, index,
 };
 use motor_rs::device_state::AxisSubscribers;
 use motor_rs::device_support::{AxisReport, MotorAxis};
@@ -1165,4 +1165,135 @@ fn a_driver_read_override_answers_its_own_params_and_leaves_the_base_s() {
         port.read_float64_blocking(index::ACCEL, 0).is_err(),
         "undefined"
     );
+}
+
+/// phytron's controller records: C's subclass `writeInt32` runs at an
+/// address with no axis, and only the base it calls refuses there
+/// (asynMotorController.cpp `getAxis` → asynError; phytronAxisMotor.cpp:365-385).
+#[derive(Default)]
+struct ControllerWrites {
+    reset: usize,
+    refused: usize,
+    gain: usize,
+    seen: Arc<Mutex<Vec<(usize, i32, bool)>>>,
+}
+
+impl ControllerParams for ControllerWrites {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.reset = base.create_param("RESET", ParamType::Int32)?;
+        self.refused = base.create_param("REFUSED", ParamType::Int32)?;
+        self.gain = base.create_param("GAIN", ParamType::Float64)?;
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        _value: i32,
+    ) -> ParamWrite {
+        let found = has_motor_axis(base, user);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((user.reason, user.addr, found));
+        if user.reason == self.reset {
+            return ParamWrite::Handled(Ok(()));
+        }
+        if user.reason == self.refused {
+            return ParamWrite::PassToBase(Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "driver's own".into(),
+            }));
+        }
+        ParamWrite::PassToBase(Ok(()))
+    }
+
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        _value: f64,
+    ) -> ParamWrite {
+        let found = has_motor_axis(base, user);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((user.reason, user.addr, found));
+        if user.reason == self.gain {
+            return ParamWrite::Handled(Ok(()));
+        }
+        ParamWrite::PassToBase(Ok(()))
+    }
+}
+
+#[test]
+fn a_write_at_an_address_with_no_axis_runs_the_driver_s_code_first() {
+    let params = ControllerWrites::default();
+    let seen = params.seen.clone();
+    let port = register_controller_port(&open_owner(), "CPNOAXIS", 2, params).unwrap();
+    let _ax = axis("CPNOAXIS", 0);
+    let (reset, refused, gain) = (
+        BASE_PARAMS.len(),
+        BASE_PARAMS.len() + 1,
+        BASE_PARAMS.len() + 2,
+    );
+    port.write_int32_blocking(reset, 0, 1).unwrap();
+    port.write_int32_blocking(reset, 1, 1).unwrap();
+    assert!(
+        port.read_int32_blocking(reset, 1).is_err(),
+        "the base stored nothing"
+    );
+    port.write_float64_blocking(gain, 1, 2.5).unwrap();
+    let e = port.write_int32_blocking(refused, 1, 1).unwrap_err();
+    assert_eq!(
+        e.status(),
+        AsynStatus::Timeout,
+        "the driver's own status first"
+    );
+    let e = port
+        .write_int32_blocking(index::DEFER_MOVES, 1, 1)
+        .unwrap_err();
+    assert_eq!(e.status(), AsynStatus::Error, "the base's no-axis refusal");
+    assert!(port.write_float64_blocking(index::ACCEL, 1, 1.0).is_err());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            (reset, 0, true),
+            (reset, 1, false),
+            (gain, 1, false),
+            (refused, 1, false),
+            (index::DEFER_MOVES, 1, false),
+            (index::ACCEL, 1, false)
+        ]
+    );
+}
+
+/// Each `getAxis` C runs at an out-of-range address prints getAddress's
+/// line once: the driver's own, then the base's if the driver calls it.
+#[test]
+fn an_out_of_range_write_prints_once_per_c_get_axis() {
+    use asyn_rs::manager::PortManager;
+    use asyn_rs::trace::TraceFile;
+    let port =
+        register_controller_port(&open_owner(), "CPRANGE", 2, ControllerWrites::default()).unwrap();
+    let _ax = axis("CPRANGE", 0);
+    let path = std::env::temp_dir().join(format!("cp-range-{}", std::process::id()));
+    let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+    let manager = PortManager::global();
+    let trace = manager.trace_manager();
+    trace.set_trace_file(Some("CPRANGE"), TraceFile::File(file.clone()));
+    trace.set_device_trace_file("CPRANGE", 5, TraceFile::File(file));
+    let lines = || {
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .matches("getAddress: CPRANGE invalid address=5")
+            .count()
+    };
+    let reset = BASE_PARAMS.len();
+    port.write_int32_blocking(reset, 5, 1).unwrap();
+    assert_eq!(lines(), 1, "the driver's getAxis only");
+    assert!(port.write_int32_blocking(index::DEFER_MOVES, 5, 1).is_err());
+    assert_eq!(lines(), 3, "the driver's and the base's");
+    let _ = std::fs::remove_file(&path);
 }

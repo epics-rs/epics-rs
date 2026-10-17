@@ -254,8 +254,7 @@ mod tests {
     use super::*;
     use std::net::UdpSocket;
 
-    fn inode_of(s: &UdpSocket) -> u32 {
-        use std::os::fd::AsRawFd;
+    fn inode_of(s: &impl std::os::fd::AsRawFd) -> u32 {
         let link = std::fs::read_link(format!("/proc/self/fd/{}", s.as_raw_fd())).unwrap();
         let link = link.to_string_lossy();
         link.trim_start_matches("socket:[")
@@ -264,15 +263,36 @@ mod tests {
             .unwrap()
     }
 
-    /// Exactly the sockets on the port, each once, with its address and inode;
-    /// a closed one is gone.
+    /// The rows of `rows` whose inode is in `inodes`, by inode, once every row
+    /// has been checked to appear once. A port picked by binding one address
+    /// is free on that address only: another process may hold the number on
+    /// another one (a caRepeater on the NIC's address did), and is rightly
+    /// listed.
+    fn own(rows: &[PortHolder], inodes: &[u32]) -> Vec<PortHolder> {
+        let mut seen: Vec<u32> = rows.iter().map(|h| h.inode).collect();
+        seen.sort_unstable();
+        assert!(
+            seen.windows(2).all(|w| w[0] != w[1]),
+            "a repeated row: {rows:?}"
+        );
+        let mut mine: Vec<PortHolder> = rows
+            .iter()
+            .filter(|h| inodes.contains(&h.inode))
+            .cloned()
+            .collect();
+        mine.sort_by_key(|h| h.inode);
+        mine
+    }
+
+    /// The port's sockets, ours among them, each once, with its address and
+    /// inode; a closed one is gone.
     #[test]
     fn a_port_lists_its_own_sockets_once() {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = a.local_addr().unwrap().port();
         let b = UdpSocket::bind(("127.0.0.2", port)).unwrap();
-        let mut got = udp_holders(port).unwrap();
-        got.sort_by_key(|h| h.inode);
+        let inodes = [inode_of(&a), inode_of(&b)];
+        let got = own(&udp_holders(port).unwrap(), &inodes);
         let mut want = vec![
             PortHolder {
                 local: a.local_addr().unwrap(),
@@ -287,7 +307,7 @@ mod tests {
         assert_eq!(got, want);
         drop(b);
         assert_eq!(
-            udp_holders(port).unwrap(),
+            own(&udp_holders(port).unwrap(), &inodes),
             vec![
                 want.into_iter()
                     .find(|h| h.local.ip() == Ipv4Addr::LOCALHOST)
@@ -297,8 +317,8 @@ mod tests {
     }
 
     /// The boundary the `/proc/net/udp` scan failed at: while other threads
-    /// open and close sockets as fast as they can, two held sockets read as
-    /// exactly two, every time.
+    /// open and close sockets as fast as they can, two held sockets read
+    /// once each, every time.
     #[test]
     fn a_held_pair_reads_as_two_under_socket_churn() {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -318,8 +338,9 @@ mod tests {
                 })
             })
             .collect();
+        let inodes = [inode_of(&a), inode_of(&b)];
         for _ in 0..500 {
-            assert_eq!(udp_holders(port).unwrap().len(), 2);
+            assert_eq!(own(&udp_holders(port).unwrap(), &inodes).len(), 2);
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for t in churn {
@@ -335,19 +356,26 @@ mod tests {
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = v4.local_addr().unwrap().port();
         let client = std::net::TcpStream::connect(v4.local_addr().unwrap()).unwrap();
-        let (_served, _) = v4.accept().unwrap();
-        let got = tcp_listeners(port).unwrap();
+        let (served, _) = v4.accept().unwrap();
+        let ours = [inode_of(&v4), inode_of(&client), inode_of(&served)];
+        let got = own(&tcp_listeners(port).unwrap(), &ours);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].local, v4.local_addr().unwrap());
         assert_eq!(
-            tcp_listeners(client.local_addr().unwrap().port()).unwrap(),
+            own(
+                &tcp_listeners(client.local_addr().unwrap().port()).unwrap(),
+                &ours
+            ),
             vec![]
         );
         drop(v4);
-        assert_eq!(tcp_listeners(port).unwrap(), vec![]);
+        assert_eq!(own(&tcp_listeners(port).unwrap(), &ours), vec![]);
 
         let v6 = std::net::TcpListener::bind("[::1]:0").unwrap();
-        let got = tcp_listeners(v6.local_addr().unwrap().port()).unwrap();
+        let got = own(
+            &tcp_listeners(v6.local_addr().unwrap().port()).unwrap(),
+            &[inode_of(&v6)],
+        );
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].local, v6.local_addr().unwrap());
     }

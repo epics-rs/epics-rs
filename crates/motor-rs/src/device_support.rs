@@ -35,6 +35,8 @@ pub struct MotorAxis {
     poll_cmd_tx: mpsc::Sender<PollCommand>,
     motor_cmd_tx: MotorCommandSender,
     subscribers: AxisSubscribers,
+    /// The model-2 parameter library its poller keeps.
+    params: Model2Params,
     report: Option<Arc<dyn AxisReport>>,
     /// The driver's [`asyn_rs::interfaces::motor::AsynMotor::disables_ntm`].
     disables_ntm: bool,
@@ -55,6 +57,7 @@ impl MotorAxis {
             poll_cmd_tx,
             motor_cmd_tx,
             subscribers,
+            params: Model2Params::default(),
             report: None,
             disables_ntm: false,
         }
@@ -74,9 +77,15 @@ impl MotorAxis {
             poll_cmd_tx: self.poll_cmd_tx.clone(),
             motor_cmd_tx: self.motor_cmd_tx.clone(),
             subscribers: self.subscribers.clone(),
+            params: self.params.clone(),
             report: self.report.clone(),
             disables_ntm: self.disables_ntm,
         }
+    }
+
+    /// The axis's model-2 parameter library.
+    pub(crate) fn params(&self) -> &Model2Params {
+        &self.params
     }
 
     /// The driver's [`AxisReport`], C's `asynMotorAxis::report` override.

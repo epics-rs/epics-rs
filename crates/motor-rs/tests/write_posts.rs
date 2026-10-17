@@ -54,8 +54,14 @@ impl AsynMotor for Axis {
     fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
         self.outcome()
     }
+    /// A failed stop raises PROBLEM and COMMS_ERROR, as a C caller of a
+    /// failed `writeController` does (smarActMCSMotorDriver.cpp:622-627).
     fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
-        Ok(())
+        if self.fail.load(Ordering::Relaxed) {
+            self.pending.push(StatusWrite::Problem(true));
+            self.pending.push(StatusWrite::CommsError(true));
+        }
+        self.outcome()
     }
     fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
         self.outcome()
@@ -445,4 +451,14 @@ fn a_controller_parameter_write_posts_nothing() {
     let mut rig = rig(controller(), 1.0);
     assert_eq!(rig.write(high_limit(5.0)), None);
     assert!(rig.record.passes().is_empty());
+}
+
+#[test]
+fn a_controller_write_that_fails_on_the_wire_posts_the_comms_error() {
+    let mut rig = rig(controller(), 1.0);
+    rig.fail.store(true, Ordering::Relaxed);
+    let stop = MotorCommand::Stop { acceleration: 1.0 };
+    let posted = rig.write(stop.clone()).unwrap();
+    assert!(posted.comms_error && posted.problem);
+    assert_eq!(rig.write(stop), None);
 }

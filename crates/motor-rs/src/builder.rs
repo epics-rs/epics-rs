@@ -303,7 +303,8 @@ impl ControllerAxes {
                 poll_cmd_tx: poll_cmd_tx.clone(),
                 mirror: mirror.clone(),
             });
-            let mut polled = Axis::polled(inbox, motor.clone(), subscribers);
+            let mut polled =
+                Axis::polled(inbox, motor.clone(), subscribers).with_params(axis.params().clone());
             if let Some((port, addr)) = mirror {
                 polled.mirror_to(&port, addr);
             }
@@ -453,6 +454,7 @@ mod tests {
     use asyn_rs::user::AsynUser;
 
     use super::*;
+    use crate::controller_port::WriteValue;
     use crate::flags::MotorCommand;
 
     type Log = Arc<Mutex<Vec<(&'static str, ThreadId, Instant)>>>;
@@ -500,6 +502,42 @@ mod tests {
                 ..MotorStatus::default()
             })
         }
+    }
+
+    /// drvMotorSim's report dumps the axis's paramLib (drvMotorSim.c:186,
+    /// paramLib.c:299-317): what a record's write stored there reads back by
+    /// port and address.
+    #[test]
+    fn a_model2_axis_s_stored_parameters_read_by_port_and_address() {
+        crate::devices::register_drv_motor_asyn_port("builderParams2", 1).unwrap();
+        let mut controller = ControllerBuilder::new();
+        let card = Card {
+            name: "P",
+            log: Log::default(),
+            delay: Duration::ZERO,
+        };
+        let user = TraceUser::Model2 {
+            port: "builderParams2".into(),
+            addr: 0,
+        };
+        let ControllerAxis { axis, .. } = controller.axis(Arc::new(Mutex::new(card)), user);
+        axis.send(MotorCommand::SetHighLimit { position: 2.5 });
+        crate::devices::register_axis(axis).unwrap();
+        controller.build(SLOW, SLOW, 0).run_queued_commands();
+
+        let params = crate::devices::model2_params("builderParams2", 0).unwrap();
+        assert_eq!(params.get(4), Some(WriteValue::Float64(2.5)));
+        let mut dump = String::new();
+        params.dump(&mut dump);
+        let mut want = String::from("Number of parameters is: 28\n");
+        for i in 0..28 {
+            want += &match i {
+                4 => format!("Parameter {i} is a double, value 2.500000\n"),
+                _ => format!("Parameter {i} is undefined\n"),
+            };
+        }
+        assert_eq!(dump, want);
+        assert!(crate::devices::model2_params("builderParams2", 1).is_none());
     }
 
     #[test]

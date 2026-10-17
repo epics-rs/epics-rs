@@ -367,6 +367,18 @@ pub trait ControllerParams: Send + Sync + 'static {
         ParamWrite::PassToBase(Ok(()))
     }
 
+    /// The subclass `readInt32`; an override calls
+    /// [`PortDriverBase::read_int32_param`] as C calls the base.
+    /// asynMotorController has none, so the base is asynPortDriver's.
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
+        base.read_int32_param(user)
+    }
+
+    /// The subclass `readFloat64`; see [`Self::read_int32`].
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
+        base.read_float64_param(user)
+    }
+
     /// The subclass `writeUInt32Digital`; see [`Self::write_int32`].
     /// asynMotorController has none, so the base is asynPortDriver's.
     fn write_uint32_digital(
@@ -451,6 +463,16 @@ impl ControllerReport<'_> {
     /// C `numAxes_`.
     pub fn num_axes(&self) -> usize {
         self.port.base().max_addr
+    }
+
+    /// C `getDoubleParam(addr, reason, &value)`.
+    pub fn float64_param(&self, addr: i32, reason: usize) -> AsynResult<f64> {
+        self.port.base().get_float64_param(reason, addr)
+    }
+
+    /// C `getIntegerParam(addr, reason, &value)`.
+    pub fn int32_param(&self, addr: i32, reason: usize) -> AsynResult<i32> {
+        self.port.base().get_int32_param(reason, addr)
     }
 
     /// C `asynMotorController::report` (asynMotorController.cpp:164-177):
@@ -1045,6 +1067,14 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
         let this: &Self = self;
         this.params
             .report(&ControllerReport { port: this }, out, level);
+    }
+
+    fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        self.params.read_int32(&mut self.base, user)
+    }
+
+    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        self.params.read_float64(&mut self.base, user)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

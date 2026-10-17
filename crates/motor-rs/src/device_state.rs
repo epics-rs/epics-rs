@@ -3,6 +3,7 @@ use asyn_rs::trace::TraceMask;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::controller_port::WriteValue;
 use crate::trace::MotorTrace;
 
 /// Stamped motor status with sequence number for change detection.
@@ -272,6 +273,50 @@ pub type SharedDeviceState = Arc<Mutex<MotorDeviceState>>;
 
 pub fn new_shared_state() -> SharedDeviceState {
     Arc::new(Mutex::new(MotorDeviceState::default()))
+}
+
+/// C `MOTOR_AXIS_NUM_PARAMS` (motor_interface.h:335): the parameters a
+/// model-2 driver's paramLib holds, `motorAxisPosition` through
+/// `motorAxisMoveToHome`.
+const MOTOR_AXIS_NUM_PARAMS: i32 = 28;
+
+/// A model-2 axis's parameter library (C paramLib), by drvMotorAsyn reason:
+/// what the driver's `setDouble` / `setInteger` stored last. The axis's
+/// poller writes it; the driver's report reads it.
+#[derive(Clone, Default)]
+pub struct Model2Params(Arc<Mutex<std::collections::HashMap<i32, WriteValue>>>);
+
+impl Model2Params {
+    /// C `paramSet`: whether it changed the parameter's type or value
+    /// (paramLib.c:112-118, 141-147).
+    pub(crate) fn set(&self, reason: i32, value: WriteValue) -> bool {
+        let mut params = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        params.insert(reason, value) != Some(value)
+    }
+
+    /// C `getDouble` / `getInteger`; `None` while undefined.
+    pub fn get(&self, reason: i32) -> Option<WriteValue> {
+        let params = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        params.get(&reason).copied()
+    }
+
+    /// C `paramDump` (paramLib.c:299-317).
+    pub fn dump(&self, out: &mut dyn std::fmt::Write) {
+        use epics_base_rs::calc::engine::cvt::fmt_f;
+        let params = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(out, "Number of parameters is: {MOTOR_AXIS_NUM_PARAMS}");
+        for i in 0..MOTOR_AXIS_NUM_PARAMS {
+            let _ = match params.get(&i) {
+                Some(WriteValue::Float64(v)) => {
+                    writeln!(out, "Parameter {i} is a double, value {}", fmt_f(*v, 6))
+                }
+                Some(WriteValue::Int32(v)) => {
+                    writeln!(out, "Parameter {i} is an integer, value {v}")
+                }
+                None => writeln!(out, "Parameter {i} is undefined"),
+            };
+        }
+    }
 }
 
 /// A record bound to an axis, by the order it attached.

@@ -212,6 +212,33 @@ pub(crate) fn axis_at(port: &str, addr: i32) -> Option<MotorAxis> {
     Some(axis.clone())
 }
 
+/// The parameter library of model-2 axis `addr` of `drvMotorAsyn` port
+/// `port`, which the driver's report dumps (drvMotorSim.c:186).
+pub fn model2_params(port: &str, addr: i32) -> Option<crate::device_state::Model2Params> {
+    let axis = axis_at(port, addr)?;
+    matches!(axis.address(), TraceUser::Model2 { .. }).then(|| axis.params().clone())
+}
+
+/// The parameter library of axis `signal` of card `card` of
+/// `motor_interface.h` driver `driver`, which its report dumps by card and
+/// axis (`drv.pFirst`, drvMotorSim.c:178-190) whether or not a `drvMotorAsyn`
+/// port opened the axis too.
+pub fn motor_interface_params(
+    driver: &str,
+    card: i32,
+    signal: i32,
+) -> Option<crate::device_state::Model2Params> {
+    let controllers = lock(controllers());
+    controllers
+        .iter()
+        .find_map(|(controller, axes)| match controller {
+            Controller::Driver { driver: d, card: c } if *d == driver && *c == card => {
+                axes.get(&signal).map(|(axis, _)| axis.params().clone())
+            }
+            _ => None,
+        })
+}
+
 fn interface_choices() -> &'static Mutex<HashSet<&'static str>> {
     static CHOICES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     CHOICES.get_or_init(Default::default)

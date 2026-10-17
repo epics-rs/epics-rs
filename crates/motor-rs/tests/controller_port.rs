@@ -1042,6 +1042,32 @@ fn the_controller_report_runs_the_driver_then_each_axis_then_the_base() {
     assert_eq!(out, "driver CPREPORT numAxes=3\nPort: CPREPORT\n");
 }
 
+/// motorsim's shape: the report reads the axis's parameters, as C's
+/// getDoubleParam/getIntegerParam do (motorSimDriver.cpp report).
+struct SoftLimits;
+
+impl ControllerParams for SoftLimits {
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, _level: i32) {
+        let high = ctx.float64_param(1, index::HIGH_LIMIT).unwrap();
+        let low = ctx.float64_param(1, index::LOW_LIMIT).unwrap();
+        let defer = ctx.int32_param(1, index::DEFER_MOVES).unwrap();
+        let _ = writeln!(out, "high={high} low={low} defer={defer}");
+        assert!(ctx.float64_param(1, index::DEFER_MOVES).is_err());
+    }
+}
+
+#[test]
+fn a_driver_report_reads_the_port_s_parameters() {
+    let mut port = ControllerPort::new("CPREPORTPARAM", 2, SoftLimits).unwrap();
+    let base = port.base_mut();
+    base.set_float64_param(index::HIGH_LIMIT, 1, 5.5).unwrap();
+    base.set_float64_param(index::LOW_LIMIT, 1, -2.0).unwrap();
+    base.set_int32_param(index::DEFER_MOVES, 1, 1).unwrap();
+    let mut out = String::new();
+    port.report(&mut out, 0);
+    assert_eq!(out, "high=5.5 low=-2 defer=1\n");
+}
+
 /// ACR's shape: `writeUInt32Digital` on its binary outputs sends `BIT n=v`
 /// and never reaches the base (ACRMotorDriver.cpp:232-248).
 #[derive(Default)]
@@ -1091,4 +1117,52 @@ fn a_uint32_digital_write_reaches_the_driver_s_own_code() {
     io.write_uint32_digital(stored, 0x6, 0x2).unwrap();
     assert_eq!(io.read_uint32_digital(stored, 0xffff_ffff).unwrap(), 0x2);
     assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// phytron's shape: a parameter whose read asks the controller, after the
+/// base read as C's `phytronController::readInt32` calls it
+/// (phytronAxisMotor.cpp:285-357, :472-512).
+#[derive(Default)]
+struct Queried {
+    current: usize,
+    temp: usize,
+}
+
+impl ControllerParams for Queried {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.current = base.create_param("CURRENT", ParamType::Int32)?;
+        self.temp = base.create_param("TEMP", ParamType::Float64)?;
+        Ok(())
+    }
+
+    fn read_int32(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<i32> {
+        let stored = base.read_int32_param(user);
+        if user.reason == self.current {
+            return Ok(10 * (user.addr + 1));
+        }
+        stored
+    }
+
+    fn read_float64(&mut self, base: &mut PortDriverBase, user: &AsynUser) -> AsynResult<f64> {
+        let stored = base.read_float64_param(user);
+        if user.reason == self.temp {
+            return Ok(21.5);
+        }
+        stored
+    }
+}
+
+#[test]
+fn a_driver_read_override_answers_its_own_params_and_leaves_the_base_s() {
+    let port = register_controller_port(&open_owner(), "CPREAD", 2, Queried::default()).unwrap();
+    let _ax = axis("CPREAD", 0);
+    let (current, temp) = (BASE_PARAMS.len(), BASE_PARAMS.len() + 1);
+    assert_eq!(port.read_int32_blocking(current, 1).unwrap(), 20);
+    assert_eq!(port.read_float64_blocking(temp, 0).unwrap(), 21.5);
+    port.write_int32_blocking(index::DEFER_MOVES, 0, 1).unwrap();
+    assert_eq!(port.read_int32_blocking(index::DEFER_MOVES, 0).unwrap(), 1);
+    assert!(
+        port.read_float64_blocking(index::ACCEL, 0).is_err(),
+        "undefined"
+    );
 }

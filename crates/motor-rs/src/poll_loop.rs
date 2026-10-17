@@ -172,9 +172,11 @@ pub(crate) struct Axis {
     /// left that no post has carried yet, so the next post goes out even if
     /// it equals it.
     status_changed: bool,
-    /// A model-2 driver's parameter library, by drvMotorAsyn reason: what
-    /// the axis's `setDouble` / `setInteger` stored last.
-    params: std::collections::HashMap<i32, WriteValue>,
+    /// A model-2 driver's parameter library, shared with its [`MotorAxis`]
+    /// for the driver's report.
+    ///
+    /// [`MotorAxis`]: crate::device_support::MotorAxis
+    params: Model2Params,
     /// A model-2 axis's `min_velocity` / `max_velocity` / `accel`, which
     /// the record's speed writes store (drvMotorAsyn.c:722-733). 0 until
     /// one is: drvMotorAsyn's axis is calloc'd.
@@ -324,6 +326,13 @@ impl Axis {
             mirrored_word: None,
             power: Power::Idle,
         }
+    }
+
+    /// Keep the model-2 parameters in `params`, the table its `MotorAxis`
+    /// reads.
+    pub(crate) fn with_params(mut self, params: Model2Params) -> Self {
+        self.params = params;
+        self
     }
 
     /// The axis's `delay` parameter when its MOTOR_POWER_AUTO_ONOFF is 1,
@@ -530,13 +539,16 @@ impl Axis {
     /// new type or value (paramLib.c:112-118, 141-147), and `callCallback`
     /// then posts to every record on the axis (drvMotorAsyn.c `intCallback`).
     fn post_writes(&mut self, write: AxisWrite) {
+        let param_changed = write
+            .params
+            .into_iter()
+            .fold(false, |changed, (reason, value)| {
+                self.params.set(reason, value) | changed
+            });
         if let Some(polled) = write.polled {
             self.publish_info(polled);
             return;
         }
-        let param_changed = write
-            .param
-            .is_some_and(|(reason, value)| self.params.insert(reason, value) != Some(value));
         if write.fields.is_empty() && !param_changed {
             return;
         }
@@ -672,7 +684,16 @@ impl Axis {
         // :48-58). C's poller ignores the poll status
         // (asynMotorController.cpp:658), so a failure prints nothing.
         match self.motor.lock() {
-            Ok(mut motor) => poll_driver(&mut *motor, &user),
+            Ok(mut motor) => {
+                let polled = poll_driver(&mut *motor, &user);
+                // A model-2 driver's update sets its paramLib
+                // (drvMotorSim.c:646-653); the poll's status posts them.
+                for write in motor.take_status_writes() {
+                    let (reason, value) = model2_param(write);
+                    self.params.set(reason, value);
+                }
+                polled
+            }
             Err(_) => Err(FailedPoll::POISONED),
         }
     }
@@ -1258,13 +1279,33 @@ fn is_driver_param(reason: i32) -> bool {
     (1..100).contains(&reason)
 }
 
+/// The paramLib parameter a model-2 driver's `write` sets, by its
+/// `motorAxisParam_t` index (motor_interface.h:278-307).
+fn model2_param(write: StatusWrite) -> (i32, WriteValue) {
+    let bit = |v: bool| WriteValue::Int32(v.into());
+    match write {
+        StatusWrite::Position(v) => (0, WriteValue::Float64(v)),
+        StatusWrite::EncoderPosition(v) => (9, WriteValue::Float64(v)),
+        StatusWrite::Direction(v) => (11, bit(v)),
+        StatusWrite::Done(v) => (12, bit(v)),
+        StatusWrite::HighHardLimit(v) => (13, bit(v)),
+        StatusWrite::HomeSignal(v) => (14, bit(v)),
+        StatusWrite::PowerOn(v) => (16, bit(v)),
+        StatusWrite::Problem(v) => (20, bit(v)),
+        StatusWrite::Moving(v) => (21, bit(v)),
+        StatusWrite::CommsError(v) => (23, bit(v)),
+        StatusWrite::LowHardLimit(v) => (24, bit(v)),
+    }
+}
+
 /// What one command wrote on the axis.
 #[derive(Debug, Default)]
 pub struct AxisWrite {
     /// The status fields it set.
     pub fields: Vec<StatusWrite>,
-    /// The model-2 parameter it stored, by drvMotorAsyn reason.
-    param: Option<(i32, WriteValue)>,
+    /// The model-2 parameters it stored, by drvMotorAsyn reason: the
+    /// status fields the driver set and the parameter the write carried.
+    params: Vec<(i32, WriteValue)>,
     /// The driver poll a GET_INFO ran.
     polled: Option<Result<MotorStatus, FailedPoll>>,
 }
@@ -1793,9 +1834,17 @@ fn execute_commands_after(
         // A model-2 driver stores a parameter only once the write succeeded
         // (drvMotorSim.c:364-368, 424-428).
         let param = c.filter(|&(reason, _)| drvset && result.is_ok() && is_driver_param(reason));
+        let params = match drvset {
+            true => writes
+                .iter()
+                .map(|&w| model2_param(w))
+                .chain(param)
+                .collect(),
+            false => Vec::new(),
+        };
         on_write(AxisWrite {
             fields: writes,
-            param,
+            params,
             polled,
         });
 
@@ -1995,6 +2044,155 @@ mod tests {
     }
     use crate::flags::MstaFlags;
     use crate::trace::TraceUser;
+
+    /// A drvMotorSim axis: `created` are its constructor's sets
+    /// (drvMotorSim.c:739), `updated` the sets of each update (:646-653).
+    struct Sim {
+        writes: Vec<StatusWrite>,
+        updated: Vec<StatusWrite>,
+    }
+
+    impl AsynMotor for Sim {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::PROBLEM_AND_COMMS_ERROR
+        }
+        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+            self.writes.extend(self.updated.iter().copied());
+            Ok(MotorStatus {
+                done: true,
+                ..MotorStatus::default()
+            })
+        }
+        fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+            std::mem::take(&mut self.writes)
+        }
+    }
+
+    /// A started poller on axis 0 of model-2 port `port`, the axis's
+    /// record half and its parameter library.
+    fn model2_sim(
+        port: &str,
+        created: Vec<StatusWrite>,
+        updated: Vec<StatusWrite>,
+    ) -> (
+        MotorPollLoop,
+        crate::device_support::MotorAxis,
+        Model2Params,
+    ) {
+        crate::devices::register_drv_motor_asyn_port(port, 1).unwrap();
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let sim = Sim {
+            writes: created,
+            updated,
+        };
+        let user = TraceUser::Model2 {
+            port: port.into(),
+            addr: 0,
+        };
+        let axis = controller.axis(Arc::new(Mutex::new(sim)), user).axis;
+        let record_half = axis.at(axis.address().clone());
+        crate::devices::register_axis(axis).unwrap();
+        let poll_loop = controller.build(SCAN, SCAN, 0);
+        let params = crate::devices::model2_params(port, 0).unwrap();
+        (poll_loop, record_half, params)
+    }
+
+    #[test]
+    fn a_model2_driver_s_update_sets_land_in_its_parameter_library() {
+        let updated = vec![
+            StatusWrite::Position(3.0),
+            StatusWrite::EncoderPosition(4.0),
+            StatusWrite::Direction(true),
+            StatusWrite::Done(true),
+            StatusWrite::HighHardLimit(false),
+            StatusWrite::HomeSignal(true),
+            StatusWrite::Moving(false),
+            StatusWrite::LowHardLimit(true),
+        ];
+        let (mut poll_loop, _axis, params) = model2_sim("PLM2UPDATE", Vec::new(), updated);
+        now(poll_loop.poller_pass(false));
+        let want = [
+            (0, WriteValue::Float64(3.0)),
+            (9, WriteValue::Float64(4.0)),
+            (11, WriteValue::Int32(1)),
+            (12, WriteValue::Int32(1)),
+            (13, WriteValue::Int32(0)),
+            (14, WriteValue::Int32(1)),
+            (21, WriteValue::Int32(0)),
+            (24, WriteValue::Int32(1)),
+        ];
+        for (reason, value) in want {
+            assert_eq!(params.get(reason), Some(value), "parameter {reason}");
+        }
+    }
+
+    /// drvMotorSim's report walks its axes by card and axis (`drv.pFirst`,
+    /// drvMotorSim.c:178-190) whoever opened them: a devMotorSim open alone
+    /// keeps the paramLib its update sets.
+    #[test]
+    fn a_motor_interface_axis_s_parameter_library_reads_by_driver_card_and_signal() {
+        let mut controller = crate::builder::ControllerBuilder::new();
+        let sim = Sim {
+            writes: Vec::new(),
+            updated: vec![StatusWrite::Position(3.0)],
+        };
+        let user = TraceUser::MotorInterface {
+            device: "PLMIDev",
+            driver: "PLMIDrv",
+            card: 1,
+            signal: 2,
+        };
+        let axis = controller.axis(Arc::new(Mutex::new(sim)), user).axis;
+        crate::devices::register_axis(axis).unwrap();
+        let mut poll_loop = controller.build(SCAN, SCAN, 0);
+        now(poll_loop.poller_pass(false));
+        let params = crate::devices::motor_interface_params("PLMIDrv", 1, 2).unwrap();
+        assert_eq!(params.get(0), Some(WriteValue::Float64(3.0)));
+        assert!(crate::devices::motor_interface_params("PLMIDrv", 1, 1).is_none());
+        assert!(crate::devices::motor_interface_params("PLMIDrv", 0, 2).is_none());
+        assert!(crate::devices::motor_interface_params("other", 1, 2).is_none());
+    }
+
+    #[test]
+    fn a_model2_driver_s_create_position_is_in_its_parameter_library() {
+        let created = vec![StatusWrite::Position(1.5)];
+        let (_poll_loop, _axis, params) = model2_sim("PLM2CREATE", created, Vec::new());
+        assert_eq!(params.get(0), Some(WriteValue::Float64(1.5)));
+    }
+
+    #[test]
+    fn a_model2_move_start_stores_done_off() {
+        let updated = vec![StatusWrite::Done(true)];
+        let (mut poll_loop, axis, params) = model2_sim("PLM2MOVE", Vec::new(), updated);
+        assert_eq!(params.get(12), Some(WriteValue::Int32(1)));
+        axis.send(MotorCommand::MoveAbsolute {
+            position: 2.0,
+            min_velocity: 0.1,
+            velocity: 1.0,
+            acceleration: 1.0,
+        });
+        poll_loop.run_queued_commands();
+        assert_eq!(params.get(12), Some(WriteValue::Int32(0)));
+    }
 
     /// Answers each poll from the script in turn; `None` is `set_status`
     /// returning early (RETRY).

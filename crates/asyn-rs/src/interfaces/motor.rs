@@ -179,6 +179,18 @@ pub enum StatusWrite {
     /// `motorAxisDirection`, which model-2 moves set before they post
     /// (drvEnsembleAsyn.cc:537, drvANC150Asyn.cc:453).
     Direction(bool),
+    /// `motorAxisHighHardLimit`, MSTA bit 2 RA_PLUS_LS.
+    HighHardLimit(bool),
+    /// `motorAxisHomeSignal`, MSTA bit 3 RA_HOME.
+    HomeSignal(bool),
+    /// `motorAxisMoving`, MSTA bit 10 RA_MOVING (drvMotorAsyn.c:847-852).
+    Moving(bool),
+    /// `motorAxisLowHardLimit`, MSTA bit 13 RA_MINUS_LS.
+    LowHardLimit(bool),
+    /// `motorStatusCommsError_`, MSTA bit 12 CNTRL_COMM_ERR, which a C
+    /// driver sets when a controller write or read fails
+    /// (smarActMCSMotorDriver.cpp:622-627, ImsMDrivePlusMotorAxis.cpp:86-87).
+    CommsError(bool),
 }
 
 impl StatusWrite {
@@ -191,6 +203,11 @@ impl StatusWrite {
             StatusWrite::PowerOn(v) => status.powered = v,
             StatusWrite::Problem(v) => status.problem = v,
             StatusWrite::Direction(v) => status.direction = v,
+            StatusWrite::HighHardLimit(v) => status.high_limit = v,
+            StatusWrite::HomeSignal(v) => status.home = v,
+            StatusWrite::Moving(v) => status.msta_moving = v,
+            StatusWrite::LowHardLimit(v) => status.low_limit = v,
+            StatusWrite::CommsError(v) => status.comms_error = v,
         }
     }
 }

@@ -1035,6 +1035,34 @@ impl PortDriverBase {
         );
     }
 
+    /// C `asynPortDriver::readInt32`: the stored value, traced. The
+    /// [`PortDriver::read_int32`] default, and the base call a driver
+    /// override makes.
+    pub fn read_int32_param(&self, user: &AsynUser) -> AsynResult<i32> {
+        let addr = self.parse_user(user)?;
+        let value = self.get_int32_param(user.reason, addr).map_err(|e| {
+            param_access_error(&self.params, user, "readInt32", e, format_args!("value=0"))
+        })?;
+        self.trace_io(user, "readInt32", format_args!("{value}"));
+        Ok(value)
+    }
+
+    /// C `asynPortDriver::readFloat64`; see [`Self::read_int32_param`].
+    pub fn read_float64_param(&self, user: &AsynUser) -> AsynResult<f64> {
+        let addr = self.parse_user(user)?;
+        let value = self.get_float64_param(user.reason, addr).map_err(|e| {
+            // readFloat64 alone names an undefined value (:2505-2513).
+            let value = if matches!(e, AsynError::ParamUndefined(_)) {
+                format_args!("value is undefined")
+            } else {
+                format_args!("value=0.000000")
+            };
+            param_access_error(&self.params, user, "readFloat64", e, value)
+        })?;
+        self.trace_io(user, "readFloat64", format_args!("{value:.6}"));
+        Ok(value)
+    }
+
     /// C `asynPortDriver::writeInt32`: store the value, run the callbacks for
     /// `user.addr`, trace the write. The [`PortDriver::write_int32`] default,
     /// and the fall-through a driver override takes for a reason it does not
@@ -2817,13 +2845,7 @@ pub trait PortDriver: Any + Send + Sync {
     // read is the untouched caller buffer, which is 0 / "" here.
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-        let base = self.base();
-        let addr = base.parse_user(user)?;
-        let value = base.get_int32_param(user.reason, addr).map_err(|e| {
-            param_access_error(&base.params, user, "readInt32", e, format_args!("value=0"))
-        })?;
-        base.trace_io(user, "readInt32", format_args!("{value}"));
-        Ok(value)
+        self.base().read_int32_param(user)
     }
 
     // The default typed writes are C `asynPortDriver::write*`
@@ -2868,20 +2890,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
-        let base = self.base();
-        let addr = base.parse_user(user)?;
-        let params = &base.params;
-        let value = base.get_float64_param(user.reason, addr).map_err(|e| {
-            // readFloat64 alone names an undefined value (:2505-2513).
-            let value = if matches!(e, AsynError::ParamUndefined(_)) {
-                format_args!("value is undefined")
-            } else {
-                format_args!("value=0.000000")
-            };
-            param_access_error(params, user, "readFloat64", e, value)
-        })?;
-        base.trace_io(user, "readFloat64", format_args!("{value:.6}"));
-        Ok(value)
+        self.base().read_float64_param(user)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {

@@ -342,6 +342,16 @@ pub trait AsynMotor: Send + Sync {
     /// Poll the motor for current status.
     fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
 
+    /// A model-1 `set_status` with a move in motion (`nodeptr != 0`):
+    /// `cdir` is the moving record's CDIR, which the C driver reads and may
+    /// overwrite through `nodeptr->mrecord` (drvSC800.cc:279-282,
+    /// drvOms58.cc:642-649); the record reads what is left. The motor task
+    /// calls it in place of [`AsynMotor::poll`] while it holds the move.
+    fn poll_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        let _ = cdir;
+        self.poll(user)
+    }
+
     /// What the C driver's `poll()` posts when it fails, i.e. when
     /// [`AsynMotor::poll`] returns `Err`. No default: drivers differ (an
     /// SMC100 raises only `motorStatusProblem_`, an XPS axis also

@@ -232,9 +232,12 @@ impl MotorDeviceSupport {
     /// from `mr->out.value.vmeio.parm` (devMVP2001.cc:262, :361).
     pub(crate) fn send_out_parm(&self, parm: String) {
         if !parm.is_empty() {
-            self.port.send(vec![MotorCommand::OutParm {
-                parm: PvString::from_bytes(parm),
-            }]);
+            self.port.send(
+                vec![MotorCommand::OutParm {
+                    parm: PvString::from_bytes(parm),
+                }],
+                false,
+            );
         }
     }
 
@@ -248,7 +251,7 @@ impl MotorDeviceSupport {
         let port = &self.port;
         let commands = std::mem::take(&mut actions.commands);
         if !commands.is_empty() {
-            port.send(commands);
+            port.send(commands, true);
         }
 
         if actions.force_poll {
@@ -282,10 +285,14 @@ impl CommandPort {
     /// Queue `commands` on the poller thread, or refuse them as the port
     /// does for a missing axis. Each move-class command is counted pending
     /// first, as C `build_trans` does; a record in COMM_ALARM sends nothing.
-    pub(crate) fn send(&self, commands: Vec<MotorCommand>) {
+    /// `pact` is the record's while it sends: set in process, clear in
+    /// init_record and special.
+    pub(crate) fn send(&self, commands: Vec<MotorCommand>, pact: bool) {
         let moves = commands.iter().filter(|c| c.is_move()).count();
         if let Ok(mut ds) = self.device_state.lock() {
-            if ds.comm_alarm() {
+            let comm_alarm = ds.comm_alarm();
+            crate::poll_loop::build_trans_flow(&self.trace, &commands, pact, comm_alarm);
+            if comm_alarm {
                 return;
             }
             for _ in 0..moves {
@@ -428,7 +435,7 @@ impl DeviceSupport for MotorDeviceSupport {
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
             .map(|rec| rec.initial_readback(&status));
         if let Some(effects) = anchor {
-            self.port.send(effects.commands);
+            self.port.send(effects.commands, false);
             if effects.request_poll {
                 self.port.send_poll(PollCommand::ForcePoll);
             }
@@ -456,7 +463,7 @@ impl DeviceSupport for MotorDeviceSupport {
             // Queued like C's SEND_MSG; non-fatal, as C ignores the
             // build_trans return, and a refusal prints asynCallback's line
             // on the poller.
-            self.port.send(commands);
+            self.port.send(commands, false);
         }
 
         self.initialized = true;

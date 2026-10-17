@@ -838,7 +838,9 @@ impl<P: ControllerParams> ControllerPort<P> {
             index::PGAIN => gain(PidGainKind::Proportional),
             index::IGAIN => gain(PidGainKind::Integral),
             index::DGAIN => gain(PidGainKind::Derivative),
-            index::ENCODER_RATIO => MotorCommand::SetEncoderRatio { ratio: value },
+            index::ENCODER_RATIO => MotorCommand::SetEncoderRatio {
+                pulses: [value, 1.0],
+            },
             _ => return false,
         };
         axis.send(command);

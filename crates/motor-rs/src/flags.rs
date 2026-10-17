@@ -352,9 +352,11 @@ pub enum MotorCommand {
     SetEncoderPosition {
         position: f64,
     },
-    /// do_work's SET_ENC_RATIO (motorRecord.cc:1973-1978).
+    /// do_work's SET_ENC_RATIO (motorRecord.cc:1973-1978): encoder and
+    /// motor pulses per scaled count, C's `ep_mp`, which devMotorAsyn's
+    /// build_trans divides.
     SetEncoderRatio {
-        ratio: f64,
+        pulses: [f64; 2],
     },
     /// C init_controller's encoder-ratio write (devMotorAsyn.c:186-198),
     /// reported by init_controller like [`InitPosition`](Self::InitPosition).
@@ -384,6 +386,11 @@ pub enum MotorCommand {
     MoveStrings {
         prem: PvString,
         post: Option<PostMessage>,
+    },
+    /// The record's CDIR, ahead of the move it belongs to: what a model-1
+    /// driver polling that move reads as `mr->cdir`.
+    MoveDirection {
+        forward: bool,
     },
     ProfileInitialize {
         max_points: usize,
@@ -491,6 +498,17 @@ impl MotorCommand {
                 | Self::Home { .. }
                 | Self::SetPosition { .. }
         )
+    }
+
+    /// The ratio an encoder-ratio write carries.
+    pub fn encoder_ratio(&self) -> Option<f64> {
+        match *self {
+            Self::SetEncoderRatio {
+                pulses: [encoder, motor],
+            } => Some(encoder / motor),
+            Self::InitEncoderRatio { ratio } => Some(ratio),
+            _ => None,
+        }
     }
 
     /// The record's STOP_AXIS, which carries no SET_ACCEL (motorRecord.cc:

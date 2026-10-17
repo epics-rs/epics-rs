@@ -846,7 +846,7 @@ fn a_load_on_the_commanded_limit_resyncs_val_from_the_readback() {
     let (mut rec, state) = frozen_load_on_low_limit(false);
     assert!(!rec.stat.dmov, "the LS-error update keeps DMOV FALSE");
     let actions = state.lock().unwrap().pending_actions.take().unwrap();
-    assert!(actions.force_poll, "GET_INFO");
+    assert!(sends_get_info(&actions.commands), "GET_INFO");
 
     state.lock().unwrap().latest_status = Some(on_low_limit_at(3, -5.0));
     rec.process().unwrap();

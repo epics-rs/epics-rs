@@ -110,7 +110,15 @@ enum Pacing {
     /// move (`motor_motion`, with its `no_motion_count`) is queried, a scan
     /// period after the last wake and on every message. An idle axis is
     /// never polled.
-    MotorTask { scan: Duration, held: Option<u32> },
+    MotorTask { scan: Duration, held: Option<Held> },
+}
+
+/// motor_task's `motor_motion`: the held move's `no_motion_count`, and the
+/// record that sent it with that record's CDIR as the driver last left it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Held {
+    count: u32,
+    mover: Option<(RecordId, bool)>,
 }
 
 /// The record's speed write `command` on an asynMotorController axis: the
@@ -259,7 +267,12 @@ impl MotorPollLoop {
         let Ok(mut motor) = motor.lock() else {
             return;
         };
+        let mut cdir = None;
         for command in &batch.commands {
+            if let MotorCommand::MoveDirection { forward } = *command {
+                cdir = Some(forward);
+                continue;
+            }
             if batch.record.is_some() {
                 async_callback_flow(&batch.trace, command);
             }
@@ -294,7 +307,12 @@ impl MotorPollLoop {
                     Pacing::Poller { .. } => self.woken = true,
                     // A MOTION or VELOCITY message replaces the held move
                     // and clears its count (motordrvCom.cc:415-437).
-                    Pacing::MotorTask { held, .. } => *held = Some(0),
+                    Pacing::MotorTask { held, .. } => {
+                        *held = Some(Held {
+                            count: 0,
+                            mover: batch.record.zip(cdir),
+                        })
+                    }
                 }
             }
         }
@@ -307,8 +325,11 @@ impl MotorPollLoop {
     /// A model-1 driver has no store: its messages carry the speeds, and it
     /// skips a speed write the record sends ahead of them.
     fn speeds_for(&mut self, trace: &MotorTrace, command: &MotorCommand) -> Option<Speeds> {
-        if trace.is_model1() {
-            return command.is_speed_write().then_some(Speeds::Stored);
+        if trace.is_model1() && command.store_speed(&mut self.speeds) {
+            // A model-1 SET_* only appends to the card string: the card keeps
+            // the speeds a later move or stop leaves unwritten, as a backlash
+            // leg's SET_VEL_BASE (motorRecord.cc do_work).
+            return Some(Speeds::Stored);
         }
         if trace.is_controller() {
             if command.is_speed_write() {
@@ -481,17 +502,17 @@ impl MotorPollLoop {
     /// called back unless the driver returned early (`set_status`'s RETRY,
     /// [`PollFailure::NONE`]) or the position sat still. Returns the move
     /// the axis holds after the pass.
-    fn query_held(&mut self, mut count: u32) -> Option<u32> {
-        let status = match self.poll_result() {
+    fn query_held(&mut self, mut held: Held) -> Option<Held> {
+        let status = match self.poll_in_motion(&mut held.mover) {
             Ok(status) => status,
-            Err(PollFailure::NONE) => return Some(count),
+            Err(PollFailure::NONE) => return Some(held),
             Err(failure) => self.failed_poll_status(failure),
         };
         let still = self
             .last_status
             .as_ref()
             .is_some_and(|last| last.position == status.position);
-        count = if still { count + 1 } else { 0 };
+        held.count = if still { held.count + 1 } else { 0 };
         let ls_active = if status.direction {
             status.high_limit
         } else {
@@ -504,10 +525,33 @@ impl MotorPollLoop {
             });
             return None;
         }
-        if count == 0 {
+        if held.count == 0 {
             self.publish(status);
         }
-        Some(count)
+        Some(held)
+    }
+
+    /// The held move's driver poll, handing the driver its record's CDIR; a
+    /// CDIR the driver changed is written into the record before the pass
+    /// calls it back, as C's `set_status` writes `mr->cdir`.
+    fn poll_in_motion(
+        &mut self,
+        mover: &mut Option<(RecordId, bool)>,
+    ) -> Result<MotorStatus, PollFailure> {
+        let Some((record, cdir)) = mover else {
+            return self.poll_result();
+        };
+        let before = *cdir;
+        let polled = match self.motor.lock() {
+            Ok(mut motor) => motor
+                .poll_in_motion(&AsynUser::new(0), cdir)
+                .map_err(|_| motor.poll_failure()),
+            Err(_) => Err(PollFailure::PROBLEM_AND_COMMS_ERROR),
+        };
+        if *cdir != before {
+            self.subscribers.set_driver_cdir(*record, *cdir);
+        }
+        polled
     }
 
     /// A GET_INFO's post, made even for an unchanged status: C
@@ -526,12 +570,12 @@ impl MotorPollLoop {
     /// the held move, if any (motordrvCom.cc:244-254).
     fn query_task(&mut self) {
         let Pacing::MotorTask {
-            held: Some(count), ..
+            held: Some(held), ..
         } = self.pacing
         else {
             return;
         };
-        let next = self.query_held(count);
+        let next = self.query_held(held);
         if let Pacing::MotorTask { held, .. } = &mut self.pacing {
             *held = next;
         }
@@ -757,8 +801,8 @@ fn c_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
         }
         MotorCommand::SetEncoderPosition { position } => (c::ENCODER_POSITION, Float64(position)),
         MotorCommand::DeferMoves { defer } => (c::DEFER_MOVES, Int32(defer.into())),
-        MotorCommand::SetEncoderRatio { ratio } | MotorCommand::InitEncoderRatio { ratio } => {
-            (c::ENCODER_RATIO, Float64(ratio))
+        MotorCommand::SetEncoderRatio { .. } | MotorCommand::InitEncoderRatio { .. } => {
+            (c::ENCODER_RATIO, Float64(cmd.encoder_ratio()?))
         }
         MotorCommand::MoveToHome { .. } => (c::MOVE_TO_HOME, Int32(1)),
         MotorCommand::SetPidGain { kind, gain } => match kind {
@@ -781,7 +825,8 @@ fn c_write(cmd: &MotorCommand) -> Option<(i32, WriteValue)> {
         | MotorCommand::ProfileReadback
         | MotorCommand::OutParm { .. }
         | MotorCommand::Primitive { .. }
-        | MotorCommand::MoveStrings { .. } => return None,
+        | MotorCommand::MoveStrings { .. }
+        | MotorCommand::MoveDirection { .. } => return None,
     };
     Some((function as i32, value))
 }
@@ -821,7 +866,8 @@ fn drv_motor_asyn_reason(cmd: &MotorCommand) -> Option<i32> {
         | MotorCommand::ProfileReadback
         | MotorCommand::OutParm { .. }
         | MotorCommand::Primitive { .. }
-        | MotorCommand::MoveStrings { .. } => return None,
+        | MotorCommand::MoveStrings { .. }
+        | MotorCommand::MoveDirection { .. } => return None,
     })
 }
 
@@ -893,35 +939,128 @@ struct MotorAsynMessage {
     dvalue: f64,
 }
 
+impl MotorAsynMessage {
+    /// The message `build_trans` queues for a record's `cmd`: both values
+    /// zeroed, then the one its interface takes set.
+    fn of(cmd: &MotorCommand) -> Option<Self> {
+        let command = dev_motor_asyn_command(cmd)?;
+        let (_, value) = c_write(cmd)?;
+        Some(match value {
+            WriteValue::Int32(ivalue) => Self {
+                command,
+                interface: 0,
+                ivalue,
+                dvalue: 0.0,
+            },
+            WriteValue::Float64(dvalue) => Self {
+                command,
+                interface: 1,
+                ivalue: 0,
+                dvalue,
+            },
+        })
+    }
+}
+
+/// The motorRecord `build_trans` calls (motor_cmnd, value) behind a record's
+/// `cmd`, the last one the call that queues it. A move is its MOVE_ABS,
+/// MOVE_REL or HOME_FOR/HOME_REV and then GO; HOME's value is `hpos = 0`
+/// (motorRecord.cc:2048). A velocity move is JOG from do_work (:2142) and
+/// JOG_VELOCITY from special's JVEL retune (:3069), the one site with pact 0.
+fn build_trans_calls(cmd: &MotorCommand, pact: bool) -> Vec<(i32, f64)> {
+    const GO: (i32, f64) = (8, 0.0);
+    match *cmd {
+        MotorCommand::MoveAbsolute { position, .. } => vec![(0, position), GO],
+        MotorCommand::MoveRelative { distance, .. } => vec![(1, distance), GO],
+        MotorCommand::Home { forward, .. } => vec![(if forward { 2 } else { 3 }, 0.0), GO],
+        MotorCommand::SetPosition { position } => vec![(4, position)],
+        MotorCommand::SetVelBase { velocity } => vec![(5, velocity)],
+        MotorCommand::SetVelocity { velocity } => vec![(6, velocity)],
+        MotorCommand::SetAccel { acceleration } => vec![(7, acceleration)],
+        MotorCommand::SetEncoderRatio { pulses } => vec![(9, pulses[0])],
+        MotorCommand::Poll => vec![(10, 0.0)],
+        MotorCommand::Stop { .. } => vec![(11, 0.0)],
+        MotorCommand::MoveVelocity { velocity, .. } => vec![(if pact { 12 } else { 21 }, velocity)],
+        MotorCommand::SetPidGain { kind, gain } => vec![(
+            match kind {
+                PidGainKind::Proportional => 13,
+                PidGainKind::Integral => 14,
+                PidGainKind::Derivative => 15,
+            },
+            gain,
+        )],
+        // special CNEN passes `temp_dbl = cnen` (motorRecord.cc:3032-3037).
+        MotorCommand::SetClosedLoop { enable } => {
+            vec![(if enable { 16 } else { 17 }, f64::from(u8::from(enable)))]
+        }
+        MotorCommand::SetHighLimit { position } => vec![(19, position)],
+        MotorCommand::SetLowLimit { position } => vec![(20, position)],
+        _ => Vec::new(),
+    }
+}
+
+/// devMotorAsyn `build_trans`'s FLOW lines for a record's `commands`
+/// (devMotorAsyn.c:497-499, :634-637), sent with the record's `pact`. A
+/// record in COMM_ALARM prints each call's first line and queues nothing
+/// (:530-531).
+pub(crate) fn build_trans_flow(
+    trace: &MotorTrace,
+    commands: &[MotorCommand],
+    pact: bool,
+    comm_alarm: bool,
+) {
+    if trace.is_model1() {
+        return;
+    }
+    let reason = trace.update_status_reason();
+    for cmd in commands {
+        let calls = build_trans_calls(cmd, pact);
+        for &(motor_cmnd, value) in &calls {
+            trace.print(
+                TraceMask::FLOW,
+                reason,
+                format_args!(
+                    "devMotorAsyn::build_trans: {} motor_cmnd={motor_cmnd}, pact={}, value={value:.6}\n",
+                    trace.record(),
+                    u8::from(pact),
+                ),
+            );
+        }
+        if calls.is_empty() || comm_alarm {
+            continue;
+        }
+        let Some(msg) = MotorAsynMessage::of(cmd) else {
+            continue;
+        };
+        // C's format has no separator after the size.
+        trace.print(
+            TraceMask::FLOW,
+            reason,
+            format_args!(
+                "devAsynMotor::build_trans: calling queueRequest, pmsg={:p}, sizeof(*pmsg)={}pmsg->command={}, pmsg->interface={}, pmsg->dvalue={:.6}\n",
+                &msg,
+                std::mem::size_of::<MotorAsynMessage>(),
+                msg.command,
+                msg.interface,
+                msg.dvalue,
+            ),
+        );
+    }
+}
+
 /// C `asynCallback`'s opening line for a record's `cmd`
 /// (devMotorAsyn.c:668-674), on the reason the port's write carries.
 fn async_callback_flow(trace: &MotorTrace, cmd: &MotorCommand) {
     if trace.is_model1() {
         return;
     }
-    let (Some(command), Some((function, value))) = (dev_motor_asyn_command(cmd), c_write(cmd))
-    else {
+    let (Some(msg), Some((function, _))) = (MotorAsynMessage::of(cmd), c_write(cmd)) else {
         return;
     };
     let reason = if trace.is_model2() {
         drv_motor_asyn_reason(cmd).unwrap_or(0)
     } else {
         function
-    };
-    // build_trans zeroes both values and sets the one its interface takes.
-    let msg = match value {
-        WriteValue::Int32(ivalue) => MotorAsynMessage {
-            command,
-            interface: 0,
-            ivalue,
-            dvalue: 0.0,
-        },
-        WriteValue::Float64(dvalue) => MotorAsynMessage {
-            command,
-            interface: 1,
-            ivalue: 0,
-            dvalue,
-        },
     };
     trace.print(
         TraceMask::FLOW,
@@ -1104,7 +1243,8 @@ pub fn execute_commands(
                 ));
                 r
             }
-            MotorCommand::SetEncoderRatio { ratio } | MotorCommand::InitEncoderRatio { ratio } => {
+            MotorCommand::SetEncoderRatio { .. } | MotorCommand::InitEncoderRatio { .. } => {
+                let ratio = cmd.encoder_ratio().unwrap_or_default();
                 let r = motor.set_encoder_ratio(&user, ratio);
                 flow(format_args!(
                     "asynMotorController:writeFloat64: Set driver {port}, axis {axis} encoder ratio={ratio:.6}\n"
@@ -1166,6 +1306,8 @@ pub fn execute_commands(
             MotorCommand::MoveStrings { ref prem, ref post } => {
                 motor.set_move_strings(&user, prem.as_bytes(), post.clone())
             }
+            // The motor task holds it with the move it precedes.
+            MotorCommand::MoveDirection { .. } => Ok(()),
             // GET_INFO polls inside the write, before its closing line
             // (asynMotorController.cpp:217-222; drvMotorAsyn.c:617-619).
             MotorCommand::Poll => {
@@ -1429,7 +1571,7 @@ mod tests {
     /// returning early (RETRY).
     struct Script(std::collections::VecDeque<Option<MotorStatus>>);
 
-    type Held = Option<u32>;
+    type Held = Option<super::Held>;
 
     impl AsynMotor for Script {
         fn move_absolute(
@@ -1507,19 +1649,17 @@ mod tests {
         }
     }
 
+    type Gate = Arc<epics_base_rs::runtime::interrupt_accept::InterruptGate>;
+
     /// A poller on axis 0 of a [`Hooked`] controller port `port`, at rest,
-    /// whose later polls answer from `script`.
+    /// whose later polls answer from `script`, and the port's interruptAccept,
+    /// still closed.
     fn hooked_poller(
         port: &str,
         script: Vec<MotorStatus>,
-    ) -> (MotorPollLoop, asyn_rs::port_handle::PortHandle) {
-        let handle = crate::devices::register_controller_port(
-            &asyn_rs::registry::open_owner(),
-            port,
-            1,
-            Hooked,
-        )
-        .unwrap();
+    ) -> (MotorPollLoop, asyn_rs::port_handle::PortHandle, Gate) {
+        let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
+        let handle = crate::devices::register_controller_port(&gate, port, 1, Hooked).unwrap();
         let (_poll_tx, poll) = mpsc::channel(1);
         let (_tx, commands) = mpsc::unbounded_channel();
         let script = std::iter::once(MotorStatus::default()).chain(script);
@@ -1534,7 +1674,7 @@ mod tests {
             0,
         );
         poll_loop.mirror_to(port, 0);
-        (poll_loop, handle)
+        (poll_loop, handle, gate)
     }
 
     fn write_stop(poll_loop: &mut MotorPollLoop, port: &str) {
@@ -1546,13 +1686,24 @@ mod tests {
     }
 
     #[test]
+    fn a_velocity_move_is_jog_in_process_and_jog_velocity_in_special() {
+        let jog = MotorCommand::MoveVelocity {
+            min_velocity: 0.0,
+            velocity: -3.0,
+            acceleration: 1.0,
+        };
+        assert_eq!(build_trans_calls(&jog, true), [(12, -3.0)]);
+        assert_eq!(build_trans_calls(&jog, false), [(21, -3.0)]);
+    }
+
+    #[test]
     fn a_hook_set_status_bit_stays_until_the_driver_changes_it() {
         let comms_error = MotorStatus {
             comms_error: true,
             ..at(2.0)
         };
         let script = vec![at(1.0), comms_error, at(3.0)];
-        let (mut poll_loop, handle) = hooked_poller("PLHOOKBIT", script);
+        let (mut poll_loop, handle, _) = hooked_poller("PLHOOKBIT", script);
         write_stop(&mut poll_loop, "PLHOOKBIT");
         poll_loop.poller_pass(false);
         assert_eq!(comms(&handle), Some(1), "a new status leaves it");
@@ -1567,22 +1718,49 @@ mod tests {
             .ok()
     }
 
-    /// Axis 0's COMMS_ERROR callbacks on `handle` from now on.
+    /// Axis 0's COMMS_ERROR callbacks on controller port `port` from the
+    /// moment `gate` opened and the port's one-shot flush ran. That flush is
+    /// on its own thread, as C's `callbackThread::run` (asynPortDriver.cpp:
+    /// 923-937), so it would post whatever was set by the time it got there.
     fn comms_posts(
+        port: &str,
         handle: &asyn_rs::port_handle::PortHandle,
+        gate: &Gate,
     ) -> (
         asyn_rs::interrupt::InterruptSubscription,
         asyn_rs::interrupt::InterruptReceiver,
     ) {
-        settle(handle);
-        handle.interrupts().register_interrupt_user(
+        use crate::controller_port::index::STATUS_COMMS_ERROR;
+        // A marker only that flush can post.
+        let mut marker = crate::controller_port::ParamDelta::default();
+        marker.set_int32(STATUS_COMMS_ERROR, 0);
+        crate::devices::param_store(port).unwrap()(0, marker);
+        let (sub, mut rx) = handle.interrupts().register_interrupt_user(
             asyn_rs::interrupt::InterruptFilter {
-                reason: Some(crate::controller_port::index::STATUS_COMMS_ERROR),
+                reason: Some(STATUS_COMMS_ERROR),
                 addr: Some(0),
                 ..Default::default()
             },
             0,
-        )
+        );
+        gate.set(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let flushed =
+            rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), rx.recv()).await });
+        assert!(
+            matches!(
+                flushed,
+                Ok(Some(asyn_rs::interrupt::InterruptValue {
+                    value: asyn_rs::param::ParamValue::Int32(0),
+                    ..
+                }))
+            ),
+            "the one-shot flush: {flushed:?}"
+        );
+        (sub, rx)
     }
 
     /// The port's actor has run everything sent to it so far.
@@ -1611,8 +1789,9 @@ mod tests {
 
     #[test]
     fn a_hook_set_waits_for_the_next_poll_pass() {
-        let (mut poll_loop, handle) = hooked_poller("PLHOOKPASS", vec![MotorStatus::default()]);
-        let (_sub, mut rx) = comms_posts(&handle);
+        let (mut poll_loop, handle, gate) =
+            hooked_poller("PLHOOKPASS", vec![MotorStatus::default()]);
+        let (_sub, mut rx) = comms_posts("PLHOOKPASS", &handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKPASS");
         assert_eq!(posted(&handle, &mut rx), None, "set, not yet called back");
         assert_eq!(comms(&handle), Some(1), "set in the parameter library");
@@ -1622,8 +1801,9 @@ mod tests {
 
     #[test]
     fn a_hook_set_rides_the_next_write_callback() {
-        let (mut poll_loop, handle) = hooked_poller("PLHOOKWRITE", vec![MotorStatus::default()]);
-        let (_sub, mut rx) = comms_posts(&handle);
+        let (mut poll_loop, handle, gate) =
+            hooked_poller("PLHOOKWRITE", vec![MotorStatus::default()]);
+        let (_sub, mut rx) = comms_posts("PLHOOKWRITE", &handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKWRITE");
         write_stop(&mut poll_loop, "PLHOOKWRITE");
         assert_eq!(
@@ -1637,7 +1817,8 @@ mod tests {
 
     #[test]
     fn a_hook_set_rides_the_next_port_write_callback() {
-        let (mut poll_loop, handle) = hooked_poller("PLHOOKPORT", vec![MotorStatus::default()]);
+        let (mut poll_loop, handle, gate) =
+            hooked_poller("PLHOOKPORT", vec![MotorStatus::default()]);
         let (motor_tx, _commands) = mpsc::unbounded_channel();
         let (poll_tx, _polls) = mpsc::channel(1);
         crate::devices::register_axis(crate::device_support::MotorAxis::new(
@@ -1651,7 +1832,7 @@ mod tests {
             AxisSubscribers::new(),
         ))
         .unwrap();
-        let (_sub, mut rx) = comms_posts(&handle);
+        let (_sub, mut rx) = comms_posts("PLHOOKPORT", &handle, &gate);
         write_stop(&mut poll_loop, "PLHOOKPORT");
         assert_eq!(posted(&handle, &mut rx), None);
         handle
@@ -1796,7 +1977,7 @@ mod tests {
         send_move(&mut poll_loop);
         assert_eq!(poll_loop.task_due(tick), Some(tick + SCAN));
         assert_eq!(script.lock().unwrap().0.len(), 1);
-        assert_eq!(held(&poll_loop), Some(0));
+        assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
 
     // An INFO while the move is held reports it not done, whatever the
@@ -1858,7 +2039,7 @@ mod tests {
         let (mut poll_loop, _) = model1_task(vec![Some(unflagged)]);
         send_move(&mut poll_loop);
         assert!(poll_loop.timed_pass().is_some());
-        assert_eq!(held(&poll_loop), Some(0));
+        assert_eq!(held(&poll_loop).map(|held| held.count), Some(0));
     }
 
     #[test]

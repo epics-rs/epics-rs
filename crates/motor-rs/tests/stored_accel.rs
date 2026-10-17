@@ -3,8 +3,8 @@
 //! read them; a move with no SET_ACCEL ahead of it (C skips it at
 //! `acc <= 0`) runs on the last stored one. On an asynMotorController axis
 //! they are the controller port's MOTOR_VELOCITY / MOTOR_VEL_BASE /
-//! MOTOR_ACCEL, which the speed writes set through the port. A model-1
-//! driver has no store: it moves on its messages' speeds.
+//! MOTOR_ACCEL, which the speed writes set through the port. On a model-1
+//! card they are the card's own registers, which a SET_* string sets.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -154,9 +154,17 @@ fn model2() -> TraceUser {
     }
 }
 
+fn model1() -> TraceUser {
+    TraceUser::Model1 {
+        device: "devStoredAccel",
+        card: 0,
+        signal: 0,
+    }
+}
+
 #[test]
 fn a_skipped_acceleration_runs_on_the_last_stored_one() {
-    for user in [controller("storedAccel").0, model2()] {
+    for user in [controller("storedAccel").0, model2(), model1()] {
         let seen = run(
             user,
             vec![
@@ -174,7 +182,7 @@ fn a_skipped_acceleration_runs_on_the_last_stored_one() {
 
 #[test]
 fn a_skipped_acceleration_before_any_is_stored_is_zero() {
-    for user in [controller("storedAccelNone").0, model2()] {
+    for user in [controller("storedAccelNone").0, model2(), model1()] {
         let seen = run(user, vec![home_with(-1.0), MotorCommand::stop_axis()]);
         assert_eq!(seen, [0.0, 0.0]);
     }
@@ -218,21 +226,8 @@ fn a_refused_set_accel_leaves_the_move_on_the_stored_one() {
 }
 
 #[test]
-fn a_model1_driver_gets_the_skipped_acceleration() {
-    let model1 = TraceUser::Model1 {
-        device: "devStoredAccel",
-        card: 0,
-        signal: 0,
-    };
-    assert_eq!(
-        run(model1, vec![set_accel(5.0), move_with(2.0), home_with(0.0)]),
-        [2.0, 0.0]
-    );
-}
-
-#[test]
 fn a_record_stop_runs_on_the_last_stored_acceleration() {
-    for user in [controller("storedAccelStop").0, model2()] {
+    for user in [controller("storedAccelStop").0, model2(), model1()] {
         let seen = run(
             user,
             vec![
@@ -286,7 +281,7 @@ fn move_then_backlash_leg() -> Vec<MotorCommand> {
 
 #[test]
 fn a_move_runs_on_the_stored_velocities() {
-    for user in [controller("storedSpeeds").0, model2()] {
+    for user in [controller("storedSpeeds").0, model2(), model1()] {
         let (_, speeds) = run_from(Some(0), user, move_then_backlash_leg());
         assert_eq!(speeds, [(1.0, 4.0), (1.0, 6.0)]);
     }
@@ -298,17 +293,6 @@ fn the_records_velocities_are_the_controller_ports_params() {
     run_from(Some(0), user, move_then_backlash_leg());
     assert_eq!(port.read_float64_blocking(index::VELOCITY, 0).unwrap(), 6.0);
     assert_eq!(port.read_float64_blocking(index::VEL_BASE, 0).unwrap(), 1.0);
-}
-
-#[test]
-fn a_model1_driver_moves_on_its_messages_speeds() {
-    let model1 = TraceUser::Model1 {
-        device: "devStoredSpeeds",
-        card: 0,
-        signal: 0,
-    };
-    let (_, speeds) = run_from(Some(0), model1, move_then_backlash_leg());
-    assert_eq!(speeds, [(9.0, 4.0), (9.0, 6.0)]);
 }
 
 #[test]

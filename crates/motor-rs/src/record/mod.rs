@@ -250,35 +250,44 @@ impl MotorRecord {
     /// record with no device support has nowhere to send.
     pub(crate) fn send_special(&self, commands: Vec<MotorCommand>) {
         if let Some(port) = &self.port {
-            port.send(self.transaction(commands));
+            port.send(self.transaction(commands), false);
         }
     }
 
     /// `commands` as C `build_trans` builds them from the record: each move
-    /// preceded by the PREM and POST it reads (devIM483PL.cc:191-205), when
-    /// either is set. A record's process and `special()` puts both send
-    /// through it.
+    /// preceded by the record's CDIR and by the PREM and POST it reads
+    /// (devIM483PL.cc:191-205), when either is set. A record's process and
+    /// `special()` puts both send through it.
     pub(crate) fn transaction(&self, commands: Vec<MotorCommand>) -> Vec<MotorCommand> {
         let prem = &self.links.prem;
         // C `if (strlen(mr->post) != 0) postmsgptr = &mr->post`: the field,
         // not its text, so the device sends what POST holds when it is done.
         let post = (!self.links.post.is_empty()).then(|| self.links.post.clone());
-        if prem.is_empty() && post.is_none() {
-            return commands;
-        }
-        let mut out = Vec::with_capacity(commands.len() + 1);
-        for command in commands {
-            if matches!(
+        let built = |command: &MotorCommand| {
+            matches!(
                 command,
                 MotorCommand::MoveAbsolute { .. }
                     | MotorCommand::MoveRelative { .. }
                     | MotorCommand::MoveVelocity { .. }
                     | MotorCommand::Home { .. }
-            ) {
-                out.push(MotorCommand::MoveStrings {
-                    prem: prem.clone(),
-                    post: post.clone(),
+            )
+        };
+        if !commands.iter().any(built) {
+            return commands;
+        }
+        let strings = !prem.is_empty() || post.is_some();
+        let mut out = Vec::with_capacity(commands.len() + 2);
+        for command in commands {
+            if built(&command) {
+                out.push(MotorCommand::MoveDirection {
+                    forward: self.stat.cdir,
                 });
+                if strings {
+                    out.push(MotorCommand::MoveStrings {
+                        prem: prem.clone(),
+                        post: post.clone(),
+                    });
+                }
             }
             out.push(command);
         }

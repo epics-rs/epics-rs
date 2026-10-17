@@ -27,16 +27,26 @@ impl MotorRecord {
         // mailbox untouched — no status consume, no STUP ack, no delay
         // take. The io_intr pulse that announced a pending status or
         // delay expiry is already queued and triggers its own pass.
-        if self.last_write.is_some() || self.internal.res_reanchor {
+        // A model-1 driver's `mr->cdir` write is no callback payload: it is
+        // the record's own field, seen by any pass.
+        let put_pass = self.last_write.is_some() || self.internal.res_reanchor;
+        let mailbox = self.device_state.as_ref().and_then(|state| {
+            let mut ds = state.lock().ok()?;
+            let cdir = ds.driver_cdir.take();
+            Some(if put_pass {
+                (cdir, None, None)
+            } else {
+                (cdir, ds.expired_delay_id.take(), ds.update_values())
+            })
+        });
+        if let Some((Some(cdir), ..)) = mailbox {
+            self.stat.cdir = cdir;
+        }
+        if put_pass {
             self.trace_update_values(false);
             return None;
         }
-        // Extract data from shared state, then drop the lock before mutating self
-        let (delay_id, new_status) = {
-            let state = self.device_state.as_ref()?;
-            let mut ds = state.lock().ok()?;
-            (ds.expired_delay_id.take(), ds.update_values())
-        };
+        let (_, delay_id, new_status) = mailbox?;
         self.trace_update_values(new_status.is_some());
 
         // Check delay expiry first (higher priority)

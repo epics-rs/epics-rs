@@ -278,7 +278,7 @@ fn a_refused_init_encoder_ratio_prints_init_controller() {
 fn a_refused_runtime_encoder_ratio_prints_the_async_callback_line() {
     let lines = traced(
         "traceLinesRatio",
-        &[MotorCommand::SetEncoderRatio { ratio: 0.5 }],
+        &[MotorCommand::SetEncoderRatio { pulses: [0.5, 1.0] }],
     );
     assert_eq!(lines.len(), 2, "{lines:#?}");
     assert!(
@@ -710,6 +710,96 @@ fn each_record_write_prints_async_callbacks_flow_line() {
             line(0, 1, 0, 5.0, 104),
             line(16, 0, 1, 0.0, 8),
             line(18, 0, 0, 0.0, 109)
+        ]
+    );
+}
+
+/// The `build_trans` lines of a model-3 record `TL:m1` on `port` through
+/// init_record (DHLM 100, DLLM -100) and one VAL=5 process pass, past each
+/// `pmsg=<address>`.
+fn build_trans_lines(port: &str) -> Vec<String> {
+    use asyn_rs::trace::TraceMask;
+    use epics_base_rs::server::device_support::DeviceSupport;
+    use epics_base_rs::server::record::Record;
+    use epics_base_rs::types::EpicsValue;
+    use motor_rs::device_state::new_shared_state;
+    use motor_rs::device_support::MotorDeviceSupport;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    PortManager::global()
+        .trace_manager()
+        .set_trace_mask(Some(port), TraceMask::FLOW);
+    let lines = traced_by(port, || {
+        let trace = MotorTrace::new(port, 0);
+        trace.set_record("TL:m1");
+        let (poll_tx, _polls) = mpsc::channel(4);
+        let (motor_tx, _commands) = mpsc::unbounded_channel();
+        let mut support = MotorDeviceSupport::new(
+            Arc::new(trace),
+            Duration::ZERO,
+            poll_tx,
+            motor_tx,
+            new_shared_state(),
+        );
+        let mut rec = motor_rs::MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.limits.dhlm = 100.0;
+        rec.limits.dllm = -100.0;
+        rec.limits.hlm = 100.0;
+        rec.limits.llm = -100.0;
+        rec.vel.velo = 2.0;
+        rec.vel.vbas = 1.0;
+        rec.vel.accl = 0.5;
+        support.init(&mut rec).unwrap();
+        rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        rec.process().unwrap();
+        support.write(&mut rec).unwrap();
+    });
+    lines
+        .iter()
+        .filter(|l| l.contains("build_trans"))
+        .map(|l| match (l.find("pmsg="), l.find(", sizeof")) {
+            (Some(at), Some(size)) => format!("{}{}", &l[..at], &l[size..]),
+            _ => l.clone(),
+        })
+        // init_controller's line has no newline (devMotorAsyn.c:235-237).
+        .map(|l| {
+            let at = l.find("devMotorAsyn::build_trans");
+            l[at.or(l.find("devAsynMotor::build_trans")).unwrap()..].to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn a_record_prints_build_trans_flow_lines_with_its_pact() {
+    let lines = build_trans_lines("traceLinesBuild");
+    let call = |cmnd, pact, value: f64| {
+        format!("devMotorAsyn::build_trans: TL:m1 motor_cmnd={cmnd}, pact={pact}, value={value:.6}")
+    };
+    let queue = |command, interface, dvalue: f64| {
+        format!(
+            "devAsynMotor::build_trans: calling queueRequest, , sizeof(*pmsg)=24pmsg->command={command}, pmsg->interface={interface}, pmsg->dvalue={dvalue:.6}"
+        )
+    };
+    assert_eq!(
+        lines,
+        [
+            // init_record's dial limits (motorRecord.cc:717-718).
+            call(19, 0, 100.0),
+            queue(14, 1, 100.0),
+            call(20, 0, -100.0),
+            queue(15, 1, -100.0),
+            // do_work's move (:2527-2535): MOVE_ABS queues only at GO.
+            call(6, 1, 2.0),
+            queue(5, 1, 2.0),
+            call(5, 1, 1.0),
+            queue(6, 1, 1.0),
+            call(7, 1, 2.0),
+            queue(7, 1, 2.0),
+            call(0, 1, 5.0),
+            call(8, 1, 0.0),
+            queue(0, 1, 5.0),
         ]
     );
 }

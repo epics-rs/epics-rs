@@ -38,6 +38,12 @@ impl MotorRecord {
             return effects;
         }
 
+        // C 1366-1380 precedes the pp test, the retry test and the delay
+        // handling of every stopped callback.
+        if !self.stat.movn && self.ls_error_update(&mut effects) {
+            return effects;
+        }
+
         // C post-delay readback pass (motorRecord.cc:1427-1439):
         // `stup != motorSTUP_ON && mip != MIP_DONE` gates maybeRetry.
         // In C every completion that must not retry-evaluate (commanded
@@ -70,8 +76,7 @@ impl MotorRecord {
         // the raw RA_DONE bit — and process_motor_info (3741-3748)
         // computes movn = 0 for ls_active and RA_PROBLEM too, so an
         // axis stopped by its limit switch or a driver fault completes
-        // (maybeRetry's ls_blocks then refuses the retry) instead of
-        // waiting forever for a DONE that never comes.
+        // instead of waiting forever for a DONE that never comes.
         let driver_done = !self.stat.movn;
 
         if !driver_done {
@@ -219,13 +224,10 @@ impl MotorRecord {
             }
             // A Pause never set pp: postProcess is skipped, mip stays
             // MIP_STOP, and maybeRetry (1040-1100) runs against the
-            // preserved target — unless a limit switch in the commanded
-            // direction ended the coast, which C makes terminal ahead of
-            // both the pp test and maybeRetry (1367-1380), so the pause is
-            // not resumable and the drive fields adopt the limit readback.
+            // preserved target. A coast ended on the limit switch took
+            // `ls_error_update` instead.
             let diff = (self.pos.dval - self.pos.drbv).abs();
-            let ls_blocks = self.sync_if_limit_stopped();
-            if diff >= self.retry.rdbd && !ls_blocks && self.retry.rtry != 0 {
+            if diff >= self.retry.rdbd && self.retry.rtry != 0 {
                 if self.retry.rcnt >= self.retry.rtry {
                     // C 1059-1074: too many retries — give up, MISS
                     // latches, the lasts adopt the unreached target
@@ -265,17 +267,16 @@ impl MotorRecord {
                     }
                 }
             } else {
-                // Close enough, RTRY disabled, or LS blocked: C maybeRetry
-                // else-branch (1084-1102) — collapse to DONE. Only the LS
-                // arm syncs, and `sync_if_limit_stopped` has already done
-                // it; on the other two the lasts already equal the reached
-                // target from the dispatch-time load. MISS clears and SPMG restores
-                // Move->Pause only on the close-enough/LS path
-                // (1087-1101); the rtry==0 path leaves both. DLY arms
+                // Close enough or RTRY disabled: C maybeRetry else-branch
+                // (1084-1102) — collapse to DONE; the lasts already equal
+                // the reached target from the dispatch-time load. MISS
+                // clears and SPMG restores Move->Pause only on the
+                // close-enough path (1087-1101); the rtry==0 path leaves
+                // both. DLY arms
                 // only on a real completion edge (C 1457 needs a fresh
                 // M_DMOV mark): an idle Pause convergence pass (dmov
                 // already true) finalizes quietly.
-                if diff < self.retry.rdbd || ls_blocks {
+                if diff < self.retry.rdbd {
                     if std::mem::take(&mut self.retry.miss) {
                         self.mark(m::MISS);
                     }
@@ -411,16 +412,6 @@ impl MotorRecord {
                 if self.stat.mip.contains(MipFlags::LOAD_P) {
                     self.stat.mip = MipFlags::empty();
                     self.mark(m::MIP);
-                    // C 1367-1378 sees `mip == MIP_LOAD_P`, not MIP_DONE, so a
-                    // load on an axis resting on its limit in the commanded
-                    // direction takes the LS-error update: DMOV stays FALSE,
-                    // pp is armed and a GET_INFO sent, and the pp branch below
-                    // resyncs the drive fields from that fresh readback.
-                    if self.limit_stopped() {
-                        self.internal.pp = true;
-                        effects.request_poll = true;
-                        return effects;
-                    }
                     self.set_dmov(true);
                 }
                 // C process (1382-1402): a done status callback with pp
@@ -432,6 +423,11 @@ impl MotorRecord {
                 // resolution.
                 if self.internal.pp {
                     self.internal.pp = false;
+                    // C 1384-1399: a target written before the pp pass is
+                    // replayed, not synced away.
+                    if self.replay_overtaken_target(&mut effects) {
+                        return effects;
+                    }
                     // C 1351: a stopped callback returns DMOV to TRUE first.
                     self.set_dmov(true);
                     self.postprocess_sync();
@@ -684,43 +680,29 @@ impl MotorRecord {
         }
     }
 
-    /// C "Do another update after LS error" (motorRecord.cc:1367-1380) —
-    /// the single owner of the limit-switch completion, predicate and
-    /// consequence together. Returns whether a struck limit switch in the
-    /// commanded direction terminated this move, having already applied the
-    /// drive-field sync that termination implies.
-    ///
-    /// C tests the limit BEFORE the `pp` test (1382) and the retry gate
-    /// (1405) and then `goto process_exit`, so `maybeRetry` never runs on
-    /// that pass: an axis that ends on a limit in the commanded direction is
-    /// a TERMINAL limit completion whatever `pp` was, forced to `pp = TRUE`
-    /// with a GET_INFO and `mip = MIP_DONE` (1376-1377). The next callback's
-    /// `postProcess` (827-849) adopts the limit readback into VAL/DVAL/RVAL
-    /// and zeroes DIFF/RDIF; the Rust poll already carries that readback
-    /// (`process_motor_info` ran this cycle), so the sync applies directly.
-    ///
-    /// C compares raw `rhls`/`rlls` against raw `cdir`; the user-frame pair
-    /// is the same condition, since `process_motor_info` (3733-3734) maps
-    /// `hls`/`lls` from `rhls`/`rlls` under the same DIR/MRES polarity flip
-    /// applied to `cdir` here.
-    ///
-    /// Both completion paths that can retry — the inline MIP_STOP (Pause)
-    /// branch and [`Self::evaluate_position_error`] — decide through this
-    /// one call, so no path can suppress the retry on a limit without also
-    /// performing the sync. Holding the two apart is what left the Pause
-    /// branch advertising a target the axis never reached after the
-    /// positional branch was fixed.
-    ///
-    /// Scope is the LS-stop ALONE: a plain MOVE_ABS never sets C `pp` (the
-    /// dispatch sites at 1983/2025/2110/2125 are SET-mode, HOME and JOG, not
-    /// positional moves), so a close-enough or rtry-disabled completion is
-    /// still not synced. Do not extend the sync to those branches.
-    fn sync_if_limit_stopped(&mut self) -> bool {
-        let ls_stopped = self.limit_stopped();
-        if ls_stopped {
-            self.postprocess_sync();
+    /// C "Do another update after LS error" (motorRecord.cc:1366-1380): a
+    /// motion that stopped on the limit switch in its commanded direction
+    /// ends as MIP_DONE with DMOV left FALSE and unposted, pp armed and a
+    /// GET_INFO sent. Its callback's pp pass (the Idle arm) adopts the limit
+    /// readback, or replays a target written meanwhile. C's sudden jog stop
+    /// collapses MIP to DONE first (1357-1364), so a plain jog never takes
+    /// it. Whatever the motion was, nothing of it re-fires: no retry, no
+    /// backlash leg, no queued home or jog.
+    fn ls_error_update(&mut self, effects: &mut ProcessEffects) -> bool {
+        let mip = self.stat.mip;
+        if mip.is_empty() || mip == MipFlags::JOGF || mip == MipFlags::JOGR || !self.limit_stopped()
+        {
+            return false;
         }
-        ls_stopped
+        self.stat.mip = MipFlags::empty();
+        self.mark(m::MIP);
+        self.set_phase(MotionPhase::Idle);
+        self.internal.pp = true;
+        self.internal.backlash_pending = false;
+        self.internal.queued_motion = None;
+        self.internal.pending_retarget = None;
+        effects.commands.push(MotorCommand::Poll);
+        true
     }
 
     /// C 1367: `(rhls && cdir) || (rlls && !cdir)` — the axis rests on the
@@ -746,8 +728,6 @@ impl MotorRecord {
 
         let diff = (self.pos.dval - self.pos.drbv).abs();
 
-        let ls_blocks_retry = self.sync_if_limit_stopped();
-
         // C `maybeRetry` (motorRecord.cc:1049): the retry comparison is
         // `fabs(pmr->diff) >= pmr->rdbd` — inclusive of the boundary.
         // At `diff == rdbd` C retries; an earlier Rust version used `>`
@@ -755,7 +735,7 @@ impl MotorRecord {
         // (`rcnt < rtry` here); C `maybeRetry` has NO `rdbd > 0`
         // condition — RDBD is kept >= |MRES| by `enforceMinRetryDeadband`,
         // and when RDBD is 0 `fabs(diff) >= 0` is trivially true.
-        if diff >= self.retry.rdbd && !ls_blocks_retry && self.retry.rtry != 0 {
+        if diff >= self.retry.rdbd && self.retry.rtry != 0 {
             if self.retry.rcnt >= self.retry.rtry {
                 // C 1059-1073: too many retries — give up and latch MISS
                 // (1072). The give-up pass still counts (`++rcnt > rtry`),
@@ -814,12 +794,12 @@ impl MotorRecord {
             self.mark(m::MIP);
             self.plan_absolute_move(effects);
         } else {
-            // Close enough, LS-blocked, or RTRY disabled. C maybeRetry:
-            // the close-enough/LS-blocked else-branch clears MISS
+            // Close enough or RTRY disabled. C maybeRetry: the
+            // close-enough else-branch clears MISS
             // (1083-1092) and restores SPMG Move->Pause (1096-1101); the
             // rtry==0 branch (1054-1056) leaves both untouched —
             // retry-disabled never latches a miss.
-            if diff < self.retry.rdbd || ls_blocks_retry {
+            if diff < self.retry.rdbd {
                 if std::mem::take(&mut self.retry.miss) {
                     self.mark(m::MISS);
                 }

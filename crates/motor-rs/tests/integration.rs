@@ -205,7 +205,11 @@ async fn test_delay_via_poll_loop() {
 
 #[tokio::test]
 async fn test_backlash_via_mailbox() {
-    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    // The backlash leg ends at -11 EGU, past the sim's default -10000-step
+    // switch; an LS stop would end the move there (C 1367-1380).
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+        SimMotor::new().with_limits(-100_000.0, 100_000.0),
+    ));
     let mut setup = make_builder(motor)
         .configure_record(|rec| {
             rec.conv.mres = 0.001;

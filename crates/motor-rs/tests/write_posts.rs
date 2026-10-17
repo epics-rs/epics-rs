@@ -246,7 +246,7 @@ fn a_write_that_sets_no_status_field_posts_nothing() {
 #[test]
 fn a_field_the_driver_set_posts_only_when_it_changed() {
     let mut rig = rig(controller(), 2.0);
-    let ratio = MotorCommand::SetEncoderRatio { ratio: 2.0 };
+    let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
     assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
     assert_eq!(rig.write(ratio), None);
 }
@@ -307,7 +307,7 @@ fn a_model2_write_that_fails_posts_nothing() {
 #[test]
 fn a_model2_driver_field_posts_like_a_controllers() {
     let mut rig = rig(model2(), 2.0);
-    let ratio = MotorCommand::SetEncoderRatio { ratio: 2.0 };
+    let ratio = MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] };
     assert_eq!(rig.write(ratio.clone()).unwrap().encoder_position, 2.0);
     assert_eq!(rig.write(ratio), None);
 }
@@ -368,7 +368,7 @@ fn a_write_that_is_no_move_processes_its_record_only_through_a_post() {
     let mut rig = rig(controller(), 2.0);
     assert_eq!(rig.write(MotorCommand::Stop { acceleration: 1.0 }), None);
     assert!(rig.record.passes().is_empty());
-    let posted = rig.write(MotorCommand::SetEncoderRatio { ratio: 2.0 });
+    let posted = rig.write(MotorCommand::SetEncoderRatio { pulses: [2.0, 1.0] });
     assert_eq!(rig.record.passes(), Vec::from_iter(posted));
 }
 

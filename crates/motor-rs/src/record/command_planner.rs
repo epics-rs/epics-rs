@@ -1760,7 +1760,7 @@ impl MotorRecord {
                 m /= 10.0;
             }
             effects.commands.push(MotorCommand::SetEncoderRatio {
-                ratio: (m / eres) / (m / mres),
+                pulses: [m / eres, m / mres],
             });
         }
         if self.conv.set && !self.conv.igset {
@@ -1948,6 +1948,10 @@ impl MotorRecord {
 
         if self.timing.ntm && direction_changed && diff.abs() > deadband {
             RetargetAction::StopAndReplan
+        } else if new_dval == self.internal.ldvl && self.stat.mip.contains(MipFlags::MOVE) {
+            // The move in flight already goes there: C's 2455 gate sends
+            // nothing, and there is no new target to extend to.
+            RetargetAction::Ignore
         } else {
             // Same-direction or within-deadband: extend the move
             // in-flight. C parks the new target until completion behind

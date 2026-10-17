@@ -59,6 +59,12 @@ pub struct MotorDeviceState {
     /// `latest_status` past it.
     consumed_seq: u64,
     pub expired_delay_id: Option<u64>,
+    /// The CDIR a model-1 driver left in `mr->cdir` while polling this
+    /// record's move ([`AsynMotor::poll_in_motion`]), for the record's next
+    /// pass to take.
+    ///
+    /// [`AsynMotor::poll_in_motion`]: asyn_rs::interfaces::motor::AsynMotor::poll_in_motion
+    pub(crate) driver_cdir: Option<bool>,
 
     // Record → DeviceSupport
     pub pending_actions: Option<DeviceActions>,
@@ -347,6 +353,18 @@ impl AxisSubscribers {
         }
         subscribed.latest = Some(status);
         pulses
+    }
+
+    /// The CDIR a model-1 driver wrote into `record` while polling its move.
+    pub(crate) fn set_driver_cdir(&self, record: RecordId, cdir: bool) {
+        let subscribed = self.lock();
+        if let Some(mut ds) = subscribed
+            .records
+            .get(record)
+            .and_then(|bound| bound.device_state.lock().ok())
+        {
+            ds.driver_cdir = Some(cdir);
+        }
     }
 
     /// `record`'s move-class command finished ([`MotorDeviceState::move_done`]).

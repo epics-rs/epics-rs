@@ -776,8 +776,8 @@ fn test_runtime_mres_change_with_an_encoder_sends_the_ratio_first() {
     assert!(
         matches!(
             effects.commands[..],
-            [MotorCommand::SetEncoderRatio { ratio }, MotorCommand::SetPosition { .. }, MotorCommand::Poll]
-                if ratio == (1_000.0 / 0.001) / (1_000.0 / 0.004)
+            [MotorCommand::SetEncoderRatio { pulses }, MotorCommand::SetPosition { .. }, MotorCommand::Poll]
+                if pulses == [1_000.0 / 0.001, 1_000.0 / 0.004]
         ),
         "{:?}",
         effects.commands
@@ -812,6 +812,7 @@ fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
     rec.stat.msta = MstaFlags::DONE;
     rec.internal.init_invariants_synced = true;
     rec.pos.val = 5.0;
+    rec.internal.lval = 5.0;
     rec.pos.dval = 5.0;
     rec.pos.drbv = 5.0;
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
@@ -1520,6 +1521,9 @@ fn test_ls_stop_syncs_drive_values_to_readback() {
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
+    rec.stat.dmov = false;
+    rec.internal.lval = 10.0;
     rec.conv.mres = 1.0;
     rec.retry.rtry = 3; // retry would fire on a 1.0 error...
     // Commanded the +direction into the high limit; the switch is struck.
@@ -1532,13 +1536,27 @@ fn test_ls_stop_syncs_drive_values_to_readback() {
     rec.pos.drbv = 9.0;
     rec.pos.rbv = 9.0;
 
-    let _ = rec.check_completion();
-
-    assert_eq!(rec.stat.phase, MotionPhase::Idle, "LS-stop finalizes");
-    assert!(
-        !rec.stat.mip.contains(MipFlags::RETRY),
-        "the limit suppresses the retry"
+    let mmap = |rec: &MotorRecord| match rec.get_field("MMAP") {
+        Some(EpicsValue::ULong(v)) => v as u64,
+        other => panic!("MMAP: {other:?}"),
+    };
+    let effects = rec.check_completion();
+    assert_eq!(
+        effects.commands,
+        [MotorCommand::Poll],
+        "C 1373: GET_INFO only"
     );
+    assert!(rec.stat.mip.is_empty(), "C 1377: MIP_DONE, no retry");
+    assert_ne!(mmap(&rec) & (1 << 26), 0, "C 1378: MIP posted");
+    assert!(!rec.stat.dmov, "C 1371: DMOV stays FALSE");
+    assert_eq!(mmap(&rec) & (1 << 4), 0, "C 1372: DMOV not posted");
+    assert_eq!(rec.pos.val, 10.0, "the sync waits for the GET_INFO reply");
+
+    // The GET_INFO reply: pp runs postProcess.
+    let effects = rec.check_completion();
+    assert!(effects.commands.is_empty(), "{:?}", effects.commands);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle, "LS-stop finalizes");
     assert_eq!(
         rec.pos.val, 9.0,
         "VAL adopts the limit readback (C postProcess)"
@@ -1547,6 +1565,40 @@ fn test_ls_stop_syncs_drive_values_to_readback() {
     assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
     assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
     assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+}
+
+#[test]
+fn test_ls_stop_replays_a_target_written_before_the_get_info_reply() {
+    // C 1384-1399: the LS-error pp pass replays `val != lval` through
+    // do_work instead of letting postProcess sync it away.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
+    rec.stat.dmov = false;
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.cdir = true;
+    rec.limits.hls = true;
+    rec.internal.lval = 10.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 9.0;
+    rec.pos.rbv = 9.0;
+    assert!(sends_get_info(&rec.check_completion()));
+
+    rec.pos.val = 5.0;
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "{:?}",
+        effects.commands
+    );
+    assert!(!rec.stat.dmov);
 }
 
 #[test]
@@ -1608,8 +1660,18 @@ fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
     assert!(rec.limits.hls, "the poll carries the struck limit");
     assert!(!rec.stat.movn, "the axis has stopped");
 
-    rec.check_completion();
+    let effects = rec.check_completion();
+    assert!(sends_get_info(&effects), "C 1373: GET_INFO");
+    assert!(!rec.stat.dmov, "C 1371: DMOV stays FALSE");
+    assert!(
+        rec.stat.mip.is_empty(),
+        "C 1377: the pause is not resumable"
+    );
 
+    // The GET_INFO reply: the armed pp runs postProcess.
+    rec.process_motor_info(&on_limit);
+    rec.check_completion();
+    assert!(rec.stat.dmov);
     assert_eq!(
         rec.pos.val, 9.0,
         "VAL adopts the limit readback: C treats a stop that ends on a \
@@ -2379,6 +2441,10 @@ fn put_onto_struck_limit(
     rec.do_process();
     rec.put_field("VAL", EpicsValue::Double(target)).unwrap();
     let effects = rec.do_process();
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    let ls = rec.do_process();
+    assert!(sends_get_info(&ls), "C 1373: GET_INFO after the LS stop");
+    assert!(!rec.stat.dmov, "C 1371: DMOV stays FALSE");
     rec.set_event(MotorEvent::DeviceUpdate(on_limit));
     rec.do_process();
     effects
@@ -6717,6 +6783,31 @@ fn test_target_written_under_spmg_stop_dispatches_on_go() {
 }
 
 #[test]
+fn test_same_target_put_during_the_go_move_sends_nothing() {
+    // C: the Go dispatch sets mip = MIP_MOVE and ldvl = dval (2461-2469),
+    // so a put of the same VAL during that move enters on !dmov (2241) and
+    // finds no MIP_DONE/MIP_RETRY to dispatch from (2455).
+    let mut rec = paused_move_setup();
+    rec.ctrl.spmg = SpmgMode::Stop;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.plan_motion(CommandSource::Spmg);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        !effects.commands.iter().any(|c| c.is_move()),
+        "the same target is no new move: {:?}",
+        effects.commands
+    );
+}
+
+#[test]
 fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
     // C: the jog dispatch armed pp (2125), so the pause-stop completion
     // post-processes (sync) instead of arming a move resume; the
@@ -8758,6 +8849,7 @@ mod jvel_live_retune {
                 commands.as_slice(),
                 [
                     MotorCommand::SetAccel { .. },
+                    MotorCommand::MoveDirection { forward: true },
                     MotorCommand::MoveVelocity { velocity, .. }
                 ] if *velocity == 2.5
             ),
@@ -8777,6 +8869,7 @@ mod jvel_live_retune {
                 commands.as_slice(),
                 [
                     MotorCommand::SetAccel { .. },
+                    MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }
                 ] if *velocity < 0.0
             ),
@@ -8799,6 +8892,7 @@ mod jvel_live_retune {
                 commands.as_slice(),
                 [
                     MotorCommand::SetAccel { .. },
+                    MotorCommand::MoveDirection { forward: false },
                     MotorCommand::MoveVelocity { velocity, .. }
                 ] if *velocity > 0.0
             ),
@@ -9102,22 +9196,23 @@ mod miss_semantics {
         assert!(rec.retry.miss, "rtry==0 leaves a latched MISS in place");
     }
 
-    // C 1049 + 1083-1092: a limit switch in the commanded direction routes
-    // the evaluation into the close-enough branch, which CLEARS miss.
+    // C 1367-1380: a limit switch in the commanded direction ends the
+    // motion ahead of maybeRetry, whose close-enough branch alone clears
+    // MISS (1090-1092); postProcess on the next pass never touches it.
     #[test]
-    fn ls_blocked_clears_miss() {
+    fn ls_stop_leaves_latched_miss() {
         let mut rec = MotorRecord::new();
         completed_short(&mut rec);
+        rec.stat.mip = MipFlags::MOVE;
+        rec.internal.lval = rec.pos.val;
         rec.retry.rtry = 3;
         rec.retry.miss = true;
         rec.stat.cdir = true; // commanded toward high limit
         rec.limits.hls = true;
         rec.check_completion();
+        rec.check_completion();
         assert_eq!(rec.stat.phase, MotionPhase::Idle);
-        assert!(
-            !rec.retry.miss,
-            "LS-blocked evaluation clears MISS (C 1092)"
-        );
+        assert!(rec.retry.miss, "no maybeRetry pass clears MISS");
         assert_eq!(rec.retry.rcnt, 0, "no retry dispatched against the limit");
     }
 
@@ -9804,9 +9899,16 @@ fn test_blinked_put_onto_hw_limit_completes_with_readback_adopted() {
     assert!(!effects.commands.is_empty(), "C dispatches into the switch");
     assert!(!rec.stat.dmov);
 
+    rec.set_event(MotorEvent::DeviceUpdate(on_limit.clone()));
+    let effects = rec.do_process();
+    assert!(
+        sends_get_info(&effects),
+        "C 1373: GET_INFO after the LS stop"
+    );
+    assert!(!rec.stat.dmov, "C 1371: DMOV stays FALSE");
     rec.set_event(MotorEvent::DeviceUpdate(on_limit));
     rec.do_process();
-    assert!(rec.stat.dmov, "the stopped callback completes the pulse");
+    assert!(rec.stat.dmov, "the GET_INFO reply completes the pulse");
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.pos.val, 0.0, "VAL adopts the limit readback");
     assert_eq!(rec.internal.ldvl, rec.pos.dval, "lasts follow the sync");

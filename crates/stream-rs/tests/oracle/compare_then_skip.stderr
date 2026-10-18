@@ -1,0 +1,4 @@
+_main_ Use of skip modifier '*' only allowed in input formats
+_main_ compare_then_skip.proto line 2: in format string: "%=*d"
+_main_ compare_then_skip.proto line 2: in command 'in'
+_main_ compare_then_skip.proto line 1: in protocol 'p'

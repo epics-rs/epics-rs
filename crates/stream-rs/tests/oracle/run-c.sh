@@ -39,7 +39,7 @@ for c in $(awk '!/^#/ {print $1}' tests/oracle/cases.txt | uniq); do
     cat >"$work/$c.cmd" <<EOF
 dbLoadDatabase "$STREAM_TOP/dbd/streamApp.dbd"
 streamApp_registerRecordDeviceDriver pdbbase
-epicsEnvSet STREAM_PROTOCOL_PATH tests/oracle:tests/proto
+epicsEnvSet STREAM_PROTOCOL_PATH tests/oracle:tests/none;tests/proto
 drvAsynIPPortConfigure "P", "127.0.0.1:9", 0, 1, 0
 var streamMsgTimeStamped 0
 #debug

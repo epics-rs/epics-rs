@@ -5,6 +5,7 @@ brace_var_unclosed brace_var_unclosed.proto p
 brace_without_name brace_without_name.proto p
 byte_range byte_range.proto p
 compare_flag_output compare_flag_output.proto p
+compare_then_skip compare_then_skip.proto p
 control_byte control_byte.proto p
 decimal_range decimal_range.proto p
 default_flag_output default_flag_output.proto p
@@ -69,6 +70,9 @@ ok_features @record X
 ok_empty_var empty_var.proto w1
 ok_empty_var empty_var.proto w2
 ok_empty_var empty_var.proto w3
+ok_boundaries boundaries.proto max
+ok_boundaries boundaries.proto closing
+ok_boundaries boundaries.proto params(a,)
 real_ADAM_4015 ADAM_4015.proto queryAll(1,2,3,4,5,6,7,8,9)
 real_ADAM_4015 ADAM_4015.proto queryChan(1,2,3,4,5,6,7,8,9)
 real_ADAM_4015 ADAM_4015.proto queryModel(1,2,3,4,5,6,7,8,9)

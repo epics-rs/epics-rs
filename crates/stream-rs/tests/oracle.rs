@@ -165,7 +165,7 @@ fn unexpand(s: &str) -> Vec<u8> {
 #[test]
 fn parser_errors_match_c() {
     common::setup();
-    protocol::set_path(Some("tests/oracle:tests/proto"));
+    protocol::set_path(Some("tests/oracle:tests/none;tests/proto"));
     let cases = std::fs::read_to_string("tests/oracle/cases.txt").unwrap();
     let mut order: Vec<&str> = Vec::new();
     let mut records: Vec<(&str, &str, &str)> = Vec::new();

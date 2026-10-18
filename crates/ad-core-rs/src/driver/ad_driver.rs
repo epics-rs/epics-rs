@@ -480,8 +480,6 @@ mod tests {
             ADDriverBase::new(
                 "TEST",
                 1,
-                8,
-                8,
                 1_000_000,
                 ASYN_CANBLOCK,
                 InterfaceMask::NONE,

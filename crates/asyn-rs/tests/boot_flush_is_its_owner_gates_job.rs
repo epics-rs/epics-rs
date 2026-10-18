@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::param::ParamType;
-use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
@@ -32,7 +32,13 @@ fn seeded_port(
     name: &str,
     gate: &Arc<InterruptGate>,
 ) -> (Arc<Mutex<Vec<usize>>>, usize, impl Sized) {
-    let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_INTERRUPTS,
+    );
     let val = base.create_param("VAL", ParamType::Float64).unwrap();
     base.set_float64_param(val, 0, 4.0).unwrap();
     let (rt, jh) =
@@ -45,6 +51,7 @@ fn seeded_port(
             addr: Some(0),
             uint32_mask: None,
             iface: None,
+            ..Default::default()
         },
         move |iv| {
             std::thread::sleep(Duration::from_millis(100));

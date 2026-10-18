@@ -36,3 +36,34 @@ fn the_noise_spans_half_the_amplitude() {
         .fold(0.0, f64::max);
     assert!(worst <= 2.0 && worst > 1.5, "{worst}");
 }
+
+/// simTask starts min/max at 1e6/-1e6 and divides the sum by maxPoints
+/// (testAsynPortDriver.cpp:209-211, :221), so an empty trace reports those.
+#[test]
+fn an_empty_trace_reports_sim_tasks_start_values() {
+    let mut empty = config(1.0, 0.0, 0.0);
+    empty.max_points = 0;
+    let r = compute_waveform(&empty, &mut Rng::new(1));
+    assert_eq!((r.min_val, r.max_val), (1e6, -1e6));
+    assert!(r.mean_val.is_nan(), "{}", r.mean_val);
+}
+
+/// simTask's loop runs `i < maxPoints` on the int it read (:201-213), so a
+/// negative MaxPoints is an empty trace: min/max stay 1e6/-1e6 and the mean
+/// is 0/maxPoints.
+#[test]
+fn a_negative_max_points_is_an_empty_trace() {
+    let sim = scope_ioc::driver::ScopeSimulator::new(
+        "scopeNegPts",
+        std::sync::Arc::new(asyn_rs::runtime::sync::Notify::new()),
+    );
+    let idx = sim.param_indices();
+    let mut base = sim.base;
+    base.set_int32_param(idx.p_max_points, 0, -1).unwrap();
+    let config = scope_ioc::driver::read_config(&base, &idx);
+    let r = compute_waveform(&config, &mut Rng::new(1));
+    assert!(r.waveform.is_empty());
+    assert_eq!((r.min_val, r.max_val), (1e6, -1e6));
+    assert_eq!(r.mean_val, 0.0);
+    assert!(r.mean_val.is_sign_negative(), "0/-1 is -0");
+}

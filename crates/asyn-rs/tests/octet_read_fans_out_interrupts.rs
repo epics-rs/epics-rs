@@ -49,6 +49,7 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: Some(InterfaceType::Octet),
+                ..Default::default()
             },
             move |iv| {
                 if let ParamValue::Octet(s) = &iv.value {

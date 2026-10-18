@@ -119,6 +119,7 @@ async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thre
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             move |_| {
                 seen.fetch_add(1, Ordering::Relaxed);

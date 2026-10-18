@@ -43,9 +43,10 @@ use tokio::sync::Notify;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
+use asyn_rs::interrupt::{InterruptClient, InterruptFilter, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
-use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port::{DrvUser, DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
 use asyn_rs::sync_io::SyncIOHandle;
@@ -53,7 +54,7 @@ use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::server::iocsh::registry::*;
 
-use crate::datatype::{self, ALL_DATA_TYPES, ModbusDataType};
+use crate::datatype::{self, ModbusDataType};
 use crate::driver::{
     IoTrace, ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
     TransportFailure,
@@ -138,6 +139,71 @@ fn decode_block_int32(dt: ModbusDataType, regs: &[u16]) -> AsynResult<Vec<i32>> 
         n += 1;
     }
     Ok(out)
+}
+
+/// Why a node's decode delivered no reading this cycle.
+enum Refusal {
+    /// Not the data reason.
+    Reason(usize),
+    /// Outside the register block.
+    Offset { offset: i32, max: usize },
+    /// The data type does not fit in the registers left at the offset.
+    Fit { offset: i32, error: AsynError },
+}
+
+impl Refusal {
+    /// The rest of C's `readPoller` trace line.
+    fn what(&self) -> String {
+        match self {
+            Self::Reason(reason) => format!("invalid pasynUser->reason {reason}"),
+            Self::Offset { offset, max } => format!("invalid memory request {offset}, max={max}"),
+            Self::Fit { offset, error } => {
+                format!("offset {offset} data type does not fit: {error}")
+            }
+        }
+    }
+}
+
+/// What a node too narrow for its data type is fired with. C fires the
+/// over-read with `auxStatus = ioStatus_` (drvModbusAsyn.cpp:1736-1738); after a
+/// good poll that read is past `data_`, allocated at `modbusLength_` (:286,
+/// :2487), so C's value is undefined and is not copied: rs fires a zero with
+/// `asynError` there, and with the failed poll's own status otherwise.
+fn fit_failure(
+    iface: Option<InterfaceType>,
+    io_status: AsynStatus,
+) -> Option<(ParamValue, AsynStatus)> {
+    let status = match io_status {
+        AsynStatus::Success => AsynStatus::Error,
+        failed => failed,
+    };
+    let value = match iface? {
+        InterfaceType::Int32 => ParamValue::Int32(0),
+        InterfaceType::Int64 => ParamValue::Int64(0),
+        InterfaceType::Float64 => ParamValue::Float64(0.0),
+        InterfaceType::UInt32Digital => ParamValue::UInt32Digital(0),
+        InterfaceType::Octet => ParamValue::Octet(Arc::from([])),
+        InterfaceType::Int32Array => ParamValue::Int32Array(Vec::new().into()),
+        InterfaceType::Float64Array => ParamValue::Float64Array(Vec::new().into()),
+        _ => return None,
+    };
+    Some((value, status))
+}
+
+/// Where C `readPoller` walks an interface's interrupt list in the cycle.
+fn poller_list_rank(iface: Option<InterfaceType>) -> usize {
+    [
+        InterfaceType::UInt32Digital,
+        InterfaceType::Int32,
+        InterfaceType::Int64,
+        InterfaceType::Float64,
+        InterfaceType::Int32Array,
+        InterfaceType::Float64Array,
+        InterfaceType::Octet,
+    ]
+    .iter()
+    .position(|i| Some(*i) == iface)
+    .unwrap_or(usize::MAX)
 }
 
 /// Float64 twin of [`decode_block_int32`] (C `readPlcFloat` fan-out,
@@ -408,11 +474,27 @@ impl OctetTransport for SyncIoTransport {
 // Port driver
 // ---------------------------------------------------------------------------
 
+/// C `modbusDrvUser_t`, which `drvUserCreate` hangs on a record's
+/// `pasynUser` when its data type is not the port's or it names a string
+/// length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModbusDrvUser {
+    data_type: ModbusDataType,
+    /// The `=N` string length; C keeps -1 for none.
+    len: Option<usize>,
+}
+
+impl ModbusDrvUser {
+    fn of(drv_user: Option<&DrvUser>) -> Option<&Self> {
+        drv_user?.downcast_ref()
+    }
+}
+
 /// The parameters the `drvModbusAsyn` constructor creates and seeds before
 /// any of its checks (drvModbusAsyn.cpp:215-230), so a half-built port has
 /// them too.
 struct ModbusParams {
-    reason_to_datatype: Vec<Option<ModbusDataType>>,
+    data_reason: usize,
     read_reason: usize,
     read_ok_reason: usize,
     write_ok_reason: usize,
@@ -427,57 +509,37 @@ struct ModbusParams {
 }
 
 impl ModbusParams {
-    fn create(base: &mut PortDriverBase, default_dt: ModbusDataType) -> AsynResult<Self> {
-        let mut reason_to_datatype: Vec<Option<ModbusDataType>> = Vec::new();
-        // MODBUS_DATA — an alias selecting the port's default data type —
-        // is created first, as drvModbusAsyn.cpp:213 does: a link with no
-        // drvInfo binds reason 0 and must read the default type.
-        let data_reason = base.create_param(
-            PARAM_DATA,
-            if default_dt.is_string() {
-                ParamType::Octet
-            } else {
-                ParamType::Float64
-            },
-        )?;
-        if reason_to_datatype.len() <= data_reason {
-            reason_to_datatype.resize(data_reason + 1, None);
-        }
-        reason_to_datatype[data_reason] = Some(default_dt);
+    /// C's base: one parameter list, and a `getAddress` that answers 0 for
+    /// every user because the asyn address is the register offset
+    /// (drvModbusAsyn.cpp:157-164, :497-502).
+    fn base(port_name: &str) -> PortDriverBase {
+        let flags = PortFlags {
+            multi_device: true,
+            can_block: true,
+            ..PortFlags::default()
+        };
+        let mut base =
+            PortDriverBase::new(port_name, 1, flags, MODBUS_INTERFACES, MODBUS_INTERRUPTS);
+        base.set_get_address(|_, _| Ok(0));
+        base
+    }
 
-        // One parameter per data type. The reason index recovers the type;
-        // numeric types use a Float64 cache value (covers the int16/int32
-        // ranges exactly), string types an Octet value.
-        for dt in ALL_DATA_TYPES {
-            let ptype = if dt.is_string() {
-                ParamType::Octet
-            } else {
-                ParamType::Float64
-            };
-            let idx = base.create_param(dt.as_str(), ptype)?;
-            if reason_to_datatype.len() <= idx {
-                reason_to_datatype.resize(idx + 1, None);
-            }
-            reason_to_datatype[idx] = Some(dt);
-        }
-
-        // Control / statistics parameters.
+    /// drvModbusAsyn.cpp:215-230, in C's order and types.
+    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+        let data_reason = base.create_param(PARAM_DATA, ParamType::Int32)?;
         let read_reason = base.create_param(PARAM_READ, ParamType::Int32)?;
+        let enable_histogram_reason =
+            base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
+        let read_histogram_reason = base.create_param(PARAM_READ_HISTOGRAM, ParamType::Int32)?;
+        let histogram_bin_reason = base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
+        let histogram_axis_reason =
+            base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
+        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
         let read_ok_reason = base.create_param(PARAM_READ_OK, ParamType::Int32)?;
         let write_ok_reason = base.create_param(PARAM_WRITE_OK, ParamType::Int32)?;
         let io_errors_reason = base.create_param(PARAM_IO_ERRORS, ParamType::Int32)?;
         let last_io_reason = base.create_param(PARAM_LAST_IO_TIME, ParamType::Int32)?;
         let max_io_reason = base.create_param(PARAM_MAX_IO_TIME, ParamType::Int32)?;
-        let poll_delay_reason = base.create_param(PARAM_POLL_DELAY, ParamType::Float64)?;
-        let enable_histogram_reason =
-            base.create_param(PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital)?;
-        let read_histogram_reason =
-            base.create_param(PARAM_READ_HISTOGRAM, ParamType::Int32Array)?;
-        let histogram_bin_reason = base.create_param(PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32)?;
-        let histogram_axis_reason =
-            base.create_param(PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array)?;
-
-        // drvModbusAsyn.cpp:226-230 seeds the statistics params.
         for r in [
             read_ok_reason,
             write_ok_reason,
@@ -487,9 +549,8 @@ impl ModbusParams {
         ] {
             base.set_int32_param(r, 0, 0)?;
         }
-
         Ok(Self {
-            reason_to_datatype,
+            data_reason,
             read_reason,
             read_ok_reason,
             write_ok_reason,
@@ -526,15 +587,9 @@ struct ModbusHalfBuilt {
 }
 
 impl ModbusHalfBuilt {
-    fn new(port_name: &str, data_type: ModbusDataType) -> AsynResult<Self> {
-        let flags = PortFlags {
-            multi_device: true,
-            can_block: true,
-            ..PortFlags::default()
-        };
-        let mut base =
-            PortDriverBase::new(port_name, 1, flags, MODBUS_INTERFACES, MODBUS_INTERRUPTS);
-        ModbusParams::create(&mut base, data_type)?;
+    fn new(port_name: &str) -> AsynResult<Self> {
+        let mut base = ModbusParams::base(port_name);
+        ModbusParams::create(&mut base)?;
         Ok(Self { base })
     }
 
@@ -574,9 +629,8 @@ pub struct ModbusPortDriver {
     base: PortDriverBase,
     engine: ModbusEngine,
     transport: Box<dyn OctetTransport>,
-    /// `reason` index → the data type it represents (`None` for non-data
-    /// params such as the statistics counters).
-    reason_to_datatype: Vec<Option<ModbusDataType>>,
+    /// reason of `MODBUS_DATA`, every data record's (C `P_Data`).
+    data_reason: usize,
     /// reason of the `MODBUS_READ` trigger parameter.
     read_reason: usize,
     /// reasons of the statistics parameters.
@@ -657,20 +711,9 @@ impl ModbusPortDriver {
         let mut engine =
             ModbusEngine::with_transaction_counter(config, link_type, counter).map_err(to_asyn)?;
         engine.record_traces();
-        let flags = PortFlags {
-            multi_device: true,
-            can_block: true,
-            ..PortFlags::default()
-        };
-        let mut base = PortDriverBase::new(
-            port_name,
-            engine.config().length.max(1),
-            flags,
-            MODBUS_INTERFACES,
-            MODBUS_INTERRUPTS,
-        );
+        let mut base = ModbusParams::base(port_name);
         let ModbusParams {
-            reason_to_datatype,
+            data_reason,
             read_reason,
             read_ok_reason,
             write_ok_reason,
@@ -682,7 +725,7 @@ impl ModbusPortDriver {
             read_histogram_reason,
             histogram_bin_reason,
             histogram_axis_reason,
-        } = ModbusParams::create(&mut base, engine.config().data_type)?;
+        } = ModbusParams::create(&mut base)?;
 
         let poll_delay_secs = engine.config().poll_delay.as_secs_f64();
 
@@ -690,7 +733,7 @@ impl ModbusPortDriver {
             base,
             engine,
             transport,
-            reason_to_datatype,
+            data_reason,
             read_reason,
             read_ok_reason,
             write_ok_reason,
@@ -751,13 +794,21 @@ impl ModbusPortDriver {
         };
     }
 
-    /// The data type bound to a reason, or an error if the reason is not a
-    /// data parameter.
-    fn datatype_of(&self, reason: usize) -> AsynResult<ModbusDataType> {
-        self.reason_to_datatype
-            .get(reason)
-            .copied()
-            .flatten()
+    /// The `modbusDrvUser_t` C's `drvUserCreate` hangs on a data client:
+    /// only when its type is not the port's or it names a length (:414-419).
+    fn drv_user_for(&self, data_type: ModbusDataType, len: Option<usize>) -> Option<DrvUser> {
+        (data_type != self.engine.config().data_type || len.is_some())
+            .then(|| Arc::new(ModbusDrvUser { data_type, len }) as DrvUser)
+    }
+
+    /// C `getDataType` (drvModbusAsyn.cpp:2356-2365): a `MODBUS_DATA`
+    /// client's type is its drvUser's when `drvUserCreate` hung one on it,
+    /// else the port's. An error for any other reason.
+    fn datatype_of(&self, reason: usize, drv_user: Option<&DrvUser>) -> AsynResult<ModbusDataType> {
+        (reason == self.data_reason)
+            .then(|| {
+                ModbusDrvUser::of(drv_user).map_or(self.engine.config().data_type, |d| d.data_type)
+            })
             .ok_or_else(|| AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("reason {reason} is not a Modbus data parameter"),
@@ -956,8 +1007,13 @@ impl ModbusPortDriver {
         // seeded by reads. A read-seeded `active` set left every `SCAN="I/O
         // Intr"` record dead, since such a record never reads on its own — its
         // first (and every) value must come from the poller's fire.
-        for (reason, addr) in self.base.interrupts.subscribed_bindings() {
-            // One unserviceable binding must cost only its own record. A
+        let mut clients = self.base.interrupts.subscribed_clients();
+        // C walks one list per interface, in this order (drvModbusAsyn.cpp:
+        // 1674, 1716, 1752, 1788, 1825, 1860, 1894).
+        clients.sort_by_key(|c| poller_list_rank(c.filter.iface));
+        let mut observed = Vec::new();
+        for client in clients {
+            // One unserviceable client must cost only its own record. A
             // legal offset can still be too narrow for the datatype bound
             // there (offset 9 of a 10-register block read as INT32_LE), and
             // letting that decode abort the cycle silenced every `SCAN="I/O
@@ -976,9 +1032,12 @@ impl ModbusPortDriver {
             // other signal — the port stays `asynSuccess` because the wire
             // transaction succeeded, IO_ERRORS stays 0, and the operator sees
             // only a PV that never changes.
-            if let Err(e) = self.fire_binding(reason, addr, force, port_gate, io_status) {
-                self.trace_binding_error(&format!("offset {addr} data type does not fit: {e}"));
-                self.fire_binding_failure(reason, addr, io_status);
+            self.fire_client(&client, force, port_gate, io_status);
+            let f = &client.filter;
+            let key = (f.reason, f.user_addr, f.iface);
+            if !observed.contains(&key) {
+                observed.push(key);
+                self.fire_rings(f, force, port_gate, io_status);
             }
         }
 
@@ -1013,242 +1072,179 @@ impl ModbusPortDriver {
         );
     }
 
-    /// The other half of skipping a binding: the record still has to hear
-    /// about it. Nothing else will fire that record — a `SCAN="I/O Intr"`
-    /// record never reads on its own — so a skip with no fire leaves it at
-    /// UDF=1 / SEVR=INVALID with no indication of why, while the port reports
-    /// `asynSuccess` and IO_ERRORS reads 0 because the wire transaction
-    /// succeeded. Every interface the binding has a subscriber for is fired
-    /// with the failed poll's status, or `asynError` after a good one, so the
-    /// record processes and takes its alarm from the callback status.
-    ///
-    /// The value delivered is a zero rather than a reading, because there is
-    /// no reading: the alarm is what carries the meaning. C's nearest arm
-    /// delivers the over-read instead and stamps `pasynUser->auxStatus =
-    /// ioStatus_` (drvModbusAsyn.cpp:1736-1738). After a good poll that is
-    /// `asynSuccess`, so C's record shows a garbage value with no alarm at
-    /// all, and alarming is the deliberate deviation. After a failed poll it
-    /// is the failure, which `io_status` carries here as in C.
-    ///
-    /// The UInt32Digital mask is `!0` so the fire is not filtered out by a
-    /// subscriber's `@asynMask`: an alarm the record's mask can veto is no
-    /// signal.
-    fn fire_binding_failure(&mut self, reason: usize, addr: i32, io_status: AsynStatus) {
-        let status = match io_status {
-            AsynStatus::Success => AsynStatus::Error,
-            failed => failed,
+    /// The other half of skipping a client: the record still has to hear
+    /// about it, since a `SCAN="I/O Intr"` record never reads on its own.
+    /// [`fit_failure`] says with what.
+    fn fire_client_failure(&self, client: &InterruptClient, io_status: AsynStatus) {
+        if let Some((value, status)) = fit_failure(client.filter.iface, io_status) {
+            self.fire(client, value, status);
+        }
+    }
+
+    /// C `pInterrupt->callback(userPvt, pasynUser, value)` with
+    /// `pasynUser->auxStatus = ioStatus_` set first.
+    fn fire(&self, client: &InterruptClient, value: ParamValue, aux_status: AsynStatus) {
+        let value = self.interrupt_value(&client.filter, value, aux_status);
+        self.base.interrupts.notify_client(client.id, value);
+    }
+
+    /// A ring is no C interrupt node, so no client's decode is its value:
+    /// it reads the offset as a node with no drvUser would, with the port's
+    /// data type (C `getDataType`, drvModbusAsyn.cpp:2356-2364), and the
+    /// refusal of that decode only. Not traced: C has no node to report.
+    fn fire_rings(
+        &self,
+        filter: &InterruptFilter,
+        force: bool,
+        port_gate: bool,
+        io_status: AsynStatus,
+    ) {
+        let node = InterruptFilter {
+            drv_user: None,
+            uint32_mask: None,
+            ..filter.clone()
         };
-        for (iface, value) in [
-            (InterfaceType::Int32, ParamValue::Int32(0)),
-            (InterfaceType::Int64, ParamValue::Int64(0)),
-            (InterfaceType::Float64, ParamValue::Float64(0.0)),
-            (InterfaceType::UInt32Digital, ParamValue::UInt32Digital(0)),
-            (InterfaceType::Octet, ParamValue::Octet(Arc::from([]))),
-            (
-                InterfaceType::Int32Array,
-                ParamValue::Int32Array(Vec::new().into()),
-            ),
-            (
-                InterfaceType::Float64Array,
-                ParamValue::Float64Array(Vec::new().into()),
-            ),
-        ] {
-            if self.base.interrupts.has_subscriber(reason, addr, iface) {
-                self.base
-                    .notify_interface_value(reason, addr, iface, value, !0, status);
+        let (value, status) = match self.decode(&node, force, port_gate) {
+            Ok(Some(value)) => (value, io_status),
+            Ok(None) | Err(Refusal::Reason(_) | Refusal::Offset { .. }) => return,
+            Err(Refusal::Fit { .. }) => match fit_failure(filter.iface, io_status) {
+                Some(failure) => failure,
+                None => return,
+            },
+        };
+        let value = self.interrupt_value(filter, value, status);
+        self.base.interrupts.notify_rings(value);
+    }
+
+    fn interrupt_value(
+        &self,
+        filter: &InterruptFilter,
+        value: ParamValue,
+        aux_status: AsynStatus,
+    ) -> InterruptValue {
+        InterruptValue {
+            reason: filter.reason.unwrap_or_default(),
+            addr: filter.user_addr.unwrap_or_default(),
+            value,
+            timestamp: self.base.get_time_stamp(),
+            aux_status,
+            iface: filter.iface,
+            // The per-offset change test already ran in the decode.
+            uint32_changed_mask: match filter.iface {
+                Some(InterfaceType::UInt32Digital) => !0,
+                _ => 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Fire one interrupt client with this cycle's register block, decoded
+    /// at its own offset with its own data type, as C `readPoller` does for
+    /// each node (drvModbusAsyn.cpp:1669-1924).
+    fn fire_client(
+        &self,
+        client: &InterruptClient,
+        force: bool,
+        port_gate: bool,
+        io_status: AsynStatus,
+    ) {
+        match self.decode(&client.filter, force, port_gate) {
+            Ok(Some(value)) => self.fire(client, value, io_status),
+            Ok(None) => {}
+            Err(refusal) => {
+                self.trace_binding_error(&refusal.what());
+                // C's invalid-reason and invalid-offset arms fire nothing.
+                if matches!(refusal, Refusal::Fit { .. }) {
+                    self.fire_client_failure(client, io_status);
+                }
             }
         }
     }
 
-    /// Fire every interface bound at (`reason`, `addr`) with this cycle's
-    /// register block. `Err` means this one binding could not be serviced —
-    /// its datatype does not fit in the registers left at its offset — and the
-    /// decode happens before any `notify_interface_value`, so a binding either
-    /// fires all of its interfaces or none of them.
-    fn fire_binding(
-        &mut self,
-        reason: usize,
-        addr: i32,
+    /// This cycle's value for a node with `filter`, or `None` when its
+    /// interface's gate holds it back.
+    fn decode(
+        &self,
+        filter: &InterruptFilter,
         force: bool,
         port_gate: bool,
-        io_status: AsynStatus,
-    ) -> AsynResult<()> {
-        let Ok(dt) = self.datatype_of(reason) else {
+    ) -> Result<Option<ParamValue>, Refusal> {
+        let reason = filter.reason.unwrap_or_default();
+        let Ok(dt) = self.datatype_of(reason, filter.drv_user.as_ref()) else {
             // C's `pasynUser->reason != P_Data` arm (drvModbusAsyn.cpp:
             // 1722-1727), reached by an `I/O Intr` READ_OK/IO_ERRORS record.
             // C then `break`s, starving every later record on that interface
-            // list each poll — a C defect, not copied: only this binding is
+            // list each poll — a C defect, not copied: only this client is
             // skipped here.
-            self.trace_binding_error(&format!("invalid pasynUser->reason {reason}"));
-            return Ok(());
+            return Err(Refusal::Reason(reason));
         };
-        // Defense-in-depth: a subscriber may bind an out-of-range `addr`
-        // (the registry does not range-check offsets); it must never index
-        // the engine buffer. A bad addr here is skipped, not allowed to
-        // panic. C is loud about exactly this one — `checkOffset` failing
-        // prints "invalid memory request %d, max=%d" at ASYN_TRACE_ERROR
-        // (drvModbusAsyn.cpp:1729-1734, the check itself at :2395-2404).
+        // C `checkOffset` failing prints "invalid memory request %d, max=%d"
+        // at ASYN_TRACE_ERROR (the check itself at :2395-2404) and `break`s,
+        // starving the rest of the list — a C defect, not copied
+        // (drvModbusAsyn.cpp:1729-1734).
         let data = self.engine.data();
-        if addr < 0 || addr as usize >= data.len() {
+        let offset = filter.user_addr.unwrap_or(-1);
+        if offset < 0 || offset as usize >= data.len() {
             let max = data.len();
-            self.trace_binding_error(&format!("invalid memory request {addr}, max={max}"));
-            self.fire_binding_failure(reason, addr, io_status);
-            return Ok(());
+            return Err(Refusal::Offset { offset, max });
         }
-        let regs = &data[addr as usize..];
-        if dt.is_string() {
-            // C gates the octet interrupt list on `forceCallback_ ||
-            // anyChanged` (port-wide change, drvModbusAsyn.cpp:1893) and
-            // skips even the `readPlcString` when nothing changed. asynOctet
-            // records are the sole subscribers for a string offset
-            // (:1894-1921), so a single typed fire suffices.
-            if port_gate {
-                let (bytes, _) =
-                    datatype::read_string(dt, regs, regs.len() * 2).map_err(to_asyn)?;
-                // The register block goes to the subscriber as the bytes it
-                // is. C `readPlcString` hands `readPoller`'s callers the
-                // buffer it filled (drvModbusAsyn.cpp), and a PLC's string
-                // registers are not required to hold UTF-8 — the
-                // `from_utf8_lossy` that used to sit here replaced any byte
-                // outside it with U+FFFD before the record ever saw it.
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::Octet,
-                    ParamValue::Octet(bytes.into()),
-                    0,
-                    io_status,
-                );
-            }
-        } else {
-            // C `readPoller` decodes the SAME register block separately per
-            // scalar interface and fires each interface's own interrupt list
-            // (drvModbusAsyn.cpp:1736 int32 / 1772 int64 / 1808 float64 / 1706
-            // uInt32Digital). One Modbus offset can be bound at once by an
-            // asynInt32 ai (ESLO convert), an asynInt64 int64in, an
-            // asynFloat64 ai (ASLO/SMOO), and an asynUInt32Digital bi (mask),
-            // each needing the value in its own type — collapsing to one
-            // Float64 (the old path) delivered a wrong-typed value to all but
-            // the asynFloat64 record. Decode all up front so a mid-decode
-            // error costs this binding its whole fire rather than a partial
-            // one; the interrupt iface filter routes each tagged value to only
-            // its interface's records.
-            let i32v = datatype::read_int32(dt, regs).map_err(to_asyn)?.0;
-            let i64v = datatype::read_int64(dt, regs).map_err(to_asyn)?.0;
-            let f64v = datatype::read_float(dt, regs).map_err(to_asyn)?.0;
-            // Raw register word for UInt32Digital; the record applies its own
-            // @asynMask via `apply_raw_readback`, matching the polled
-            // `read_uint32_digital` which delivers the unmasked word.
-            let word = regs.first().copied().unwrap_or(0) as u32;
-            // Array interfaces: C `readPoller` decodes the SAME register
-            // block from the record's offset to `modbusLength_` and fires the
-            // array interrupt lists — int32Array (drvModbusAsyn.cpp:1840-1851)
-            // and float64Array (:1875-1886) — so an asynInt32ArrayIn /
-            // asynFloat64ArrayIn waveform on `SCAN="I/O Intr"` updates every
-            // frame. Decode the whole block once per array interface a record
-            // is bound to; the subscriber-presence gate skips the decode when
-            // no array record exists, mirroring C iterating an empty interrupt
-            // list (the per-element `readPlcInt32`/`readPlcFloat` loop never
-            // runs). The waveform consumer caps the array at its NELM. Decode
-            // up front with the scalars so a mid-decode error costs this
-            // binding its whole fire rather than a partial one.
-            //
-            // int32Array fires on `forceCallback_ || anyChanged` (port-wide
-            // change, drvModbusAsyn.cpp:1824); float64Array fires every cycle
-            // (ADC averaging, :1860). The `has_subscriber` gate skips the
-            // whole-block decode when no array record is bound, mirroring C
-            // iterating an empty interrupt list (the per-element
-            // `readPlcInt32`/`readPlcFloat` loop never runs).
-            let int32_array = if port_gate
-                && self
-                    .base
-                    .interrupts
-                    .has_subscriber(reason, addr, InterfaceType::Int32Array)
-            {
-                Some(decode_block_int32(dt, regs)?)
-            } else {
-                None
-            };
-            let float64_array =
-                if self
-                    .base
-                    .interrupts
-                    .has_subscriber(reason, addr, InterfaceType::Float64Array)
-                {
-                    Some(decode_block_float64(dt, regs)?)
-                } else {
-                    None
+        let fit = |error: AsynError| Refusal::Fit { offset, error };
+        let regs = &data[offset as usize..];
+        // int32/int64/float64 and float64Array fire every cycle (ADC
+        // averaging, :1714/1858); uInt32Digital (:1673), int32Array (:1824)
+        // and octet (:1893) only on `forceCallback_ || anyChanged`.
+        let value = match filter.iface {
+            Some(InterfaceType::UInt32Digital) if port_gate => {
+                // C fires on a per-offset masked change (:1695-1707) and
+                // hands the callback the masked word.
+                let mask = match filter.uint32_mask {
+                    Some(m) if m != 0 && m != 0xFFFF => m,
+                    _ => !0,
                 };
-            self.base.notify_interface_value(
-                reason,
-                addr,
-                InterfaceType::Int32,
-                ParamValue::Int32(i32v),
-                0,
-                io_status,
-            );
-            self.base.notify_interface_value(
-                reason,
-                addr,
-                InterfaceType::Int64,
-                ParamValue::Int64(i64v),
-                0,
-                io_status,
-            );
-            self.base.notify_interface_value(
-                reason,
-                addr,
-                InterfaceType::Float64,
-                ParamValue::Float64(f64v),
-                0,
-                io_status,
-            );
-            // C fires uInt32Digital only on a per-offset masked change
-            // (`forceCallback_ || (newValue & mask != prevValue & mask)`,
-            // drvModbusAsyn.cpp:1695-1707). The asyn interrupt filter applies
-            // the same gate: a subscriber with `@asynMask` M passes iff
-            // `uint32_changed_mask & M != 0` (interrupt.rs `matches`;
-            // asynPortDriver.cpp:720). So pass the actually-changed bits
-            // `word ^ prev_word` as the changed mask — equivalent to C's
-            // per-subscriber `(new ^ prev) & mask` test — and skip the fire
-            // entirely when the offset's word is unchanged. `force` (first
-            // cycle / post-I/O-error) passes `!0` so every subscriber fires
-            // regardless, matching C `forceCallback_`.
-            let prev_word = self.prev_data.get(addr as usize).copied().unwrap_or(0) as u32;
-            let changed_bits = word ^ prev_word;
-            if force || changed_bits != 0 {
-                let changed_mask = if force { !0 } else { changed_bits };
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::UInt32Digital,
-                    ParamValue::UInt32Digital(word),
-                    changed_mask,
-                    io_status,
-                );
+                let word = u32::from(regs[0]) & mask;
+                let prev = self.prev_data.get(offset as usize).copied();
+                let prev = u32::from(prev.unwrap_or(0)) & mask;
+                if !force && word == prev {
+                    return Ok(None);
+                }
+                ParamValue::UInt32Digital(word)
             }
-            if let Some(arr) = int32_array {
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::Int32Array,
-                    ParamValue::Int32Array(arr.into()),
-                    0,
-                    io_status,
-                );
+            Some(InterfaceType::Int32) => ParamValue::Int32(
+                datatype::read_int32(dt, regs)
+                    .map_err(|e| fit(to_asyn(e)))?
+                    .0,
+            ),
+            Some(InterfaceType::Int64) => ParamValue::Int64(
+                datatype::read_int64(dt, regs)
+                    .map_err(|e| fit(to_asyn(e)))?
+                    .0,
+            ),
+            Some(InterfaceType::Float64) => ParamValue::Float64(
+                datatype::read_float(dt, regs)
+                    .map_err(|e| fit(to_asyn(e)))?
+                    .0,
+            ),
+            Some(InterfaceType::Int32Array) if port_gate => {
+                ParamValue::Int32Array(decode_block_int32(dt, regs).map_err(fit)?.into())
             }
-            if let Some(arr) = float64_array {
-                self.base.notify_interface_value(
-                    reason,
-                    addr,
-                    InterfaceType::Float64Array,
-                    ParamValue::Float64Array(arr.into()),
-                    0,
-                    io_status,
-                );
+            Some(InterfaceType::Float64Array) => {
+                ParamValue::Float64Array(decode_block_float64(dt, regs).map_err(fit)?.into())
             }
-        }
-        Ok(())
+            Some(InterfaceType::Octet) if port_gate && dt.is_string() => {
+                // C `getStringLen(pasynUser, sizeof(stringBuffer))` (:1914).
+                let room = regs.len() * 2;
+                let len = ModbusDrvUser::of(filter.drv_user.as_ref())
+                    .and_then(|d| d.len)
+                    .map_or(room, |len| len.min(room));
+                let (bytes, _) =
+                    datatype::read_string(dt, regs, len).map_err(|e| fit(to_asyn(e)))?;
+                // The register block goes to the subscriber as the bytes it
+                // is: a PLC's string registers are not required to hold UTF-8.
+                ParamValue::Octet(bytes.into())
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
     }
 
     /// Every Modbus transaction goes through here. C `doModbusIO` sets the
@@ -1496,35 +1492,25 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
-        // The modbus drvInfo names the data type (`INT16`, `FLOAT32LE`, …), so
-        // the parameter type comes from the drvInfo, not from the bound record's
-        // interface (`req.iface`): a record whose DTYP disagrees with the
-        // configured data type is a configuration error, not a retype request.
+        // C `drvUserCreate` (drvModbusAsyn.cpp:368-433): the drvInfo up to the
+        // first '=' is matched case-insensitively against the data-type names;
+        // anything else, `MODBUS_DATA` included, goes to the base class whole.
+        // The record's DTYP plays no part: the drvInfo alone names the type.
         let (drv_info, addr) = (req.drv_info.as_str(), req.addr);
-        // C `drvUserCreate` (drvModbusAsyn.cpp:368-433) strips everything after
-        // the first '=' to resolve the data-type name, then validates the
-        // optional `=N` string-length suffix: it is legal ONLY for the eight
-        // string types (`strtol` base 0, non-negative); a non-string type with
-        // a suffix, or a garbage/negative length, is rejected with `asynError`
-        // (:399-412). A valid length is stashed as the per-record octet cap
-        // (C `modbusDrvUser_t.len`); `getStringLen` later caps the asyn octet
-        // `maxLen` to it (:2367-2377), which the binding applies to its octet
-        // buffer length at init.
-        let mut parts = drv_info.splitn(2, '=');
-        let base_info = parts.next().unwrap_or(drv_info).trim();
-        let suffix = parts.next();
-        // A drvInfo that names no data type (statistics/control) goes to the
-        // base class whole, suffix included (:432-433).
-        let Some((reason, datatype)) = self.base.find_param(base_info).and_then(|reason| {
-            let dt = self.reason_to_datatype.get(reason).copied().flatten()?;
-            Some((reason, dt))
-        }) else {
+        let (type_name, suffix) = match drv_info.split_once('=') {
+            Some((name, suffix)) => (name, Some(suffix)),
+            None => (drv_info, None),
+        };
+        let Some(datatype) = ModbusDataType::from_type_string(type_name) else {
             return self.base.drv_user_create(req);
         };
-        // C runs `getAddr` + `checkOffset` in the data-type branch only
-        // (:378-384). Reject an out-of-range offset here at bind so the record
-        // fails init instead of binding and alarming on every I/O.
-        if let Err(e) = self.engine.check_offset(addr) {
+        // C's refusals leave `pasynUser->errorMessage` untouched; the trace
+        // line is the whole report.
+        let refused = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        };
+        if self.engine.check_offset(addr).is_err() {
             self.base.trace_print(
                 TraceMask::ERROR,
                 format_args!(
@@ -1532,12 +1518,13 @@ impl PortDriver for ModbusPortDriver {
                     self.base.port_name
                 ),
             );
-            return Err(to_asyn(e));
+            return Err(refused());
         }
-        let mut max_octet_len = None;
+        // `=N` is legal only on the eight string types (:387-412); its length
+        // is C `modbusDrvUser_t.len`, which `getStringLen` caps `maxLen` to.
+        let mut len = None;
         if let Some(suffix) = suffix {
             if !datatype.is_string() {
-                // C: the `=` length suffix is invalid for a non-string type.
                 self.base.trace_print(
                     TraceMask::ERROR,
                     format_args!(
@@ -1545,34 +1532,21 @@ impl PortDriver for ModbusPortDriver {
                         self.base.port_name
                     ),
                 );
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("invalid drvUser (length suffix on non-string): {drv_info}"),
-                });
+                return Err(refused());
             }
-            match parse_drvuser_string_len(suffix) {
-                // C stores the parsed length in `drvUser->len`; it is `>= 0`
-                // here (the parser rejects negatives), so the cap is exact.
-                Some(len) => max_octet_len = Some(len as usize),
-                None => {
-                    // C: `strtol` base 0 with the `endptr[0] != '\0' || len < 0`
-                    // guard rejects garbage or a negative length.
-                    self.base.trace_print(
-                        TraceMask::ERROR,
-                        format_args!(
-                            "drvModbusAsyn::drvUserCreate port {} invalid string length: {suffix}\n",
-                            self.base.port_name
-                        ),
-                    );
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: format!("invalid string length: {suffix}"),
-                    });
-                }
-            }
+            let Some(n) = parse_drvuser_string_len(suffix) else {
+                self.base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "drvModbusAsyn::drvUserCreate port {} invalid string length: {suffix}\n",
+                        self.base.port_name
+                    ),
+                );
+                return Err(refused());
+            };
+            len = Some(n as usize);
         }
-        // C prints through the caller's user once its reason is the data
-        // parameter's (drvModbusAsyn.cpp:420-427).
+        let reason = self.data_reason;
         self.base.trace_print_at(
             addr,
             reason as i32,
@@ -1586,7 +1560,8 @@ impl PortDriver for ModbusPortDriver {
             ),
         );
         Ok(DrvUserInfo {
-            max_octet_len,
+            max_octet_len: len,
+            drv_user: self.drv_user_for(datatype, len),
             ..DrvUserInfo::from_reason(reason)
         })
     }
@@ -1609,9 +1584,9 @@ impl PortDriver for ModbusPortDriver {
         // C `drvModbusAsyn::readInt32` (drvModbusAsyn.cpp:653-723): only the
         // `P_Data` reason runs the Modbus decode path; every other reason
         // (statistics/control params) delegates to `asynPortDriver::readInt32`,
-        // returning the cached parameter-library value.
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
-            return self.base.get_int32_param(user.reason, user.addr);
+        // whose `getAddress` reads list 0 at any asyn address.
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+            return self.base.read_int32_param(user);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // Absolute mode: read this record's own wire address now (the C
@@ -1629,8 +1604,8 @@ impl PortDriver for ModbusPortDriver {
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
         // Non-data reason → cached parameter value (see `read_int32`).
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
-            return self.base.get_int64_param(user.reason, user.addr);
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+            return self.base.read_int64_param(user);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // C `readInt64` (drvModbusAsyn.cpp:836-837) uses a FIXED request
@@ -1645,8 +1620,8 @@ impl PortDriver for ModbusPortDriver {
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
         // Non-data reason → cached parameter value (see `read_int32`).
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
-            return self.base.get_float64_param(user.reason, user.addr);
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
+            return self.base.read_float64_param(user);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // C `readFloat64` (drvModbusAsyn.cpp:982-983) uses a FIXED request
@@ -1663,14 +1638,10 @@ impl PortDriver for ModbusPortDriver {
         // Non-data reason (e.g. ENABLE_HISTOGRAM) → cached parameter value;
         // see `read_int32` for the C parity reference.
         if self
-            .reason_to_datatype
-            .get(user.reason)
-            .copied()
-            .flatten()
-            .is_none()
+            .datatype_of(user.reason, user.drv_user.as_ref())
+            .is_err()
         {
-            let raw = self.base.get_uint32_param(user.reason, user.addr)?;
-            return Ok(if mask == 0 { raw } else { raw & mask });
+            return self.base.read_uint32_digital_param(user, mask);
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         if self.is_absolute() {
@@ -1684,7 +1655,7 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         if self.is_absolute() {
             // C `readOctet` (drvModbusAsyn.cpp:1464-1465) issues
@@ -1749,7 +1720,7 @@ impl PortDriver for ModbusPortDriver {
             return Ok(n);
         }
         // Otherwise a Modbus data array — one element per `register_count`.
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         let rc = dt.register_count().max(1);
         // Absolute mode: C `readInt32Array` (drvModbusAsyn.cpp:1294-1295)
         // issues `doModbusIO(..., std::min((int)maxChans, modbusLength_))` —
@@ -1803,7 +1774,7 @@ impl PortDriver for ModbusPortDriver {
             }
             return Ok(n);
         }
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         let rc = dt.register_count().max(1);
         // Absolute mode: per-record read at the wire address (see
         // `read_int32_array`).
@@ -1831,7 +1802,7 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         // C `writeInt32Array` accepts only write-multiple functions; any other
         // function (single-value writes, read functions) returns asynError
         // (drvModbusAsyn.cpp:1422-1427). Reject it here rather than emit a
@@ -1874,7 +1845,7 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         // C `writeFloat64Array` accepts only write-multiple functions; any
         // other function returns asynError (drvModbusAsyn.cpp:1252-... default).
         let function = self.engine.config().function;
@@ -1944,7 +1915,7 @@ impl PortDriver for ModbusPortDriver {
         }
         // Any other non-data reason is C's `asynPortDriver::writeInt32`
         // (drvModbusAsyn.cpp:805), whose callbacks also post the statistics.
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
             return self.base.write_int32_param(user, value);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1955,7 +1926,7 @@ impl PortDriver for ModbusPortDriver {
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
         // C `writeInt64` hands a non-data reason to `asynPortDriver::writeInt64`
         // (drvModbusAsyn.cpp:951).
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
             return self.base.write_int64_param(user, value);
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1982,7 +1953,7 @@ impl PortDriver for ModbusPortDriver {
         }
         // C `writeFloat64` ignores any other non-data reason and returns
         // asynSuccess (drvModbusAsyn.cpp:1094-1101).
-        let Some(dt) = self.reason_to_datatype.get(user.reason).copied().flatten() else {
+        let Some(dt) = self.datatype_of(user.reason, user.drv_user.as_ref()).ok() else {
             return Ok(());
         };
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -2012,11 +1983,8 @@ impl PortDriver for ModbusPortDriver {
         // Any other non-data reason is C's `asynPortDriver::writeUInt32Digital`
         // (drvModbusAsyn.cpp:643).
         if self
-            .reason_to_datatype
-            .get(user.reason)
-            .copied()
-            .flatten()
-            .is_none()
+            .datatype_of(user.reason, user.drv_user.as_ref())
+            .is_err()
         {
             return self.base.write_uint32_digital_param(user, value, mask);
         }
@@ -2089,7 +2057,7 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let dt = self.datatype_of(user.reason)?;
+        let dt = self.datatype_of(user.reason, user.drv_user.as_ref())?;
         // C `writeOctet` (drvModbusAsyn.cpp:1545-1563) accepts only the
         // write-multiple-registers functions; any other function returns
         // asynError.
@@ -2505,8 +2473,7 @@ impl CommandHandler for ModbusConfigHandler {
         let (config, sync) = match built {
             Ok(built) => built,
             Err(line) => {
-                let half =
-                    ModbusHalfBuilt::new(port_name, args.data_type).map_err(|e| e.to_string())?;
+                let half = ModbusHalfBuilt::new(port_name).map_err(|e| e.to_string())?;
                 let (_runtime, port_handle) = match start_port(claim, half, ctx) {
                     Ok(started) => started,
                     Err(outcome) => return Ok(outcome),
@@ -3040,17 +3007,18 @@ mod tests {
             )),
         )
         .expect("an RTU read config must build");
-        let reason = absolute
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
+        let (reason, reason_du) = data_param(&absolute, ModbusDataType::UInt16);
         // The record's link supplies the modbus register as the asyn address.
         // C reads it with the raw `pasynManager->getAddr` and refuses a
         // negative one in `checkOffset` (drvModbusAsyn.cpp:2397) before any
         // I/O, so an unaddressed user would test that refusal, not the
         // timeout this case is about.
         let err = absolute
-            .read_int32(&AsynUser::new(reason).with_addr(0))
+            .read_int32(
+                &AsynUser::new(reason)
+                    .with_drv_user(reason_du.clone())
+                    .with_addr(0),
+            )
             .expect_err("a silent slave must fail the read");
         assert_eq!(
             err.status(),
@@ -3147,7 +3115,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(masks(&built.base), c);
-        let half = ModbusHalfBuilt::new("mbmaskhalf", ModbusDataType::Int16).unwrap();
+        let half = ModbusHalfBuilt::new("mbmaskhalf").unwrap();
         assert_eq!(masks(&half.base), c);
     }
 
@@ -3511,6 +3479,11 @@ mod tests {
         runtime.shutdown();
     }
 
+    /// A `MODBUS_DATA` client of type `dt`, as `drvUserCreate` binds one.
+    fn data_param(driver: &ModbusPortDriver, dt: ModbusDataType) -> (usize, Option<DrvUser>) {
+        (driver.data_reason, driver.drv_user_for(dt, None))
+    }
+
     fn test_config(start_address: i32, length: usize) -> ModbusConfig {
         ModbusConfig {
             slave: 1,
@@ -3538,7 +3511,10 @@ mod tests {
         )
         .expect("config must build");
         assert_eq!(driver.base.find_param(PARAM_DATA), Some(0));
-        assert_eq!(driver.datatype_of(0).unwrap(), ModbusDataType::Float32Be);
+        assert_eq!(
+            driver.datatype_of(0, None).unwrap(),
+            ModbusDataType::Float32Be
+        );
     }
 
     /// A read port configured with absolute addressing builds successfully —
@@ -3635,6 +3611,123 @@ mod tests {
                 .drv_user_create(&DrvUserRequest::new("NOPE", 0))
                 .is_err()
         );
+    }
+
+    /// C `drvUserCreate` (drvModbusAsyn.cpp:374-430): a data-type name
+    /// matches case-insensitively and binds `MODBUS_DATA`, with a drvUser only
+    /// when the type is not the port's or a length was given. `MODBUS_DATA`
+    /// itself names no type and goes to the base, with no offset check.
+    #[test]
+    fn drv_user_create_binds_a_data_type_to_modbus_data() {
+        let mut driver = test_driver(
+            "MB_DU_DATA",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        let data = driver.base.find_param(PARAM_DATA).unwrap();
+        let mut bind = |drv_info: &str, addr: i32| {
+            let info = driver
+                .drv_user_create(&DrvUserRequest::new(drv_info, addr))
+                .unwrap();
+            (
+                info.reason,
+                ModbusDrvUser::of(info.drv_user.as_ref()).copied(),
+            )
+        };
+        let own = |data_type, len| Some(ModbusDrvUser { data_type, len });
+        assert_eq!(bind("int16", 0), (data, own(ModbusDataType::Int16, None)));
+        assert_eq!(
+            bind("Float32_LE", 0),
+            (data, own(ModbusDataType::Float32Le, None))
+        );
+        assert_eq!(bind("UINT16", 0), (data, None), "the port's own type");
+        assert_eq!(
+            bind("string_high=5", 0),
+            (data, own(ModbusDataType::StringHigh, Some(5)))
+        );
+        assert_eq!(bind("MODBUS_DATA", 15), (data, None));
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new(" INT16", 0))
+                .is_err(),
+            "C does not trim the drvInfo"
+        );
+    }
+
+    /// C's data-type refusals return `asynError` without touching
+    /// `pasynUser->errorMessage` (drvModbusAsyn.cpp:380-410).
+    #[test]
+    fn a_refused_data_type_carries_no_message() {
+        let mut driver = test_driver(
+            "MB_DU_MSG",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        for (drv_info, addr) in [("INT16", 16), ("INT16=5", 0), ("STRING_HIGH=x", 0)] {
+            match driver.drv_user_create(&DrvUserRequest::new(drv_info, addr)) {
+                Err(e) => assert_eq!(
+                    (e.status(), e.message()),
+                    (AsynStatus::Error, String::new()),
+                    "{drv_info}"
+                ),
+                Ok(_) => panic!("{drv_info} must be refused"),
+            }
+        }
+    }
+
+    /// C's constructor (drvModbusAsyn.cpp:157-224) makes one parameter list
+    /// (maxAddr 1; `getAddress` always answers 0, :497-502) of twelve
+    /// parameters, before any check that can leave the port half-built.
+    #[test]
+    fn the_port_has_c_s_twelve_parameters_in_one_list() {
+        let params = |base: &PortDriverBase| {
+            let names: Vec<_> = (0..)
+                .map_while(|i| {
+                    Some((
+                        base.params.param_name(i)?.to_string(),
+                        base.params.param_type(i)?,
+                    ))
+                })
+                .collect();
+            (names, base.max_addr)
+        };
+        let c = (
+            [
+                (PARAM_DATA, ParamType::Int32),
+                (PARAM_READ, ParamType::Int32),
+                (PARAM_ENABLE_HISTOGRAM, ParamType::UInt32Digital),
+                (PARAM_READ_HISTOGRAM, ParamType::Int32),
+                (PARAM_HISTOGRAM_BIN_TIME, ParamType::Int32),
+                (PARAM_HISTOGRAM_TIME_AXIS, ParamType::Int32Array),
+                (PARAM_POLL_DELAY, ParamType::Float64),
+                (PARAM_READ_OK, ParamType::Int32),
+                (PARAM_WRITE_OK, ParamType::Int32),
+                (PARAM_IO_ERRORS, ParamType::Int32),
+                (PARAM_LAST_IO_TIME, ParamType::Int32),
+                (PARAM_MAX_IO_TIME, ParamType::Int32),
+            ]
+            .map(|(n, t)| (n.to_string(), t))
+            .to_vec(),
+            1,
+        );
+        let mut driver = test_driver(
+            "MB_PARAMS",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        assert_eq!(params(&driver.base), c);
+        let half = ModbusHalfBuilt::new("MB_PARAMS_HALF").unwrap();
+        assert_eq!(params(&half.base), c);
+        let read_ok = driver
+            .drv_user_create(&DrvUserRequest::new(PARAM_READ_OK, 99))
+            .expect("every address is list 0");
+        assert_eq!(read_ok.reason, driver.read_ok_reason);
     }
 
     /// A drvInfo naming no data type goes to the base class, which prints the
@@ -3838,17 +3931,13 @@ mod tests {
                 .is_err()
         );
         // A non-data (statistics) reason skips `checkOffset` and goes to the
-        // base class, whose `getAddress` still refuses an address past the
-        // port's (asynPortDriver.cpp:1901-1914).
+        // base class, whose `getAddress` is drvModbusAsyn's: 0 for every
+        // address (drvModbusAsyn.cpp:497-502).
         assert!(
             driver
-                .drv_user_create(&DrvUserRequest::new("READ_OK", 0))
+                .drv_user_create(&DrvUserRequest::new("READ_OK", 99))
                 .is_ok()
         );
-        assert!(matches!(
-            driver.drv_user_create(&DrvUserRequest::new("READ_OK", 99)),
-            Err(AsynError::AddressOutOfRange(99))
-        ));
     }
 
     /// A valid `TYPE=N` suffix on a string type yields the per-record octet cap
@@ -3937,11 +4026,8 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         // Wire address far beyond the 16-word scratch buffer — legal in
         // absolute mode (0..=65535).
         user.addr = 0x2710;
@@ -3965,11 +4051,8 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("absolute config must build");
-        let data_reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(data_reason);
+        let (data_reason, data_reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(data_reason).with_drv_user(data_reason_du.clone());
         user.addr = 0x2710;
         driver
             .read_int32(&user)
@@ -4001,11 +4084,8 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Err(ModbusError::Timeout)])),
         )
         .expect("absolute config must build");
-        let data_reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(data_reason);
+        let (data_reason, data_reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(data_reason).with_drv_user(data_reason_du.clone());
         user.addr = 0x2710;
         driver
             .read_int32(&user)
@@ -4599,11 +4679,8 @@ mod tests {
         cfg.data_type = ModbusDataType::StringHigh;
         let mut driver = test_driver("MB_ABS_STR", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x3000;
         // The record buffer (`NELM`) holds 10 chars.
         let mut buf = [0u8; 10];
@@ -4646,11 +4723,8 @@ mod tests {
         cfg.data_type = ModbusDataType::StringHigh;
         let mut driver = test_driver("MB_ABS_STR_EOM", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x3000;
         let mut buf = [0u8; 10];
         let (n, eom) = driver
@@ -4683,11 +4757,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x2710;
         driver
             .read_int32(&user)
@@ -4714,11 +4785,8 @@ mod tests {
         cfg.data_type = ModbusDataType::Float64Le;
         let mut driver = test_driver("MB_ABS_F64_LEN", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Float64Le.as_str())
-            .expect("FLOAT64_LE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Float64Le);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x2710;
         driver
             .read_float64(&user)
@@ -4755,11 +4823,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x2710;
         // Record array length (`NELM` / `maxChans`) is 4, below config.length.
         let mut buf = [0i32; 4];
@@ -4795,11 +4860,8 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         // Wire address 0x2710 is well past the 4-word scratch buffer and past
         // the parameter table — the write must still succeed.
         user.addr = 0x2710;
@@ -4836,12 +4898,11 @@ mod tests {
             ])),
         )
         .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("the UINT16 data type is registered");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
         let mut driver = driver;
-        let user = AsynUser::new(reason).with_addr(0);
+        let user = AsynUser::new(reason)
+            .with_drv_user(reason_du.clone())
+            .with_addr(0);
 
         // Boundary A — the poll succeeded: every accessor serves the block.
         driver.poll_cycle().expect("the first poll must run");
@@ -4853,11 +4914,10 @@ mod tests {
         assert_eq!(driver.read_int32_array(&user, &mut i32s).unwrap(), 4);
         let mut f64s = [0f64; 4];
         assert_eq!(driver.read_float64_array(&user, &mut f64s).unwrap(), 4);
-        let string_reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("the STRING_HIGH data type is registered");
-        let string_user = AsynUser::new(string_reason).with_addr(0);
+        let (string_reason, string_reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let string_user = AsynUser::new(string_reason)
+            .with_drv_user(string_reason_du.clone())
+            .with_addr(0);
         let mut octets = [0u8; 4];
         driver
             .read_octet(&string_user, &mut octets)
@@ -4935,8 +4995,6 @@ mod tests {
     /// port before its first poll.
     #[test]
     fn a_write_port_seeds_from_the_plc_and_never_serves_a_fabricated_zero() {
-        let uint16 = ModbusDataType::UInt16.as_str();
-
         // Boundary A — pollMsec != 0: the readOnce runs and the readback is
         // the PLC's value, not 0.
         let mut cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 4);
@@ -4951,7 +5009,7 @@ mod tests {
             ))])),
         )
         .expect("a write config must build");
-        let reason = driver.base.find_param(uint16).expect("UINT16 exists");
+        let reason = driver.data_reason;
         let user = AsynUser::new(reason).with_addr(0);
         assert_eq!(driver.read_int32(&user).expect("seeded readback"), 0x1234);
 
@@ -4964,7 +5022,7 @@ mod tests {
             Box::new(NullTransport),
         )
         .expect("a write config must build");
-        let reason = driver.base.find_param(uint16).expect("UINT16 exists");
+        let reason = driver.data_reason;
         let user = AsynUser::new(reason).with_addr(0);
         assert!(
             driver.read_int32(&user).is_err(),
@@ -4980,7 +5038,7 @@ mod tests {
             Box::new(NullTransport),
         )
         .expect("a read config must build");
-        let reason = driver.base.find_param(uint16).expect("UINT16 exists");
+        let reason = driver.data_reason;
         let user = AsynUser::new(reason).with_addr(0);
         assert!(
             driver.read_int32(&user).is_err(),
@@ -5029,11 +5087,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Be.as_str())
-            .expect("INT32_BE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x2710;
         // 6 INT32 elements = 12 registers; only 2 elements (4 registers) fit.
         let data = [1i32, 2, 3, 4, 5, 6];
@@ -5080,11 +5135,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Float64Le.as_str())
-            .expect("FLOAT64_LE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Float64Le);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x2710;
         // 4 FLOAT64 elements = 16 registers; only 2 whole elements fit (the
         // second starts at outIndex 4, still < config.length 6).
@@ -5132,11 +5184,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Be.as_str())
-            .expect("INT32_BE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 3;
         // 5 INT32 elements = 10 registers; from outIndex 3 only 2 whole
         // elements (4 registers) fit before outIndex reaches config.length 6.
@@ -5181,11 +5230,8 @@ mod tests {
             Box::new(transport),
         )
         .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Float64Le.as_str())
-            .expect("FLOAT64_LE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Float64Le);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 3;
         // 3 FLOAT64 elements = 12 registers; from outIndex 3 only 1 whole
         // element (4 registers) fits before outIndex reaches config.length 6.
@@ -5221,11 +5267,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
         let mut driver = test_driver("MB_REL_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Be.as_str())
-            .expect("INT32_BE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 1;
         driver
             .write_int32(&mut user, 0x1234_5678)
@@ -5263,11 +5306,8 @@ mod tests {
         cfg.function = ModbusFunctionCode::WriteSingleRegister;
         let mut driver = test_driver("MB_ABS_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Be.as_str())
-            .expect("INT32_BE parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x0100;
         driver
             .write_int32(&mut user, 0x1234_5678)
@@ -5299,16 +5339,10 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 8);
         let mut driver = test_driver("MB_WSR_ARR", cfg, LinkType::Tcp, Box::new(NullTransport))
             .expect("config must build");
-        let i32_reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Be.as_str())
-            .expect("INT32_BE parameter must exist");
-        let f64_reason = driver
-            .base
-            .find_param(ModbusDataType::Float64Le.as_str())
-            .expect("FLOAT64_LE parameter must exist");
-        let i32_user = AsynUser::new(i32_reason);
-        let f64_user = AsynUser::new(f64_reason);
+        let (i32_reason, i32_reason_du) = data_param(&driver, ModbusDataType::Int32Be);
+        let (f64_reason, f64_reason_du) = data_param(&driver, ModbusDataType::Float64Le);
+        let i32_user = AsynUser::new(i32_reason).with_drv_user(i32_reason_du.clone());
+        let f64_user = AsynUser::new(f64_reason).with_drv_user(f64_reason_du.clone());
         assert!(
             driver.write_int32_array(&i32_user, &[1, 2, 3]).is_err(),
             "int32-array write on FC06 port must be rejected"
@@ -5334,11 +5368,8 @@ mod tests {
         cfg.function = ModbusFunctionCode::WriteSingleRegister;
         let mut driver = test_driver("MB_ABS_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0x0100;
         driver
             .write_uint32_digital(&mut user, 0xABCD, 0xFFFF)
@@ -5371,11 +5402,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
         let mut driver = test_driver("MB_REL_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 2;
         driver
             .write_uint32_digital(&mut user, 0x00F0, 0x00FF)
@@ -5420,11 +5448,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 4);
         let mut driver = test_driver("MB_REL_WSR_ACK", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 2;
         driver
             .write_uint32_digital(&mut user, 0xAB12, 0x00FF)
@@ -5453,11 +5478,8 @@ mod tests {
         cfg.function = ModbusFunctionCode::WriteSingleCoil;
         let mut driver = test_driver("MB_ABS_WSC_DIG", cfg, LinkType::Tcp, Box::new(transport))
             .expect("absolute coil config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 5;
         // Partial mask (1) would have triggered a readback under the old flat
         // logic; the coil path must ignore it.
@@ -5486,11 +5508,8 @@ mod tests {
             Box::new(NullTransport),
         )
         .expect("read config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 1;
         assert!(
             driver.write_uint32_digital(&mut user, 1, 1).is_err(),
@@ -5511,11 +5530,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 8);
         let mut driver = test_driver("MB_ZSTR_W", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative string config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::ZStringHigh.as_str())
-            .expect("ZSTRING_HIGH parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::ZStringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         driver
             .write_octet(&mut user, b"Hi")
@@ -5547,11 +5563,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteMultipleRegisters, 8);
         let mut driver = test_driver("MB_STR_W", cfg, LinkType::Tcp, Box::new(transport))
             .expect("relative string config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         driver
             .write_octet(&mut user, b"Hi")
@@ -5578,11 +5591,8 @@ mod tests {
         let cfg = write_config(ModbusFunctionCode::WriteSingleRegister, 8);
         let mut driver = test_driver("MB_STR_BADFN", cfg, LinkType::Tcp, Box::new(NullTransport))
             .expect("config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         assert!(
             driver.write_octet(&mut user, b"Hi").is_err(),
@@ -5602,11 +5612,8 @@ mod tests {
         )
         .expect("non-absolute config must build");
         // UINT16 is a numeric data parameter; recover its reason.
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         // addr 100 is well past the 4-word buffer.
         user.addr = 100;
 
@@ -5617,7 +5624,7 @@ mod tests {
         let mut sbuf = [0u8; 8];
         assert!(driver.read_octet(&user, &mut sbuf).is_err());
 
-        let mut wuser = AsynUser::new(reason);
+        let mut wuser = AsynUser::new(reason).with_drv_user(reason_du.clone());
         wuser.addr = 100;
         assert!(driver.write_int32(&mut wuser, 1).is_err());
         assert!(driver.write_int64(&mut wuser, 1).is_err());
@@ -5643,16 +5650,13 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
 
         // Out-of-range read/write still fail cleanly at the accessor.
-        let mut ruser = AsynUser::new(reason);
+        let mut ruser = AsynUser::new(reason).with_drv_user(reason_du.clone());
         ruser.addr = 100;
         assert!(driver.read_int32(&ruser).is_err());
-        let mut wuser = AsynUser::new(reason);
+        let mut wuser = AsynUser::new(reason).with_drv_user(reason_du.clone());
         wuser.addr = 100;
         assert!(driver.write_int32(&mut wuser, 1).is_err());
 
@@ -5666,6 +5670,7 @@ mod tests {
             .register_interrupt_user(
                 asyn_rs::interrupt::InterruptFilter {
                     reason: Some(reason),
+                    drv_user: reason_du.clone(),
                     addr: Some(100),
                     iface: Some(InterfaceType::Int32),
                     ..Default::default()
@@ -5687,7 +5692,7 @@ mod tests {
     /// transaction had succeeded. C fires the rest of the list regardless —
     /// `readPlcInt32` (:1736) over-reads `data_` instead.
     #[test]
-    fn a_binding_too_narrow_for_its_datatype_alarms_only_its_own_record() {
+    fn a_binding_too_narrow_for_its_datatype_costs_only_its_own_record() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
         let mut driver = test_driver(
             "MB_NARROW_BINDING",
@@ -5696,43 +5701,34 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let good = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let narrow = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
+        let (good, good_du) = data_param(&driver, ModbusDataType::UInt16);
+        let (narrow, narrow_du) = data_param(&driver, ModbusDataType::Int32Le);
 
-        let (_good_sub, _good_rx) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(good),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
+        let log = FireLog::default();
+        let _good_sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(good),
+                drv_user: good_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
         // The last register of the block, read as a two-register type.
-        let (_narrow_sub, _narrow_rx) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(narrow),
-                    addr: Some(3),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let _narrow_sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(narrow),
+                drv_user: narrow_du.clone(),
+                addr: Some(3),
+                user_addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         driver
             .poll_cycle()
@@ -5759,9 +5755,8 @@ mod tests {
         assert_eq!(
             narrow_status,
             Some(AsynStatus::Error),
-            "the binding that cannot be decoded must still reach its record, \
-             carrying the alarm — a record that never processes holds UDF=1 \
-             with nothing saying why"
+            "after a good poll the binding that cannot be decoded reaches its \
+             record alarmed: C over-reads data_ there with no alarm"
         );
     }
 
@@ -5781,24 +5776,19 @@ mod tests {
             ))])),
         )
         .expect("non-absolute config must build");
-        let narrow = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
-        let (_narrow_sub, _narrow_rx) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(narrow),
-                    addr: Some(3),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (narrow, narrow_du) = data_param(&driver, ModbusDataType::Int32Le);
+        let mut rx = FireLog::default();
+        let _narrow = rx.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(narrow),
+                addr: Some(0),
+                user_addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                drv_user: narrow_du,
+                ..Default::default()
+            },
+        );
 
         driver.poll_cycle().unwrap();
 
@@ -5826,25 +5816,21 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let good = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
+        let (good, good_du) = data_param(&driver, ModbusDataType::UInt16);
         let read_reason = driver.read_reason;
-        let (_sub, _rx) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(good),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(good),
+                drv_user: good_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         let path = std::env::temp_dir().join(format!(
             "modbus_MB_TRACE_CLEAN_{}.trace",
@@ -5896,10 +5882,11 @@ mod tests {
         }
     }
 
-    /// The all-fail boundary: when *every* binding is unserviceable the cycle
-    /// still completes and every record is alarmed rather than left silent.
+    /// An out-of-range node fires nothing, as C's `checkOffset` arm does,
+    /// and the nodes after it still fire: C's `break` there starves them
+    /// (drvModbusAsyn.cpp:1729-1734), a C defect not copied.
     #[test]
-    fn a_cycle_whose_bindings_all_fail_alarms_them_all_and_still_completes() {
+    fn an_out_of_range_node_fires_nothing_and_the_list_goes_on() {
         let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
         let mut driver = test_driver(
             "MB_ALL_NARROW",
@@ -5908,48 +5895,43 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let narrow = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
-        // Offset 3 is a legal offset too narrow for INT32_LE; offset 99 is not
-        // an offset of this block at all. Both must alarm.
+        // In list order: offset 99 is no offset of this block, offset 3 is
+        // too narrow for INT32_LE, offset 0 reads the port's UINT16.
         // Held for the whole cycle: dropping a guard unregisters its binding.
-        let _subs: Vec<_> = [3, 99]
-            .into_iter()
-            .map(|addr| {
-                driver
-                    .base
-                    .interrupts
-                    .register_interrupt_user(
-                        asyn_rs::interrupt::InterruptFilter {
-                            reason: Some(narrow),
-                            addr: Some(addr),
-                            iface: Some(InterfaceType::Int32),
-                            ..Default::default()
-                        },
-                        4096,
-                    )
-                    .unwrap()
-            })
-            .collect();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let log = FireLog::default();
+        let _subs: Vec<_> = [
+            (99, ModbusDataType::Int32Le),
+            (3, ModbusDataType::Int32Le),
+            (0, ModbusDataType::UInt16),
+        ]
+        .into_iter()
+        .map(|(addr, dt)| {
+            let (reason, drv_user) = data_param(&driver, dt);
+            log.client(
+                &driver.base.interrupts,
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    drv_user,
+                    addr: Some(0),
+                    user_addr: Some(addr),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+        let mut rx = log.clone();
 
         driver
             .poll_cycle()
-            .expect("a cycle in which no binding can be served still completes");
+            .expect("a cycle with unserviceable bindings still completes");
 
-        let mut alarmed: Vec<i32> = Vec::new();
-        while let Ok(iv) = rx.try_recv() {
-            if iv.reason == narrow && iv.aux_status == AsynStatus::Error {
-                alarmed.push(iv.addr);
-            }
-        }
-        alarmed.sort_unstable();
+        let fired: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|iv| (iv.addr, iv.value.as_int32().unwrap(), iv.aux_status))
+            .collect();
         assert_eq!(
-            alarmed,
-            vec![3, 99],
-            "both the too-narrow offset and the out-of-range one must alarm"
+            fired,
+            [(3, 0, AsynStatus::Error), (0, 1, AsynStatus::Success)]
         );
     }
 
@@ -5976,25 +5958,21 @@ mod tests {
             Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
         )
         .expect("non-absolute config must build");
-        let narrow = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
+        let (narrow, narrow_du) = data_param(&driver, ModbusDataType::Int32Le);
         let read_reason = driver.read_reason;
         // The last register of the block, read as a two-register type.
-        let (_narrow_sub, _narrow_rx) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(narrow),
-                    addr: Some(3),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
+        let log = FireLog::default();
+        let _narrow_sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(narrow),
+                drv_user: narrow_du.clone(),
+                addr: Some(3),
+                user_addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
 
         // Distinct per case and per process: the sibling case above holds
         // the other constant, and the pid keeps a second run of this suite
@@ -6069,27 +6047,22 @@ mod tests {
             .base
             .find_param(PARAM_READ_OK)
             .expect("READ_OK parameter must exist");
-        let good = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
+        let good = driver.data_reason;
         let read_reason = driver.read_reason;
+        let log = FireLog::default();
         let _subs: Vec<_> = [(read_ok, 0), (good, 99)]
             .into_iter()
             .map(|(reason, addr)| {
-                driver
-                    .base
-                    .interrupts
-                    .register_interrupt_user(
-                        asyn_rs::interrupt::InterruptFilter {
-                            reason: Some(reason),
-                            addr: Some(addr),
-                            iface: Some(InterfaceType::Int32),
-                            ..Default::default()
-                        },
-                        4096,
-                    )
-                    .unwrap()
+                log.client(
+                    &driver.base.interrupts,
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(reason),
+                        addr: Some(addr),
+                        user_addr: Some(addr),
+                        iface: Some(InterfaceType::Int32),
+                        ..Default::default()
+                    },
+                )
             })
             .collect();
 
@@ -6135,8 +6108,76 @@ mod tests {
         }
     }
 
-    /// BUG 1 regression — a statistics reason has no `reason_to_datatype`
-    /// entry. `read_int32` must return the param `doModbusIO` set (C
+    /// C `getDataType` (drvModbusAsyn.cpp:2356-2365): a data client decodes
+    /// with the type its drvUser names, else the port's.
+    #[test]
+    fn a_data_read_decodes_with_its_drv_user_data_type() {
+        let pdu = [0x01u8, 0x03, 0x08, 0xFF, 0xFF, 0, 1, 0, 2, 0, 3];
+        let mut driver = test_driver(
+            "MB_DRVUSER_TYPE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        let data = driver.base.find_param(PARAM_DATA).unwrap();
+        let port_type = AsynUser::new(data).with_addr(0);
+        assert_eq!(driver.read_int32(&port_type).unwrap(), 0xFFFF);
+        let int16: DrvUser = Arc::new(ModbusDrvUser {
+            data_type: ModbusDataType::Int16,
+            len: None,
+        });
+        let own_type = AsynUser::new(data).with_addr(0).with_drv_user(Some(int16));
+        assert_eq!(driver.read_int32(&own_type).unwrap(), -1);
+        assert_eq!(driver.read_float64(&own_type).unwrap(), -1.0);
+    }
+
+    /// C `readPoller` (drvModbusAsyn.cpp:1714-1749) reads each int32 node's
+    /// own offset (`getAddr`) and type (`getDataType`), so two records on one
+    /// interface list get their own values.
+    #[test]
+    fn each_poller_client_gets_its_own_offset_and_drv_user_type() {
+        let pdu = [0x01u8, 0x03, 0x08, 0xFF, 0xFF, 0, 1, 0, 2, 0, 3];
+        let mut driver = test_driver(
+            "MB_PER_CLIENT",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let data = driver.base.find_param(PARAM_DATA).unwrap();
+        let int16: DrvUser = Arc::new(ModbusDrvUser {
+            data_type: ModbusDataType::Int16,
+            len: None,
+        });
+        let filter =
+            |user_addr: i32, drv_user: Option<DrvUser>| asyn_rs::interrupt::InterruptFilter {
+                reason: Some(data),
+                addr: Some(0),
+                user_addr: Some(user_addr),
+                drv_user,
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            };
+        let (port_type, own_type, offset2) =
+            (FireLog::default(), FireLog::default(), FireLog::default());
+        let _a = port_type.client(&driver.base.interrupts, filter(0, None));
+        let _b = own_type.client(&driver.base.interrupts, filter(0, Some(int16)));
+        let _c = offset2.client(&driver.base.interrupts, filter(2, None));
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        let one = |mut log: FireLog| {
+            let iv = log.try_recv().expect("each client is fired");
+            assert!(log.try_recv().is_err(), "and only once");
+            (iv.addr, iv.value.as_int32().unwrap())
+        };
+        assert_eq!(one(port_type), (0, 0xFFFF));
+        assert_eq!(one(own_type), (0, -1));
+        assert_eq!(one(offset2), (2, 2));
+    }
+
+    /// BUG 1 regression — a statistics reason is not `MODBUS_DATA`.
+    /// `read_int32` must return the param `doModbusIO` set (C
     /// `readInt32` delegates `reason != P_Data` to `asynPortDriver::readInt32`),
     /// not error.
     #[test]
@@ -6184,6 +6225,31 @@ mod tests {
                 "statistics reason {reason} must be readable via read_int32"
             );
         }
+    }
+
+    /// drvModbusAsyn.cpp:497-502: `getAddress` answers list 0 for every
+    /// user, so a non-data read at a register offset reads list 0.
+    #[test]
+    fn a_non_data_read_at_an_offset_reads_list_0() {
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = test_driver(
+            "MB_STATS_ADDR",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        let at_3 = |reason| AsynUser::new(reason).with_addr(3);
+        assert_eq!(driver.read_int32(&at_3(driver.read_ok_reason)).unwrap(), 1);
+        let (delay, histogram) = (driver.poll_delay_reason, driver.enable_histogram_reason);
+        driver.base.set_float64_param(delay, 0, 0.25).unwrap();
+        assert_eq!(driver.read_float64(&at_3(delay)).unwrap(), 0.25);
+        driver
+            .base
+            .set_uint32_param(histogram, 0, 1, !0, 0)
+            .unwrap();
+        assert_eq!(driver.read_uint32_digital(&at_3(histogram), !0).unwrap(), 1);
     }
 
     /// Opens `interruptAccept` as `iocInit` would and subscribes, so a post
@@ -6283,30 +6349,33 @@ mod tests {
         // per-interface decode is observable, not the same number typed four
         // ways. `datatype_of` is per-reason, so the value is decoded as
         // Int32Le even though the port's config datatype is UInt16.
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
-        // A record bound at addr 0 puts the offset on the interrupt list; the
-        // poller then fires every scalar interface for it. One mailbox
-        // subscription suffices to enumerate the binding — the per-interface
-        // fan-out below is unconditional, so the broadcast observer sees all
-        // four typed values regardless of this subscriber's own iface.
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Le);
+        // One record per scalar interface at addr 0; each gets the value
+        // decoded for its own interface.
+        let log = FireLog::default();
+        let _subs: Vec<_> = [
+            InterfaceType::Int32,
+            InterfaceType::Int64,
+            InterfaceType::Float64,
+            InterfaceType::UInt32Digital,
+        ]
+        .into_iter()
+        .map(|iface| {
+            log.client(
+                &driver.base.interrupts,
                 asyn_rs::interrupt::InterruptFilter {
                     reason: Some(reason),
+                    drv_user: reason_du.clone(),
                     addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
+                    user_addr: Some(0),
+                    iface: Some(iface),
                     ..Default::default()
                 },
-                4096,
             )
-            .unwrap();
+        })
+        .collect();
 
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let mut rx = log.clone();
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         let mut int32 = None;
@@ -6322,14 +6391,6 @@ mod tests {
                 (Some(InterfaceType::Int64), ParamValue::Int64(v)) => int64 = Some(*v),
                 (Some(InterfaceType::Float64), ParamValue::Float64(v)) => float64 = Some(*v),
                 (Some(InterfaceType::UInt32Digital), ParamValue::UInt32Digital(v)) => {
-                    // This is the first (forced) cycle, so every bit is marked
-                    // changed (`!0`) and no `@asynMask` gates it out. The
-                    // per-offset masked-change cadence on later cycles is covered
-                    // by `poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change`.
-                    assert_eq!(
-                        iv.uint32_changed_mask, !0,
-                        "the forced first cycle marks all bits changed"
-                    );
                     uint32 = Some(*v);
                 }
                 other => panic!("unexpected per-interface fire: {other:?}"),
@@ -6355,6 +6416,244 @@ mod tests {
             uint32,
             Some(1),
             "asynUInt32Digital must see the raw register word, not the collapsed value"
+        );
+    }
+
+    /// A `RuntimeClient::subscribe` ring on the port sees the offset a
+    /// record is bound at, read with the port's UINT16, not the record's
+    /// INT32_LE.
+    #[test]
+    fn poll_cycle_fire_reaches_a_ring() {
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        let mut driver = test_driver(
+            "MB_FIRE_RING",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Le);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du,
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut ring = driver
+            .base
+            .interrupts
+            .subscribe_async_filtered(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                8,
+                0,
+            )
+            .unwrap();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        let iv = ring.try_recv().expect("the ring saw no fire");
+        assert_eq!(iv.value.as_int32().unwrap(), 1);
+    }
+
+    /// Clients bound at one offset each take their own fire, but a ring
+    /// observing that offset takes one value per poll, not one per client.
+    #[test]
+    fn a_ring_takes_one_value_per_poll_from_clients_at_one_offset() {
+        let pdu = [0x01u8, 0x03, 0x02, 0xff, 0xff];
+        let mut driver = test_driver(
+            "MB_RING_ONCE",
+            test_config(0, 1),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let log = FireLog::default();
+        let _subs: Vec<_> = [
+            ModbusDataType::Int16,
+            ModbusDataType::Int16,
+            ModbusDataType::UInt16,
+        ]
+        .into_iter()
+        .map(|dt| {
+            let (reason, drv_user) = data_param(&driver, dt);
+            log.client(
+                &driver.base.interrupts,
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(reason),
+                    drv_user,
+                    addr: Some(0),
+                    user_addr: Some(0),
+                    iface: Some(InterfaceType::Int32),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+        let mut ring = driver
+            .base
+            .interrupts
+            .subscribe_async_filtered(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(driver.data_reason),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                8,
+                0,
+            )
+            .unwrap();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        assert_eq!(log.0.lock().unwrap().len(), 3, "each client's own fire");
+        assert_eq!(ring.try_recv().unwrap().value.as_int32().unwrap(), 65535);
+        assert!(ring.try_recv().is_err(), "a second copy reached the ring");
+    }
+
+    /// What a ring at offset 0 of a one-register UINT16 port holding 0xFFFF
+    /// takes in one poll, with `clients` bound there in that order.
+    fn ring_after_a_poll(port: &str, clients: &[ModbusDataType]) -> Vec<(i32, AsynStatus)> {
+        let pdu = [0x01u8, 0x03, 0x02, 0xff, 0xff];
+        let mut driver = test_driver(
+            port,
+            test_config(0, 1),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("non-absolute config must build");
+        let log = FireLog::default();
+        let _subs: Vec<_> = clients
+            .iter()
+            .map(|&dt| {
+                let (reason, drv_user) = data_param(&driver, dt);
+                log.client(
+                    &driver.base.interrupts,
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(reason),
+                        drv_user,
+                        addr: Some(0),
+                        user_addr: Some(0),
+                        iface: Some(InterfaceType::Int32),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let mut ring = driver
+            .base
+            .interrupts
+            .subscribe_async_filtered(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(driver.data_reason),
+                    addr: Some(0),
+                    ..Default::default()
+                },
+                8,
+                0,
+            )
+            .unwrap();
+        driver.poll_cycle().expect("poll_cycle must succeed");
+        std::iter::from_fn(|| ring.try_recv().ok())
+            .map(|iv| (iv.value.as_int32().unwrap(), iv.aux_status))
+            .collect()
+    }
+
+    /// A ring is no C interrupt node; it reads an offset as a node with no
+    /// drvUser does, with the port's data type (drvModbusAsyn.cpp:2356-2364),
+    /// whatever the clients bound there and whichever registered first.
+    #[test]
+    fn a_ring_decodes_with_the_port_s_data_type_in_either_registration_order() {
+        let (int16, uint16) = (ModbusDataType::Int16, ModbusDataType::UInt16);
+        for (port, clients) in [
+            ("MB_RING_TYPE_A", [int16, uint16]),
+            ("MB_RING_TYPE_B", [uint16, int16]),
+        ] {
+            assert_eq!(
+                ring_after_a_poll(port, &clients),
+                [(65535, AsynStatus::Success)],
+                "{clients:?}"
+            );
+        }
+    }
+
+    /// A client whose type does not fit at the offset is refused alone: the
+    /// ring still reads the offset with the port's type.
+    #[test]
+    fn a_ring_reads_past_a_refused_first_client() {
+        let clients = [ModbusDataType::Int32Le, ModbusDataType::Int16];
+        assert_eq!(
+            ring_after_a_poll("MB_RING_REFUSED", &clients),
+            [(65535, AsynStatus::Success)]
+        );
+    }
+
+    /// What a ring takes when the poll answers `reply` and the port's
+    /// INT32_LE type is too narrow at offset 3 of its 4 registers.
+    fn refused_ring_fires(
+        port: &str,
+        reply: Result<Vec<u8>, ModbusError>,
+    ) -> Vec<(i32, AsynStatus)> {
+        let mut config = test_config(0, 4);
+        config.data_type = ModbusDataType::Int32Le;
+        let mut driver = test_driver(
+            port,
+            config,
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![reply])),
+        )
+        .expect("non-absolute config must build");
+        let log = FireLog::default();
+        let _narrow = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(driver.data_reason),
+                addr: Some(0),
+                user_addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut ring = driver
+            .base
+            .interrupts
+            .subscribe_async_filtered(
+                asyn_rs::interrupt::InterruptFilter {
+                    reason: Some(driver.data_reason),
+                    ..Default::default()
+                },
+                8,
+                0,
+            )
+            .unwrap();
+        driver.poll_cycle().unwrap();
+        std::iter::from_fn(|| ring.try_recv().ok())
+            .map(|iv| (iv.addr, iv.aux_status))
+            .collect()
+    }
+
+    /// A refused ring takes a failed poll's status, as C's `auxStatus =
+    /// ioStatus_` stamps it (drvModbusAsyn.cpp:1738), and `asynError` after a
+    /// good one, where C over-reads `data_`.
+    #[test]
+    fn a_refused_ring_carries_a_failed_poll_s_status_else_error() {
+        let pdu = [0x01u8, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4];
+        assert_eq!(
+            refused_ring_fires("MB_RING_NARROW_GOOD", Ok(tcp_response(1, &pdu))),
+            [(3, AsynStatus::Error)]
+        );
+        let down = ModbusError::Io(
+            crate::error::IoStatus::Disconnected,
+            "port not connected".into(),
+        );
+        assert_eq!(
+            refused_ring_fires("MB_RING_NARROW_FAILED", Err(down)),
+            [(3, AsynStatus::Disconnected)]
         );
     }
 
@@ -6387,39 +6686,33 @@ mod tests {
         // 4-register block decodes to two elements. No prior read: the poller
         // fires purely from the registered subscribers, exactly as a real
         // SCAN="I/O Intr" waveform — which never reads on its own — relies on.
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Le);
 
         // --- Poll 1: array records ARE bound (mailbox subscribers present). ---
-        let (_sub_i, _rx_i) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32Array),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let (_sub_f, _rx_f) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Float64Array),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let log = FireLog::default();
+        let _sub_i = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32Array),
+                ..Default::default()
+            },
+        );
+        let _sub_f = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Float64Array),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         let mut int32_arr = None;
@@ -6451,9 +6744,7 @@ mod tests {
         // --- Poll 2: no array record bound (subscribers dropped) → gate skips. ---
         drop(_sub_i);
         drop(_sub_f);
-        drop(_rx_i);
-        drop(_rx_f);
-        let mut rx2 = driver.base.interrupts.subscribe_async(256, 4096);
+        let mut rx2 = log.clone();
         driver.poll_cycle().expect("second poll_cycle must succeed");
         while let Ok(iv) = rx2.try_recv() {
             assert!(
@@ -6467,10 +6758,35 @@ mod tests {
         }
     }
 
+    /// Every value the poller fires at the clients registered through it,
+    /// in firing order.
+    #[derive(Default, Clone)]
+    struct FireLog(Arc<Mutex<std::collections::VecDeque<asyn_rs::interrupt::InterruptValue>>>);
+
+    impl FireLog {
+        /// A record client with `filter`, as device support registers one.
+        fn client(
+            &self,
+            interrupts: &asyn_rs::interrupt::InterruptManager,
+            filter: asyn_rs::interrupt::InterruptFilter,
+        ) -> asyn_rs::interrupt::SyncCallbackSubscription {
+            let log = self.0.clone();
+            interrupts
+                .register_sync_callback(filter, move |iv| {
+                    log.lock().unwrap().push_back(iv.clone());
+                })
+                .unwrap()
+        }
+
+        fn try_recv(&mut self) -> Result<asyn_rs::interrupt::InterruptValue, ()> {
+            self.0.lock().unwrap().pop_front().ok_or(())
+        }
+    }
+
     /// Drain every buffered interrupt fire for `(reason, addr 0)`, in order.
     /// The R57 on-change tests inspect which interfaces fired each poll.
     fn drain_addr0_fires(
-        rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver,
+        rx: &mut FireLog,
         reason: usize,
     ) -> Vec<asyn_rs::interrupt::InterruptValue> {
         let mut out = Vec::new();
@@ -6498,11 +6814,10 @@ mod tests {
 
     /// R57: a `uInt32Digital` I/O-Intr record fires only on a per-offset masked
     /// change, mirroring C `readPoller` (drvModbusAsyn.cpp:1695-1707) — not every
-    /// poll. The first cycle forces (changed mask `!0`); an unchanged word is
-    /// suppressed even when a different offset changed (per-offset, not
-    /// port-wide); a changed word fires carrying only the changed bits, so a
-    /// record `@asynMask` that does not overlap them is gated out by the
-    /// interrupt filter.
+    /// poll. The first cycle forces; an unchanged word is suppressed even when
+    /// a different offset changed (per-offset, not port-wide); a changed word
+    /// fires each client whose own `@asynMask` bits changed, with the masked
+    /// word.
     #[test]
     fn poll_cycle_uint32_digital_fires_only_on_per_offset_masked_change() {
         let mut driver = test_driver(
@@ -6517,26 +6832,35 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        // UInt16 reason (rc=1) at addr 0 — the fired word is regs[0]. A mailbox
-        // subscriber enumerates the binding; the broadcast observer sees fires.
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::UInt32Digital),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        // UInt16 reason (rc=1) at addr 0 — the fired word is regs[0].
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::UInt32Digital),
+                ..Default::default()
+            },
+        );
+        // A record whose @asynMask 0x0003 does not cover the bit poll 3 flips.
+        let masked = FireLog::default();
+        let _masked = masked.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::UInt32Digital),
+                uint32_mask: Some(0x0003),
+            },
+        );
+        let mut masked_rx = masked.clone();
+        let mut rx = log.clone();
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
             fires
@@ -6557,6 +6881,11 @@ mod tests {
             vec![(1, !0)],
             "first poll forces the uInt32Digital fire with all bits marked changed"
         );
+        assert_eq!(
+            u32d(&drain_addr0_fires(&mut masked_rx, reason)),
+            vec![(1, !0)],
+            "the forced fire carries the word masked by the client's 0x0003"
+        );
 
         // Poll 2: word@0 unchanged though the block changed (regs[1]) -> no fire.
         driver.poll_cycle().expect("poll 2 must succeed");
@@ -6566,12 +6895,16 @@ mod tests {
              offset changed (per-offset gate, not port-wide)"
         );
 
-        // Poll 3: word@0 1 -> 5, changed bits = 1 ^ 5 = 0x0004 -> fires that mask.
+        // Poll 3: word@0 1 -> 5 flips 0x0004 only.
         driver.poll_cycle().expect("poll 3 must succeed");
         assert_eq!(
             u32d(&drain_addr0_fires(&mut rx, reason)),
-            vec![(5, 0x0004)],
-            "a changed word fires carrying only the changed bits as the mask"
+            vec![(5, !0)],
+            "a changed word fires the unmasked client"
+        );
+        assert!(
+            drain_addr0_fires(&mut masked_rx, reason).is_empty(),
+            "1 & 0x0003 == 5 & 0x0003, so the masked client is not fired"
         );
     }
 
@@ -6594,37 +6927,47 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
-        let (_si, _ri) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32Array),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let (_sf, _rf) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Float64Array),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::Int32Le);
+        let log = FireLog::default();
+        let _si = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32Array),
+                ..Default::default()
+            },
+        );
+        let _sf = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Float64Array),
+                ..Default::default()
+            },
+        );
+        let _scalars: Vec<_> = [InterfaceType::Int32, InterfaceType::UInt32Digital]
+            .into_iter()
+            .map(|iface| {
+                log.client(
+                    &driver.base.interrupts,
+                    asyn_rs::interrupt::InterruptFilter {
+                        reason: Some(reason),
+                        drv_user: reason_du.clone(),
+                        addr: Some(0),
+                        user_addr: Some(0),
+                        iface: Some(iface),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let mut rx = log.clone();
 
         // Poll 1 (force): int32Array + float64Array + scalars all fire.
         driver.poll_cycle().expect("poll 1 must succeed");
@@ -6709,24 +7052,20 @@ mod tests {
         )
         .expect("non-absolute string config must build");
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Octet),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Octet),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         driver.poll_cycle().expect("poll 1 must succeed");
         assert_eq!(
@@ -6948,24 +7287,20 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::UInt32Digital),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::UInt32Digital),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         driver.poll_cycle().expect("poll 1 must succeed");
         let _ = drain_addr0_fires(&mut rx, reason); // discard the forced first fire
@@ -7034,30 +7369,34 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        let u16_reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let i32_reason = driver
-            .base
-            .find_param(ModbusDataType::Int32Le.as_str())
-            .expect("INT32_LE parameter must exist");
+        let (u16_reason, u16_reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let (i32_reason, i32_reason_du) = data_param(&driver, ModbusDataType::Int32Le);
 
         // Good uInt32Digital binding at addr 0 (word = regs[0], always decodable).
-        let (_good, _rg) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(u16_reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::UInt32Digital),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let log = FireLog::default();
+        let _good = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(u16_reason),
+                drv_user: u16_reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::UInt32Digital),
+                ..Default::default()
+            },
+        );
+        let _good_i32 = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(u16_reason),
+                drv_user: u16_reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         let u32d = |fires: &[asyn_rs::interrupt::InterruptValue]| -> Vec<(u32, u32)> {
             fires
@@ -7078,19 +7417,17 @@ mod tests {
 
         // Bind an INT32_LE (rc=2) subscriber at addr 3: regs[3..] is one word, so
         // the per-offset read_int32 decode errors and aborts the cycle mid-loop.
-        let (sub_bad, _rb) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(i32_reason),
-                    addr: Some(3),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
+        let sub_bad = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(i32_reason),
+                drv_user: i32_reason_du.clone(),
+                addr: Some(3),
+                user_addr: Some(3),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
 
         // Poll 2: the tail binding is skipped, the rest of the cycle runs.
         driver
@@ -7306,11 +7643,8 @@ mod tests {
             "the constructor readOnce must seed the cache from the PLC"
         );
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         driver
             .write_int32(&mut user, 0x2222)
@@ -7344,12 +7678,10 @@ mod tests {
         )
         .expect("config must build");
         let mut rx = subscribe_opened(&mut driver);
-        let find = |d: &ModbusPortDriver, t: ModbusDataType| {
-            d.base.find_param(t.as_str()).expect("data parameter")
-        };
-        let mut user = AsynUser::new(find(&driver, ModbusDataType::UInt16)).with_addr(0);
+        let mut user = AsynUser::new(driver.data_reason).with_addr(0);
         driver.write_int32(&mut user, 7).expect("int32 write");
-        let mut user = AsynUser::new(find(&driver, ModbusDataType::StringHigh)).with_addr(0);
+        let (reason, drv_user) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut user = AsynUser::new(reason).with_drv_user(drv_user).with_addr(0);
         driver.write_octet(&mut user, b"Hi").expect("octet write");
 
         assert_eq!(driver.engine.stats.write_ok, 2);
@@ -7424,11 +7756,8 @@ mod tests {
         .expect("config must build");
         driver.engine.data_mut()[0] = 0x1111;
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         // mask 0xFFFF -> straight write, no read/modify/write.
         driver
@@ -7456,11 +7785,8 @@ mod tests {
         driver.engine.data_mut()[0] = 0x1111;
         driver.engine.data_mut()[1] = 0x1111;
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let mut user = AsynUser::new(reason);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let mut user = AsynUser::new(reason).with_drv_user(reason_du.clone());
         user.addr = 0;
         driver
             .write_int32_array(&user, &[0x2222, 0x3333])
@@ -7501,27 +7827,23 @@ mod tests {
         )
         .expect("non-absolute config must build");
 
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (reason, reason_du) = data_param(&driver, ModbusDataType::UInt16);
+        let log = FireLog::default();
+        let _sub = log.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                drv_user: reason_du.clone(),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let mut rx = log.clone();
 
         // The Int32 fires this cycle produced, as (value, aux_status).
-        let int32_fires = |rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver| {
+        let int32_fires = |rx: &mut FireLog| {
             let mut out = Vec::new();
             while let Ok(iv) = rx.try_recv() {
                 if iv.reason == reason
@@ -7607,25 +7929,19 @@ mod tests {
         .expect("non-absolute config must build");
         let gate = InterruptGate::new();
         driver.base.own_interrupts(gate.clone());
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
-        let int32_fires = |rx: &mut asyn_rs::interrupt::AsyncInterruptReceiver| {
+        let (reason, _) = data_param(&driver, ModbusDataType::UInt16);
+        let mut rx = FireLog::default();
+        let _sub = rx.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
+        let int32_fires = |rx: &mut FireLog| {
             let mut out = Vec::new();
             while let Ok(iv) = rx.try_recv() {
                 if iv.reason == reason && iv.iface == Some(InterfaceType::Int32) {
@@ -7731,24 +8047,18 @@ mod tests {
             .expect("non-absolute config must build");
         let gate = InterruptGate::new();
         driver.base.own_interrupts(gate.clone());
-        let reason = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let (_sub, _rx_sub) = driver
-            .base
-            .interrupts
-            .register_interrupt_user(
-                asyn_rs::interrupt::InterruptFilter {
-                    reason: Some(reason),
-                    addr: Some(0),
-                    iface: Some(InterfaceType::Int32),
-                    ..Default::default()
-                },
-                4096,
-            )
-            .unwrap();
-        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        let (reason, _) = data_param(&driver, ModbusDataType::UInt16);
+        let mut rx = FireLog::default();
+        let _sub = rx.client(
+            &driver.base.interrupts,
+            asyn_rs::interrupt::InterruptFilter {
+                reason: Some(reason),
+                addr: Some(0),
+                user_addr: Some(0),
+                iface: Some(InterfaceType::Int32),
+                ..Default::default()
+            },
+        );
         let read_reason = driver.read_reason;
         let poll_delay = driver.poll_delay.clone();
         let poll_wake = driver.poll_wake.clone();
@@ -7774,10 +8084,16 @@ mod tests {
         );
 
         gate.set(true);
-        let fire = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("the open must deliver the held callbacks")
-            .expect("the ring must stay open");
+        let fire = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(iv) = rx.try_recv() {
+                    break iv;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the open must deliver the held callbacks");
         assert_eq!(fire.aux_status, AsynStatus::Timeout);
         assert_eq!(written.lock().unwrap().len(), 1, "the delivery did no I/O");
 
@@ -7805,17 +8121,11 @@ mod tests {
         )
         .expect("relative config must build");
 
-        let num = driver
-            .base
-            .find_param(ModbusDataType::UInt16.as_str())
-            .expect("UINT16 parameter must exist");
-        let text = driver
-            .base
-            .find_param(ModbusDataType::StringHigh.as_str())
-            .expect("STRING_HIGH parameter must exist");
-        let mut nuser = AsynUser::new(num);
+        let (num, num_du) = data_param(&driver, ModbusDataType::UInt16);
+        let (text, text_du) = data_param(&driver, ModbusDataType::StringHigh);
+        let mut nuser = AsynUser::new(num).with_drv_user(num_du.clone());
         nuser.addr = 0;
-        let mut suser = AsynUser::new(text);
+        let mut suser = AsynUser::new(text).with_drv_user(text_du.clone());
         suser.addr = 0;
 
         // Every reader, run once. `Ok`/`Err` is all each boundary asserts;

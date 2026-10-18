@@ -2800,6 +2800,7 @@ mod tests {
                     addr: Some(0),
                     uint32_mask: None,
                     iface: None,
+                    ..Default::default()
                 },
                 move |iv: &InterruptValue| {
                     sink.lock().push((iv.addr, iv.value.as_int32().unwrap()))

@@ -56,6 +56,7 @@ fn the_boot_flush_posts_a_seeded_scalar_and_no_seeded_array() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             move |iv| sink.lock().unwrap().push(iv.reason),
         )

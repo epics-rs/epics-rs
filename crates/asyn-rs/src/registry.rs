@@ -44,7 +44,7 @@ pub struct PortEntry {
 /// published.
 enum Slot {
     Claimed,
-    Published(PortEntry),
+    Published(Box<PortEntry>),
 }
 
 /// Shared port registry — can be injected into multiple IOC instances.
@@ -114,7 +114,9 @@ impl PortClaim {
         let mut reg = registry.inner.lock().unwrap();
         // Only this claim's own `Drop` frees a claimed slot, so it is still ours.
         match reg.slots.get_mut(&self.name) {
-            Some((_, slot @ Slot::Claimed)) => *slot = Slot::Published(PortEntry { handle }),
+            Some((_, slot @ Slot::Claimed)) => {
+                *slot = Slot::Published(Box::new(PortEntry { handle }))
+            }
             _ => unreachable!("claimed slot {} left its claim", self.name),
         }
         self.published = true;
@@ -240,7 +242,7 @@ impl PortRegistry {
     pub fn get(&self, name: &str) -> Option<PortEntry> {
         let reg = self.inner.lock().ok()?;
         match &reg.slots.get(name)?.1 {
-            Slot::Published(entry) => Some(entry.clone()),
+            Slot::Published(entry) => Some(PortEntry::clone(entry)),
             Slot::Claimed => None,
         }
     }

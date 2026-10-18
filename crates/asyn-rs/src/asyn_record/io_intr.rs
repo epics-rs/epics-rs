@@ -114,6 +114,7 @@ pub(crate) struct IoIntrBinding {
     pub addr: i32,
     pub reason: usize,
     pub ui32mask: u32,
+    pub drv_user: Option<crate::port::DrvUser>,
 }
 
 #[derive(Default)]
@@ -282,6 +283,8 @@ impl IoIntrScan {
         let filter = InterruptFilter {
             reason: Some(binding.reason),
             addr: Some(binding.handle.param_list(binding.addr)),
+            user_addr: Some(binding.addr),
+            drv_user: binding.drv_user.clone(),
             // C passes the record's UI32MASK to
             // `pasynUInt32->registerInterruptUser` (:635); the driver then fires
             // only when the changed bits overlap it. No other interface carries

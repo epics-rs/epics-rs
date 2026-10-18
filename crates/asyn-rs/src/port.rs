@@ -147,6 +147,9 @@ fn locate_device(
 pub(crate) struct DeviceTable {
     multi_device: bool,
     port: DpCells,
+    /// The port's trace and name, which a new device's trace slot is made on.
+    trace: Arc<TraceManager>,
+    port_name: Arc<str>,
     devices: Arc<Mutex<HashMap<i32, DeviceState>>>,
     shared: Arc<PortShared>,
     announcer: Arc<ExceptionAnnouncer>,
@@ -164,6 +167,8 @@ impl DeviceTable {
         Self {
             multi_device: false,
             port: DpCells::new(true, true, true),
+            trace: Arc::new(TraceManager::new()),
+            port_name: Arc::from("detached"),
             devices: Arc::default(),
             shared: Arc::default(),
             announcer: Arc::new(ExceptionAnnouncer::new("detached", false)),
@@ -172,8 +177,11 @@ impl DeviceTable {
 
     /// C `connectDevice`'s `locateDevice` (asynManager.c:1349-1352): the cells of
     /// the `dpCommon` a user bound to `addr` reads — the device's on a
-    /// multi-device port, created if new, the port's own otherwise.
+    /// multi-device port, created if new, the port's own otherwise. A new
+    /// device's trace slot starts at `tracePvtInit`'s defaults, as
+    /// `dpCommonInit` makes both (:530); C creates a device nowhere else.
     pub(crate) fn connect_user(&self, addr: i32) -> DpCells {
+        self.trace.connect_device(&self.port_name, addr);
         match dp_common_key(self.multi_device, addr) {
             Some(addr) => {
                 let port = &self.port;
@@ -1112,6 +1120,37 @@ impl PortDriverBase {
         Ok(value)
     }
 
+    /// C `asynPortDriver::readInt64`; see [`Self::read_int32_param`].
+    pub fn read_int64_param(&self, user: &AsynUser) -> AsynResult<i64> {
+        let addr = self.parse_user(user)?;
+        let value = self.get_int64_param(user.reason, addr).map_err(|e| {
+            param_access_error(&self.params, user, "readInt64", e, format_args!("value=0"))
+        })?;
+        self.trace_io(user, "readInt64", format_args!("{value}"));
+        Ok(value)
+    }
+
+    /// C `asynPortDriver::readUInt32Digital`; see [`Self::read_int32_param`].
+    pub fn read_uint32_digital_param(&self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        let addr = self.parse_user(user)?;
+        let val = self.get_uint32_param(user.reason, addr).map_err(|e| {
+            param_access_error(
+                &self.params,
+                user,
+                "readUInt32Digital",
+                e,
+                format_args!("value=0 mask={mask}"),
+            )
+        })?;
+        let value = val & mask;
+        self.trace_io(
+            user,
+            "readUInt32Digital",
+            format_args!("{value}, mask={mask}"),
+        );
+        Ok(value)
+    }
+
     /// C `asynPortDriver::readFloat64`; see [`Self::read_int32_param`].
     pub fn read_float64_param(&self, user: &AsynUser) -> AsynResult<f64> {
         let addr = self.parse_user(user)?;
@@ -1781,6 +1820,8 @@ impl PortDriverBase {
         DeviceTable {
             multi_device: self.flags.multi_device,
             port: self.port_cells(),
+            trace: Arc::clone(&self.trace),
+            port_name: Arc::clone(&self.port_name),
             devices: Arc::clone(&self.device_states),
             shared: Arc::clone(&self.shared),
             announcer: Arc::clone(&self.announcer),
@@ -3038,13 +3079,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
-        let base = self.base();
-        let addr = base.parse_user(user)?;
-        let value = base.get_int64_param(user.reason, addr).map_err(|e| {
-            param_access_error(&base.params, user, "readInt64", e, format_args!("value=0"))
-        })?;
-        base.trace_io(user, "readInt64", format_args!("{value}"));
-        Ok(value)
+        self.base().read_int64_param(user)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
@@ -3115,25 +3150,7 @@ pub trait PortDriver: Any + Send + Sync {
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
-        let base = self.base();
-        let addr = base.parse_user(user)?;
-        let params = &base.params;
-        let val = base.get_uint32_param(user.reason, addr).map_err(|e| {
-            param_access_error(
-                params,
-                user,
-                "readUInt32Digital",
-                e,
-                format_args!("value=0 mask={mask}"),
-            )
-        })?;
-        let value = val & mask;
-        base.trace_io(
-            user,
-            "readUInt32Digital",
-            format_args!("{value}, mask={mask}"),
-        );
-        Ok(value)
+        self.base().read_uint32_digital_param(user, mask)
     }
 
     fn write_uint32_digital(
@@ -3917,6 +3934,7 @@ pub(crate) mod tests {
                     addr: Some(0),
                     uint32_mask: None,
                     iface: None,
+                    ..Default::default()
                 },
                 move |iv: &InterruptValue| {
                     if let ParamValue::Int32(v) = &iv.value {

@@ -1641,7 +1641,7 @@ impl PortHandle {
     /// `asynManagerLock`, so this takes the port's device-list lock and asks
     /// nothing of the actor: `asynRecord` binds under the record's lock.
     /// Answers the cells of the `dpCommon` the user is bound to (see
-    /// [`crate::port::DpCells`]).
+    /// [`crate::port::DpCells`]), with the device's trace slot.
     pub fn connect_device(&self, addr: i32) -> crate::port::DpCells {
         self.devices.connect_user(addr)
     }
@@ -2438,6 +2438,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(devices, vec![3]);
+    }
+
+    /// C `connectDevice` creates the device's dpCommon with `tracePvtInit`'s
+    /// ERROR mask (asynManager.c:456); a port-scoped `setTraceMask` reaches
+    /// only the devices that already exist (:2806-2813).
+    #[test]
+    fn a_device_bound_after_a_port_trace_mask_starts_at_error() {
+        let trace = Arc::new(TraceManager::new());
+        trace.register_port("handle_test", true);
+        let mut driver = TestDriver::new();
+        driver.base.flags.multi_device = true;
+        driver.base.trace = trace.clone();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = PortActor::new(Box::new(driver), rx);
+        let handle = PortHandle::new(
+            tx,
+            "handle_test".into(),
+            Arc::new(InterruptManager::new()),
+            actor.link(),
+            trace.clone(),
+        );
+        handle.connect_device(1);
+        trace.set_trace_mask(
+            Some("handle_test"),
+            crate::trace::TraceMask::ERROR | crate::trace::TraceMask::FLOW,
+        );
+        handle.connect_device(2);
+        let flow =
+            |addr| trace.is_enabled_device("handle_test", addr, crate::trace::TraceMask::FLOW);
+        assert!(flow(1), "an existing device takes the port's mask");
+        assert!(!flow(2), "a new device starts at ASYN_TRACE_ERROR");
+        assert!(trace.is_enabled_device("handle_test", 2, crate::trace::TraceMask::ERROR));
+    }
+
+    /// A device the actor's ConnectUser binds starts at `tracePvtInit`'s
+    /// ERROR mask too.
+    #[test]
+    fn a_device_connect_user_binds_starts_at_error() {
+        use crate::trace::TraceMask;
+        let trace = Arc::new(TraceManager::new());
+        trace.register_port("handle_test", true);
+        let mut driver = TestDriver::new();
+        driver.base.flags.multi_device = true;
+        driver.base.trace = trace.clone();
+        let handle = make_handle(driver);
+        trace.set_trace_mask(Some("handle_test"), TraceMask::ERROR | TraceMask::FLOW);
+        handle
+            .submit_blocking(RequestOp::ConnectUser, AsynUser::new(0).with_addr(2))
+            .unwrap();
+        assert!(!trace.is_enabled_device("handle_test", 2, TraceMask::FLOW));
+        assert!(trace.is_enabled_device("handle_test", 2, TraceMask::ERROR));
     }
 
     /// C `enable` and `autoConnectAsyn` store on the caller's thread

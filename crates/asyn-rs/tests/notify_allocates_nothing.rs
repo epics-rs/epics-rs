@@ -81,6 +81,7 @@ fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
         addr: Some(0),
         uint32_mask: None,
         iface,
+        ..Default::default()
     };
 
     let ring = Arc::new(AtomicUsize::new(0));
@@ -149,6 +150,7 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             move |_| {
                 hits.fetch_add(1, Ordering::Relaxed);
@@ -163,6 +165,7 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             4096,
         )
@@ -296,6 +299,7 @@ fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
                         addr: Some(0),
                         uint32_mask: None,
                         iface: None,
+                        ..Default::default()
                     },
                     256,
                 )
@@ -347,6 +351,7 @@ async fn a_mailbox_clamps_a_payload_to_its_registered_size() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             16,
         )
@@ -395,6 +400,7 @@ async fn a_mailbox_registered_for_a_large_array_delivers_it_whole() {
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             100_000 * 8,
         )

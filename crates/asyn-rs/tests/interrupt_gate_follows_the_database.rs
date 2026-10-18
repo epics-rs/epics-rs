@@ -203,6 +203,7 @@ fn count_deliveries(handle: &PortHandle) -> (Arc<std::sync::atomic::AtomicUsize>
                 addr: Some(0),
                 uint32_mask: None,
                 iface: None,
+                ..Default::default()
             },
             move |_| {
                 sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

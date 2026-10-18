@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(59): checked, not waived — all 59 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(39): checked, not waived — all 39 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1404/1404). asyn-rs became a census subject when its
@@ -2569,6 +2569,8 @@ impl AsynDeviceSupport {
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
             uint32_mask: None,
             // Per-interface routing: a driver that fires interface-typed
             // values (e.g. Modbus) must reach this accumulating callback
@@ -4041,6 +4043,8 @@ impl DeviceSupport for AsynDeviceSupport {
             let filter = InterruptFilter {
                 reason: Some(self.reason),
                 addr: Some(self.handle.param_list(self.addr)),
+                user_addr: Some(self.addr),
+                drv_user: self.drv_user.clone(),
                 uint32_mask: None,
                 // Averaging accumulates every sample; restrict to this record's
                 // interface so a per-interface driver's parallel typed fires for
@@ -4199,6 +4203,8 @@ impl DeviceSupport for AsynDeviceSupport {
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
             uint32_mask: if is_uint32 { Some(mask) } else { None },
             // Per-interface routing (C's per-interface interrupt lists): a
             // driver firing interface-typed values reaches this record only with
@@ -4383,6 +4389,8 @@ impl DeviceSupport for AsynDeviceSupport {
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
             uint32_mask: None,
             // This IS the record's asynEnum interrupt client (C
             // `registerInterruptUser` on the asynEnum interface,
@@ -9162,6 +9170,65 @@ mod tests {
         );
     }
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
+    /// C's interrupt node keeps the record's `pasynUser`, so a driver walking
+    /// its clients reads the address the link named and the drvUser
+    /// `drvUserCreate` hung on it (drvModbusAsyn.cpp:1727-1733).
+    #[tokio::test]
+    async fn an_io_intr_client_carries_its_link_address_and_drv_user() {
+        struct TagPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for TagPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn drv_user_create(
+                &mut self,
+                req: &DrvUserRequest,
+            ) -> crate::error::AsynResult<crate::port::DrvUserInfo> {
+                Ok(crate::port::DrvUserInfo::from_reason(0)
+                    .with_drv_user(Arc::new(req.drv_info.clone())))
+            }
+        }
+        use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
+
+        let mut base = PortDriverBase::new(
+            "tagport",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.create_param("DATA", ParamType::Int32).unwrap();
+        let (rt, _jh) =
+            create_port_runtime_unclaimed(TagPort { base }, RuntimeConfig::default()).unwrap();
+        let link = AsynLink {
+            port_name: "tagport".into(),
+            addr: 3,
+            timeout: Some(Duration::from_secs(1)),
+            drv_info: "INT16".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(rt.port_handle().clone(), link, "asynInt32");
+        ads.set_record_info("TEST:TAG", ScanType::IoIntr);
+        let mut rec = epics_base_rs::server::records::ai::AiRecord::default();
+        ads.init(&mut rec).unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+        let clients = rt.port_handle().interrupts().subscribed_clients();
+        let [client] = clients.as_slice() else {
+            panic!("{clients:?}");
+        };
+        assert_eq!(client.filter.user_addr, Some(3));
+        let tag = client.filter.drv_user.as_ref().unwrap();
+        assert_eq!(tag.downcast_ref::<String>().unwrap(), "INT16");
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(20): the file-level marker's sites resume
+    // here; checked as it says.
     /// R11-48. C device support calls `drvUser->create` only when the port
     /// registered asynDrvUser **and** the record named a userParam
     /// (`if (pasynInterface && pPvt->userParam)`, devAsynInt32.c:264-265). A byte

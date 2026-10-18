@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(17): checked, not waived — all 17 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(14): checked, not waived — all 14 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
 // --all-features`, 1081/1081). asyn-rs became a census subject when its
@@ -38,7 +38,27 @@ pub struct InterruptFilter {
     /// (`call_param_callbacks`) leaves the value's `iface` `None`, which every
     /// subscriber still accepts — preserving the pre-per-interface behaviour.
     pub iface: Option<InterfaceType>,
+    /// The address the client connected with (C `pasynManager->getAddr` on
+    /// its `pasynUser`). `addr` is the parameter list the driver's
+    /// `getAddress` maps it to, and is all a fire matches; a driver that
+    /// decodes per client, as Modbus `readPoller` does, reads this one.
+    pub user_addr: Option<i32>,
+    /// The client's `pasynUser->drvUser` from `drvUserCreate`.
+    pub drv_user: Option<crate::port::DrvUser>,
 }
+
+/// One record client of the registry, C's `interruptNode`: a polling driver
+/// walks these and fires each with [`InterruptManager::notify_client`].
+#[derive(Debug, Clone)]
+pub struct InterruptClient {
+    pub id: ClientId,
+    pub filter: InterruptFilter,
+}
+
+/// Identity of one mailbox or synchronous-callback registration, in
+/// registration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClientId(u64);
 
 impl InterruptFilter {
     /// Whether an interrupt value passes this filter (reason + addr +
@@ -223,6 +243,7 @@ impl Default for InterruptValue {
 /// Per-subscriber mailbox: stores the latest matching interrupt value.
 /// Intermediate updates are coalesced — consumer always sees the most recent state.
 struct SubscriptionMailbox {
+    id: ClientId,
     filter: InterruptFilter,
     /// Latest matching value (overwritten on each notify, taken on recv).
     latest: parking_lot::Mutex<Slot>,
@@ -702,6 +723,7 @@ impl Drop for InterruptSharedState {
 /// updates to the latest, and the broadcast path drops on lag — either would
 /// silently corrupt the mean, so averaging cannot use them.
 struct SyncCallback {
+    id: ClientId,
     filter: InterruptFilter,
     callback: Box<dyn Fn(&InterruptValue) + Send + Sync>,
     active: AtomicBool,
@@ -807,6 +829,8 @@ pub struct InterruptSharedState {
     notify_count: AtomicU64,
     /// Number of times a mailbox value was overwritten before the consumer read it.
     coalesce_count: AtomicU64,
+    /// The next [`ClientId`].
+    next_client: AtomicU64,
     /// The `interruptAccept` of the database that owns this port, set once
     /// at registration — see [`InterruptManager::accepting`]. A single cell:
     /// the flush path reads it with one atomic load, takes no lock and
@@ -857,6 +881,7 @@ impl InterruptManager {
                 sync_callbacks: parking_lot::Mutex::new(Arc::from([])),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
+                next_client: AtomicU64::new(0),
                 owner: std::sync::OnceLock::new(),
                 sources,
             }),
@@ -994,6 +1019,7 @@ impl InterruptManager {
     {
         self.interrupt_pvt(&filter)?;
         let cb = Arc::new(SyncCallback {
+            id: self.next_client_id(),
             filter,
             callback: Box::new(callback),
             active: AtomicBool::new(true),
@@ -1017,13 +1043,28 @@ impl InterruptManager {
     /// go through [`notify_octet`](Self::notify_octet), which names its fan-out
     /// rule explicitly.
     pub fn notify(&self, value: InterruptValue) {
-        self.dispatch(value, |f, v| f.matches(v));
+        self.dispatch(value, |_, f, v| f.matches(v));
+    }
+
+    /// Fire `value` at the one client `id` names, whatever its filter: C
+    /// Modbus `readPoller` calls each node's callback with the value it
+    /// decoded for that node (drvModbusAsyn.cpp:1669-1924). A ring is no
+    /// node and takes none of these; see [`Self::notify_rings`].
+    pub fn notify_client(&self, id: ClientId, value: InterruptValue) {
+        self.dispatch(value, |client, _, _| client == Some(id));
+    }
+
+    /// Send `value` to the rings alone, by their filters: what a driver
+    /// that decodes per client ([`Self::notify_client`]) decoded for an
+    /// observer, which has no drvUser.
+    pub fn notify_rings(&self, value: InterruptValue) {
+        self.dispatch(value, |client, f, v| client.is_none() && f.matches(v));
     }
 
     /// Send an **octet** interrupt under one of C's two octet fan-out rules
     /// (see [`OctetFanOut`]). Neither rule consults `reason`.
     pub fn notify_octet(&self, rule: OctetFanOut, value: InterruptValue) {
-        self.dispatch(value, |f, _| f.accepts_octet(rule));
+        self.dispatch(value, |_, f, _| f.accepts_octet(rule));
     }
 
     /// The single delivery path — sync callbacks, then mailboxes, then the
@@ -1033,7 +1074,7 @@ impl InterruptManager {
     fn dispatch(
         &self,
         value: InterruptValue,
-        pass: impl Fn(&InterruptFilter, &InterruptValue) -> bool,
+        pass: impl Fn(Option<ClientId>, &InterruptFilter, &InterruptValue) -> bool,
     ) {
         self.state.notify_count.fetch_add(1, Ordering::Relaxed);
 
@@ -1047,7 +1088,7 @@ impl InterruptManager {
             if !cb.active.load(Ordering::Relaxed) {
                 continue;
             }
-            if pass(&cb.filter, &value) {
+            if pass(Some(cb.id), &cb.filter, &value) {
                 (cb.callback)(&value);
             }
         }
@@ -1065,7 +1106,7 @@ impl InterruptManager {
             if !sub.active.load(Ordering::Relaxed) {
                 continue;
             }
-            if !pass(&sub.filter, &value) {
+            if !pass(Some(sub.id), &sub.filter, &value) {
                 continue;
             }
             if sub.accept.as_ref().is_some_and(|accept| !accept()) {
@@ -1083,7 +1124,7 @@ impl InterruptManager {
 
         // Deliver to the rings.
         for ring in self.state.async_rings.lock().iter() {
-            if ring.active.load(Ordering::Relaxed) && pass(&ring.filter, &value) {
+            if ring.active.load(Ordering::Relaxed) && pass(None, &ring.filter, &value) {
                 ring.push(&value);
             }
         }
@@ -1136,6 +1177,7 @@ impl InterruptManager {
     ) -> AsynResult<(InterruptSubscription, InterruptReceiver)> {
         self.interrupt_pvt(&filter)?;
         let mailbox = Arc::new(SubscriptionMailbox {
+            id: self.next_client_id(),
             filter,
             latest: parking_lot::Mutex::new(Slot::new(payload_bytes)),
             wakeup: tokio::sync::Notify::new(),
@@ -1251,6 +1293,39 @@ impl InterruptManager {
             }
         }
         out
+    }
+
+    /// Every active mailbox and synchronous-callback client that names a
+    /// reason, in registration order, each with the filter it registered.
+    /// Unlike [`subscribed_bindings`](Self::subscribed_bindings) nothing is
+    /// merged: C `readPoller` fires each node on its own.
+    pub fn subscribed_clients(&self) -> Vec<InterruptClient> {
+        let client = |id, f: &InterruptFilter| {
+            f.reason.is_some().then(|| InterruptClient {
+                id,
+                filter: f.clone(),
+            })
+        };
+        let mut out: Vec<InterruptClient> = {
+            let g = self.state.mailboxes.lock();
+            g.iter()
+                .filter(|s| s.active.load(Ordering::Relaxed))
+                .filter_map(|s| client(s.id, &s.filter))
+                .collect()
+        };
+        let sync_cbs = self.state.sync_callbacks.lock().clone();
+        out.extend(
+            sync_cbs
+                .iter()
+                .filter(|c| c.active.load(Ordering::Relaxed))
+                .filter_map(|c| client(c.id, &c.filter)),
+        );
+        out.sort_by_key(|c| c.id);
+        out
+    }
+
+    fn next_client_id(&self) -> ClientId {
+        ClientId(self.state.next_client.fetch_add(1, Ordering::Relaxed))
     }
 
     // --- Metrics ---
@@ -1774,6 +1849,7 @@ mod tests {
                     addr: Some(0),
                     iface: Some(InterfaceType::UInt32Digital),
                     uint32_mask: Some(0xFF),
+                    ..Default::default()
                 },
                 4096,
             )
@@ -2117,6 +2193,74 @@ mod tests {
         assert!(im.subscribed_bindings().is_empty());
     }
 
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
+    /// C `readPoller` fires each node with the value it decoded from that
+    /// node's own address and drvUser (drvModbusAsyn.cpp:1669-1924): two
+    /// clients on one reason and parameter list keep both, and a value fired
+    /// at one client reaches no other.
+    #[test]
+    fn each_client_keeps_its_address_and_drv_user_and_takes_its_own_fire() {
+        let im = InterruptManager::new();
+        let client = |user_addr, kind: &str| InterruptFilter {
+            reason: Some(0),
+            addr: Some(0),
+            user_addr: Some(user_addr),
+            drv_user: Some(Arc::new(kind.to_string())),
+            ..Default::default()
+        };
+        let hits = Arc::new(AtomicU64::new(0));
+        let seen = hits.clone();
+        let _sync = im
+            .register_sync_callback(client(3, "INT16"), move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let (_sub, mut mb) = im
+            .register_interrupt_user(client(5, "FLOAT32_LE"), 0)
+            .unwrap();
+
+        let clients = im.subscribed_clients();
+        let kinds: Vec<_> = clients
+            .iter()
+            .map(|c| {
+                let kind = c.filter.drv_user.as_ref().unwrap();
+                let kind = kind.downcast_ref::<String>().unwrap().clone();
+                (c.filter.user_addr, kind)
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (Some(3), "INT16".to_string()),
+                (Some(5), "FLOAT32_LE".to_string())
+            ]
+        );
+
+        let value = |v| InterruptValue {
+            value: ParamValue::Int32(v),
+            ..Default::default()
+        };
+        im.notify_client(clients[1].id, value(7));
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "the INT16 client");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let got = rt.block_on(mb.recv()).unwrap();
+        assert_eq!(got.value.as_int32().unwrap(), 7);
+        im.notify_client(clients[0].id, value(8));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        rt.block_on(async {
+            tokio::select! {
+                biased;
+                v = mb.recv() => panic!("the FLOAT32_LE client took {v:?}"),
+                () = std::future::ready(()) => {}
+            }
+        });
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(3): the file-level marker's sites resume
+    // here; checked as it says.
     /// C delivers a GenericPointer to the registered callbacks inline and to
     /// nothing else (asynPortDriver.cpp:3340-3375): a sync callback sees it,
     /// no ring or mailbox queues it, and the notifier's `Arc` is the last.
@@ -2271,6 +2415,69 @@ mod tests {
             ),
             ("B", 8, 1)
         );
+    }
+
+    /// A value fired at one client reaches that client and no ring.
+    #[test]
+    fn a_value_fired_at_one_client_reaches_no_ring() {
+        let im = InterruptManager::new();
+        let filter = InterruptFilter {
+            reason: Some(1),
+            addr: Some(0),
+            ..Default::default()
+        };
+        let hits = Arc::new(AtomicU64::new(0));
+        let seen = hits.clone();
+        let _sync = im
+            .register_sync_callback(filter.clone(), move |_| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let mut ring = im.subscribe_async_filtered(filter, 8, 0).unwrap();
+        let id = im.subscribed_clients()[0].id;
+        im.notify_client(
+            id,
+            InterruptValue {
+                reason: 1,
+                value: ParamValue::Int32(7),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        assert_eq!(ring.try_recv().unwrap_err(), AsyncTryRecvError::Empty);
+    }
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — ran and passed under
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs`.
+    /// `notify_rings` reaches the rings its value passes and no client.
+    #[test]
+    fn notify_rings_reaches_the_rings_by_filter_and_no_client() {
+        let im = InterruptManager::new();
+        let filter = |reason| InterruptFilter {
+            reason: Some(reason),
+            addr: Some(0),
+            ..Default::default()
+        };
+        let (_sub, mut mb) = im.register_interrupt_user(filter(1), 0).unwrap();
+        let mut wanted = im.subscribe_async_filtered(filter(1), 8, 0).unwrap();
+        let mut other = im.subscribe_async_filtered(filter(2), 8, 0).unwrap();
+        im.notify_rings(InterruptValue {
+            reason: 1,
+            value: ParamValue::Int32(7),
+            ..Default::default()
+        });
+        assert_eq!(wanted.try_recv().unwrap().value.as_int32().unwrap(), 7);
+        assert_eq!(other.try_recv().unwrap_err(), AsyncTryRecvError::Empty);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::select! {
+                biased;
+                v = mb.recv() => panic!("the client took {v:?}"),
+                () = std::future::ready(()) => {}
+            }
+        });
     }
 
     /// A ring takes the fan-out rule of the emitter, as a mailbox does: the

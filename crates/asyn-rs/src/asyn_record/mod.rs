@@ -3469,6 +3469,7 @@ impl AsynRecord {
             addr: self.addr,
             reason: self.resolved_reason,
             ui32mask: self.ui32mask,
+            drv_user: self.drv_user.clone(),
         });
         if let Err(refusal) = self.io_intr.rebind(binding) {
             self.report_register_refusal(refusal);
@@ -14221,6 +14222,17 @@ A.OEOS
         assert_eq!(prog(&flush_user(&plan)).as_deref(), Some("START_PROG1"));
         let special = rec.special_user(OptionQueue::Normal).user();
         assert_eq!(prog(&special).as_deref(), Some("START_PROG1"));
+
+        // And the record's interrupt node, as C's keeps the same pasynUser.
+        let _wakeups = rec.io_intr_scan().take_receiver().unwrap();
+        rec.set_io_intr_scan(true);
+        let clients = rt.port_handle().interrupts().subscribed_clients();
+        let [client] = clients.as_slice() else {
+            panic!("{clients:?}");
+        };
+        let tag = client.filter.drv_user.as_ref();
+        let tag = tag.and_then(|d| d.downcast_ref::<String>());
+        assert_eq!(tag.map(String::as_str), Some("START_PROG1"));
     }
 
     /// R18-89. C assigns the reason only on success:

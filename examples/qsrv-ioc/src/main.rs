@@ -114,7 +114,10 @@ async fn main() -> CaResult<()> {
     }
 
     // ── Simulator ──
-    spawn_simulator(&reactor, db.clone());
+    // Off to pair with a C softIocPVA, where nothing writes the records.
+    if std::env::var_os("QSRV_IOC_NO_SIMULATOR").is_none() {
+        spawn_simulator(&reactor, db.clone());
+    }
 
     // ── Scan start (C iocInit owns it, the servers do not scan) ──
     // One core-owned scan owner covers both front-ends; held to the end

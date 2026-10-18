@@ -82,6 +82,9 @@ epics> dbpf DEMO:AO 42.5    # write AO value
 epics> dbpf DEMO:BI 1       # set BI to "On"
 ```
 
+Set `QSRV_IOC_NO_SIMULATOR` to leave the records unwritten, as a C
+softIocPVA serving the same database does.
+
 ## Port Configuration
 
 Override default ports via environment variables:

@@ -18,7 +18,8 @@
 # sets TPRO 2; "noval" leaves VAL out of the record, which then loads
 # with UDF 1; "reload" runs streamReload after the processing; "report"
 # runs streamReportRecord rec; "tointr" puts SCAN "I/O Intr" after the
-# processing, "topassive" puts it back to "Passive".
+# processing, "topassive" puts it back to "Passive"; "flip" puts SCAN
+# "I/O Intr", 0.2 s later "Passive" and "I/O Intr" again, and waits 1.5 s.
 # Arguments, if any, are the cases to run.
 set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
@@ -61,6 +62,12 @@ epicsThreadSleep 0.5"
     has topassive && after="$after
 dbpf rec.SCAN Passive
 epicsThreadSleep 0.5"
+    has flip && after="$after
+dbpf rec.SCAN \"I/O Intr\"
+epicsThreadSleep 0.2
+dbpf rec.SCAN Passive
+dbpf rec.SCAN \"I/O Intr\"
+epicsThreadSleep 1.5"
     cat >"$work/$c.cmd" <<EOC
 dbLoadDatabase "$STREAM_TOP/dbd/streamApp.dbd"
 streamApp_registerRecordDeviceDriver pdbbase

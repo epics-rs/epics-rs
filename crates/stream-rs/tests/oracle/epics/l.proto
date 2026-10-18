@@ -8,3 +8,5 @@ d { out "D"; in "%f"; }
 w { out "GET"; wait 100; in "%d"; }
 t { ReplyTimeout = 100; out "GET"; in "%d"; }
 c { connect 100; out "GET"; }
+i { in "V=%d"; }
+iw { wait 1000; in "V=%d"; }

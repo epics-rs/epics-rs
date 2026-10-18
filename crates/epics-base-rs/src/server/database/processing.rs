@@ -745,6 +745,11 @@ impl AsyncDbHandle {
         self.inner.strong_count() > 0
     }
 
+    /// C's `interruptAccept`, this database's: its scan facility runs.
+    pub fn interrupt_accept(&self) -> bool {
+        self.db().is_some_and(|db| db.scan_control().is_running())
+    }
+
     /// C `dbNameToAddr(name)` succeeding: `name` is a field this database
     /// serves. `held` is the record the caller holds, as a device's own
     /// record during its `init` or `process`, which is asked directly.

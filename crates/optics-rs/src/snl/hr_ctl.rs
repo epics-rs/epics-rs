@@ -459,6 +459,45 @@ pub async fn run(
     config: HrConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::select! {
+        r = hr_ctl(&config, db.clone()) => r,
+        () = update_pseudo(&config, &db) => Ok(()),
+    }
+}
+
+/// ss updatePsuedo (hrCtl.st:1487-1536). Its phi readback clauses never
+/// fire: nothing sets phi1MotRdbkPseudo_mon or phi2MotRdbkPseudo_mon.
+async fn update_pseudo(config: &HrConfig, db: &PvDatabase) {
+    let origin = alloc_origin();
+    let echoes = [
+        ("", "phi1CmdAO", &config.m_phi1),
+        ("", "phi2CmdAO", &config.m_phi2),
+        (".DMOV", "phi1DmovBI", &config.m_phi1),
+        (".DMOV", "phi2DmovBI", &config.m_phi2),
+    ]
+    .map(|(field, echo, m)| {
+        (
+            config.motor_pv(m, field),
+            DbChannel::with_origin(db, &config.pv(echo), origin),
+        )
+    });
+    let watched: Vec<String> = echoes.iter().map(|(pv, _)| pv.clone()).collect();
+    let mut monitor = DbMultiMonitor::new(db, &watched).await;
+    loop {
+        let (pv, v) = monitor.wait_change().await;
+        let (from, echo) = echoes.iter().find(|(from, _)| *from == pv).unwrap();
+        let _ = if from.ends_with(".DMOV") {
+            echo.put_i16_process(v as i16).await
+        } else {
+            echo.put_f64_process(v).await
+        };
+    }
+}
+
+async fn hr_ctl(
+    config: &HrConfig,
+    db: PvDatabase,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("hrCtl: starting for prefix={}HR{}", config.prefix, config.n);
 
     let my_origin = alloc_origin();
@@ -527,8 +566,8 @@ pub async fn run(
     // Echo PVs
     let ch_phi1_mot_name = DbChannel::with_origin(&db, &config.pv("phi1PvSI"), my_origin);
     let ch_phi2_mot_name = DbChannel::with_origin(&db, &config.pv("phi2PvSI"), my_origin);
-    let _ch_phi1_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi1CmdAO"), my_origin);
-    let _ch_phi2_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi2CmdAO"), my_origin);
+    let ch_phi1_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi1CmdAO"), my_origin);
+    let ch_phi2_cmd_echo = DbChannel::with_origin(&db, &config.pv("phi2CmdAO"), my_origin);
     let ch_phi1_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi1RdbkAI"), my_origin);
     let ch_phi2_rdbk_echo = DbChannel::with_origin(&db, &config.pv("phi2RdbkAI"), my_origin);
     let ch_phi1_dmov_echo = DbChannel::with_origin(&db, &config.pv("phi1DmovBI"), my_origin);
@@ -809,6 +848,22 @@ pub async fn run(
             for pv in enter_clears {
                 monitor.clear(pv);
             }
+            // The echoes and opAck follow the efClears (hrCtl.st:624-680).
+            for (echo, from) in [
+                (&ch_phi1_rdbk_echo, &ch_phi1_mot_rbv),
+                (&ch_phi2_rdbk_echo, &ch_phi2_mot_rbv),
+                (&ch_phi1_cmd_echo, &ch_phi1_mot_cmd),
+                (&ch_phi2_cmd_echo, &ch_phi2_mot_cmd),
+            ] {
+                let _ = echo.put_f64_process(from.get_f64().await).await;
+            }
+            for (echo, from) in [
+                (&ch_phi1_dmov_echo, &ch_phi1_dmov),
+                (&ch_phi2_dmov_echo, &ch_phi2_dmov),
+            ] {
+                let _ = echo.put_i16_process(from.get_i16().await).await;
+            }
+            let _ = ch_oper_ack.put_i16_process(0).await;
         }
         wait_for_cmnd_enter = true;
         let mut proceed_to_theta_changed = false;
@@ -1201,20 +1256,6 @@ pub async fn run(
             _caused_move = false;
             let _ = ch_moving.put_i16_process(0).await;
         }
-
-        // Echo updates
-        let _ = ch_phi1_rdbk_echo
-            .put_f64_process(ch_phi1_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_phi2_rdbk_echo
-            .put_f64_process(ch_phi2_mot_rbv.get_f64().await)
-            .await;
-        let _ = ch_phi1_dmov_echo
-            .put_i16_process(ch_phi1_dmov.get_i16().await)
-            .await;
-        let _ = ch_phi2_dmov_echo
-            .put_i16_process(ch_phi2_dmov.get_i16().await)
-            .await;
     }
 }
 

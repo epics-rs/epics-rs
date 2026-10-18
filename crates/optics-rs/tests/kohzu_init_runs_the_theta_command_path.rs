@@ -466,6 +466,69 @@ async fn eventually_near(ioc: &PvDatabase, pv: &str, want: f64) {
     assert_near(ioc, pv, want).await;
 }
 
+/// Return with the sequencer idle after an enter. An ack posted during a
+/// pass is lost to that pass's opAck = 0, as in C, so it is posted again
+/// until one is taken (msg1 " ") and its enter has ended (opAck 0).
+async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
+    let ack_ch = optics_rs::db_access::DbChannel::new(db, ack);
+    for _ in 0..50 {
+        db.get_record(msg1)
+            .unwrap()
+            .write()
+            .record
+            .put_field("VAL", EpicsValue::String("-".into()))
+            .unwrap();
+        ack_ch.put_f64_process(1.0).await.unwrap();
+        for _ in 0..20 {
+            task::sleep(Duration::from_millis(50)).await;
+            if string_of(db, msg1).await == " " && f64_of(db, ack).await == 0.0 {
+                return;
+            }
+        }
+    }
+    panic!("{ack} never taken");
+}
+
+/// Run `posts` while the sequencer is held past waitForCmndEnter's
+/// efClears (kohzuCtl.st:607-620): `ack` sends it there, the `echo` put is its
+/// first after them, and its next read blocks on K:y, locked here. A post
+/// that lands before the efClears is dropped, as in C.
+async fn post_while_held(db: &PvDatabase, ack: &str, echo: &str, posts: impl FnOnce(&PvDatabase)) {
+    let rbv = f64_of(db, "K:th.RBV").await;
+    idle(db, ack, "K:KohzuSeqMsg1SI").await;
+    db.get_record(echo)
+        .unwrap()
+        .write()
+        .record
+        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
+        .unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let y = db.get_record("K:y").unwrap();
+    let holder = std::thread::spawn(move || {
+        let _held = y.write();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+    optics_rs::db_access::DbChannel::new(db, ack)
+        .put_f64_process(1.0)
+        .await
+        .unwrap();
+    eventually_near(db, echo, rbv).await;
+    posts(db);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+/// Post `v` to `pv`'s VAL with no processing.
+fn post(db: &PvDatabase, pv: &str, v: EpicsValue) {
+    let rec = db.get_record(pv).unwrap();
+    let mut inst = rec.write();
+    inst.record.put_field("VAL", v).unwrap();
+    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+}
+
 /// Two E puts queued before the sequencer looks raise E_mon once, and C's
 /// sync'd variable holds the later value, so theta follows the second put.
 #[epics_base_rs::epics_test]
@@ -473,16 +536,12 @@ async fn two_queued_e_puts_take_the_later_value() {
     let ioc = boot([10.0, -17.77, 100.78]).await;
     settled(&ioc, "y offset changed to 17.500000").await;
     let db = PvDatabase::clone(&ioc);
-    // Both posts land in one step with no await, so the sequencer, on this
-    // one-thread runtime, cannot take the first before the second is queued.
-    {
-        let rec = db.get_record("K:BraggEAO").unwrap();
-        let mut inst = rec.write();
+    post_while_held(&db, "K:KohzuOperAckBO", "K:KohzuThetaRdbkAI", |db| {
         for e in [12.0, 14.0] {
-            inst.record.put_field("VAL", EpicsValue::Double(e)).unwrap();
-            inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+            post(db, "K:BraggEAO", EpicsValue::Double(e));
         }
-    }
+    })
+    .await;
     let two_d = f64_of(&ioc, "K:Bragg2dSpacingAO").await;
     let theta = optics_rs::snl::kohzu_ctl::lambda_to_theta(
         optics_rs::snl::kohzu_ctl::energy_to_lambda(14.0),
@@ -511,17 +570,11 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         .pos
         .val = 5.0;
     let e = f64_of(&ioc, "K:BraggEAO").await;
-    // No await between the posts: on this one-thread runtime the sequencer
-    // finds both queued.
-    for (pv, v) in [
-        ("K:KohzuModeBO", EpicsValue::Enum(1)),
-        ("K:BraggEAO", EpicsValue::Double(e + 1e-6)),
-    ] {
-        let rec = db.get_record(pv).unwrap();
-        let mut inst = rec.write();
-        inst.record.put_field("VAL", v).unwrap();
-        inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
-    }
+    post_while_held(&db, "K:KohzuOperAckBO", "K:KohzuThetaRdbkAI", |db| {
+        post(db, "K:KohzuModeBO", EpicsValue::Enum(1));
+        post(db, "K:BraggEAO", EpicsValue::Double(e + 1e-6));
+    })
+    .await;
     eventually_near(&ioc, "K:y.VAL", -17.77).await;
 }
 

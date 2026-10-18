@@ -64,8 +64,9 @@ async fn boot() -> (Arc<PvDatabase>, PvDatabase) {
     (ioc, db)
 }
 
-/// Post each value as a monitor, with no await between the posts: on the
-/// one-thread runtime the sequencer finds them all queued.
+/// Post each value as a monitor, in order. A monitored variable is read
+/// from its queue when an event is taken, so it holds every post made
+/// before that event's.
 fn post(db: &epics_base_rs::server::database::PvDatabase, posts: &[(String, EpicsValue)]) {
     for (pv, v) in posts {
         let rec = db.get_record(pv).unwrap();

@@ -78,6 +78,79 @@ async fn settled(ioc: &PvDatabase, msg1: &str) {
     panic!("SeqMsg1 never read {msg1:?}");
 }
 
+/// Return with the sequencer idle after an enter. An ack posted during a
+/// pass is lost to that pass's opAck = 0, as in C, so it is posted again
+/// until one is taken (msg1 " ") and its enter has ended (opAck 0).
+async fn idle(db: &PvDatabase, ack: &str, msg1: &str) {
+    let ack_ch = optics_rs::db_access::DbChannel::new(db, ack);
+    for _ in 0..50 {
+        db.get_record(msg1)
+            .unwrap()
+            .write()
+            .record
+            .put_field("VAL", EpicsValue::String("-".into()))
+            .unwrap();
+        ack_ch.put_f64_process(1.0).await.unwrap();
+        for _ in 0..20 {
+            task::sleep(Duration::from_millis(50)).await;
+            if string_of(db, msg1).await == " " && f64_of(db, ack).await == 0.0 {
+                return;
+            }
+        }
+    }
+    panic!("{ack} never taken");
+}
+
+/// Run `posts` while the sequencer is held past waitForCmndEnter's
+/// efClears (ml_monoCtl.st:564-575): OperAck sends it there, the theta
+/// readback echo is its first put after them, and the theta2 echo, locked
+/// here, its next. A post that lands before the efClears is dropped, as in C.
+async fn post_while_held(db: &PvDatabase, posts: impl FnOnce(&PvDatabase)) {
+    let rbv = f64_of(db, "M:th.RBV").await;
+    idle(db, "M:ml_monoOperAck", "M:ml_monoSeqMsg1").await;
+    db.get_record("M:ml_monoThetaRdbkEcho")
+        .unwrap()
+        .write()
+        .record
+        .put_field("VAL", EpicsValue::Double(rbv - 1.0))
+        .unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let echo2 = db.get_record("M:ml_monoTheta2RdbkEcho").unwrap();
+    let holder = std::thread::spawn(move || {
+        let _held = echo2.write();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+    optics_rs::db_access::DbChannel::new(db, "M:ml_monoOperAck")
+        .put_f64_process(1.0)
+        .await
+        .unwrap();
+    wait_near(db, "M:ml_monoThetaRdbkEcho", rbv).await;
+    posts(db);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+async fn wait_near(ioc: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..100 {
+        if (f64_of(ioc, pv).await - want).abs() < 1e-6 {
+            return;
+        }
+        task::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{pv} = {}, want {want}", f64_of(ioc, pv).await);
+}
+
+/// Write `pv` and post it as a C client's put would.
+fn post(ioc: &PvDatabase, pv: &str, v: EpicsValue) {
+    let rec = ioc.get_record(pv).unwrap();
+    let mut inst = rec.write();
+    inst.record.put_field("VAL", v).unwrap();
+    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
+}
+
 /// An E put queued with Mode=Auto already sees auto mode and drives theta,
 /// though E is taken before Mode. The boot's own yOffset put wakes the
 /// yOffset arm last (C kohzuIoc oracle, y at 35: "y offset changed to
@@ -86,21 +159,12 @@ async fn settled(ioc: &PvDatabase, msg1: &str) {
 async fn an_e_put_queued_after_auto_mode_moves() {
     let ioc = boot([10.0, 10.0, 35.0, 100.0]).await;
     settled(&ioc, "y offset changed to 35.000000").await;
-    // Past the waitForCmndEnter that clears E 0.1 s after that pass.
-    task::sleep(Duration::from_millis(500)).await;
-    let db = PvDatabase::clone(&ioc);
     let e = f64_of(&ioc, "M:ml_monoE").await;
-    // No await between the posts: on this one-thread runtime the sequencer
-    // finds both queued.
-    for (pv, v) in [
-        ("M:ml_monoMode", EpicsValue::Enum(1)),
-        ("M:ml_monoE", EpicsValue::Double(e * 1.01)),
-    ] {
-        let rec = db.get_record(pv).unwrap();
-        let mut inst = rec.write();
-        inst.record.put_field("VAL", v).unwrap();
-        inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
-    }
+    post_while_held(&ioc, |db| {
+        post(db, "M:ml_monoMode", EpicsValue::Enum(1));
+        post(db, "M:ml_monoE", EpicsValue::Double(e * 1.01));
+    })
+    .await;
     for _ in 0..100 {
         let theta = f64_of(&ioc, "M:ml_monoTheta").await;
         if (theta - 9.89998).abs() < 1e-5 && f64_of(&ioc, "M:th.VAL").await == theta {
@@ -113,14 +177,6 @@ async fn an_e_put_queued_after_auto_mode_moves() {
         f64_of(&ioc, "M:ml_monoTheta").await,
         f64_of(&ioc, "M:th.VAL").await
     );
-}
-
-/// Write `pv` and post it as a C client's put would, with no await between.
-fn post(ioc: &PvDatabase, pv: &str, v: EpicsValue) {
-    let rec = ioc.get_record(pv).unwrap();
-    let mut inst = rec.write();
-    inst.record.put_field("VAL", v).unwrap();
-    inst.notify_field("VAL", EventMask::VALUE | EventMask::LOG);
 }
 
 async fn theta_driven_to(ioc: &PvDatabase, want: f64) {
@@ -144,10 +200,12 @@ async fn theta_driven_to(ioc: &PvDatabase, want: f64) {
 async fn an_oper_ack_0_leaves_the_e_put_after_it() {
     let ioc = boot([10.0, 10.0, 35.0, 100.0]).await;
     settled(&ioc, "y offset changed to 35.000000").await;
-    task::sleep(Duration::from_millis(500)).await;
     let e = f64_of(&ioc, "M:ml_monoE").await;
-    post(&ioc, "M:ml_monoMode", EpicsValue::Enum(1));
-    post(&ioc, "M:ml_monoOperAck", EpicsValue::Enum(0));
+    post_while_held(&ioc, |db| {
+        post(db, "M:ml_monoMode", EpicsValue::Enum(1));
+        post(db, "M:ml_monoOperAck", EpicsValue::Enum(0));
+    })
+    .await;
     task::sleep(Duration::from_millis(30)).await;
     post(&ioc, "M:ml_monoE", EpicsValue::Double(e * 1.01));
     theta_driven_to(&ioc, 9.89998).await;

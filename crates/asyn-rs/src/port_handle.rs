@@ -2460,7 +2460,13 @@ mod tests {
 
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let handle = make_handle(Tokens {
-            base: PortDriverBase::new("sync_token", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "sync_token",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
             seen: seen.clone(),
         });
         let cell = handle.new_cell(Arc::new(Read));

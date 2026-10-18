@@ -7,12 +7,13 @@
 //! write to any of them in ONE place: `dbPut` runs `dbPutSpecial(paddr, 0)`,
 //! whose first act is `if ((special == SPC_NOMOD) && (pass == 0)) return
 //! S_db_noMod` (dbAccess.c:122-127). Every runtime entry lands there —
-//! `dbPutField` calls `dbPut` (dbAccess.c:1262), so a CA put, `dbpf`, an OUT
-//! link and an autosave `reboot_restore` are all refused by the same test.
+//! `dbPutField` calls `dbPut` (dbAccess.c:1262), so a CA put, `dbpf` and an
+//! OUT link are all refused by the same test. (Autosave's boot restore is a
+//! static `dbPutString`, which never sees `special`.)
 //!
 //! The port's gate is `field_io::check_no_mod`, and its `dbPutField`-analogue
-//! (`put_pv_no_process`, the autosave restore route) was not calling it: the
-//! `dbPut` bodies refused these twelve and the restore route wrote them. The
+//! (`put_pv_no_process`) was not calling it: the `dbPut` bodies refused these
+//! twelve and `put_pv_no_process` wrote them. The
 //! record's own `put_field` is deliberately NOT the gate — `dbLoadRecords`
 //! goes through it, and C's load route is `dbStaticLib`'s `dbPutString`, which
 //! never crosses `dbPut` and so never sees `special`. asynRecord.db relies on
@@ -83,7 +84,7 @@ record(asyn, "NOMOD:ASYN") {
             "{field}: dbPut must answer S_db_noMod, got {put:?}"
         );
 
-        // `dbPutField` without process — the autosave restore route.
+        // `dbPutField` without process.
         let restore = db.put_pv_no_process(&pv, EpicsValue::Long(7)).await;
         assert!(
             matches!(

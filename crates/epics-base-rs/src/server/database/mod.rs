@@ -28,7 +28,7 @@ pub use ca_client::{
     PutCompletion,
 };
 pub use ca_link::CA_LINK_EVENT_MASK;
-pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode};
+pub use field_io::{HeldPuts, HeldRecord, LockedRecord, ProcessMode, RestoreTarget};
 pub(crate) use field_io::{PutSrc, render_for_string_target};
 pub(crate) use link_put_queue::{LinkId, LinkInstall};
 pub use link_set::{

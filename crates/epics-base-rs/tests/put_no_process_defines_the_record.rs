@@ -2,13 +2,13 @@
 //!
 //! C `dbPut` ends with `isValueField = dbIsValueField(pfldDes); if
 //! (isValueField) precord->udf = FALSE;` (`dbAccess.c:1408-1409`) — one rule,
-//! reached by every caller, `dbPutField` and the autosave restore path alike.
+//! reached by every caller, `dbPutField` included.
 //! It clears `udf` and NOTHING else: STAT/SEVR keep the born `UDF_ALARM` until
 //! the record's own cycle recomputes them.
 //!
-//! `put_pv_no_process` — the port's restore-shaped route, which writes without
-//! driving a process — was the one put body that omitted it, so a restored
-//! record stayed undefined and raised UDF_ALARM on its first cycle.
+//! `put_pv_no_process` — the port's route that writes without driving a
+//! process — was the one put body that omitted it, so a record it wrote
+//! stayed undefined and raised UDF_ALARM on its first cycle.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::AlarmSeverity;

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::server::database::PvDatabase;
+use crate::types::EpicsValue;
 use tokio::sync::RwLock;
 
 use super::backup::{
@@ -473,9 +474,9 @@ impl SaveSet {
         e
     }
 
-    /// Perform one restore: find best file -> read -> put_pv_no_process.
+    /// Perform one pass-1 boot restore of the best file.
     pub async fn restore_once(&self, db: &PvDatabase) -> AutosaveResult<RestoreResult> {
-        self.restore_once_with_mode(db, RestoreMode::NoProcess)
+        self.restore_once_with_mode(db, RestoreMode::Boot(RestorePass::One))
             .await
     }
 
@@ -587,44 +588,36 @@ impl SaveSet {
     }
 }
 
-/// Restore propagation mode — controls whether a restored value is
-/// processed (rippling through PP / OUT links / FLNK chains) or
-/// written silently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// How a restore stores what it read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreMode {
-    /// Write each PV with `put_pv_no_process` — the value is set but
-    /// the record is NOT processed, OUT links do not fire, FLNK
-    /// chains do not run.
-    ///
-    /// This is C's behaviour, not a divergence from it: C-autosave
-    /// restores with `dbPut` (`dbrestore.c:299-301`, pass 1) and with
-    /// `dbPutString` / `dbPutMenuIndex` through static database access
-    /// (pass 0) at `R6-0-20-g186f467`. `dbPutField` — the entry point
-    /// that takes the lock, honours `PP` and calls `dbProcess`
-    /// (`dbAccess.c` at `R7.0.10`) — appears nowhere in the module, and
-    /// neither does `dbPutLink`. So a restored `.VAL` does not ripple
-    /// to OUT links in C either, which is also what the common "restore
-    /// a setpoint AO at boot" case wants: no spurious hardware write at
-    /// startup.
-    ///
-    /// [`RestoreMode::Process`] is the port's own extension for the
-    /// cases where restore correctness depends on processing.
-    #[default]
-    NoProcess,
+    /// C `reboot_restore(file, pass)` (`dbrestore.c:765-1080`), the boot
+    /// restore: a scalar through the static database (`scalar_restore`), an
+    /// array straight into the field (`SR_put_array_values`). Neither runs
+    /// `special()` or processes; only a `DBF_NOACCESS` scalar takes `dbPut`.
+    Boot(RestorePass),
     /// Write each PV with `put_record_field_from_ca_no_notify`, the
     /// `dbPutField` that C's `do_manual_restore` reaches through `ca_put`
     /// (save_restore.c:3245): `PP` fields, OUT links and FLNK chains run.
     Process,
 }
 
-/// Best-effort restore from a save file, in [`RestoreMode::NoProcess`].
-/// Each PV is independent. See [`restore_from_entries_with_mode`] for
-/// the process-on-restore variant.
+/// The `iocInit` point a boot restore runs at: pass 0 before the records'
+/// `init_record`, pass 1 after (`initHookAfterInitDevSup`,
+/// `initHookAfterInitDatabase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePass {
+    Zero,
+    One,
+}
+
+/// Best-effort pass-1 boot restore from a save file. Each PV is
+/// independent. See [`restore_from_entries_with_mode`] for the others.
 pub async fn restore_from_entries(
     db: &PvDatabase,
     path: &std::path::Path,
 ) -> AutosaveResult<RestoreResult> {
-    restore_from_entries_with_mode(db, path, RestoreMode::NoProcess).await
+    restore_from_entries_with_mode(db, path, RestoreMode::Boot(RestorePass::One)).await
 }
 
 /// Best-effort restore from a save file with an explicit
@@ -714,34 +707,28 @@ async fn restore_contents(
             }
         };
 
-        let parsed = match save_file::parse_save_value(&entry.value, &current) {
-            Some(v) => v,
-            None => {
-                result.parse_failed.push(entry.pv_name.clone());
-                continue;
-            }
-        };
-
         let put_result = match mode {
-            RestoreMode::NoProcess => db.put_pv_no_process(&entry.pv_name, parsed).await,
-            RestoreMode::Process => {
-                let (base, field) = crate::server::database::parse_pv_name(&entry.pv_name);
-                db.put_record_field_from_ca_no_notify(base, field, parsed)
-                    .await
-            }
+            RestoreMode::Boot(pass) => boot_store(db, entry, &current, pass).await,
+            RestoreMode::Process => match save_file::parse_save_value(&entry.value, &current) {
+                Some(parsed) => {
+                    let (base, field) = crate::server::database::parse_pv_name(&entry.pv_name);
+                    db.put_record_field_from_ca_no_notify(base, field, parsed)
+                        .await
+                        .map(|()| Stored::Yes)
+                        .map_err(StoreError::Put)
+                }
+                None => Err(StoreError::Parse),
+            },
         };
         match put_result {
-            Ok(()) => {
+            Ok(Stored::Yes) => {
                 result.restored += 1;
             }
-            Err(e) => {
-                // Name the record and the status here, at the one site every
-                // restore route reaches. `put_pv_no_process` now adopts the
-                // after-put `special()` status the way C's `dbPut` does
-                // (`dbAccess.c:1398-1404`), so a restore of an unresolvable
-                // SNAM or an illegal CALC FAILS where it used to be accepted
-                // silently — that must not become a silently DROPPED restore.
-                // The iocsh summary prints only a count.
+            Ok(Stored::Skipped) => {}
+            Err(StoreError::Parse) => result.parse_failed.push(entry.pv_name.clone()),
+            Err(StoreError::Put(e)) => {
+                // Named here, at the one site every restore route reaches:
+                // the iocsh summary prints only a count.
                 eprintln!("autosave restore: {} put failed: {e}", entry.pv_name);
                 result.failed_puts.push(PvRestoreError {
                     pv_name: entry.pv_name.clone(),
@@ -752,4 +739,100 @@ async fn restore_contents(
     }
 
     result
+}
+
+/// Whether [`boot_store`] wrote the value or C's pass rules left it alone.
+enum Stored {
+    Yes,
+    Skipped,
+}
+
+enum StoreError {
+    Parse,
+    Put(crate::error::CaError),
+}
+
+/// One saved value into the database as C `reboot_restore` stores it
+/// (`dbrestore.c:963-991`): an array, or a scalar by its declared type
+/// (`scalar_restore`, `:222-327`).
+async fn boot_store(
+    db: &PvDatabase,
+    entry: &SaveEntry,
+    current: &EpicsValue,
+    pass: RestorePass,
+) -> Result<Stored, StoreError> {
+    use crate::types::DbfCode;
+
+    // C looks the field up without the long-string `$` (`:948-951`).
+    let name = entry.pv_name.strip_suffix('$');
+    let long_string = name.is_some();
+    let Some(target) = db.restore_target(name.unwrap_or(&entry.pv_name)) else {
+        // A PV no record serves has no special() and no processing to skip.
+        let parsed = save_file::parse_save_value(&entry.value, current).ok_or(StoreError::Parse)?;
+        return db
+            .put_pv_no_process(&entry.pv_name, parsed)
+            .await
+            .map(|()| Stored::Yes)
+            .map_err(StoreError::Put);
+    };
+    let put = |r: crate::error::CaResult<()>| r.map(|()| Stored::Yes).map_err(StoreError::Put);
+    // `SR_array_restore`, for an `@array@` value or a field of more than one
+    // element (`:914-928`), written in pass 1 only (`:722-723`).
+    if !long_string && (target.elements > 1 || current.is_array()) {
+        if pass == RestorePass::Zero {
+            return Ok(Stored::Skipped);
+        }
+        let parsed = save_file::parse_save_value(&entry.value, current).ok_or(StoreError::Parse)?;
+        return put(db.put_pv_array_static(&entry.pv_name, parsed));
+    }
+    // `value_string` after `epicsStrnRawFromEscaped` (`:235`).
+    let text = match save_file::parse_save_value(&entry.value, &EpicsValue::String("".into())) {
+        Some(EpicsValue::String(s)) => s.to_string(),
+        _ => entry.value.clone(),
+    };
+    match target.dbf {
+        DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink => match pass {
+            RestorePass::Zero => put(db.put_pv_static(&entry.pv_name, &text).await),
+            RestorePass::One => Ok(Stored::Skipped),
+        },
+        // `dbPutMenuIndex(pdbentry, atol(value_string))`.
+        DbfCode::Menu => put(db
+            .put_pv_menu_index(&entry.pv_name, c_atol(&text) as i32)
+            .await),
+        DbfCode::NoAccess => match pass {
+            RestorePass::Zero => Ok(Stored::Skipped),
+            RestorePass::One => {
+                let parsed =
+                    save_file::parse_save_value(&entry.value, current).ok_or(StoreError::Parse)?;
+                put(db.put_pv_no_process(&entry.pv_name, parsed).await)
+            }
+        },
+        // The switch has no arm for it (`:306-311`).
+        DbfCode::Device => Err(StoreError::Put(crate::error::CaError::InvalidValue(
+            format!("field_type '{}' not handled", DbfCode::Device as u8),
+        ))),
+        // `SPC_CALC` fields may not be empty (`:258-260`).
+        DbfCode::String if target.calc && text.is_empty() => {
+            put(db.put_pv_static(&entry.pv_name, "0").await)
+        }
+        _ => put(db.put_pv_static(&entry.pv_name, &text).await),
+    }
+}
+
+/// C `atol`: leading space, an optional sign, then digits up to the first
+/// non-digit; 0 when there are none.
+fn c_atol(text: &str) -> i64 {
+    let t = text.trim_start();
+    let (negative, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0i64, |n, d| {
+            n.wrapping_mul(10).wrapping_add(i64::from(d - b'0'))
+        });
+    if negative { n.wrapping_neg() } else { n }
 }

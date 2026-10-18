@@ -579,17 +579,19 @@ impl IocBuilder {
         // link passes below.
         crate::server::ioc_app::ca_link_init(&db, self.link_set_installers).await;
 
-        // 4. Autosave restore
-        if let Some((ref autosave_cfg, _)) = self.autosave_config {
-            autosave::restore_from_file(&db, &autosave_cfg.save_path).await?;
-        }
-
         // 4.5. C's `initDatabase` per-record pass: bind each record's dset and
         // run its `init_record` now that every record has loaded — deferred from
         // load time so a record's device-support port could be configured first.
         // Before `setup_io_intr` (C's `scanInit`), so a dset is bound before I/O
         // Intr wiring reads it.
         db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+
+        // 4.6. Autosave restore, in pass 1 as `IocApplication` restores the
+        // same file: arrays and DBF_NOACCESS fields are pass-1 only in C.
+        if let Some((ref autosave_cfg, _)) = self.autosave_config {
+            autosave::restore_from_file(&db, &autosave_cfg.save_path, autosave::RestorePass::One)
+                .await?;
+        }
 
         // 5. I/O Intr setup — through the single owner shared with the
         // `IocApplication` iocInit path, so C `scanAdd`'s failure exits

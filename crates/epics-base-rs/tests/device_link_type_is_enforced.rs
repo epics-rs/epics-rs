@@ -12,10 +12,9 @@
 //!
 //! C does NOT run this rule at db-load. `dbPutString` on a link field parses
 //! the text and stores it, and nothing more (`dbStaticLib.c:2626-2634`); the
-//! `dbCanSetLink` branch beside it is the *after*-init path autosave restore
-//! takes. The rule runs once, at `iocInit`, from `dbInitRecordLinks`
-//! (`dbStaticLib.c:2222`), which prints one line per refusal and then returns
-//! 0 unconditionally.
+//! `dbCanSetLink` branch beside it is the *after*-init path. The rule runs
+//! once, at `iocInit`, from `dbInitRecordLinks` (`dbStaticLib.c:2222`), which
+//! prints one line per refusal and then returns 0 unconditionally.
 //!
 //! ```text
 //! record(ai,"T:R1"){ field(DTYP,"Soft Timestamp") field(INP,"5")           }
@@ -229,8 +228,7 @@ async fn an_unspelled_dtyp_still_binds_the_first_declared_device() {
 
 /// C applies the SAME rule to a link written at runtime — `dbPutFieldLink`
 /// calls `dbCanSetLink` (`dbAccess.c:1132`), and so does `dbPutString` once the
-/// links are initialized, which is the arm autosave restore takes
-/// (`dbStaticLib.c:2634-2642`). Both RETURN the status, so unlike the `iocInit`
+/// links are initialized (`dbStaticLib.c:2634-2642`). Both RETURN the status, so unlike the `iocInit`
 /// pass a runtime assignment really is refused and the link is left as it was.
 /// C prints nothing on that path; the message below is the port's own.
 ///

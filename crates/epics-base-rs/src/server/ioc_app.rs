@@ -1574,7 +1574,13 @@ impl IocBuild {
                 Box::new(move || {
                     Box::pin(async move {
                         for sav_path in &files {
-                            if let Err(e) = autosave::restore_from_file(&db_p0, sav_path).await {
+                            if let Err(e) = autosave::restore_from_file(
+                                &db_p0,
+                                sav_path,
+                                autosave::RestorePass::Zero,
+                            )
+                            .await
+                            {
                                 eprintln!("pass0 restore warning: {} - {e}", sav_path.display());
                             }
                         }
@@ -1593,12 +1599,24 @@ impl IocBuild {
                 Box::new(move || {
                     Box::pin(async move {
                         for sav_path in &files {
-                            if let Err(e) = autosave::restore_from_file(&db_p1, sav_path).await {
+                            if let Err(e) = autosave::restore_from_file(
+                                &db_p1,
+                                sav_path,
+                                autosave::RestorePass::One,
+                            )
+                            .await
+                            {
                                 eprintln!("pass1 restore warning: {} - {e}", sav_path.display());
                             }
                         }
                         if let Some(path) = cfg_path {
-                            if let Err(e) = autosave::restore_from_file(&db_p1, &path).await {
+                            if let Err(e) = autosave::restore_from_file(
+                                &db_p1,
+                                &path,
+                                autosave::RestorePass::One,
+                            )
+                            .await
+                            {
                                 eprintln!("autosave restore warning: {} - {e}", path.display());
                             }
                         }

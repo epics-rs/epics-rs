@@ -1,13 +1,14 @@
-//! The autosave-restore write must run BOTH `special()` passes, as every
-//! other `dbPut` route does.
+//! `put_pv_no_process`, the `dbPutField` analogue without its process, must
+//! run BOTH `special()` passes, as every other `dbPut` route does. (A boot
+//! restore is not this route: it is C's static `dbPutString`, which runs
+//! neither; see `autosave_restore_is_a_static_put.rs`.)
 //!
 //! C line numbers below resolve at epics-base tag `R7.0.10`, not at this
 //! machine's working tree (`R7.0.10-146-g8f5015b66`), where PR #944 puts
 //! `dbPut`'s header 3 lines lower and its body, from the first `if (special)`
 //! on, 5 lower.
 //!
-//! C's autosave `reboot_restore` writes through `dbPutField`, and both of
-//! that function's branches run the pair. For an ordinary field
+//! Both of C `dbPutField`'s branches run the pair. For an ordinary field
 //! (`dbAccess.c` `dbPut():1345-1348`, `:1399-1403` with the status adopted
 //! at `:1404`; the block is quoted below with the `:1398` comment above it):
 //!
@@ -33,9 +34,9 @@
 //! registry — and `dbPut` ADOPTS its status, so an unresolvable name is a
 //! failed put and not a silent one.
 //!
-//! `put_pv_no_process` ran only the before pass, so a restored CALC left the
-//! record evaluating the OLD expression and a restored SNAM left it running
-//! the OLD routine, with the restore reporting success either way.
+//! `put_pv_no_process` ran only the before pass, so a CALC it wrote left the
+//! record evaluating the OLD expression and a SNAM left it running the OLD
+//! routine, with the put reporting success either way.
 //!
 //! Boundaries, one case each: the record's own half of the after pass (CALC ->
 //! RPCL), the registry half (SNAM -> subroutine), and the status the after

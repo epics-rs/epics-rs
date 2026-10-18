@@ -10,8 +10,7 @@
 //!
 //! One boundary per put entry: the `dbPut` analogues (`put_pv`,
 //! `put_pv_and_post`, the OUT-link route) refuse; the `dbPutField` analogues
-//! (`put_record_field_from_ca_no_notify`, the autosave restore's
-//! `put_pv_no_process`) still rewire.
+//! (`put_record_field_from_ca_no_notify`, `put_pv_no_process`) still rewire.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -134,9 +133,8 @@ async fn ca_route_still_rewires_a_link_field() {
     assert_eq!(link_text(&db, "R3.INP"), "SRC3.VAL NPP NMS");
 }
 
-/// `put_pv_no_process` is the autosave-restore entry; its C analogue
-/// (`reboot_restore` → `dbPutField`) permits link-field writes, so it must
-/// keep permitting them.
+/// `put_pv_no_process` is a `dbPutField`, which permits link-field writes, so
+/// it must keep permitting them.
 #[epics_macros_rs::epics_test]
 async fn put_pv_no_process_still_rewires_for_restore() {
     let db = build(
@@ -153,7 +151,7 @@ async fn put_pv_no_process_still_rewires_for_restore() {
 }
 
 /// An autosave restore in `RestoreMode::Process` must still restore a saved
-/// link field: C's restore writes via `dbPutField`, and `dbPutField` on a
+/// link field: C's manual restore writes via `ca_put`, and `dbPutField` on a
 /// link field is the no-process `dbPutFieldLink` write — not the `dbPut`
 /// that now refuses.
 #[epics_macros_rs::epics_test]

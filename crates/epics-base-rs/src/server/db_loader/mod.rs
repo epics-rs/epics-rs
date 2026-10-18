@@ -430,6 +430,16 @@ fn load_menu_of(desc: &FieldDesc) -> Option<(Option<&'static str>, &'static [&'s
     Some((menu_name_of(choices), choices))
 }
 
+/// The choice table of `record_type`'s menu field `field`, as
+/// `dbPutMenuIndex` reads `pdbMenu->nChoice` (`dbStaticRun.c:552-557`).
+pub(crate) fn menu_choices_of(record_type: &str, field: &str) -> Option<&'static [&'static str]> {
+    let desc = crate::server::record::declared_field(record_type, field)?;
+    if desc.declared_dbf != DbfCode::Menu {
+        return None;
+    }
+    load_menu_of(desc).map(|(_, choices)| choices)
+}
+
 /// The `.dbd` name of the menu whose choice table is `choices`.
 ///
 /// C reads it off the menu itself (`pdbMenu->name`, `dbStaticRun.c:497`). The
@@ -973,6 +983,11 @@ pub(crate) struct MenuRefusal {
 }
 
 impl MenuRefusal {
+    /// `errSymLookup` of the status the refusing arm returned.
+    pub(crate) fn status(&self) -> &'static str {
+        self.status
+    }
+
     /// The `ERROR:` line, read against the block's `entry` after this arm
     /// wrote to it.
     pub(crate) fn line(&self, entry: &mut EntryMessage) -> String {

@@ -159,8 +159,7 @@ async fn an_empty_put_into_a_waveform_is_still_refused() {
     );
 }
 
-/// An autosave restore (`dbPutField`, as `reboot_restore` calls it) takes the
-/// same row: `aSub.A` at NOA 1 is stored as a scalar but declared
+/// `put_pv_no_process` (`dbPutField` without its process) takes the same row: `aSub.A` at NOA 1 is stored as a scalar but declared
 /// `special(SPC_DBADDR)`, so only the declaration sends `""` to
 /// `putStringDouble`. C `dbpf AS.A ""` after `dbpf AS.A 4` reads back 4.
 #[epics_macros_rs::epics_test]

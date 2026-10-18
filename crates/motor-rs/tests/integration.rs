@@ -1111,7 +1111,7 @@ async fn a_failure_raising_no_bit_posts_only_when_forced() {
 }
 
 /// autosave pass0 restore contract. C `reboot_restore` pass0 writes fields
-/// with `dbPut` BEFORE `init_record` runs (`initHookAfterInitDevSup`
+/// with the static `dbPutString` BEFORE `init_record` runs (`initHookAfterInitDevSup`
 /// precedes `initDatabase` in iocInit), so a restored VAL is a plain field
 /// write: per-record device init clears the parked put (`clear_last_write`)
 /// and the Startup readback's RSTM decision adopts the restored DVAL via

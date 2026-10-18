@@ -180,8 +180,8 @@ fn check_no_mod_in_db_put_field(
 /// record's link field on every process. The port's `dbPutField` analogue is
 /// the `put_record_field_from_ca` family, whose ordinary write path re-parses
 /// the link (`RecordInstance::put_common_field`'s INP/OUT/FLNK arms);
-/// `put_pv_no_process` is the autosave-restore entry whose C analogue is
-/// likewise `dbPutField` (`reboot_restore`), so it stays link-writable.
+/// `put_pv_no_process` is `dbPutField` without its process, so it stays
+/// link-writable.
 ///
 /// Runs ahead of [`check_no_mod_in_db_put`]: C reaches `SPC_NOMOD` only in
 /// `dbPutSpecial(paddr, 0)` (`:1349-1350`, `:123-126`), after this gate, so a
@@ -585,8 +585,7 @@ fn post_cycle_marks_in(
 ///   the one caller and every route goes through that.
 ///
 /// `RecordInstance::new` initialises the field to `None`, which is the initial
-/// state and not a transition. `put_pv_no_process` (the autosave-restore entry)
-/// used to write SNAM while running NEITHER `special()` pass and so left the
+/// state and not a transition. `put_pv_no_process` used to write SNAM while running NEITHER `special()` pass and so left the
 /// binding stale; it reaches this owner through [`special_after_put`] like
 /// every other put route. The remaining writers are `#[test]` fixtures binding
 /// a routine without a registry.
@@ -4556,15 +4555,17 @@ impl PvDatabase {
         put_answer(parked, processed)
     }
 
-    /// Put a PV value without triggering process (for restore).
+    /// Put a PV value without triggering process: `dbPutField` without its
+    /// process.
     ///
     /// Unlike the `dbPut`-analogue bodies (`put_pv`, `put_pv_and_post`) this
-    /// entry accepts DBF link fields: its production caller is the autosave
-    /// restore, whose C analogue (`reboot_restore`) writes via `dbPutField` —
-    /// and `dbPutField` on a link field is `dbPutFieldLink`, a re-parse
-    /// write that never processes. That is exactly this body's behavior
-    /// (`put_common_field`'s INP/OUT/FLNK arms, no process), so the
-    /// `check_not_link_field` refusal does not apply here.
+    /// entry accepts DBF link fields, as `dbPutField` does through
+    /// `dbPutFieldLink`, a re-parse write that never processes. That is
+    /// exactly this body's behavior (`put_common_field`'s INP/OUT/FLNK arms,
+    /// no process), so the `check_not_link_field` refusal does not apply here.
+    /// Autosave's boot restore is NOT this: it stores through the static
+    /// database ([`Self::put_pv_static`]) and reaches here only for a
+    /// `DBF_NOACCESS` field, C's `dbPut` (`dbrestore.c:296-302`).
     pub async fn put_pv_no_process(
         &self,
         name: impl AsRef<[u8]>,
@@ -4596,10 +4597,9 @@ impl PvDatabase {
         if let Some(rec) = self.get_record(base) {
             let (field, at) =
                 crate::server::record::record_instance::PutAddr::resolve_named(&rec, field)?;
-            // `put_pv_no_process` is a public record-write API
-            // (autosave restore). It must take the advisory write gate
-            // (`dbScanLock` analogue) so an autosave restore cannot
-            // land between the member writes of a QSRV atomic group or
+            // `put_pv_no_process` is a public record-write API. It must take
+            // the advisory write gate (`dbScanLock` analogue) so its put
+            // cannot land between the member writes of a QSRV atomic group or
             // a pvalink atomic scan epoch holding `lock_records`. Taken
             // on the record, so an alias and its target share one gate
             // for the reason C's do — one `dbCommon`, one `lset`. Held
@@ -4608,10 +4608,8 @@ impl PvDatabase {
             // the put replaces drop after it.
             let mut parses = self.parse_link_put(base, &field, &value);
             let _record_gate = self.acquire_put_gate(base, &field, Some(&value));
-            // An autosave restore is a `dbPutField` (`reboot_restore`), so
-            // a saved link text is held to `dbCanSetLink` exactly as a
-            // `caput` is — that arm of `dbStaticLib.c:2634-2642` is the
-            // one autosave takes. Above the no-mod gate for the reason
+            // A `dbPutField`, so a link text is held to `dbCanSetLink`
+            // exactly as a `caput` is. Above the no-mod gate for the reason
             // given at the other body: C's link route is above `dbPut`.
             // Both refusals read only what the gate above keeps still.
             {
@@ -4630,12 +4628,12 @@ impl PvDatabase {
                 // before the rset's `special()` is ever dispatched
                 // (`dbAccess.c:122-127`). `dbPutField` — the call this body
                 // models — reaches it like every other entry, through `dbPut`
-                // (`dbAccess.c:1265`), so an autosave restore cannot write a
-                // field the `.dbd` declares immutable. This route was the one
+                // (`dbAccess.c:1265`), so this put cannot write a field the
+                // `.dbd` declares immutable. This route was the one
                 // dbPut-analogue body that skipped the gate, which left
                 // asynRecord's twelve `special(SPC_NOMOD)` fields (OMAX, AINP,
                 // TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP, SPR, OPTR,
-                // IPTR) restorable, and dbCommon's with them.
+                // IPTR) writable, and dbCommon's with them.
                 check_no_mod_in_db_put_field(&instance, &field, &at, tail)?;
             }
             let LinkPutParses {
@@ -4691,6 +4689,139 @@ impl PvDatabase {
             String::from_utf8_lossy(name).into_owned(),
         ))
     }
+
+    /// What autosave's boot restore needs to know about a record field before
+    /// it stores into it (`dbrestore.c` `reboot_restore`, `scalar_restore`);
+    /// `None` for a name that is no record's field.
+    pub fn restore_target(&self, name: impl AsRef<[u8]>) -> Option<RestoreTarget> {
+        let (base, field) = super::parse_pv_name(name.as_ref());
+        let rec = self.get_record(base)?;
+        let (field, _) = rec.put_name(field);
+        let elements = rec.no_elements(&field)?;
+        let inst = rec.read();
+        let desc = crate::server::record::record_instance::field_desc_of(&*inst.record, &field)
+            .or_else(|| {
+                crate::server::record::dbd_generated::DB_COMMON_FIELDS
+                    .iter()
+                    .find(|d| d.name == field)
+            })?;
+        Some(RestoreTarget {
+            dbf: desc.declared_dbf,
+            calc: desc.declared_special == crate::server::record::Special::Calc,
+            elements,
+        })
+    }
+
+    /// C `dbPutMenuIndex` (`dbStaticRun.c:540-561`): `index` stored only when
+    /// `0 <= index < nChoice`, a bound the `.db` loader's own does not keep.
+    pub async fn put_pv_menu_index(&self, name: impl AsRef<[u8]>, index: i32) -> CaResult<()> {
+        let name = name.as_ref();
+        let (base, field) = super::parse_pv_name(name);
+        let rec = self
+            .get_record(base)
+            .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let (field, _) = rec.put_name(field);
+        let record_type = rec.read().record.record_type().to_string();
+        let refused = |status: &str| {
+            CaError::InvalidValue(format!("{}: {status}", String::from_utf8_lossy(name)))
+        };
+        let choices = crate::server::db_loader::menu_choices_of(&record_type, &field)
+            .ok_or_else(|| refused("Menu not found"))?;
+        let label = usize::try_from(index)
+            .ok()
+            .and_then(|i| choices.get(i))
+            .ok_or_else(|| refused("Bad Field value"))?;
+        self.put_pv_static(name, label).await
+    }
+
+    /// C `dbPutString` on the record's static entry (`dbStaticLib.c:2570-2662`):
+    /// `text` converted as a `.db` field value is, with no `special()`, no
+    /// processing and no post. A VAL put also clears UDF, as there.
+    pub async fn put_pv_static(&self, name: impl AsRef<[u8]>, text: &str) -> CaResult<()> {
+        let name = name.as_ref();
+        let (base, field) = super::parse_pv_name(name);
+        let rec = self
+            .get_record(base)
+            .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let (field, _) = rec.put_name(field);
+        let record_name = String::from_utf8_lossy(base).into_owned();
+        let _gate = self.acquire_put_gate(base, &field, Some(&EpicsValue::String(text.into())));
+        let _relink = self.link_field_write(base, &field);
+        let mut common = Vec::new();
+        {
+            let mut inst = rec.write();
+            let record_type = inst.record.record_type().to_string();
+            let refusal = crate::server::db_loader::menu_value_refusal(
+                &record_type,
+                &record_name,
+                &field,
+                text,
+            );
+            let field = [crate::server::db_loader::DbFieldDef::new(&*field, text)];
+            match refusal {
+                None => crate::server::db_loader::apply_fields(&mut *inst, &field, &mut common)?,
+                Some(refusal) => {
+                    if let Some(notice) = &refusal.notice {
+                        notice.print();
+                    }
+                    // A SPC_CALC text `postfix()` refuses is stored all the same.
+                    if refusal.stored {
+                        crate::server::db_loader::apply_fields(&mut *inst, &field, &mut common)?;
+                    }
+                    return Err(CaError::InvalidValue(format!(
+                        "{record_name}.{}: {}",
+                        field[0].name,
+                        refusal.status()
+                    )));
+                }
+            }
+        }
+        for (field, value) in common {
+            let mut link = PreparedCommonLink::for_put(&field, &value);
+            let put = rec
+                .write()
+                .put_common_field_db_load_prepared(&field, value, &mut link);
+            drop(link);
+            match put? {
+                crate::server::record::CommonFieldPutResult::ScanChanged {
+                    old_scan,
+                    new_scan,
+                    phas,
+                } => self.update_scan_index(base, old_scan, new_scan, phas, phas),
+                crate::server::record::CommonFieldPutResult::PhasChanged {
+                    scan,
+                    old_phas,
+                    new_phas,
+                } => self.update_scan_index(base, scan, scan, old_phas, new_phas),
+                crate::server::record::CommonFieldPutResult::NoChange => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// C `SR_put_array_values` (`dbrestore.c:329-357`): the array converted
+    /// into the field and the element count set, with no `special()`, no
+    /// processing and no post.
+    pub fn put_pv_array_static(&self, name: impl AsRef<[u8]>, value: EpicsValue) -> CaResult<()> {
+        let name = name.as_ref();
+        let (base, field) = super::parse_pv_name(name);
+        let rec = self
+            .get_record(base)
+            .ok_or_else(|| CaError::ChannelNotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let (field, _) = rec.put_name(field);
+        let _gate = self.acquire_put_gate(base, &field, Some(&value));
+        rec.write().put_declared_field(&field, value)
+    }
+}
+
+/// [`PvDatabase::restore_target`]'s answer: the field's declared `DBF_*`
+/// type, whether it is `special(SPC_CALC)`, and `dbNameToAddr`'s element
+/// count.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreTarget {
+    pub dbf: crate::types::DbfCode,
+    pub calc: bool,
+    pub elements: u32,
 }
 
 /// Project a decoded `DBR_CTRL_*` / `DBR_GR_*` snapshot's metadata fields
@@ -5919,7 +6050,7 @@ mod tests {
                 .await;
             assert!(
                 restore.is_err(),
-                "{name}.{field}: an autosave restore is a dbPutField too"
+                "{name}.{field}: put_pv_no_process is a dbPutField too"
             );
 
             let after = db
@@ -6007,7 +6138,7 @@ mod tests {
                     restore,
                     Err(crate::server::database::CaError::BadDbrType(_))
                 ),
-                "the autosave body is a dbPutField too, got {restore:?} for {bad:?}"
+                "put_pv_no_process is a dbPutField too, got {restore:?} for {bad:?}"
             );
             let held = db.get_pv("TY:CALC.SDIS").unwrap();
             assert!(
@@ -6055,7 +6186,7 @@ mod tests {
         );
     }
 
-    /// An autosave restore is a `dbPutField`, so it must run the
+    /// `put_pv_no_process` is a `dbPutField`, so it must run the
     /// `dbPutConvertRoutine` type row — not just the shape arm. A saved
     /// `DBF_DOUBLE` field stored as a string (`"3.5"`) has to reach the record
     /// through `putStringDouble`'s parse, the same row the client `dbPut` path

@@ -22,8 +22,8 @@
 //! The invariant: **while OMSL=closed_loop, no put route may write a B field.**
 //! The boundaries are the two OMSL values, the B/non-B field split, a live OMSL
 //! flip (C reads `prec->omsl` at put time, not at channel-open time), and each
-//! put route — the CA route and the no-process autosave-restore route, which is
-//! C's `dbPutField` under `reboot_restore` and runs the same pass-0 special.
+//! put route — the CA route and the no-process route, which is C's
+//! `dbPutField` and runs the same pass-0 special.
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
@@ -152,11 +152,11 @@ async fn the_refusal_follows_a_live_omsl_change() {
     );
 }
 
-/// The no-process route (`put_pv_no_process`) is C's `dbPutField` under
-/// autosave `reboot_restore`, which runs the same `dbPutSpecial(paddr, 0)`.
+/// The no-process route (`put_pv_no_process`) is C's `dbPutField`, which runs
+/// the same `dbPutSpecial(paddr, 0)`.
 /// It was the one `dbPut` body in the port that skipped the pre-store pass.
 #[epics_macros_rs::epics_test]
-async fn the_autosave_restore_route_is_refused_too() {
+async fn the_no_process_route_is_refused_too() {
     let db = build().await;
     process(&db, "CL").await;
 

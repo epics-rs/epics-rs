@@ -685,7 +685,10 @@ impl DeviceSupport for MotorDeviceSupport {
         if gate.is_open() {
             open();
         } else {
-            gate.on_open(open);
+            gate.on_open(move || {
+                open();
+                epics_base_rs::runtime::interrupt_accept::EdgeDone::Inline
+            });
         }
     }
 

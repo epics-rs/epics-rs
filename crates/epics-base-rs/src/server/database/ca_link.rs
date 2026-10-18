@@ -357,7 +357,7 @@ impl LinkSet for CaLinks {
     fn link_metadata(&self, name: &[u8]) -> Option<LinkMetadata> {
         self.answer(
             name,
-            |link| Some(link.meta.clone()),
+            |link| link.state.meta.get().cloned(),
             |n| Some(n.link_metadata(name)),
         )
         .flatten()
@@ -406,8 +406,12 @@ struct LocalState {
     taken: AtomicU64,
     /// The monitor has ended: no queued event will be taken.
     ended: AtomicBool,
-    /// The monitor's queue slot, read for its `npend`.
-    queue: (std::pin::Pin<Arc<EvQue>>, AttachId),
+    /// The monitor's queue slot, read for its `npend`; set when the link
+    /// subscribes.
+    queue: std::sync::OnceLock<(std::pin::Pin<Arc<EvQue>>, AttachId)>,
+    /// `CA_GET_ATTRIBUTES`, answered once when the link subscribes: a local
+    /// channel connects once.
+    meta: std::sync::OnceLock<LinkMetadata>,
 }
 
 impl LocalState {
@@ -415,7 +419,11 @@ impl LocalState {
     /// queued now has been taken.
     fn mark(&self) -> u64 {
         let _taking = self.delivery.lock();
-        self.taken.load(Ordering::SeqCst) + self.queue.0.npend(self.queue.1) as u64
+        let pending = self
+            .queue
+            .get()
+            .map_or(0, |(queue, id)| queue.npend(*id) as u64);
+        self.taken.load(Ordering::SeqCst) + pending
     }
 
     /// Wait until the events up to `mark` are taken, then until the worker
@@ -437,8 +445,6 @@ impl LocalState {
 struct LocalLink {
     state: Arc<LocalState>,
     channel: Arc<LocalChannel>,
-    /// `CA_GET_ATTRIBUTES`, answered once: a local channel connects once.
-    meta: LinkMetadata,
     /// C `pvlOptInpNative` (`dbCa.c:456`).
     input_native: AtomicBool,
     _monitor: AbortOnDrop,
@@ -455,40 +461,21 @@ impl Drop for AbortOnDrop {
 }
 
 impl LocalLink {
-    /// The `DBR_TIME` native monitor dbCa asks for (`dbCa.c:1225-1229`),
-    /// whose first event is the current value (`dbSubscriptionIO`), and the
-    /// attribute gets `connectionCallback` schedules on the connect.
-    /// `None` when the database captured no reactor to run the link on.
+    /// A link to `channel`, whose `DBR_TIME` native monitor
+    /// ([`subscribe`]) is made once `dbCaRun` has released it. `None` when
+    /// the database captured no reactor to run the link on.
     fn open(db: &PvDatabase, channel: LocalChannel, name: &[u8]) -> Option<Self> {
         let bridge = db.inner.link_puts.network()?;
-        let native = channel.native_type();
-        let monitor = match channel.subscribe(db, native.time_dbr_type(), CA_LINK_EVENT_MASK) {
-            Ok(monitor) => monitor,
-            Err(e) => {
-                tracing::debug!(pv = %String::from_utf8_lossy(name), "local CA link subscribe refused: {e:?}");
-                return None;
-            }
-        };
-        let attrs = (native != DbFieldType::String)
-            .then(|| channel.read(DBR_CTRL_DOUBLE, 1))
-            .flatten();
-        let labels = (native == DbFieldType::Enum)
-            .then(|| channel.read(native.ctrl_dbr_type(), 1))
-            .flatten();
-        let meta = LinkMetadata::from_ca_attributes(
-            Some(native),
-            Some(channel.element_count()),
-            attrs.as_ref(),
-            labels.as_ref(),
-        );
         let state = Arc::new(LocalState {
             cache: ArcSwapOption::empty(),
             process: ExternalCpProcess::awaiting_first_event(name),
             delivery: parking_lot::Mutex::new(()),
             taken: AtomicU64::new(0),
             ended: AtomicBool::new(false),
-            queue: (monitor.reader.queue(), monitor.reader.id()),
+            queue: std::sync::OnceLock::new(),
+            meta: std::sync::OnceLock::new(),
         });
+        let channel = Arc::new(channel);
         let weak = Arc::downgrade(&db.inner);
         let worker = state.clone();
         let process = bridge.spawn(async move {
@@ -497,11 +484,14 @@ impl LocalLink {
                 .run_worker(|| weak.upgrade().map(|inner| PvDatabase { inner }))
                 .await
         });
-        let monitor = bridge.spawn(run_monitor(monitor, state.clone()));
+        let monitor = bridge.spawn(subscribe(
+            db.inner.ca_run.clone(),
+            channel.clone(),
+            state.clone(),
+        ));
         Some(Self {
             state,
-            channel: Arc::new(channel),
-            meta,
+            channel,
             input_native: AtomicBool::new(false),
             _monitor: AbortOnDrop(monitor),
             _process: AbortOnDrop(process),
@@ -546,6 +536,55 @@ impl LocalLink {
             input_string: false,
             output_native: false,
             output_string: false,
+        }
+    }
+}
+
+/// `dbCaTask`'s `CA_GET_ATTRIBUTES` and `CA_MONITOR_NATIVE` for a local
+/// link (`dbCa.c:1209-1236`), serviced only once `dbCaRun` has run: the
+/// attribute gets `connectionCallback` schedules, then the native
+/// `DBR_TIME` monitor (`dbCa.c:1225-1229`), whose first event is the
+/// channel's value now (`dbSubscriptionIO`). An I/O Intr source is read as
+/// a turn on its own pump, behind every interrupt queued to it before.
+async fn subscribe(
+    ca_run: Arc<super::processing::CaRunGate>,
+    channel: Arc<LocalChannel>,
+    state: Arc<LocalState>,
+) {
+    ca_run.reached().await;
+    let Some(db) = channel.db() else { return };
+    if let ChannelTarget::RecordField { record, .. } = &channel.chan.target {
+        db.io_intr_turn(record).await;
+    }
+    let native = channel.native_type();
+    let attrs = (native != DbFieldType::String)
+        .then(|| channel.read(DBR_CTRL_DOUBLE, 1))
+        .flatten();
+    let labels = (native == DbFieldType::Enum)
+        .then(|| channel.read(native.ctrl_dbr_type(), 1))
+        .flatten();
+    let _ = state.meta.set(LinkMetadata::from_ca_attributes(
+        Some(native),
+        Some(channel.element_count()),
+        attrs.as_ref(),
+        labels.as_ref(),
+    ));
+    match channel.subscribe(&db, native.time_dbr_type(), CA_LINK_EVENT_MASK) {
+        Ok(monitor) => {
+            drop(db);
+            let _ = state
+                .queue
+                .set((monitor.reader.queue(), monitor.reader.id()));
+            run_monitor(monitor, state).await;
+        }
+        // `dbCaTask`'s `ca_add_array_event` failure (`dbCa.c:1230-1233`):
+        // the link stays without a value. Its init wait is released, where
+        // C's `dbCaRun` would wait for it forever.
+        Err(e) => {
+            tracing::debug!("local CA link subscribe refused: {e:?}");
+            state.process.request_init_ready();
+            state.ended.store(true, Ordering::SeqCst);
+            state.process.notify_settled();
         }
     }
 }

@@ -3275,15 +3275,17 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             // would be on.
             let prio = inst.common.callback_priority();
             let direct = dev.io_intr_processes_directly();
+            let mut turns = db.register_io_intr_pump(&rec_arc);
             crate::runtime::task::spawn_background(prio, async move {
-                while intr_rx.recv().await.is_some() {
+                // One interrupt's pass.
+                let pump = async || {
                     // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr
                     // callback queues nothing while the scan facility is
                     // not running, which is what `interruptAccept` buys a
                     // building or paused IOC. A device's own `dbProcess`
                     // passes no such gate.
                     if !direct && !db_clone.scan_control().is_running() {
-                        continue;
+                        return;
                     }
                     // Process if the device drives SCAN-independently,
                     // or the record is still on I/O Intr scan, and the
@@ -3299,7 +3301,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                             })
                     };
                     if !process {
-                        continue;
+                        return;
                     }
                     let mut visited = crate::server::database::ProcStack::new();
                     // Driver-callback cycle: an output (`asyn:READBACK`)
@@ -3308,6 +3310,26 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                     let _ = db_clone
                         .process_record_readback(&rec_name, &mut visited)
                         .await;
+                };
+                // A turn is served after the interrupts queued when it was
+                // taken, so a first event behind them sees what they did.
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(turn) = turns.recv() => {
+                            for _ in 0..intr_rx.len() {
+                                if intr_rx.recv().await.is_none() {
+                                    break;
+                                }
+                                pump().await;
+                            }
+                            let _ = turn.send(());
+                        }
+                        woke = intr_rx.recv() => match woke {
+                            Some(()) => pump().await,
+                            None => break,
+                        },
+                    }
                 }
             });
             count += 1;

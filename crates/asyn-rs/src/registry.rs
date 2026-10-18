@@ -27,7 +27,10 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+use epics_libcom_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
+
+/// The thread a port's boot flush runs on.
+const BOOT_FLUSH_THREAD: &str = "asyn-boot-flush";
 
 use crate::error::{AsynError, AsynResult};
 use crate::port_handle::PortHandle;
@@ -122,10 +125,17 @@ impl PortClaim {
         self.published = true;
         // By name, so the gate does not keep a withdrawn port's actor alive.
         let (flush, port) = (registry.clone(), self.name.clone());
-        owner.on_open(move || flush.flush_in_background(&port));
+        owner.on_open(move || {
+            let (registry, port) = (flush.clone(), port.clone());
+            EdgeDone::Job {
+                name: BOOT_FLUSH_THREAD,
+                job: Box::new(move || registry.flush(&port)),
+            }
+        });
         if owner.is_open() {
             // Behind the lock held here: the lookup sees the entry.
-            registry.flush_in_background(&self.name);
+            let (registry, port) = (registry.clone(), self.name.clone());
+            owner.spawn_job(BOOT_FLUSH_THREAD, move || registry.flush(&port));
         }
         Ok(())
     }
@@ -224,19 +234,15 @@ impl PortRegistry {
         }
     }
 
-    /// C's `callbackThread` is its own thread so it does not block the
-    /// caller that set `interruptAccept` (the scan facility on the iocRun
-    /// path); the sweep uses the port actor's blocking bridge, which must not
-    /// run on the scan/setup thread.
-    fn flush_in_background(&self, name: &str) {
-        let (registry, name) = (self.clone(), name.to_string());
-        let _ = std::thread::Builder::new()
-            .name("asyn-boot-flush".into())
-            .spawn(move || {
-                if let Some(entry) = registry.get(&name) {
-                    flush_port(&entry.handle);
-                }
-            });
+    /// The boot flush of the port `name`. C's `callbackThread` is its own
+    /// thread so it does not block the caller that set `interruptAccept`
+    /// (the scan facility on the iocRun path); the sweep uses the port
+    /// actor's blocking bridge, which must not run on the scan/setup thread,
+    /// so it runs as the owner gate's job.
+    fn flush(&self, name: &str) {
+        if let Some(entry) = self.get(name) {
+            flush_port(&entry.handle);
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<PortEntry> {

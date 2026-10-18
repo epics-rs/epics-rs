@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::runtime::interrupt_accept::InterruptGate;
+use epics_base_rs::runtime::interrupt_accept::{EdgeDone, InterruptGate};
 use epics_base_rs::runtime::sync::mpsc;
 use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport};
 use epics_base_rs::server::record::Record;
@@ -110,7 +110,10 @@ impl AcceptSlot {
     /// Run `cb` on every opening edge, and now if the gate is already open.
     fn arm(gate: &InterruptGate, cb: OnAccept) {
         let edge = Arc::clone(&cb);
-        gate.on_open(move || edge());
+        gate.on_open(move || {
+            edge();
+            EdgeDone::Inline
+        });
         if gate.is_open() {
             cb();
         }

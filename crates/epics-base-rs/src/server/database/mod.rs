@@ -9,6 +9,7 @@ pub mod db_access;
 pub mod dbr_delivery;
 mod field_io;
 pub mod filters;
+mod io_intr_turn;
 mod link_check;
 mod link_put_queue;
 mod link_set;
@@ -750,6 +751,8 @@ struct PvDatabaseInner {
     external_cp_links: SnapshotCell<CpRegistry>,
     /// C `dbCaRun`'s gate over the CP/CPP workers.
     ca_run: std::sync::Arc<processing::CaRunGate>,
+    /// The I/O Intr pumps' turns a local CA link's first event waits for.
+    io_intr_turns: io_intr_turn::IoIntrTurns,
     /// Alias map: alternate-name → the [`AliasNode`] it names. Mirrors
     /// epics-base PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -1534,6 +1537,7 @@ impl PvDatabase {
                     load_order_counter: std::sync::atomic::AtomicU64::new(0),
                     external_cp_links: SnapshotCell::new(CpRegistry::default()),
                     ca_run,
+                    io_intr_turns: Default::default(),
                     aliases: RecursiveReadLock::new(HashMap::new()),
                     registration_mutex: crate::runtime::sync::UnlistedPriorityInheritanceMutex::new(
                         (),

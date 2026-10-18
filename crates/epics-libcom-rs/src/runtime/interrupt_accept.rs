@@ -44,16 +44,57 @@
 //! lowered the flag does not re-flush. `asyn-rs` registers one such callback
 //! per registered port that flushes its changed params once; it is this
 //! crate's stand-in for C's per-port `callbackThread`.
-use std::sync::atomic::{AtomicBool, Ordering};
+//!
+//! # Edge jobs
+//!
+//! An edge callback returns what it left running ([`EdgeDone`]): work it
+//! cannot run inline is handed back for the gate to run, so no callback can
+//! start work [`InterruptGate::jobs_settled`] does not see. The database's
+//! `dbCaRun` step runs behind those jobs,
+//! as C's `callbackThread` flush lands well ahead of the CP links' first
+//! events, which only start connecting at `dbCaRun`.
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-type OnOpen = Arc<dyn Fn() + Send + Sync + 'static>;
+type OnOpen = Arc<dyn Fn() -> EdgeDone + Send + Sync + 'static>;
+
+/// What an edge callback leaves behind when it returns.
+pub enum EdgeDone {
+    /// Its work is done.
+    Inline,
+    /// Work to run on a thread of its own, named `name`, which the gate
+    /// counts until it returns.
+    Job {
+        name: &'static str,
+        job: Box<dyn FnOnce() + Send + 'static>,
+    },
+}
 
 /// One database's `interruptAccept`: closed at creation, written only by that
 /// database's scan facility.
 pub struct InterruptGate {
     open: AtomicBool,
     on_open: Mutex<Vec<OnOpen>>,
+    jobs: Arc<Jobs>,
+}
+
+/// The gate's running jobs.
+#[derive(Default)]
+struct Jobs {
+    running: AtomicUsize,
+    done: crate::runtime::sync::Notify,
+}
+
+/// One running job's count, released when its thread ends, a panic included,
+/// or when the thread never started.
+struct JobClaim(Arc<Jobs>);
+
+impl Drop for JobClaim {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.done.notify_waiters();
+        }
+    }
 }
 
 impl InterruptGate {
@@ -62,6 +103,7 @@ impl InterruptGate {
         Arc::new(Self {
             open: AtomicBool::new(false),
             on_open: Mutex::new(Vec::new()),
+            jobs: Arc::default(),
         })
     }
 
@@ -89,18 +131,51 @@ impl InterruptGate {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             for cb in own {
-                cb();
+                if let EdgeDone::Job { name, job } = cb() {
+                    self.spawn_job(name, job);
+                }
             }
         }
     }
 
     /// Register a callback for this gate's next `false → true` edges.
     /// Registration does not fire it, even if the gate is already open.
-    pub fn on_open<F: Fn() + Send + Sync + 'static>(&self, cb: F) {
+    pub fn on_open<F: Fn() -> EdgeDone + Send + Sync + 'static>(&self, cb: F) {
         self.on_open
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::new(cb));
+    }
+
+    /// Run `job` on a thread of its own, counted until it returns: an edge's
+    /// [`EdgeDone::Job`], or work a producer starts while the gate is open.
+    /// The thread is C asynPortDriver's callback thread's class
+    /// (`asynPortDriver.cpp:907`), the work these jobs are.
+    pub fn spawn_job(&self, name: &str, job: impl FnOnce() + Send + 'static) {
+        self.jobs.running.fetch_add(1, Ordering::AcqRel);
+        let claim = JobClaim(self.jobs.clone());
+        let _ = crate::runtime::task::spawn_dedicated_thread(
+            name.into(),
+            crate::runtime::task::ThreadPriority::Medium,
+            crate::runtime::task::StackSizeClass::Medium,
+            move || {
+                let _claim = claim;
+                job();
+            },
+        );
+    }
+
+    /// Return once no job started by [`Self::spawn_job`] is running.
+    pub async fn jobs_settled(&self) {
+        loop {
+            let done = self.jobs.done.notified();
+            let mut done = std::pin::pin!(done);
+            done.as_mut().enable();
+            if self.jobs.running.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            done.await;
+        }
     }
 }
 
@@ -117,6 +192,7 @@ mod tests {
         let h = hits.clone();
         gate.on_open(move || {
             h.fetch_add(1, Ordering::SeqCst);
+            EdgeDone::Inline
         });
 
         gate.set(true);
@@ -142,8 +218,45 @@ mod tests {
         let h = hits.clone();
         gate.on_open(move || {
             h.fetch_add(1, Ordering::SeqCst);
+            EdgeDone::Inline
         });
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Boundary — no job: settled at once.
+    #[test]
+    fn a_gate_with_no_job_is_settled() {
+        crate::runtime::task::test_block_on(InterruptGate::new().jobs_settled());
+    }
+
+    /// Boundary — the job an edge callback handed back is still running:
+    /// settled only after it returns.
+    #[test]
+    fn jobs_settled_waits_for_the_edges_job() {
+        let gate = InterruptGate::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        gate.on_open(move || {
+            let r = r.clone();
+            EdgeDone::Job {
+                name: "edge-job-test",
+                job: Box::new(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    r.store(true, Ordering::SeqCst);
+                }),
+            }
+        });
+        gate.set(true);
+        crate::runtime::task::test_block_on(gate.jobs_settled());
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// Boundary — a job that panics still releases its count.
+    #[test]
+    fn a_panicking_job_settles() {
+        let gate = InterruptGate::new();
+        gate.spawn_job("edge-job-panic", || panic!("edge job panics"));
+        crate::runtime::task::test_block_on(gate.jobs_settled());
     }
 
     /// Boundary — one gate's edge does not run another gate's callbacks.
@@ -155,9 +268,11 @@ mod tests {
         let (xa, xb) = (ha.clone(), hb.clone());
         a.on_open(move || {
             xa.fetch_add(1, Ordering::SeqCst);
+            EdgeDone::Inline
         });
         b.on_open(move || {
             xb.fetch_add(1, Ordering::SeqCst);
+            EdgeDone::Inline
         });
         a.set(true);
         assert_eq!(

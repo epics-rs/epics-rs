@@ -5360,7 +5360,12 @@ impl PvDatabase {
     /// the CP/CPP processing the links' monitors requested while `dbCaTask`
     /// was paused runs from here, so a holder's connect-time process follows
     /// PINI. From here a relinked CP link also opens its own channel.
+    ///
+    /// It first waits for the jobs `scanRun`'s edge started (the asyn ports'
+    /// boot flush), so every interrupt they queue is on its pump before a
+    /// link's first event takes its turn there.
     pub async fn process_cp_links_on_connect(&self) {
+        self.scan_control().interrupt_gate().jobs_settled().await;
         self.inner
             .external_cp_links
             .update(|cp| cp.mark_connected());
@@ -5371,6 +5376,24 @@ impl PvDatabase {
     /// local CA link before the call has run its CP/CPP processing.
     pub async fn ca_sync(&self) {
         self.inner.ca_links.sync().await;
+    }
+
+    /// `record`'s pump's turn requests (see [`Self::io_intr_turn`]).
+    pub(crate) fn register_io_intr_pump(
+        &self,
+        record: &std::sync::Arc<crate::server::record::RecordCell>,
+    ) -> crate::runtime::sync::mpsc::UnboundedReceiver<crate::runtime::sync::oneshot::Sender<()>>
+    {
+        self.inner.io_intr_turns.register(record)
+    }
+
+    /// Return once `record`'s I/O Intr pump has processed every interrupt
+    /// queued to it now; at once for a record with no pump.
+    pub(crate) async fn io_intr_turn(
+        &self,
+        record: &std::sync::Arc<crate::server::record::RecordCell>,
+    ) {
+        self.inner.io_intr_turns.turn(record).await;
     }
 
     /// The CP/CPP worker's wait for [`Self::process_cp_links_on_connect`].

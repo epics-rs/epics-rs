@@ -80,7 +80,7 @@ impl AutosaveBuilder {
     /// left the IOC saving nothing at all and `fdblist` listing nothing to
     /// say so. The failure is announced on the error log when it happens
     /// and kept as that set's [`SaveSetStatus::Error`], which
-    /// [`Self::status_all`] reports.
+    /// [`AutosaveManager::status_all`] reports.
     pub async fn build(self) -> AutosaveManager {
         let (shutdown_tx, _) = watch::channel(false);
         let manager = AutosaveManager {

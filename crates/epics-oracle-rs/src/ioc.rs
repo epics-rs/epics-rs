@@ -2760,6 +2760,24 @@ time.sleep(60)
         );
     }
 
+    /// A `sleep 30` that has finished exec. `posix_spawn` returns once the
+    /// child's execve has released the vfork, before the kernel closes its
+    /// CLOEXEC copies of this process's sockets and renames it: until `comm`
+    /// reads "sleep" the child still holds them.
+    fn exec_d_sleep() -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let comm = format!("/proc/{}/comm", child.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(&comm).unwrap() != "sleep\n" {
+            assert!(Instant::now() < deadline, "sleep never exec'd");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        child
+    }
+
     /// An ephemeral UDP socket whose port number nothing else on the host
     /// shares. The kernel hands out a port per address, so another process's
     /// IPv6 socket can sit on the same number; the tests here assert on who
@@ -2812,10 +2830,7 @@ time.sleep(60)
     fn a_foreign_socket_on_the_port_is_a_retryable_collision_naming_its_owner() {
         let tools = PvxTools::discover().expect("the pvxs tree must be built");
         let squatter = quiet_udp_socket();
-        let mut other = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn a process standing in for the IOC");
+        let mut other = exec_d_sleep();
         let ioc = FakeIoc {
             port: squatter.local_addr().unwrap().port(),
             side: Side::C,
@@ -2846,10 +2861,7 @@ time.sleep(60)
         let sock = quiet_udp_socket();
         let port = sock.local_addr().unwrap().port();
         assert_eq!(foreign_udp_holders(std::process::id(), port), Some(vec![]));
-        let mut other = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut other = exec_d_sleep();
         let seen = foreign_udp_holders(other.id(), port).expect("proc readable");
         let _ = other.kill();
         let _ = other.wait();

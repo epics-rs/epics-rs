@@ -175,8 +175,7 @@ async fn the_statistics_are_posted_before_the_waveform() {
 async fn sim_task_posts_the_statistics_before_the_waveform() {
     let notify = Arc::new(Notify::new());
     let mut driver = ScopeSimulator::new("scopeOrderMutex", notify.clone());
-    driver.base.interrupts =
-        asyn_rs::interrupt::InterruptManager::owned_by(asyn_rs::registry::open_owner());
+    driver.base.own_interrupts(asyn_rs::registry::open_owner());
     let idx = driver.param_indices();
     let mut rx = driver.base.interrupts.subscribe_async(256, 1 << 16);
     driver

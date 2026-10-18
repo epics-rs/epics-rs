@@ -45,8 +45,9 @@ impl SimDetector {
             max_size_y,
             max_memory,
             ASYN_NONE,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            // "No interfaces beyond those set in ADDriver.cpp" (:1036).
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let sim_params = SimDetectorParams::create(&mut ad.port_base)?;
 
@@ -337,6 +338,34 @@ mod tests {
     use ad_core_rs::plugin::channel::NDArrayOutput;
     use asyn_rs::interfaces::InterfaceType;
     use asyn_rs::port::DrvUserRequest;
+
+    /// simDetector.cpp:1036 adds nothing, so the port carries exactly the
+    /// ADDriver.cpp:131-132 and asynNDArrayDriver.cpp:866-867 masks.
+    #[test]
+    fn test_port_carries_the_c_interface_and_interrupt_masks() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let det = SimDetector::new(
+            "SIM_MASKS",
+            8,
+            8,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            acq_tx,
+            dirty,
+        )
+        .unwrap();
+        let interrupts = InterfaceMask::INT32
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::INT32_ARRAY
+            | InterfaceMask::GENERIC_POINTER;
+        assert_eq!(det.ad.port_base.interrupt_mask(), interrupts);
+        assert_eq!(
+            det.ad.port_base.interface_mask(),
+            interrupts | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
+    }
 
     #[test]
     fn test_new_seeds_the_configured_data_type() {

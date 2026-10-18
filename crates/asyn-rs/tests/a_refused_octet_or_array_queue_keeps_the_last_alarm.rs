@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -99,6 +100,8 @@ async fn failed_then_refused(case: Case) -> [(u16, AlarmSeverity); 2] {
             can_block,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("P", param).unwrap();
     base.set_auto_connect(false);

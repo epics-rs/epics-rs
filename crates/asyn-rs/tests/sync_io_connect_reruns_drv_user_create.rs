@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
-use asyn_rs::interfaces::{Capability, default_capabilities};
+use asyn_rs::interfaces::Capability;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::database::PvDatabase;
@@ -48,7 +49,7 @@ impl PortDriver for Counting {
         self.base().drv_user_create(req)
     }
     fn capabilities(&self) -> Vec<Capability> {
-        let mut caps = default_capabilities();
+        let mut caps = InterfaceMask::UNMIGRATED_ALL.capabilities();
         if !self.enum_iface {
             caps.retain(|c| !matches!(c, Capability::EnumRead | Capability::EnumWrite));
         }
@@ -76,7 +77,13 @@ async fn ioc(
     records: &str,
 ) -> (Creates, Arc<PvDatabase>, PortRuntimeHandle) {
     let db = Arc::new(PvDatabase::new());
-    let mut base = PortDriverBase::new(port, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        port,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     for (name, kind) in PARAMS {
         base.create_param(name, kind).unwrap();
     }

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::database::PvDatabase;
@@ -52,7 +53,13 @@ record(stringout, "SO") { field(DTYP, "asynOctetWrite") field(OUT, "@asyn(INITRB
 #[epics_base_rs::epics_test]
 async fn only_an_octet_output_reads_the_initial_readback_tag() {
     let db = Arc::new(PvDatabase::new());
-    let mut base = PortDriverBase::new("INITRB", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "INITRB",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let i32 = base.create_param("I32", ParamType::Int32).unwrap();
     let f64 = base.create_param("F64", ParamType::Float64).unwrap();
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();

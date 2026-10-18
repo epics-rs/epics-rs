@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -43,7 +44,13 @@ impl PortDriver for Bounded {
 /// The database, and the port's runtime, which must outlive it.
 async fn ioc(port: &str, iface: &str) -> (Arc<PvDatabase>, PortRuntimeHandle) {
     let db = Arc::new(PvDatabase::new());
-    let mut base = PortDriverBase::new(port, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        port,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("I32", ParamType::Int32).unwrap();
     base.create_param("I64", ParamType::Int64).unwrap();
     let param = if iface == "asynInt64" { "I64" } else { "I32" };

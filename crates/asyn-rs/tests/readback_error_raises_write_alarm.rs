@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynStatus;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::database::PvDatabase;
@@ -70,7 +71,13 @@ async fn stat(db: &PvDatabase, name: &str) -> (EpicsValue, EpicsValue) {
 #[epics_base_rs::epics_test]
 async fn a_failed_readback_on_a_scalar_output_is_write_alarm() {
     let db = Arc::new(PvDatabase::new());
-    let mut base = PortDriverBase::new("RBKERR", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "RBKERR",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let reasons: Vec<usize> = PARAMS
         .iter()
         .map(|(name, ty)| base.create_param(name, *ty).unwrap())

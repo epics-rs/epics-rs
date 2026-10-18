@@ -1053,7 +1053,13 @@ mod tests {
     #[test]
     fn test_acquire_write_off_address_zero_does_not_gate_frames() {
         let proc = make_proc(2, "TST_TS_ADDR");
-        let mut base = PortDriverBase::new("TST_TS_ADDR_B", 3, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TST_TS_ADDR_B",
+            3,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let acquire = proc.state.lock().p.ts_acquire;
         let out = proc.validate_int32(
             acquire,

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -46,6 +47,8 @@ async fn failed_write(port: &str, can_block: bool, record_type: &str) -> (u16, A
             can_block,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("ARR", ParamType::Int32Array).unwrap();
     let (runtime, _actor) =

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use epics_base_rs::server::database::PvDatabase;
@@ -37,6 +38,8 @@ async fn a_disconnected_blocking_port_raises_comm_on_a_write() {
             can_block: true,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("VAL", ParamType::Int32).unwrap();
     base.set_auto_connect(false);

@@ -204,8 +204,10 @@ impl QxbpmDriver {
             port_name,
             1,
             flags,
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            // rs-only simulation port: optics has no C driver for it
+            // (sncqxbpm.st talks to the serial port itself).
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
         );
         let params = QxbpmParams::create(&mut base)?;
 
@@ -517,6 +519,20 @@ mod tests {
         let mut driver = QxbpmDriver::new(port_name, sim).unwrap();
         driver.connect(&AsynUser::default()).unwrap();
         driver
+    }
+
+    /// The port serves Int32 and Float64 params and names them through
+    /// drvUser; PortDriverBase adds Common as asynPortDriver does.
+    #[test]
+    fn test_port_masks_are_the_interfaces_it_serves() {
+        let driver =
+            QxbpmDriver::new("QXBPM_MASKS", Arc::new(Mutex::new(SimQxbpm::new(0.0, 0.0)))).unwrap();
+        let served = InterfaceMask::INT32 | InterfaceMask::FLOAT64;
+        assert_eq!(driver.base().interrupt_mask(), served);
+        assert_eq!(
+            driver.base().interface_mask(),
+            served | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
     }
 
     #[test]

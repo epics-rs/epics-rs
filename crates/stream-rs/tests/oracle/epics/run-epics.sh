@@ -19,7 +19,8 @@
 # with UDF 1; "reload" runs streamReload after the processing; "report"
 # runs streamReportRecord rec; "tointr" puts SCAN "I/O Intr" after the
 # processing, "topassive" puts it back to "Passive"; "flip" puts SCAN
-# "I/O Intr", 0.2 s later "Passive" and "I/O Intr" again, and waits 1.5 s.
+# "I/O Intr", 0.2 s later "Passive", 0.2 s later "I/O Intr" again, and
+# waits 1.5 s; "pauserun" runs iocPause, then iocRun 0.2 s later.
 # Arguments, if any, are the cases to run.
 set -euo pipefail
 : "${STREAM_TOP:?set STREAM_TOP to a built StreamDevice}"
@@ -62,10 +63,16 @@ epicsThreadSleep 0.5"
     has topassive && after="$after
 dbpf rec.SCAN Passive
 epicsThreadSleep 0.5"
+    has pauserun && after="$after
+iocPause
+epicsThreadSleep 0.2
+iocRun
+epicsThreadSleep 0.5"
     has flip && after="$after
 dbpf rec.SCAN \"I/O Intr\"
 epicsThreadSleep 0.2
 dbpf rec.SCAN Passive
+epicsThreadSleep 0.2
 dbpf rec.SCAN \"I/O Intr\"
 epicsThreadSleep 1.5"
     cat >"$work/$c.cmd" <<EOC
@@ -105,7 +112,7 @@ EOC
         "$STREAM_TOP/bin/$ARCH/streamApp" "$work/$c.cmd" </dev/null >"$work/$c.out" 2>"$work/$c.err" || true
         if [ -n "$dev" ]; then kill "$dev" 2>/dev/null || true; wait "$dev" 2>/dev/null || true; dev=; fi
         perl -ne 'next unless $on ||= /Stream(Epics|Core)\.cc:\d+: /;
-            next if /^\e\[|^iocsh Error: |^iocRun: |^iocInit: |^Starting iocInit|^#|StreamCore::attachBus\(/;
+            next if /^\e\[|^iocsh Error: |^iocRun: |^iocPause: |^iocInit: |^Starting iocInit|^#|StreamCore::attachBus\(/;
             next unless s/^\S+ //;
             s/( failed\\n)\S+ (?!Stream(Core|Epics)\.cc:)\S+\.cc?:\d+: .*/$1/;
             next if /^\S+ lockRequest: port \S+ not connected$/;

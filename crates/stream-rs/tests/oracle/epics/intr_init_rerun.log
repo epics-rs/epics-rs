@@ -1,0 +1,91 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto ri P"
+Stream::initRecord rec: filename="l.proto" protocol="ri" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "ri")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+Stream::initRecord rec: waiting for initDone
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="5", size=1)
+StreamCore::readCallback(rec) inputBuffer="5", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="5", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "5"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="5" value=5
+Stream::scan() currentValueLength=1
+Stream::matchValue(rec): success, 1 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = wait
+Stream::startTimer(stream=rec, timeout=300) = 0.300000 seconds
+StreamCore::timerCallback(rec)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+Stream::protocolFinishHook rec: signalling init done
+Stream::initRecord rec: initDone
+Stream::initRecord rec: initialized. don't convert
+streamInitRecord(rec) done status=0
+streamGetIointInfo(rec,cmd=0): stream=0x5798c4e87b60, ioscanpvt=0x5798c4e89720
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+rec: stopping "I/O Intr"
+StreamCore::finishProtocol(rec, Abort) not bus owner
+Stream::protocolFinishHook(rec, Abort)
+rec: Protocol aborted
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) error status=UDF (17)
+recordProcessCallback(rec) processing record done
+rec: running @init handler
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="5", size=1)
+StreamCore::readCallback(rec) inputBuffer="5", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="5", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "5"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="5" value=5
+Stream::scan() currentValueLength=1
+Stream::matchValue(rec): success, 1 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = wait
+Stream::startTimer(stream=rec, timeout=300) = 0.300000 seconds
+StreamCore::timerCallback(rec)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+Stream::protocolFinishHook rec: signalling init done
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+VAL 5 = 0x5
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

@@ -1,0 +1,42 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto iw P"
+Stream::initRecord rec: filename="l.proto" protocol="iw" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "iw")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x584cc3966ad0, ioscanpvt=0x584cc3968620
+streamGetIointInfo(rec): start protocol
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = wait
+Stream::startTimer(stream=rec, timeout=1000) = 1.000000 seconds
+streamGetIointInfo(rec,cmd=1): stream=0x584cc3966ad0, ioscanpvt=0x584cc3968620
+streamGetIointInfo(rec): abort protocol
+StreamCore::finishProtocol(rec, Abort) not bus owner
+Stream::protocolFinishHook(rec, Abort)
+rec: Protocol aborted
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = wait
+Stream::startTimer(stream=rec, timeout=1000) = 1.000000 seconds
+Stream::process(rec): protocol started
+recordProcessCallback(rec) processing record done
+streamGetIointInfo(rec,cmd=0): stream=0x584cc3966ad0, ioscanpvt=0x584cc3968620
+streamGetIointInfo(rec): start protocol
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = wait
+Stream::startTimer(stream=rec, timeout=1000) = 1.000000 seconds
+StreamCore::timerCallback(rec)
+StreamCore::evalCommand(rec): activeCommand = in
+VAL 0 = 0x0
+SEVR "NO_ALARM"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 1 = 0x1
+PROC 0 = 0x0

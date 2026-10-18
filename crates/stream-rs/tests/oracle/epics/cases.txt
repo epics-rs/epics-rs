@@ -29,5 +29,7 @@ tpro	longin	l.proto p P	0	GET\r\n=>7\r\n	tpro
 si_ok	stringin	l.proto s P	0	S\r\n=>hello\r\n	noval
 connect_fault	longin	l.proto c P	0	-	-
 intr_ok	longin	l.proto i P	0	@=>V=5\r\n	intr
-intr_two	longin	l.proto i P	0	@=>V=5\r\nV=6\r\n	intr
 intr_flip	longin	l.proto iw P	0	x=>	noproc,flip
+intr_pause	longin	l.proto i P	0	x=>	intr,pauserun
+init_rerun	longin	l.proto r P	0	I\r\n=>5\r\n;;GET\r\n=>6\r\n	noproc,pauserun
+intr_init_rerun	longin	l.proto ri P	0	I\r\n=>5\r\n	intr,pauserun

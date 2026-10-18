@@ -37,8 +37,9 @@ use epics_base_rs::server::database::{
     AsyncDbHandle, DeviceDone, DeviceDoneSource, ProcessCallback,
 };
 use epics_base_rs::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart, WriteStart,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart, WriteStart,
 };
+use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
 use epics_base_rs::server::recgbl::alarm_status::{
     CALC_ALARM, COMM_ALARM, NO_ALARM, READ_ALARM, TIMEOUT_ALARM, UDF_ALARM, WRITE_ALARM,
 };
@@ -46,7 +47,7 @@ use epics_base_rs::server::recgbl::{alarm_condition_string, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, HwLink, ParsedLink, Record, ScanType, parse_link_v2,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::StreamBuffer;
 use crate::bus::StreamIoStatus;
@@ -373,6 +374,9 @@ struct Shared {
     /// The timer's current start; an earlier start's expiry is dropped, as
     /// C's `epicsTimer::start` replaces it.
     timer_start: AtomicU64,
+    /// `initDone`, set by the finish of an `@init` run.
+    init_done: Mutex<bool>,
+    init_signal: Condvar,
 }
 
 impl Shared {
@@ -399,6 +403,15 @@ impl Shared {
             self.slot.lend(record, common, || lock.dispatch(entry))
         })
         .unwrap_or(0)
+    }
+
+    /// Run `f` with the record taken and lent, given its SCAN; `None` when
+    /// the stream has no database or the record is gone.
+    fn held<R>(&self, f: impl FnOnce(ScanType) -> R) -> Option<R> {
+        self.db.get()?.with_instance(&self.name, |record, common| {
+            let scan = common.scan;
+            self.slot.lend(record, common, || f(scan))
+        })
     }
 
     /// `Stream::process()`, the record lent: whether the record goes on.
@@ -535,6 +548,20 @@ impl CallbackBody for RecordProcess {
         debug!(format!(
             "recordProcessCallback({name}) processing record done\n"
         ));
+        let Some(lock) = shared.lock.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        shared.held(|scan| {
+            if scan == ScanType::IoIntr && lock.lock().flags.get() & ABORTED == 0 {
+                // restart protocol for next turn
+                debug!(format!(
+                    "recordProcessCallback({name}) restart async protocol\n"
+                ));
+                if !lock.start_protocol(StartMode::StartAsync) {
+                    stream_error(&cmsg!(name, b": Can't restart \"I/O Intr\" protocol\n"));
+                }
+            }
+        });
     }
 }
 
@@ -551,8 +578,6 @@ pub struct StreamHooks {
     current_value_length: Cell<isize>,
     /// `ioscanpvt`: set once the record has been initialized.
     initialized: Cell<bool>,
-    /// `initDone`, signalled by the finish of an `@init` run.
-    init_done: Cell<bool>,
     /// C's `record->pact` as `process` sets it: a protocol it started is
     /// running.
     pact: Cell<bool>,
@@ -631,14 +656,15 @@ impl StreamCoreHooks for StreamHooks {
                 "Stream::protocolFinishHook {}: signalling init done\n",
                 core.name()
             ));
-            self.init_done.set(true);
+            *self.shared.init_done.lock() = true;
+            self.shared.init_signal.notify_all();
             return;
         }
         if result != ProtocolResult::Abort && io_intr {
             // re-enable early input
             core.flags.set(core.flags.get() | ACCEPT_INPUT);
         }
-        if pact || io_intr {
+        if (pact || io_intr) && !TERMINATING.load(Ordering::Acquire) {
             // process record in callback thread to break possible recursion
             if let Some(cell) = self.shared.process_callback.get() {
                 let prio =
@@ -778,6 +804,9 @@ impl StreamCoreHooks for StreamHooks {
 /// `drvStreamInit` has run.
 static DRV_INIT: OnceLock<()> = OnceLock::new();
 
+/// Set by `streamExitHook`: no record is processed after the protocol ends.
+static TERMINATING: AtomicBool = AtomicBool::new(false);
+
 /// `Stream::drvInit`, the driver's `init`, which iocInit runs before the
 /// records': here before the first record's.
 fn drv_init() {
@@ -807,7 +836,85 @@ fn drv_init() {
                 None => format!("non-EPICS_{:?}", thread.id()),
             })
         }));
+        init_hook_register(Arc::new(init_hook));
+        epics_base_rs::runtime::exit::at_exit("streamExitHook", || {
+            TERMINATING.store(true, Ordering::Release);
+        });
     });
+}
+
+/// `Stream::initHook(state)`
+fn init_hook(state: InitHookState) {
+    let all: Vec<Arc<Shared>> = streams()
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|lock| lock.lock().hooks.shared.clone())
+        .collect();
+    let lock_of = |shared: &Shared| shared.lock.get().and_then(Weak::upgrade);
+    match state {
+        InitHookState::AtIocRun => {
+            // re-run @init handlers after restart
+            static IN_IOC_INIT: AtomicBool = AtomicBool::new(true);
+            if IN_IOC_INIT.swap(false, Ordering::AcqRel) {
+                // We don't want to run @init twice in iocInit
+                return;
+            }
+            for shared in all {
+                let Some(lock) = lock_of(&shared) else {
+                    continue;
+                };
+                if !lock.lock().on_init.borrow().is_set() {
+                    continue;
+                }
+                let name = shared.name.as_str();
+                debug!(format!("{name}: running @init handler\n"));
+                *shared.init_done.lock() = false;
+                if !shared
+                    .held(|_| lock.start_protocol(StartMode::StartInit))
+                    .unwrap_or(false)
+                {
+                    stream_error(&cmsg!(name, b": @init handler failed.\n"));
+                }
+                let mut done = shared.init_done.lock();
+                while !*done {
+                    shared.init_signal.wait(&mut done);
+                }
+            }
+        }
+        InitHookState::AtIocPause => {
+            // stop polling I/O Intr
+            for shared in all {
+                let Some(lock) = lock_of(&shared) else {
+                    continue;
+                };
+                shared.held(|scan| {
+                    if scan == ScanType::IoIntr {
+                        debug!(format!("{}: stopping \"I/O Intr\"\n", shared.name));
+                        lock.lock().finish_protocol(ProtocolResult::Abort);
+                    }
+                });
+            }
+        }
+        InitHookState::AfterIocRunning => {
+            // start polling I/O Intr
+            for shared in all {
+                let Some(lock) = lock_of(&shared) else {
+                    continue;
+                };
+                shared.held(|scan| {
+                    if scan == ScanType::IoIntr {
+                        let name = shared.name.as_str();
+                        debug!(format!("{name}: starting \"I/O Intr\"\n"));
+                        if !lock.start_protocol(StartMode::StartAsync) {
+                            stream_error(&cmsg!(name, b": Can't start \"I/O Intr\" protocol\n"));
+                        }
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `streamInit(after)`, the dset's `init`: errors are on while the
@@ -957,6 +1064,8 @@ impl Stream {
             process_callback: OnceLock::from(CallbackCell::new(RecordProcess(me.clone()))),
             reprocess: OnceLock::new(),
             timer_start: AtomicU64::new(0),
+            init_done: Mutex::new(false),
+            init_signal: Condvar::new(),
         });
         if let Some(db) = db {
             let _ = shared.reprocess.set(db.process_callback(name));
@@ -974,7 +1083,6 @@ impl Stream {
                 convert: Cell::new(DO_NOT_CONVERT),
                 current_value_length: Cell::new(0),
                 initialized: Cell::new(false),
-                init_done: Cell::new(false),
                 pact: Cell::new(false),
             },
             Box::new(move |lock, entry| gate_shared.enter(lock, entry)),
@@ -1118,14 +1226,14 @@ impl Stream {
         // initialize the record from hardware
         let (waiter, jobs) = mpsc::channel::<Job>();
         *self.shared.init_waiter.lock() = Some(waiter);
-        self.lock.lock().hooks.init_done.set(false);
+        *self.shared.init_done.lock() = false;
         if !self.lock.start_protocol(StartMode::StartInit) {
             self.end_init_wait(&jobs);
             stream_error(&cmsg!(name, b": Can't start @init handler\n"));
             return ERROR;
         }
         debug!(format!("Stream::initRecord {name}: waiting for initDone\n"));
-        while !self.lock.lock().hooks.init_done.get() {
+        while !*self.shared.init_done.lock() {
             let Ok(job) = jobs.recv() else { break };
             let _ = job.reply.send(self.lock.dispatch(job.entry.entry()));
         }
@@ -1182,6 +1290,11 @@ impl Stream {
     }
 }
 
+/// C's `%p`: glibc prints a null pointer as "(nil)".
+fn c_ptr(p: Option<*const ()>) -> String {
+    p.map_or_else(|| "(nil)".to_string(), |p| format!("{p:p}"))
+}
+
 /// C's `%#lx` of a `long`.
 fn c_alt_hex(v: i64) -> String {
     if v == 0 {
@@ -1200,6 +1313,9 @@ pub struct StreamDevice {
     name: String,
     /// What the pass's I/O entry returned, for the read that follows it.
     status: i64,
+    /// `ioscanpvt`, held so the record stays on the I/O Intr list: nothing
+    /// requests a scan on it, the stream processes its record itself.
+    ioscanpvt: Option<epics_base_rs::runtime::sync::mpsc::Sender<()>>,
 }
 
 impl StreamDevice {
@@ -1210,6 +1326,7 @@ impl StreamDevice {
             db: None,
             name: String::new(),
             status: ERROR,
+            ioscanpvt: None,
         }
     }
 
@@ -1336,6 +1453,71 @@ impl DeviceSupport for StreamDevice {
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         unreachable!("write_begin_common never asks for the write")
+    }
+
+    /// `streamGetIointInfo(cmd, record, ppvt)`
+    fn get_ioint_info(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+        cmd: IoIntrCmd,
+    ) -> bool {
+        let name = self.name.as_str();
+        let stream = self.stream.as_ref();
+        let ioscanpvt = stream.filter(|s| s.lock.lock().hooks.initialized.get());
+        debug!(format!(
+            "streamGetIointInfo({name},cmd={}): stream={}, ioscanpvt={}\n",
+            cmd as i32,
+            c_ptr(stream.map(|s| Arc::as_ptr(&s.shared).cast::<()>())),
+            c_ptr(ioscanpvt.map(|s| Arc::as_ptr(&s.lock).cast::<()>()))
+        ));
+        let Some(stream) = stream else {
+            stream_error(b"streamGetIointInfo called without stream instance\n");
+            return false;
+        };
+        match cmd {
+            IoIntrCmd::Add => {
+                if !self
+                    .db
+                    .as_ref()
+                    .is_some_and(AsyncDbHandle::interrupt_accept)
+                {
+                    // We will start polling later in initHook.
+                    debug!(format!("streamGetIointInfo({name}): start later...\n"));
+                    return true;
+                }
+                debug!(format!("streamGetIointInfo({name}): start protocol\n"));
+                // SCAN has been set to "I/O Intr"
+                if !stream.shared.slot.lend(record, common, || {
+                    stream.lock.start_protocol(StartMode::StartAsync)
+                }) {
+                    stream_error(&cmsg!(name, b": Can't start \"I/O Intr\" protocol\n"));
+                }
+            }
+            IoIntrCmd::Delete => {
+                // SCAN is no longer "I/O Intr"
+                debug!(format!("streamGetIointInfo({name}): abort protocol\n"));
+                stream.shared.slot.lend(record, common, || {
+                    stream.lock.lock().finish_protocol(ProtocolResult::Abort)
+                });
+            }
+        }
+        true
+    }
+
+    /// The `ioscanpvt` `streamGetIointInfo` hands `scanAdd`: none before the
+    /// record was initialized.
+    fn io_intr_receiver(&mut self) -> Option<epics_base_rs::runtime::sync::mpsc::Receiver<()>> {
+        let initialized = self
+            .stream
+            .as_ref()
+            .is_some_and(|s| s.lock.lock().hooks.initialized.get());
+        if !initialized {
+            return None;
+        }
+        let (tx, rx) = epics_base_rs::runtime::sync::mpsc::channel(1);
+        self.ioscanpvt = Some(tx);
+        Some(rx)
     }
 
     fn dtyp(&self) -> &str {

@@ -1,0 +1,33 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto i P"
+Stream::initRecord rec: filename="l.proto" protocol="i" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "i")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x61aaa43ceb10, ioscanpvt=0x61aaa43d05f0
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+rec: stopping "I/O Intr"
+StreamCore::finishProtocol(rec, Abort) not bus owner
+Stream::protocolFinishHook(rec, Abort)
+rec: Protocol aborted
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) error status=UDF (17)
+recordProcessCallback(rec) processing record done
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+VAL 0 = 0x0
+SEVR "INVALID"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

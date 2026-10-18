@@ -337,6 +337,21 @@ fn fields(db: &PvDatabase) -> Vec<String> {
     ]
 }
 
+/// streamGetIointInfo's pointers, which differ run to run.
+fn masked(l: &str) -> String {
+    if !l.starts_with("streamGetIointInfo(") {
+        return l.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = l;
+    while let Some(at) = rest.find("=0x") {
+        out.push_str(&rest[..at + 1]);
+        rest = rest[at + 3..].trim_start_matches(|c: char| c.is_ascii_hexdigit());
+        out.push_str("<ptr>");
+    }
+    out + rest
+}
+
 /// The C log, made comparable: the protocol path is the oracle directory.
 fn expected(name: &str) -> Vec<String> {
     // C keeps the spaces before the bus name in the protocol name
@@ -356,7 +371,7 @@ fn expected(name: &str) -> Vec<String> {
         .to_string();
     log.lines()
         .map(|l| {
-            let l = fixed_convert_text(&l.replace(&dir, "<dir>"));
+            let l = masked(&fixed_convert_text(&l.replace(&dir, "<dir>")));
             if name == "link_spaces" {
                 l.replace(
                     "parse link string \"l.proto p P\"",
@@ -409,7 +424,12 @@ async fn run_case(name: &str) {
         stream_rs::error::set_stream_debug_file(Some(Box::new(Out)));
     });
     let case = case(name);
-    common::MOCK.lock().lock_ok = case.table != "-";
+    {
+        let mut mock = common::MOCK.lock();
+        mock.lock_ok = case.table != "-";
+        // asyn's octet ports take an interrupt user
+        mock.async_read = true;
+    }
     *common::CLIENT.lock() = None;
     OUT.lock().clear();
     stream_rs::error::set_stream_debug(1);
@@ -424,6 +444,10 @@ async fn run_case(name: &str) {
     let script = want.clone();
     let player = std::thread::spawn(move || {
         for (i, line) in script.iter().enumerate() {
+            // evalIn hands its early input to readCallback itself
+            if i > 0 && script[i - 1].starts_with("StreamCore::evalIn(rec): early input: ") {
+                continue;
+            }
             let Some(play) = play(line) else { continue };
             let have = wait_lines(i - drv);
             if have.len() < i - drv {
@@ -446,16 +470,21 @@ async fn run_case(name: &str) {
     } else {
         format!("field(VAL, \"{}\")", case.val)
     };
+    let scan = if has("intr") {
+        "field(SCAN, \"I/O Intr\")"
+    } else {
+        ""
+    };
     let tpro = if has("tpro") {
         "field(TPRO, \"2\")"
     } else {
         ""
     };
     let db_text = format!(
-        "record({}, \"rec\") {{ field(DTYP, \"stream\") field({field}, \"{link}\") {val} {tpro} }}\n",
+        "record({}, \"rec\") {{ field(DTYP, \"stream\") field({field}, \"{link}\") {val} {scan} {tpro} }}\n",
         case.rtype
     );
-    let (db, _) = IocBuilder::new()
+    let ioc = IocBuilder::new()
         .register_dynamic_device_support(
             &[
                 ("longin", &LONGIN),
@@ -476,10 +505,20 @@ async fn run_case(name: &str) {
         )
         .db_string(&db_text, &HashMap::new())
         .unwrap()
-        .build()
+        .build_ioc()
         .await
         .unwrap();
-    if !has("noproc") {
+    let db = ioc.database().clone();
+    assert!(ioc.run().await);
+    let put_scan = |scan: &'static str| {
+        let db = db.clone();
+        async move {
+            let _ = db
+                .put_record_field_from_ca_no_notify("rec", "SCAN", EpicsValue::String(scan.into()))
+                .await;
+        }
+    };
+    if !has("noproc") && !has("intr") {
         let proc = if has("proc2") { 2 } else { 1 };
         // dbpf's put: a dbPutField
         let _ = db
@@ -497,6 +536,20 @@ async fn run_case(name: &str) {
             .put_record_field_from_ca_no_notify("rec", "PROC", EpicsValue::Long(1))
             .await;
     }
+    if has("flip") {
+        put_scan("I/O Intr").await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+        put_scan("Passive").await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+        put_scan("I/O Intr").await;
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(1500)).await;
+    }
+    if has("pauserun") {
+        assert_eq!(epics_base_rs::server::ioc_app::ioc_pause(), 0);
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
+        assert_eq!(epics_base_rs::server::ioc_app::ioc_run(), 0);
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(500)).await;
+    }
     player.join().unwrap().unwrap();
     wait_lines(want.len() - drv);
     stream_rs::error::set_stream_debug(0);
@@ -512,7 +565,7 @@ async fn run_case(name: &str) {
     }
     let dir = oracle_dir().display().to_string();
     for l in &mut got {
-        *l = l.replace(&dir, "<dir>");
+        *l = masked(&l.replace(&dir, "<dir>"));
     }
     want.extend(fields_want);
     got.extend(fields(&db));
@@ -556,4 +609,9 @@ cases!(
     tpro,
     si_ok,
     connect_fault,
+    intr_ok,
+    intr_flip,
+    intr_pause,
+    init_rerun,
+    intr_init_rerun,
 );

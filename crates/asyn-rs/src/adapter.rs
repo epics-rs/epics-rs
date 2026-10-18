@@ -1,7 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(39): checked, not waived — all 39 ran and passed
+// RTEMS-EXEC-MODEL-ALLOW(44): checked, not waived — all 44 ran and passed
 // on the exec backend (measured on this tree:
 // `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
-// --all-features`, 1404/1404). asyn-rs became a census subject when its
+// --all-features`, 1485/1485). asyn-rs became a census subject when its
 // `build.rs` began deriving `tokio_backend`; nothing here builds a CA
 // server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.

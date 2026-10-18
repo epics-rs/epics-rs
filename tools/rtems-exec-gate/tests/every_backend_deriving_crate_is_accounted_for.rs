@@ -213,6 +213,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ("epics-ca-rs", "tests/dollar_long_string_record.rs"),
     ("epics-ca-rs", "tests/long_string_dollar_monitor_counts.rs"),
     ("epics-ca-rs", "tests/long_string_plain_monitor_counts.rs"),
+    ("epics-ca-rs", "tests/lsi_val_reads_past_len_to_its_nul.rs"),
     (
         "epics-ca-rs",
         "tests/plain_write_fails_on_the_process_status.rs",

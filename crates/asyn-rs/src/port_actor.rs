@@ -424,13 +424,13 @@ enum CDispatch {
 /// port carries `ASYN_MULTIDEVICE`, so an addr names a device only there;
 /// everywhere else the port's own `dpCommon` is the one and only slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum DpKey {
+pub(crate) enum DpKey {
     Port,
     Device(i32),
 }
 
 impl DpKey {
-    fn of(multi_device: bool, addr: i32) -> Self {
+    pub(crate) fn of(multi_device: bool, addr: i32) -> Self {
         match crate::port::dp_common_key(multi_device, addr) {
             Some(addr) => DpKey::Device(addr),
             None => DpKey::Port,
@@ -438,7 +438,9 @@ impl DpKey {
     }
 }
 
-/// C's two `pblockProcessHolder` fields, and the one gate that reads them.
+/// C's block state, all of it under `asynManagerLock`: each user's
+/// `blockPortCount` / `blockDeviceCount` and the two `pblockProcessHolder`
+/// fields the drain gate reads (asynManager.c:889-892).
 ///
 /// `port` is `pport->pblockProcessHolder`; `dp_commons` holds
 /// `pdpCommon->pblockProcessHolder` per `dpCommon`, including the port's own —
@@ -446,15 +448,24 @@ impl DpKey {
 /// device-scoped block taken on a single-device port is not the same thing as
 /// a port-wide one even though both end up gating every request.
 ///
-/// Each entry is `(token, nesting_count)`, C's `blockPortCount` /
-/// `blockDeviceCount` per holder.
+/// A count changes on the caller's thread ([`RequestCell::block_process_callback`],
+/// or the actor for a [`RequestOp::BlockProcess`]); a holder is taken only by the
+/// actor, after the counting user's callback returns ([`Self::settle`], :931-934),
+/// and released by whichever thread drops the count to zero ([`Self::unblock`],
+/// :1773-1786). The maps keep their capacity, so a block taken again allocates
+/// nothing.
 #[derive(Default)]
-struct BlockHolders {
-    port: Option<(u64, u32)>,
-    dp_commons: HashMap<DpKey, (u64, u32)>,
+pub(crate) struct BlockBook {
+    /// `(blockPortCount, blockDeviceCount)` per block identity.
+    counts: HashMap<u64, (u32, u32)>,
+    port: Option<u64>,
+    dp_commons: HashMap<DpKey, u64>,
+    /// A holder was released since the actor last looked: C's
+    /// `epicsEventSignal(pport->notifyPortThread)` (:1786).
+    released: bool,
 }
 
-impl BlockHolders {
+impl BlockBook {
     fn any_held(&self) -> bool {
         self.port.is_some() || !self.dp_commons.is_empty()
     }
@@ -463,41 +474,165 @@ impl BlockHolders {
     /// user (asynManager.c:889-892). One holder alone is never enough to admit
     /// a request, and never enough to refuse one.
     fn admits(&self, token: Option<u64>, dp: DpKey) -> bool {
-        let free = |h: Option<&(u64, u32)>| match h {
-            None => true,
-            Some((owner, _)) => token == Some(*owner),
-        };
+        let free = |h: Option<&u64>| h.is_none_or(|owner| token == Some(*owner));
         free(self.port.as_ref()) && free(self.dp_commons.get(&dp))
     }
 
-    /// The holder a block/unblock at this scope owns. `all_devices` is C's
-    /// argument to `blockProcessCallback` (asynManager.c:1694); the `dpCommon`
-    /// it names when the answer is "not all" comes from the user's own device,
-    /// exactly as `findDpCommon(puserPvt)` reads it (:1766).
-    fn holder(&self, all_devices: bool, dp: DpKey) -> Option<(u64, u32)> {
+    /// The count `all_devices` names for `token`.
+    pub(crate) fn count(&self, token: u64, all_devices: bool) -> u32 {
+        let (port, device) = self.counts.get(&token).copied().unwrap_or_default();
+        if all_devices { port } else { device }
+    }
+
+    /// C `blockProcessCallback`'s `blockPortCount++` / `blockDeviceCount++`
+    /// (:1719-1722).
+    pub(crate) fn block(&mut self, token: u64, all_devices: bool) {
+        let (port, device) = self.counts.entry(token).or_default();
         if all_devices {
-            self.port
+            *port += 1;
         } else {
-            self.dp_commons.get(&dp).copied()
+            *device += 1;
         }
     }
 
-    /// The only mutator. Every transition of either holder goes through here,
-    /// so "held ⟺ some caller's block is outstanding" cannot drift between the
-    /// two scopes.
-    fn set_holder(&mut self, all_devices: bool, dp: DpKey, held: Option<(u64, u32)>) {
-        if all_devices {
-            self.port = held;
+    /// C `unblockProcessCallback` from its count check on (:1741-1786): the
+    /// count drops, and at zero the holder that is this user is released.
+    /// `Ok(true)` is C's `wasOwner`, the actor's wake.
+    pub(crate) fn unblock(
+        &mut self,
+        token: u64,
+        dp: DpKey,
+        all_devices: bool,
+    ) -> Result<bool, &'static str> {
+        let Some(counts) = self.counts.get_mut(&token) else {
+            return Err("asynManager::unblockProcessCallback but not locked");
+        };
+        let count = if all_devices {
+            &mut counts.0
         } else {
-            match held {
-                Some(h) => {
-                    self.dp_commons.insert(dp, h);
-                }
-                None => {
-                    self.dp_commons.remove(&dp);
-                }
-            }
+            &mut counts.1
+        };
+        if *count == 0 {
+            return Err("asynManager::unblockProcessCallback but not locked");
         }
+        *count -= 1;
+        let released = *count == 0;
+        if *counts == (0, 0) {
+            self.counts.remove(&token);
+        }
+        let was_owner = released
+            && if all_devices {
+                self.port.take_if(|owner| *owner == token).is_some()
+            } else if self.dp_commons.get(&dp) == Some(&token) {
+                self.dp_commons.remove(&dp);
+                true
+            } else {
+                false
+            };
+        self.released |= was_owner;
+        Ok(was_owner)
+    }
+
+    /// C `portThread` after a callback (:931-934): a user still counting a
+    /// block becomes its holder. True when a holder was newly taken.
+    fn settle(&mut self, token: u64, dp: DpKey) -> bool {
+        let Some(&(port, device)) = self.counts.get(&token) else {
+            return false;
+        };
+        let mut taken = false;
+        if port > 0 && self.port != Some(token) {
+            self.port = Some(token);
+            taken = true;
+        }
+        if device > 0 && self.dp_commons.get(&dp) != Some(&token) {
+            self.dp_commons.insert(dp, token);
+            taken = true;
+        }
+        taken
+    }
+
+    fn take_released(&mut self) -> bool {
+        std::mem::take(&mut self.released)
+    }
+
+    fn summary(&self) -> u8 {
+        let bit = |set: bool, bit: u8| if set { bit } else { 0 };
+        bit(!self.counts.is_empty(), Blocks::COUNTED)
+            | bit(self.any_held(), Blocks::HELD)
+            | bit(self.released, Blocks::RELEASED)
+    }
+}
+
+/// The [`BlockBook`] under its lock, with a summary of it the actor reads
+/// without the lock on every request. Only [`BlocksGuard`]'s drop writes the
+/// summary, under the lock, so it is the book's state as of the last release.
+/// A stale `HELD` or `COUNTED` costs the actor one lock; a stale clear one
+/// cannot hide a holder, because only the actor takes holders.
+#[derive(Default)]
+pub(crate) struct Blocks {
+    book: parking_lot::Mutex<BlockBook>,
+    summary: std::sync::atomic::AtomicU8,
+}
+
+pub(crate) struct BlocksGuard<'a> {
+    book: parking_lot::MutexGuard<'a, BlockBook>,
+    summary: &'a std::sync::atomic::AtomicU8,
+}
+
+impl std::ops::Deref for BlocksGuard<'_> {
+    type Target = BlockBook;
+    fn deref(&self) -> &BlockBook {
+        &self.book
+    }
+}
+
+impl std::ops::DerefMut for BlocksGuard<'_> {
+    fn deref_mut(&mut self) -> &mut BlockBook {
+        &mut self.book
+    }
+}
+
+impl Drop for BlocksGuard<'_> {
+    fn drop(&mut self) {
+        self.summary
+            .store(self.book.summary(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Blocks {
+    const COUNTED: u8 = 1;
+    const HELD: u8 = 2;
+    const RELEASED: u8 = 4;
+
+    pub(crate) fn lock(&self) -> BlocksGuard<'_> {
+        BlocksGuard {
+            book: self.book.lock(),
+            summary: &self.summary,
+        }
+    }
+
+    #[inline]
+    fn any(&self, bit: u8) -> bool {
+        self.summary.load(std::sync::atomic::Ordering::Acquire) & bit != 0
+    }
+
+    /// Some holder may be set: [`BlockBook::admits`] must be asked.
+    #[inline]
+    fn held(&self) -> bool {
+        self.any(Self::HELD)
+    }
+
+    /// Some block may be counted: [`BlockBook::settle`] must be asked.
+    #[inline]
+    fn counted(&self) -> bool {
+        self.any(Self::COUNTED)
+    }
+
+    /// A holder may have been released: [`BlockBook::take_released`] must
+    /// be asked.
+    #[inline]
+    fn released(&self) -> bool {
+        self.any(Self::RELEASED)
     }
 }
 
@@ -512,14 +647,10 @@ pub(crate) struct PortActor {
     /// with no message, so queueing one allocates nothing.
     cells: Arc<CellQueue>,
     heap: BinaryHeap<ActorMessage>,
-    /// C keeps **two** block holders, and the drain gate requires both to be
-    /// NULL-or-me before a request is eligible (asynManager.c:889-892):
-    /// `pport->pblockProcessHolder` (set when `blockPortCount > 0`, :931-932)
-    /// and `pdpCommon->pblockProcessHolder` (`blockDeviceCount > 0`, :933-934).
-    /// devGpib takes the device form for an SRQ transaction
+    /// The requests a block holder ([`BlockBook`], in the cell queue) holds
+    /// back. devGpib takes the device form of a block for an SRQ transaction
     /// (devSupportGpib.c:1216), so a port-wide-only model stalls every other
     /// GPIB address on the port for the duration.
-    block_holders: BlockHolders,
     pending_while_blocked: Vec<ActorMessage>,
     /// Requests whose *device* is disabled. C's `portThread` leaves them in the
     /// queue and skips them on every pass (`if(!pdpCommon->enabled) continue;`,
@@ -609,13 +740,14 @@ impl PortActor {
         // own connect edge, say) is not a signal *this* thread ever waited on —
         // C's port thread is started with the event unsignalled.
         let seen_exceptions = driver.base().exceptions_announced();
+        let flags = driver.base().flags;
+        let cells = Arc::new(CellQueue::for_port(flags.can_block, flags.multi_device));
         Self {
             id: ActorId::new(),
             driver,
             rx,
-            cells: Arc::default(),
+            cells,
             heap: BinaryHeap::new(),
-            block_holders: BlockHolders::default(),
             pending_while_blocked: Vec::new(),
             parked: Vec::new(),
             rescan_parked: false,
@@ -925,6 +1057,7 @@ impl PortActor {
 
     fn drain_channel(&mut self) {
         self.driver.base_mut().start_owed_connect_timer();
+        self.readmit_released();
         while let Ok(msg) = self.rx.try_recv() {
             self.enqueue_message(msg);
         }
@@ -1048,7 +1181,7 @@ impl PortActor {
             );
             // C counts every priority's queue (:1038-1039) and asks whether a
             // `blockProcessCallback` holder owns the port (:1063). Both are the
-            // actor's state: the heap is the queue, `block_holders` the holders, and
+            // actor's state: the heap is the queue, [`BlockBook`] the holders, and
             // the requests held back behind the block or a disabled device are
             // queued as much as the ones in the heap — in C they are all one
             // `queueList`.
@@ -1057,7 +1190,7 @@ impl PortActor {
                 "    nDevices {} nQueued {} blocked:{}",
                 base.devices().len(),
                 self.heap.len() + self.pending_while_blocked.len() + self.parked.len(),
-                yn(self.block_holders.any_held())
+                yn(self.cells.blocks().lock().any_held())
             );
             // C try-locks the two port mutexes from a *separate* report thread
             // (:1051-1072). `synchronousLock` was sampled on the caller's thread
@@ -1297,9 +1430,87 @@ impl PortActor {
     /// Whether both block holders admit this request — C's drain-loop test
     /// (asynManager.c:889-892). The one place that reads the holders, so a
     /// device block can never be mistaken for a port-wide one.
+    #[inline]
     fn admits(&self, msg: &ActorMessage) -> bool {
-        self.block_holders
+        !self.cells.blocks().held() || self.admits_held(msg)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn admits_held(&self, msg: &ActorMessage) -> bool {
+        self.cells
+            .blocks()
+            .lock()
             .admits(msg.user.block_token, self.dp_key(msg.user.addr))
+    }
+
+    /// C `portThread` after a callback (:931-934): the user's counted blocks
+    /// become holders, and what the heap already took that they now hold back
+    /// leaves it — re-tested through the gate, so a device block diverts only
+    /// the requests resolving to *that* `dpCommon`.
+    #[inline]
+    fn settle_block(&mut self, user: &AsynUser) {
+        if let Some(token) = user.block_token
+            && self.cells.blocks().counted()
+        {
+            self.settle_counted(token, user.addr);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_counted(&mut self, token: u64, addr: i32) {
+        let dp = self.dp_key(addr);
+        if !self.cells.blocks().lock().settle(token, dp) {
+            return;
+        }
+        let drained: Vec<ActorMessage> = self.heap.drain().collect();
+        for msg in drained {
+            if Self::is_lifecycle_op(&msg.op) || self.admits(&msg) {
+                self.heap.push(msg);
+            } else {
+                self.pending_while_blocked.push(msg);
+            }
+        }
+    }
+
+    /// The port-thread side of C `unblockProcessCallback`'s signal (:1786):
+    /// once a holder was released, from any thread, what the remaining holders
+    /// admit goes back to the heap. Releasing the device holder must not free
+    /// requests the port-wide holder still gates, and vice versa; C gets this
+    /// for free because it never moved them off the queue (:889-892).
+    #[inline]
+    fn readmit_released(&mut self) {
+        if self.cells.blocks().released() {
+            self.readmit();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn readmit(&mut self) {
+        if !self.cells.blocks().lock().take_released() {
+            return;
+        }
+        self.woken = true;
+        let pending = std::mem::take(&mut self.pending_while_blocked);
+        for msg in pending {
+            if self.admits(&msg) {
+                self.heap.push(msg);
+            } else {
+                self.pending_while_blocked.push(msg);
+            }
+        }
+    }
+
+    /// C `puserPvt->isQueued` for a block identity: a request of its own still
+    /// waits in the queue.
+    fn is_queued(&self, token: u64) -> bool {
+        self.heap
+            .iter()
+            .chain(&self.pending_while_blocked)
+            .chain(&self.parked)
+            .any(|msg| msg.user.block_token == Some(token))
     }
 
     /// The block identity a BlockProcess/UnblockProcess holds or releases.
@@ -1551,11 +1762,14 @@ impl PortActor {
         // C runs a callback and a `lockPort` span under `synchronousLock`
         // (asynManager.c:830, :909, :1581, :1800); a direct manager call
         // takes no port lock.
-        let held = (Self::c_dispatch(&op) != CDispatch::Direct
-            || matches!(op, RequestOp::LockPort(_)))
-        .then(|| self.sync_lock.hold());
+        let callback = Self::c_dispatch(&op) != CDispatch::Direct;
+        let held =
+            (callback || matches!(op, RequestOp::LockPort(_))).then(|| self.sync_lock.hold());
         let result = self.dispatch_io(&mut user, &op);
         drop(held);
+        if callback {
+            self.settle_block(&user);
+        }
         if let Some(reply) = reply {
             let _ = reply.send(result);
         }
@@ -2128,86 +2342,50 @@ impl PortActor {
                 Ok(RequestResult::bounds_read(low, high))
             }
             RequestOp::BlockProcess { all_devices } => {
-                // The holder is `user.block_token`, the value admission
-                // reads: C's `pblockProcessHolder = puserPvt`
-                // (asynManager.c:1709-1712).
+                // C `blockProcessCallback` (asynManager.c:1694-1725) counts the
+                // block; the holder is taken after this user's next callback
+                // ([`Self::settle_block`]).
                 let token = Self::block_identity(user)?;
-                let dp = self.dp_key(user.addr);
-                match self.block_holders.holder(*all_devices, dp) {
-                    Some((existing, count)) => {
-                        if existing != token {
-                            return Err(AsynError::Status {
-                                status: AsynStatus::Error,
-                                message: "port already blocked by another user".into(),
-                            });
-                        }
-                        // C parity: nested lock — increment the count
-                        // (`blockPortCount++` / `blockDeviceCount++`,
-                        // asynManager.c:1719-1722).
-                        self.block_holders
-                            .set_holder(*all_devices, dp, Some((token, count + 1)));
-                    }
-                    None => {
-                        self.block_holders
-                            .set_holder(*all_devices, dp, Some((token, 1)));
-                        // Messages already drained into the heap before this
-                        // BlockProcess executed would otherwise still be
-                        // dispatched to the driver, breaking block exclusivity.
-                        // enqueue_message only diverts messages that arrive
-                        // *after* the block, so re-test the heap against the
-                        // holders now. Re-testing rather than comparing tokens
-                        // is what keeps this in step with the gate: a device
-                        // block must divert only the requests resolving to
-                        // *that* `dpCommon`, and the gate is the one place that
-                        // knows which those are.
-                        let drained: Vec<ActorMessage> = self.heap.drain().collect();
-                        for msg in drained {
-                            if Self::is_lifecycle_op(&msg.op) || self.admits(&msg) {
-                                self.heap.push(msg);
-                            } else {
-                                self.pending_while_blocked.push(msg);
-                            }
-                        }
-                    }
+                if !self.driver.base().flags.can_block {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "asynManager::blockProcessCallback blockProcessCallback \
+                                  not supported because port is synchronous"
+                            .into(),
+                    });
                 }
+                if self.is_queued(token) {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "asynManager::blockProcessCallback is queued".into(),
+                    });
+                }
+                self.cells.blocks().lock().block(token, *all_devices);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::UnblockProcess { all_devices } => {
                 let token = Self::block_identity(user)?;
-                let dp = self.dp_key(user.addr);
-                if let Some((owner, count)) = self.block_holders.holder(*all_devices, dp) {
-                    if owner != token {
-                        // C parity: only the block holder can unblock
-                        return Err(AsynError::Status {
-                            status: AsynStatus::Error,
-                            message: "unblock rejected: not the block holder".into(),
-                        });
-                    }
-                    if count > 1 {
-                        self.block_holders
-                            .set_holder(*all_devices, dp, Some((owner, count - 1)));
-                    } else {
-                        self.block_holders.set_holder(*all_devices, dp, None);
-                        // C `unblockProcessCallback` signals the port thread only
-                        // when the block was actually released (`wasOwner`,
-                        // asynManager.c:1774) — the nested decrement above leaves
-                        // the port blocked and signals nothing.
-                        self.woken = true;
-                        // Only what the *remaining* holders now admit goes back
-                        // to the heap: releasing the device holder must not free
-                        // requests the port-wide holder still gates, and vice
-                        // versa. C gets this for free because it never moved
-                        // them off the queue in the first place (:889-892).
-                        let pending = std::mem::take(&mut self.pending_while_blocked);
-                        for msg in pending {
-                            if self.admits(&msg) {
-                                self.heap.push(msg);
-                            } else {
-                                self.pending_while_blocked.push(msg);
-                            }
-                        }
-                    }
+                if self.cells.blocks().lock().count(token, *all_devices) == 0 {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "asynManager::unblockProcessCallback but not locked".into(),
+                    });
                 }
+                if self.is_queued(token) {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "asynManager::unblockProcessCallback is queued".into(),
+                    });
+                }
+                let dp = self.dp_key(user.addr);
+                self.cells
+                    .blocks()
+                    .lock()
+                    .unblock(token, dp, *all_devices)
+                    .map_err(|message| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: message.into(),
+                    })?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::DrvUserCreate(req) => {
@@ -6075,7 +6253,10 @@ mod tests {
 
     #[test]
     fn actor_block_unblock_process() {
-        let tx = spawn_actor(TestDriver::new());
+        // C refuses a block on a synchronous port (asynManager.c:1708-1713).
+        let mut drv = TestDriver::new();
+        drv.base.flags.can_block = true;
+        let tx = spawn_actor(drv);
 
         // Write initial value
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -6118,6 +6299,13 @@ mod tests {
             .with_timeout(Duration::from_secs(1));
         owner.block_token = Some(42);
         send_and_wait(&tx, RequestOp::BlockProcess { all_devices: false }, owner).unwrap();
+        // The holder is taken when the owner's next callback returns
+        // (asynManager.c:931-934).
+        let mut owner = AsynUser::new(0)
+            .with_addr(0)
+            .with_timeout(Duration::from_secs(1));
+        owner.block_token = Some(42);
+        send_and_wait(&tx, RequestOp::Int32Read, owner).unwrap();
 
         // Address 1 — a different dpCommon — is not gated by it. Probed
         // without blocking on the reply: under a port-wide holder this read
@@ -6208,6 +6396,9 @@ mod tests {
 
         send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, u(7, -1)).unwrap();
         send_and_wait(&tx, RequestOp::BlockProcess { all_devices: false }, u(7, 0)).unwrap();
+        // Both holders are taken when the owner's next callback returns
+        // (asynManager.c:931-934).
+        send_and_wait(&tx, RequestOp::Int32Read, u(7, 0)).unwrap();
 
         // A non-owner on address 1: only the PORT holder gates it.
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -6261,11 +6452,16 @@ mod tests {
         // the C-parity ParamUndefined for an unset param; this test asserts
         // the unblock lifecycle, not undefined-read state.
         drv.base.params.set_int32(0, 0, 0).unwrap();
+        drv.base.flags.can_block = true;
         let tx = spawn_actor(drv);
 
-        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        user.block_token = Some(7);
-        send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, user).unwrap();
+        let owner = || {
+            let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            user.block_token = Some(7);
+            user
+        };
+        send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, owner()).unwrap();
+        send_and_wait(&tx, RequestOp::Int32Read, owner()).unwrap();
 
         // Submit the unblock with an already-expired deadline.
         let mut user = AsynUser::new(0).with_timeout(Duration::from_nanos(1));
@@ -6292,12 +6488,20 @@ mod tests {
     /// `send_and_wait` here would hang).
     #[test]
     fn actor_nonowner_lifecycle_runs_while_blocked() {
-        let tx = spawn_actor(TestDriver::new());
+        let mut drv = TestDriver::new();
+        drv.base.flags.can_block = true;
+        drv.base.params.set_int32(0, 0, 0).unwrap();
+        let tx = spawn_actor(drv);
 
-        // Block the port with owner token 42.
-        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
-        user.block_token = Some(42);
-        send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, user).unwrap();
+        // Block the port with owner token 42; the holder is taken when the
+        // owner's next callback returns.
+        let owner = || {
+            let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            user.block_token = Some(42);
+            user
+        };
+        send_and_wait(&tx, RequestOp::BlockProcess { all_devices: true }, owner()).unwrap();
+        send_and_wait(&tx, RequestOp::Int32Read, owner()).unwrap();
 
         // A non-owner (no block_token) SetEnable(false) must run immediately,
         // not divert — otherwise this call never returns.

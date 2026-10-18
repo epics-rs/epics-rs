@@ -2149,6 +2149,328 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
     }
 
+    /// A cell whose body blocks the whole port on its first run and, on its
+    /// second, unblocks it from inside the body when `unblock_in_body`.
+    struct SelfBlocker {
+        cell: std::sync::OnceLock<std::sync::Weak<crate::request::RequestCell>>,
+        runs: std::sync::atomic::AtomicU32,
+        tx: std::sync::mpsc::Sender<&'static str>,
+    }
+
+    impl crate::request::CellBody for SelfBlocker {
+        fn process(&self, _port: &mut dyn PortCalls) {
+            let cell = self.cell.get().unwrap().upgrade().unwrap();
+            match self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    cell.block_process_callback(true).unwrap();
+                    self.tx.send("blocked").unwrap();
+                }
+                _ => {
+                    cell.unblock_process_callback(true).unwrap();
+                    self.tx.send("unblocked").unwrap();
+                }
+            }
+        }
+        fn unrun(&self, why: crate::request::Unrun) {
+            panic!("the blocker did not run: {why:?}");
+        }
+        fn done(self: Arc<Self>) {}
+    }
+
+    /// A blocking port whose cell has blocked it, with another user's
+    /// `Int32Read` held behind the block; that user says "other" once it ran.
+    fn blocked_port() -> (
+        PortHandle,
+        Arc<crate::request::RequestCell>,
+        std::sync::mpsc::Receiver<&'static str>,
+    ) {
+        let mut driver = TestDriver::new();
+        driver.base.flags.can_block = true;
+        driver.base.params.set_int32(0, 0, 5).unwrap();
+        let mut handle = make_handle(driver);
+        handle.set_can_block(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = Arc::new(SelfBlocker {
+            cell: std::sync::OnceLock::new(),
+            runs: std::sync::atomic::AtomicU32::new(0),
+            tx: tx.clone(),
+        });
+        let cell = handle.new_cell(body.clone());
+        body.cell.set(Arc::downgrade(&cell)).unwrap();
+        handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("blocked"));
+
+        let other = handle.clone();
+        std::thread::spawn(move || {
+            other
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap();
+            tx.send("other").unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "another user's request ran while the cell held the block"
+        );
+        (handle, cell, rx)
+    }
+
+    /// C `unblockProcessCallback` from the port thread, inside the holder's
+    /// own callback (asynManager.c:1727-1786): the release lands when the
+    /// body returns, and the held user runs.
+    #[test]
+    fn unblocking_inside_the_body_releases_the_held_user() {
+        let (handle, cell, rx) = blocked_port();
+        handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("unblocked"));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
+    }
+
+    /// C `unblockProcessCallback` from any thread signals the port thread
+    /// (:1786), which then runs what the holder held back.
+    #[test]
+    fn unblocking_from_another_thread_wakes_the_port() {
+        let (_handle, cell, rx) = blocked_port();
+        std::thread::spawn(move || cell.unblock_process_callback(true).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
+    }
+
+    /// C's refusals, in C's order and text (:1694-1758).
+    #[test]
+    fn block_refusals_carry_c_text() {
+        use crate::request::{CellBody, Unrun};
+        use std::sync::mpsc as std_mpsc;
+
+        fn text(e: AsynError) -> String {
+            e.message()
+        }
+
+        // Nothing blocked.
+        let (handle, cell, _rx) = blocked_port();
+        let idle = handle.new_cell(Arc::new(SelfBlocker {
+            cell: std::sync::OnceLock::new(),
+            runs: std::sync::atomic::AtomicU32::new(0),
+            tx: std_mpsc::channel().0,
+        }));
+        assert_eq!(
+            text(idle.unblock_process_callback(true).unwrap_err()),
+            "asynManager::unblockProcessCallback but not locked"
+        );
+        assert_eq!(
+            text(cell.unblock_process_callback(false).unwrap_err()),
+            "asynManager::unblockProcessCallback but not locked"
+        );
+        let mut tokened = AsynUser::new(0);
+        tokened.block_token = Some(crate::user::next_block_token());
+        assert_eq!(
+            text(
+                handle
+                    .submit_blocking(RequestOp::UnblockProcess { all_devices: true }, tokened)
+                    .unwrap_err()
+            ),
+            "asynManager::unblockProcessCallback but not locked"
+        );
+
+        // A synchronous port, through the cell and through the op.
+        let sync = make_handle(TestDriver::new());
+        let sync_cell = sync.new_cell(Arc::new(SelfBlocker {
+            cell: std::sync::OnceLock::new(),
+            runs: std::sync::atomic::AtomicU32::new(0),
+            tx: std_mpsc::channel().0,
+        }));
+        let synchronous = "asynManager::blockProcessCallback blockProcessCallback \
+                           not supported because port is synchronous";
+        assert_eq!(
+            text(sync_cell.block_process_callback(true).unwrap_err()),
+            synchronous
+        );
+        let mut tokened = AsynUser::new(0);
+        tokened.block_token = Some(crate::user::next_block_token());
+        assert_eq!(
+            text(
+                sync.submit_blocking(RequestOp::BlockProcess { all_devices: true }, tokened)
+                    .unwrap_err()
+            ),
+            synchronous
+        );
+
+        // Queued: a cell queued behind a body that holds the port thread.
+        struct Stall(parking_lot::Mutex<std_mpsc::Receiver<()>>);
+        impl CellBody for Stall {
+            fn process(&self, _port: &mut dyn PortCalls) {
+                self.0.lock().recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the stall did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+        let mut driver = TestDriver::new();
+        driver.base.flags.can_block = true;
+        let mut port = make_handle(driver);
+        port.set_can_block(true);
+        let (go, wait) = std_mpsc::channel();
+        let stall = port.new_cell(Arc::new(Stall(parking_lot::Mutex::new(wait))));
+        let queued = port.new_cell(Arc::new(SelfBlocker {
+            cell: std::sync::OnceLock::new(),
+            runs: std::sync::atomic::AtomicU32::new(1),
+            tx: std_mpsc::channel().0,
+        }));
+        port.queue_request(&stall, &AsynUser::new(0)).unwrap();
+        port.queue_request(&queued, &AsynUser::new(0)).unwrap();
+        assert_eq!(
+            text(queued.block_process_callback(true).unwrap_err()),
+            "asynManager::blockProcessCallback is queued"
+        );
+        go.send(()).unwrap();
+        drop(cell);
+    }
+
+    /// The op path's `isQueued` (:1712-1716, :1745-1750): a user whose own
+    /// request waits behind another user's block can neither block nor
+    /// unblock until that request has run.
+    #[test]
+    fn a_user_with_a_queued_request_cannot_block_or_unblock() {
+        let (handle, cell, rx) = blocked_port();
+        let as_t = |t: u64| {
+            let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(5));
+            user.block_token = Some(t);
+            user
+        };
+        let t = crate::user::next_block_token();
+        // T counts a block it never holds: no callback of T has run since.
+        handle
+            .submit_blocking(RequestOp::BlockProcess { all_devices: true }, as_t(t))
+            .unwrap();
+        let waiter = handle.clone();
+        let (tx, ran) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            waiter
+                .submit_blocking(RequestOp::Int32Read, as_t(t))
+                .unwrap();
+            tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            handle
+                .submit_blocking(RequestOp::BlockProcess { all_devices: true }, as_t(t))
+                .unwrap_err()
+                .message(),
+            "asynManager::blockProcessCallback is queued"
+        );
+        assert_eq!(
+            handle
+                .submit_blocking(RequestOp::UnblockProcess { all_devices: true }, as_t(t))
+                .unwrap_err()
+                .message(),
+            "asynManager::unblockProcessCallback is queued"
+        );
+        // Released, both run in queue order; T's read leaves T the holder.
+        cell.unblock_process_callback(true).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
+        ran.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle
+            .submit_blocking(RequestOp::UnblockProcess { all_devices: true }, as_t(t))
+            .unwrap();
+    }
+
+    /// No block identity falls back to `reason` (reviewer5 B3): a user without
+    /// a `block_token` can neither block nor release, nor is it admitted as
+    /// the holder whose token equals its reason.
+    #[test]
+    fn a_user_without_a_block_identity_is_not_its_reason() {
+        let mut driver = TestDriver::new();
+        driver.base.flags.can_block = true;
+        driver.base.params.set_int32(0, 0, 5).unwrap();
+        let handle = make_handle(driver);
+        let tokenless = || AsynUser::new(0).with_timeout(Duration::from_secs(5));
+        assert!(
+            handle
+                .submit_blocking(RequestOp::BlockProcess { all_devices: true }, tokenless())
+                .is_err()
+        );
+
+        let as_zero = || {
+            let mut user = tokenless();
+            user.block_token = Some(0);
+            user
+        };
+        handle
+            .submit_blocking(RequestOp::BlockProcess { all_devices: true }, as_zero())
+            .unwrap();
+        handle
+            .submit_blocking(RequestOp::Int32Read, as_zero())
+            .unwrap();
+        assert!(
+            handle
+                .submit_blocking(RequestOp::UnblockProcess { all_devices: true }, tokenless())
+                .is_err()
+        );
+        let other = handle.clone();
+        let (tx, ran) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            other
+                .submit_blocking(RequestOp::Int32Read, tokenless())
+                .unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            ran.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a tokenless user with reason 0 was admitted past holder 0"
+        );
+        handle
+            .submit_blocking(RequestOp::UnblockProcess { all_devices: true }, as_zero())
+            .unwrap();
+        ran.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    /// The synchronous-port inline path runs the body as the cell (reviewer5
+    /// B4): every call the body makes carries the cell's block identity.
+    #[test]
+    fn a_synchronous_cell_body_calls_as_the_cell() {
+        use crate::request::{CellBody, Unrun};
+
+        struct Tokens {
+            base: PortDriverBase,
+            seen: Arc<parking_lot::Mutex<Vec<Option<u64>>>>,
+        }
+        impl PortDriver for Tokens {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+                self.seen.lock().push(user.block_token);
+                Ok(0)
+            }
+        }
+        struct Read;
+        impl CellBody for Read {
+            fn process(&self, port: &mut dyn PortCalls) {
+                port.call(&RequestOp::Int32Read, AsynUser::new(0)).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the read did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let handle = make_handle(Tokens {
+            base: PortDriverBase::new("sync_token", 1, PortFlags::default()),
+            seen: seen.clone(),
+        });
+        let cell = handle.new_cell(Arc::new(Read));
+        assert_eq!(
+            handle.queue_request(&cell, &AsynUser::new(0)).unwrap(),
+            QueueOutcome::Ran
+        );
+        assert_eq!(*seen.lock(), [Some(cell.block_token())]);
+    }
+
     /// C `queueRequest` runs `processUser` inline on a port without
     /// `ASYN_CANBLOCK` (asynManager.c:1555-1584) and queues it on one with.
     #[test]

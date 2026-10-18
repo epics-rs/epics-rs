@@ -271,6 +271,53 @@ impl RequestCell {
         true
     }
 
+    /// C `blockProcessCallback(pasynUser, allDevices)` (asynManager.c:1694-1725)
+    /// on this cell's block identity, from any thread. The block holds once
+    /// this cell's next callback returns, or the one running now.
+    pub fn block_process_callback(&self, all_devices: bool) -> AsynResult<()> {
+        if !self.queue.can_block {
+            return Err(block_error(
+                "asynManager::blockProcessCallback blockProcessCallback \
+                 not supported because port is synchronous",
+            ));
+        }
+        let slot = self.lock();
+        if slot.state.is_queued() {
+            return Err(block_error("asynManager::blockProcessCallback is queued"));
+        }
+        self.queue
+            .blocks()
+            .lock()
+            .block(self.block_token, all_devices);
+        Ok(())
+    }
+
+    /// C `unblockProcessCallback(pasynUser, allDevices)`
+    /// (asynManager.c:1727-1786), from any thread — the port thread inside this
+    /// cell's own callback included. Releasing the holder wakes the actor.
+    pub fn unblock_process_callback(&self, all_devices: bool) -> AsynResult<()> {
+        let slot = self.lock();
+        let mut blocks = self.queue.blocks().lock();
+        if blocks.count(self.block_token, all_devices) == 0 {
+            return Err(block_error(
+                "asynManager::unblockProcessCallback but not locked",
+            ));
+        }
+        if slot.state.is_queued() {
+            return Err(block_error("asynManager::unblockProcessCallback is queued"));
+        }
+        let dp = crate::port_actor::DpKey::of(self.queue.multi_device, slot.request.addr);
+        let was_owner = blocks
+            .unblock(self.block_token, dp, all_devices)
+            .map_err(block_error)?;
+        drop(blocks);
+        drop(slot);
+        if was_owner {
+            self.queue.nudge();
+        }
+        Ok(())
+    }
+
     /// [`CellBody::timeout_user`].
     pub(crate) fn timeout_user(&self) -> bool {
         self.body.timeout_user()
@@ -410,6 +457,13 @@ impl std::fmt::Debug for RequestCell {
     }
 }
 
+fn block_error(message: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: message.into(),
+    }
+}
+
 /// A port's queue of [`RequestCell`]s as the queueing side sees it: a push
 /// into capacity every registered cell reserved, and a wake of the actor —
 /// C's `ellAdd` and `epicsEventSignal(notifyPortThread)`
@@ -421,6 +475,13 @@ pub(crate) struct CellQueue {
     /// A request left the queue on someone else's clock — the timer's or a
     /// waiter's — and the actor still holds its entry.
     left: std::sync::atomic::AtomicBool,
+    /// The port's block state, under the lock C keeps it under
+    /// (`asynManagerLock`), so a block is counted and released from any
+    /// thread.
+    blocks: crate::port_actor::Blocks,
+    /// `ASYN_CANBLOCK`: C refuses a block on a synchronous port (:1708-1713).
+    can_block: bool,
+    multi_device: bool,
 }
 
 #[derive(Default)]
@@ -432,6 +493,18 @@ struct CellQueueInner {
 }
 
 impl CellQueue {
+    pub(crate) fn for_port(can_block: bool, multi_device: bool) -> Self {
+        Self {
+            can_block,
+            multi_device,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn blocks(&self) -> &crate::port_actor::Blocks {
+        &self.blocks
+    }
+
     /// A cell for this queue. Each cell reserves its own slot, so queueing one
     /// never grows the queue.
     pub(crate) fn new_cell(self: &Arc<Self>, body: Arc<dyn CellBody>) -> Arc<RequestCell> {

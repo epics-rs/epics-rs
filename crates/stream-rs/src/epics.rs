@@ -238,7 +238,8 @@ struct Lent {
 }
 
 // SAFETY: a `Lent` is dereferenced only on the thread that lent it (see
-// `RecordSlot::with`).
+// `RecordSlot::with`). Each `lend` takes `&mut` of the record, so the
+// record lock is held: the slot holds one thread's entries at a time.
 unsafe impl Send for Lent {}
 
 impl RecordSlot {
@@ -260,6 +261,12 @@ impl RecordSlot {
             thread: std::thread::current().id(),
         };
         let previous = self.0.lock().replace(lent);
+        assert!(
+            previous
+                .as_ref()
+                .is_none_or(|p| p.thread == std::thread::current().id()),
+            "a record lent on two threads at once"
+        );
         struct Restore<'a>(&'a RecordSlot, Option<Lent>);
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
@@ -1333,5 +1340,27 @@ impl DeviceSupport for StreamDevice {
 
     fn dtyp(&self) -> &str {
         "stream"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    #[test]
+    #[should_panic(expected = "a record lent on two threads at once")]
+    fn a_lend_while_another_thread_has_the_slot_panics() {
+        let slot = RecordSlot::default();
+        let (mut a, mut b) = (AiRecord::default(), AiRecord::default());
+        let (mut ca, mut cb) = (CommonFields::default(), CommonFields::default());
+        slot.lend(&mut a, &mut ca, || {
+            std::thread::scope(|s| {
+                let lent = s.spawn(|| slot.lend(&mut b, &mut cb, || ()));
+                if let Err(panic) = lent.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            })
+        });
     }
 }

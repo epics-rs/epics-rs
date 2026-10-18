@@ -602,7 +602,7 @@ fn device_init(rec: &mut MotorRecord, status: MotorStatus) -> Vec<MotorCommand> 
     );
     dev.init(rec as &mut dyn Record).unwrap();
     let mut commands = Vec::new();
-    while let Ok(batch) = motor_cmd_rx.try_recv() {
+    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = motor_cmd_rx.try_recv() {
         commands.extend(batch.commands);
     }
     commands

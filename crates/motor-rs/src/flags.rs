@@ -453,13 +453,12 @@ pub enum MotorCommand {
     SetAccel {
         acceleration: f64,
     },
-    /// A driver's own call on its axis, which its parameter write queues
-    /// through [`AxisUser::queue`](crate::controller_port::AxisUser::queue).
+    /// A driver's own call on its axis, which its parameter write runs
+    /// through [`AxisUser::run`](crate::controller_port::AxisUser::run).
     Driver(DriverCall),
 }
 
-/// The call a [`MotorCommand::Driver`] runs on the axis's poller, with the
-/// axis locked.
+/// The call a [`MotorCommand::Driver`] runs with the axis locked.
 #[derive(Clone)]
 pub struct DriverCall(Arc<dyn Fn(&mut dyn AsynMotor, &AsynUser) -> AsynResult<()> + Send + Sync>);
 

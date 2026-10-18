@@ -8,9 +8,16 @@ use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::PvString;
 use tokio::sync::mpsc;
 
+use std::sync::Mutex;
+
+use asyn_rs::interfaces::motor::AsynMotor;
+
 use crate::device_state::*;
 use crate::flags::MotorCommand;
-use crate::poll_loop::{CommandBatch, MissingAxis, MotorCommandSender, PollCommand};
+use crate::poll_loop::{
+    CommandBatch, MissingAxis, MotorCommandSender, PollCommand, SharedControllerPoll, ToAxis,
+    Written,
+};
 use crate::trace::{MotorTrace, TraceUser};
 
 /// An axis subclass's C `report(fp, level)`, which its controller's
@@ -64,6 +71,9 @@ pub enum DialLimitReset {
 #[derive(Clone)]
 pub struct MotorAxis {
     user: TraceUser,
+    /// The driver, which a controller-port write calls on the port thread.
+    motor: Arc<Mutex<dyn AsynMotor>>,
+    controller_poll: SharedControllerPoll,
     timeout: Duration,
     poll_cmd_tx: mpsc::Sender<PollCommand>,
     motor_cmd_tx: MotorCommandSender,
@@ -80,6 +90,7 @@ impl MotorAxis {
     /// `subscribers` is the list the axis' poller posts to.
     pub fn new(
         user: TraceUser,
+        motor: Arc<Mutex<dyn AsynMotor>>,
         timeout: Duration,
         poll_cmd_tx: mpsc::Sender<PollCommand>,
         motor_cmd_tx: MotorCommandSender,
@@ -87,6 +98,8 @@ impl MotorAxis {
     ) -> Self {
         Self {
             user,
+            motor,
+            controller_poll: SharedControllerPoll::default(),
             timeout,
             poll_cmd_tx,
             motor_cmd_tx,
@@ -96,6 +109,12 @@ impl MotorAxis {
             build_trans: None,
             disables_ntm: false,
         }
+    }
+
+    /// The controller poll its controller's UPDATE_STATUS write runs.
+    pub(crate) fn with_controller_poll(mut self, poll: SharedControllerPoll) -> Self {
+        self.controller_poll = poll;
+        self
     }
 
     pub(crate) fn disabling_ntm(mut self, disables_ntm: bool) -> Self {
@@ -108,6 +127,8 @@ impl MotorAxis {
     pub(crate) fn at(&self, user: TraceUser) -> Self {
         Self {
             user,
+            motor: self.motor.clone(),
+            controller_poll: self.controller_poll.clone(),
             timeout: self.timeout,
             poll_cmd_tx: self.poll_cmd_tx.clone(),
             motor_cmd_tx: self.motor_cmd_tx.clone(),
@@ -149,17 +170,37 @@ impl MotorAxis {
         &self.user
     }
 
-    /// Queue `command` on the poller for a writer that is no record: C's
-    /// controller port running a base function on the axis.
-    pub(crate) fn send(&self, command: MotorCommand) {
-        let _ = self.motor_cmd_tx.send(CommandBatch {
-            trace: Arc::new(MotorTrace::with_user(self.user.clone())),
-            record: None,
-            commands: vec![command],
-        });
+    /// The driver, for a controller-port write on the port thread.
+    pub(crate) fn motor(&self) -> &Arc<Mutex<dyn AsynMotor>> {
+        &self.motor
     }
 
-    /// Poll now and post: C `motorUpdateStatus_`.
+    /// C `pC->poll()`, which UPDATE_STATUS runs before the axis's.
+    pub(crate) fn controller_poll(&self) -> &SharedControllerPoll {
+        &self.controller_poll
+    }
+
+    /// Queue `command` on the poller as a harness's batch, which no record
+    /// sent.
+    #[cfg(test)]
+    pub(crate) fn send(&self, command: MotorCommand) {
+        let _ = self.motor_cmd_tx.send(
+            CommandBatch {
+                trace: Arc::new(MotorTrace::with_user(self.user.clone())),
+                record: None,
+                commands: vec![command],
+            }
+            .into(),
+        );
+    }
+
+    /// Hand the poller what a controller-port write set on the axis.
+    pub(crate) fn post_written(&self, written: Written) {
+        let _ = self.motor_cmd_tx.send(written.into());
+    }
+
+    /// Poll now and post: the drvMotorAsyn stand-in's GET_INFO.
+    #[cfg(test)]
     pub(crate) fn force_poll(&self) {
         let _ = self.poll_cmd_tx.try_send(PollCommand::ForcePoll);
     }
@@ -346,7 +387,7 @@ impl MotorDeviceSupport {
 impl CommandPort {
     /// A port whose commands land on the returned channel as record 0's:
     /// for a harness with no poller.
-    pub fn capture() -> (Self, mpsc::UnboundedReceiver<CommandBatch>) {
+    pub fn capture() -> (Self, mpsc::UnboundedReceiver<ToAxis>) {
         let (motor_cmd_tx, motor_cmd_rx) = mpsc::unbounded_channel();
         let port = Self {
             link: AxisLink::Bound {
@@ -413,11 +454,14 @@ impl CommandPort {
                 record,
                 ..
             } => {
-                let _ = motor_cmd_tx.send(CommandBatch {
-                    trace: self.trace.clone(),
-                    record: Some(*record),
-                    commands,
-                });
+                let _ = motor_cmd_tx.send(
+                    CommandBatch {
+                        trace: self.trace.clone(),
+                        record: Some(*record),
+                        commands,
+                    }
+                    .into(),
+                );
             }
             AxisLink::Missing(missing) => {
                 crate::poll_loop::refuse_commands(&self.trace, *missing, &commands);

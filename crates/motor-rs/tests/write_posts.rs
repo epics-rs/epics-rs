@@ -95,7 +95,7 @@ impl AsynMotor for Axis {
 
 struct Rig {
     poll_loop: MotorPollLoop,
-    commands: mpsc::UnboundedSender<CommandBatch>,
+    commands: mpsc::UnboundedSender<motor_rs::poll_loop::ToAxis>,
     trace: Arc<MotorTrace>,
     /// The record whose commands run.
     record: Bound,
@@ -191,11 +191,11 @@ impl Rig {
             self.record.state.lock().unwrap().move_queued();
         }
         self.commands
-            .send(CommandBatch {
+            .send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
                 trace: self.trace.clone(),
                 record: Some(0),
                 commands: vec![command],
-            })
+            }))
             .unwrap();
         self.poll_loop.run_queued_commands();
         let mut posts = self.observer.passes();

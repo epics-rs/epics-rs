@@ -1614,16 +1614,19 @@ async fn force_poll_does_not_reload_the_forced_fast_polls() {
     settled(7).await;
 
     motor_cmd_tx
-        .send(motor_rs::poll_loop::CommandBatch {
-            trace: Arc::new(motor_rs::trace::MotorTrace::new("forcePollFast", 0)),
-            record: Some(0),
-            commands: vec![MotorCommand::MoveAbsolute {
-                position: 10.0,
-                min_velocity: 0.0,
-                velocity: 1.0,
-                acceleration: 1.0,
-            }],
-        })
+        .send(
+            motor_rs::poll_loop::CommandBatch {
+                trace: Arc::new(motor_rs::trace::MotorTrace::new("forcePollFast", 0)),
+                record: Some(0),
+                commands: vec![MotorCommand::MoveAbsolute {
+                    position: 10.0,
+                    min_velocity: 0.0,
+                    velocity: 1.0,
+                    acceleration: 1.0,
+                }],
+            }
+            .into(),
+        )
         .unwrap();
     // The move wakes the poller: one poll and 5 forced fast polls.
     settled(13).await;

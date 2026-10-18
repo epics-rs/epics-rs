@@ -91,11 +91,11 @@ fn run_from(
         Duration::from_secs(1),
         0,
     );
-    tx.send(CommandBatch {
+    tx.send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
         trace: Arc::new(MotorTrace::with_user(user)),
         record,
         commands,
-    })
+    }))
     .unwrap();
     poll_loop.run_queued_commands();
     let seen = seen.lock().unwrap().clone();
@@ -135,6 +135,7 @@ fn controller_with(port: &str, params: impl ControllerParams) -> (TraceUser, Por
     let (poll_tx, _) = mpsc::channel(1);
     register_axis(MotorAxis::new(
         user.clone(),
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         Duration::from_secs(1),
         poll_tx,
         motor_tx,

@@ -87,7 +87,14 @@ fn axis(user: TraceUser, position: f64) {
 fn unpolled(user: TraceUser, subscribers: AxisSubscribers) -> MotorAxis {
     let (poll_tx, _) = mpsc::channel(16);
     let (cmd_tx, _) = mpsc::unbounded_channel();
-    MotorAxis::new(user, Duration::from_secs(1), poll_tx, cmd_tx, subscribers)
+    MotorAxis::new(
+        user,
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
+        Duration::from_secs(1),
+        poll_tx,
+        cmd_tx,
+        subscribers,
+    )
 }
 
 /// `port`'s trace, written to a fresh file from now on.
@@ -959,6 +966,7 @@ async fn a_record_in_comm_alarm_sends_no_command() {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     register_axis(MotorAxis::new(
         asyn("COMM", 0),
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         Duration::from_secs(1),
         poll_tx,
         cmd_tx,
@@ -1009,6 +1017,7 @@ async fn a_model1_record_in_comm_alarm_still_sends_its_move() {
             card: 9,
             signal: 0,
         },
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         Duration::from_secs(1),
         poll_tx,
         cmd_tx,
@@ -1037,6 +1046,9 @@ record(motor, "C1:m") { field(DTYP, "TestModel1") field(OUT, "#C9 S0 @") field(M
         .await
         .expect("the move reaches the driver")
         .unwrap();
+    let motor_rs::poll_loop::ToAxis::Batch(sent) = sent else {
+        panic!("{sent:?}");
+    };
     assert!(sent.commands.iter().any(|c| c.is_move()), "{sent:?}");
 }
 
@@ -1061,6 +1073,7 @@ async fn a_move_start_pass_commits_and_resets_the_alarm() {
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         register_axis(MotorAxis::new(
             asyn(port, 0),
+            std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
             Duration::from_secs(1),
             poll_tx,
             cmd_tx,

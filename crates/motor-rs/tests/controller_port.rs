@@ -2,7 +2,7 @@
 //! `writeFloat64` and a subclass's own parameters at the controller and
 //! axis addresses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,33 +53,135 @@ impl ControllerParams for Pmacish {
     }
 }
 
+/// The driver calls the port makes on an axis, as the commands they run.
+#[derive(Default)]
+struct Recorder(Arc<Mutex<VecDeque<MotorCommand>>>);
+
+impl Recorder {
+    fn push(&self, command: MotorCommand) -> AsynResult<()> {
+        self.0.lock().unwrap().push_back(command);
+        Ok(())
+    }
+}
+
+impl asyn_rs::interfaces::motor::AsynMotor for Recorder {
+    fn move_absolute(&mut self, _: &AsynUser, p: f64, b: f64, v: f64, a: f64) -> AsynResult<()> {
+        self.push(MotorCommand::MoveAbsolute {
+            position: p,
+            min_velocity: b,
+            velocity: v,
+            acceleration: a,
+        })
+    }
+    fn move_relative(&mut self, _: &AsynUser, d: f64, b: f64, v: f64, a: f64) -> AsynResult<()> {
+        self.push(MotorCommand::MoveRelative {
+            distance: d,
+            min_velocity: b,
+            velocity: v,
+            acceleration: a,
+        })
+    }
+    fn move_velocity(&mut self, _: &AsynUser, b: f64, v: f64, a: f64) -> AsynResult<()> {
+        self.push(MotorCommand::MoveVelocity {
+            min_velocity: b,
+            velocity: v,
+            acceleration: a,
+        })
+    }
+    fn home(&mut self, _: &AsynUser, b: f64, v: f64, a: f64, forward: bool) -> AsynResult<()> {
+        self.push(MotorCommand::Home {
+            forward,
+            min_velocity: b,
+            velocity: v,
+            acceleration: a,
+        })
+    }
+    fn stop(&mut self, _: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.push(MotorCommand::Stop { acceleration })
+    }
+    fn set_position(&mut self, _: &AsynUser, position: f64) -> AsynResult<()> {
+        self.push(MotorCommand::SetPosition { position })
+    }
+    fn set_encoder_position(&mut self, _: &AsynUser, position: f64) -> AsynResult<()> {
+        self.push(MotorCommand::SetEncoderPosition { position })
+    }
+    fn set_closed_loop(&mut self, _: &AsynUser, enable: bool) -> AsynResult<()> {
+        self.push(MotorCommand::SetClosedLoop { enable })
+    }
+    fn set_deferred_moves(&mut self, _: &AsynUser, defer: bool) -> AsynResult<()> {
+        self.push(MotorCommand::DeferMoves { defer })
+    }
+    fn initialize_profile(&mut self, _: &AsynUser, max_points: usize) -> AsynResult<()> {
+        self.push(MotorCommand::ProfileInitialize { max_points })
+    }
+    fn define_profile(&mut self, _: &AsynUser, positions: &[f64]) -> AsynResult<()> {
+        self.push(MotorCommand::ProfileDefine {
+            positions: positions.to_vec(),
+        })
+    }
+    fn build_profile(&mut self, _: &AsynUser) -> AsynResult<()> {
+        self.push(MotorCommand::ProfileBuild)
+    }
+    fn execute_profile(&mut self, _: &AsynUser) -> AsynResult<()> {
+        self.push(MotorCommand::ProfileExecute)
+    }
+    fn abort_profile(&mut self, _: &AsynUser) -> AsynResult<()> {
+        self.push(MotorCommand::ProfileAbort)
+    }
+    fn readback_profile(&mut self, _: &AsynUser) -> AsynResult<Vec<f64>> {
+        self.push(MotorCommand::ProfileReadback)?;
+        Ok(Vec::new())
+    }
+    fn poll_failure(&self) -> asyn_rs::interfaces::motor::PollFailure {
+        asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+    fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+        self.push(MotorCommand::Poll)?;
+        Ok(Default::default())
+    }
+}
+
 struct Axis {
-    commands: mpsc::UnboundedReceiver<CommandBatch>,
+    calls: Arc<Mutex<VecDeque<MotorCommand>>>,
     polls: mpsc::Receiver<PollCommand>,
+    // Held so the port's posts to the poller find it open.
+    _commands: mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
 }
 
 fn axis(port: &str, addr: i32) -> Axis {
     let (motor_tx, commands) = mpsc::unbounded_channel();
     let (poll_tx, polls) = mpsc::channel(1);
+    let recorder = Recorder::default();
+    let calls = recorder.0.clone();
     register_axis(MotorAxis::new(
         TraceUser::Asyn {
             port: port.into(),
             addr,
         },
+        Arc::new(Mutex::new(recorder)),
         Duration::from_secs(1),
         poll_tx,
         motor_tx,
         AxisSubscribers::new(),
     ))
     .unwrap();
-    Axis { commands, polls }
+    Axis {
+        calls,
+        polls,
+        _commands: commands,
+    }
 }
 
 fn next(axis: &mut Axis) -> MotorCommand {
-    let batch = axis.commands.try_recv().expect("a command");
-    assert_eq!(batch.record, None);
-    let [command] = <[_; 1]>::try_from(batch.commands).unwrap();
-    command
+    axis.calls
+        .lock()
+        .unwrap()
+        .pop_front()
+        .expect("a driver call")
+}
+
+fn no_call(axis: &Axis) -> bool {
+    axis.calls.lock().unwrap().is_empty()
 }
 
 #[test]
@@ -220,17 +322,18 @@ fn base_int32_functions_reach_the_axis() {
     assert_eq!(next(&mut ax), MotorCommand::Stop { acceleration: 4.0 });
     port.write_int32_blocking(index::CLOSED_LOOP, 1, 1).unwrap();
     assert_eq!(next(&mut ax), MotorCommand::SetClosedLoop { enable: true });
+    // C polls inside the write, ahead of its callbacks and closing line
+    // (asynMotorController.cpp:217-221, :245-254).
     port.write_int32_blocking(index::UPDATE_STATUS, 1, 1)
         .unwrap();
-    assert!(matches!(ax.polls.try_recv(), Ok(PollCommand::ForcePoll)));
-    assert!(ax.commands.try_recv().is_err());
+    assert_eq!(next(&mut ax), MotorCommand::Poll);
+    assert!(ax.polls.try_recv().is_err());
 }
 
 /// C's base write posts with the callParamCallbacks after the driver call
-/// (asynMotorController.cpp:203-245, :277-460); a write handed to the axis
-/// is posted by the axis's poller once the call ran, not by the port.
+/// (asynMotorController.cpp:203-245, :277-460), inside the write.
 #[test]
-fn a_write_handed_to_the_axis_is_posted_after_the_driver_call() {
+fn a_port_write_to_an_axis_is_posted_after_the_driver_call() {
     use asyn_rs::interrupt::InterruptFilter;
     let gate = epics_base_rs::runtime::interrupt_accept::InterruptGate::new();
     let port = register_controller_port(&gate, "CPPOSTW", 2, ()).unwrap();
@@ -274,15 +377,11 @@ fn a_write_handed_to_the_axis_is_posted_after_the_driver_call() {
     assert_eq!(next(&mut ax), MotorCommand::SetClosedLoop { enable: true });
     assert!(matches!(next(&mut ax), MotorCommand::MoveAbsolute { .. }));
     let posted = |rx: &mut asyn_rs::interrupt::InterruptReceiver| {
-        rt.block_on(async { tokio::time::timeout(Duration::from_millis(200), rx.recv()).await })
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), rx.recv()).await })
             .ok()
             .flatten()
             .is_some()
     };
-    assert!(!posted(&mut closed_loop), "posted ahead of setClosedLoop");
-    assert!(!posted(&mut move_abs), "posted ahead of move");
-    // The poller's callParamCallbacks after the call posts both.
-    port.set_params_and_notify_blocking(1, Vec::new()).unwrap();
     assert!(posted(&mut closed_loop));
     assert!(posted(&mut move_abs));
 }
@@ -461,12 +560,12 @@ fn build_profile_fills_the_fixed_times_and_reaches_every_axis() {
 #[test]
 fn build_profile_fails_on_an_undefined_parameter() {
     let port = register_controller_port(&open_owner(), "CPPBUNDEF", 1, ()).unwrap();
-    let mut ax = axis("CPPBUNDEF", 0);
+    let ax = axis("CPPBUNDEF", 0);
     assert!(
         port.write_int32_blocking(index::PROFILE_BUILD, 0, 1)
             .is_err()
     );
-    assert!(ax.commands.try_recv().is_err());
+    assert!(no_call(&ax));
 }
 
 #[test]
@@ -624,7 +723,7 @@ fn profile_arrays_are_cut_to_the_profile_and_positions_go_to_controller_units() 
     write_array(&port, index::PROFILE_POSITIONS, 0, vec![2.0]).unwrap();
     assert_eq!(axis_positions::<()>(&port, 0), [0.0, 0.0, 0.0]);
     next(&mut ax0);
-    assert!(ax0.commands.try_recv().is_err());
+    assert!(no_call(&ax0));
 }
 
 #[test]
@@ -1134,12 +1233,12 @@ fn the_hook_status_reaches_the_record() {
 fn the_hook_refuses_a_port_write_before_the_base() {
     let (params, seen) = Hooked::new();
     let port = register_controller_port(&open_owner(), "CPHOOKREF", 2, params).unwrap();
-    let mut ax = axis("CPHOOKREF", 1);
+    let ax = axis("CPHOOKREF", 1);
     assert!(
         port.write_float64_blocking(index::MOVE_ABS, 1, 3.0)
             .is_err()
     );
-    assert!(ax.commands.try_recv().is_err());
+    assert!(no_call(&ax));
     assert!(port.read_float64_blocking(index::MOVE_ABS, 1).is_err());
     assert_eq!(
         take(&seen),
@@ -1148,28 +1247,35 @@ fn the_hook_refuses_a_port_write_before_the_base() {
 }
 
 #[test]
-fn a_port_write_an_axis_runs_reaches_the_hook_once_the_axis_has() {
+fn a_port_write_an_axis_runs_reaches_the_hook_after_the_driver_call() {
     let (params, seen) = Hooked::new();
     let port = register_controller_port(&open_owner(), "CPHOOKAXIS", 2, params).unwrap();
     let mut ax = axis("CPHOOKAXIS", 0);
     port.write_float64_blocking(index::ENCODER_POSITION, 0, 4.0)
         .unwrap();
-    assert!(take(&seen).is_empty(), "the axis has not run it");
-    let command = next(&mut ax);
-    let mut motor = Encoder::default();
-    motor_rs::poll_loop::execute_commands(
-        &mut motor,
-        &motor_rs::trace::MotorTrace::new("CPHOOKAXIS", 0),
-        &[command],
-        &mut |_| {},
+    assert_eq!(
+        next(&mut ax),
+        MotorCommand::SetEncoderPosition { position: 4.0 }
     );
-    assert_eq!(motor.0, [4.0]);
     assert_eq!(
         take(&seen),
         [(0, index::ENCODER_POSITION, WriteValue::Float64(4.0), true)]
     );
     let comms = port.read_int32_blocking(index::STATUS_COMMS_ERROR, 0);
     assert_eq!(comms.unwrap(), 0);
+}
+
+#[test]
+fn a_port_write_the_axis_runs_keeps_the_value_written() {
+    let (params, seen) = Hooked::new();
+    let port = register_controller_port(&open_owner(), "CPHOOKVAL", 2, params).unwrap();
+    let mut ax = axis("CPHOOKVAL", 0);
+    port.write_int32_blocking(index::STOP, 0, 1).unwrap();
+    assert!(matches!(next(&mut ax), MotorCommand::Stop { .. }));
+    // C stores and prints the value written, not one rebuilt from the
+    // driver call (asynMotorController.cpp:204, :245-254).
+    assert_eq!(take(&seen), [(0, index::STOP, WriteValue::Int32(1), true)]);
+    assert_eq!(port.read_int32_blocking(index::STOP, 0).unwrap(), 1);
 }
 
 #[test]
@@ -1226,6 +1332,7 @@ fn the_controller_report_runs_the_driver_then_each_axis_then_the_base() {
                 port: "CPREPORT".into(),
                 addr,
             },
+            Arc::new(Mutex::new(Recorder::default())),
             Duration::from_secs(1),
             poll_tx,
             motor_tx,
@@ -1688,7 +1795,7 @@ fn every_subclass_entry_is_handed_getaddress_s_axis() {
     assert_eq!(*seen.lock().unwrap(), [0; 8]);
 }
 
-/// Records the closed-loop calls and moves the poller runs.
+/// Records the closed-loop calls, moves and polls.
 struct Servoed(Arc<Mutex<Vec<String>>>);
 
 impl asyn_rs::interfaces::motor::AsynMotor for Servoed {
@@ -1716,13 +1823,14 @@ impl asyn_rs::interfaces::motor::AsynMotor for Servoed {
         asyn_rs::interfaces::motor::PollFailure::PROBLEM_AND_COMMS_ERROR
     }
     fn poll(&mut self, _: &AsynUser) -> AsynResult<asyn_rs::interfaces::motor::MotorStatus> {
+        self.0.lock().unwrap().push("poll".into());
         Ok(asyn_rs::interfaces::motor::MotorStatus::default())
     }
 }
 
 /// pi-gcs2's PI_SUP_SERVO shape: a parameter of the driver's whose write
 /// switches the axis's closed loop, after the port has been busy long
-/// enough for a record move to take the axis and wait on the port.
+/// enough for a record move to wait on the port.
 #[derive(Default)]
 struct Servo {
     reason: usize,
@@ -1744,14 +1852,15 @@ impl ControllerParams for Servo {
             return ParamWrite::PassToBase(Ok(()));
         }
         std::thread::sleep(Duration::from_millis(200));
-        ParamWrite::Handled(user.queue(base, MotorCommand::SetClosedLoop { enable: value != 0 }))
+        ParamWrite::Handled(user.run(base, MotorCommand::SetClosedLoop { enable: value != 0 }))
     }
 }
 
-/// A driver's write queued on the axis runs on its poller, and does not
-/// wait on a record move that holds the axis while it waits on the port.
+/// A driver's write runs on the port thread with the axis locked, as C's
+/// does under the controller lock, and a record move the poller runs
+/// meanwhile reads its speeds from the port without holding the axis.
 #[test]
-fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
+fn a_driver_write_overlapping_a_record_move_does_not_deadlock() {
     use motor_rs::poll_loop::{MotorPollLoop, PollerInbox};
     use motor_rs::trace::MotorTrace;
     let name = "CPQUEUE";
@@ -1763,17 +1872,18 @@ fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
         port: name.into(),
         addr: 0,
     };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
+        Arc::new(Mutex::new(Servoed(seen.clone())));
     register_axis(MotorAxis::new(
         user.clone(),
+        motor.clone(),
         Duration::from_secs(1),
         poll_tx,
         motor_tx.clone(),
         AxisSubscribers::new(),
     ))
     .unwrap();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let motor: Arc<Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>> =
-        Arc::new(Mutex::new(Servoed(seen.clone())));
     let mut poll_loop = MotorPollLoop::new(
         PollerInbox { poll, commands },
         motor,
@@ -1782,13 +1892,14 @@ fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
         Duration::from_secs(1),
         0,
     );
+    seen.lock().unwrap().clear();
     let write = {
         let port = port.clone();
         std::thread::spawn(move || port.write_int32_blocking(reason, 0, 1))
     };
     std::thread::sleep(Duration::from_millis(50));
     motor_tx
-        .send(CommandBatch {
+        .send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
             trace: Arc::new(MotorTrace::with_user(user)),
             record: Some(0),
             commands: vec![
@@ -1800,7 +1911,7 @@ fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
                     acceleration: 1.0,
                 },
             ],
-        })
+        }))
         .unwrap();
     let poller = std::thread::spawn(move || {
         poll_loop.run_queued_commands();
@@ -1815,7 +1926,6 @@ fn a_queued_driver_write_overlapping_a_record_move_runs_on_the_poller() {
         std::thread::sleep(Duration::from_millis(10));
     }
     write.join().unwrap().unwrap();
-    let mut poll_loop = poller.join().unwrap();
-    poll_loop.run_queued_commands();
-    assert_eq!(*seen.lock().unwrap(), ["move 5", "servo true"]);
+    poller.join().unwrap();
+    assert_eq!(*seen.lock().unwrap(), ["servo true", "move 5"]);
 }

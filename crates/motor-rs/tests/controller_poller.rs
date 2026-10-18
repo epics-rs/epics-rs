@@ -142,8 +142,9 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
     let (motor, user) = axis("A2", 2);
     let ControllerAxis { poll_cmd_tx, .. } = controller.axis(motor, user);
     let axes = controller.axes();
-    let poller = tokio::spawn(controller.build(PERIOD, PERIOD, 0).run());
-    tokio::time::sleep(PERIOD * 4).await;
+    // No timed pass: each pass below is one a Wakeup asks for.
+    let idle = Duration::from_secs(3600);
+    let poller = tokio::spawn(controller.build(idle, idle, 0).run());
     let (motor, user) = axis("A0", 0);
     // Held: a dropped axis ends the poller.
     let _a0 = tokio::task::spawn_blocking(move || axes.add(motor, user))
@@ -151,22 +152,21 @@ async fn an_axis_added_after_the_poller_starts_joins_it_in_address_order() {
         .unwrap()
         .unwrap();
     let joined = log.lock().unwrap().len();
-    tokio::time::sleep(PERIOD * 8).await;
+    for pass in 1..=2 {
+        poll_cmd_tx.send(PollCommand::Wakeup).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.lock().unwrap().len() < joined + 3 * pass {
+            assert!(Instant::now() < deadline, "pass {pass} never ran");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
     poll_cmd_tx.send(PollCommand::Shutdown).await.unwrap();
     poller.await.unwrap();
-    // A pass may be under way when the add returns; count from the next.
     let names: Vec<_> = log.lock().unwrap()[joined..]
         .iter()
         .map(|(name, _)| *name)
-        .skip_while(|&name| name != "C")
         .collect();
-    assert!(names.len() >= 6, "{names:?}");
-    let whole = names.len() / 3 * 3;
-    assert_eq!(
-        names[..whole],
-        ["C", "A0", "A2"].repeat(whole / 3),
-        "{names:?}"
-    );
+    assert_eq!(names, ["C", "A0", "A2"].repeat(2));
 }
 
 /// Moves one count every poll, so every poll posts a change.

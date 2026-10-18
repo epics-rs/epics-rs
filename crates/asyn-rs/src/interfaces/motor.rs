@@ -7,6 +7,92 @@ use parking_lot::Mutex;
 use crate::error::AsynResult;
 use crate::user::AsynUser;
 
+/// One step a driver makes on its own controller port: C's
+/// `setXxxParam(addr, …)` or `callParamCallbacks(addr)`, `pAxis->setXxxParam`
+/// on the axis's own address, a status field set and called back on axis
+/// `addr`, or `epicsEventSignal(pollEventId_)`.
+#[derive(Debug, Clone)]
+pub enum PortSet {
+    Set {
+        addr: i32,
+        reason: usize,
+        value: crate::param::ParamValue,
+    },
+    Axis {
+        reason: usize,
+        value: crate::param::ParamValue,
+    },
+    Callbacks(i32),
+    Status {
+        addr: i32,
+        field: StatusWrite,
+    },
+    WakeupPoller,
+}
+
+/// The steps a driver made on its own controller port, in the order made;
+/// see [`AsynMotor::take_port_sets`].
+#[derive(Debug, Clone, Default)]
+pub struct PortSets(Vec<PortSet>);
+
+impl PortSets {
+    pub fn set(&mut self, addr: i32, reason: usize, value: crate::param::ParamValue) {
+        self.0.push(PortSet::Set {
+            addr,
+            reason,
+            value,
+        });
+    }
+
+    pub fn call_param_callbacks(&mut self, addr: i32) {
+        self.0.push(PortSet::Callbacks(addr));
+    }
+
+    /// C's `pAxis->setXxxParam(…)` beyond the status, such as phytron's
+    /// `axisStatus_` (phytronAxisMotor.cpp:2084): on the axis's own
+    /// address, posted by the `callParamCallbacks` that ends the poll or
+    /// the write (asynMotorController.cpp:319).
+    pub fn axis(&mut self, reason: usize, value: crate::param::ParamValue) {
+        self.0.push(PortSet::Axis { reason, value });
+    }
+
+    /// C's `pAxis->setIntegerParam(motorStatusXxx_, …)` then
+    /// `pAxis->callParamCallbacks()` on axis `addr`, which may be another
+    /// axis than the caller's.
+    pub fn status(&mut self, addr: i32, field: StatusWrite) {
+        self.0.push(PortSet::Status { addr, field });
+    }
+
+    /// C `epicsEventSignal(pollEventId_)`: the controller's poller passes.
+    pub fn wakeup_poller(&mut self) {
+        self.0.push(PortSet::WakeupPoller);
+    }
+
+    pub fn append(&mut self, mut other: PortSets) {
+        self.0.append(&mut other.0);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl IntoIterator for PortSets {
+    type Item = PortSet;
+    type IntoIter = std::vec::IntoIter<PortSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// A controller poll that sets nothing on its port.
+impl From<()> for PortSets {
+    fn from((): ()) -> Self {
+        Self::default()
+    }
+}
+
 /// A model-1 record's POST field, shared with the device: C arms a move with
 /// `postmsgptr = &mr->post` and the driver copies it out when the move is
 /// done, so a POST put during the move is the one sent. A clone is the same
@@ -465,13 +551,14 @@ pub trait AsynMotor: std::any::Any + Send + Sync {
         Vec::new()
     }
 
-    /// The controller port parameters the poll or write method just set on
-    /// the axis's address beyond its status, such as phytron's
-    /// `axisStatus_` (phytronAxisMotor.cpp:2084): the poller posts them in
-    /// the `callParamCallbacks` that ends the poll or the write
-    /// (asynMotorController.cpp:319). None by default.
-    fn take_poll_params(&mut self) -> Vec<(usize, crate::param::ParamValue)> {
-        Vec::new()
+    /// What the poll or write method just did to its own controller port,
+    /// in C's program order: its `setXxxParam` calls on the controller or
+    /// on the axis, and `callParamCallbacks(addr)`, made under the lock the
+    /// method holds. The axis's owner applies them once it lets go of the
+    /// axis; a driver never calls its own port from under the axis lock.
+    /// None by default.
+    fn take_port_sets(&mut self) -> PortSets {
+        PortSets::default()
     }
 
     /// A model-2 driver's `motorAxisforceCallback`, which drvMotorAsyn

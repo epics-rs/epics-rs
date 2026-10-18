@@ -123,6 +123,7 @@ fn a_new_axis_sets_what_the_asyn_motor_axis_constructor_does() {
             port: "axisCtorParams".into(),
             addr: 1,
         },
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         Duration::from_secs(1),
         poll_tx,
         motor_tx,
@@ -205,11 +206,11 @@ fn a_records_get_info_polls_and_posts_an_unchanged_status() {
     };
     let primed = seq(&state);
 
-    tx.send(CommandBatch {
+    tx.send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
         trace,
         record: Some(record),
         commands: vec![MotorCommand::Poll],
-    })
+    }))
     .unwrap();
     poll_loop.run_queued_commands();
     // C motorUpdateStatus_: poll, then force the callback

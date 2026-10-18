@@ -1,14 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asyn_rs::interfaces::motor::AsynMotor;
+use asyn_rs::interfaces::motor::{AsynMotor, PortSets};
 use epics_base_rs::server::record::Record;
 use tokio::sync::mpsc;
 
 use crate::device_state::AxisSubscribers;
 use crate::device_support::{MotorAxis, MotorDeviceSupport};
 use crate::poll_loop::{
-    Axis, ControllerPoll, Join, Joining, MotorPollLoop, PollCommand, PollerInbox,
+    Axis, Join, Joining, MotorPollLoop, PollCommand, PollerInbox, SharedControllerPoll,
 };
 use crate::record::MotorRecord;
 use crate::trace::TraceUser;
@@ -191,6 +191,7 @@ fn axis_parts(
     let disables_ntm = motor.lock().is_ok_and(|m| m.disables_ntm());
     let axis = MotorAxis::new(
         user,
+        motor.clone(),
         timeout,
         poll_cmd_tx.clone(),
         motor_cmd_tx,
@@ -214,7 +215,6 @@ pub struct ControllerAxis {
 /// in turn: C `startPoller`'s thread (asynMotorController.cpp:567-575).
 #[derive(Default)]
 pub struct ControllerBuilder {
-    controller_poll: Option<ControllerPoll>,
     axes: ControllerAxes,
 }
 
@@ -226,6 +226,8 @@ pub struct ControllerAxes(Arc<Mutex<Axes>>);
 
 struct Axes {
     list: AxisList,
+    /// The controller poll, which each axis's UPDATE_STATUS write runs too.
+    poll: SharedControllerPoll,
     /// Each driver axis added, once: a later add of the same one is another
     /// address of the axis already polled.
     opened: Vec<Opened>,
@@ -250,6 +252,7 @@ impl Default for ControllerAxes {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(Axes {
             list: AxisList::Pending(Vec::new()),
+            poll: SharedControllerPoll::default(),
             opened: Vec::new(),
         })))
     }
@@ -280,6 +283,9 @@ impl ControllerAxes {
         };
         let same = |o: &Opened| std::ptr::addr_eq(Arc::as_ptr(&o.motor), Arc::as_ptr(&motor));
         let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((port, _)) = &mirror {
+            axes.poll.set_port(port);
+        }
         // Recorded before the poller confirms, so a concurrent add of the
         // same motor finds it.
         let (join, added) = if let Some(opened) = axes.opened.iter_mut().find(|o| same(o)) {
@@ -304,6 +310,7 @@ impl ControllerAxes {
         } else {
             let (axis, inbox, subscribers, poll_cmd_tx) =
                 axis_parts(&motor, user, timeout, capacity);
+            let axis = axis.with_controller_poll(axes.poll.clone());
             axes.opened.push(Opened {
                 motor: motor.clone(),
                 axis: axis.at(axis.address().clone()),
@@ -343,11 +350,18 @@ impl ControllerAxes {
     }
 
     /// The axes so far, and the channel later ones join the poller by.
-    fn start(&self) -> (Vec<Axis>, mpsc::UnboundedReceiver<Joining>) {
+    fn start(
+        &self,
+    ) -> (
+        Vec<Axis>,
+        mpsc::UnboundedReceiver<Joining>,
+        SharedControllerPoll,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut axes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let poll = axes.poll.clone();
         match std::mem::replace(&mut axes.list, AxisList::Running(tx)) {
-            AxisList::Pending(axes) => (axes, rx),
+            AxisList::Pending(axes) => (axes, rx, poll),
             // The builder is consumed by the one start.
             AxisList::Running(_) => unreachable!("a controller's poller starts once"),
         }
@@ -360,9 +374,15 @@ impl ControllerBuilder {
     }
 
     /// The driver's `asynMotorController::poll` override, run before the
-    /// axes on every pass and on the startup pass.
-    pub fn controller_poll(mut self, poll: impl FnMut() + Send + 'static) -> Self {
-        self.controller_poll = Some(Box::new(poll));
+    /// axes on every pass and on the startup pass. What it returns is what
+    /// it set on its own port, which the poller applies once it returns.
+    pub fn controller_poll<R: Into<PortSets>>(
+        self,
+        mut poll: impl FnMut() -> R + Send + 'static,
+    ) -> Self {
+        let axes = self.axes.0.lock().unwrap_or_else(|e| e.into_inner());
+        axes.poll.set(Box::new(move || poll().into()));
+        drop(axes);
         self
     }
 
@@ -397,14 +417,14 @@ impl ControllerBuilder {
         idle_poll_interval: Duration,
         forced_fast_polls: u32,
     ) -> MotorPollLoop {
-        let (axes, joining) = self.axes.start();
+        let (axes, joining, controller_poll) = self.axes.start();
         MotorPollLoop::controller(
             axes,
             Some(joining),
             moving_poll_interval,
             idle_poll_interval,
             forced_fast_polls,
-            self.controller_poll,
+            controller_poll,
         )
     }
 }

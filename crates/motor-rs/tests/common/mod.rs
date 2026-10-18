@@ -100,7 +100,7 @@ pub struct MotorFixture {
     pub(crate) _poll_cmd_rx: tokio::sync::mpsc::Receiver<motor_rs::poll_loop::PollCommand>,
     /// The driver commands the record queued for the poller thread, which
     /// this fixture stands in for.
-    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+    motor_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
 }
 
 impl MotorFixture {
@@ -211,7 +211,7 @@ impl MotorFixture {
         let user = AsynUser::new(0);
         let status = {
             let mut motor = self.motor.lock().unwrap();
-            while let Ok(batch) = self.motor_cmd_rx.try_recv() {
+            while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = self.motor_cmd_rx.try_recv() {
                 motor_rs::poll_loop::execute_commands(
                     &mut *motor,
                     &batch.trace,

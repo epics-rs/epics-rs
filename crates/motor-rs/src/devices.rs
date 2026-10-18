@@ -236,6 +236,14 @@ pub(crate) fn axis_at(port: &str, addr: i32) -> Option<MotorAxis> {
     Some(axis.clone())
 }
 
+/// Every axis registered on asyn port `port`.
+pub(crate) fn axes_of(port: &str) -> Vec<MotorAxis> {
+    lock(controllers())
+        .get(&Controller::Port(port.to_owned()))
+        .map(|axes| axes.values().map(|(axis, _)| axis.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// The parameter library of model-2 axis `addr` of `drvMotorAsyn` port
 /// `port`, which the driver's report dumps (drvMotorSim.c:186).
 pub fn model2_params(port: &str, addr: i32) -> Option<crate::device_state::Model2Params> {

@@ -141,6 +141,21 @@ fn block_on_prebounded_reply<F: Future>(fut: F) -> F::Output {
 /// "this handle points at me" is not knowable at any call site the compiler can
 /// see. The error names the fix.
 fn guard_reentrant(actor: ActorId, port_name: &str, what: &str) -> AsynResult<()> {
+    if FORBIDDEN.with(|ports| ports.borrow().iter().any(|p| p == port_name)) {
+        let message = format!(
+            "{what} called on port {port_name} by a thread inside a ForbidBlocking \
+             scope for it: the scope's owner applies the step itself once the scope ends"
+        );
+        // A step that waits on its own port's owner deadlocks only on some
+        // interleavings; fail every time where a test can see it.
+        if cfg!(debug_assertions) {
+            panic!("{message}");
+        }
+        return Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        });
+    }
     if HELD.with(|held| held.borrow().contains(&actor)) {
         return Err(AsynError::Status {
             status: AsynStatus::Error,
@@ -169,6 +184,29 @@ fn guard_reentrant(actor: ActorId, port_name: &str, what: &str) -> AsynResult<()
 thread_local! {
     /// The ports whose driver this thread holds through a [`DriverHold`].
     static HELD: std::cell::RefCell<Vec<ActorId>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The ports this thread is inside a [`ForbidBlocking`] scope for.
+    static FORBIDDEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// While alive, a blocking request from this thread to the port named
+/// `port` is a bug: it panics under `debug_assertions` and is refused
+/// otherwise. For a lock whose holder the port's own thread can wait on,
+/// such as a motor axis lock that the controller port's writes take.
+#[must_use]
+pub struct ForbidBlocking(());
+
+/// Open a [`ForbidBlocking`] scope for `port`.
+pub fn forbid_blocking(port: &str) -> ForbidBlocking {
+    FORBIDDEN.with(|ports| ports.borrow_mut().push(port.to_owned()));
+    ForbidBlocking(())
+}
+
+impl Drop for ForbidBlocking {
+    fn drop(&mut self) {
+        FORBIDDEN.with(|ports| {
+            ports.borrow_mut().pop();
+        });
+    }
 }
 
 type HeldOp<D> = Box<dyn FnOnce(&mut D) + Send>;
@@ -1992,6 +2030,23 @@ mod tests {
             actor_link,
             Arc::new(TraceManager::new()),
         )
+    }
+
+    #[test]
+    fn a_blocking_request_outside_a_forbid_scope_runs() {
+        let handle = make_handle(TestDriver::new());
+        drop(forbid_blocking(handle.port_name()));
+        let _other = forbid_blocking("another_port");
+        handle.write_int32_blocking(0, 0, 1).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ForbidBlocking")]
+    fn a_blocking_request_inside_a_forbid_scope_panics() {
+        let handle = make_handle(TestDriver::new());
+        let _forbid = forbid_blocking(handle.port_name());
+        let _ = handle.set_params_blocking(0, Vec::new());
     }
 
     /// C `queueRequest` refuses a disconnected port before queueing

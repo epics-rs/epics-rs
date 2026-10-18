@@ -20,7 +20,7 @@ use motor_rs::devices::{
     device_support_factory, devices, model1_device, register_axis, register_model1_device,
 };
 use motor_rs::flags::MotorCommand;
-use motor_rs::poll_loop::{CommandBatch, execute_commands};
+use motor_rs::poll_loop::{ToAxis, execute_commands};
 use motor_rs::trace::{MotorTrace, TraceUser};
 use tokio::sync::mpsc;
 
@@ -36,12 +36,12 @@ fn user(card: i32) -> TraceUser {
 
 /// A done model-1 axis at `card`, signal 0, whose commands land on the
 /// returned channel; no poller runs.
-fn axis(card: i32) -> mpsc::UnboundedReceiver<CommandBatch> {
+fn axis(card: i32) -> mpsc::UnboundedReceiver<ToAxis> {
     axis_with(card).0
 }
 
 /// [`axis`], with the subscribers its status posts go through.
-fn axis_with(card: i32) -> (mpsc::UnboundedReceiver<CommandBatch>, AxisSubscribers) {
+fn axis_with(card: i32) -> (mpsc::UnboundedReceiver<ToAxis>, AxisSubscribers) {
     let subscribers = AxisSubscribers::new();
     subscribers.store(StampedStatus {
         seq: 1,
@@ -54,6 +54,7 @@ fn axis_with(card: i32) -> (mpsc::UnboundedReceiver<CommandBatch>, AxisSubscribe
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     register_axis(MotorAxis::new(
         user(card),
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         Duration::from_secs(1),
         poll_tx,
         cmd_tx,
@@ -78,9 +79,9 @@ async fn boot(db: &str) -> Arc<PvDatabase> {
 }
 
 /// Every command queued so far, in order.
-fn sent(rx: &mut mpsc::UnboundedReceiver<CommandBatch>) -> Vec<MotorCommand> {
+fn sent(rx: &mut mpsc::UnboundedReceiver<ToAxis>) -> Vec<MotorCommand> {
     let mut out = Vec::new();
-    while let Ok(batch) = rx.try_recv() {
+    while let Ok(ToAxis::Batch(batch)) = rx.try_recv() {
         out.extend(batch.commands);
     }
     out
@@ -159,7 +160,7 @@ record(motor, "S:bare") { field(DTYP, "TestStrings") field(OUT, "#C46 S0 @") }
 }
 
 /// Wait for the commands a put queued; none arrive later than this.
-async fn settle(rx: &mut mpsc::UnboundedReceiver<CommandBatch>) -> Vec<MotorCommand> {
+async fn settle(rx: &mut mpsc::UnboundedReceiver<ToAxis>) -> Vec<MotorCommand> {
     tokio::time::sleep(Duration::from_millis(50)).await;
     sent(rx)
 }

@@ -624,7 +624,7 @@ fn async_callback_lines(port: &str, user: TraceUser) -> Vec<String> {
         );
         let trace = MotorTrace::with_user(user);
         trace.set_record("TL:m1");
-        tx.send(CommandBatch {
+        tx.send(motor_rs::poll_loop::ToAxis::from(CommandBatch {
             trace: Arc::new(trace),
             record: Some(0),
             commands: vec![
@@ -638,7 +638,7 @@ fn async_callback_lines(port: &str, user: TraceUser) -> Vec<String> {
                 MotorCommand::SetClosedLoop { enable: true },
                 MotorCommand::Poll,
             ],
-        })
+        }))
         .unwrap();
         poll_loop.run_queued_commands();
     });
@@ -830,6 +830,7 @@ fn a_write_the_subclass_takes_itself_prints_no_base_line() {
             port: port.into(),
             addr: 0,
         },
+        std::sync::Arc::new(std::sync::Mutex::new(motor_rs::sim_motor::SimMotor::new())),
         std::time::Duration::from_secs(1),
         poll_tx,
         motor_tx,

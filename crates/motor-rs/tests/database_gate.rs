@@ -138,7 +138,9 @@ async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
         .await
         .unwrap();
 
-    let batch = sent.try_recv().unwrap();
+    let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = sent.try_recv() else {
+        panic!("no batch");
+    };
     assert!(matches!(
         batch.commands.as_slice(),
         [q] if matches!(q, MotorCommand::SetPidGain { .. })
@@ -148,10 +150,10 @@ async fn a_pid_gain_put_reaches_the_driver_at_put_time() {
 /// Stands in for the poller thread: runs the driver commands the record
 /// passes queued.
 fn run_queued(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
     motor: &std::sync::Mutex<dyn asyn_rs::interfaces::motor::AsynMotor>,
 ) {
-    while let Ok(batch) = rx.try_recv() {
+    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = rx.try_recv() {
         motor_rs::poll_loop::execute_commands(
             &mut *motor.lock().unwrap(),
             &batch.trace,

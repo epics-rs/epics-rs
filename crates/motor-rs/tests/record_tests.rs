@@ -12,7 +12,7 @@ fn sends_get_info(effects: &ProcessEffects) -> bool {
 
 fn capture(
     rec: &mut MotorRecord,
-) -> tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch> {
+) -> tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis> {
     let (port, rx) = motor_rs::device_support::CommandPort::capture();
     rec.set_command_port(port);
     rx
@@ -20,10 +20,10 @@ fn capture(
 
 /// What the port sent since the last read.
 fn sent(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
 ) -> Vec<MotorCommand> {
     let mut commands = Vec::new();
-    while let Ok(batch) = rx.try_recv() {
+    while let Ok(motor_rs::poll_loop::ToAxis::Batch(batch)) = rx.try_recv() {
         commands.extend(batch.commands);
     }
     commands
@@ -8755,7 +8755,7 @@ fn limit_device_record(
     controller_high: Option<f64>,
 ) -> (
     MotorRecord,
-    tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::CommandBatch>,
+    tokio::sync::mpsc::UnboundedReceiver<motor_rs::poll_loop::ToAxis>,
 ) {
     let mut rec = MotorRecord::new();
     let (port, rx) = motor_rs::device_support::CommandPort::capture();

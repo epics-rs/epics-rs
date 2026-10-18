@@ -9,14 +9,17 @@
 //! profile functions are the controller's, over every axis, through the
 //! [`ControllerParams`] profile hooks a driver overrides as C's virtuals.
 //!
-//! A motor record's writes reach the same C subclass write, but here go to
-//! the axis's poller; what the subclass does around the base on both paths
-//! is its [`WriteHook`].
+//! A base function's driver call runs on the port thread under the axis's
+//! lock, as C's runs under the controller lock, and its status is the
+//! write's; the axis's poller posts what it set. A motor record's writes
+//! reach the same C subclass write, but here run on the axis's poller; what
+//! the subclass does around the base on both paths is its [`WriteHook`].
 
 use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
+use asyn_rs::interfaces::motor::{PortSet, PortSets};
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::InterfaceMask;
@@ -31,6 +34,8 @@ use epics_base_rs::runtime::interrupt_accept::InterruptGate;
 
 use crate::device_support::MotorAxis;
 use crate::flags::{MotorCommand, PidGainKind};
+use crate::poll_loop::Written;
+use crate::trace::MotorTrace;
 
 /// C `asynMotorController`'s `createParam` calls (asynMotorController.cpp:
 /// 56-129), in order: index `i` is the `i`-th parameter, as in C.
@@ -337,15 +342,13 @@ impl<'a> AxisUser<'a> {
         self.asyn
     }
 
-    /// Run `command` on the axis's poller, as the base's own axis writes
-    /// run. A driver's write runs on the port thread, where locking the
-    /// axis would wait on a poller that holds it while it waits on this
-    /// port.
-    pub fn queue(&self, base: &PortDriverBase, command: MotorCommand) -> AsynResult<()> {
+    /// Run `command` on the axis's driver now and return its status, as a
+    /// C subclass write calls its axis under the controller lock.
+    pub fn run(&self, base: &mut PortDriverBase, command: MotorCommand) -> AsynResult<()> {
         let axis = crate::devices::axis_at(&base.port_name, self.addr)
             .ok_or_else(|| no_axis(&base.port_name, self.addr))?;
-        axis.send(command);
-        Ok(())
+        let c = crate::poll_loop::c_write(&command);
+        run_on_axis(base, None, &axis, self.addr, &command, c)
     }
 }
 
@@ -620,10 +623,12 @@ impl ControllerCtx<'_> {
     }
 
     /// Each motor axis's driver: the `asynMotorAxis` virtual a base loop
-    /// calls.
-    fn send_to_axes(&self, command: impl Fn() -> MotorCommand) {
-        for axis in self.axes.iter().filter_map(|(_, axis)| axis.as_ref()) {
-            axis.send(command());
+    /// calls, whose status C drops.
+    fn send_to_axes(&mut self, command: MotorCommand) {
+        for (addr, axis) in &self.axes {
+            if let Some(axis) = axis {
+                let _ = run_on_axis(self.base, None, axis, *addr, &command, None);
+            }
         }
     }
 
@@ -648,7 +653,7 @@ impl ControllerCtx<'_> {
             following_errors: zeroed,
         };
         self.profile.axes = vec![axis; self.base.max_addr];
-        self.send_to_axes(|| MotorCommand::ProfileInitialize { max_points });
+        self.send_to_axes(MotorCommand::ProfileInitialize { max_points });
         Ok(())
     }
 
@@ -667,14 +672,14 @@ impl ControllerCtx<'_> {
             self.profile.times.fill(0.0);
             self.profile.times[..n].fill(time);
         }
-        self.send_to_axes(|| MotorCommand::ProfileBuild);
+        self.send_to_axes(MotorCommand::ProfileBuild);
         Ok(())
     }
 
     /// C `asynMotorController::abortProfile` (asynMotorController.cpp:
     /// 888-900).
     pub fn abort_profile(&mut self) -> AsynResult<()> {
-        self.send_to_axes(|| MotorCommand::ProfileAbort);
+        self.send_to_axes(MotorCommand::ProfileAbort);
         Ok(())
     }
 
@@ -685,7 +690,7 @@ impl ControllerCtx<'_> {
             // C drops the axis's status.
             let _ = self.axis_readback_profile(addr);
         }
-        self.send_to_axes(|| MotorCommand::ProfileReadback);
+        self.send_to_axes(MotorCommand::ProfileReadback);
         Ok(())
     }
 
@@ -726,13 +731,15 @@ impl ControllerCtx<'_> {
 
     /// The axis driver's `defineProfile` with the first `n` converted
     /// positions.
-    fn send_profile(&self, addr: i32, n: usize) {
+    fn send_profile(&mut self, addr: i32, n: usize) {
         let axis = self.axes.iter().find(|(a, _)| *a == addr);
         let positions = self.profile.axes.get(addr as usize).map(|p| &p.positions);
         if let (Some((_, Some(axis))), Some(positions)) = (axis, positions) {
-            axis.send(MotorCommand::ProfileDefine {
+            let command = MotorCommand::ProfileDefine {
                 positions: positions[..n.min(positions.len())].to_vec(),
-            });
+            };
+            // C drops the axis's status.
+            let _ = run_on_axis(self.base, None, axis, addr, &command, None);
         }
     }
 
@@ -815,7 +822,7 @@ impl ControllerCtx<'_> {
     /// C `asynMotorController::executeProfile` (asynMotorController.cpp:
     /// 873-885).
     pub fn execute_profile(&mut self) -> AsynResult<()> {
-        self.send_to_axes(|| MotorCommand::ProfileExecute);
+        self.send_to_axes(MotorCommand::ProfileExecute);
         Ok(())
     }
 }
@@ -936,31 +943,26 @@ impl<P: ControllerParams> ControllerPort<P> {
         self.base.get_float64_param(index, addr).unwrap_or(0.0)
     }
 
-    /// The base `writeInt32`'s driver call for `function`.
-    /// Whether the poller runs it, which prints the write's closing line
-    /// with the driver's status.
-    fn int32_command(&self, axis: &MotorAxis, addr: i32, function: usize, value: i32) -> bool {
-        let command = match function {
+    /// The base `writeInt32`'s driver call for `function`, if any.
+    fn int32_command(&self, addr: i32, function: usize, value: i32) -> Option<MotorCommand> {
+        Some(match function {
             index::STOP => MotorCommand::Stop {
                 acceleration: self.float(index::ACCEL, addr),
             },
             index::DEFER_MOVES => MotorCommand::DeferMoves { defer: value != 0 },
             index::CLOSED_LOOP => MotorCommand::SetClosedLoop { enable: value != 0 },
-            index::UPDATE_STATUS => {
-                axis.force_poll();
-                return false;
-            }
-            _ => return false,
-        };
-        axis.send(command);
-        true
+            // C polls inside the write, before its callbacks and closing
+            // line (asynMotorController.cpp:217-221, :245-254).
+            index::UPDATE_STATUS => MotorCommand::Poll,
+            _ => return None,
+        })
     }
 
     /// The base `writeFloat64`'s driver call for `function`; a move reads
     /// its speeds from the parameters in its own arm, as C does
     /// (asynMotorController.cpp:291-350), so no other write reports them
     /// undefined.
-    fn float64_command(&self, axis: &MotorAxis, addr: i32, function: usize, value: f64) -> bool {
+    fn float64_command(&self, addr: i32, function: usize, value: f64) -> Option<MotorCommand> {
         let speeds = || {
             (
                 self.float(index::VEL_BASE, addr),
@@ -1012,10 +1014,9 @@ impl<P: ControllerParams> ControllerPort<P> {
             index::ENCODER_RATIO => MotorCommand::SetEncoderRatio {
                 pulses: [value, 1.0],
             },
-            _ => return false,
+            _ => return None,
         };
-        axis.send(command);
-        true
+        Some(command)
     }
 
     /// C's closing `asynPrint` of a base write (asynMotorController.cpp:
@@ -1063,15 +1064,6 @@ impl<P: ControllerParams> ControllerPort<P> {
     }
 }
 
-/// Where a controller-port write's base call finished.
-enum BaseWrite {
-    /// On the port: the write's status.
-    Finished(AsynResult<()>),
-    /// Handed to an axis, whose poller finishes it; the port's status so
-    /// far.
-    OnAxis(AsynResult<()>),
-}
-
 impl<P: ControllerParams> ControllerPort<P> {
     /// The driver's own code, its hook's check, then the base `writeInt32`.
     fn write_int32_base(
@@ -1080,13 +1072,13 @@ impl<P: ControllerParams> ControllerPort<P> {
         addr: i32,
         axis: Option<MotorAxis>,
         value: i32,
-    ) -> BaseWrite {
+    ) -> AsynResult<()> {
         let own = match self.params.write_int32(&mut self.base, user, value) {
             ParamWrite::PassToBase(own) => own,
-            ParamWrite::Handled(status) => return BaseWrite::Finished(status),
+            ParamWrite::Handled(status) => return status,
         };
         if let Some(Err(e)) = self.hook.as_ref().map(|h| h.check(addr, user.reason)) {
-            return BaseWrite::Finished(Err(e));
+            return Err(e);
         }
         let _ = self.base.set_int32_param(user.reason, addr, value);
         let status = match user.reason {
@@ -1094,17 +1086,13 @@ impl<P: ControllerParams> ControllerPort<P> {
             index::PROFILE_ABORT => self.with_params(|params, ctx| params.abort_profile(ctx)),
             index::PROFILE_READBACK => self.with_params(|params, ctx| params.readback_profile(ctx)),
             index::PROFILE_EXECUTE => self.with_params(|params, ctx| params.execute_profile(ctx)),
-            _ => {
-                let sent = axis
-                    .as_ref()
-                    .is_some_and(|axis| self.int32_command(axis, addr, user.reason, value));
-                // The axis's poller posts it after the driver call, as
-                // C's closing callParamCallbacks does.
-                if sent {
-                    return BaseWrite::OnAxis(own);
+            function => match (axis, self.int32_command(addr, function, value)) {
+                (Some(axis), Some(command)) => {
+                    let c = Some((function as i32, WriteValue::Int32(value)));
+                    run_on_axis(&mut self.base, self.hook.as_ref(), &axis, addr, &command, c)
                 }
-                Ok(())
-            }
+                _ => Ok(()),
+            },
         };
         let _ = self.base.call_param_callbacks(addr);
         self.print_write(
@@ -1114,7 +1102,7 @@ impl<P: ControllerParams> ControllerPort<P> {
             &status,
             format_args!("{value}"),
         );
-        BaseWrite::Finished(own.and(status))
+        own.and(status)
     }
 
     /// The driver's own code, its hook's check, then the base
@@ -1125,45 +1113,41 @@ impl<P: ControllerParams> ControllerPort<P> {
         addr: i32,
         axis: Option<MotorAxis>,
         value: f64,
-    ) -> BaseWrite {
+    ) -> AsynResult<()> {
         let own = match self.params.write_float64(&mut self.base, user, value) {
             ParamWrite::PassToBase(own) => own,
-            ParamWrite::Handled(status) => return BaseWrite::Finished(status),
+            ParamWrite::Handled(status) => return status,
         };
         if let Some(Err(e)) = self.hook.as_ref().map(|h| h.check(addr, user.reason)) {
-            return BaseWrite::Finished(Err(e));
+            return Err(e);
         }
         let _ = self.base.set_float64_param(user.reason, addr, value);
-        let sent = axis
-            .as_ref()
-            .is_some_and(|axis| self.float64_command(axis, addr, user.reason, value));
-        if sent {
-            return BaseWrite::OnAxis(own);
-        }
+        let status = match (axis, self.float64_command(addr, user.reason, value)) {
+            (Some(axis), Some(command)) => {
+                let c = Some((user.reason as i32, WriteValue::Float64(value)));
+                run_on_axis(&mut self.base, self.hook.as_ref(), &axis, addr, &command, c)
+            }
+            _ => Ok(()),
+        };
         let _ = self.base.call_param_callbacks(addr);
         self.print_write(
             addr,
             user.reason,
             "writeFloat64",
-            &Ok(()),
+            &status,
             format_args!("{value:.6}"),
         );
-        BaseWrite::Finished(own)
+        own.and(status)
     }
 
-    /// The hook's code after a write the port finished; the axis's poller
-    /// runs it for one it handed on.
+    /// The hook's code after the base's write returned `status`.
     fn after_write(
         &mut self,
         addr: i32,
         function: usize,
         value: WriteValue,
-        write: BaseWrite,
+        status: AsynResult<()>,
     ) -> AsynResult<()> {
-        let status = match write {
-            BaseWrite::OnAxis(status) => return status,
-            BaseWrite::Finished(status) => status,
-        };
         let Some(hook) = &self.hook else {
             return status;
         };
@@ -1339,6 +1323,87 @@ impl<P: ControllerParams> PortDriver for ControllerPort<P> {
             .min(array.len());
         buf[..n].copy_from_slice(&array[..n]);
         Ok(n)
+    }
+}
+
+/// C's base calling the axis driver for `command` on the port thread, under
+/// the controller's lock as C's: its status is the
+/// write's. What the call set on the axis lands in `base` and goes to the
+/// axis's poller to post; a move wakes the poller (asynMotorController.cpp:
+/// 291-355). `c` is the base function and value the write stored.
+fn run_on_axis(
+    base: &mut PortDriverBase,
+    hook: Option<&Arc<dyn WriteHook>>,
+    axis: &MotorAxis,
+    addr: i32,
+    command: &MotorCommand,
+    c: Option<(i32, WriteValue)>,
+) -> AsynResult<()> {
+    let trace = MotorTrace::with_user(axis.address().clone());
+    let quiet =
+        hook.is_some_and(|hook| c.is_some_and(|(function, _)| hook.handles(function as usize)));
+    let moves = command.is_move() && !matches!(command, MotorCommand::SetPosition { .. });
+    // C writeFloat64 powers the axis on before a move and waits out the
+    // delay under the lock (asynMotorController.cpp:291-295).
+    let on_delay = moves
+        .then(|| {
+            let on = base.get_int32_param(index::POWER_AUTO_ONOFF, addr);
+            (on.unwrap_or(0) == 1).then(|| {
+                base.get_float64_param(index::POWER_ON_DELAY, addr)
+                    .unwrap_or(0.0)
+            })
+        })
+        .flatten()
+        .map(|secs| std::time::Duration::try_from_secs_f64(secs).unwrap_or_default());
+    let driven = {
+        let held = axis.controller_poll().hold();
+        // UPDATE_STATUS runs `poll()` before the axis's (:217-221).
+        if matches!(command, MotorCommand::Poll) {
+            apply_port_sets(base, None, axis.controller_poll().run(&held));
+        }
+        let port = base.port_name.clone();
+        let Some(mut motor) = crate::poll_loop::lock_axis(axis.motor(), Some(&port), &held) else {
+            return Err(base_error());
+        };
+        if let Some(delay) = on_delay {
+            let _ = motor.set_closed_loop(&AsynUser::new(0), true);
+            std::thread::sleep(delay);
+        }
+        crate::poll_loop::drive(&mut *motor, &trace, command, c, quiet)
+    };
+    apply_port_sets(base, Some(addr), driven.port_sets);
+    axis.post_written(Written::new(driven.write, on_delay.is_some()));
+    if moves {
+        axis.wakeup();
+    }
+    // C axis methods get the controller's asynUser, so the writer's
+    // errorMessage is left as it was: empty.
+    driven
+        .result
+        .map_err(|e| AsynError::from_c_status_code(e.c_status_code(), String::new()).unwrap_or(e))
+}
+
+/// A driver's own-port steps on the port's thread, as C makes them: on the
+/// parameter library itself. `axis` is the address a [`PortSet::Axis`]
+/// lands on, None for a controller poll's.
+fn apply_port_sets(base: &mut PortDriverBase, axis: Option<i32>, sets: PortSets) {
+    for set in sets {
+        let _ = match set {
+            PortSet::Set {
+                addr,
+                reason,
+                value,
+            } => base.set_param_value(reason, addr, value),
+            PortSet::Axis { reason, value } => match axis {
+                Some(addr) => base.set_param_value(reason, addr, value),
+                None => Ok(()),
+            },
+            PortSet::Callbacks(addr) => base.call_param_callbacks(addr),
+            other => {
+                crate::poll_loop::apply_axis_set(&base.port_name, other);
+                Ok(())
+            }
+        };
     }
 }
 

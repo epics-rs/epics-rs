@@ -2438,13 +2438,13 @@ fn fetch_arrays(ca: &Ca, c: &ScanChans, s: &mut Scan) -> bool {
 
 /// `mkdir(path, 0775)`.
 fn mkdir_0775(path: &str) -> std::io::Result<()> {
-    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o775);
+        std::fs::DirBuilder::new().mode(0o775).create(path)
     }
-    b.create(path)
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new().create(path)
 }
 
 /// `checkRWpermission`: create and remove a `rix_` file in `path`.

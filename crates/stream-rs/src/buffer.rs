@@ -266,15 +266,15 @@ impl StreamBuffer {
             remlen += remstart;
             remstart = 0;
         }
-        // A range wholly before the buffer start removes nothing. C casts
-        // the negative remlen to size_t (StreamBuffer.cc:242) and so
-        // removes everything after remstart.
-        remlen = remlen.max(0);
         if remstart > len {
             // remove begins after bufferend
             remstart = len;
         }
-        if remlen >= len - remstart {
+        // A range wholly before the buffer start leaves remlen negative;
+        // C compares it as size_t (StreamBuffer.cc:242), so it removes
+        // everything after remstart; compileNumber's truncate after an
+        // empty variable depends on it.
+        if remlen < 0 || remlen >= len - remstart {
             // truncate remove after bufferend
             remlen = len - remstart;
         }
@@ -437,10 +437,13 @@ impl StreamBuffer {
             length += start;
             start = 0;
         }
-        // A range wholly before the buffer start is empty. C turns the
-        // negative end into a size_t (StreamBuffer.cc:366) and expands the
-        // whole buffer.
-        let end = (start + length).min(len);
+        // A negative end is a size_t in C (StreamBuffer.cc:366): a range
+        // wholly before the buffer start expands the whole buffer.
+        let end = if start + length < 0 {
+            len
+        } else {
+            (start + length).min(len)
+        };
         let mut result = StreamBuffer::new();
         let mut i = start;
         while i < end {
@@ -563,18 +566,30 @@ mod tests {
     }
 
     #[test]
-    fn a_range_wholly_before_the_start_is_empty() {
+    /// The results are C's StreamBuffer.cc at 562dd5a, run on these calls.
+    fn a_range_wholly_before_the_start_takes_the_whole_buffer_as_c() {
         let mut x = b(b"abc");
         // (-5, 1) reaches from 2 before the start to 1 before it.
         x.replace(-5, 1, b"X");
-        assert_eq!(x.bytes(), b"Xabc");
+        assert_eq!(x.bytes(), b"X");
         x.replace(-9, -2, b"");
-        assert_eq!(x.bytes(), b"Xabc");
+        assert_eq!(x.bytes(), b"");
+        let mut x = b(b"abcdef");
+        x.replace(-10, 2, b"XY");
+        assert_eq!(x.bytes(), b"XY");
         // A range that overlaps the start is cut at the start.
+        let mut x = b(b"Xabc");
         x.replace(-6, 3, b"");
         assert_eq!(x.bytes(), b"abc");
-        assert_eq!(x.expand_range(-5, 1).bytes(), b"");
+        assert_eq!(x.expand_range(-5, 1).bytes(), b"abc");
+        assert_eq!(x.expand_range(-9, -2).bytes(), b"abc");
         assert_eq!(x.expand_range(-4, 2).bytes(), b"a");
+        // compileNumber's truncate after an empty variable.
+        for (s, want) in [(&b"1"[..], &b""[..]), (b"12", b""), (b"123", b"23")] {
+            let mut x = b(s);
+            x.truncate(-5);
+            assert_eq!(x.bytes(), want);
+        }
     }
 
     #[test]

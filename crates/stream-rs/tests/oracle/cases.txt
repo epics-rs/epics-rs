@@ -66,6 +66,9 @@ ok_features features.proto spaces
 ok_features features.proto locals
 ok_features features.proto binary
 ok_features @record X
+ok_empty_var empty_var.proto w1
+ok_empty_var empty_var.proto w2
+ok_empty_var empty_var.proto w3
 real_ADAM_4015 ADAM_4015.proto queryAll(1,2,3,4,5,6,7,8,9)
 real_ADAM_4015 ADAM_4015.proto queryChan(1,2,3,4,5,6,7,8,9)
 real_ADAM_4015 ADAM_4015.proto queryModel(1,2,3,4,5,6,7,8,9)

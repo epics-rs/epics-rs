@@ -1,0 +1,6 @@
+_main_ empty_var.proto line 0: Unsigned numeric value expected: 
+_main_ empty_var.proto line 5: in command 'wait'
+_main_ empty_var.proto line 5: in protocol 'w1'
+_main_ empty_var.proto line 0: Unsigned numeric value expected: 
+_main_ empty_var.proto line 6: in command 'wait'
+_main_ empty_var.proto line 6: in protocol 'w2'

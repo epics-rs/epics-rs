@@ -1,0 +1,7 @@
+# compileNumber after an empty variable: its truncate cuts into the digits
+# before it (StreamBuffer::replace on a range before the buffer start).
+# The "line 0" in C's error is read past the end of the arguments.
+x = ;
+w1 { wait 1$x; }
+w2 { wait 12$x; }
+w3 { wait 123$x; }

@@ -180,6 +180,12 @@ impl DeviceSupport for SecPastEpochDeviceSupport {
         self.time = ctx.time;
     }
 
+    // C `devTimeOfDay.c:93` fills `special_linconv` with `no_op`; having the
+    // slot is what makes the record move EOFF to EGUL on a LINEAR put.
+    fn has_special_linconv(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         // C `devTimeOfDay.c:145` `aiReadTs`: `recGblGetTimeStamp(pai)`
         // resolves `pai->time` from TSE, then `pai->val =

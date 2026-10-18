@@ -361,6 +361,9 @@ pub struct AsynDeviceSupport {
     /// bounds), derived when the interface is `asynInt32` and a non-zero
     /// bit count was given. `None` for every other case (no masking).
     int32_mask: Option<Int32Mask>,
+    /// C `pPvt->deviceLow`/`deviceHigh`: the raw range `convertAi`/`convertAo`
+    /// scale over, fixed at init and (0, 0) until then.
+    device_bounds: (i64, i64),
     last_alarm_status: u16,
     last_alarm_severity: u16,
     last_ts: Option<epics_base_rs::types::WallTime>,
@@ -832,6 +835,7 @@ impl AsynDeviceSupport {
             iface,
             mask: 0xFFFFFFFF,
             int32_mask: None,
+            device_bounds: (0, 0),
             max_array_elements: 307200,
             octet_val_size: 256,
             octet_max_size: 256,
@@ -2102,18 +2106,12 @@ fn enum_table_fields(
 }
 
 impl AsynDeviceSupport {
-    /// C parity for `devAsynInt32.c::initAi` (lines 821-828) +
-    /// `convertAi` (lines 437-454): query the driver's int32 / int64
-    /// bounds, then compute `ESLO = (EGUF - EGUL) / (high - low)` and
-    /// `EOFF = (high*EGUL - low*EGUF) / (high - low)` and write
-    /// them on the record. Caller has already verified the record
-    /// exposes ESLO and the interface is `asynInt32` / `asynInt64`.
-    fn apply_linear_eslo_eoff(&self, record: &mut dyn Record) {
-        // C devAsynInt32.c:824-827 — the nbits-derived deviceLow/High (set
-        // when @asynMask gives a bit count) take precedence; `getBounds` is
-        // the fallback only when no nbits was specified.
-        let (low, high) = if let Some(m) = self.int32_mask {
-            (m.device_low as f64, m.device_high as f64)
+    /// C `devAsynInt32.c::initAi` (lines 821-828): the `@asynMask` nbits
+    /// bounds when given, else the driver's `getBounds`, which a failure
+    /// leaves at (0, 0).
+    fn init_device_bounds(&mut self) {
+        self.device_bounds = if let Some(m) = self.int32_mask {
+            (m.device_low.into(), m.device_high.into())
         } else {
             let op = if self.iface_type == "asynInt64" {
                 RequestOp::GetBoundsInt64
@@ -2121,22 +2119,23 @@ impl AsynDeviceSupport {
                 RequestOp::GetBoundsInt32
             };
             let user = self.init_user();
-            let result = match self.handle.submit_blocking(op, user) {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            match result.bounds {
-                Some((l, h)) => (l as f64, h as f64),
-                None => return,
-            }
+            self.handle
+                .submit_blocking(op, user)
+                .ok()
+                .and_then(|r| r.bounds)
+                .unwrap_or((0, 0))
         };
-        // C parity: `if (deviceHigh != deviceLow)` (convertAi:444).
-        // A degenerate driver that reports 0,0 (the "I don't know"
-        // sentinel — matches the early-out at initAi:824) leaves the
-        // existing ESLO/EOFF untouched.
-        if (high - low).abs() < f64::EPSILON {
+    }
+
+    /// C `convertAi`/`convertAo` (devAsynInt32.c:437-473) after pass 0:
+    /// `ESLO = (EGUF - EGUL) / (high - low)` and
+    /// `EOFF = (high*EGUL - low*EGUF) / (high - low)` over the init bounds.
+    fn apply_linear_eslo_eoff(&self, record: &mut dyn Record) {
+        let (low, high) = self.device_bounds;
+        if low == high {
             return;
         }
+        let (low, high) = (low as f64, high as f64);
         let eguf = match record.get_field("EGUF") {
             Some(EpicsValue::Double(v)) => v,
             _ => return,
@@ -3182,6 +3181,7 @@ impl DeviceSupport for AsynDeviceSupport {
         if (self.iface_type == "asynInt32" || self.iface_type == "asynInt64")
             && record.get_field("ESLO").is_some()
         {
+            self.init_device_bounds();
             self.apply_linear_eslo_eoff(record);
         }
 
@@ -3712,6 +3712,20 @@ impl DeviceSupport for AsynDeviceSupport {
         };
         self.end_processing();
         written
+    }
+
+    /// devAsynInt32.c:157-161 and devAsynInt64.c:153-157: the ai, aiAverage
+    /// and ao dsets fill `special_linconv` with `convertAi`/`convertAo`. Only
+    /// ai/ao have the LINR/EGUF/EGUL puts that call it.
+    fn has_special_linconv(&self) -> bool {
+        matches!(self.dset, Dset::Int32 { .. } | Dset::Int64)
+    }
+
+    fn special_linconv(&mut self, record: &mut dyn Record, after: bool) -> CaResult<()> {
+        if after {
+            self.apply_linear_eslo_eoff(record);
+        }
+        Ok(())
     }
 
     fn dtyp(&self) -> &str {

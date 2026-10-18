@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::{InterfaceMask, InterfaceType};
+use crate::interpose::EomReason;
 use crate::param::ParamValue;
 
 /// Filter for selecting which interrupts to receive.
@@ -207,6 +208,11 @@ pub struct InterruptValue {
     /// driver fired a single untyped value (the `call_param_callbacks` path).
     /// See [`InterruptFilter::iface`] for the per-interface routing contract.
     pub iface: Option<InterfaceType>,
+    /// The octet callback's `eomReason` argument: the driver read's own eom
+    /// on an `asynOctetBase` read fan-out (asynOctetBase.c:234-236), END from
+    /// `paramList::octetCallback` (asynPortDriver.cpp:816-818). Empty on the
+    /// other interfaces, whose callbacks take none.
+    pub eom_reason: EomReason,
 }
 
 impl InterruptValue {
@@ -232,6 +238,7 @@ impl Default for InterruptValue {
             alarm_status: 0,
             alarm_severity: 0,
             iface: None,
+            eom_reason: EomReason::empty(),
         }
     }
 }
@@ -534,6 +541,7 @@ impl InterruptValue {
             alarm_status: self.alarm_status,
             alarm_severity: self.alarm_severity,
             iface: self.iface,
+            eom_reason: self.eom_reason,
         }
     }
 }
@@ -2310,6 +2318,7 @@ mod tests {
         let ring = AsyncRing::new(InterruptFilter::default(), 2, 64);
         ring.push(&InterruptValue {
             value: ParamValue::Octet(Arc::from(&b"hello"[..])),
+            eom_reason: EomReason::END,
             ..Default::default()
         });
         let mut out = Vec::with_capacity(64);
@@ -2318,7 +2327,9 @@ mod tests {
         assert!(matches!(taken.value.value, ParamValue::Undefined));
         assert_eq!((out.as_ptr(), out.capacity()), (ptr, cap), "no growth");
         assert_eq!(out, b"hello");
-        match taken.build(&out).value {
+        let built = taken.build(&out);
+        assert_eq!(built.eom_reason, EomReason::END, "the meta rides the ring");
+        match built.value {
             ParamValue::Octet(b) => assert_eq!(&*b, b"hello"),
             other => panic!("{other:?}"),
         }

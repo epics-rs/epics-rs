@@ -1,0 +1,47 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "b.proto is P"
+Stream::initRecord rec: filename="b.proto" protocol="is" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("b.proto", "is")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+Stream::initRecord rec: waiting for initDone
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="t", size=1)
+StreamCore::readCallback(rec) inputBuffer="t", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="wo", size=2)
+StreamCore::readCallback(rec) inputBuffer="two", size 3
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "two"
+StreamCore::matchInput(rec): format = "%s"
+StreamCore::scanValue(rec, format=%s, char*, size=4) input="two" value="two<00>"
+Stream::scan() currentValueLength=3
+Stream::matchValue(rec): readData failed
+rec: Record does not accept input "two"
+rec: Format "%s" has data type string which is not supported by "rec".
+StreamCore::readCallback(rec) match failure
+StreamCore::finishProtocol(rec, ScanError) bus owner
+Stream::protocolFinishHook(rec, ScanError)
+Stream::protocolFinishHook rec: signalling init done
+Stream::initRecord rec: initDone
+rec: @init handler failed
+rec: Record initialization failed
+streamInitRecord(rec) done status=0xffffffffffffffff
+VAL "zero"
+SEVR "NO_ALARM"
+STAT "CALC"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0

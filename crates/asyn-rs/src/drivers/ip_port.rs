@@ -722,6 +722,7 @@ impl IpIoState {
                     Ok(0) => Ok(OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::END,
+                        taken_back: 0,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -733,6 +734,7 @@ impl IpIoState {
                         } else {
                             EomReason::empty()
                         },
+                        taken_back: 0,
                     }),
                     Err(e) => Err(classify_read_error(e)),
                 }
@@ -766,6 +768,7 @@ impl IpIoState {
                         } else {
                             EomReason::empty()
                         },
+                        taken_back: 0,
                     }),
                     Err(e) => Err(classify_read_error(e)),
                 }
@@ -786,6 +789,7 @@ impl IpIoState {
                     Ok(0) => Ok(OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::END,
+                        taken_back: 0,
                     }),
                     Ok(n) => Ok(OctetReadResult {
                         nbytes_transferred: n,
@@ -797,6 +801,7 @@ impl IpIoState {
                         } else {
                             EomReason::empty()
                         },
+                        taken_back: 0,
                     }),
                     Err(e) => Err(classify_read_error(e)),
                 }
@@ -2259,7 +2264,7 @@ mod tests {
     /// ends at, so a test that wants the EOS layer must enter above it, exactly
     /// as `PortActor` does.
     fn chain_read(drv: &mut DrvAsynIPPort, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        crate::port::octet_read_chain(drv, user, buf).map(|(n, _eom)| n)
+        crate::port::octet_read_chain(drv, user, buf).map(|r| r.nbytes_transferred)
     }
 
     /// Gated with its only caller,
@@ -2271,7 +2276,7 @@ mod tests {
         user: &AsynUser,
         buf: &mut [u8],
     ) -> AsynResult<(usize, EomReason)> {
-        crate::port::octet_read_chain(drv, user, buf)
+        crate::port::octet_read_chain(drv, user, buf).map(|r| (r.nbytes_transferred, r.eom_reason))
     }
 
     fn chain_flush(drv: &mut DrvAsynIPPort, user: &mut AsynUser) -> AsynResult<()> {

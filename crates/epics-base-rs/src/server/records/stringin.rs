@@ -87,6 +87,11 @@ impl Record for StringinRecord {
         "stringin"
     }
 
+    /// devstringinStream.c reads and writes the `stringinRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// devSiSoft.c returns `dbGetLink`'s status.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {

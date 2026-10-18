@@ -1030,6 +1030,12 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 #record_type_str
             }
 
+            // A device support that writes the C struct's members, as the
+            // `dev*Stream.c` files do, reaches them by downcasting.
+            fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+                Some(self)
+            }
+
             fn get_field(&self, name: &str) -> Option<#krate::types::EpicsValue> {
                 match name {
                     #(#get_arms)*

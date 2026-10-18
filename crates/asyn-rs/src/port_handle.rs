@@ -392,6 +392,7 @@ pub struct PortHandle {
     /// a second manager at registration is what made those masks silent.
     trace: Arc<TraceManager>,
     sync_lock: crate::port_actor::SyncLock,
+    input_eos: crate::port_actor::InputEos,
 }
 
 /// A [`PortHandle`] that does not keep its port alive: the actor ends once
@@ -413,6 +414,7 @@ pub struct WeakPortHandle {
     interfaces: Arc<[Capability]>,
     trace: Arc<TraceManager>,
     sync_lock: crate::port_actor::SyncLock,
+    input_eos: crate::port_actor::InputEos,
 }
 
 impl WeakPortHandle {
@@ -440,6 +442,7 @@ impl WeakPortHandle {
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
+            input_eos: self.input_eos.clone(),
         })
     }
 }
@@ -495,6 +498,7 @@ impl PortHandle {
                 .into(),
             trace,
             sync_lock: actor.sync_lock,
+            input_eos: actor.input_eos,
         }
     }
 
@@ -515,6 +519,7 @@ impl PortHandle {
             interfaces: self.interfaces.clone(),
             trace: self.trace.clone(),
             sync_lock: self.sync_lock.clone(),
+            input_eos: self.input_eos.clone(),
         }
     }
 
@@ -680,6 +685,13 @@ impl PortHandle {
     /// loop — a failing request is a device error, not a shutdown.
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+
+    /// The driver's input EOS for a user at `addr`, as C `getInputEos` would
+    /// answer it, without the driver: an interrupt callback inside the
+    /// driver's read can ask while the port thread holds it.
+    pub fn input_eos(&self, addr: i32) -> Vec<u8> {
+        self.input_eos.get(addr)
     }
 
     /// Access the interrupt manager for subscribing to interrupt callbacks.
@@ -1679,6 +1691,27 @@ impl PortHandle {
         .map(drop)
     }
 
+    /// [`Self::exception_disconnect`] waiting for C's status: an already-down
+    /// `dpCommon` answers `asynError` with C's errorMessage (asynManager.c:2176-2181).
+    pub fn exception_disconnect_blocking(&self, addr: i32) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::ExceptionDisconnect,
+            AsynUser::default().with_addr(addr),
+        )
+        .map(drop)
+    }
+
+    /// C `exceptionConnect` (asynManager.c:2142-2163) for a user bound to
+    /// `addr`: an already-up `dpCommon` answers `asynError` with C's
+    /// errorMessage.
+    pub fn exception_connect_blocking(&self, addr: i32) -> AsynResult<()> {
+        self.submit_blocking(
+            RequestOp::ExceptionConnect,
+            AsynUser::default().with_addr(addr),
+        )
+        .map(drop)
+    }
+
     /// Was the port shut down? See [`crate::port::DeviceTable::is_defunct`].
     pub(crate) fn is_defunct(&self) -> bool {
         self.devices.is_defunct()
@@ -2233,6 +2266,15 @@ mod tests {
         std::thread::spawn(move || cell.unblock_process_callback(true).unwrap())
             .join()
             .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
+    }
+
+    /// A port-wide holder dropped with its block still held releases it;
+    /// C leaks it (see `RequestCell`'s drop).
+    #[test]
+    fn dropping_a_holding_cell_wakes_the_port() {
+        let (_handle, cell, rx) = blocked_port();
+        drop(cell);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
     }
 
@@ -4676,21 +4718,81 @@ mod tests {
         let events = Events::default();
         let _g = handle.exception_callback_add(0, recorder(&events));
 
-        handle
-            .submit_blocking(RequestOp::ExceptionDisconnect, AsynUser::default())
-            .unwrap();
+        handle.exception_disconnect_blocking(-1).unwrap();
         assert!(!connected_after(&handle, -1));
         assert_eq!(*events.lock(), [(AsynException::Connect, -1)]);
         assert_eq!(disconnects.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let e = handle
-            .submit_blocking(RequestOp::ExceptionDisconnect, AsynUser::default())
-            .unwrap_err();
+        let e = handle.exception_disconnect_blocking(-1).unwrap_err();
         assert_eq!(
             e.message(),
             "exc_down addr -1 asynManager:exceptionDisconnect but not connected"
         );
         assert_eq!(events.lock().len(), 1);
+    }
+
+    /// C `exceptionConnect` (asynManager.c:2142-2163) marks the `dpCommon` up,
+    /// counts the connect and announces it without the driver's `connect`, and
+    /// refuses a `dpCommon` that is already up.
+    #[test]
+    fn exception_connect_ups_the_port_without_the_driver() {
+        use crate::exception::AsynException;
+        let (handle, _) = counted_port("exc_up", 1);
+        let e = handle.exception_connect_blocking(-1).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "exc_up addr -1 asynManager:exceptionConnect already connected"
+        );
+        handle.exception_disconnect_blocking(-1).unwrap();
+        let before = handle.report_blocking(1).unwrap();
+        let events = Events::default();
+        let _g = handle.exception_callback_add(-1, recorder(&events));
+
+        handle.exception_connect_blocking(-1).unwrap();
+        assert!(connected_after(&handle, -1));
+        assert_eq!(*events.lock(), [(AsynException::Connect, -1)]);
+        let after = handle.report_blocking(1).unwrap();
+        let connects = |r: &str| {
+            r.split("numberConnects ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        assert_eq!(connects(&after), connects(&before) + 1, "{after}");
+    }
+
+    /// A device user's exceptionConnect raises its device, and its refusal names
+    /// the addr (asynManager.c:2153-2156).
+    #[test]
+    fn exception_connect_of_a_device_raises_only_the_device() {
+        let (handle, _) = counted_port("exc_devup", 4);
+        handle.connect_addr_blocking(2).unwrap();
+        let e = handle.exception_connect_blocking(2).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "exc_devup addr 2 asynManager:exceptionConnect already connected"
+        );
+        handle.exception_disconnect_blocking(2).unwrap();
+        handle.exception_connect_blocking(2).unwrap();
+        assert!(connected_after(&handle, 2));
+    }
+
+    /// The refusal names the device a device user is bound to
+    /// (asynManager.c:2178-2179).
+    #[test]
+    fn exception_disconnect_of_a_downed_device_names_its_addr() {
+        let (handle, _) = counted_port("exc_dev", 4);
+        handle.connect_addr_blocking(2).unwrap();
+        handle.exception_disconnect_blocking(2).unwrap();
+        let e = handle.exception_disconnect_blocking(2).unwrap_err();
+        assert_eq!(
+            e.message(),
+            "exc_dev addr 2 asynManager:exceptionDisconnect but not connected"
+        );
     }
 
     /// drvLove.c:663-687: a layered port's callback on the serial port under it

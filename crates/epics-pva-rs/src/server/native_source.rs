@@ -15,7 +15,9 @@ use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::{PutOptions, RecordPutKind, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
-use epics_base_rs::server::database::char_view::{DollarView, PvaDollar, long_string_text};
+use epics_base_rs::server::database::char_view::{
+    DollarView, PvaDollar, char_view, long_string_field_text, long_string_text,
+};
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
 use epics_base_rs::server::database::filters::{ChannelName, FilterChain, db_channel_create};
@@ -1137,6 +1139,9 @@ enum ChannelRender {
     /// A long string's `LEN` elements as their text: pvxs reshapes the plain
     /// channel to a `form = "String"` char array (`ioc/channel.cpp:58-67`).
     LongStringText,
+    /// A long string with no room past `MAX_STRING_SIZE + 1`: pvxs keeps its
+    /// `DBF_STRING` (`ioc/channel.cpp:58-60`), the buffer read to its NUL.
+    LongStringField,
     /// A `$` channel.
     Dollar(DollarView),
 }
@@ -1146,6 +1151,7 @@ impl ChannelRender {
     fn shaper(self) -> fn(MonitorEvent) -> MonitorEvent {
         match self {
             ChannelRender::LongStringText => long_string_shaped,
+            ChannelRender::LongStringField => long_string_field_shaped,
             ChannelRender::Dollar(d) if d.scalar() => scalar_shaped,
             ChannelRender::Dollar(d) if d.serve == PvaDollar::Chars => std::convert::identity,
             ChannelRender::Dollar(_) => long_string_shaped,
@@ -1166,6 +1172,9 @@ impl ChannelRender {
             }
             ChannelRender::LongStringText => {
                 snap.value = read_chain(filters, long_string_text(take_value(snap)));
+            }
+            ChannelRender::LongStringField => {
+                snap.value = read_chain(filters, long_string_field_text(take_value(snap)));
             }
             ChannelRender::Dollar(dollar) => {
                 let image = dollar.render(take_value(snap));
@@ -1205,7 +1214,11 @@ fn record_channel_render(
         return DollarView::of(&inst, &cn.field, filters).map(ChannelRender::Dollar);
     }
     Some(if rec.field_is_long_string(&cn.field) {
-        ChannelRender::LongStringText
+        if char_view(&inst, &cn.field).is_some_and(|v| v.re_views_plain_channel()) {
+            ChannelRender::LongStringText
+        } else {
+            ChannelRender::LongStringField
+        }
     } else {
         ChannelRender::Shaped(ChannelShape::of_record_channel(&inst, &cn.field, filters))
     })
@@ -2244,6 +2257,20 @@ fn long_string_shaped(
     ev
 }
 
+/// [`long_string_shaped`] for a [`ChannelRender::LongStringField`].
+fn long_string_field_shaped(
+    mut ev: epics_base_rs::server::pv::MonitorEvent,
+) -> epics_base_rs::server::pv::MonitorEvent {
+    if matches!(
+        ev.value().as_value(),
+        Some(EpicsValue::CharArray(_) | EpicsValue::UCharArray(_))
+    ) {
+        let value = ev.replace_value(EpicsValue::Long(0));
+        ev.replace_value(long_string_field_text(value));
+    }
+    ev
+}
+
 /// `ev` with its snapshot collapsed to the one element the channel serves.
 ///
 /// `replace_value` copies the post first: every other subscriber it reached
@@ -2419,7 +2446,7 @@ fn record_put_value(
     cn: &ChannelName,
     value: &PvField,
 ) -> Result<(EpicsValue, bool), OpError> {
-    use epics_base_rs::server::database::char_view::{char_view, pva_char_request};
+    use epics_base_rs::server::database::char_view::pva_char_request;
     let epics = put_payload_to_epics(value)?;
     // A char array is the `int8_t[]` only a `$` channel serves.
     let chars = match &epics {
@@ -6997,6 +7024,62 @@ ASG(PLAIN) {
                 want,
                 "{name}"
             );
+        }
+    }
+
+    /// A long string whose failed device read left its NUL past `LEN`
+    /// (devlsiStream.c): pvxs keeps a SIZV 41 VAL the `DBF_STRING`
+    /// `cvt_dbaddr` made it, read to the buffer's NUL, and re-views a SIZV
+    /// 100 VAL as its `LEN` chars (`ioc/channel.cpp:58-67`).
+    #[epics_macros_rs::epics_test]
+    async fn a_long_string_reads_past_len_only_without_the_re_view() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+        let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+            .db_string(
+                r#"record(lsi, "A") { field(SIZV, "41") field(MPST, "Always") }
+                record(lsi, "B") { field(SIZV, "100") field(MPST, "Always") }"#,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        for (name, read) in [("A", b"abcdef".to_vec()), ("B", vec![b'x'; 50])] {
+            let cell = db.get_record(name).unwrap();
+            let mut inst = cell.write();
+            let lsi = inst
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<LsiRecord>())
+                .unwrap();
+            lsi.val.set_text(b"o");
+            let sizv = lsi.sizv as usize;
+            lsi.val.scan_in_place(sizv, |buf| {
+                buf[..read.len()].copy_from_slice(&read);
+                buf[read.len()] = 0;
+                None
+            });
+        }
+        let source = PvDatabaseSource::new(db.clone());
+        for (name, want) in [("A.VAL", "abcdef"), ("B.VAL", "xx")] {
+            let want = Some(PvField::Scalar(ScalarValue::String(want.into())));
+            assert_eq!(
+                dollar_value(source.get_value(name.as_bytes()).await),
+                want,
+                "pvget {name}"
+            );
+            let mut mon = source.subscribe(name.as_bytes()).await.expect("subscribes");
+            // MPST Always: the cycle posts VAL, which reads no new text.
+            db.put_record_field_from_ca(&name[..1], "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            let first = epics_base_rs::runtime::task::timeout(
+                std::time::Duration::from_secs(5),
+                mon.recv(),
+            )
+            .await
+            .expect("an event");
+            assert_eq!(dollar_value(first), want, "pvmonitor {name}");
         }
     }
 

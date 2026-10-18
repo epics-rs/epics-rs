@@ -1130,7 +1130,7 @@ fn hunt_double(s: &[u8]) -> f64 {
     if i > 0 && s[i - 1] == b'-' {
         i -= 1;
     }
-    super::strtod::strtod(&s[i..]).value
+    crate::runtime::stdlib::strtod(&s[i..]).value
 }
 
 /// C `SMALL` (`sCalcPerform.c:46`) — the tolerance sCalc's numeric comparisons

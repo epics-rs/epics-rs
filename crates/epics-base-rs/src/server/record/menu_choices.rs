@@ -516,6 +516,22 @@ pub fn multibit_state_string_index(field: &str) -> Option<u16> {
         .map(|i| i as u16)
 }
 
+/// ZRVL..FFVL, the state values.
+const MULTIBIT_STATE_VALUES: [&str; 16] = [
+    "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL", "ELVL",
+    "TVVL", "TTVL", "FTVL", "FFVL",
+];
+
+/// One of the 32 state fields whose put reaches `init_common` from
+/// `special()` (`mbbiRecord.c:221`, `mbboRecord.c:286`): every `SPC_MOD`
+/// field but SIMM.
+pub fn multibit_state_field(field: &str) -> bool {
+    multibit_state_string_index(field).is_some()
+        || MULTIBIT_STATE_VALUES
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+}
+
 /// C `get_enum_str` for the two-state records (`bi`/`bo`/`busy`):
 /// `VAL==0 -> ZNAM`, `VAL==1 -> ONAM`, anything else `"Illegal_Value"`
 /// (`biRecord.c:173-192`, `boRecord.c:320-339`).

@@ -160,6 +160,7 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: 1,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             } else {
                 Err(AsynError::Status {
@@ -204,6 +205,7 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: 1,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -284,6 +286,7 @@ mod tests {
                     return Ok(OctetReadResult {
                         nbytes_transferred: 1,
                         eom_reason: EomReason::CNT,
+                        taken_back: 0,
                     });
                 }
                 Err(AsynError::Status {
@@ -361,6 +364,7 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {

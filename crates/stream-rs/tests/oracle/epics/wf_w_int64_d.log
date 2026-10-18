@@ -1,0 +1,43 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=3
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto wfod P"
+Stream::initRecord rec: filename="l.proto" protocol="wfod" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "wfod")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %f
+Stream::formatValue(rec, format=%f, fieldaddr=(nil)
+Stream::formatValue(rec) format=%f type=DBF_DOUBLE
+streamPrintf(rec,format=%f)
+StreamCore::printValue(rec, %f, -5.00000): "-5.000000"
+streamPrintf(rec,format=%f)
+StreamCore::printValue(rec, %f, 9.00720e+15): "-5.000000,9007199254740992.000000"
+streamPrintf(rec,format=%f)
+StreamCore::printValue(rec, %f, 1.67772e+07): "-5.000000,9007199254740992.000000,16777217.000000"
+StreamCore::evalOut: outputLine = "-5.000000,9007199254740992.000000,16777217.000000<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+Stream::process(rec): protocol started
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. don't convert
+recordProcessCallback(rec) processing record done
+VAL [3] -5 = -0x5 9007199254740993 = 0x20000000000001 16777217 = 0x1000001
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+NORD 3 = 0x3

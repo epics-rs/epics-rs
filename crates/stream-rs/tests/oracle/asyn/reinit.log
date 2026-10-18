@@ -1,0 +1,4 @@
+AsynDriverInterface::exceptionHandler(rec, Connect)
+AsynDriverInterface::exceptionHandler(rec) P 0 disconnected. ioAction: None
+AsynDriverInterface::exceptionHandler(rec, Connect)
+AsynDriverInterface::exceptionHandler(rec) P 0 connected. ioAction: None

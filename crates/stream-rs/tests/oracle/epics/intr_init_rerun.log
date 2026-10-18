@@ -1,5 +1,5 @@
 drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
 streamInitRecord(rec): SEVR=0
 streamInitRecord(rec): create new Stream object
 streamInitRecord(rec): calling initRecord
@@ -39,7 +39,7 @@ Stream::protocolFinishHook rec: signalling init done
 Stream::initRecord rec: initDone
 Stream::initRecord rec: initialized. don't convert
 streamInitRecord(rec) done status=0
-streamGetIointInfo(rec,cmd=0): stream=0x5798c4e87b60, ioscanpvt=0x5798c4e89720
+streamGetIointInfo(rec,cmd=0): stream=0x55f72db21880, ioscanpvt=0x55f72db23440
 streamGetIointInfo(rec): start later...
 rec: starting "I/O Intr"
 StreamCore::startProtocol(rec, startMode=StartAsync)

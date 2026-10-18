@@ -1,5 +1,5 @@
 drvStreamInit()
-StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/stream-wt/crates/stream-rs/tests/oracle/epics
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
 streamInitRecord(rec): SEVR=0
 streamInitRecord(rec): create new Stream object
 streamInitRecord(rec): calling initRecord
@@ -14,7 +14,7 @@ Stream::process(rec) start
 StreamCore::startProtocol(rec, startMode=StartNormal)
 StreamCore::evalCommand(rec): activeCommand = connect
 Stream::process(rec): protocol started
-rec connectToAsynPort: Can't connect to 127.0.0.1:27301: Operation now in progress
+rec connectToAsynPort: Can't connect to 127.0.0.1:<port>: Operation now in progress
 StreamCore::connectCallback(rec, StreamIoFault) activeCommand: connect
 rec: Connect failed
 StreamCore::finishProtocol(rec, Fault) not bus owner

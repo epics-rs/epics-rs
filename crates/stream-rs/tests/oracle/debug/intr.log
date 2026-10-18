@@ -1,0 +1,27 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/reviewer6/sbase/crates/stream-rs/tests/oracle/debug
+streamInitRecord(rec): SEVR=3
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "d.proto i debug"
+Stream::initRecord rec: filename="d.proto" protocol="i" bus="debug" addr=0 params=""
+Stream::initRecord rec: attachBus("debug", 0, "")
+StreamBusInterface::find(rec, debug, 0, "")
+StreamBusInterface::find rec check DebugInterface
+DebugInterface::getBusInterface(debug, 0): new Interface allocated
+StreamBusInterface::find DebugInterface matches
+Stream::initRecord rec: parse("d.proto", "i")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x572857532b50, ioscanpvt=0x5728575345e0
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+rec: Businterface does not support async mode
+rec: Can't start "I/O Intr" protocol
+VAL 0
+SEVR "INVALID"
+STAT "UDF"
+UDF 1 = 0x1
+PACT 0 = 0x0
+PROC 0 = 0x0

@@ -1136,6 +1136,10 @@ impl Record for WaveformRecord {
         Ok(())
     }
 
+    fn dset_init_in_pass0(&self) -> bool {
+        matches!(self.kind, ArrayKind::Aai | ArrayKind::Aao)
+    }
+
     /// waveform/aai/aao clear UDF in `process()` itself, on the line after
     /// `readValue` returns and whatever status it returned —
     /// `prec->pact = TRUE; prec->udf = FALSE;` (waveformRecord.c:143-144,

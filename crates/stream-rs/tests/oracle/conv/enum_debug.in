@@ -1,0 +1,7 @@
+pl	%{a|b}	1
+pl	%#{a|b=?}	9
+pl	%#{a=3|\x1bb\x01}	4
+sl	%{ab|a}	61
+sl	%{a|b}	63
+sl	%{a\x01|b}	61
+pl	%{a	0

@@ -190,6 +190,11 @@ impl Record for BiRecord {
         self.skip_convert = did_compute;
     }
 
+    /// devbiStream.c reads and writes the `biRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// asyn device readback: a raw hardware word read through `asynInt32`
     /// (`processBi` `pr->rval = value`, MASK unset so 0 — `initBi` passes
     /// NULL for the mask, devAsynInt32.c) or `asynUInt32Digital` (`processBi`

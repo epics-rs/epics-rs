@@ -123,6 +123,57 @@ impl Drop for SyncLockHeld {
     }
 }
 
+/// The driver's input EOS for [`crate::port_handle::PortHandle::input_eos`],
+/// which a reader on the port thread (an interrupt callback inside the
+/// driver's read) needs while the driver is borrowed: what `get_input_eos`
+/// answers for each device. The actor republishes it after every driver
+/// `set_input_eos` it makes ([`PortActor::set_input_eos`]), and nothing else
+/// writes it.
+#[derive(Clone, Default)]
+pub(crate) struct InputEos {
+    multi_device: bool,
+    by_key: Arc<parking_lot::RwLock<HashMap<i32, Vec<u8>>>>,
+}
+
+impl InputEos {
+    fn of(driver: &dyn PortDriver) -> Self {
+        let eos = Self {
+            multi_device: driver.base().flags.multi_device,
+            by_key: Arc::default(),
+        };
+        eos.publish(driver);
+        eos
+    }
+
+    /// The terminator `get_input_eos` gives a user at `addr`.
+    pub(crate) fn get(&self, addr: i32) -> Vec<u8> {
+        let key = crate::port::eos_device_key(self.multi_device, addr);
+        self.by_key.read().get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Every device's readback, not only the one set: a driver may keep one
+    /// terminator for all its addresses (Prologix's single `++eos`).
+    fn publish(&self, driver: &dyn PortDriver) {
+        let devices = if self.multi_device {
+            0..driver.base().max_addr as i32
+        } else {
+            0..0
+        };
+        let known: Vec<i32> = self.by_key.read().keys().copied().collect();
+        let readback: HashMap<i32, Vec<u8>> = std::iter::once(-1)
+            .chain(devices)
+            .chain(known)
+            .map(|key| {
+                (
+                    key,
+                    driver.get_input_eos(&AsynUser::default().with_addr(key)),
+                )
+            })
+            .collect();
+        *self.by_key.write() = readback;
+    }
+}
+
 /// What a [`crate::port_handle::PortHandle`] takes from the actor behind its
 /// channel: the actor's identity, for the re-entrancy guard, and the port's
 /// [`QueueGate`], for C `queueRequest`'s refusals on the queueing thread.
@@ -134,6 +185,7 @@ pub(crate) struct ActorLink {
     pub(crate) gate: QueueGate,
     pub(crate) devices: crate::port::DeviceTable,
     pub(crate) sync_lock: SyncLock,
+    pub(crate) input_eos: InputEos,
 }
 
 impl ActorLink {
@@ -149,6 +201,7 @@ impl ActorLink {
             gate: QueueGate::open(),
             devices: crate::port::DeviceTable::detached(),
             sync_lock: SyncLock::default(),
+            input_eos: InputEos::default(),
         }
     }
 }
@@ -551,6 +604,18 @@ impl BlockBook {
         taken
     }
 
+    /// Everything `token` counts or holds, at once: the end of a block
+    /// identity whose owner is gone. True when it held a holder.
+    pub(crate) fn release(&mut self, token: u64) -> bool {
+        self.counts.remove(&token);
+        let mut was_owner = self.port.take_if(|owner| *owner == token).is_some();
+        let held = self.dp_commons.len();
+        self.dp_commons.retain(|_, owner| *owner != token);
+        was_owner |= self.dp_commons.len() != held;
+        self.released |= was_owner;
+        was_owner
+    }
+
     fn take_released(&mut self) -> bool {
         std::mem::take(&mut self.released)
     }
@@ -704,6 +769,7 @@ pub(crate) struct PortActor {
     /// port thread rescans its whole queue on every wake.
     rescanned_exceptions: u64,
     sync_lock: SyncLock,
+    input_eos: InputEos,
 }
 
 /// A cell still queued when the actor goes runs its body as refused: a cell
@@ -742,6 +808,7 @@ impl PortActor {
         let seen_exceptions = driver.base().exceptions_announced();
         let flags = driver.base().flags;
         let cells = Arc::new(CellQueue::for_port(flags.can_block, flags.multi_device));
+        let input_eos = InputEos::of(&*driver);
         Self {
             id: ActorId::new(),
             driver,
@@ -756,6 +823,7 @@ impl PortActor {
             seen_exceptions,
             rescanned_exceptions: seen_exceptions,
             sync_lock: SyncLock::default(),
+            input_eos,
         }
     }
 
@@ -770,7 +838,16 @@ impl PortActor {
             gate: self.driver.base().queue_gate(),
             devices: self.driver.base().device_table(),
             sync_lock: self.sync_lock.clone(),
+            input_eos: self.input_eos.clone(),
         }
+    }
+
+    /// The driver's `setInputEos`, and the one writer of [`InputEos`]: its
+    /// readers see the driver's terminator as of the last set, refused or not.
+    fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        let set = self.driver.set_input_eos(user, eos);
+        self.input_eos.publish(&*self.driver);
+        set
     }
 
     /// A fixture's registration: the connect `new` armed runs now, as C's
@@ -1309,6 +1386,7 @@ impl PortActor {
             // Direct `pasynManager` calls under `asynManagerLock`.
             RequestOp::SetEnable { .. }
             | RequestOp::ExceptionDisconnect
+            | RequestOp::ExceptionConnect
             | RequestOp::SetAutoConnect { .. }
             | RequestOp::GetEnable
             | RequestOp::GetAutoConnect
@@ -1978,15 +2056,11 @@ impl PortActor {
     /// runs per lower-level read, on the raw driver chunk. That position is
     /// `DriverOctetLink::read`; firing it here instead handed
     /// interrupt users the post-EOS message and the EOS eomReason (R19-112).
-    fn octet_read(
-        &mut self,
-        user: &AsynUser,
-        buf_size: usize,
-    ) -> AsynResult<(Vec<u8>, usize, EomReason)> {
+    fn octet_read(&mut self, user: &AsynUser, buf_size: usize) -> AsynResult<RequestResult> {
         let mut buf = vec![0u8; buf_size];
-        let (n, eom) = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf)?;
-        buf.truncate(n);
-        Ok((buf, n, eom))
+        let r = crate::port::octet_read_chain(&mut *self.driver, user, &mut buf)?;
+        buf.truncate(r.nbytes_transferred);
+        Ok(RequestResult::octet_read_chain(buf, &r))
     }
 
     /// The port's octet write: through the interpose chain, ending at the driver
@@ -2025,10 +2099,7 @@ impl PortActor {
                 let n = self.octet_write(user, data)?;
                 Ok(RequestResult::write_n(n))
             }
-            RequestOp::OctetRead { buf_size } => {
-                let (buf, n, eom) = self.octet_read(user, *buf_size)?;
-                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
-            }
+            RequestOp::OctetRead { buf_size } => self.octet_read(user, *buf_size),
             RequestOp::OctetWriteBinary { data } => {
                 // C parity: asynRecord binary output (asynRecord.c:1528-1541).
                 // Save the driver's output EOS, clear it for the raw write,
@@ -2065,14 +2136,13 @@ impl PortActor {
                 let saved = self.driver.get_input_eos(user);
                 let bracket = !saved.is_empty();
                 if bracket {
-                    self.driver.set_input_eos(user, &[])?;
+                    self.set_input_eos(user, &[])?;
                 }
                 let res = self.octet_read(user, *buf_size);
                 if bracket {
-                    let _ = self.driver.set_input_eos(user, &saved);
+                    let _ = self.set_input_eos(user, &saved);
                 }
-                let (buf, n, eom) = res?;
-                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
+                res
             }
             RequestOp::OctetWriteRead {
                 data,
@@ -2107,10 +2177,8 @@ impl PortActor {
                 if !*flush && sent != data.len() {
                     return Ok(RequestResult::write_n(sent));
                 }
-                let (buf, n, eom) = self
-                    .octet_read(user, *buf_size)
-                    .map_err(|e| e.in_octet_step(OctetStep::Read))?;
-                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
+                self.octet_read(user, *buf_size)
+                    .map_err(|e| e.in_octet_step(OctetStep::Read))
             }
             RequestOp::Int32Write { value } => {
                 self.driver.io_write_int32(user, *value)?;
@@ -2215,6 +2283,19 @@ impl PortActor {
                         status: AsynStatus::Error,
                         message: format!(
                             "{} addr {} asynManager:exceptionDisconnect but not connected",
+                            self.driver.base().port_name,
+                            self.driver.base().dp_addr(user.addr).unwrap_or(-1)
+                        ),
+                    });
+                }
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::ExceptionConnect => {
+                if !self.driver.base_mut().set_addr_connected(user.addr, true) {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!(
+                            "{} addr {} asynManager:exceptionConnect already connected",
                             self.driver.base().port_name,
                             self.driver.base().dp_addr(user.addr).unwrap_or(-1)
                         ),
@@ -2592,7 +2673,7 @@ impl PortActor {
                 // of truth (`PortDriverBase::input_eos`) rather than
                 // the orphaned options HashMap. The terminator belongs to the
                 // device the request addressed, so the user goes with it.
-                self.driver.set_input_eos(user, eos)?;
+                self.set_input_eos(user, eos)?;
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetOutputEos { eos } => {
@@ -3480,6 +3561,49 @@ mod tests {
         assert!(eom.contains(EomReason::CNT));
         assert!(!eom.contains(EomReason::EOS));
         assert!(!eom.contains(EomReason::END));
+    }
+
+    /// A "\r\n" split across two OctetReads: the second reply takes back
+    /// the "\r" the first delivered (asynInterposeEos.c:201-204).
+    #[test]
+    fn actor_octet_read_carries_eos_taken_back() {
+        use crate::interpose::eos::{EosConfig, EosInterpose};
+
+        struct LineDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for LineDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                buf[..4].copy_from_slice(b"AB\r\n");
+                Ok(4)
+            }
+        }
+        let mut drv = LineDriver {
+            base: PortDriverBase::new(
+                "takeback_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+        };
+        drv.base
+            .install_octet_interpose(Box::new(EosInterpose::new(EosConfig {
+                input_eos: b"\r\n".to_vec(),
+                output_eos: Vec::new(),
+            })));
+        let tx = spawn_actor(drv);
+        let user = || AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let first = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 3 }, user()).unwrap();
+        assert_eq!((first.nbytes, first.taken_back), (3, 0));
+        let second = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 3 }, user()).unwrap();
+        assert_eq!((second.nbytes, second.taken_back), (0, 1));
     }
 
     #[test]
@@ -4788,6 +4912,7 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: crate::interpose::EomReason::CNT,
+                    taken_back: 0,
                 })
             }
             fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {

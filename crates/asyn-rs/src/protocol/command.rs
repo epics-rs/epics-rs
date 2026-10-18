@@ -241,6 +241,8 @@ pub enum PortCommand {
     ConnectUser,
     /// C `pasynManager->exceptionDisconnect`. Appended last, as above.
     ExceptionDisconnect,
+    /// C `pasynManager->exceptionConnect`. Appended last, as above.
+    ExceptionConnect,
 }
 
 #[cfg(test)]
@@ -340,6 +342,7 @@ mod tests {
             },
             PortCommand::ConnectUser,
             PortCommand::ExceptionDisconnect,
+            PortCommand::ExceptionConnect,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

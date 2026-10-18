@@ -18,6 +18,13 @@ pub enum SubscribeRefused {
     NoRecord,
     /// The per-PV subscriber cap (`EPICS_CAS_MAX_SUBSCRIBERS_PER_PV`).
     CapReached,
+    /// C `dbChannelCreate` found no such field (`pvNameLookup`,
+    /// `dbChannel.c:460-462`), or a `$` on a field that is neither a string
+    /// nor a link (`:500-503`).
+    FieldNotFound,
+    /// C `dbChannelCreate`'s `chf_parse` stopped on the filter suffix
+    /// (`dbChannel.c:513-516`), having printed C's line.
+    BadFilter,
 }
 
 /// A reader's drop unlinks its monitor, so the post walks live rows only.

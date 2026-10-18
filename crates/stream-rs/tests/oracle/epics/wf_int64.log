@@ -1,0 +1,56 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=3
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto wfl P"
+Stream::initRecord rec: filename="l.proto" protocol="wfl" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "wfl")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "A<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+Stream::process(rec): protocol started
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="-", size=1)
+StreamCore::readCallback(rec) inputBuffer="-", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="1,9223372036854775807,4294967297", size=32)
+StreamCore::readCallback(rec) inputBuffer="-1,9223372036854775807,4294967297", size 33
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "-1,9223372036854775807,4294967297"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="-1" value=-1
+Stream::scan() currentValueLength=2
+StreamCore::matchSeparator(rec) separator "," found
+StreamCore::scanValue(rec, format=%d, long) input="9223372036854775807" value=9223372036854775807
+Stream::scan() currentValueLength=19
+StreamCore::matchSeparator(rec) separator "," found
+StreamCore::scanValue(rec, format=%d, long) input="4294967297" value=4294967297
+Stream::scan() currentValueLength=10
+StreamCore::matchSeparator(rec) separator "," not found
+Stream::scan() currentValueLength=-1
+Stream::matchValue(rec): success, 0 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. don't convert
+recordProcessCallback(rec) processing record done
+VAL [3] -1 = -0x1 9223372036854775807 = 0x7fffffffffffffff 4294967297 = 0x100000001
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+NORD 3 = 0x3

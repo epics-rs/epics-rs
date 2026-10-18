@@ -1,0 +1,49 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "b.proto ii P"
+Stream::initRecord rec: filename="b.proto" protocol="ii" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("b.proto", "ii")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x61c7c96a8890, ioscanpvt=0x61c7c96aa430
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="V=5<0d><0a>", size=5)
+StreamCore::readCallback(rec) inputBuffer="V=5<0d><0a>", size 5
+StreamCore::readCallback(rec) inTerminator <0d><0a> at position 3
+StreamCore::readCallback(rec) input line: "V=5"
+StreamCore::matchInput(rec): format = "%d"
+StreamCore::scanValue(rec, format=%d, long) input="5" value=5
+Stream::scan() currentValueLength=1
+Stream::matchValue(rec): success, 1 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) not bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. convert
+recordProcessCallback(rec) processing record done
+recordProcessCallback(rec) restart async protocol
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="", size 0
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) async timeout: just restart
+VAL ""
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+RVAL 1 = 0x1
+RBV 5 = 0x5
+ORAW 1 = 0x1
+ORBV 5 = 0x5
+MLST 1 = 0x1

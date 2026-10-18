@@ -70,6 +70,7 @@ epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.32.0" }
 epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.32.0" }
 motor-rs = { path = "crates/motor-rs", version = "0.32.0" }
 std-rs = { path = "crates/std-rs", version = "0.32.0" }
+stream-pcre-sys = { path = "crates/stream-pcre-sys", version = "0.32.0" }
 scaler-rs = { path = "crates/scaler-rs", version = "0.32.0" }
 optics-rs = { path = "crates/optics-rs", version = "0.32.0" }
 mca-rs = { path = "crates/mca-rs", version = "0.32.0" }

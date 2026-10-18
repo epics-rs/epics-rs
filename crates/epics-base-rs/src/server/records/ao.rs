@@ -405,6 +405,16 @@ impl Record for AoRecord {
         "ao"
     }
 
+    /// `aoRecord.c:152`
+    fn bad_init_ret_message(&self) -> Option<&'static str> {
+        Some("ao: init_record")
+    }
+
+    /// devaoStream.c reads and writes the `aoRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// devAoSoft.c, devAoSoftRaw.c and devAoSoftCallback.c return `dbPutLink`'s status.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
@@ -732,6 +742,7 @@ impl Record for AoRecord {
             "RBV" => Some(EpicsValue::Long(self.rbv)),
             "ORBV" => Some(EpicsValue::Long(self.orbv)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "OMOD" => Some(EpicsValue::UChar(self.omod as u8)),
             "LINR" => Some(EpicsValue::Short(self.linr)),
             "EGUF" => Some(EpicsValue::Double(self.eguf)),
             "EGUL" => Some(EpicsValue::Double(self.egul)),

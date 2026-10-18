@@ -3863,13 +3863,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "stream-pcre-sys"
+version = "0.32.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "stream-rs"
 version = "0.32.0"
 dependencies = [
+ "asyn-rs",
  "chrono",
  "epics-base-rs",
  "libc",
  "parking_lot",
+ "stream-pcre-sys",
  "tempfile",
 ]
 

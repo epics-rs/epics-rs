@@ -906,6 +906,7 @@ impl OctetNext for SerialIoState {
             } else {
                 EomReason::empty()
             },
+            taken_back: 0,
         })
     }
 
@@ -2832,7 +2833,9 @@ mod tests {
         // The EOS layer is the port's, not the driver's: a caller enters the
         // chain at the top and the driver is its base (C findInterface,
         // asynManager.c:1494-1503). `PortActor` does exactly this.
-        let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+        let (n, _eom) = crate::port::octet_read_chain(&mut drv, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
         // EOS should strip the terminator
         assert_eq!(&buf[..n], b"OK");
     }

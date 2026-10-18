@@ -529,6 +529,27 @@ pub fn long_string_text(value: EpicsValue) -> EpicsValue {
     }
 }
 
+/// A long-string field's buffer as its plain address reads it: `cvt_dbaddr`
+/// makes it one `DBF_STRING` of `field_size = SIZV` (`lsiRecord.c:122`,
+/// `lsoRecord.c:164`, `printfRecord.c:410`), so the text runs to the
+/// buffer's NUL, past `LEN` where a device scanned into VAL and then failed
+/// (devlsiStream.c). Only the char view is `LEN` elements.
+pub fn long_string_field_bytes(b: &crate::types::SharedArray<u8>) -> &[u8] {
+    let buf = &b.buffer()[..];
+    &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]
+}
+
+/// [`long_string_field_bytes`] as the one `DBF_STRING` element; any other
+/// value is returned unchanged.
+pub fn long_string_field_text(value: EpicsValue) -> EpicsValue {
+    match value {
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => EpicsValue::String(
+            crate::types::PvString::from_bytes(long_string_field_bytes(&b)),
+        ),
+        value => value,
+    }
+}
+
 /// What pvxs serves a `$` channel as, from its `getChannelValueType`
 /// (`ioc/iocsource.cpp:619-643`). The native PVA source and QSRV both ask
 /// it, so the two servers cannot part on a `$` channel's type.

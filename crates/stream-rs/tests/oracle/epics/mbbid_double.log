@@ -1,0 +1,51 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto d P"
+Stream::initRecord rec: filename="l.proto" protocol="d" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "d")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "D<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+Stream::process(rec): protocol started
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="3", size=1)
+StreamCore::readCallback(rec) inputBuffer="3", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input=".5", size=2)
+StreamCore::readCallback(rec) inputBuffer="3.5", size 3
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "3.5"
+StreamCore::matchInput(rec): format = "%f"
+Stream::matchValue(rec): readData failed
+rec: Format "%f" has data type double which is not supported by "rec".
+StreamCore::readCallback(rec) match failure
+StreamCore::finishProtocol(rec, ScanError) bus owner
+starting exception handler
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, ScanError)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) error status=CALC (12)
+recordProcessCallback(rec) processing record done
+VAL 3 = 0x3
+SEVR "INVALID"
+STAT "CALC"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+RVAL 0 = 0x0
+B0 1 = 0x1

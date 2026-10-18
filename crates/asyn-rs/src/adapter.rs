@@ -20,7 +20,8 @@ use epics_base_rs::types::EpicsValue;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::InterfaceType;
 use crate::interrupt::{
-    ENUM_ENTRY_BYTES, InterruptFilter, InterruptSubscription, MAX_ENUM_STATES, clamp_enum_table,
+    ENUM_ENTRY_BYTES, InterruptFilter, InterruptReceiver, InterruptSubscription, MAX_ENUM_STATES,
+    clamp_enum_table,
 };
 use crate::port::{DrvUserRequest, QueuePriority};
 use crate::port_handle::{AsyncCompletionHandle, PortHandle};
@@ -200,7 +201,7 @@ fn parse_inst_io(link: &str, mask: bool) -> Result<InstIo, &'static str> {
         if p.starts_with(')') {
             break 'fields;
         }
-        let read = epics_base_rs::calc::engine::strtod::strtod(p.as_bytes());
+        let read = epics_base_rs::runtime::stdlib::strtod(p.as_bytes());
         if read.erange {
             return Err(error);
         }
@@ -366,7 +367,10 @@ pub struct AsynDeviceSupport {
     /// C `pPvt->previousQueueRequestStatus`, the last refused `queueRequest`'s.
     queue_status: AsynStatus,
     record_name: String,
-    scan: ScanType,
+    /// C `pPvt->isIOIntrScan`: set by `get_ioint_info`'s cmd 0 and cleared by
+    /// its cmd 1 (devAsynInt32.c:383/:399), read by the average callback on
+    /// the driver's thread. Seeded from the loaded SCAN.
+    io_intr_scan: Arc<std::sync::atomic::AtomicBool>,
     /// Maximum number of array elements for array read operations.
     /// Default: 307200 (enough for 640x480 images).
     max_array_elements: usize,
@@ -476,9 +480,13 @@ pub struct AsynDeviceSupport {
     /// record's own put leaves the FIFO desynced and the final driver value
     /// (e.g. AD `Acquire` returning to 0) is never popped.
     output_callback_pending: bool,
-    /// The ring's wakeup, for the callback a queued write deferred
-    /// ([`InterruptFifo::end_processing`]).
-    readback_wake: Option<tokio::sync::mpsc::Sender<()>>,
+    /// The record's `scanIoRequest`: every ring callback, and the one a
+    /// queued write deferred ([`InterruptFifo::end_processing`]), wakes it.
+    /// One channel for the record's life, as C's `ioScanPvt` is, so a client
+    /// `get_ioint_info` registers again reaches the pump iocInit spawned.
+    scan_io_tx: tokio::sync::mpsc::Sender<()>,
+    /// The receiving end of `scan_io_tx`, until `io_intr_receiver` takes it.
+    scan_io_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     /// True once the `asynFloat64` ai path has written VAL at least once.
     /// The SMOO filter primes on the first read (C `processAi` skips
     /// smoothing while `pr->udf`, devAsynFloat64.c:599); this is the
@@ -487,12 +495,12 @@ pub struct AsynDeviceSupport {
     /// signal — and it does not depend on the framework's UDF lifecycle.
     smoo_primed: bool,
     /// Enum state-field family captured at init when the record exposes
-    /// ZRST/ZNAM and the driver provided an asynEnum table. `Some` arms the
-    /// runtime re-propagation callback ([`Self::property_post_receiver`]);
-    /// `None` means no enum table (mirrors C's
-    /// `findInterface(asynEnumType) && maxEnums>0` gate).
+    /// ZRST/ZNAM and the port has asynEnum (C's
+    /// `findInterface(asynEnumType) && maxEnums>0` gate). `Some` arms the
+    /// runtime re-propagation callback ([`Self::property_post_receiver`]).
     enum_shape: Option<EnumRecordShape>,
-    /// The driver enum table applied at init — the diff seed for the
+    /// The driver enum table applied at init, `None` when the read failed —
+    /// the diff seed for the
     /// runtime callback so a value-only change (enum index moves, choices
     /// unchanged) fires no DBE_PROPERTY post (C's asynEnum callback only
     /// fires on `doCallbacksEnum`, never on an int32 value callback).
@@ -501,11 +509,14 @@ pub struct AsynDeviceSupport {
     /// unsubscribes. Distinct from `interrupt_sub` (the value I/O Intr
     /// subscription); C registers the asynEnum callback separately.
     enum_interrupt_sub: Option<InterruptSubscription>,
+    /// The tables `init`'s asynEnum registration receives, until
+    /// `property_post_receiver` takes them.
+    enum_intr_rx: Option<InterruptReceiver>,
 }
 
 /// Shared state for an averaging (`asynInt32Average` / `asynFloat64Average`)
-/// record. The always-on interrupt callback (registered in
-/// [`AsynDeviceSupport::io_intr_receiver`]) pushes each driver sample into
+/// record. The always-on interrupt callback (registered in `init`, by
+/// [`AsynDeviceSupport::subscribe_average`]) pushes each driver sample into
 /// `averager` and stashes the sample's driver alarm in `last_alarm`; the
 /// periodic record-process `read()` drains the arithmetic mean and applies
 /// the alarm. Mirrors C `devPvt.sum`/`numAverage` (devAsynInt32.c:98-99) plus
@@ -808,9 +819,7 @@ impl AsynDeviceSupport {
     fn end_processing(&self) {
         let wake = self.interrupt_fifo.lock().unwrap().end_processing();
         if wake {
-            if let Some(tx) = &self.readback_wake {
-                let _ = tx.try_send(());
-            }
+            let _ = self.scan_io_tx.try_send(());
         }
     }
 
@@ -821,6 +830,7 @@ impl AsynDeviceSupport {
             bound: std::sync::OnceLock::new(),
             port: handle.interrupts().clone(),
         });
+        let (scan_io_tx, scan_io_rx) = tokio::sync::mpsc::channel(16);
         Self {
             gate,
             dset: Dset::of("", iface_type),
@@ -846,7 +856,7 @@ impl AsynDeviceSupport {
             last_ts: None,
             queue_status: AsynStatus::Success,
             record_name: String::new(),
-            scan: ScanType::Passive,
+            io_intr_scan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             initial_readback: false,
             octet_output: false,
             asyn_readback: false,
@@ -858,13 +868,15 @@ impl AsynDeviceSupport {
             time_series_sub: None,
             time_series_wake: None,
             interrupt_sub: None,
-            readback_wake: None,
+            scan_io_tx,
+            scan_io_rx: Some(scan_io_rx),
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
             smoo_primed: false,
             enum_shape: None,
             enum_choices: None,
             enum_interrupt_sub: None,
+            enum_intr_rx: None,
             device_job: Arc::new(DeviceJob::default()),
             request_cell: None,
         }
@@ -1018,6 +1030,266 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// The record's input interrupt client: every callback lands in the ring
+    /// and wakes `scan_io_tx`, C's `scanIoRequest`.
+    fn subscribe_input(&mut self) -> AsynResult<()> {
+        // C parity: a UInt32Digital record registers its @asynMask as the
+        // interrupt mask (devAsynUInt32Digital.c:293/343); the driver fires
+        // the callback only when `pInterrupt->mask & interruptMask`
+        // (asynPortDriver.cpp:720) and delivers `pInterrupt->mask & value`
+        // (asynPortDriver.cpp:729). Other interfaces carry no changed-bit
+        // mask (uint32_changed_mask == 0), so a mask filter would gate every
+        // interrupt out — restrict the gate (and the value masking below) to
+        // UInt32Digital.
+        let is_uint32 = self.iface_type == "asynUInt32Digital";
+        let mask = self.mask;
+        // asynInt32 @asynMask nbits config, applied to interrupt values
+        // the same way the polled read masks them (C interruptCallbackInput,
+        // devAsynInt32.c:537-540). `None` for every non-int32 / no-nbits
+        // case, so the closure leaves the value untouched.
+        let int32_mask = self.int32_mask;
+        let filter = InterruptFilter {
+            reason: Some(self.reason),
+            addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
+            uint32_mask: if is_uint32 { Some(mask) } else { None },
+            // Per-interface routing (C's per-interface interrupt lists): a
+            // driver firing interface-typed values reaches this record only with
+            // its own interface, so an asynUInt32Digital bi gets the raw word to
+            // mask and an asynInt32 ai gets the int to ESLO-convert — not the one
+            // collapsed value. A single-value driver fires untyped and still
+            // reaches here (InterruptFilter::iface).
+            iface: self.iface,
+        };
+
+        // Every callback lands in the ring, inline in the driver's notify()
+        // like C's interruptCallbackInput; the mpsc<()> is only the
+        // scanIoRequest wakeup that setup_io_intr() consumes.
+        let tx = self.scan_io_tx.clone();
+        let fifo = self.interrupt_fifo.clone();
+        let gate = self.gate.clone();
+        let sub = self
+            .handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
+                if !gate.open() {
+                    return;
+                }
+                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
+                // deliver `mask & value` for UInt32Digital so the I/O-Intr value
+                // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
+                // interruptCallbackInput stores the already-masked value in the
+                // ring buffer; mirror that here. For asynInt32 apply the
+                // @asynMask nbits mask + sign-extend (devAsynInt32.c:537-540),
+                // matching the polled `result_to_value` path. Other values
+                // pass through.
+                let value = match &iv.value {
+                    crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
+                        crate::param::ParamValue::UInt32Digital(v & mask)
+                    }
+                    crate::param::ParamValue::Int32(v) => {
+                        crate::param::ParamValue::Int32(int32_mask.map_or(*v, |m| m.apply(*v)))
+                    }
+                    other => other.clone(),
+                };
+                let entry = CachedInterrupt {
+                    value,
+                    timestamp: iv.timestamp,
+                    // Carry the driver alarm so the IoIntr read path can
+                    // recGblSetSevr it (C devAsynInt32.c:561-563/843-847);
+                    // dropping it left I/O-Intr records permanently
+                    // NO_ALARM even when the driver flagged an alarm.
+                    alarm_status: iv.alarm_status,
+                    alarm_severity: iv.alarm_severity,
+                    // Carry the transport status too (C ring `rp->status =
+                    // pasynUser->auxStatus`, devAsynInt32.c:600); the read maps
+                    // it and gates the value store.
+                    aux_status: iv.aux_status,
+                    octet_nul: iv.octet_counts_nul(),
+                };
+                // C parity (devAsynInt32.c:564-576):
+                //   - On overflow (ring full), drop oldest +
+                //     overflows++ and DO NOT call scanIoRequest.
+                //     The already-pending process will pick up the
+                //     newer tail; a duplicate request would just
+                //     flood dbScan.
+                //   - On normal add, request the record to process.
+                let wake = {
+                    let mut g = fifo.lock().unwrap();
+                    g.push_with_overflow(entry) && g.wake_or_defer()
+                };
+                // try_send: inline in the driver's notify(), so it must not
+                // block; a full wakeup channel means a process is already
+                // pending and will drain the ring.
+                if wake {
+                    let _ = tx.try_send(());
+                }
+            });
+        self.interrupt_sub = Some(sub?);
+        Ok(())
+    }
+
+    /// C `initAiAverage`'s registration (devAsynInt32.c:870-872,
+    /// devAsynFloat64.c:698-700): one SYNCHRONOUS callback in every SCAN, since
+    /// averaging must see every sample. Each sample asks `isIOIntrScan` which
+    /// of C's two models it feeds, so a SCAN move switches it.
+    fn subscribe_average(&mut self) -> AsynResult<()> {
+        let Some(acc) = self.average.clone() else {
+            return Ok(());
+        };
+        let filter = InterruptFilter {
+            reason: Some(self.reason),
+            addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
+            uint32_mask: None,
+            // Averaging accumulates every sample; restrict to this record's
+            // interface so a per-interface driver's parallel typed fires for
+            // one poll are not each pushed as a separate sample.
+            iface: self.iface,
+        };
+        // asynInt32Average applies the same @asynMask nbits the polled
+        // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
+        let int32_mask = self.int32_mask;
+        let is_int32 = self.iface_type == "asynInt32";
+
+        // Mode 1 — SCAN="I/O Intr": C `interruptCallbackAverage` isIOIntrScan
+        // branch (devAsynInt32.c:673-702). Accumulate every sample, and every
+        // round(SVAL) samples decimate the mean into the IoIntr ring and
+        // `scanIoRequest` the record; read() drains the ring
+        // (`getCallbackValue`). The ring entry carries the TRIGGERING sample's
+        // status/alarm — C `rp->status = pasynUser->auxStatus` (:685-687), NOT
+        // the Mode 2 OR-accumulation.
+        //
+        // Mode 2 — periodic SCAN: the periodic record process drains the
+        // running mean in read(). The callback OR-accumulates the transport
+        // status and stashes the last sample's EPICS alarm
+        // (devAsynInt32.c:705-707, devAsynFloat64.c:516-518) — once any sample
+        // is non-success the period stays a transport error (asynSuccess == 0,
+        // so the OR is sticky).
+        let tx = self.scan_io_tx.clone();
+        let fifo = self.interrupt_fifo.clone();
+        let gate = self.gate.clone();
+        let io_intr_scan = self.io_intr_scan.clone();
+        let sub = self
+            .handle
+            .interrupts()
+            .register_sync_callback(filter, move |iv| {
+                use std::sync::atomic::Ordering;
+                if !gate.open() {
+                    return;
+                }
+                let sample = match &iv.value {
+                    crate::param::ParamValue::Int32(v) => {
+                        Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
+                    }
+                    crate::param::ParamValue::Float64(v) => Some(*v),
+                    _ => None,
+                };
+                let Some(s) = sample else {
+                    return;
+                };
+                // C: numAverage++; sum += value (devAsynInt32.c:665-666).
+                acc.averager.push(s);
+                if !io_intr_scan.load(Ordering::Relaxed) {
+                    let mut st = acc.status.lock().unwrap();
+                    st.last_alarm = (iv.alarm_status, iv.alarm_severity);
+                    if iv.aux_status != crate::error::AsynStatus::Success {
+                        st.aux_error = Some(iv.aux_status);
+                    }
+                    return;
+                }
+                // C: numToAverage = (int)(sval+0.5), min 1; decimate
+                // when numAverage >= numToAverage (devAsynInt32.c:674-676).
+                let n = acc.num_to_average.load(Ordering::Relaxed).max(1) as u64;
+                if acc.averager.count() < n {
+                    return;
+                }
+                // C: dval = round(sum/numAverage); reset sum/count
+                // (devAsynInt32.c:679-683). The checked drains reset
+                // atomically and return Some (count >= n >= 1 here).
+                let value = if is_int32 {
+                    crate::param::ParamValue::Int32(
+                        acc.averager.read_and_reset_int32_checked().unwrap_or(0),
+                    )
+                } else {
+                    crate::param::ParamValue::Float64(
+                        acc.averager.read_and_reset_checked().unwrap_or(0.0),
+                    )
+                };
+                let entry = CachedInterrupt {
+                    value,
+                    timestamp: iv.timestamp,
+                    // C takes the triggering sample's status/alarm, NOT
+                    // an OR-accumulation (rp->status = pasynUser->
+                    // auxStatus, devAsynInt32.c:685-687).
+                    alarm_status: iv.alarm_status,
+                    alarm_severity: iv.alarm_severity,
+                    aux_status: iv.aux_status,
+                    octet_nul: false,
+                };
+                // C: ring full → evict oldest + overflow, NO
+                // scanIoRequest; fresh add → scanIoRequest
+                // (devAsynInt32.c:688-701).
+                let was_fresh = {
+                    let mut g = fifo.lock().unwrap();
+                    g.push_with_overflow(entry)
+                };
+                // try_send: the callback runs inline in the driver
+                // notify() and must not block; a full wakeup channel
+                // means a process is already pending and will drain the
+                // ring (C does not re-request when one is pending).
+                if was_fresh {
+                    let _ = tx.try_send(());
+                }
+            });
+        self.average_callback_sub = Some(sub?);
+        Ok(())
+    }
+
+    /// The record's asynEnum interrupt client (C `callbackEnum`'s
+    /// `registerInterruptUser`, devAsynInt32.c:317-323).
+    fn subscribe_enum(&mut self) -> AsynResult<InterruptReceiver> {
+        // Subscribe to the enum param's interrupts. On a `ParamType::Enum`
+        // param the enum value (index) and the enum table (choices) live on one
+        // `ParamValue::Enum`, so both a value change and a `set_enum_choices`
+        // change arrive here; C separates them across the asynInt32 and
+        // asynEnum interfaces. The bridge below recovers that separation by
+        // posting only when the *choices* differ from the last-applied table
+        // (seeded with the init table) — so an int32 value change fires no
+        // DBE_PROPERTY, matching C.
+        let filter = InterruptFilter {
+            reason: Some(self.reason),
+            addr: Some(self.handle.param_list(self.addr)),
+            user_addr: Some(self.addr),
+            drv_user: self.drv_user.clone(),
+            uint32_mask: None,
+            // This IS the record's asynEnum interrupt client (C
+            // `registerInterruptUser` on the asynEnum interface,
+            // devAsynInt32.c:318): a table fired for a param of any other type
+            // comes tagged asynEnum (`PortDriverBase::do_callbacks_enum`),
+            // which the record's own value interface would gate out. The
+            // untyped `call_param_callbacks` fire of an Enum param matches any
+            // filter.
+            iface: Some(crate::interfaces::InterfaceType::Enum),
+        };
+        // C's enum callbacks return before `setEnums` and the DBE_PROPERTY
+        // post while `interruptAccept` is false (devAsynInt32.c:718/:732/
+        // :746/:760, devAsynUInt32Digital.c:553/:567/:581/:595): the table
+        // is dropped, and the next one after the gate opens is applied. The
+        // gate is read when the callback fires, in the mailbox write, not
+        // when the task below drains it.
+        let gate = self.gate.clone();
+        let (sub, rx) = self.handle.interrupts().register_interrupt_user_when(
+            filter,
+            MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
+            move || gate.open(),
+        )?;
+        self.enum_interrupt_sub = Some(sub);
+        Ok(rx)
+    }
+
     /// C devAsyn's line for a `registerInterruptUser` the port refused
     /// (`getInterruptPvt`, asynManager.c:2492-2497). C `printf`s it, except
     /// devAsynXXXArray.cpp:245 and devAsynXXXTimeSeries.h:162, which print it
@@ -1047,9 +1319,16 @@ impl AsynDeviceSupport {
         }
     }
 
-    /// C `getCallbackValue`'s test: an I/O Intr record holds a ring entry.
+    /// C `pPvt->isIOIntrScan`.
+    fn is_io_intr_scan(&self) -> bool {
+        self.io_intr_scan.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// C `getCallbackValue`'s test: the ring holds an entry. C does not ask
+    /// whether the record is still on I/O Intr (devAsynInt32.c:768-790), so an
+    /// entry left when SCAN moved off it is the next process's value.
     fn callback_value_waiting(&self) -> bool {
-        self.scan == ScanType::IoIntr && !self.interrupt_fifo.lock().unwrap().entries.is_empty()
+        !self.interrupt_fifo.lock().unwrap().entries.is_empty()
     }
 
     /// The result a queued read left for the re-entered pass, or one the queue
@@ -3247,6 +3526,14 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
+        // C `initAiAverage` registers its callback after `initCommon` and before
+        // `getBounds` (devAsynInt32.c:866-881).
+        if self.average.is_some() {
+            if let Err(e) = self.subscribe_average() {
+                self.report_register_refusal(Register::Average, &e);
+            }
+        }
+
         // ai/ao LINEAR ESLO/EOFF wiring.
         //
         // C devAsynInt32.c::initAi (line 824-828) / initAo / initAiAverage:
@@ -3271,17 +3558,12 @@ impl DeviceSupport for AsynDeviceSupport {
 
         // Driver enum-string table -> record state fields. C asyn int32/uint32
         // device support (devAsynInt32.c::initCommon:298-324,
-        // devAsynUInt32Digital.c:547-601) queries the driver's asynEnum
-        // interface and `setEnums` the strings/values/severities onto the
-        // record (ZRST/ZRVL/ZRSV… for mbbi/mbbo, ZNAM/ONAM… for bi/bo). The
-        // record family is identified by the state fields it exposes (ZRST or
-        // ZNAM); the EnumRead itself only returns a table when the driver
-        // provides one (an Enum param or an overridden read_enum), mirroring
-        // C's `findInterface(asynEnumType) != NULL` gate — a driver without
-        // an enum table makes EnumRead fail and the record keeps its .db
-        // strings.
-        // C reads the table inside `if (findInterface(asynEnumType) &&
-        // maxEnums > 0)`, after an EnumSyncIO connect (devAsynInt32.c:300-311).
+        // devAsynUInt32Digital.c:255-280) enters this block on
+        // `findInterface(asynEnumType) && maxEnums>0`, after an EnumSyncIO
+        // connect (devAsynInt32.c:300-311); the record family is identified by
+        // the state fields it exposes (ZRST or ZNAM). Inside it only `setEnums`
+        // waits on a successful read: `callbackEnum` registers whether or not
+        // the driver returned a table.
         let enum_table = EnumRecordShape::of_record(record).filter(|_| {
             self.dset.connects_enum_sync_io() && self.handle.has_interface(InterfaceType::Enum)
         });
@@ -3289,21 +3571,30 @@ impl DeviceSupport for AsynDeviceSupport {
             if let Err(dead) = self.sync_io_connect(drv_user, "EnumSyncIO") {
                 return Ok(dead);
             }
+            self.enum_shape = Some(shape);
             let user = self.init_user();
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
                     // The table setEnums leaves in the record, which is also
-                    // what a ring slot carries back.
+                    // what a ring slot carries back, and the runtime
+                    // callback's diff seed.
                     let entries = clamp_enum_table(&entries);
                     self.apply_enum_table(record, &entries);
-                    // Capture the shape + table so the runtime callback
-                    // (property_post_receiver) can re-propagate on change.
-                    // Only set when the driver actually provided a table —
-                    // C registers callbackEnum only inside the
-                    // `findInterface(asynEnumType) && maxEnums>0` block.
-                    self.enum_shape = Some(shape);
                     self.enum_choices = Some(entries);
                 }
+            }
+            match self.subscribe_enum() {
+                Ok(rx) => self.enum_intr_rx = Some(rx),
+                Err(e) => self.report_register_refusal(Register::Enum, &e),
+            }
+        }
+
+        // C `initCommon` registers the `asyn:READBACK` callback here, after the
+        // enum table and ahead of the initial readback (devAsynInt32.c:325-341,
+        // and the same step in each devAsyn file).
+        if self.asyn_readback && self.average.is_none() && self.time_series.is_none() {
+            if let Err(e) = self.subscribe_input() {
+                self.report_register_refusal(Register::ReadBack, &e);
             }
         }
 
@@ -3367,7 +3658,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // Mode 1 averaging: snapshot the SVAL decimation count so the first
         // decimation period uses the configured value before the first process
         // refreshes it (C reads pai->sval live; devAsynInt32.c:674).
-        if self.scan == ScanType::IoIntr {
+        if self.is_io_intr_scan() {
             self.refresh_average_decimation_threshold(record);
         }
         Ok(init_status(
@@ -3502,27 +3793,28 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // Mode 1 averaging (SCAN="I/O Intr"): the decimated mean is delivered
-        // through the IoIntr ring — `io_intr_receiver` decimates every
+        // through the IoIntr ring — the average callback decimates every
         // round(SVAL) samples into `interrupt_fifo` and wakes the record (C
         // `interruptCallbackAverage` isIOIntrScan branch, devAsynInt32.c:
         // 673-702). Refresh the live SVAL threshold; the ring-pop path below
         // drains the decimated value (C `processAiAverage` `getCallbackValue`
         // branch, :895-898).
-        if self.average.is_some() && self.scan == ScanType::IoIntr {
+        if self.average.is_some() && self.is_io_intr_scan() {
             self.refresh_average_decimation_threshold(record);
         }
         // A blocking port ran the read queued by `read_begin`, or the queue
         // refused it there.
         let ran = self.take_ran();
-        // For I/O Intr records, pop the oldest entry from the ring
-        // buffer. C parity: `devAsynInt32.c::getCallbackValue` —
-        // returns the next FIFO entry, logs+resets the overflow
-        // counter on consume. An `asyn:READBACK` output record consumes
+        // Pop the oldest entry from the ring buffer in any SCAN. C parity:
+        // `devAsynInt32.c::getCallbackValue` — returns the next FIFO entry,
+        // logs+resets the overflow counter on consume; `processAi` (:836) and
+        // `processAiAverage` (:895) call it ungated, so an entry queued before
+        // a move off I/O Intr is still read. An `asyn:READBACK` output record consumes
         // from the same ring: the framework calls `read()` on it only on a
         // driver-callback cycle (`process_record_readback`), so popping
         // the FIFO here is the output-record analogue of
         // `processBo`'s `getCallbackValue` readback branch.
-        if self.scan == ScanType::IoIntr || self.asyn_readback {
+        {
             // The record reached its read stage, so this driver-callback
             // cycle processed: clear the armed flag (C `processBo` clears
             // `newOutputCallbackValue` when it runs). A survived flag after
@@ -3640,8 +3932,8 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // Mode 2 averaging (periodic SCAN), and Mode 1 with an empty ring: the
-        // always-on interrupt callback (io_intr_receiver) has been accumulating
-        // samples into the SumAverager since iocInit. Drain the arithmetic mean
+        // always-on interrupt callback (`subscribe_average`) has been
+        // accumulating samples into the SumAverager since the gate opened. Drain the arithmetic mean
         // since the last process and reset — C `processAiAverage` else branch
         // (devAsynInt32.c:887-928, devAsynFloat64.c:708-755). Reuses the normal
         // ai store paths: int32 routes the rounded mean to RVAL (the ai record's
@@ -3859,7 +4151,10 @@ impl DeviceSupport for AsynDeviceSupport {
 
     fn set_record_info(&mut self, name: &str, scan: ScanType) {
         self.record_name = name.to_string();
-        self.scan = scan;
+        self.io_intr_scan.store(
+            scan == ScanType::IoIntr,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn apply_record_info(&mut self, info: &std::collections::HashMap<String, String>) {
@@ -4009,12 +4304,74 @@ impl DeviceSupport for AsynDeviceSupport {
         let _ = self.gate.bound.set(gate.clone());
     }
 
+    fn get_ioint_info(
+        &mut self,
+        record: &mut dyn Record,
+        _common: &mut epics_base_rs::server::record::CommonFields,
+        cmd: epics_base_rs::server::device_support::IoIntrCmd,
+    ) -> bool {
+        use epics_base_rs::server::device_support::IoIntrCmd;
+        use std::sync::atomic::Ordering;
+        // "If initCommon failed then pPvt->pint32 is NULL, return error".
+        if !self.reason_set {
+            return false;
+        }
+        // The time-series dsets have no get_ioint_info; BUSY drives theirs.
+        if self.time_series.is_some() {
+            return true;
+        }
+        let driver = self.dset.driver();
+        let rec = &self.record_name;
+        match cmd {
+            IoIntrCmd::Add => {
+                self.dev_print(
+                    crate::trace::TraceMask::FLOW,
+                    file!(),
+                    line!(),
+                    format_args!("{rec} {driver}::getIoIntInfo registering interrupt\n"),
+                );
+                self.io_intr_scan.store(true, Ordering::Relaxed);
+                // An average's callback is registered in every SCAN; only the
+                // decimation count it now reads matters (devAsynInt32.c:385).
+                if self.average.is_some() {
+                    self.refresh_average_decimation_threshold(record);
+                } else if self.interrupt_sub.is_none() {
+                    // An `asyn:READBACK` output already holds its `initCommon`
+                    // client. C registers a second one on the same ring
+                    // (devAsynInt32.c:386-389), overwriting `registrarPvt`, so
+                    // each driver update lands twice and scans the record
+                    // twice: a C defect, not copied.
+                    if let Err(e) = self.subscribe_input() {
+                        self.report_register_refusal(Register::IoIntr, &e);
+                    }
+                }
+            }
+            IoIntrCmd::Delete => {
+                let canceling = if self.dset == Dset::Int64 {
+                    "canceling"
+                } else {
+                    "cancelling"
+                };
+                self.dev_print(
+                    crate::trace::TraceMask::FLOW,
+                    file!(),
+                    line!(),
+                    format_args!("{rec} {driver}::getIoIntInfo {canceling} interrupt\n"),
+                );
+                self.io_intr_scan.store(false, Ordering::Relaxed);
+                if self.average.is_none() && !self.asyn_readback {
+                    self.interrupt_sub = None;
+                }
+            }
+        }
+        // C returns 0 whether or not the driver took the client.
+        true
+    }
+
     fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> {
-        // Activate the driver-callback path for either:
-        //   1. records with `SCAN="I/O Intr"` (legacy behaviour), OR
-        //   2. records flagged via `set_asyn_readback(true)` (asyn
-        //      upstream PRs #60 / #208 — output records that follow
-        //      driver-side changes regardless of SCAN).
+        // C's `ioScanPvt`, for a record on I/O Intr or one whose callbacks run
+        // in every SCAN (an average or an `asyn:READBACK` output). The client
+        // feeding it is `get_ioint_info`'s, or `init`'s for those two.
         if !self.reason_set {
             return None;
         }
@@ -4030,272 +4387,10 @@ impl DeviceSupport for AsynDeviceSupport {
             return Some(rx);
         }
 
-        // Averaging device support (asynInt32Average / asynFloat64Average):
-        // register an ALWAYS-ON accumulating callback regardless of SCAN. C
-        // registers it once, in `initAiAverage` (devAsynInt32.c:870-872), and
-        // `getIoIntInfo` then leaves it alone — "for aiAverage we don't enable
-        // callbacks here, because they are always enabled in any scan mode",
-        // `if (!pPvt->isAiAverage)` (:385-394).
-        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser):
-        // averaging must observe every sample, and it pushes the mean itself
-        // rather than the sample the plain I/O Intr path would ring.
-        if let Some(acc) = self.average.clone() {
-            let filter = InterruptFilter {
-                reason: Some(self.reason),
-                addr: Some(self.handle.param_list(self.addr)),
-                user_addr: Some(self.addr),
-                drv_user: self.drv_user.clone(),
-                uint32_mask: None,
-                // Averaging accumulates every sample; restrict to this record's
-                // interface so a per-interface driver's parallel typed fires for
-                // one poll are not each pushed as a separate sample.
-                iface: self.iface,
-            };
-            // asynInt32Average applies the same @asynMask nbits the polled
-            // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
-            let int32_mask = self.int32_mask;
-            let is_int32 = self.iface_type == "asynInt32";
-
-            // Mode 1 — SCAN="I/O Intr": C `interruptCallbackAverage` isIOIntrScan
-            // branch (devAsynInt32.c:673-702). Accumulate every sample, and every
-            // round(SVAL) samples decimate the mean into the IoIntr ring and
-            // `scanIoRequest` the record; read() drains the ring
-            // (`getCallbackValue`). The ring entry carries the TRIGGERING sample's
-            // status/alarm — C `rp->status = pasynUser->auxStatus` (:685-687), NOT
-            // the Mode 2 OR-accumulation.
-            if self.scan == ScanType::IoIntr {
-                let (tx, rx) = tokio::sync::mpsc::channel(16);
-                let fifo = self.interrupt_fifo.clone();
-                let gate = self.gate.clone();
-                let sub = self
-                    .handle
-                    .interrupts()
-                    .register_sync_callback(filter, move |iv| {
-                        use std::sync::atomic::Ordering;
-                        if !gate.open() {
-                            return;
-                        }
-                        let sample = match &iv.value {
-                            crate::param::ParamValue::Int32(v) => {
-                                Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
-                            }
-                            crate::param::ParamValue::Float64(v) => Some(*v),
-                            _ => None,
-                        };
-                        let Some(s) = sample else {
-                            return;
-                        };
-                        // C: numAverage++; sum += value (devAsynInt32.c:665-666).
-                        acc.averager.push(s);
-                        // C: numToAverage = (int)(sval+0.5), min 1; decimate
-                        // when numAverage >= numToAverage (devAsynInt32.c:674-676).
-                        let n = acc.num_to_average.load(Ordering::Relaxed).max(1) as u64;
-                        if acc.averager.count() < n {
-                            return;
-                        }
-                        // C: dval = round(sum/numAverage); reset sum/count
-                        // (devAsynInt32.c:679-683). The checked drains reset
-                        // atomically and return Some (count >= n >= 1 here).
-                        let value = if is_int32 {
-                            crate::param::ParamValue::Int32(
-                                acc.averager.read_and_reset_int32_checked().unwrap_or(0),
-                            )
-                        } else {
-                            crate::param::ParamValue::Float64(
-                                acc.averager.read_and_reset_checked().unwrap_or(0.0),
-                            )
-                        };
-                        let entry = CachedInterrupt {
-                            value,
-                            timestamp: iv.timestamp,
-                            // C takes the triggering sample's status/alarm, NOT
-                            // an OR-accumulation (rp->status = pasynUser->
-                            // auxStatus, devAsynInt32.c:685-687).
-                            alarm_status: iv.alarm_status,
-                            alarm_severity: iv.alarm_severity,
-                            aux_status: iv.aux_status,
-                            octet_nul: false,
-                        };
-                        // C: ring full → evict oldest + overflow, NO
-                        // scanIoRequest; fresh add → scanIoRequest
-                        // (devAsynInt32.c:688-701).
-                        let was_fresh = {
-                            let mut g = fifo.lock().unwrap();
-                            g.push_with_overflow(entry)
-                        };
-                        // try_send: the callback runs inline in the driver
-                        // notify() and must not block; a full wakeup channel
-                        // means a process is already pending and will drain the
-                        // ring (C does not re-request when one is pending).
-                        if was_fresh {
-                            let _ = tx.try_send(());
-                        }
-                    });
-                return match sub {
-                    Ok(sub) => {
-                        self.average_callback_sub = Some(sub);
-                        Some(rx)
-                    }
-                    Err(e) => {
-                        self.report_register_refusal(Register::Average, &e);
-                        None
-                    }
-                };
-            }
-
-            // Mode 2 — periodic SCAN: accumulate every sample; the periodic
-            // record process drains the running mean in read(). The callback
-            // OR-accumulates the transport status and stashes the last sample's
-            // EPICS alarm (devAsynInt32.c:705-707, devAsynFloat64.c:516-518) —
-            // once any sample is non-success the period stays a transport error
-            // (asynSuccess == 0, so the OR is sticky). Return None: no
-            // per-callback reprocess wakeup (the record scans on its own period).
-            let gate = self.gate.clone();
-            let sub = self
-                .handle
-                .interrupts()
-                .register_sync_callback(filter, move |iv| {
-                    if !gate.open() {
-                        return;
-                    }
-                    let sample = match &iv.value {
-                        crate::param::ParamValue::Int32(v) => {
-                            Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
-                        }
-                        crate::param::ParamValue::Float64(v) => Some(*v),
-                        _ => None,
-                    };
-                    if let Some(s) = sample {
-                        acc.averager.push(s);
-                        let mut st = acc.status.lock().unwrap();
-                        st.last_alarm = (iv.alarm_status, iv.alarm_severity);
-                        if iv.aux_status != crate::error::AsynStatus::Success {
-                            st.aux_error = Some(iv.aux_status);
-                        }
-                    }
-                });
-            match sub {
-                Ok(sub) => self.average_callback_sub = Some(sub),
-                Err(e) => self.report_register_refusal(Register::Average, &e),
-            }
+        if self.average.is_none() && !self.is_io_intr_scan() && !self.asyn_readback {
             return None;
         }
-
-        if self.scan != ScanType::IoIntr && !self.asyn_readback {
-            return None;
-        }
-
-        // C parity: a UInt32Digital record registers its @asynMask as the
-        // interrupt mask (devAsynUInt32Digital.c:293/343); the driver fires
-        // the callback only when `pInterrupt->mask & interruptMask`
-        // (asynPortDriver.cpp:720) and delivers `pInterrupt->mask & value`
-        // (asynPortDriver.cpp:729). Other interfaces carry no changed-bit
-        // mask (uint32_changed_mask == 0), so a mask filter would gate every
-        // interrupt out — restrict the gate (and the value masking below) to
-        // UInt32Digital.
-        let is_uint32 = self.iface_type == "asynUInt32Digital";
-        let mask = self.mask;
-        // asynInt32 @asynMask nbits config, applied to interrupt values
-        // the same way the polled read masks them (C interruptCallbackInput,
-        // devAsynInt32.c:537-540). `None` for every non-int32 / no-nbits
-        // case, so the closure leaves the value untouched.
-        let int32_mask = self.int32_mask;
-        let filter = InterruptFilter {
-            reason: Some(self.reason),
-            addr: Some(self.handle.param_list(self.addr)),
-            user_addr: Some(self.addr),
-            drv_user: self.drv_user.clone(),
-            uint32_mask: if is_uint32 { Some(mask) } else { None },
-            // Per-interface routing (C's per-interface interrupt lists): a
-            // driver firing interface-typed values reaches this record only with
-            // its own interface, so an asynUInt32Digital bi gets the raw word to
-            // mask and an asynInt32 ai gets the int to ESLO-convert — not the one
-            // collapsed value. A single-value driver fires untyped and still
-            // reaches here (InterruptFilter::iface).
-            iface: self.iface,
-        };
-
-        // Every callback lands in the ring, inline in the driver's notify()
-        // like C's interruptCallbackInput; the mpsc<()> is only the
-        // scanIoRequest wakeup that setup_io_intr() consumes.
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let wake_tx = tx.clone();
-        let fifo = self.interrupt_fifo.clone();
-        let gate = self.gate.clone();
-        let sub = self
-            .handle
-            .interrupts()
-            .register_sync_callback(filter, move |iv| {
-                if !gate.open() {
-                    return;
-                }
-                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
-                // deliver `mask & value` for UInt32Digital so the I/O-Intr value
-                // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
-                // interruptCallbackInput stores the already-masked value in the
-                // ring buffer; mirror that here. For asynInt32 apply the
-                // @asynMask nbits mask + sign-extend (devAsynInt32.c:537-540),
-                // matching the polled `result_to_value` path. Other values
-                // pass through.
-                let value = match &iv.value {
-                    crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
-                        crate::param::ParamValue::UInt32Digital(v & mask)
-                    }
-                    crate::param::ParamValue::Int32(v) => {
-                        crate::param::ParamValue::Int32(int32_mask.map_or(*v, |m| m.apply(*v)))
-                    }
-                    other => other.clone(),
-                };
-                let entry = CachedInterrupt {
-                    value,
-                    timestamp: iv.timestamp,
-                    // Carry the driver alarm so the IoIntr read path can
-                    // recGblSetSevr it (C devAsynInt32.c:561-563/843-847);
-                    // dropping it left I/O-Intr records permanently
-                    // NO_ALARM even when the driver flagged an alarm.
-                    alarm_status: iv.alarm_status,
-                    alarm_severity: iv.alarm_severity,
-                    // Carry the transport status too (C ring `rp->status =
-                    // pasynUser->auxStatus`, devAsynInt32.c:600); the read maps
-                    // it and gates the value store.
-                    aux_status: iv.aux_status,
-                    octet_nul: iv.octet_counts_nul(),
-                };
-                // C parity (devAsynInt32.c:564-576):
-                //   - On overflow (ring full), drop oldest +
-                //     overflows++ and DO NOT call scanIoRequest.
-                //     The already-pending process will pick up the
-                //     newer tail; a duplicate request would just
-                //     flood dbScan.
-                //   - On normal add, request the record to process.
-                let wake = {
-                    let mut g = fifo.lock().unwrap();
-                    g.push_with_overflow(entry) && g.wake_or_defer()
-                };
-                // try_send: inline in the driver's notify(), so it must not
-                // block; a full wakeup channel means a process is already
-                // pending and will drain the ring.
-                if wake {
-                    let _ = tx.try_send(());
-                }
-            });
-        let sub = match sub {
-            Ok(sub) => sub,
-            Err(e) => {
-                // C registers twice for a readback output on I/O Intr:
-                // `initCommon` first, then `getIoIntInfo`; each prints.
-                if self.asyn_readback {
-                    self.report_register_refusal(Register::ReadBack, &e);
-                }
-                if self.scan == ScanType::IoIntr {
-                    self.report_register_refusal(Register::IoIntr, &e);
-                }
-                return None;
-            }
-        };
-        self.interrupt_sub = Some(sub);
-        self.readback_wake = Some(wake_tx);
-        Some(rx)
+        self.scan_io_rx.take()
     }
 
     /// An `asyn_readback`-flagged record follows driver-side changes via the
@@ -4310,8 +4405,8 @@ impl DeviceSupport for AsynDeviceSupport {
     /// callback in `initAiAverage` (devAsynInt32.c:870-872), outside the SCAN
     /// path entirely; `getIoIntInfo` skips it (`if (!pPvt->isAiAverage)`,
     /// :385-394), which is what makes it independent of SCAN.
-    /// `io_intr_receiver` returns `None` for the average case, so this only
-    /// arms the accumulating subscription; it spawns no reprocess task (the
+    /// `init` armed the accumulating subscription and `io_intr_receiver`
+    /// returns `None` off I/O Intr, so this spawns no reprocess task (the
     /// record scans on its own period, not per callback).
     fn io_intr_scan_independent(&self) -> bool {
         // Time-series records are SCAN="Passive" (driven by RARM puts, the Read
@@ -4369,57 +4464,13 @@ impl DeviceSupport for AsynDeviceSupport {
         // `setEnums` + `db_post_events(DBE_PROPERTY)` whenever the driver
         // changes the table via `doCallbacksEnum`. Gate exactly as C's
         // `findInterface(asynEnumType) && maxEnums>0`: only a record that
-        // exposed an enum state family AND received a driver table at init
-        // (so `enum_shape` is set) arms the callback. Independent of SCAN —
+        // exposed an enum state family on a port with asynEnum (so
+        // `enum_shape` is set) arms the callback. Independent of SCAN —
         // a property post is not a value scan, so it never processes the
         // record.
         let shape = self.enum_shape?;
-        if !self.reason_set {
-            return None;
-        }
 
-        // Subscribe to the enum param's interrupts. On a `ParamType::Enum`
-        // param the enum value (index) and the enum table (choices) live on one
-        // `ParamValue::Enum`, so both a value change and a `set_enum_choices`
-        // change arrive here; C separates them across the asynInt32 and
-        // asynEnum interfaces. The bridge below recovers that separation by
-        // posting only when the *choices* differ from the last-applied table
-        // (seeded with the init table) — so an int32 value change fires no
-        // DBE_PROPERTY, matching C.
-        let filter = InterruptFilter {
-            reason: Some(self.reason),
-            addr: Some(self.handle.param_list(self.addr)),
-            user_addr: Some(self.addr),
-            drv_user: self.drv_user.clone(),
-            uint32_mask: None,
-            // This IS the record's asynEnum interrupt client (C
-            // `registerInterruptUser` on the asynEnum interface,
-            // devAsynInt32.c:318): a table fired for a param of any other type
-            // comes tagged asynEnum (`PortDriverBase::do_callbacks_enum`),
-            // which the record's own value interface would gate out. The
-            // untyped `call_param_callbacks` fire of an Enum param matches any
-            // filter.
-            iface: Some(crate::interfaces::InterfaceType::Enum),
-        };
-        // C's enum callbacks return before `setEnums` and the DBE_PROPERTY
-        // post while `interruptAccept` is false (devAsynInt32.c:718/:732/
-        // :746/:760, devAsynUInt32Digital.c:553/:567/:581/:595): the table
-        // is dropped, and the next one after the gate opens is applied. The
-        // gate is read when the callback fires, in the mailbox write, not
-        // when the task below drains it.
-        let gate = self.gate.clone();
-        let (sub, mut intr_rx) = match self.handle.interrupts().register_interrupt_user_when(
-            filter,
-            MAX_ENUM_STATES * ENUM_ENTRY_BYTES,
-            move || gate.open(),
-        ) {
-            Ok(registered) => registered,
-            Err(e) => {
-                self.report_register_refusal(Register::Enum, &e);
-                return None;
-            }
-        };
-        self.enum_interrupt_sub = Some(sub);
+        let mut intr_rx = self.enum_intr_rx.take()?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let mut last_choices = self.enum_choices.clone();
@@ -6638,8 +6689,11 @@ mod tests {
     }
 
     fn make_adapter(scan: ScanType) -> AsynDeviceSupport {
+        make_adapter_on(scan, Arc::new(InterruptManager::new()))
+    }
+
+    fn make_adapter_on(scan: ScanType, interrupts: Arc<InterruptManager>) -> AsynDeviceSupport {
         let driver = TestPort::new();
-        let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(driver), rx);
         let actor_link = actor.link();
@@ -6664,6 +6718,54 @@ mod tests {
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
         ads.set_record_info("TEST:REC", scan);
         ads
+    }
+
+    /// iocInit's `scanAdd` for a record loaded on I/O Intr: `get_ioint_info(0)`,
+    /// then the pump's receiver.
+    fn join_io_intr(
+        ads: &mut AsynDeviceSupport,
+        rec: &mut dyn Record,
+    ) -> Option<tokio::sync::mpsc::Receiver<()>> {
+        let mut common = epics_base_rs::server::record::CommonFields::default();
+        let add = epics_base_rs::server::device_support::IoIntrCmd::Add;
+        assert!(ads.get_ioint_info(rec, &mut common, add));
+        ads.io_intr_receiver()
+    }
+
+    /// C `initCommon` registers the `asyn:READBACK` callback in `init_record`
+    /// (devAsynInt32.c:325-341), so its refusal prints there, ahead of the
+    /// initial readback; iocInit's `io_intr_receiver` hands on the record's
+    /// `ioScanPvt` and registers nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readback_registers_in_init() {
+        use epics_base_rs::server::records::bo::BoRecord;
+        for (sources, live) in [(InterfaceMask::INT32, true), (InterfaceMask::NONE, false)] {
+            let mut ads = make_adapter_on(
+                ScanType::Passive,
+                Arc::new(InterruptManager::with_sources(sources)),
+            );
+            ads.set_asyn_readback(true);
+            ads.init(&mut BoRecord::new(0)).unwrap();
+            assert_eq!(ads.interrupt_sub.is_some(), live, "{sources:?} after init");
+            assert!(ads.io_intr_receiver().is_some(), "{sources:?} at iocInit");
+            assert_eq!(ads.interrupt_sub.is_some(), live, "{sources:?} at iocInit");
+        }
+    }
+
+    /// C `initAiAverage` registers the average callback in `init_record`
+    /// (devAsynInt32.c:870-872) in every SCAN; iocInit's `io_intr_receiver`
+    /// hands on the `ioScanPvt` a later move to I/O Intr wakes, and registers
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_registers_in_init() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        for scan in [ScanType::Passive, ScanType::IoIntr] {
+            let mut ads = make_average_adapter("asynInt32");
+            ads.set_record_info("TEST:AVG", scan);
+            ads.init(&mut AiRecord::new(0.0)).unwrap();
+            assert!(ads.average_callback_sub.is_some(), "{scan:?} after init");
+            assert!(ads.io_intr_receiver().is_some(), "{scan:?} at iocInit");
+        }
     }
 
     /// Build a Passive asynInt32 input adapter whose port has VAL pre-seeded to
@@ -6710,9 +6812,8 @@ mod tests {
 
     /// Build an averaging (`asynInt32Average` / `asynFloat64Average`) adapter:
     /// a plain ai adapter on the base interface with `average` set, on a
-    /// periodic (non-IoIntr) SCAN. The accumulating interrupt is armed by
-    /// calling `io_intr_receiver()` (which `io_intr_scan_independent` would
-    /// gate in production); the port is never read by the average path.
+    /// periodic (non-IoIntr) SCAN. `init` arms the accumulating interrupt;
+    /// the port is never read by the average path.
     fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
         let driver = TestPort::new();
         let interrupts = Arc::new(InterruptManager::new());
@@ -7321,7 +7422,7 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let fifo = ads.interrupt_fifo.clone();
-        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let _rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
 
         interrupts.notify(InterruptValue {
             reason,
@@ -7356,7 +7457,7 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let fifo = ads.interrupt_fifo.clone();
-        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let _rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
 
         interrupts.notify(InterruptValue {
             reason,
@@ -7404,7 +7505,7 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let fifo = ads.interrupt_fifo.clone();
-        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let _rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
 
         interrupts.notify(InterruptValue {
             reason,
@@ -7540,7 +7641,7 @@ mod tests {
         ads.bind_interrupt_gate(&gate);
         let (reason, interrupts) = (ads.reason, ads.handle.interrupts().clone());
         let fifo = ads.interrupt_fifo.clone();
-        let mut rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let mut rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
         let fire = |v: u32| {
             interrupts.notify(InterruptValue {
                 reason,
@@ -7583,15 +7684,16 @@ mod tests {
         )
         .with_mask(0xFF);
         b.set_record_info("TEST:U32B", ScanType::IoIntr);
-        a.init(&mut LonginRecord::new(0)).unwrap();
-        b.init(&mut LonginRecord::new(0)).unwrap();
+        let (mut rec_a, mut rec_b) = (LonginRecord::new(0), LonginRecord::new(0));
+        a.init(&mut rec_a).unwrap();
+        b.init(&mut rec_b).unwrap();
         a.bind_interrupt_gate(&gate_a);
         b.bind_interrupt_gate(&gate_b);
         let interrupts = a.handle.interrupts().clone();
         let (reason, fifo_a, fifo_b) =
             (a.reason, a.interrupt_fifo.clone(), b.interrupt_fifo.clone());
-        let _rx_a = a.io_intr_receiver().expect("A receiver");
-        let _rx_b = b.io_intr_receiver().expect("B receiver");
+        let _rx_a = join_io_intr(&mut a, &mut rec_a).expect("A receiver");
+        let _rx_b = join_io_intr(&mut b, &mut rec_b).expect("B receiver");
 
         interrupts.notify(InterruptValue {
             reason,
@@ -7621,7 +7723,7 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let fifo = ads.interrupt_fifo.clone();
-        let mut rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let mut rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
 
         for v in [1u32, 2, 3] {
             interrupts.notify(InterruptValue {
@@ -7984,12 +8086,6 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let acc = ads.average.clone().unwrap();
-        // Average arms the accumulating interrupt but returns no reprocess
-        // wakeup — the record scans periodically (periodic-SCAN model).
-        assert!(
-            ads.io_intr_receiver().is_none(),
-            "averaging records get no per-callback reprocess channel"
-        );
 
         for v in [10, 20, 30, 40] {
             interrupts.notify(InterruptValue {
@@ -8043,8 +8139,6 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let acc = ads.average.clone().unwrap();
-        assert!(ads.io_intr_receiver().is_none());
-
         for v in [1.0, 2.0, 6.0] {
             interrupts.notify(InterruptValue {
                 reason,
@@ -8083,8 +8177,6 @@ mod tests {
         let mut ads = make_average_adapter("asynFloat64");
         let mut rec = AiRecord::new(7.5); // pre-existing VAL
         ads.init(&mut rec).unwrap();
-        assert!(ads.io_intr_receiver().is_none());
-
         // No samples notified → the accumulator is empty.
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
@@ -8124,8 +8216,6 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let acc = ads.average.clone().unwrap();
-        assert!(ads.io_intr_receiver().is_none());
-
         interrupts.notify(InterruptValue {
             reason,
             addr: 0,
@@ -8162,8 +8252,6 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let acc = ads.average.clone().unwrap();
-        assert!(ads.io_intr_receiver().is_none());
-
         // A sample with a transport error (Timeout) during the period.
         interrupts.notify(InterruptValue {
             reason,
@@ -8229,8 +8317,6 @@ mod tests {
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let acc = ads.average.clone().unwrap();
-        assert!(ads.io_intr_receiver().is_none());
-
         interrupts.notify(InterruptValue {
             reason,
             addr: 0,
@@ -8265,8 +8351,7 @@ mod tests {
     /// Mode 1 decimates the running mean into the IoIntr ring every
     /// `round(SVAL)` samples (C devAsynInt32.c:673-702): below the threshold
     /// the ring stays empty; the `round(SVAL)`-th sample pushes the mean and
-    /// resets the accumulator. Unlike Mode 2, the averaging adapter returns a
-    /// per-decimation reprocess wakeup (`io_intr_receiver` → `Some`).
+    /// resets the accumulator, and each decimation wakes `io_intr_receiver`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn average_mode1_io_intr_decimates_every_sval_samples_into_ring() {
         let gate = open_gate();
@@ -8282,11 +8367,7 @@ mod tests {
         let acc = ads.average.clone().unwrap();
         let fifo = ads.interrupt_fifo.clone();
 
-        // Mode 1 delivers a reprocess wakeup channel (Mode 2 returns None).
-        assert!(
-            ads.io_intr_receiver().is_some(),
-            "Mode 1 (SCAN=I/O Intr) averaging delivers a per-decimation reprocess wakeup"
-        );
+        assert!(ads.io_intr_receiver().is_some());
 
         // 3 samples (< SVAL=4): accumulate, no decimation, ring stays empty.
         for v in [10, 20, 30] {
@@ -8322,6 +8403,59 @@ mod tests {
             acc.averager.count(),
             0,
             "decimation resets the accumulator (C numAverage=0, sum=0)"
+        );
+    }
+
+    /// The one average callback asks `isIOIntrScan` per sample
+    /// (devAsynInt32.c:673-707), and `get_ioint_info` sets and clears it
+    /// (:383/:399): a Passive average moved to I/O Intr decimates into the
+    /// ring and wakes the receiver iocInit took, and moved back it
+    /// accumulates for the periodic read again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_average_follows_its_scan_moves() {
+        use epics_base_rs::server::device_support::IoIntrCmd;
+        use epics_base_rs::server::record::CommonFields;
+        use epics_base_rs::server::records::ai::AiRecord;
+        let gate = open_gate();
+        let mut ads = make_average_adapter("asynInt32");
+        ads.bind_interrupt_gate(&gate);
+        ads.set_record_info("TEST:AVG", ScanType::Passive);
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 2.0;
+        ads.init(&mut rec).unwrap();
+        let mut rx = ads.io_intr_receiver().expect("an average's ioScanPvt");
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        let fifo = ads.interrupt_fifo.clone();
+        let sample = |v| InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(v),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        };
+        let mut common = CommonFields::default();
+
+        assert!(ads.get_ioint_info(&mut rec, &mut common, IoIntrCmd::Add));
+        interrupts.notify(sample(10));
+        interrupts.notify(sample(20));
+        let value = await_fifo_value(&fifo).await;
+        assert!(
+            matches!(value, crate::param::ParamValue::Int32(15)),
+            "on I/O Intr, SVAL=2 samples decimate, got {value:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the decimation wakes the iocInit receiver");
+
+        assert!(ads.get_ioint_info(&mut rec, &mut common, IoIntrCmd::Delete));
+        interrupts.notify(sample(30));
+        interrupts.notify(sample(40));
+        await_average_count(&acc, 2).await;
+        assert!(
+            fifo.lock().unwrap().pop().is_none(),
+            "off I/O Intr the samples accumulate for the periodic read"
         );
     }
 
@@ -8714,6 +8848,46 @@ mod tests {
     /// block — but an interrupt carrying the SAME choices (a value-only
     /// change) must fire NO post (C's asynEnum callback only runs on a table
     /// change, never on an int32 value callback).
+    /// C `initCommon` registers `callbackEnum` in `init_record`, right after
+    /// `setEnums` (devAsynInt32.c:317-323); iocInit's `property_post_receiver`
+    /// only takes that registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enum_registers_in_init() {
+        use crate::param::EnumEntry;
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let choices: Arc<[EnumEntry]> = Arc::from(vec![enum_entry("OFF", 0, 0)]);
+        let mut ads = make_enum_adapter(choices);
+        ads.init(&mut MbbiRecord::new(0)).unwrap();
+        assert!(ads.enum_interrupt_sub.is_some(), "after init");
+        assert!(ads.property_post_receiver().is_some(), "at iocInit");
+        assert!(ads.property_post_receiver().is_none(), "registered once");
+    }
+
+    /// C enters the asynEnum block on `findInterface(asynEnumType) &&
+    /// maxEnums>0` and registers `callbackEnum` even when
+    /// `pasynEnumSyncIO->read` fails (devAsynInt32.c:298-322); a port without
+    /// asynEnum registers nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enum_registers_without_a_table() {
+        use crate::interfaces::Capability;
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        for (enum_iface, registered) in [(true, true), (false, false)] {
+            let mut ads = make_adapter(ScanType::Passive);
+            if !enum_iface {
+                let caps: Vec<Capability> = InterfaceMask::UNMIGRATED_ALL
+                    .capabilities()
+                    .into_iter()
+                    .filter(|c| c.interface_type() != InterfaceType::Enum)
+                    .collect();
+                ads.handle.set_interfaces(caps);
+            }
+            ads.init(&mut MbbiRecord::new(0)).unwrap();
+            assert!(ads.enum_choices.is_none(), "the Int32 param has no table");
+            assert_eq!(ads.enum_interrupt_sub.is_some(), registered, "{enum_iface}");
+            assert_eq!(ads.property_post_receiver().is_some(), registered);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn property_post_receiver_emits_only_on_table_change() {
         use crate::interrupt::InterruptValue;
@@ -9217,7 +9391,7 @@ mod tests {
         ads.set_record_info("TEST:TAG", ScanType::IoIntr);
         let mut rec = epics_base_rs::server::records::ai::AiRecord::default();
         ads.init(&mut rec).unwrap();
-        assert!(ads.io_intr_receiver().is_some());
+        assert!(join_io_intr(&mut ads, &mut rec).is_some());
         let clients = rt.port_handle().interrupts().subscribed_clients();
         let [client] = clients.as_slice() else {
             panic!("{clients:?}");
@@ -9575,6 +9749,29 @@ mod tests {
             assert_eq!(t.rec.val, 3.0, "{name}");
             assert_eq!(t.reads(), 0, "{name}: the device is not read");
         }
+    }
+
+    /// A ring entry left when SCAN moved off I/O Intr is still C
+    /// `getCallbackValue`'s value (devAsynInt32.c:768-790, :836): a blocking
+    /// port's pass takes it and queues no read.
+    #[test]
+    fn a_ring_entry_left_off_io_intr_queues_no_read() {
+        use epics_base_rs::server::device_support::IoIntrCmd;
+        let mut t = IntrRead::new("INTRLEFTBLK", true);
+        let mut common = epics_base_rs::server::record::CommonFields::default();
+        assert!(
+            t.ads
+                .get_ioint_info(&mut t.rec, &mut common, IoIntrCmd::Add)
+        );
+        push_f64(&t.ads, 3.0);
+        assert!(
+            t.ads
+                .get_ioint_info(&mut t.rec, &mut common, IoIntrCmd::Delete)
+        );
+        assert!(matches!(t.begin(), ReadStart::Synchronous));
+        t.ads.read(&mut t.rec).unwrap();
+        assert_eq!(t.rec.val, 3.0);
+        assert_eq!(t.reads(), 0, "the device is not read");
     }
 
     /// An empty ring is C's `queueRequest`: queued on a blocking port, read in
@@ -10016,6 +10213,28 @@ mod tests {
             Some((3, 1)),
             "IoIntr read must surface the driver alarm carried by the ring entry"
         );
+    }
+
+    /// C `processAi` pops the ring before it asks the driver, whatever SCAN
+    /// the record is in (devAsynInt32.c:836): an entry queued before SCAN
+    /// moved off I/O Intr is the next periodic process's value.
+    #[test]
+    fn a_ring_entry_left_by_a_scan_move_is_read() {
+        use epics_base_rs::server::device_support::IoIntrCmd;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::Passive);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let mut common = epics_base_rs::server::record::CommonFields::default();
+        assert!(ads.get_ioint_info(&mut rec, &mut common, IoIntrCmd::Add));
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(9, 0));
+        assert!(ads.get_ioint_info(&mut rec, &mut common, IoIntrCmd::Delete));
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
+        assert!(ads.interrupt_fifo.lock().unwrap().pop().is_none());
     }
 
     #[test]
@@ -10519,7 +10738,7 @@ mod tests {
         ads.init(&mut rec).unwrap();
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
-        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+        let _rx = join_io_intr(&mut ads, &mut rec).expect("io intr receiver for IoIntr");
 
         for (iface, bytes, nord) in [
             (None, &b"AH501BE 1.0"[..], 12),

@@ -13,8 +13,9 @@
 //! -1.
 //!
 //! The standard converters (`StdLongConverter` and on in
-//! `StreamFormatConverter.cc`) and the converter files are ported on top of
-//! this and registered with [`register_converter`].
+//! `StreamFormatConverter.cc`) are in [`crate::std_converters`] and
+//! registered with the table; the converter files are ported on top of this
+//! and registered with [`register_converter`].
 
 use std::sync::OnceLock;
 
@@ -144,7 +145,73 @@ type Table = RwLock<[Option<&'static Registered>; 256]>;
 
 fn registered() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
-    TABLE.get_or_init(|| RwLock::new([None; 256]))
+    TABLE.get_or_init(|| {
+        let mut table = [None; 256];
+        for (name, provided, converter) in crate::std_converters::standard() {
+            provide(&mut table, name, provided, converter);
+        }
+        for (name, provided, converter) in [
+            crate::bcd_converter::registered(),
+            crate::regexp_converter::registered(),
+        ] {
+            provide(&mut table, name, provided, converter);
+        }
+        provide(
+            &mut table,
+            "EnumConverter",
+            b"{",
+            Box::new(crate::enum_converter::EnumConverter),
+        );
+        provide(
+            &mut table,
+            "RawConverter",
+            b"r",
+            Box::new(crate::raw_converter::RawConverter),
+        );
+        provide(
+            &mut table,
+            "MantissaExponentConverter",
+            b"m",
+            Box::new(crate::mantissa_exponent_converter::MantissaExponentConverter),
+        );
+        provide(
+            &mut table,
+            "ChecksumConverter",
+            b"<",
+            Box::new(crate::checksum::ChecksumConverter),
+        );
+        provide(
+            &mut table,
+            "BinaryConverter",
+            b"bB",
+            Box::new(crate::binary::BinaryConverter),
+        );
+        provide(
+            &mut table,
+            "TimestampConverter",
+            b"T",
+            Box::new(crate::timestamp_converter::TimestampConverter),
+        );
+        provide(
+            &mut table,
+            "RawFloatConverter",
+            b"R",
+            Box::new(crate::raw_float_converter::RawFloatConverter),
+        );
+        RwLock::new(table)
+    })
+}
+
+fn provide(
+    table: &mut [Option<&'static Registered>; 256],
+    name: &'static str,
+    provided: &[u8],
+    converter: Box<dyn StreamFormatConverter>,
+) {
+    let r: &'static Registered = Box::leak(Box::new(Registered { name, converter }));
+    for &c in provided {
+        table[c as usize] = Some(r);
+    }
 }
 
 /// `RegisterConverter(converter, "conversions")` / `provides`: the
@@ -155,11 +222,7 @@ pub fn register_converter(
     provided: &[u8],
     converter: Box<dyn StreamFormatConverter>,
 ) {
-    let r: &'static Registered = Box::leak(Box::new(Registered { name, converter }));
-    let mut table = registered().write();
-    for &c in provided {
-        table[c as usize] = Some(r);
-    }
+    provide(&mut registered().write(), name, provided, converter);
 }
 
 /// `StreamFormatConverter::find`

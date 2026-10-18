@@ -1,0 +1,46 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto cois P"
+Stream::initRecord rec: filename="l.proto" protocol="cois" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "cois")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+Stream::initRecord rec: waiting for initDone
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="x", size=1)
+StreamCore::readCallback(rec) inputBuffer="x", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="x", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "x"
+StreamCore::matchInput(rec): format = "%s"
+Stream::matchValue(rec): readData failed
+rec: Format "%s" has data type string which is not supported by "rec".
+StreamCore::readCallback(rec) match failure
+StreamCore::finishProtocol(rec, ScanError) bus owner
+Stream::protocolFinishHook(rec, ScanError)
+Stream::protocolFinishHook rec: signalling init done
+Stream::initRecord rec: initDone
+rec: @init handler failed
+rec: Record initialization failed
+streamInitRecord(rec) done status=0xffffffffffffffff
+VAL 0
+SEVR "NO_ALARM"
+STAT "CALC"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+MLST 0
+ALST 0

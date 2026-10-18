@@ -1,0 +1,4 @@
+AsynDriverInterface::writeHandler(rec)
+AsynDriverInterface::writeHandler(rec): reading old input
+AsynDriverInterface::writeHandler(rec): flushing 6 bytes: "early<0d>"
+AsynDriverInterface::writeHandler(rec): write(..., "X", outputSize=1, written=1) [timeout=0.1 sec] = asynSuccess 

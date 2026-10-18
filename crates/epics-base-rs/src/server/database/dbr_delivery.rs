@@ -38,8 +38,10 @@ pub fn apply_long_string(
 /// is the inverse of [`apply_long_string`] — the conversion the CA
 /// boundary applies for *plain* (non-`$`) access so the channel ships a
 /// single `DBR_STRING` element. The buffer is decoded verbatim (no
-/// UTF-8 validation, matching pvxs raw-byte storage) up to the first
-/// NUL; the DBR_STRING encoder then truncates to `MAX_STRING_SIZE`
+/// UTF-8 validation, matching pvxs raw-byte storage) up to its first
+/// NUL, past `LEN` included
+/// ([`long_string_field_bytes`](crate::server::database::char_view::long_string_field_bytes));
+/// the DBR_STRING encoder then truncates to `MAX_STRING_SIZE`
 /// (= 40), so an over-long value clips on the wire exactly as C does.
 /// Non-`CharArray` values pass through unchanged.
 ///
@@ -52,7 +54,7 @@ pub fn apply_native_long_string(v: crate::types::EpicsValue) -> crate::types::Ep
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) if b.is_empty() => {
             EpicsValue::StringArray(Vec::new().into())
         }
-        v => crate::server::database::char_view::long_string_text(v),
+        v => crate::server::database::char_view::long_string_field_text(v),
     }
 }
 

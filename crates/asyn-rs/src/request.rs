@@ -446,7 +446,17 @@ impl RequestCell {
 }
 
 impl Drop for RequestCell {
+    /// A block this cell still counts or holds ends with it. C does not:
+    /// ~AsynDriverInterface's cancelRequest (AsynDriverInterface.cc:308)
+    /// leaves the counts (asynManager.c:1632-1690), its disconnect refuses
+    /// while `blockProcessCallback is active` (:1377-1380) and its
+    /// freeAsynUser (AsynDriverInterface.cc:315-316) fails with it
+    /// (:1245-1246), so the asynUser leaks and the port stays blocked for
+    /// good, a `streamReload` included. That defect is not copied.
     fn drop(&mut self) {
+        if self.queue.blocks().lock().release(self.block_token) {
+            self.queue.nudge();
+        }
         self.queue.unregister();
     }
 }
@@ -961,6 +971,10 @@ pub enum RequestOp {
     /// driver's `disconnect`. A layered driver calls it on its own port when the
     /// port under it drops (drvLove.c:663-687).
     ExceptionDisconnect,
+    /// C `pasynManager->exceptionConnect(pasynUser)` (asynManager.c:2142-2163):
+    /// mark the user's `dpCommon` up and announce it, without calling the
+    /// driver's `connect`.
+    ExceptionConnect,
     /// Enable / disable auto-connect — C
     /// `pasynManager->autoConnect(pasynUser, autoConnect)`
     /// (`asynManager.c::autoConnectAsyn` :2312-2329, fired by asynRecord `AUCT`
@@ -1229,6 +1243,9 @@ pub struct RequestResult {
     pub status: AsynStatus,
     pub message: String,
     pub nbytes: usize,
+    /// An octet read's [`crate::interpose::OctetReadResult::taken_back`]: C's
+    /// `*nbytesTransferred` is `nbytes - taken_back`.
+    pub taken_back: usize,
     pub data: Option<Vec<u8>>,
     pub int_val: Option<i32>,
     pub int64_val: Option<i64>,
@@ -1298,6 +1315,7 @@ impl RequestResult {
             status: AsynStatus::Success,
             message: String::new(),
             nbytes: 0,
+            taken_back: 0,
             data: None,
             int_val: None,
             int64_val: None,
@@ -1358,6 +1376,18 @@ impl RequestResult {
             nbytes,
             data: Some(buf),
             eom_reason,
+            ..Self::base()
+        }
+    }
+
+    /// An octet read through the port's interpose chain, `buf` already cut to
+    /// the bytes `r` transferred.
+    pub fn octet_read_chain(buf: Vec<u8>, r: &crate::interpose::OctetReadResult) -> Self {
+        Self {
+            nbytes: r.nbytes_transferred,
+            taken_back: r.taken_back,
+            data: Some(buf),
+            eom_reason: r.eom_reason.bits(),
             ..Self::base()
         }
     }
@@ -1994,5 +2024,19 @@ mod tests {
         assert!(token.cancel());
         assert!(!token.begin_running(), "cancelled is terminal");
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn octet_read_chain_keeps_the_taken_back_byte() {
+        use crate::interpose::{EomReason, OctetReadResult};
+        let r = RequestResult::octet_read_chain(
+            Vec::new(),
+            &OctetReadResult {
+                nbytes_transferred: 0,
+                eom_reason: EomReason::EOS,
+                taken_back: 1,
+            },
+        );
+        assert_eq!((r.nbytes, r.taken_back, r.eom_reason), (0, 1, 0x02));
     }
 }

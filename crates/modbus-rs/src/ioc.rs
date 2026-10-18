@@ -1134,6 +1134,12 @@ impl ModbusPortDriver {
                 Some(InterfaceType::UInt32Digital) => !0,
                 _ => 0,
             },
+            // C readPoller's octet callback passes ASYN_EOM_CNT
+            // (drvModbusAsyn.cpp:1921).
+            eom_reason: match filter.iface {
+                Some(InterfaceType::Octet) => EomReason::CNT,
+                _ => EomReason::empty(),
+            },
             ..Default::default()
         }
     }
@@ -7068,11 +7074,17 @@ mod tests {
         let mut rx = log.clone();
 
         driver.poll_cycle().expect("poll 1 must succeed");
+        let fires = drain_addr0_fires(&mut rx, reason);
         assert_eq!(
-            count_iface(&drain_addr0_fires(&mut rx, reason), InterfaceType::Octet),
+            count_iface(&fires, InterfaceType::Octet),
             1,
             "first poll forces the octet fire"
         );
+        // C passes ASYN_EOM_CNT (drvModbusAsyn.cpp:1921).
+        let octet = fires
+            .iter()
+            .find(|iv| iv.iface == Some(InterfaceType::Octet));
+        assert_eq!(octet.unwrap().eom_reason, EomReason::CNT);
 
         driver.poll_cycle().expect("poll 2 must succeed");
         assert_eq!(

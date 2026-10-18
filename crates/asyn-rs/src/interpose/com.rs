@@ -370,6 +370,7 @@ impl OctetInterpose for ComInterpose {
         Ok(OctetReadResult {
             nbytes_transferred: n_read,
             eom_reason: eom,
+            taken_back: r.taken_back,
         })
     }
 
@@ -1159,6 +1160,7 @@ mod tests {
                 return Ok(OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::empty(),
+                    taken_back: 0,
                 });
             }
             let mut n = 0;
@@ -1184,6 +1186,7 @@ mod tests {
                 } else {
                     EomReason::empty()
                 },
+                taken_back: 0,
             })
         }
 

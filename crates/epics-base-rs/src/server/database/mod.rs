@@ -47,7 +47,7 @@ pub use processing::{
     AsyncDbHandle, AsyncToken, CaLinkInit, DeviceDone, DeviceDoneSource, ExternalCpProcess,
     InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
 };
-pub(crate) use processing::{NotifiedRead, ReadPolicy};
+pub(crate) use processing::{NotifiedRead, ReadPolicy, seed_record_constants};
 #[cfg(feature = "test-hooks")]
 pub use record_lock::fresh_hold_hook;
 pub(crate) use record_lock::{

@@ -12,7 +12,7 @@ mod common;
 
 use common::{Core, MOCK, MockConfig, TestHooks, Value};
 use std::sync::atomic::Ordering;
-use stream_rs::bus::{Client, StreamIoStatus};
+use stream_rs::bus::{Client, ReadInput, StreamIoStatus};
 
 use stream_rs::core::{STREAM_ERROR_DEAD_TIME, StartMode, StreamCoreLock};
 use stream_rs::error::{capture_stderr, set_stream_debug, take_captured};
@@ -69,8 +69,19 @@ fn play(core: &Core, line: &str) -> bool {
                 .and_then(|(_, a)| a.rsplit_once("\", size="))
                 .unwrap_or_else(|| panic!("{line}"));
             let input = unexpand(input.0);
-            assert_eq!(format!("{})", input.len()), input_size(line), "{line}");
-            core.read_callback(status(arg), &input);
+            // C's size_t: a take-back of 1 prints as 18446744073709551615
+            let size = input_size(line).strip_suffix(')').unwrap_or("");
+            let size = size.parse::<u64>().unwrap_or_else(|_| panic!("{line}")) as i64;
+            if size < 0 {
+                assert!(input.is_empty(), "{line}");
+                core.read_callback(
+                    status(arg),
+                    ReadInput::TakeBack(size.unsigned_abs() as usize),
+                );
+            } else {
+                assert_eq!(size as usize, input.len(), "{line}");
+                core.read_callback(status(arg), ReadInput::Bytes(&input));
+            }
         }
         _ => return false,
     }

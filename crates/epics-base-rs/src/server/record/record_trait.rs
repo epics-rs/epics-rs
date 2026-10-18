@@ -3611,7 +3611,19 @@ pub struct SimmCells {
     pub sdly: f64,
 }
 
-pub trait Record: Send + Sync + 'static {
+/// The `&mut dyn Any` of a sized record, which [`Record::as_any_mut`]'s
+/// default reaches through the vtable; sealed in this module.
+pub trait RecordAny: std::any::Any {
+    fn record_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+impl<T: std::any::Any> RecordAny for T {
+    fn record_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+pub trait Record: RecordAny + Send + Sync + 'static {
     /// Return the record type name (e.g., "ai", "ao", "bi").
     fn record_type(&self) -> &'static str;
 
@@ -5212,6 +5224,13 @@ pub trait Record: Send + Sync + 'static {
         crate::server::device_support::DsetInit::Ok
     }
 
+    /// The `pmessage` of the record's `recGblRecordError(S_dev_badInitRet)`
+    /// for a dset `init_record` status other than 0 or 2. `None` for the
+    /// record types that pass the status on unreported (default).
+    fn bad_init_ret_message(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The record's `init_record` arm for a dset `init_record` that returned
     /// 0: convert the RVAL the dset left into VAL, returning the UDF it sets.
     /// `None` for the record types with no such arm (default).
@@ -5231,6 +5250,20 @@ pub trait Record: Send + Sync + 'static {
     /// EOFF/ESLO [`Self::eoff_eslo_before_dset_init`] saved. A dset with no
     /// `init_record` never reaches it.
     fn eoff_eslo_after_dset_init(&mut self, _saved: (f64, f64)) {}
+
+    /// Whether the record calls its dset's `init_record` in pass 0 rather
+    /// than pass 1: aai and aao do (`aaiRecord.c:115-127`,
+    /// `aaoRecord.c:124-131`), so the driver's init runs before
+    /// `doResolveLinks` and every record's `add_record`. Default `false`.
+    fn dset_init_in_pass0(&self) -> bool {
+        false
+    }
+
+    /// The record's `init_record` right after the dset's `init_record` call,
+    /// or where a dset without one would make it, whatever its status:
+    /// `init_common` in mbbi (`mbbiRecord.c:135`) and mbbo
+    /// (`mbboRecord.c:141`, `:173`). Before [`Self::dset_init_convert`].
+    fn after_dset_init(&mut self) {}
 
     /// Post-init finalisation hook with mutable access to the
     /// framework's UDF flag. Called once after both `init_record`
@@ -5341,8 +5374,11 @@ pub trait Record: Send + Sync + 'static {
     /// halves in `seed_deadband_tracking`, which made "the trackers are seeded"
     /// and "the record is converted" the same call — so a caller that wanted
     /// one got the other, and busy (which needs the convert without the
-    /// trackers) had to be the exception. Default: empty.
-    fn init_record_tail(&mut self) {}
+    /// trackers) had to be the exception.
+    ///
+    /// `common` is there for an alarm the tail raises: mbbo's `convert()`
+    /// raises SOFT/INVALID into NSEV at `mbboRecord.c:177`. Default: empty.
+    fn init_record_tail(&mut self, _common: &mut CommonFields) {}
 
     /// Seed the monitor/archive/alarm deadband trackers (MLST/ALST/LALM)
     /// from the initial value at iocInit, called once by the builder after
@@ -5960,8 +5996,23 @@ pub trait Record: Send + Sync + 'static {
     /// Called from the single owner of the SCAN transition
     /// (`RecordInstance::put_common_field*`, and the `scanAdd`-failure demotion
     /// in `ioc_app`) only when I/O Intr membership actually changes, so it is
-    /// never invoked twice for the same state. Default: ignore.
-    fn set_io_intr_scan(&mut self, _active: bool) {}
+    /// never invoked twice for the same state.
+    ///
+    /// Returns `false` when joining is refused — C `get_ioint_info(0)`
+    /// returning non-zero, on which `scanAdd` leaves the record Passive
+    /// (dbScan.c:286-288). Default: accept.
+    fn set_io_intr_scan(&mut self, _active: bool) -> bool {
+        true
+    }
+
+    /// iocInit's `scanAdd` (`buildScanLists`, dbScan.c:286) for a record that
+    /// loaded with `SCAN="I/O Intr"`: the registration
+    /// [`Self::set_io_intr_scan`] deferred at load may exist now. `false` is C's
+    /// `get_ioint_info(0)` refusal, and the framework demotes the record to
+    /// Passive. Default: accept.
+    fn io_intr_scan_add(&mut self) -> bool {
+        true
+    }
 
     /// The link writes a C `special()` performs *itself*, inside `dbPut`.
     ///
@@ -6093,10 +6144,10 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
-    /// Downcast to concrete type for device support init injection.
-    /// Override in record types that need device support to inject state (e.g., MotorRecord).
+    /// Downcast to the concrete type, for a device support that reaches
+    /// its record's C members.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        None
+        Some(self.record_any_mut())
     }
 
     /// C's `*(void **)pfield` for a `DBF_NOACCESS` pointer member that only

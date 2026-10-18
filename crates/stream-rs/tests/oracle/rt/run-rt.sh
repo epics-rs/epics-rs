@@ -5,7 +5,12 @@
 # Each case of cases.txt boots an IOC with one record "rec" of the case's
 # type and VAL, loading protocol p of rt/<case>.proto on an asyn IP port
 # "P" to dev.py (which answers each request of the device table) or to a
-# port nobody listens on. The record is processed once with streamDebug 1.
+# port nobody listens on. dev.py takes a free port either way and the IOC
+# starts no CA server (RSRV's UDP bind of a picked port could fail and
+# cantProceed), so runs can overlap. The record is processed once with
+# streamDebug 1.
+# The IOC writes stderr a line per write (rt/linewise.c), so two threads'
+# debug lines cannot interleave.
 # Kept from stderr, from the first StreamCore line on: StreamCore.cc's
 # debug lines and the error lines (no source file), without the thread
 # name and file:line prefix. Debug lines of other files are the record
@@ -25,14 +30,20 @@ set -euo pipefail
 ARCH=${EPICS_HOST_ARCH:-linux-x86_64}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
-dev=
-trap '[ -n "$dev" ] && kill "$dev" 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$work"' EXIT
-# below the ephemeral range, where a client socket can hold the port
-port=27100
+# dev.py and the IOC each lead a process group (setsid), killed whole on
+# any exit; the IOC runs in the background so a TERM or INT, which bash
+# holds while a foreground command runs, reaches the trap at once. A
+# SIGKILL of the rig skips the trap, so each also gets SIGKILL when the rig
+# dies (pdeathsig); the PPID test covers a rig gone before the prctl.
+own=(setsid setpriv --pdeathsig KILL sh -c '[ "$PPID" = "$0" ] && exec "$@"' "$$")
+dev= ioc=
+trap 'kill -- ${dev:+-$dev} ${ioc:+-$ioc} 2>/dev/null || true; [ -n "${KEEP:-}" ] || rm -rf "$work"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+cc -shared -fPIC -o "$work/linewise.so" "$here/linewise.c" -ldl
 while IFS=$'\t' read -r c rtype val table opts; do
     case "$c" in '#'* | '') continue ;; esac
     if [ $# -gt 0 ] && [[ " $* " != *" $c "* ]]; then continue; fi
-    port=$((port + 1))
     case "$rtype" in *o | *out | *oDirect) link=OUT ;; *) link=INP ;; esac
     scan=Passive proc="dbpf rec.PROC 1"
     case ",$opts," in *,intr,*) scan="I/O Intr" proc= ;; esac
@@ -47,11 +58,11 @@ epicsThreadSleep 2.1
 dbpf rec.PROC 1
 epicsThreadSleep 0.5" ;; esac
     dead=$(printf '%s\n' "$opts" | tr , '\n' | sed -n 's/^deadtime=//p')
-    cat >"$work/$c.cmd" <<EOF
+    cat >"$work/$c.cmd.in" <<EOF
 dbLoadDatabase "$STREAM_TOP/dbd/streamApp.dbd"
 streamApp_registerRecordDeviceDriver pdbbase
 epicsEnvSet STREAM_PROTOCOL_PATH $here
-drvAsynIPPortConfigure "P", "127.0.0.1:$port", 0, 0, 0
+drvAsynIPPortConfigure "P", "127.0.0.1:@PORT@", 0, 0, 0
 var streamMsgTimeStamped 0
 var streamErrorDeadTime ${dead:-0}
 dbLoadRecords "$work/$c.db"
@@ -64,30 +75,27 @@ $again
 var streamDebug 0
 exit
 EOF
-    # Threads print a debug line in pieces, so two can interleave; a kept
-    # line that is none of StreamCore's shows it (scanValue's "failed\n"
-    # line, which C runs into the next, aside), and the case is run again.
-    for try in 1 2 3 4 5; do
-        dev=
-        if [ "$table" != - ]; then
-            python3 -I "$here/dev.py" "$port" "$table" &
-            dev=$!
-            until python3 -c "import socket,sys; sys.exit(socket.socket().connect_ex(('127.0.0.1',$port)))"; do
-                kill -0 "$dev"
-                sleep 0.05
-            done
-        fi
-        "$STREAM_TOP/bin/$ARCH/streamApp" "$work/$c.cmd" </dev/null >/dev/null 2>"$work/$c.err" || true
-        if [ -n "$dev" ]; then kill "$dev" 2>/dev/null || true; wait "$dev" 2>/dev/null || true; dev=; fi
-        perl -ne 'next unless $on ||= /StreamCore\.cc:\d+: /;
-            next if /^\e\[|^iocsh Error: |^iocRun: |StreamCore::attachBus\(/;
-            next unless s/^\S+ //;
-            s/( failed\\n)\S+ (?!StreamCore\.cc:)\S+\.cc?:\d+: .*/$1/;
-            next if /^\S+ lockRequest: port \S+ not connected$/;
-            if (s/^(\S+\.cc?):\d+: //) { print if $1 eq "StreamCore.cc" } else { print }' \
-            "$work/$c.err" >"$here/$c.log"
-        grep -vF 'failed\n' "$here/$c.log" |
-            grep -qvE '^(StreamCore::|rec: |starting exception handler$|reparsing input |No match for )' ||
-            break
+    : >"$work/port"
+    "${own[@]}" python3 -I "$here/dev.py" 0 "$table" >"$work/port" &
+    dev=$!
+    until [ -s "$work/port" ]; do
+        kill -0 "$dev"
+        sleep 0.05
     done
+    sed "s/@PORT@/$(cat "$work/port")/" "$work/$c.cmd.in" >"$work/$c.cmd"
+    EPICS_IOC_IGNORE_SERVERS=rsrv LD_PRELOAD="$work/linewise.so" \
+        "${own[@]}" "$STREAM_TOP/bin/$ARCH/streamApp" "$work/$c.cmd" </dev/null >/dev/null 2>"$work/$c.err" &
+    ioc=$!
+    wait "$ioc" || true
+    ioc=
+    kill -- -"$dev" 2>/dev/null || true
+    wait "$dev" 2>/dev/null || true
+    dev=
+    perl -ne 'next unless $on ||= /StreamCore\.cc:\d+: /;
+        next if /^\e\[|^iocsh Error: |^iocRun: |StreamCore::attachBus\(/;
+        next unless s/^\S+ //;
+        s/( failed\\n)\S+ (?!StreamCore\.cc:)\S+\.cc?:\d+: .*/$1/;
+        next if /^\S+ lockRequest: port \S+ not connected$/;
+        if (s/^(\S+\.cc?):\d+: //) { print if $1 eq "StreamCore.cc" } else { print }' \
+        "$work/$c.err" >"$here/$c.log"
 done <"$here/cases.txt"

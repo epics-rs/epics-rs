@@ -1,0 +1,39 @@
+a a v0 TIMEOUT INVALID
+a a v1  
+a b v0 TIMEOUT INVALID
+a b v1  
+a c v0 TIMEOUT INVALID
+a c v1  
+a d v0 TIMEOUT INVALID
+l a v1  
+l a v2  
+l b v0 TIMEOUT INVALID
+l b v1  
+l b v1  
+l b v2  
+l c v1  
+l c v2  
+l d v0 TIMEOUT INVALID
+v a v1  
+v a v2  
+v a.SEVR 3 TIMEOUT INVALID
+v a.SEVR 0  
+v a.STAT 10 TIMEOUT INVALID
+v a.STAT 0  
+v b v0 TIMEOUT INVALID
+v b v1  
+v b v1  
+v b v2  
+v b.SEVR 3 TIMEOUT INVALID
+v b.SEVR 0  
+v b.STAT 10 TIMEOUT INVALID
+v b.STAT 0  
+v c v0 TIMEOUT INVALID
+v c v1  
+v c v1  
+v c v2  
+v c.SEVR 3 TIMEOUT INVALID
+v c.SEVR 0  
+v c.STAT 10 TIMEOUT INVALID
+v c.STAT 0  
+v d v0 TIMEOUT INVALID

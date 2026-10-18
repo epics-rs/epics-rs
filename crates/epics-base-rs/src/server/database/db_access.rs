@@ -312,7 +312,6 @@ impl Drop for SubscriberSlot {
 
 /// A subscription's read-time work, C's post chain on its `dbChannel`, run
 /// off the record lock as the event is read (`dbEvent.c:984-985`).
-#[derive(Default)]
 pub struct PostStage {
     /// The channel's post-chain filters.
     post: crate::server::database::filters::FilterChain,
@@ -430,34 +429,51 @@ impl DbSubscription {
     ///
     /// Use `EventMask::PROPERTY` to receive display/control/enum metadata
     /// change events separately from value events (pvxs DBE_PROPERTY).
+    ///
+    /// The name is C's `dbChannelCreate`'s: refused where it returns NULL,
+    /// a `$` name is read as its chars, and a `{json}` suffix is the
+    /// channel's filter chain, per subscriber as a `dbChannel`'s. The
+    /// pre-chain filters run on the post, the post-chain ones as the event
+    /// is read
+    /// ([`SubscriptionFilter::post_chain`](crate::server::database::filters::SubscriptionFilter::post_chain)).
     pub async fn subscribe_with_mask(
         db: &PvDatabase,
         pv_name: impl AsRef<[u8]>,
         ignore_origin: u64,
         mask: u16,
     ) -> Result<Self, SubscribeRefused> {
-        Self::subscribe_with_mask_and_filters(db, pv_name, ignore_origin, mask, None).await
-    }
-
-    /// Subscribe with both a custom event mask and an
-    /// optional pvxs-compatible channel filter chain. Per-subscriber
-    /// state, as a `dbChannel`'s. The pre-chain filters run on the post,
-    /// the post-chain ones as the event is read
-    /// ([`SubscriptionFilter::post_chain`](crate::server::database::filters::SubscriptionFilter::post_chain)).
-    pub async fn subscribe_with_mask_and_filters(
-        db: &PvDatabase,
-        pv_name: impl AsRef<[u8]>,
-        ignore_origin: u64,
-        mask: u16,
-        filters: Option<&crate::server::database::filters::FilterChain>,
-    ) -> Result<Self, SubscribeRefused> {
-        let (record_name, field) = parse_pv_name(pv_name.as_ref());
+        use crate::server::database::filters::{
+            ChannelCreateError, db_channel_create, parse_channel_name,
+        };
+        let channel = match db_channel_create(db, pv_name.as_ref()) {
+            Ok(channel) => channel,
+            Err(ChannelCreateError::Filter(_)) => return Err(SubscribeRefused::BadFilter),
+            Err(ChannelCreateError::NotFound) => {
+                let name = parse_channel_name(pv_name.as_ref());
+                let record = parse_pv_name(&name.record_path).0;
+                return Err(match db.get_record(record) {
+                    Some(_) => SubscribeRefused::FieldNotFound,
+                    None => SubscribeRefused::NoRecord,
+                });
+            }
+        };
+        let (record_name, field) = parse_pv_name(&channel.name.record_path);
         let field = field.to_ascii_uppercase();
         let rec = db
             .get_record(record_name)
             .ok_or(SubscribeRefused::NoRecord)?;
+        let dollar = if channel.name.string_view {
+            let view = crate::server::database::char_view::DollarView::of(
+                &rec.read(),
+                &field,
+                &channel.chain,
+            );
+            Some(view.ok_or(SubscribeRefused::FieldNotFound)?)
+        } else {
+            None
+        };
         let sid = next_sid();
-        let (pre, post) = filters.map(|chain| chain.split()).unwrap_or_default();
+        let (pre, post) = channel.chain.split();
         let reader = {
             let mut instance = rec.write();
             let reader = instance.add_subscriber(&field, sid, DbFieldType::Double, mask)?;
@@ -478,20 +494,8 @@ impl DbSubscription {
                 id: reader.id(),
             },
             reader,
-            read: PostStage::new(post, None).map(Box::new),
+            read: PostStage::new(post, dollar).map(Box::new),
         })
-    }
-
-    /// Serve this subscription as a `$` channel: each event is read as
-    /// [`DollarView::render`](crate::server::database::char_view::DollarView::render)'s
-    /// image, through the post chain, then
-    /// `DollarView::cut`.
-    pub fn with_dollar_view(
-        mut self,
-        view: crate::server::database::char_view::DollarView,
-    ) -> Self {
-        self.read.get_or_insert_default().dollar = Some(view);
-        self
     }
 
     /// The event as read, `None` where it is skipped: the one place
@@ -1340,10 +1344,11 @@ mod multi_monitor_tests {
 mod delivery_read_tests {
     use super::*;
 
-    /// A queued update of a field the delivery read cannot reach is a failed
-    /// get (`camessage.c:545-560`), not a made-up value.
+    /// A field the record does not have is no channel: C's
+    /// `dbChannelCreate` returns NULL from `pvNameLookup`
+    /// (`dbChannel.c:460-462`), so there is nothing to subscribe.
     #[epics_macros_rs::epics_test]
-    async fn a_failed_delivery_read_is_a_failed_get() {
+    async fn a_field_the_record_lacks_is_refused() {
         let db = PvDatabase::new();
         db.add_record(
             "X",
@@ -1351,19 +1356,10 @@ mod delivery_read_tests {
         )
         .await
         .unwrap();
-        let mut sub = DbSubscription::subscribe(&db, "X.NOSUCH").await.unwrap();
-        let posted = crate::server::snapshot::Snapshot::new(
-            EpicsValue::Double(2.0),
-            0,
-            0,
-            std::time::SystemTime::UNIX_EPOCH,
-        );
-        sub.slot.record.read().post_single_event(
-            "NOSUCH",
-            sub.slot.id,
-            std::sync::Arc::new(posted),
-        );
-        assert!(matches!(sub.try_recv_snapshot(), Ok(Err(GetFailed))));
+        assert!(matches!(
+            DbSubscription::subscribe(&db, "X.NOSUCH").await,
+            Err(SubscribeRefused::FieldNotFound)
+        ));
     }
 
     /// The channel keeps the name it was opened by, as C's `dbChannel` does.

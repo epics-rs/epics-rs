@@ -1,0 +1,48 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto aoii P"
+Stream::initRecord rec: filename="l.proto" protocol="aoii" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "aoii")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+streamGetIointInfo(rec,cmd=0): stream=0x595da13f98d0, ioscanpvt=0x595da13fb420
+streamGetIointInfo(rec): start later...
+rec: starting "I/O Intr"
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="V=6.5<0d><0a>", size=7)
+StreamCore::readCallback(rec) inputBuffer="V=6.5<0d><0a>", size 7
+StreamCore::readCallback(rec) inTerminator <0d><0a> at position 5
+StreamCore::readCallback(rec) input line: "V=6.5"
+StreamCore::matchInput(rec): format = "%f"
+StreamCore::scanValue(rec, format=%f, double) input="6.5" value=6.50000
+Stream::scan() currentValueLength=3
+Stream::matchValue(rec): success, 3 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) not bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. convert
+recordProcessCallback(rec) processing record done
+recordProcessCallback(rec) restart async protocol
+StreamCore::startProtocol(rec, startMode=StartAsync)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoTimeout input="", size=0)
+StreamCore::readCallback(rec) inputBuffer="", size 0
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) async timeout: just restart
+VAL 13
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+OVAL 13
+MLST 13
+ALST 13
+RVAL 7 = 0x7

@@ -1,6 +1,6 @@
 use super::ExprKind;
 use super::error::CalcError;
-use super::strtod;
+use crate::runtime::stdlib::strtod;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FuncName {
@@ -871,7 +871,7 @@ impl<'a> Tokenizer<'a> {
     /// `CALC_ERR_BAD_LITERAL` (C tests `pnext == psrc`) — which is why a lone `.`
     /// is a bad literal rather than a syntax error.
     ///
-    /// The scan itself is `strtod::strtod`, shared with sCalc's `atof` coercion.
+    /// The scan itself is libcom's `strtod`, shared with sCalc's `atof` coercion.
     /// A sign or leading whitespace never reaches it here: `at_literal` only
     /// fires on a digit, a `.`, or one of the table's literal words — which is
     /// also why an out-of-range literal is only ever the MAGNITUDE: `-1e400` is
@@ -898,7 +898,7 @@ impl<'a> Tokenizer<'a> {
                 .map_err(|_| CalcError::BadLiteral);
         }
 
-        let n = strtod::strtod(rem);
+        let n = strtod(rem);
         if n.len == 0 {
             return Err(CalcError::BadLiteral);
         }
@@ -919,7 +919,7 @@ impl<'a> Tokenizer<'a> {
 /// C `epicsStrnCaseCmp(text, name, strlen(name)) == 0`: does `name` prefix
 /// `text`, ignoring case? This is how `get_element` matches every element.
 fn starts_with_ci(text: &[u8], name: &str) -> bool {
-    strtod::starts_with_ci(text, name.as_bytes())
+    text.len() >= name.len() && text[..name.len()].eq_ignore_ascii_case(name.as_bytes())
 }
 
 impl<'a> Lexer<'a> {

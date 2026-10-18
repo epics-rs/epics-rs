@@ -113,6 +113,10 @@ pub async fn write_save_file_with_settings(
             content.push(' ');
             content.push_str(&entry.value);
             content.push('\n');
+        } else if entry.pv_name.ends_with('$') {
+            // C `write_it` writes a `$` member from its char buffer, which
+            // no get has filled (save_restore.c:1827-1830, :1844-1848).
+            content.push_str(&format!("#{} \n", entry.pv_name));
         } else {
             // C `write_it`'s `#name value` for a channel that never
             // connected (save_restore.c:1296, :1835), which `asVerify` counts.

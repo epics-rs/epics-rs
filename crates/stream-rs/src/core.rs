@@ -39,7 +39,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 
 use crate::buffer::StreamBuffer;
-use crate::bus::{self, BusInterface, ClientBus, StreamIoStatus};
+use crate::bus::{self, BusInterface, ClientBus, ReadInput, StreamIoStatus};
 use crate::cmsg;
 use crate::converter::{self, ESC};
 use crate::cstr::fmt_c_alt_g;
@@ -203,6 +203,8 @@ pub trait StreamCoreHooks: Send + Sized + 'static {
     fn priority(&self, _core: &StreamCore<Self>) -> i64 {
         0
     }
+    /// `interruptAccept`, for the bus's asynchronous input.
+    fn interrupt_accept(&self, core: &StreamCore<Self>) -> bool;
 }
 
 /// `class MutexLock`: the core, locked.
@@ -223,7 +225,7 @@ pub struct StreamCoreLock<H: StreamCoreHooks> {
 pub enum Entry<'a> {
     Lock(StreamIoStatus),
     Write(StreamIoStatus),
-    Read(StreamIoStatus, &'a [u8]),
+    Read(StreamIoStatus, ReadInput<'a>),
     Event(StreamIoStatus),
     Connect(StreamIoStatus),
     Disconnect(StreamIoStatus),
@@ -355,7 +357,7 @@ impl<H: StreamCoreHooks> bus::Client for StreamCoreLock<H> {
         self.enter(Entry::Write(status));
     }
 
-    fn read_callback(&self, status: StreamIoStatus, input: &[u8]) -> isize {
+    fn read_callback(&self, status: StreamIoStatus, input: ReadInput<'_>) -> isize {
         self.enter(Entry::Read(status, input))
     }
 
@@ -374,6 +376,11 @@ impl<H: StreamCoreHooks> bus::Client for StreamCoreLock<H> {
     fn priority(&self) -> i64 {
         let core = self.lock();
         core.hooks.priority(&core)
+    }
+
+    fn interrupt_accept(&self) -> bool {
+        let core = self.lock();
+        core.hooks.interrupt_accept(&core)
     }
 
     fn get_in_terminator(&self) -> Option<Vec<u8>> {
@@ -1493,7 +1500,8 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 self.input_buffer.borrow().expand(),
                 b"\n"
             );
-            expected_input = self.read_callback(self.last_input_status.get(), &[]);
+            expected_input =
+                self.read_callback(self.last_input_status.get(), ReadInput::Bytes(&[]));
             if expected_input == 0 {
                 return true;
             }
@@ -1531,8 +1539,10 @@ impl<H: StreamCoreHooks> StreamCore<H> {
     /// `readCallback(status, input, size)`, the lock held: the number of
     /// bytes to read additionally, -1 when not known. C's check for an
     /// illegal status has no counterpart; the enum holds none.
-    fn read_callback(&self, status: StreamIoStatus, input: &[u8]) -> isize {
+    fn read_callback(&self, status: StreamIoStatus, input: ReadInput<'_>) -> isize {
         use StreamIoStatus::*;
+        let size = input.size();
+        let input = input.bytes();
         let mut status = status;
         if self.has(ABORTED) {
             return 0;
@@ -1546,7 +1556,8 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                 status.to_str()
             ),
             StreamBuffer::from_bytes(input).expand(),
-            format!("\", size={})\n", input.len())
+            // C prints the size_t: a take-back of 1 is 18446744073709551615
+            format!("\", size={})\n", size as usize)
         );
 
         if !self.has(ACCEPT_INPUT) {
@@ -1618,7 +1629,16 @@ impl<H: StreamCoreHooks> StreamCore<H> {
             }
         }
         self.hooks.input_hook(self, input);
-        self.input_buffer.borrow_mut().append(input);
+        {
+            // StreamBuffer::append: a negative size deletes from the end
+            let mut buffer = self.input_buffer.borrow_mut();
+            if size < 0 {
+                let len = buffer.length();
+                buffer.truncate((len - size.unsigned_abs().min(len)) as isize);
+            } else {
+                buffer.append(input);
+            }
+        }
         debug!(
             format!("StreamCore::readCallback({}) inputBuffer=\"", self.name()),
             self.input_buffer.borrow().expand(),
@@ -1656,7 +1676,7 @@ impl<H: StreamCoreHooks> StreamCore<H> {
                     // already parsed chunks in inputBuffer
                     // start parsing at beginning of new data
                     // but beware of split terminators
-                    (length as isize - input.len() as isize - terminator.length() as isize).max(0)
+                    (length as isize - size - terminator.length() as isize).max(0)
                 };
                 end = self.input_buffer.borrow().find(terminator.bytes(), start);
                 if end >= 0 {

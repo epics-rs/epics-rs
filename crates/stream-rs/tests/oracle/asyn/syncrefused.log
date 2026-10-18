@@ -1,0 +1,3 @@
+AsynDriverInterface::lockRequest(rec, 5000 msec)
+AsynDriverInterface::lockHandler(rec)
+rec lockHandler: pasynManager->blockProcessCallback() failed: asynManager::blockProcessCallback blockProcessCallback not supported because port is synchronous

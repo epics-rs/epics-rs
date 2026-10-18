@@ -199,7 +199,7 @@ impl StackValue {
     pub fn to_double(&self) -> f64 {
         match self {
             StackValue::Double(v) => *v,
-            StackValue::Str(s) => super::strtod::strtod(s.as_bytes()).value,
+            StackValue::Str(s) => crate::runtime::stdlib::strtod(s.as_bytes()).value,
         }
     }
 

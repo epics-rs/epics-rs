@@ -5,7 +5,7 @@ use super::{
     ChannelName, FilterChain, FilterParseError, parse_channel_name, try_parse_filter_chain,
 };
 use crate::server::database::PvDatabase;
-use crate::types::DbFieldType;
+use crate::types::{DbFieldType, EpicsValue};
 
 /// A channel `dbChannelCreate` returned non-NULL for.
 #[derive(Debug)]
@@ -19,6 +19,31 @@ impl DbChannel {
     /// leaves it.
     pub fn final_field_type(&self, native: DbFieldType) -> DbFieldType {
         self.chain.final_field_type(native)
+    }
+
+    /// C `dbChannelGet` of the whole value through a read log: the field
+    /// through the channel's filters, a `$` channel's chars as the string
+    /// they hold. `None` where the read fails. Takes the record's lock; a
+    /// caller must hold none.
+    pub fn get(&self, db: &PvDatabase) -> Option<EpicsValue> {
+        let value = match db.get_record(&self.name.record) {
+            Some(rec) => {
+                let field = rec.canonical_field(&self.name.field);
+                crate::server::database::channel_io::record_field_snapshot_scan_locked(
+                    db,
+                    &rec,
+                    &field,
+                    self.name.string_view,
+                )?
+                .value
+            }
+            None => db.get_pv(&self.name.record_path).ok()?,
+        };
+        Some(
+            self.chain
+                .apply_to_read_value(value.clone())
+                .unwrap_or(value),
+        )
     }
 }
 

@@ -80,11 +80,9 @@ pub struct MbboRecord {
     pub siol: PvString,
     pub sims: i16,
     pub sdly: f64,
-    /// Set by `convert()` when VAL is an illegal state (`> 15` with a
-    /// defined state table). C `mbboRecord.c::convert` raises
-    /// `SOFT_ALARM/INVALID` for this case; the alarm is actually
-    /// raised in `check_alarms()` since `convert()` has no access to
-    /// `CommonFields`.
+    /// `process()`'s `convert()` met an illegal state, so this cycle's
+    /// `check_alarms()` raises C's `SOFT_ALARM/INVALID`: `process()` has
+    /// no `CommonFields`.
     soft_alarm: bool,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
@@ -95,6 +93,8 @@ pub struct MbboRecord {
     skip_convert: bool,
     /// `special()` re-labelled the state VAL sits on; the put drains it.
     label_post: bool,
+    /// SDEF, written by [`Self::init_common`] only.
+    sdef: bool,
 }
 
 impl Default for MbboRecord {
@@ -172,6 +172,7 @@ impl Default for MbboRecord {
             soft_alarm: false,
             skip_convert: false,
             label_post: false,
+            sdef: false,
         }
     }
 }
@@ -184,7 +185,8 @@ impl MbboRecord {
         }
     }
 
-    fn raw_values(&self) -> [u32; 16] {
+    /// ZRVL..FFVL, C's `(&prec->zrvl)[i]`.
+    pub fn raw_values(&self) -> [u32; 16] {
         [
             self.zrvl, self.onvl, self.twvl, self.thvl, self.frvl, self.fvvl, self.sxvl, self.svvl,
             self.eivl, self.nivl, self.tevl, self.elvl, self.tvvl, self.ttvl, self.ftvl, self.ffvl,
@@ -209,40 +211,41 @@ impl MbboRecord {
         65535
     }
 
-    /// C `mbboRecord.c::init_common` — "check if any states are defined": TRUE
-    /// as soon as one of ZRVL..FFVL is non-zero or one of ZRST..FFST is
-    /// non-empty.
-    ///
-    /// DERIVED, never stored. C keeps `prec->sdef` as a struct member and
-    /// recomputes it from `init_common` — at init, and from `special()` after
-    /// every write to a state field. A cached copy of a value that is a pure
-    /// function of 32 other fields can go stale, and here staleness is not
-    /// cosmetic: `sdef` selects VAL's WIRE TYPE (`cvt_dbaddr`, DBF_USHORT with
-    /// no state table, DBF_ENUM with one), so a stale `false` serves an enum
-    /// field as a long. Computing it on demand makes that state unreachable
-    /// rather than merely unlikely.
-    fn sdef(&self) -> bool {
+    /// C `mbboRecord.c::init_common` (93-107) — "check if any states are
+    /// defined": TRUE as soon as one of ZRVL..FFVL is non-zero or one of
+    /// ZRST..FFST is non-empty. C calls it at pass 0 (`:115`), again after the
+    /// dset's `init_record` (`:141`, or `:173` without one), and from
+    /// `special()` after a put to any of the 32 state fields (`:286`).
+    fn init_common(&mut self) {
         let rvs = self.raw_values();
-        let sts: [&PvString; 16] = [
+        let sts = self.state_strings();
+        self.sdef = (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty());
+    }
+
+    /// ZRST..FFST, C's `(&prec->zrst)[i]`.
+    pub fn state_strings(&self) -> [&PvString; 16] {
+        [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
-        ];
-        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
+        ]
+    }
+
+    /// C's `prec->sdef`: 0 until `init_common` has run. It selects VAL's wire
+    /// type (`cvt_dbaddr`).
+    pub fn sdef(&self) -> bool {
+        self.sdef
     }
 
     /// C convert(): VAL -> RVAL with SDEF check and SHFT.
     ///
     /// When the state table is defined and `VAL > 15` the conversion
-    /// is illegal — C `mbboRecord.c::convert` raises
-    /// `SOFT_ALARM/INVALID` and leaves RVAL stale. We flag it via
-    /// `soft_alarm` so `check_alarms()` raises the alarm.
-    fn convert(&mut self) {
-        self.soft_alarm = false;
+    /// is illegal: C `mbboRecord.c:428-431` raises `SOFT_ALARM/INVALID`
+    /// and leaves RVAL stale. Returns true then; the caller raises it.
+    fn convert(&mut self) -> bool {
         if self.sdef() {
             if self.val > 15 {
-                self.soft_alarm = true;
-                return;
+                return true;
             }
             let rvs = self.raw_values();
             self.rval = rvs[self.val as usize];
@@ -260,10 +263,11 @@ impl MbboRecord {
             // value any sane 32-bit shift-out yields.
             self.rval = self.rval.checked_shl(self.shft as u32).unwrap_or(0);
         }
+        false
     }
 
     /// Per-state severity fields ZRSV..FFSV indexed by state 0..15.
-    fn state_severities(&self) -> [i16; 16] {
+    pub fn state_severities(&self) -> [i16; 16] {
         [
             self.zrsv, self.onsv, self.twsv, self.thsv, self.frsv, self.fvsv, self.sxsv, self.svsv,
             self.eisv, self.nisv, self.tesv, self.elsv, self.tvsv, self.ttsv, self.ftsv, self.ffsv,
@@ -490,14 +494,16 @@ impl Record for MbboRecord {
     /// label posts nothing, because no subscriber's rendering moved.
     ///
     /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
-    /// fall outside the index range and post nothing. What they DO reach is
-    /// `init_common`, whose `sdef` this port derives on demand
-    /// (`Self::sdef`) rather than caching, so that half needs no hook.
+    /// fall outside the index range and post nothing; they reach only
+    /// `init_common`.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         // Every state string is `??ST`; a VAL put skips the name scan.
         if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
             self.label_post =
                 crate::server::record::multibit_state_string_index(field) == Some(self.val);
+        }
+        if after && crate::server::record::multibit_state_field(field) {
+            self.init_common();
         }
         Ok(())
     }
@@ -620,6 +626,8 @@ impl Record for MbboRecord {
             _ => return Err(CaError::TypeMismatch("IVOV".into())),
         };
         self.put_field("VAL", EpicsValue::Enum(v))?;
+        // Its SOFT alarm is dropped: IVOA only runs once NSEV is INVALID
+        // (`mbboRecord.c:227`), so C's second raise at :234 changes nothing.
         self.convert();
         Ok(())
     }
@@ -641,6 +649,7 @@ impl Record for MbboRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            self.init_common();
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
@@ -663,11 +672,23 @@ impl Record for MbboRecord {
 
     /// C `mbboRecord.c:177,181-182` — the derived half of the init tail,
     /// run right after the constant load: `convert(prec)` maps the seeded state
-    /// index to RVAL, then `oraw = rval; orbv = rbv`.
-    fn init_record_tail(&mut self) {
-        self.convert();
+    /// index to RVAL, then `oraw = rval; orbv = rbv`. Its SOFT alarm goes to
+    /// NSEV at init and is still there for the first process, as in C.
+    fn init_record_tail(&mut self, common: &mut crate::server::record::CommonFields) {
+        if self.convert() {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
         self.oraw = self.rval;
         self.orbv = self.rbv;
+    }
+
+    /// `mbboRecord.c:141`, `:173`
+    fn after_dset_init(&mut self) {
+        self.init_common();
     }
 
     /// `devMbboSoft`/`devMbboSoftRaw` `init_record` return 2.
@@ -705,9 +726,7 @@ impl Record for MbboRecord {
         // would recompute RVAL from VAL and discard it. One-shot (C
         // `processMbbo` readback returns without re-converting; a normal
         // process always converts).
-        if !self.skip_convert {
-            self.convert();
-        }
+        self.soft_alarm = !self.skip_convert && self.convert();
         self.skip_convert = false;
         Ok(ProcessOutcome::complete())
     }
@@ -942,6 +961,9 @@ impl Record for MbboRecord {
             self.state_severities()[val as usize]
         };
         recgbl::rec_gbl_set_sevr_raw(common, alarm_status::STATE_ALARM, raw_sev as u16);
+        // mbboRecord.c:389-394 leaves LALM behind when COS raised, so COS
+        // re-fires on every process; LALM advances here as in mbbi, where
+        // EPICS PR #817 (c9817fa59) fixed the same short-circuit.
         if val != self.lalm {
             recgbl::rec_gbl_set_sevr_raw(common, alarm_status::COS_ALARM, self.cosv as u16);
             self.lalm = val;

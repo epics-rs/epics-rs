@@ -1,0 +1,58 @@
+--- a/src/StreamEpics.cc
++++ b/src/StreamEpics.cc
+@@ -90,6 +90,7 @@
+     epicsTimer* timer;
+     epicsMutex mutex;
+     epicsEvent initDone;
++    int starting; // 1 in startProtocol, 2 when it finished there
+     int status;
+     int convert;
+     ssize_t currentValueLength;
+@@ -660,6 +661,7 @@
+ :record(_record), ioLink(ioLink), readData(readData), writeData(writeData)
+ {
+     streamname = record->name;
++    starting = 0;
+ #ifdef EPICS_3_13
+     timer = wdCreate();
+     mutex = semMCreate(SEM_INVERSION_SAFE | SEM_Q_PRIORITY);
+@@ -840,6 +842,7 @@
+     debug("Stream::process(%s)\n", name());
+     if (record->pact || record->scan == SCAN_IO_EVENT)
+     {
++complete:
+         record->proc = 0;
+         if (status != NO_ALARM)
+         {
+@@ -870,7 +873,11 @@
+     {
+         StreamDebugClass(record->name).print("start protocol '%s'\n", protocolname());
+     }
+-    if (!startProtocol(record->proc == 2 ? StreamCore::StartInit : StreamCore::StartNormal))
++    starting = 1;
++    bool started = startProtocol(record->proc == 2 ? StreamCore::StartInit : StreamCore::StartNormal);
++    bool finished = starting == 2;
++    starting = 0;
++    if (!started)
+     {
+         debug("Stream::process(%s): could not start %sprotocol, status=%s (%d)\n",
+             name(), record->proc == 2 ? "@init " : "",
+@@ -882,6 +889,7 @@
+         return false;
+     }
+     debug("Stream::process(%s): protocol started\n", name());
++    if (finished) goto complete;
+     record->pact = true;
+     return true;
+ }
+@@ -1035,7 +1043,9 @@
+         flags |= AcceptInput;
+     }
+ 
+-    if ((record->pact || record->scan == SCAN_IO_EVENT) && !terminating)
++    if (starting)
++        starting = 2;
++    else if ((record->pact || record->scan == SCAN_IO_EVENT) && !terminating)
+     {
+         // process record in callback thread to break possible recursion
+         callbackSetPriority(priority(), &processCallback);

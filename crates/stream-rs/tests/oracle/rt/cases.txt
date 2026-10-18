@@ -20,6 +20,7 @@ in_noreply	longin	0	GET\r\n=>	-
 in_readtimeout	longin	0	GET\r\n=>12	-
 in_double	ai	0	GET\r\n=>V=3.5\r\n	-
 in_string	stringin	0	GET\r\n=>N hello\r\n	-
+in_empty_split	stringin	0	GET\r\n=>\r\n	-
 in_mismatch_handler	longin	0	GET\r\n=>B 7\r\n	-
 in_mismatch_handler_fail	longin	0	GET\r\n=>C 7\r\n	-
 in_skip	longin	0	GET\r\n=>1,2\r\n	-
@@ -41,7 +42,7 @@ h_mismatch_out	longin	0	GET\r\n=>X\r\n;;MM\r\n=>	-
 h_init	longin	0	GET\r\n=>5\r\n;;I\r\n=>	init
 h_extra_ignore	longin	0	GET\r\n=>42 x\r\n	-
 h_twice_noreply	longin	0	GET\r\n=>	twice,deadtime=1
-h_handler_fails	longin	0	GET\r\n=>;;TO\r\n=>	-
+h_handler_fails	longin	0	GET\r\n=>;;TO\r\n=>	deadtime=-1
 h_twice_mismatch	longin	0	GET\r\n=>X\r\n	twice
 h_thrice_noreply	longin	0	GET\r\n=>	thrice,deadtime=1
 r_out_val	longout	7	V=7\r\n=>	-

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
-use epics_base_rs::server::database::filters::parse_filter_chain;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -58,11 +57,11 @@ async fn a_ts_string_log_is_read_without_the_fields_precision() {
     db.add_record("AO", Box::new(AoRecord::default()))
         .await
         .unwrap();
-    let chain = parse_filter_chain(r#"{"ts":{"str":"epics"}}"#);
     let mask = (EventMask::VALUE | EventMask::LOG).bits();
-    let mut sub = DbSubscription::subscribe_with_mask_and_filters(&db, "AO", 0, mask, Some(&chain))
-        .await
-        .unwrap();
+    let mut sub =
+        DbSubscription::subscribe_with_mask(&db, r#"AO.VAL{"ts":{"str":"epics"}}"#, 0, mask)
+            .await
+            .unwrap();
 
     db.put_record_field_from_ca("AO", "VAL", EpicsValue::Double(1.5))
         .await

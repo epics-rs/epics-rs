@@ -4,7 +4,6 @@
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::DbSubscription;
-use epics_base_rs::server::database::filters::parse_filter_chain;
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -20,9 +19,8 @@ async fn ts_then_utag_leaves_the_other_subscribers_time_and_utag() {
         .await
         .unwrap();
     let mask = (EventMask::VALUE | EventMask::LOG).bits();
-    let chain = parse_filter_chain(r#"{"ts":{},"utag":{}}"#);
     let mut filtered =
-        DbSubscription::subscribe_with_mask_and_filters(&db, "AO", 0, mask, Some(&chain))
+        DbSubscription::subscribe_with_mask(&db, r#"AO.VAL{"ts":{},"utag":{}}"#, 0, mask)
             .await
             .unwrap();
     let mut plain = DbSubscription::subscribe_with_mask(&db, "AO", 0, mask)

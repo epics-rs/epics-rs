@@ -258,6 +258,17 @@ pub struct ListStatus {
 
 /// C's WARN for values `get_channel_values` could not fetch
 /// (save_restore.c:2127-2130).
+/// A member's value as C's `ca_array_get` reads it (`save_restore.c:1562`):
+/// a channel `dbChannelCreate` makes, read through its filters, a `$`
+/// member as its chars. `None` for a member no channel serves. The create
+/// is the read's own, as C's channel was made at `connect_list`, so it
+/// prints nothing.
+pub(crate) fn read_member(db: &PvDatabase, name: &str) -> Option<EpicsValue> {
+    crate::server::database::filters::channel::db_channel_create_unreported(db, name.as_bytes())
+        .ok()?
+        .get(db)
+}
+
 fn not_saved_status(n: usize) -> ListStatus {
     let noun = if n == 1 { "value" } else { "values" };
     ListStatus::new(SrStatus::Warn, &format!("{n} {noun} not saved"))
@@ -394,8 +405,8 @@ impl SaveSet {
         let entries: Vec<SaveEntry> = self
             .pv_names()
             .into_iter()
-            .map(|pv| match db.get_pv(&pv) {
-                Ok(val) => {
+            .map(|pv| match read_member(db, &pv) {
+                Some(val) => {
                     // C `SR_get_array` for a member of more than one element
                     // (save_restore.c:1576-1579, dbrestore.c:1357-1360).
                     if self.settings.debug() >= 10
@@ -418,7 +429,7 @@ impl SaveSet {
                         connected: true,
                     }
                 }
-                Err(_) => {
+                None => {
                     if debug > 1 {
                         println!("save_restore:get_channel_values: {pv} not connected");
                     }

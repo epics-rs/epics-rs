@@ -1088,6 +1088,22 @@ impl AsyncDbHandle {
         Some(r)
     }
 
+    /// The `db_post_events` calls a device made on a thread that does not
+    /// hold the record, as C's StreamDevice bus callbacks do: taken here,
+    /// for the posts only, and nothing written.
+    pub fn post_events(
+        &self,
+        name: impl AsRef<[u8]>,
+        posts: Vec<crate::server::device_support::DevicePost>,
+    ) {
+        if posts.is_empty() {
+            return;
+        }
+        if let Some(rec) = self.db().and_then(|db| db.get_record(name.as_ref())) {
+            rec.write().post_device_values(posts);
+        }
+    }
+
     /// Arm a put-notify wait-set — see [`PvDatabase::new_put_notify`].
     /// Database-independent (re-exported associated fn).
     pub fn new_put_notify() -> (
@@ -2927,6 +2943,28 @@ impl PvDatabase {
             self.reconcile_readback_callback(name);
             result
         })
+    }
+
+    /// An output's callback-readback read, in its OUT stage: the device sets
+    /// VAL (and states UDF) from the callback; whether the read failed.
+    fn read_callback_value(instance: &mut RecordInstance) -> bool {
+        let Some(mut dev) = instance.device.take() else {
+            return false;
+        };
+        let failed = match dev.read(&mut *instance.record) {
+            Ok(outcome) => {
+                use crate::server::device_support::DeviceUdf;
+                match outcome.udf() {
+                    DeviceUdf::Untouched => {}
+                    DeviceUdf::Defined => instance.common.udf = 0,
+                    DeviceUdf::Undefined => instance.common.udf = 1,
+                }
+                outcome.status.read_failed()
+            }
+            Err(_) => true,
+        };
+        instance.device = Some(dev);
+        failed
     }
 
     /// Arm the entry record's output driver-callback cycle before a readback
@@ -6339,12 +6377,18 @@ impl PvDatabase {
                 let mut device_did_compute =
                     (soft_inp_applied && is_soft) || soft_input_skips_convert;
                 // Input records read every cycle (`!is_output`). An OUTPUT record
-                // reads only on a driver-callback (`asyn:READBACK`) cycle: it pulls
-                // the callback value into VAL here and the OUT stage below skips the
-                // write — C `devAsynInt32.c::processBo` `getCallbackValue` readback
-                // branch. A put/FLNK/scan cycle (`device_callback == false`) leaves
-                // the output untouched here and writes below.
-                if !is_soft && (!is_output || device_callback) {
+                // reads here only on a driver-callback cycle of a device without
+                // the readback contract (devMotorAsyn); one with it reads in the
+                // OUT stage instead, after the alarm check, as C's readback branch
+                // runs inside `write_ao` (devAsynInt32.c:970-994). A
+                // put/FLNK/scan cycle (`device_callback == false`) leaves the
+                // output untouched here and writes below.
+                let callback_readback = device_callback
+                    && instance
+                        .device
+                        .as_ref()
+                        .is_some_and(|d| d.output_callback_readback());
+                if !is_soft && (!is_output || (device_callback && !callback_readback)) {
                     if let Some(mut dev) = instance.device.take() {
                         // Push framework-owned common state (PHAS/TSE/TSEL/
                         // UDF) so device support's read() can see it — C
@@ -6725,37 +6769,21 @@ impl PvDatabase {
             if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
                 process_result
             {
-                // Intermediate notification (e.g. DMOV=0 at move start).
-                // Execute device write first so the move command reaches the
-                // driver, then fire the record's link writes, then flush
-                // DMOV=0 etc. to monitors. This mirrors the C ordering on an
-                // async (pact=1) pass: `motorRecord.cc:1491` runs `do_work`
-                // (the device move), `motorRecord.cc:1495` then fires
-                // `dbPutLink(&pmr->rlnk, ...)` UNCONDITIONALLY — on every pass
-                // including the move-start pass where DMOV just went 0 — and
-                // only `motorRecord.cc:1507` afterwards calls `monitor()`. So
-                // the requested `WriteDbLink`/`WriteDbLinkNotify` actions must
-                // run on the pending cycle as well; a put processes a PP target
-                // even when the value is unchanged, so dropping them changes
-                // downstream process counts (motor RLNK, asyn async writes).
-                // The forward link stays deferred: C runs `recGblFwdLink` only
-                // when `pmr->dmov != 0` (motorRecord.cc:1509), i.e. on async
-                // completion, not on this pending pass.
-                // Guarded: device write, timestamp, and the changed-field
-                // snapshot. The data guard is released before the link-write /
-                // notify awaits below (parking_lot guards are `!Send`).
+                // The ODLY pass of calcout, scalcout and acalcout: C returns
+                // before `writeValue` (calcoutRecord.c:277-282), so no device
+                // write here; the continuation writes. The record's link
+                // writes still fire before the notify (C `dbPutLink`
+                // precedes `monitor()`); the forward link waits for the
+                // continuation. The data guard is released before the
+                // link-write / notify awaits below (parking_lot guards are
+                // `!Send`).
                 guard.release();
                 let tsel = self.cycle_tsel(rec, visited);
+                let holds_pact_until_continuation = process_actions
+                    .iter()
+                    .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
                 let snapshot = {
                     let mut instance = rec.write();
-                    if !is_soft {
-                        if let Some(mut dev) = instance.device.take() {
-                            let inst = &mut *instance;
-                            dev.set_process_context(&inst.common.process_context());
-                            let _ = dev.write_common(&mut *inst.record, &mut inst.common);
-                            inst.device = Some(dev);
-                        }
-                    }
                     let inst = &mut *instance;
                     if tsel.stamp(&inst.name, &mut inst.common, || false) {
                         inst.hand_cycle_stamp();
@@ -6785,9 +6813,6 @@ impl PvDatabase {
                     // it would stick forever (spurious SCAN_ALARM). Tying the hold
                     // to the presence of its own release keeps the invariant by
                     // construction and leaves motor's path untouched.
-                    let holds_pact_until_continuation = process_actions.iter().any(|a| {
-                        matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_))
-                    });
                     if holds_pact_until_continuation {
                         instance.enter_pact();
                     }
@@ -7395,7 +7420,7 @@ impl PvDatabase {
                         let soft_out = instance.has_soft_output();
                         let record_should_output = instance.should_output();
                         if !can_dev_write {
-                            // Non-output records (calcout, etc.) may still have a
+                            // Non-output records (scalcout, etc.) may still have a
                             // soft OUT link (DB or external ca://`/`pva://`).
                             // Write OVAL to OUT when the record says should_output().
                             if record_should_output && instance.parsed_out.is_writable_out_link() {
@@ -7452,6 +7477,13 @@ impl PvDatabase {
                             } else {
                                 None
                             }
+                        } else if !record_should_output {
+                            // OOPT gating for hardware outputs (longout DTYP=...):
+                            // C `conditional_write` skips `write_longout`, and
+                            // with it the callback readback below that runs
+                            // inside it (longoutRecord.c:486-487). The record's
+                            // val/timestamp/snapshot path still runs.
+                            None
                         } else if device_callback
                             && instance
                                 .device
@@ -7459,25 +7491,21 @@ impl PvDatabase {
                                 .is_some_and(|d| d.output_callback_readback())
                         {
                             // Driver-callback (`asyn:READBACK`) cycle on a hardware output
-                            // whose device support takes the callback-readback branch: the
-                            // new value was read back into VAL by the read stage above;
-                            // writing it here would re-assert the setpoint to the driver and
-                            // re-trigger it (the AD `Acquire` loop). C
+                            // whose device support takes the callback-readback branch: C
                             // `devAsynInt32.c::processBo` takes the `newOutputCallbackValue`
-                            // readback branch and never calls `processCallbackOutput`'s
-                            // `write()` on a callback cycle. Devices without that contract
-                            // (`output_callback_readback` false — devMotorAsyn) run their
-                            // output stage on callback cycles like any other C `dbProcess`:
-                            // the motor record's retry / backlash / NTM-stop commands are
-                            // emitted on exactly these passes.
+                            // branch in place of the write, setting VAL from the callback
+                            // after the record's alarm check — writing would re-assert the
+                            // setpoint and re-trigger the driver (the AD `Acquire` loop).
+                            // Devices without that contract (`output_callback_readback`
+                            // false — devMotorAsyn) run their output stage on callback
+                            // cycles like any other C `dbProcess`: the motor record's
+                            // retry / backlash / NTM-stop commands are emitted on exactly
+                            // these passes.
+                            let read_failed = Self::read_callback_value(instance);
+                            if read_failed {
+                                cycle_status.io(Err(DbStatus::FAILED));
+                            }
                             apply_device_alarm(instance, false);
-                            None
-                        } else if !record_should_output {
-                            // OOPT gating for hardware outputs (longout DTYP=...).
-                            // Skip the device write when the OOPT predicate is
-                            // not satisfied; the record's val/timestamp/snapshot
-                            // path still runs so monitor consumers see the value
-                            // change even on a non-output cycle.
                             None
                         } else {
                             if let Some(mut dev) = instance.device.take() {
@@ -7487,11 +7515,15 @@ impl PvDatabase {
                                 // Try async write_begin() first
                                 use crate::server::device_support::WriteStart;
                                 let done = DeviceDoneSource::new(&instance.device_done);
-                                let write_failed = match dev.write_begin_common(
+                                let begun = dev.write_begin_common(
                                     &mut *instance.record,
                                     &mut instance.common,
                                     &done,
-                                ) {
+                                );
+                                if facts.device_posts {
+                                    instance.post_device_values(dev.take_device_posts());
+                                }
+                                let write_failed = match begun {
                                     Ok(WriteStart::Pending) => {
                                         // Async write submitted -- set PACT, return early.
                                         // The device's `DeviceDone` re-enters the record
@@ -8910,7 +8942,7 @@ impl PvDatabase {
                 let out_value = if skip_out || soft_callback {
                     None
                 } else if !can_dev_write {
-                    // Non-output records (calcout, etc.) with soft OUT link
+                    // Non-output records (scalcout, etc.) with soft OUT link
                     // (DB or external `ca://`/`pva://`).
                     if record_should_output && instance.parsed_out.is_writable_out_link() {
                         super::PutSrc::of_output(rec, &instance, false)
@@ -9898,14 +9930,10 @@ impl PvDatabase {
     /// Gated on soft DTYP because a hardware record's INP is a device ADDRESS,
     /// not a value — C only ever loads it in soft dev support.
     ///
-    /// **This is THE init-seed owner.** Beyond the device-support INP above it
-    /// applies the record's own `recGblInitConstantLink` table,
-    /// [`Record::constant_init_links`](crate::server::record::Record::constant_init_links) — calc/calcout/sub/sel/aSub/scalcout/
-    /// acalcout/transform `INPA..L → A..L`, sel `NVL → SELN`, fanout/dfanout/
-    /// seq `SELL → SELN`, seq `DOLn → DOn`, aSub `SUBL → SNAM`, and the
-    /// `DOL → VAL` seeds that also clear UDF. Every one of those links is
-    /// dead at process time (the link layer returns `LinkFetch::NoData` for a
-    /// constant), so this is the only place their values can arrive.
+    /// **This is THE init-seed owner**, in two halves at C's two seats. The
+    /// record's own `recGblInitConstantLink` table runs in
+    /// [`seed_record_constants`], from `init_record(1)`; this half is the
+    /// device seat's load above and the tail after it.
     ///
     /// Must be called once per record, after its fields are applied and both
     /// `init_record` passes have run (the record needs its final NELM/FTVL
@@ -9922,8 +9950,63 @@ impl PvDatabase {
     }
 }
 
-/// The body of the init-seed owner, over a locked record — shared by
-/// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
+/// The record's own seeds: [`Record::constant_init_links`] — calc/calcout/
+/// sub/sel/aSub/scalcout/acalcout/transform `INPA..L → A..L`, sel `NVL →
+/// SELN`, fanout/dfanout/seq `SELL → SELN`, seq `DOLn → DOn`, aSub `SUBL →
+/// SNAM`, the `DOL → VAL` seeds that also clear UDF — and lso's DOL
+/// `dbLoadLinkLS`. Every one of those links is dead at process time (the link
+/// layer returns `LinkFetch::NoData` for a constant), so this is the only
+/// place their values can arrive.
+///
+/// C makes them inside `init_record` ahead of `pdset->init_record`
+/// (`aoRecord.c:112` before `:127`, `lsoRecord.c:82` before `:85`,
+/// `aSubRecord.c:126` before the SNAM lookup at `:139`), so a device that
+/// reads back at init sees the seed and overwrites it. Only
+/// `RecordInstance::run_init_pass1` calls this, before `init_device_support`.
+///
+/// [`Record::constant_init_links`]: crate::server::record::Record::constant_init_links
+pub(crate) fn seed_record_constants(instance: &mut RecordInstance) {
+    if !instance.init_record_reaches_body() {
+        return;
+    }
+    match instance.record.constant_ls_link() {
+        Some("DOL") => {
+            let text = match instance.record.get_field("DOL") {
+                Some(EpicsValue::String(s)) => s,
+                _ => crate::types::PvString::new(),
+            };
+            if let Some(load) = crate::server::record::load_link_ls(&text) {
+                instance.record.apply_ls_load(load);
+            }
+        }
+        // lsi's INP load is its soft device support's (devLsiSoft.c:24).
+        Some(_) => {}
+        None => {
+            for seed in instance.record.constant_init_links() {
+                let Some(value) =
+                    crate::server::record::rec_gbl_init_constant_link(&mut *instance.record, &seed)
+                else {
+                    continue;
+                };
+                // C's UDF rule for a successful constant load is per record, and the two
+                // shapes differ only in the NaN case:
+                //   aoRecord.c:112-113 / dfanoutRecord.c:105-106 — `udf = isnan(val)`
+                //   longoutRecord.c:113 / mbboRecord.c:133 / int64outRecord.c:110 —
+                //                                            `udf = FALSE`
+                // A NaN cannot survive the conversion into an integer target, so the
+                // isnan test covers both: the value that reached the field is defined
+                // unless it is NaN.
+                let is_nan = value.to_f64().is_some_and(f64::is_nan);
+                if seed.clears_udf && !is_nan {
+                    instance.common.udf = 0;
+                }
+            }
+        }
+    }
+}
+
+/// The device-seat half of the init-seed owner, over a locked record — shared
+/// by [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
 pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     // The SECOND seat of C's `init_record` body, and so it takes the same
     // opening test: every step below sits BELOW `if (!pdset) { … return
@@ -9936,39 +10019,27 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         return;
     }
 
-    // 0. The long-string load, C `dbLoadLinkLS` — a lset entry of its own, NOT
-    //    `recGblInitConstantLink`, and the only one that can write a
-    //    long-string VAL: `lso` runs it on DOL (lsoRecord.c:82), `lsi`'s soft
-    //    device support on INP (devLsiSoft.c:24). It replaces the scalar seeds
-    //    below for those records — a long-string VAL takes no scalar put.
+    // 0. The long-string records. lsi's soft device support loads INP with
+    //    `dbLoadLinkLS` (devLsiSoft.c:24), a hardware DTYP nothing; lso's DOL
+    //    load is the record's own, in `seed_record_constants`.
     if let Some(link_field) = instance.record.constant_ls_link() {
-        // C binds `loadLS` to the INP link through the SOFT device support, so
-        // a hardware DTYP loads nothing; DOL is in the record itself and is
-        // never gated.
-        let gated = link_field != "INP" || instance.common.dtyp.is_soft();
-        let text = if link_field == "INP" {
-            instance.common.text.inp.clone()
-        } else {
-            match instance.record.get_field(link_field) {
-                Some(EpicsValue::String(s)) => s,
-                _ => crate::types::PvString::new(),
-            }
-        };
-        if gated {
-            if let Some(load) = crate::server::record::load_link_ls(&text) {
-                // C's lso/lsi init tail: `if (prec->len) { … prec->udf = FALSE; }`
-                // — a link that loaded (even the number case, whose LEN is 1
-                // with an empty VAL) DEFINES the record. The load itself
-                // precedes the dset's `init_record` (lsoRecord.c:82), but the
-                // tail sits below its `if (status) return status;` gate.
-                if instance.record.apply_ls_load(load) != 0
-                    && instance.dset_init != crate::server::device_support::DsetInit::Failed
-                {
-                    instance.common.udf = 0;
-                }
+        if link_field == "INP" && instance.common.dtyp.is_soft() {
+            if let Some(load) = crate::server::record::load_link_ls(&instance.common.text.inp) {
+                instance.record.apply_ls_load(load);
             }
         }
-        instance.record.init_record_tail();
+        // C's lso/lsi init tail, below the dset's `if (status) return
+        // status;`: `if (prec->len) { … prec->udf = FALSE; }` — LEN as the
+        // load or the dset's own init left it (a number load has LEN 1 and an
+        // empty VAL).
+        let len = match instance.record.val() {
+            Some(EpicsValue::CharArray(v)) => v.len(),
+            _ => 0,
+        };
+        if len != 0 && instance.dset_init != crate::server::device_support::DsetInit::Failed {
+            instance.common.udf = 0;
+        }
+        instance.record.init_record_tail(&mut instance.common);
         instance.record.seed_deadband_tracking(instance.dset_init);
         return;
     }
@@ -10047,31 +10118,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
         instance.record.soft_input_dset_init(loaded);
     }
 
-    // 2. The record's own `recGblInitConstantLink` table, through the shared
-    //    owner of "a CONSTANT link's text becomes the target field's value"
-    //    (`record::rec_gbl_init_constant_link`) — the SAME load a runtime put to
-    //    the link field re-runs from `special()`, so the two cannot drift.
-    for seed in instance.record.constant_init_links() {
-        let Some(value) =
-            crate::server::record::rec_gbl_init_constant_link(&mut *instance.record, &seed)
-        else {
-            continue;
-        };
-        // C's UDF rule for a successful constant load is per record, and the two
-        // shapes differ only in the NaN case:
-        //   aoRecord.c:112-113 / dfanoutRecord.c:105-106 — `udf = isnan(val)`
-        //   longoutRecord.c:113 / mbboRecord.c:133 / int64outRecord.c:110 —
-        //                                            `udf = FALSE`
-        // A NaN cannot survive the conversion into an integer target, so the
-        // isnan test covers both: the value that reached the field is defined
-        // unless it is NaN.
-        let is_nan = value.to_f64().is_some_and(f64::is_nan);
-        if seed.clears_udf && !is_nan {
-            instance.common.udf = 0;
-        }
-    }
-
-    // 3. C's `init_record` TAIL, which every record runs immediately AFTER its
+    // 2. C's `init_record` TAIL, which every record runs immediately AFTER its
     //    `recGblInitConstantLink` calls (`aoRecord.c:156-161`: `oval = pval =
     //    val; mlst = alst = lalm = val; oraw = rval; orbv = rbv`). It re-derives
     //    the record's init-time tracking state from the value the seed just
@@ -10079,7 +10126,7 @@ pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
     //    (softIoc-verified) — so it belongs to the seed owner, not to a caller
     //    that may or may not remember it (the iocsh `dbLoadRecords` path did
     //    not).
-    instance.record.init_record_tail();
+    instance.record.init_record_tail(&mut instance.common);
     instance.record.seed_deadband_tracking(instance.dset_init);
 
     // C's init-time `db_post_events` run during iocInit, before any client can
@@ -11545,7 +11592,7 @@ mod input_link_texts_tests {
 
 #[cfg(test)]
 mod ls_init_udf_tests {
-    use super::seed_constant_links;
+    use super::{seed_constant_links, seed_record_constants};
     use crate::server::device_support::DsetInit;
     use crate::server::record::RecordInstance;
     use crate::server::records::lso::LsoRecord;
@@ -11558,6 +11605,7 @@ mod ls_init_udf_tests {
             .put_field("DOL", EpicsValue::String("5".into()))
             .expect("DOL takes a constant");
         instance.common.udf = 1;
+        seed_record_constants(&mut instance);
         instance.dset_init = dset_init;
         seed_constant_links(&mut instance);
         instance.common.udf

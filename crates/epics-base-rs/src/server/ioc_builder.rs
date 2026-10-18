@@ -15,7 +15,7 @@ use crate::types::EpicsValue;
 use super::cvt_bpt::BrkTable;
 use super::database::PvDatabase;
 use super::device_support;
-use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
+use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory, InitHookState};
 use super::{DeviceSupportFactory, RecordFactory};
 use super::{autosave, db_loader};
 
@@ -444,13 +444,15 @@ impl IocBuilder {
     /// Once per process: a second call is refused as C's `iocBuild` is.
     pub async fn build_ioc(mut self) -> CaResult<BareIoc> {
         let server_inits = std::mem::take(&mut self.server_inits);
-        let (db, autosave_config, build) = self
+        let (db, autosave_config, mut build) = self
             .build_through(
-                || crate::server::ioc_app::BareBuild::begin(|line| println!("{line}")),
+                || crate::server::ioc_app::BuildSequence::begin(|line| println!("{line}")),
                 LinkInit::Build,
             )
             .await?;
+        build.reach(InitHookState::AfterScanInit);
         crate::server::ioc_app::initial_process(&db);
+        build.reach(InitHookState::AfterInitialProcess);
         let mut servers = crate::server::ioc_app::InitializedServers::default();
         for (name, init) in server_inits {
             servers.push(name, init().await?);
@@ -465,7 +467,7 @@ impl IocBuilder {
 
     /// `build`'s body. `iocinit_begins` runs once the load has succeeded and
     /// before any deferred `init_record`; `None` from it fails the build.
-    async fn build_through<T>(
+    async fn build_through<T: BuildSteps>(
         self,
         iocinit_begins: impl FnOnce() -> Option<T>,
         link_init: LinkInit,
@@ -569,7 +571,7 @@ impl IocBuilder {
                 }
             }
         }
-        let Some(begun) = iocinit_begins() else {
+        let Some(mut begun) = iocinit_begins() else {
             return Err(CaError::InvalidValue(
                 "IOC can only be initialized from uninitialized or stopped state".into(),
             ));
@@ -577,44 +579,49 @@ impl IocBuilder {
         // C `iocBuild` runs `dbCaLinkInit` right after `iocBuild_1`
         // (`iocInit.c:217`), so a link set exists before `init_record` and the
         // link passes below.
+        begun.reach(InitHookState::AfterCaLinkInit);
         crate::server::ioc_app::ca_link_init(&db, self.link_set_installers).await;
+        begun.reach(InitHookState::AfterInitDevSup);
 
-        // 4.5. C's `initDatabase` per-record pass: bind each record's dset and
-        // run its `init_record` now that every record has loaded — deferred from
-        // load time so a record's device-support port could be configured first.
-        // Before `setup_io_intr` (C's `scanInit`), so a dset is bound before I/O
-        // Intr wiring reads it.
-        db.drain_deferred_record_inits(&|line| eprintln!("{line}"));
+        // 5. C `initDatabase`, through the owner every `iocBuild` shares;
+        // `build` leaves the links to its caller. Link status is FINAL when
+        // `build` returns, as it is when C's `iocInit` returns.
+        crate::server::ioc_app::init_database(&db, matches!(link_init, LinkInit::Build), &|line| {
+            eprintln!("{line}")
+        })
+        .await;
+        begun.reach(InitHookState::AfterInitDatabase);
 
-        // 4.6. Autosave restore, in pass 1 as `IocApplication` restores the
-        // same file: arrays and DBF_NOACCESS fields are pass-1 only in C.
+        // 6. Autosave restore at `initHookAfterInitDatabase`, in pass 1 as
+        // `IocApplication` restores the same file: arrays and DBF_NOACCESS
+        // fields are pass-1 only in C.
         if let Some((ref autosave_cfg, _)) = self.autosave_config {
             autosave::restore_from_file(&db, &autosave_cfg.save_path, autosave::RestorePass::One)
                 .await?;
         }
 
-        // 5. I/O Intr setup — through the single owner shared with the
-        // `IocApplication` iocInit path, so C `scanAdd`'s failure exits
-        // (`dbScan.c:266-297`: no DSET / no interrupt source → log and demote
-        // SCAN to Passive) apply on both startup routes.
-        let _ = crate::server::ioc_app::setup_io_intr(db.clone()).await;
-
-        // 6. Out-of-band PROPERTY-post setup (asyn enum-string runtime
-        // re-propagation). Independent of SCAN, so it is a separate pass
-        // from the I/O Intr wiring above. Shared with the IocApplication
-        // iocInit path so both builders arm the enum callback identically.
-        crate::server::ioc_app::setup_property_posts(db.clone()).await;
-        if let LinkInit::Build = link_init {
-            crate::server::ioc_app::init_links(&db).await;
-        }
-
-        // 7. The `iocInit` barrier: every record exists, so run the link-status
-        // classifications queued during the load. Link status is FINAL when
-        // `build` returns, as it is when C's `iocInit` returns.
-        db.ioc_init().await;
         db.scan_control().finish_dev_sup();
+        begun.reach(InitHookState::AfterFinishDevSup);
+        crate::server::ioc_app::scan_init(&db).await;
 
         Ok((db, self.autosave_config, begun))
+    }
+}
+
+/// What a build announces its init hooks through: nothing for
+/// [`IocBuilder::build`], which is no `iocBuild`, and the one sequence every
+/// `iocBuild` walks for [`IocBuilder::build_ioc`].
+trait BuildSteps {
+    fn reach(&mut self, state: InitHookState);
+}
+
+impl BuildSteps for () {
+    fn reach(&mut self, _state: InitHookState) {}
+}
+
+impl BuildSteps for crate::server::ioc_app::BuildSequence {
+    fn reach(&mut self, state: InitHookState) {
+        crate::server::ioc_app::BuildSequence::reach(self, state);
     }
 }
 

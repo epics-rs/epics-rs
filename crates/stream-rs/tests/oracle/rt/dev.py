@@ -3,14 +3,20 @@
 # with a request, it sends the reply; the reply to request '@' is sent on
 # connecting; a reply ending in '!close' closes the connection after the
 # rest is sent, one ending in '!once' is sent the first time only. Connections are served one at a time.
-import socket, sys
+# Port 0 takes a free port and prints it; the table '-' holds the port
+# without listening, so a connect to it is refused.
+import socket, sys, time
 port = int(sys.argv[1])
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', port))
+if sys.argv[2] != '-': s.listen(1)
+if port == 0: print(s.getsockname()[1], flush=True)
+if sys.argv[2] == '-':
+    while True: time.sleep(3600)
 table = {}
 for a in sys.argv[2].split(';;'):
     k, v = a.split('=>', 1)
     table[k.encode().decode('unicode_escape').encode('latin1')] = v.encode().decode('unicode_escape').encode('latin1')
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', port)); s.listen(1)
 while True:
     c, _ = s.accept()
     if table.get(b'@'): c.sendall(table[b'@'])

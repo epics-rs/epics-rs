@@ -182,22 +182,26 @@ impl IoIntrScan {
 
     /// The framework's `get_ioint_info` seam: hand over the wakeup receiver
     /// (C `*iopvt = pasynRecPvt->ioScanPvt`) and arm the record's
-    /// `interruptAccept` gate. Taken once, at `iocInit`.
+    /// `interruptAccept` gate. Taken once, at `iocInit`; a record that loaded
+    /// with SCAN="I/O Intr" registers in [`Self::scan_add`] right after.
     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<()>> {
         let rx = self.rx.lock().unwrap().take()?;
-        {
-            let mut reg = self.reg.lock().unwrap();
-            reg.started = true;
-        }
-        // A record that loaded with SCAN="I/O Intr" set `active` before the IOC
-        // was running; this is the first moment its registration may exist.
-        let _ = self.refresh();
+        self.reg.lock().unwrap().started = true;
         Some(rx)
+    }
+
+    /// iocInit's `scanAdd` → `getIoIntInfo(0)` for a record that loaded with
+    /// SCAN="I/O Intr": the first moment its registration may exist. On a
+    /// refusal `scanAdd`'s demotion clears `active` through
+    /// [`Self::set_active`].
+    pub(crate) fn scan_add(&self) -> Result<(), RegisterRefusal> {
+        self.refresh()
     }
 
     /// C `getIoIntInfo(cmd)` (asynRecord.c:588-594): the record joined (`true`)
     /// or left (`false`) the I/O Intr scan list. Returns the C
-    /// `registerInterrupts` failure, which the caller reports into ERRS.
+    /// `registerInterrupts` failure, which the caller reports; the record is
+    /// then not on the list, since `scanAdd` demotes it to Passive.
     pub(crate) fn set_active(&self, active: bool) -> Result<(), RegisterRefusal> {
         {
             let mut reg = self.reg.lock().unwrap();
@@ -207,6 +211,7 @@ impl IoIntrScan {
             reg.active = active;
         }
         self.refresh()
+            .inspect_err(|_| self.reg.lock().unwrap().active = false)
     }
 
     /// Publish the record's current port binding — C `registerInterrupts`

@@ -1741,6 +1741,12 @@ impl Record for ScalcoutRecord {
         true
     }
 
+    /// A non-soft DTYP writes through its dset (asynCalc.dbd's
+    /// `asynOctetWrite`); the soft OUT stays on `multi_output_links`.
+    fn can_device_write(&self) -> bool {
+        true
+    }
+
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
         // `awaiting_out` is the second gate, and it is what makes a double
         // write structurally impossible rather than merely unlikely: while

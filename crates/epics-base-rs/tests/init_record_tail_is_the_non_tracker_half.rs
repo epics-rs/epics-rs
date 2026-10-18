@@ -33,6 +33,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::device_support::DsetInit;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::CommonFields;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -120,15 +121,17 @@ fn init_record_tail_derives_and_seeds_no_tracker() {
     let mut bo = create_record("bo").unwrap();
     bo.put_field("MASK", EpicsValue::ULong(255)).unwrap();
     bo.put_field("VAL", EpicsValue::Enum(1)).unwrap();
-    bo.init_record_tail();
+    bo.init_record_tail(&mut CommonFields::default());
     assert_eq!(cell(&*bo, "RVAL"), 255.0, "boRecord.c:167-169");
     assert_eq!(cell(&*bo, "ORAW"), 255.0, "boRecord.c:174");
     assert_eq!(cell(&*bo, "MLST"), 0.0, "boRecord.c:172 is the other hook");
 
     let mut mo = create_record("mbbo").unwrap();
     mo.put_field("TWVL", EpicsValue::ULong(77)).unwrap();
+    // the loaded table reaches SDEF at pass 0 (`mbboRecord.c:115`)
+    mo.init_record(0).unwrap();
     mo.put_field("VAL", EpicsValue::UShort(2)).unwrap();
-    mo.init_record_tail();
+    mo.init_record_tail(&mut CommonFields::default());
     assert_eq!(cell(&*mo, "RVAL"), 77.0, "mbboRecord.c:177 convert()");
     assert_eq!(
         cell(&*mo, "LALM"),

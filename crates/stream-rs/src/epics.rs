@@ -4,8 +4,8 @@
 //!
 //! A record type's device support builds a [`StreamDevice`] with its
 //! [`StreamRecordType`], which carries its `initRecord` and the `readData`
-//! / `writeData` it hands [`Stream::init_record`] (C's
-//! `streamInitRecord`); those reach the record's value through the record
+//! / `writeData` it hands C's `streamInitRecord` in [`StreamInitArgs`];
+//! those reach the record's value through the record
 //! and its `dbCommon` and print or scan it through the [`StreamIo`] they are
 //! given (C's `streamPrintf` / `streamScanf`).
 //!
@@ -37,20 +37,24 @@ use epics_base_rs::server::database::{
     AsyncDbHandle, DeviceDone, DeviceDoneSource, ProcessCallback,
 };
 use epics_base_rs::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart, WriteStart,
+    DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, IoIntrCmd, ReadStart,
+    WriteStart,
 };
 use epics_base_rs::server::ioc_app::{InitHookState, init_hook_register};
 use epics_base_rs::server::recgbl::alarm_status::{
     CALC_ALARM, COMM_ALARM, NO_ALARM, READ_ALARM, TIMEOUT_ALARM, UDF_ALARM, WRITE_ALARM,
 };
-use epics_base_rs::server::recgbl::{alarm_condition_string, rec_gbl_set_sevr};
+use epics_base_rs::server::recgbl::{
+    AlarmResetResult, EventMask, alarm_condition_string, rec_gbl_set_sevr,
+};
 use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, HwLink, ParsedLink, Record, ScanType, parse_link_v2,
 };
+use epics_base_rs::types::EpicsValue;
 use parking_lot::{Condvar, Mutex};
 
 use crate::StreamBuffer;
-use crate::bus::StreamIoStatus;
+use crate::bus::{OwnedReadInput, StreamIoStatus};
 use crate::core::{
     ABORTED, ACCEPT_INPUT, Entry, INIT_RUN, ProtocolResult, SCAN_TRIED, StartMode, StreamCore,
     StreamCoreHooks, StreamCoreLock,
@@ -165,6 +169,94 @@ impl StreamIo<'_> {
         if n < 0 { n } else { size as isize }
     }
 
+    /// `streamPrintf(record, format, long)`: [`OK`] or [`ERROR`].
+    pub fn printf_long(&self, format: &Format<'_>, value: i64) -> i64 {
+        self.print(format, |c| match format.type_ {
+            Dbf::Ulong | Dbf::Long | Dbf::Enum => c.print_value_long(format.priv_, value),
+            _ => self.illegal_print(format),
+        })
+    }
+
+    /// `streamPrintf(record, format, double)`
+    pub fn printf_double(&self, format: &Format<'_>, value: f64) -> i64 {
+        self.print(format, |c| match format.type_ {
+            Dbf::Double => c.print_value_double(format.priv_, value),
+            _ => self.illegal_print(format),
+        })
+    }
+
+    /// `streamPrintf(record, format, char*)`: `value` up to its first 0x00.
+    pub fn printf_string(&self, format: &Format<'_>, value: &[u8]) -> i64 {
+        self.print(format, |c| match format.type_ {
+            Dbf::String => c.print_value_string(format.priv_, value),
+            _ => self.illegal_print(format),
+        })
+    }
+
+    /// `record->pact`: a protocol `process` started is running.
+    pub fn pact(&self) -> bool {
+        self.core.hooks.run.get() == Run::Active
+    }
+
+    /// `db_post_events(record, &field, mask)` with the field's `value` now,
+    /// posted by whoever holds the record before it lets go.
+    pub fn post_events(&self, field: &'static str, value: EpicsValue, mask: EventMask) {
+        self.post(DevicePost { field, mask, value });
+    }
+
+    /// The posts `recGblResetAlarms` made for `reset`, as
+    /// [`Self::post_events`] does.
+    pub fn post_alarm_reset(&self, common: &CommonFields, reset: &AlarmResetResult) {
+        for post in DevicePost::alarm_reset(common, reset) {
+            self.post(post);
+        }
+    }
+
+    fn post(&self, post: DevicePost) {
+        let shared = &self.core.hooks.shared;
+        // No database, no monitors.
+        if shared.db.get().is_some() {
+            shared.posts.lock().push(post);
+        }
+    }
+
+    /// `INIT_RUN`, `!interruptAccept`: the record is processed by its
+    /// `@init` run, before iocInit ends.
+    pub fn init_run(&self) -> bool {
+        !self
+            .core
+            .hooks
+            .shared
+            .db
+            .get()
+            .is_some_and(AsyncDbHandle::interrupt_accept)
+    }
+
+    /// `streamPrintf`, `Stream::print`'s type switch given as `print`.
+    fn print(
+        &self,
+        format: &Format<'_>,
+        print: impl FnOnce(&StreamCore<StreamHooks>) -> bool,
+    ) -> i64 {
+        debug!(format!(
+            "streamPrintf({},format=%{})\n",
+            self.name(),
+            format.priv_.conv as char
+        ));
+        if print(self.core) { OK } else { ERROR }
+    }
+
+    /// C reads the `va_arg` its format's type names, whatever the caller
+    /// passed: a type no `dev*Stream.c` passes is refused here.
+    fn illegal_print(&self, format: &Format<'_>) -> bool {
+        stream_error(&cmsg!(format!(
+            "INTERNAL ERROR ({}): Illegal format type {}\n",
+            self.name(),
+            format.type_ as i32
+        )));
+        false
+    }
+
     /// `Stream::scan`, the scan given: [`ERROR`] or the bytes it took.
     fn scan(
         &self,
@@ -200,17 +292,35 @@ impl StreamIo<'_> {
     }
 }
 
+/// What a record type's `initRecord` passes `streamInitRecord`, and how it
+/// returns the status.
+pub struct StreamInitArgs {
+    /// The text of the record's INP or OUT.
+    pub link: String,
+    pub read_data: Option<StreamIoFunction>,
+    pub write_data: Option<StreamIoFunction>,
+    /// `streamInitRecord(...) == ERROR ? ERROR : OK`; else the status as is.
+    pub map_error: bool,
+}
+
+impl StreamInitArgs {
+    fn status(&self, status: i64) -> i64 {
+        if !self.map_error || status == ERROR {
+            status
+        } else {
+            OK
+        }
+    }
+}
+
 /// A record type's `dev*Stream.c`.
 pub trait StreamRecordType: Send + Sync + 'static {
-    /// The dset's `init_record`: C's `initRecord`, which calls
-    /// [`Stream::init_record`] with the record's link and its `readData`
-    /// and `writeData`, and maps the status.
-    fn init_record(
-        &self,
-        stream: &Stream,
-        record: &mut dyn Record,
-        common: &mut CommonFields,
-    ) -> i64;
+    /// The dset's `init_record`: C's `initRecord` up to its call of
+    /// `streamInitRecord`, which the caller makes after it, with what it
+    /// returns. A record type's own init (`mask <<= shft`, `sevr = 0`)
+    /// thus runs before `streamInitRecord` prints SEVR, on every
+    /// `init_record`, `streamReload`'s too.
+    fn init_record(&self, record: &mut dyn Record, common: &mut CommonFields) -> StreamInitArgs;
 
     /// Whether the dset's I/O entry writes (`streamWrite`); else it reads.
     fn is_output(&self) -> bool;
@@ -314,7 +424,7 @@ struct Job {
 enum OwnedEntry {
     Lock(StreamIoStatus),
     Write(StreamIoStatus),
-    Read(StreamIoStatus, Vec<u8>),
+    Read(StreamIoStatus, OwnedReadInput),
     Event(StreamIoStatus),
     Connect(StreamIoStatus),
     Disconnect(StreamIoStatus),
@@ -327,7 +437,7 @@ impl OwnedEntry {
         match entry {
             Entry::Lock(s) => Self::Lock(s),
             Entry::Write(s) => Self::Write(s),
-            Entry::Read(s, input) => Self::Read(s, input.to_vec()),
+            Entry::Read(s, input) => Self::Read(s, input.to_owned()),
             Entry::Event(s) => Self::Event(s),
             Entry::Connect(s) => Self::Connect(s),
             Entry::Disconnect(s) => Self::Disconnect(s),
@@ -340,7 +450,7 @@ impl OwnedEntry {
         match self {
             Self::Lock(s) => Entry::Lock(*s),
             Self::Write(s) => Entry::Write(*s),
-            Self::Read(s, input) => Entry::Read(*s, input),
+            Self::Read(s, input) => Entry::Read(*s, input.as_input()),
             Self::Event(s) => Entry::Event(*s),
             Self::Connect(s) => Entry::Connect(*s),
             Self::Disconnect(s) => Entry::Disconnect(*s),
@@ -377,9 +487,33 @@ struct Shared {
     /// `initDone`, set by the finish of an `@init` run.
     init_done: Mutex<bool>,
     init_signal: Condvar,
+    /// The process callbacks requested, and how many of those requests a
+    /// run has started after: `streamReload` waits for the second.
+    process_requested: AtomicU64,
+    process_served: Mutex<u64>,
+    process_signal: Condvar,
+    /// The `db_post_events` calls of the record's `readData`, for whoever
+    /// holds the record to post before it lets go.
+    posts: Mutex<Vec<DevicePost>>,
 }
 
 impl Shared {
+    /// [`AsyncDbHandle::with_instance`], the posts `f` made delivered after
+    /// the record is let go: the bus, timer and `exec` callbacks this takes
+    /// the record for run unlocked in C.
+    fn with_instance<R>(
+        &self,
+        db: &AsyncDbHandle,
+        f: impl FnOnce(&mut dyn Record, &mut CommonFields) -> R,
+    ) -> Option<R> {
+        let (r, posts) = db.with_instance(&self.name, |record, common| {
+            let r = f(record, common);
+            (r, std::mem::take(&mut *self.posts.lock()))
+        })?;
+        db.post_events(&self.name, posts);
+        Some(r)
+    }
+
     /// The gate: the record, then the core.
     fn enter(&self, lock: &StreamCoreLock<StreamHooks>, entry: Entry<'_>) -> isize {
         let waiter = self.init_waiter.lock().clone();
@@ -399,16 +533,33 @@ impl Shared {
         let Some(db) = self.db.get() else {
             return lock.dispatch(entry);
         };
-        db.with_instance(&self.name, |record, common| {
+        self.with_instance(db, |record, common| {
             self.slot.lend(record, common, || lock.dispatch(entry))
         })
         .unwrap_or(0)
     }
 
+    /// Every process callback requested up to `request` has run.
+    fn served(&self, request: u64) {
+        let mut served = self.process_served.lock();
+        *served = (*served).max(request);
+        self.process_signal.notify_all();
+    }
+
+    /// Wait until a run of the process callback has finished after every
+    /// request made so far.
+    fn wait_process_callbacks(&self) {
+        let requested = self.process_requested.load(Ordering::Acquire);
+        let mut served = self.process_served.lock();
+        while *served < requested {
+            self.process_signal.wait(&mut served);
+        }
+    }
+
     /// Run `f` with the record taken and lent, given its SCAN; `None` when
     /// the stream has no database or the record is gone.
     fn held<R>(&self, f: impl FnOnce(ScanType) -> R) -> Option<R> {
-        self.db.get()?.with_instance(&self.name, |record, common| {
+        self.with_instance(self.db.get()?, |record, common| {
             let scan = common.scan;
             self.slot.lend(record, common, || f(scan))
         })
@@ -422,7 +573,7 @@ impl Shared {
         debug!(format!("Stream::process({name})\n"));
         let Some((completing, proc_field, tpro)) = self.slot.with(|_, common| {
             (
-                hooks.pact.get() || common.scan == ScanType::IoIntr,
+                hooks.run.get() == Run::Active || common.scan == ScanType::IoIntr,
                 common.proc_field,
                 common.tpro,
             )
@@ -431,26 +582,8 @@ impl Shared {
         };
         if completing {
             // C's record clears PACT at the end of this pass.
-            hooks.pact.set(false);
-            let status = hooks.status.get();
-            self.slot.with(|_, common| {
-                common.proc_field = 0;
-                if status != NO_ALARM as i64 {
-                    rec_gbl_set_sevr(common, status as u16, AlarmSeverity::Invalid);
-                }
-            });
-            if status != NO_ALARM as i64 {
-                debug!(format!(
-                    "Stream::process({name}) error status={} ({status})\n",
-                    alarm_text(status)
-                ));
-                return false;
-            }
-            debug!(format!(
-                "Stream::process({name}) ready. {}\n",
-                convert_text(hooks.convert.get())
-            ));
-            return true;
+            hooks.run.set(Run::Idle);
+            return self.complete(hooks);
         }
         debug!(format!("Stream::process({name}) start\n"));
         hooks.status.set(NO_ALARM as i64);
@@ -460,11 +593,14 @@ impl Shared {
             stream_debug_print(Some(name), 0, &msg);
         }
         let init = proc_field == 2;
-        if !lock.start_protocol(if init {
+        hooks.run.set(Run::Starting);
+        let started = lock.start_protocol(if init {
             StartMode::StartInit
         } else {
             StartMode::StartNormal
-        }) {
+        });
+        let run = hooks.run.replace(Run::Idle);
+        if !started {
             let status = hooks.status.get();
             debug!(format!(
                 "Stream::process({name}): could not start {}protocol, status={} ({status})\n",
@@ -483,9 +619,54 @@ impl Shared {
             return false;
         }
         debug!(format!("Stream::process({name}): protocol started\n"));
-        hooks.pact.set(true);
+        if run == Run::FinishedInline {
+            // C sets PACT here (StreamEpics.cc:884-885) after a synchronous
+            // bus already finished the protocol, and protocolFinishHook
+            // (:1036-1041) requested no processCallback as PACT was still
+            // 0, so the record stays active for good: this pass completes.
+            return self.complete(hooks);
+        }
+        hooks.run.set(Run::Active);
         true
     }
+
+    /// `Stream::process()`'s completing pass, the record lent: whether the
+    /// record goes on.
+    fn complete(&self, hooks: &StreamHooks) -> bool {
+        let name = self.name.as_str();
+        let status = hooks.status.get();
+        self.slot.with(|_, common| {
+            common.proc_field = 0;
+            if status != NO_ALARM as i64 {
+                rec_gbl_set_sevr(common, status as u16, AlarmSeverity::Invalid);
+            }
+        });
+        if status != NO_ALARM as i64 {
+            debug!(format!(
+                "Stream::process({name}) error status={} ({status})\n",
+                alarm_text(status)
+            ));
+            return false;
+        }
+        debug!(format!(
+            "Stream::process({name}) ready. {}\n",
+            convert_text(hooks.convert.get())
+        ));
+        true
+    }
+}
+
+/// Where the protocol a `process` pass starts stands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// None runs: C's `record->pact` 0.
+    Idle,
+    /// `process` is in `startProtocol`.
+    Starting,
+    /// The protocol finished before `startProtocol` returned.
+    FinishedInline,
+    /// The protocol `process` started is running: C's `record->pact` 1.
+    Active,
 }
 
 /// `epicsAlarmConditionStrings[status]`, or "ERROR" outside it.
@@ -515,14 +696,24 @@ impl CallbackBody for RecordProcess {
         let Some(shared) = self.0.upgrade() else {
             return;
         };
+        struct Served<'a>(&'a Shared, u64);
+        impl Drop for Served<'_> {
+            fn drop(&mut self) {
+                self.0.served(self.1);
+            }
+        }
+        let _served = Served(&shared, shared.process_requested.load(Ordering::Acquire));
         let name = shared.name.as_str();
         // process record
         // This will call streamReadWrite.
         debug!(format!("recordProcessCallback({name}) processing record\n"));
         let output = shared.record_type.get().is_some_and(|t| t.is_output());
-        if output {
+        let pending = shared.device_done.lock().take();
+        if let (true, Some(done)) = (output, pending) {
             // An output's pass ends with the device's completion, which runs
-            // no device code: the record type's I/O entry runs here.
+            // no device code: the record type's I/O entry runs here. With no
+            // pass pending (I/O Intr) the record processes, as C's
+            // rset->process does for every record.
             let stream = shared
                 .lock
                 .get()
@@ -534,14 +725,12 @@ impl CallbackBody for RecordProcess {
             if let (Some(stream), Some(db), Some(record_type)) =
                 (stream, shared.db.get(), shared.record_type.get())
             {
-                db.with_instance(name, |record, common| {
+                shared.with_instance(db, |record, common| {
                     record_type.read_write(&stream, record, common);
                 });
             }
-            if let Some(done) = shared.device_done.lock().take() {
-                let prio = CallbackPriority::from_record_prio(shared.prio.load(Ordering::Relaxed));
-                let _ = done.complete(prio);
-            }
+            let prio = CallbackPriority::from_record_prio(shared.prio.load(Ordering::Relaxed));
+            let _ = done.complete(prio);
         } else if let Some(reprocess) = shared.reprocess.get() {
             reprocess.process_now();
         }
@@ -578,9 +767,9 @@ pub struct StreamHooks {
     current_value_length: Cell<isize>,
     /// `ioscanpvt`: set once the record has been initialized.
     initialized: Cell<bool>,
-    /// C's `record->pact` as `process` sets it: a protocol it started is
-    /// running.
-    pact: Cell<bool>,
+    /// The protocol a `process` pass started: C's `record->pact` as
+    /// `process` sets it.
+    run: Cell<Run>,
 }
 
 impl StreamHooks {
@@ -607,7 +796,8 @@ impl StreamCoreHooks for StreamHooks {
             core.name(),
             result.to_str()
         ));
-        let pact = self.pact.get();
+        let run = self.run.get();
+        let pact = run == Run::Active;
         let (io_intr, proc_field, tpro) = self
             .with_record(|_, c| (c.scan == ScanType::IoIntr, c.proc_field, c.tpro))
             .unwrap_or((false, 0, 0));
@@ -664,12 +854,19 @@ impl StreamCoreHooks for StreamHooks {
             // re-enable early input
             core.flags.set(core.flags.get() | ACCEPT_INPUT);
         }
-        if (pact || io_intr) && !TERMINATING.load(Ordering::Acquire) {
+        if run == Run::Starting {
+            // process completes the record when startProtocol returns
+            self.run.set(Run::FinishedInline);
+        } else if (pact || io_intr) && !TERMINATING.load(Ordering::Acquire) {
             // process record in callback thread to break possible recursion
             if let Some(cell) = self.shared.process_callback.get() {
                 let prio =
                     CallbackPriority::from_record_prio(self.shared.prio.load(Ordering::Relaxed));
-                let _ = request_cell(prio, cell);
+                let request = self.shared.process_requested.fetch_add(1, Ordering::AcqRel) + 1;
+                if request_cell(prio, cell).is_err() {
+                    // refused: no run will come for it
+                    self.shared.served(request);
+                }
             }
         }
     }
@@ -701,8 +898,15 @@ impl StreamCoreHooks for StreamHooks {
         &self,
         core: &StreamCore<Self>,
         format: &StreamFormat,
-        _fieldaddress: Option<&[u8]>,
+        fieldaddress: Option<&[u8]>,
     ) -> bool {
+        // C's line has no closing parenthesis
+        debug!(format!(
+            "Stream::formatValue({}, format=%{}, fieldaddr={}\n",
+            core.name(),
+            format.conv as char,
+            c_ptr(fieldaddress.map(|a| a.as_ptr().cast()))
+        ));
         let fmt = Format {
             type_: Dbf::of(format.type_),
             priv_: format,
@@ -799,6 +1003,13 @@ impl StreamCoreHooks for StreamHooks {
     fn priority(&self, _core: &StreamCore<Self>) -> i64 {
         self.shared.prio.load(Ordering::Relaxed) as i64
     }
+
+    fn interrupt_accept(&self, _core: &StreamCore<Self>) -> bool {
+        self.shared
+            .db
+            .get()
+            .is_some_and(AsyncDbHandle::interrupt_accept)
+    }
 }
 
 /// `drvStreamInit` has run.
@@ -807,8 +1018,25 @@ static DRV_INIT: OnceLock<()> = OnceLock::new();
 /// Set by `streamExitHook`: no record is processed after the protocol ends.
 static TERMINATING: AtomicBool = AtomicBool::new(false);
 
-/// `Stream::drvInit`, the driver's `init`, which iocInit runs before the
-/// records': here before the first record's.
+/// stream.dbd's `driver(stream)` and the stream dsets' `init`: iocInit runs
+/// them whether or not a record uses them, `drvStreamInit` in `initDrvSup`
+/// (iocInit.c:167), `streamInit(0)` in `initDevSup` (:173) and
+/// `streamInit(1)` in `finishDevSup` (:183). Base has no driver or dset
+/// init pass, so they run from the hook each of those is announced
+/// before.
+pub fn register_driver() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        init_hook_register(Arc::new(|state| match state {
+            InitHookState::AfterInitDrvSup => drv_init(),
+            InitHookState::AfterInitRecSup => stream_init(false),
+            InitHookState::AfterFinishDevSup => stream_init(true),
+            _ => {}
+        }))
+    });
+}
+
+/// `Stream::drvInit`, the driver's `init`.
 fn drv_init() {
     DRV_INIT.get_or_init(|| {
         debug!(b"drvStreamInit()\n");
@@ -1066,6 +1294,10 @@ impl Stream {
             timer_start: AtomicU64::new(0),
             init_done: Mutex::new(false),
             init_signal: Condvar::new(),
+            process_requested: AtomicU64::new(0),
+            process_served: Mutex::new(0),
+            process_signal: Condvar::new(),
+            posts: Mutex::new(Vec::new()),
         });
         if let Some(db) = db {
             let _ = shared.reprocess.set(db.process_callback(name));
@@ -1083,7 +1315,7 @@ impl Stream {
                 convert: Cell::new(DO_NOT_CONVERT),
                 current_value_length: Cell::new(0),
                 initialized: Cell::new(false),
-                pact: Cell::new(false),
+                run: Cell::new(Run::Idle),
             },
             Box::new(move |lock, entry| gate_shared.enter(lock, entry)),
         );
@@ -1097,23 +1329,21 @@ impl Stream {
         &self.shared.name
     }
 
-    /// `streamInitRecord(record, ioLink, readData, writeData)`: `link` is
-    /// the text of the record's INP or OUT.
-    pub fn init_record(
+    /// `streamInitRecord(record, ioLink, readData, writeData)` from its
+    /// link checks on.
+    fn init_record(
         &self,
         record: &mut dyn Record,
         common: &mut CommonFields,
-        link: &str,
-        read_data: Option<StreamIoFunction>,
-        write_data: Option<StreamIoFunction>,
+        args: &StreamInitArgs,
     ) -> i64 {
         let name = self.name();
         {
             let core = self.lock.lock();
-            core.hooks.read_data.set(read_data);
-            core.hooks.write_data.set(write_data);
+            core.hooks.read_data.set(args.read_data);
+            core.hooks.write_data.set(args.write_data);
         }
-        let link = match parse_link_v2(link) {
+        let link = match parse_link_v2(&args.link) {
             ParsedLink::Hw(HwLink::InstIo { string }) => string,
             // a field the .db leaves out is the device's INST_IO, empty
             ParsedLink::None => String::new(),
@@ -1204,21 +1434,31 @@ impl Stream {
         }
 
         // record is ready to use
-        let has_init = {
+        let reload = {
             let core = self.lock.lock();
             core.hooks.status.set(NO_ALARM as i64);
-            if core.hooks.initialized.get() {
-                // we have been called by streamReload
-                debug!(format!(
-                    "Stream::initRecord {name}: re-initialize after streamReload\n"
-                ));
-            } else {
-                debug!(format!(
-                    "Stream::initRecord {name}: initialize the first time\n"
-                ));
-            }
-            core.on_init.borrow().is_set()
+            core.hooks.initialized.get()
         };
+        if reload {
+            // we have been called by streamReload
+            debug!(format!(
+                "Stream::initRecord {name}: re-initialize after streamReload\n"
+            ));
+            let io_intr = self.shared.slot.with(|_, c| c.scan == ScanType::IoIntr);
+            if io_intr == Some(true) {
+                debug!(format!(
+                    "Stream::initRecord {name}: restarting \"I/O Intr\" after reload\n"
+                ));
+                if !self.lock.start_protocol(StartMode::StartAsync) {
+                    stream_error(&cmsg!(name, b": Can't restart \"I/O Intr\" protocol\n"));
+                }
+            }
+        } else {
+            debug!(format!(
+                "Stream::initRecord {name}: initialize the first time\n"
+            ));
+        }
+        let has_init = self.lock.lock().on_init.borrow().is_set();
         if !has_init {
             return DO_NOT_CONVERT; // no @init handler, keep DOL
         }
@@ -1286,8 +1526,190 @@ impl Stream {
 
     /// A protocol `process` started is running: the record stays active.
     fn active(&self) -> bool {
-        self.lock.lock().hooks.pact.get()
+        self.lock.lock().hooks.run.get() == Run::Active
     }
+
+    /// `streamInitRecord`'s start for a record that has its stream.
+    fn stop_running_protocol(&self, record: &mut dyn Record, common: &mut CommonFields) {
+        // stop any running protocol
+        debug!(format!(
+            "streamInitRecord({}): stop running protocol\n",
+            self.name()
+        ));
+        self.shared.slot.lend(record, common, || {
+            self.lock.lock().finish_protocol(ProtocolResult::Abort)
+        });
+    }
+
+    /// `record->dset->init_record(record)` as `streamReload` calls it: the
+    /// record type's `initRecord`, which reaches `streamInitRecord` again.
+    ///
+    /// C holds no record lock here, so the process callback of the protocol
+    /// it aborts runs while the record re-initializes: in practice before
+    /// `initRecord` resets the status, and the callback finishes the record
+    /// with the abort's alarm, leaving the restart to `initRecord`. Holding
+    /// the record, rs waits for that callback between the two halves: run
+    /// after `initRecord`, it would finish the record without the alarm and
+    /// start a second I/O Intr protocol beside `initRecord`'s.
+    fn reinit_record(&self, db: &AsyncDbHandle) -> Option<i64> {
+        let name = self.name();
+        let record_type = self.shared.record_type.get()?;
+        let args = db.with_instance(name, |record, common| {
+            let args = record_type.init_record(record, common);
+            debug!(format!(
+                "streamInitRecord({name}): SEVR={}\n",
+                common.sevr as i32
+            ));
+            self.stop_running_protocol(record, common);
+            args
+        })?;
+        // C races here: streamReload (StreamEpics.cc:193) runs init_record
+        // unlocked against recordProcessCallback's dbScanLock (:1052); rs
+        // fixes the order C showed in every run, callback first.
+        self.shared.wait_process_callbacks();
+        db.with_instance(name, |record, common| {
+            args.status(self.init_record(record, common, &args))
+        })
+    }
+
+    /// The link text after the `@`, as `ioLink->value.instio.string`.
+    fn link(&self) -> String {
+        self.lock.lock().hooks.link.borrow().clone()
+    }
+}
+
+/// Every stream, in creation order, as C walks `Stream::first`.
+fn all_streams() -> Vec<Stream> {
+    streams()
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|lock| {
+            let shared = lock.lock().hooks.shared.clone();
+            Stream { lock, shared }
+        })
+        .collect()
+}
+
+fn glob(name: &str, pattern: &str) -> bool {
+    epics_base_rs::runtime::epics_string::epics_str_glob_match(name.as_bytes(), pattern.as_bytes())
+}
+
+/// `streamReload(recordname)`: run the `init_record` of each stream's
+/// record, all of them for no name or an empty one, which stops its
+/// protocol and reads the protocol file again; `out` is the shell's stdout.
+pub fn stream_reload(recordname: Option<&str>, out: &mut dyn std::io::Write) -> i64 {
+    let old_stream_error = STREAM_ERROR.swap(1, Ordering::Relaxed);
+    // The shell that runs this has a database: C's "No database has been
+    // loaded" (no pdbbase) cannot happen here.
+    debug!(format!(
+        "streamReload({})\n",
+        recordname.unwrap_or("(null)")
+    ));
+    for stream in all_streams() {
+        let name = stream.name();
+        if let Some(pattern) = recordname
+            && !pattern.is_empty()
+            && !glob(name, pattern)
+        {
+            continue;
+        }
+        // This cancels any running protocol and reloads
+        // the protocol file
+        let status = stream
+            .shared
+            .db
+            .get()
+            .and_then(|db| stream.reinit_record(db));
+        if matches!(status, Some(OK | DO_NOT_CONVERT)) {
+            let _ = writeln!(out, "{name}: Protocol reloaded");
+        } else {
+            stream_error(&cmsg!(name, b": Protocol reload failed\n"));
+        }
+    }
+    protocol::free();
+    STREAM_ERROR.store(old_stream_error, Ordering::Relaxed);
+    OK
+}
+
+/// `streamReportRecord(recordname)`: each matching stream's link, status
+/// and protocol; all of them for no name.
+pub fn stream_report_record(recordname: Option<&str>, out: &mut dyn std::io::Write) -> i64 {
+    for stream in all_streams() {
+        let name = stream.name();
+        if recordname.is_some_and(|pattern| !glob(name, pattern)) {
+            continue;
+        }
+        let _ = writeln!(out, "{name}: {}", stream.link());
+        let core = stream.lock.lock();
+        let mut buffer = StreamBuffer::new();
+        core.print_status(&mut buffer);
+        let _ = out.write_all(buffer.bytes());
+        let _ = out.write_all(b"\n");
+        let _ = core.print_protocol(out);
+        let _ = out.write_all(b"\n");
+    }
+    OK
+}
+
+/// `streamSetLogfile`: debug and error lines also go to `filename`,
+/// truncated; none closes the file.
+pub fn stream_set_logfile(filename: Option<&str>, _: &mut dyn std::io::Write) -> i64 {
+    let file = match filename.map(std::fs::File::create).transpose() {
+        Ok(file) => file,
+        Err(e) => {
+            // strerror's text, without Rust's " (os error N)"
+            let text = e.to_string();
+            let text = text.rfind(" (os error ").map_or(&*text, |at| &text[..at]);
+            eprintln!(
+                "Opening file {} failed: {text}",
+                filename.unwrap_or_default()
+            );
+            return ERROR;
+        }
+    };
+    crate::error::set_stream_debug_file(
+        file.map(|f| Box::new(f) as Box<dyn std::io::Write + Send>),
+    );
+    OK
+}
+
+/// `streamRegistrar`'s iocsh commands `streamReload`,
+/// `streamReportRecord` and `streamSetLogfile`.
+pub fn iocsh_commands() -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
+    use epics_base_rs::server::iocsh::registry::{
+        ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
+    };
+    type Command = fn(Option<&str>, &mut dyn std::io::Write) -> i64;
+    let def = |name: &'static str, arg: &'static str, run: Command| {
+        CommandDef::new(
+            name,
+            vec![ArgDesc {
+                name: arg,
+                arg_type: ArgType::String,
+            }],
+            // C's iocshFuncDef has no usage: help prints the synopsis only
+            "",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let arg = match args.first() {
+                    Some(ArgValue::String(s)) => Some(s.to_str_lossy().into_owned()),
+                    _ => None,
+                };
+                let mut out = Vec::new();
+                run(arg.as_deref(), &mut out);
+                // println_bytes adds the newline the last line has
+                if let Some(text) = out.strip_suffix(b"\n") {
+                    ctx.println_bytes(text);
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    };
+    vec![
+        def("streamReload", "recordname", stream_reload),
+        def("streamReportRecord", "recordname", stream_report_record),
+        def("streamSetLogfile", "filename", stream_set_logfile),
+    ]
 }
 
 /// C's `%p`: glibc prints a null pointer as "(nil)".
@@ -1376,8 +1798,7 @@ impl DeviceSupport for StreamDevice {
         record: &mut dyn Record,
         common: &mut CommonFields,
     ) -> CaResult<DeviceInitOutcome> {
-        drv_init();
-        stream_init(false);
+        let args = self.record_type.init_record(record, common);
         let name = self.name.clone();
         debug!(format!(
             "streamInitRecord({name}): SEVR={}\n",
@@ -1395,14 +1816,10 @@ impl DeviceSupport for StreamDevice {
                 self.record_type.clone(),
             ));
         } else if let Some(stream) = self.stream.as_ref() {
-            // stop any running protocol
-            debug!(format!("streamInitRecord({name}): stop running protocol\n"));
-            stream.shared.slot.lend(record, common, || {
-                stream.lock.lock().finish_protocol(ProtocolResult::Abort)
-            });
+            stream.stop_running_protocol(record, common);
         }
         let stream = self.stream.as_ref().expect("created above");
-        match self.record_type.init_record(stream, record, common) {
+        match args.status(stream.init_record(record, common, &args)) {
             OK => Ok(DeviceInitOutcome::ok()),
             DO_NOT_CONVERT => Ok(DeviceInitOutcome::DoNotConvert(Default::default())),
             status => Err(init_error(status)),
@@ -1522,6 +1939,17 @@ impl DeviceSupport for StreamDevice {
 
     fn dtyp(&self) -> &str {
         "stream"
+    }
+
+    fn posts_from_device(&self) -> bool {
+        true
+    }
+
+    fn take_device_posts(&mut self) -> Vec<DevicePost> {
+        self.stream
+            .as_ref()
+            .map(|s| std::mem::take(&mut *s.shared.posts.lock()))
+            .unwrap_or_default()
     }
 }
 

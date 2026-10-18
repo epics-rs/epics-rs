@@ -538,7 +538,7 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
     // ZRVL into RVAL (C `mbboRecord.c:177`, after the constant-DOL load); the
     // high bit must not be lost to sign.
     rec.init_record(0).unwrap();
-    rec.init_record_tail();
+    rec.init_record_tail(&mut epics_base_rs::server::record::CommonFields::default());
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 

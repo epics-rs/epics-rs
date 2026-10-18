@@ -3257,8 +3257,7 @@ impl PvDatabase {
         // from the source's buffer up to its NUL.
         let ls_str = match src.long_string() {
             Some(chars) if !takes_chars(held, to.rec, to.at, to.field) => {
-                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-                Some(&chars[..end])
+                Some(super::char_view::long_string_field_bytes(chars))
             }
             _ => None,
         };
@@ -3463,10 +3462,9 @@ impl PvDatabase {
         };
         match self.external_link_metadata(name)?.dbf_type? {
             LinkDbfType::Char | LinkDbfType::UChar => Some(src.into_value()),
-            _ => {
-                let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-                Some(EpicsValue::String(PvString::from(&chars[..end])))
-            }
+            _ => Some(EpicsValue::String(PvString::from(
+                super::char_view::long_string_field_bytes(chars),
+            ))),
         }
     }
 

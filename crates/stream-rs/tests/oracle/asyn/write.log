@@ -1,0 +1,4 @@
+AsynDriverInterface::writeRequest(rec, "X", 100 msec)
+AsynDriverInterface::writeHandler(rec)
+AsynDriverInterface::writeHandler(rec): reading old input
+AsynDriverInterface::writeHandler(rec): write(..., "X", outputSize=1, written=1) [timeout=0.1 sec] = asynSuccess 

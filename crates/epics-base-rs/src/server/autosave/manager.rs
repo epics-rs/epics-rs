@@ -1023,8 +1023,11 @@ impl ListState {
             .iter()
             .filter(|n| !self.connected.contains(n.as_str()))
             .collect();
-        let (found, failed): (Vec<&String>, Vec<&String>) =
-            searched.iter().partition(|n| db.get_pv(n.as_str()).is_ok());
+        // `ca_create_channel` makes the server's `dbChannelCreate`, which
+        // prints its own refusal once per create.
+        let (found, failed): (Vec<&String>, Vec<&String>) = searched.iter().partition(|n| {
+            crate::server::database::filters::db_channel_create(db, n.as_str()).is_ok()
+        });
         if !failed.is_empty() {
             println!("save_restore:connect_list: not all searches successful");
             if verbose {
@@ -1058,7 +1061,7 @@ impl ListState {
         self.connected.extend(found.into_iter().cloned());
         self.not_connected = names
             .iter()
-            .filter(|n| db.get_pv(n.as_str()).is_err())
+            .filter(|n| super::save_set::read_member(db, n).is_none())
             .count();
     }
 
@@ -1103,8 +1106,11 @@ impl ListState {
                         Arc::as_ptr(&self.set)
                     );
                 }
-                // An unconnected channel's `ca_add_event` succeeds and
-                // waits; a member with no record raises no event here.
+                // `ca_add_event` goes on the channel `connect_list` made, so
+                // it creates none; one C refused never raises an event.
+                if !self.connected.contains(&name) {
+                    continue;
+                }
                 if let Ok(sub) =
                     DbSubscription::subscribe_with_mask(db, &name, 0, CA_DEFAULT_MASK).await
                 {

@@ -1323,46 +1323,102 @@ pub(crate) fn build_refusal() -> String {
     )
 }
 
-/// C `iocBuild_1` and `iocBuild_3` for an IOC with no [`IocApplication`]
-/// behind it — the bare shell's `iocBuild`/`iocInit` and
+/// The states C `iocBuild` announces, in its `initHookAnnounce` order
+/// (`iocInit.c:123-206`).
+pub(crate) const BUILD_HOOK_STATES: [InitHookState; 13] = [
+    InitHookState::AtIocBuild,
+    InitHookState::AtBeginning,
+    InitHookState::AfterCallbackInit,
+    InitHookState::AfterCaLinkInit,
+    InitHookState::AfterInitDrvSup,
+    InitHookState::AfterInitRecSup,
+    InitHookState::AfterInitDevSup,
+    InitHookState::AfterInitDatabase,
+    InitHookState::AfterFinishDevSup,
+    InitHookState::AfterScanInit,
+    InitHookState::AfterInitialProcess,
+    InitHookState::AfterCaServerInit,
+    InitHookState::AfterIocBuilt,
+];
+
+/// C `iocBuild_1` and `iocBuild_3`, and the init hooks `iocBuild` announces,
+/// for every build path: [`IocApplication`]'s, the bare shell's
+/// `iocBuild`/`iocInit` and
 /// [`IocBuilder::build_ioc`](crate::server::ioc_builder::IocBuilder::build_ioc).
 ///
-/// C has no such IOC: `iocBuild_1` runs for everyone, so the state cell
-/// advances, `coreRelease()` prints and `Starting iocInit` is said, before
-/// `initDatabase` runs any `init_record`, whatever built the IOC. A value of
-/// this type is [`IocState::Building`]: only [`BareBuild::begin`] makes one,
-/// so record work done while holding it is after that line by construction.
-///
-/// The init hooks C announces around this (`initHookAtIocBuild`,
-/// `initHookAtBeginning`, `initHookAfterIocBuilt`) are deliberately not
-/// announced: they produce no output, so nothing measured says what a bare
-/// IOC should do with them.
-pub(crate) struct BareBuild(());
+/// C has one `iocBuild`, so a driver's hook runs whatever built the IOC.
+/// The states are announced only through [`Self::until`], which walks
+/// [`BUILD_HOOK_STATES`] in order, so no path can skip or reorder one. A
+/// value of this type is [`IocState::Building`]: only [`Self::begin`] makes
+/// one, so record work done while holding it is after that line by
+/// construction.
+pub(crate) struct BuildSequence {
+    next: usize,
+}
 
-impl BareBuild {
+impl BuildSequence {
     /// C `iocBuild_1` (`iocInit.c:116-148`): refused from any state but
-    /// `iocVoid`; otherwise `Starting iocInit` on the errlog (`:129`), then
-    /// `coreRelease()`, whose `printf` (`misc/epicsRelease.c:23-27`) is the
-    /// build's only stdout write (`:147`), then `iocBuilding`.
+    /// `iocVoid`; otherwise `initHookAtIocBuild`, `Starting iocInit` on the
+    /// errlog (`:129`), `initHookAtBeginning`, then `coreRelease()`, whose
+    /// `printf` (`misc/epicsRelease.c:23-27`) is the build's only stdout
+    /// write (`:147`), then `iocBuilding` — after both announces, so their
+    /// observers read the state the IOC came from.
     pub(crate) fn begin(out: impl Fn(&str)) -> Option<Self> {
         if get_ioc_state() != IocState::Void {
             crate::runtime::log::errlog_printf(&build_refusal());
             return None;
         }
+        let mut build = Self { next: 0 };
+        build.reach(InitHookState::AtIocBuild);
         // C raises the caller to ok-to-block here (`iocInit.c:125-127`).
         crate::runtime::task::set_thread_ok_to_block(true);
         crate::runtime::log::errlog_printf("Starting iocInit\n");
+        build.reach(InitHookState::AtBeginning);
         for line in crate::server::iocsh::misc_commands::core_release_block() {
             out(&line);
         }
         set_ioc_state(IocState::Building);
-        Some(Self(()))
+        Some(build)
     }
 
-    /// C `iocBuild_3` (`iocInit.c:205`). A build that fails before this
-    /// leaves `iocBuilding`, as C's does.
-    pub(crate) fn finish(self) {
+    /// Announce every state not yet announced up to and including `state`,
+    /// each as the iterator yields it, so a caller can run its own work for
+    /// a state before the next is announced. Panics on a state already
+    /// passed.
+    pub(crate) fn until(
+        &mut self,
+        state: InitHookState,
+    ) -> impl Iterator<Item = InitHookState> + '_ {
+        let end = BUILD_HOOK_STATES[self.next..]
+            .iter()
+            .position(|s| *s == state)
+            .map(|i| self.next + i + 1)
+            .unwrap_or_else(|| panic!("{} announced out of iocBuild order", state.name()));
+        std::iter::from_fn(move || {
+            (self.next < end).then(|| {
+                let state = BUILD_HOOK_STATES[self.next];
+                self.next += 1;
+                init_hook_announce(state);
+                state
+            })
+        })
+    }
+
+    /// [`Self::until`] for a caller with nothing of its own to run.
+    pub(crate) fn reach(&mut self, state: InitHookState) {
+        self.until(state).for_each(drop);
+    }
+
+    /// C `iocBuild_3` (`iocInit.c:201-207`): the states left through
+    /// `initHookAfterCaServerInit`, then `iocBuilt`, then
+    /// `initHookAfterIocBuilt`, whose observers read `iocBuilt`. A build
+    /// that fails before this leaves `iocBuilding`, as C's does.
+    pub(crate) fn finish(mut self) {
+        if self.next < BUILD_HOOK_STATES.len() - 1 {
+            self.reach(InitHookState::AfterCaServerInit);
+        }
         set_ioc_state(IocState::Built);
+        self.reach(InitHookState::AfterIocBuilt);
     }
 }
 
@@ -1403,6 +1459,51 @@ pub(crate) async fn init_links(db: &PvDatabase) {
     // after `setup_cp_links` so the `Db`→`Ca` rewrite it applies to
     // non-local CP holders is already visible to the enumeration.
     db.setup_external_link_opens().await;
+}
+
+/// C `initDatabase` (`iocInit.c:179`), which every `iocBuild` runs: an
+/// `IocApplication`'s, an `IocBuilder`'s and the bare shell's. The record
+/// init passes, the property posts, the links when `open_links`, then the
+/// `iocInit` barrier. [`scan_init`] follows it, after
+/// `initHookAfterInitDatabase` and `finishDevSup`.
+///
+/// A database whose scan lists are built has had all of this before its
+/// shell typed `iocInit` (`CaServerBuilder` builds first), and only crosses
+/// the barrier again, which is idempotent. An `IocBuilder` owns the database
+/// it builds and a shell build holds the IOC lifecycle, so nothing races the
+/// check.
+///
+/// `err` is the building thread's stderr, used only by the record init
+/// passes, which run before this returns.
+pub(crate) fn init_database(
+    db: &Arc<PvDatabase>,
+    open_links: bool,
+    err: &dyn Fn(&str),
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let fresh = !db.scan_control().lists_built();
+    if fresh {
+        db.drain_deferred_record_inits(err);
+    }
+    let db = db.clone();
+    async move {
+        if fresh {
+            setup_property_posts(db.clone()).await;
+            if open_links {
+                init_links(&db).await;
+            }
+        }
+        db.ioc_init().await;
+    }
+}
+
+/// C `scanInit`'s list joins (`iocInit.c:186`), which every `iocBuild` runs
+/// after `finishDevSup`, so a dset's `get_ioint_info(0)` sees what autosave
+/// pass 1 restored and its `init(after)`. A database whose lists are built
+/// has had it.
+pub(crate) async fn scan_init(db: &Arc<PvDatabase>) {
+    if !db.scan_control().lists_built() {
+        setup_io_intr(db.clone()).await;
+    }
 }
 
 /// C `scanInit` and `initialProcess()` (`iocInit.c:186`, `:194-195`,
@@ -1464,15 +1565,21 @@ pub(crate) async fn run_built(db: &Arc<PvDatabase>) -> bool {
 }
 
 /// C `iocBuild` for the bare shell's `iocBuild`/`iocInit`: the record-load
-/// close, then [`initial_process`], inside [`BareBuild`]. False when
+/// close, then [`initial_process`], inside [`BuildSequence`]. False when
 /// `iocBuild_1` refused. `out` is the building thread's stdout.
 pub(crate) async fn build_without_application(db: &Arc<PvDatabase>, out: impl Fn(&str)) -> bool {
-    let Some(build) = BareBuild::begin(out) else {
+    let Some(mut build) = BuildSequence::begin(out) else {
         return false;
     };
-    db.ioc_init().await;
+    build.reach(InitHookState::AfterInitDevSup);
+    init_database(db, true, &|line| eprintln!("{line}")).await;
+    build.reach(InitHookState::AfterInitDatabase);
     db.scan_control().finish_dev_sup();
+    build.reach(InitHookState::AfterFinishDevSup);
+    scan_init(db).await;
+    build.reach(InitHookState::AfterScanInit);
     initial_process(db);
+    build.reach(InitHookState::AfterInitialProcess);
     build.finish();
     true
 }
@@ -1611,53 +1718,31 @@ impl IocBuild {
             ));
         }
 
+        // C `iocBuild_1`. `IocLifecycle::Armed` is only ever the IOC's first
+        // build, so the refusal is unreachable here.
+        let Some(mut build) = BuildSequence::begin(&out) else {
+            return Err(CaError::InvalidValue(build_refusal()));
+        };
+
         // Fire an init-hook state: the C-parity sync `init_hook_*`
         // callbacks first, then the local async lifecycle hooks
         // (autosave restore). Drains every lifecycle hook matching
         // `state` out of the table so each fires exactly once.
         macro_rules! announce {
             ($state:expr) => {{
-                let state = $state;
-                init_hook_announce(state);
-                let mut i = 0;
-                while i < lifecycle_hooks.len() {
-                    if lifecycle_hooks[i].0 == state {
-                        let (_, hook) = lifecycle_hooks.remove(i);
-                        hook().await;
-                    } else {
-                        i += 1;
+                for state in build.until($state) {
+                    let mut i = 0;
+                    while i < lifecycle_hooks.len() {
+                        if lifecycle_hooks[i].0 == state {
+                            let (_, hook) = lifecycle_hooks.remove(i);
+                            hook().await;
+                        } else {
+                            i += 1;
+                        }
                     }
                 }
             }};
         }
-
-        // C `iocBuild_1` announces both of these while `iocState` is still
-        // `iocVoid` (`iocInit.c:122` and `:145`) and assigns `iocBuilding`
-        // only after them (`:148`), so an `initHookRegister` observer at
-        // `AtBeginning` reads the PRE-build state. Announcing them below the
-        // assignment showed it `Building` instead — the one thing this order
-        // decides that no caller can see for itself.
-        announce!(InitHookState::AtIocBuild);
-        // C `iocBuild_1` (`iocInit.c:129`), between the two announces above and
-        // through the errlog rather than stdout, so a subscriber that captures
-        // the errlog sink sees the boot start exactly as it sees every later
-        // `iocInit:` line. It is what `epics_oracle_rs::ioc`'s boot classifier
-        // reads to tell "the IOC began initialising" from "the process printed
-        // nothing", and this port emitted it nowhere. C raises the caller to
-        // ok-to-block first (`iocInit.c:125-127`).
-        crate::runtime::task::set_thread_ok_to_block(true);
-        crate::runtime::log::errlog_printf("Starting iocInit\n");
-        announce!(InitHookState::AtBeginning);
-        // C `coreRelease()` stands between the announce and the assignment
-        // (`iocInit.c:147`) and writes stdout, as its `printf` does
-        // (`misc/epicsRelease.c:23-27`). The wording is the iocsh command's,
-        // which is C's arrangement too: one function, two callers.
-        for line in crate::server::iocsh::misc_commands::core_release_block() {
-            out(&line);
-        }
-
-        // iocBuild begins.
-        set_ioc_state(IocState::Building);
         // C `scanInit` leaves the facility at `ctlPause` (`dbScan.c:199`)
         // and `iocRun`'s `scanRun` is what starts it, so nothing an
         // in-flight build wires up — an I/O Intr callback, a posted event
@@ -1733,10 +1818,6 @@ impl IocBuild {
             crate::runtime::log::errlog_printf(&format!("device support {dset} not found\n"));
         }
         announce!(InitHookState::AfterInitDevSup);
-        db.drain_deferred_record_inits(&err);
-        setup_io_intr(db.clone()).await;
-        setup_property_posts(db.clone()).await;
-        init_links(&db).await;
 
         // C: initDatabase() then initHookAfterInitDatabase (autosave
         // pass 1). The registered hook performs pass-1 + SaveSetConfig
@@ -1746,10 +1827,11 @@ impl IocBuild {
         // startup script loaded now exists, so the link-status classifications
         // queued during the load run here, against the complete database. A
         // no-op when the script already spelled `iocInit` out.
-        db.ioc_init().await;
+        init_database(&db, true, &err).await;
         announce!(InitHookState::AfterInitDatabase);
         db.scan_control().finish_dev_sup();
         announce!(InitHookState::AfterFinishDevSup);
+        scan_init(&db).await;
 
         // C `iocBuild_2` (`iocInit.c:186-191`): `scanInit()`, then `asInit()`,
         // then `initHookAfterScanInit`. THIS is the second caller of
@@ -1827,10 +1909,9 @@ impl IocBuild {
             servers.push(name, init(args).await?);
         }
         announce!(InitHookState::AfterCaServerInit);
-        announce!(InitHookState::AfterIocBuilt);
         // C `iocBuild` ends here, and the IOC is quiescent — `iocBuilt` is
         // the state `iocRun` below is legal from.
-        set_ioc_state(IocState::Built);
+        build.finish();
 
         Ok(BuildOutcome::Built(Box::new(BuiltIoc {
             db,
@@ -3182,10 +3263,11 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &[u8], message: Option
 
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
 ///
-/// The single owner of that wiring — `IocBuilder` calls this too, so the C
-/// `scanAdd` failure paths cannot be present on one startup route and absent on
-/// the other.
+/// The single owner of that wiring, reached through [`scan_init`] by every
+/// build path, so the C `scanAdd` failure paths cannot be present on one
+/// startup route and absent on another.
 pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
+    db.scan_control().build_lists();
     // `buildScanLists` order (`dbScan.c:1054-1076`), so the refusals print in C's.
     let all_names = db.iterate_record_names().await;
     let io_intr_recs: Vec<(crate::types::RecordName, Arc<record::RecordCell>)> = {
@@ -3222,130 +3304,101 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         if !on_io_intr && !independent {
             continue;
         }
-        let Some(mut dev) = inst.device.take() else {
-            // A soft device is served by the framework, so no device object
-            // says nothing about C's `precord->dset`; its devSup row does.
-            // No row is `dbScan.c:272-276` (the trailing space is C's
-            // literal), a row without `get_ioint_info` is `:278-281`, and a
-            // hook with no device here to answer it is `:290-293`'s NULL list.
-            if on_io_intr {
-                let row = record::dev_sup_of(inst.record.record_type(), inst.common.dtyp.as_str());
-                demote.push((
-                    name,
-                    Some(match row {
-                        None => "scanAdd: I/O Intr not valid (no DSET) ",
-                        Some(row) if !row.has_get_ioint_info() => {
-                            "scanAdd: I/O Intr not valid (no get_ioint_info)"
-                        }
-                        Some(_) => "scanAdd: I/O Intr not valid",
-                    }),
-                ));
+        if let Some(dev) = inst.device.as_mut() {
+            dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
+            dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
+        }
+        if !on_io_intr {
+            if inst.wire_io_intr_pump() {
+                count += 1;
             }
             continue;
-        };
-        dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
-        dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
-        // `scanAdd`'s `if (get_ioint_info(0, precord, &piosh))`
-        // (dbScan.c:285): a refusal demotes silently.
-        let held = &mut *inst;
-        if on_io_intr
-            && !dev.get_ioint_info(
-                &mut *held.record,
-                &mut held.common,
-                crate::server::device_support::IoIntrCmd::Add,
-            )
-        {
-            inst.device = Some(dev);
-            demote.push((name, None));
-            continue;
         }
-        if let Some(mut intr_rx) = dev.io_intr_receiver() {
-            let db_clone = db.clone();
-            let rec_name = name.clone();
-            let rec_arc_clone = rec_arc.clone();
-            // C keeps one I/O Intr scan list per band and fires
-            // `callbackRequest` on the band the record joined —
-            // `callbackSetPriority(prio, &piosl->callback)` (`dbScan.c:597`),
-            // with `scanAdd` filing the record under `precord->prio`. This
-            // pump is per record, so the record's own band is the list it
-            // would be on.
-            let prio = inst.common.callback_priority();
-            let direct = dev.io_intr_processes_directly();
-            let mut turns = db.register_io_intr_pump(&rec_arc);
-            crate::runtime::task::spawn_background(prio, async move {
-                // One interrupt's pass.
-                let pump = async || {
-                    // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr
-                    // callback queues nothing while the scan facility is
-                    // not running, which is what `interruptAccept` buys a
-                    // building or paused IOC. A device's own `dbProcess`
-                    // passes no such gate.
-                    if !direct && !db_clone.scan_control().is_running() {
-                        return;
-                    }
-                    // Process if the device drives SCAN-independently,
-                    // or the record is still on I/O Intr scan, and the
-                    // device's own callback asks for it. A device out for
-                    // processing has no callback to run.
-                    let process = {
-                        let mut guard = rec_arc_clone.write();
-                        let inst = &mut *guard;
-                        (independent || inst.common.scan == record::ScanType::IoIntr)
-                            && inst.device.as_mut().is_none_or(|d| {
-                                d.io_intr_callback(&mut *inst.record, &mut inst.common)
-                                    == crate::server::device_support::IoIntrAction::Process
-                            })
-                    };
-                    if !process {
-                        return;
-                    }
-                    let mut visited = crate::server::database::ProcStack::new();
-                    // Driver-callback cycle: an output (`asyn:READBACK`)
-                    // record reads the value back into VAL and skips the
-                    // device write; input records are unaffected.
-                    let _ = db_clone
-                        .process_record_readback(&rec_name, &mut visited)
-                        .await;
-                };
-                // A turn is served after the interrupts queued when it was
-                // taken, so a first event behind them sees what they did.
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(turn) = turns.recv() => {
-                            for _ in 0..intr_rx.len() {
-                                if intr_rx.recv().await.is_none() {
-                                    break;
-                                }
-                                pump().await;
-                            }
-                            let _ = turn.send(());
-                        }
-                        woke = intr_rx.recv() => match woke {
-                            Some(()) => pump().await,
-                            None => break,
-                        },
-                    }
+        match inst.scan_add_io_intr() {
+            Ok(()) => {
+                count += 1;
+                if !inst.record.io_intr_scan_add() {
+                    demote.push((name, None));
                 }
-            });
-            count += 1;
-        } else if on_io_intr {
-            // C `dbScan.c:280-289`: a dset row with the hook means it ran and
-            // declined (devAsyn* after a failed `initCommon` returns -1), which
-            // demotes silently; with no row or no hook, C logs the refusal.
-            let row = record::dev_sup_of(inst.record.record_type(), inst.common.dtyp.as_str());
-            let message = match row {
-                Some(row) if row.has_get_ioint_info() => None,
-                _ => Some("scanAdd: I/O Intr not valid (no get_ioint_info)"),
-            };
-            demote.push((name, message));
+            }
+            Err(message) => demote.push((name, message)),
         }
-        inst.device = Some(dev);
     }
     for (name, message) in demote {
         demote_io_intr_to_passive(&db, &name, message).await;
     }
     count
+}
+
+/// The task behind [`record::RecordInstance::wire_io_intr_pump`]: each wake
+/// the device sends is C `scanIoRequest` on the list the record joined.
+pub(crate) fn spawn_io_intr_pump(
+    db: PvDatabase,
+    rec_name: crate::types::RecordName,
+    rec: Arc<record::RecordCell>,
+    mut intr_rx: crate::runtime::sync::mpsc::Receiver<()>,
+    // C keeps one I/O Intr scan list per band and fires `callbackRequest` on
+    // the band the record joined — `callbackSetPriority(prio,
+    // &piosl->callback)` (`dbScan.c:597`), with `scanAdd` filing the record
+    // under `precord->prio`. This pump is per record, so the record's own
+    // band is the list it would be on.
+    prio: crate::runtime::task::CallbackPriority,
+    direct: bool,
+    independent: bool,
+) -> crate::runtime::task::BackgroundTaskHandle<()> {
+    let mut turns = db.register_io_intr_pump(&rec);
+    crate::runtime::task::spawn_background(prio, async move {
+        // One interrupt's pass.
+        let pump = async || {
+            // C `scanIoRequest` (`dbScan.c:616-618`): an I/O Intr callback
+            // queues nothing while the scan facility is not running, which is
+            // what `interruptAccept` buys a building or paused IOC. A
+            // device's own `dbProcess` passes no such gate.
+            if !direct && !db.scan_control().is_running() {
+                return;
+            }
+            // Process if the device drives SCAN-independently, or the record
+            // is still on I/O Intr scan, and the device's own callback asks
+            // for it. A device out for processing has no callback to run.
+            let process = {
+                let mut guard = rec.write();
+                let inst = &mut *guard;
+                (independent || inst.common.scan == record::ScanType::IoIntr)
+                    && inst.device.as_mut().is_none_or(|d| {
+                        d.io_intr_callback(&mut *inst.record, &mut inst.common)
+                            == crate::server::device_support::IoIntrAction::Process
+                    })
+            };
+            if !process {
+                return;
+            }
+            let mut visited = crate::server::database::ProcStack::new();
+            // Driver-callback cycle: an output (`asyn:READBACK`) record reads
+            // the value back into VAL and skips the device write; input
+            // records are unaffected.
+            let _ = db.process_record_readback(&rec_name, &mut visited).await;
+        };
+        // A turn is served after the interrupts queued when it was taken, so
+        // a first event behind them sees what they did.
+        loop {
+            tokio::select! {
+                biased;
+                Some(turn) = turns.recv() => {
+                    for _ in 0..intr_rx.len() {
+                        if intr_rx.recv().await.is_none() {
+                            break;
+                        }
+                        pump().await;
+                    }
+                    let _ = turn.send(());
+                }
+                woke = intr_rx.recv() => match woke {
+                    Some(()) => pump().await,
+                    None => break,
+                },
+            }
+        }
+    })
 }
 
 /// Spawn the out-of-band PROPERTY-post drains for every device exposing a
@@ -3355,7 +3408,9 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
 /// `db_post_events(DBE_PROPERTY)` independently of `SCAN`. This mirrors
 /// [`setup_io_intr`]: the device owns the source subscription (the asyn
 /// interrupt) and yields a channel of [`PropertyPost`]s; the framework owns
-/// the post (`post_property`). Returns the number of drains wired.
+/// the post (`post_property`). Each record's drain starts in
+/// [`record::RecordInstance::wire_property_posts`], which a device-link put
+/// also reaches. Returns the number of drains wired.
 ///
 /// [`PropertyPost`]: crate::server::device_support::PropertyPost
 pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
@@ -3363,24 +3418,8 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
     let mut count = 0;
     for name in names {
         if let Some(rec_arc) = db.get_record(&name) {
-            let mut inst = rec_arc.write();
-            if let Some(mut dev) = inst.device.take() {
-                if let Some(mut rx) = dev.property_post_receiver() {
-                    dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
-                    let db_clone = db.clone();
-                    let rec_name = name.clone();
-                    let prio = inst.common.callback_priority();
-                    crate::runtime::task::spawn_background(prio, async move {
-                        // Each message is the setEnums field block plus the
-                        // one field C posts on; DBE_PROPERTY on that field is
-                        // what makes clients re-read the choices.
-                        while let Some(post) = rx.recv().await {
-                            let _ = db_clone.post_property(&rec_name, post);
-                        }
-                    });
-                    count += 1;
-                }
-                inst.device = Some(dev);
+            if rec_arc.write().wire_property_posts() {
+                count += 1;
             }
         }
     }
@@ -4244,21 +4283,58 @@ mod lifecycle_tests {
         assert_eq!(ioc_run(), 0);
     }
 
+    /// The bare shell's `iocBuild` announces C's build hooks in C's order
+    /// (`iocInit.c:123-206`), as `IocApplication` and `build_ioc` do.
+    #[epics_macros_rs::epics_test]
+    async fn a_bare_build_walks_c_build_hooks() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        init_hook_register(Arc::new(move |state: InitHookState| {
+            log.lock().unwrap().push(state.name());
+        }));
+        build_and_run().await;
+        let seen = seen.lock().unwrap();
+        let end = seen
+            .iter()
+            .position(|n| *n == "initHookAfterIocBuilt")
+            .expect("announced")
+            + 1;
+        assert_eq!(
+            seen[..end],
+            [
+                "initHookAtIocBuild",
+                "initHookAtBeginning",
+                "initHookAfterCallbackInit",
+                "initHookAfterCaLinkInit",
+                "initHookAfterInitDrvSup",
+                "initHookAfterInitRecSup",
+                "initHookAfterInitDevSup",
+                "initHookAfterInitDatabase",
+                "initHookAfterFinishDevSup",
+                "initHookAfterScanInit",
+                "initHookAfterInitialProcess",
+                "initHookAfterCaServerInit",
+                "initHookAfterIocBuilt",
+            ]
+        );
+    }
+
     /// BOUNDARY: `iocBuild_1` from anything but `iocVoid` refuses and moves
     /// nothing (`iocInit.c:116-121`), so a second bring-up in one process
     /// cannot say `Starting iocInit` twice.
     #[epics_macros_rs::epics_test]
     async fn a_second_bare_build_is_refused() {
         build_and_run().await;
-        assert!(BareBuild::begin(|line| println!("{line}")).is_none());
+        assert!(BuildSequence::begin(|line| println!("{line}")).is_none());
         assert_eq!(get_ioc_state(), IocState::Running);
     }
 
-    /// BOUNDARY: a held [`BareBuild`] is `iocBuilding`, and one never
+    /// BOUNDARY: a held [`BuildSequence`] is `iocBuilding`, and one never
     /// finished leaves the state there, as a failed C `iocBuild` does.
     #[test]
     fn an_unfinished_bare_build_stays_building() {
-        let _unfinished: BareBuild = BareBuild::begin(|line| println!("{line}")).expect("void");
+        let _unfinished: BuildSequence =
+            BuildSequence::begin(|line| println!("{line}")).expect("void");
         assert_eq!(get_ioc_state(), IocState::Building);
         assert_eq!(get_ioc_state(), IocState::Building);
         assert_eq!(ioc_run(), -1, "iocRun from iocBuilding is C's -1");
@@ -4308,7 +4384,7 @@ mod lifecycle_tests {
     /// leftovers and the old one's records are freed.
     #[epics_macros_rs::epics_test]
     async fn shutdown_releases_the_published_database() {
-        let build = BareBuild::begin(|line| println!("{line}")).expect("void");
+        let build = BuildSequence::begin(|line| println!("{line}")).expect("void");
         let db = Arc::new(PvDatabase::new());
         initial_process(&db);
         build.finish();

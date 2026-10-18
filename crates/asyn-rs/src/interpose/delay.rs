@@ -112,6 +112,7 @@ mod tests {
             Ok(OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             })
         }
         fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {

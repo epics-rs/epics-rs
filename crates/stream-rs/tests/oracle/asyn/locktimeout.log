@@ -1,0 +1,5 @@
+AsynDriverInterface::lockRequest(first, 5000 msec)
+AsynDriverInterface::lockHandler(first)
+AsynDriverInterface::lockRequest(second, 50 msec)
+AsynDriverInterface::handleTimeout(second)
+AsynDriverInterface::unlock(first)

@@ -166,6 +166,32 @@ impl LongStringVal {
         Ok(())
     }
 
+    /// A device read into the `sizv`-wide buffer as it stands, as
+    /// devlsiStream.c's `streamScanfN(record, format, val, sizv)` writes VAL
+    /// itself: `scan` writes in place and returns the byte count, which
+    /// becomes LEN with a NUL after it when it is short of `sizv`; `None`
+    /// leaves LEN over whatever it wrote.
+    pub fn scan_in_place(
+        &mut self,
+        sizv: usize,
+        scan: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> Option<usize> {
+        let len = self.0.len();
+        let capacity = self.0.buffer().len().max(sizv);
+        let buf = self.0.make_mut_resized(capacity, 0);
+        let read = scan(&mut buf[..sizv]);
+        match read {
+            Some(n) => {
+                if n < sizv {
+                    buf[n] = 0;
+                }
+                self.0.truncate(n);
+            }
+            None => self.0.truncate(len),
+        }
+        read
+    }
+
     /// Cut the text to `max` bytes.
     pub fn cut_text(&mut self, max: usize) {
         if self.text().len() > max {

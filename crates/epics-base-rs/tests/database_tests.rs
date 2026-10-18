@@ -2653,6 +2653,145 @@ async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
     );
 }
 
+/// An output readback that pops the next driver value into VAL.
+struct ReadbackDevice {
+    values: std::collections::VecDeque<i32>,
+}
+
+impl epics_base_rs::server::device_support::DeviceSupport for ReadbackDevice {
+    fn read(
+        &mut self,
+        record: &mut dyn Record,
+    ) -> epics_base_rs::error::CaResult<epics_base_rs::server::device_support::DeviceReadOutcome>
+    {
+        let v = self.values.pop_front().unwrap();
+        record.put_field("VAL", EpicsValue::Long(v))?;
+        Ok(
+            epics_base_rs::server::device_support::DeviceReadOutcome::computed(
+                epics_base_rs::server::device_support::DeviceUdf::Defined,
+            ),
+        )
+    }
+    fn write(&mut self, _record: &mut dyn Record) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn dtyp(&self) -> &str {
+        "MockDev"
+    }
+    fn output_callback_readback(&self) -> bool {
+        true
+    }
+}
+
+/// devAsynInt32.c `processLo` sets VAL from the callback inside write_longout
+/// (:1084-1090), which longoutRecord runs after `checkAlarms` has copied VAL
+/// into LALM (longoutRecord.c:131-136, :380-436): each readback leaves LALM at
+/// the value before it.
+#[epics_macros_rs::epics_test]
+async fn test_readback_cycle_sets_val_after_the_alarm_check() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    let db = PvDatabase::new();
+    db.add_record("LO_RB", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("LO_RB") {
+        let mut inst = rec.write();
+        inst.common.dtyp = "MockDev".into();
+        inst.device = Some(Box::new(ReadbackDevice {
+            values: [10, 20, 24].into(),
+        }));
+    }
+    let mut lalm = Vec::new();
+    for _ in 0..3 {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_readback("LO_RB", &mut visited)
+            .await
+            .unwrap();
+        let rec = db.get_record("LO_RB").unwrap();
+        let inst = rec.read();
+        lalm.push((inst.record.get_field("LALM"), inst.record.get_field("VAL")));
+    }
+    let long = |v| Some(EpicsValue::Long(v));
+    assert_eq!(
+        lalm,
+        [
+            (long(0), long(10)),
+            (long(10), long(20)),
+            (long(20), long(24))
+        ]
+    );
+}
+
+/// The readback runs inside `write_longout`, which `conditional_write` calls
+/// only when OOPT allows (longoutRecord.c:447-489): a When Zero longout at
+/// VAL=5 never reads the callback value.
+#[epics_macros_rs::epics_test]
+async fn test_readback_cycle_obeys_oopt() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    let db = PvDatabase::new();
+    db.add_record("LO_OOPT", Box::new(LongoutRecord::new(5)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("LO_OOPT") {
+        let mut inst = rec.write();
+        inst.record.put_field("OOPT", EpicsValue::Short(2)).unwrap();
+        inst.common.dtyp = "MockDev".into();
+        inst.device = Some(Box::new(ReadbackDevice {
+            values: [10, 20, 24].into(),
+        }));
+    }
+    let mut vals = Vec::new();
+    for _ in 0..3 {
+        let mut visited = epics_base_rs::server::database::ProcStack::new();
+        db.process_record_readback("LO_OOPT", &mut visited)
+            .await
+            .unwrap();
+        vals.push(
+            db.get_record("LO_OOPT")
+                .unwrap()
+                .read()
+                .record
+                .get_field("VAL"),
+        );
+    }
+    let five = Some(EpicsValue::Long(5));
+    assert_eq!(vals, [five.clone(), five.clone(), five]);
+}
+
+/// IVOA "Don't drive outputs" on an INVALID cycle skips write_longout
+/// (longoutRecord.c:180-196), and with it the readback branch inside it
+/// (devAsynInt32.c:1084-1090): VAL keeps its value.
+#[epics_macros_rs::epics_test]
+async fn test_ivoa_dont_drive_skips_the_readback() {
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    let db = PvDatabase::new();
+    db.add_record("LO_IVOA", Box::new(LongoutRecord::new(0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("LO_IVOA").unwrap();
+        let mut inst = rec.write();
+        inst.common.dtyp = "MockDev".into();
+        inst.device = Some(Box::new(ReadbackDevice {
+            values: [10].into(),
+        }));
+        inst.record.put_field("IVOA", EpicsValue::Short(1)).unwrap();
+        // HIHI at INVALID: the readback cycle clears UDF first
+        // (devAsynInt32.c:631), so UDF_ALARM cannot be the source.
+        inst.put_common_field("HIHI", EpicsValue::Long(0)).unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(3)).unwrap();
+    }
+    let mut visited = epics_base_rs::server::database::ProcStack::new();
+    db.process_record_readback("LO_IVOA", &mut visited)
+        .await
+        .unwrap();
+    let rec = db.get_record("LO_IVOA").unwrap();
+    let inst = rec.read();
+    assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+    assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Long(0)));
+}
+
 // epics-base f2fe9d12 (devBiSoftRaw): a `bi` record with
 // `DTYP="Raw Soft Channel"`, MASK set, and a soft INP link must mask
 // the link value into RVAL before the RVAL→VAL convert. The framework
@@ -8414,7 +8553,7 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
     rec2.put_field("VAL", EpicsValue::Long(0b0101)).unwrap();
     let mut udf2 = false;
     rec2.post_init_finalize_undef(&mut udf2).unwrap();
-    rec2.init_record_tail();
+    rec2.init_record_tail(&mut epics_base_rs::server::record::CommonFields::default());
     assert!(!udf2, "UDF stays cleared");
     assert!(matches!(rec2.get_field("VAL"), Some(EpicsValue::Long(5))));
     // bits[0] and bits[2] should reflect VAL=5 (binary 0101). B0..B1F are

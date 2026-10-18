@@ -281,6 +281,30 @@ pub fn fmt_alt_hex04(v: u32) -> String {
     }
 }
 
+/// `sscanf(s, "%d%n")` as glibc reads it: `(int)strtol(s, &end, 10)`.
+/// `None` when no conversion was made, else the value and the bytes
+/// consumed, skipped leading whitespace included.
+pub fn c_sscanf_int(s: CPtr<'_>) -> Option<(i32, usize)> {
+    let (v, end) = c_strtol(s, 10);
+    (end != s.offset()).then(|| (v as i32, end - s.offset()))
+}
+
+/// printf `%.<prec>e`.
+pub fn fmt_c_e(v: f64, prec: usize) -> String {
+    if !v.is_finite() {
+        let sign = if v.is_sign_negative() { "-" } else { "" };
+        return format!("{sign}{}", if v.is_nan() { "nan" } else { "inf" });
+    }
+    let e = format!("{v:.prec$e}");
+    let (mantissa, exp) = e.split_once('e').unwrap();
+    let x: i32 = exp.parse().unwrap();
+    format!(
+        "{mantissa}e{}{:02}",
+        if x < 0 { '-' } else { '+' },
+        x.unsigned_abs()
+    )
+}
+
 /// printf `%#g`: six significant digits, trailing zeros and the point kept.
 pub fn fmt_c_alt_g(v: f64) -> String {
     if !v.is_finite() {

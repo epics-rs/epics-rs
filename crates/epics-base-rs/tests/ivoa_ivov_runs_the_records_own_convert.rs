@@ -140,6 +140,8 @@ fn mbbo_with_a_state_table_puts_the_state_value_in_rval() {
     rec.put_field("ZRVL", EpicsValue::ULong(0x10)).unwrap();
     rec.put_field("ONVL", EpicsValue::ULong(0x20)).unwrap();
     rec.put_field("TWVL", EpicsValue::ULong(0x40)).unwrap();
+    // the loaded table reaches SDEF at pass 0 (`mbboRecord.c:115`)
+    rec.init_record(0).unwrap();
     let ivov = served_ivov(&mut rec, EpicsValue::UShort(2));
     rec.apply_invalid_output_value(ivov).unwrap();
 

@@ -261,3 +261,202 @@ async fn a_del_record_refusal_puts_an_io_intr_record_back_on_its_list() {
     assert_eq!(rec.read().common.text.inp.as_str_lossy(), "@keep");
     assert!(listed(&db).await);
 }
+
+static STICKY: DevSup = DevSup {
+    name: "devAiSticky",
+    choice: "Sticky",
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(6, &[2, 3, 4], true),
+};
+
+/// What every `Sticky` object refuses, switched by the test.
+#[derive(Default)]
+struct Refuse {
+    del_record: std::sync::atomic::AtomicBool,
+    add: std::sync::atomic::AtomicBool,
+}
+
+struct Sticky {
+    id: usize,
+    calls: RelinkCalls,
+    refuse: Arc<Refuse>,
+    _pulses: Option<mpsc::Sender<()>>,
+}
+
+impl DeviceSupport for Sticky {
+    fn get_ioint_info(
+        &mut self,
+        _record: &mut dyn Record,
+        common: &mut CommonFields,
+        cmd: IoIntrCmd,
+    ) -> bool {
+        self.calls.lock().unwrap().push((self.id, cmd, common.scan));
+        !(cmd == IoIntrCmd::Add && self.refuse.add.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
+        let (tx, rx) = mpsc::channel(1);
+        self._pulses = Some(tx);
+        Some(rx)
+    }
+
+    fn del_record(&mut self) -> Result<(), epics_base_rs::error::LinkRefusal> {
+        if self
+            .refuse
+            .del_record
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(epics_base_rs::error::LinkRefusal::del_record("devAiSticky"));
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    fn dtyp(&self) -> &str {
+        "Sticky"
+    }
+}
+
+async fn sticky_ioc() -> (
+    Arc<epics_base_rs::server::database::PvDatabase>,
+    RelinkCalls,
+    Arc<Refuse>,
+) {
+    let calls: RelinkCalls = Arc::default();
+    let refuse: Arc<Refuse> = Arc::default();
+    let (seen, refusing) = (calls.clone(), refuse.clone());
+    let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (db, _) = IocBuilder::new()
+        .register_device_support("ai", &STICKY, move || {
+            Box::new(Sticky {
+                id: made.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                calls: seen.clone(),
+                refuse: refusing.clone(),
+                _pulses: None,
+            })
+        })
+        .db_string(
+            r#"record(ai, "ST") { field(DTYP, "Sticky") field(INP, "@a") field(SCAN, "I/O Intr") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    std::mem::take(&mut *calls.lock().unwrap());
+    (db, calls, refuse)
+}
+
+async fn on_io_intr_list(db: &epics_base_rs::server::database::PvDatabase, name: &str) -> bool {
+    db.records_for_scan(ScanType::IoIntr)
+        .await
+        .iter()
+        .any(|n| n == name)
+}
+
+/// `dbPutFieldLink`'s `goto restoreScan` on a `del_record` refusal
+/// (`dbAccess.c:1160-1166`, `:1218-1222`): the old dset goes back on the
+/// I/O Intr list through `scanAdd`.
+#[epics_macros_rs::epics_test]
+async fn a_refused_del_record_puts_the_record_back_on_io_intr() {
+    let (db, calls, refuse) = sticky_ioc().await;
+    refuse
+        .del_record
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let put = db
+        .put_record_field_from_ca_no_notify("ST", "INP", EpicsValue::String("@b".into()))
+        .await;
+    assert!(put.is_err(), "{put:?}");
+    use IoIntrCmd::{Add, Delete};
+    let intr = ScanType::IoIntr;
+    assert_eq!(*calls.lock().unwrap(), [(0, Delete, intr), (0, Add, intr)]);
+    assert_eq!(db.get_record("ST").unwrap().read().common.scan, intr);
+    assert!(on_io_intr_list(&db, "ST").await);
+}
+
+/// A refused `del_record` whose `restoreScan` `scanAdd` is refused too
+/// (`dbScan.c:285-288`): the record reads Passive, and the scan index
+/// follows it off the I/O Intr list.
+#[epics_macros_rs::epics_test]
+async fn a_refused_restore_leaves_the_io_intr_list() {
+    let (db, _, refuse) = sticky_ioc().await;
+    refuse
+        .del_record
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    refuse.add.store(true, std::sync::atomic::Ordering::Relaxed);
+    let put = db
+        .put_record_field_from_ca_no_notify("ST", "INP", EpicsValue::String("@b".into()))
+        .await;
+    assert!(put.is_err(), "{put:?}");
+    assert_eq!(
+        db.get_record("ST").unwrap().read().common.scan,
+        ScanType::Passive
+    );
+    assert!(!on_io_intr_list(&db, "ST").await);
+}
+
+/// `dbPutFieldLink`'s `postScanEvent` (`dbAccess.c:1223-1225`): a put that
+/// leaves the record off I/O Intr posts SCAN.
+#[epics_macros_rs::epics_test]
+async fn a_device_link_put_that_ends_off_io_intr_posts_scan() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let (db, _, refuse) = sticky_ioc().await;
+    let mut scan = db
+        .get_record("ST")
+        .unwrap()
+        .write()
+        .add_subscriber("SCAN", 1, DbFieldType::Enum, EventMask::VALUE.bits())
+        .unwrap();
+    while scan.try_recv().is_ok() {}
+    refuse.add.store(true, std::sync::atomic::Ordering::Relaxed);
+    db.put_record_field_from_ca_no_notify("ST", "INP", EpicsValue::String("@b".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_record("ST").unwrap().read().common.scan,
+        ScanType::Passive
+    );
+    assert!(scan.try_recv().is_ok(), "no SCAN post");
+}
+
+/// A constant SIML that turns simulation on at init swaps SSCN in through
+/// `recGblCheckSimm`'s `scanAdd` (recGbl.c:430-435) before `scanInit`'s
+/// `buildScanLists` adds every record (dbScan.c:1073). C asks
+/// `get_ioint_info(0)` at both and files the record on the list twice; it is
+/// asked once.
+#[epics_macros_rs::epics_test]
+async fn a_scan_swapped_in_before_scan_init_is_added_once() {
+    let calls: Calls = Arc::default();
+    let seen = calls.clone();
+    let (db, _) = IocBuilder::new()
+        .register_device_support("ai", &HOOKED, move || {
+            Box::new(Hooked {
+                name: String::new(),
+                calls: seen.clone(),
+                _pulses: None,
+            })
+        })
+        .db_string(
+            r#"record(ai, "SIM") { field(DTYP, "Hooked") field(INP, "@x") field(SIML, "1") field(SSCN, "I/O Intr") }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_record("SIM").unwrap().read().common.scan,
+        ScanType::IoIntr
+    );
+    let adds = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.1 == IoIntrCmd::Add)
+        .count();
+    assert_eq!(adds, 1);
+}

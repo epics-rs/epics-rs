@@ -925,6 +925,11 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
+    /// devcalcoutStream.c reads and writes the `calcoutRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// `calcoutRecord.c:417-423` `get_linkNumber` — identical to `calc`'s.
     fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
         crate::server::record::calc_class_link_backed_metadata_field(field)
@@ -1791,9 +1796,11 @@ impl Record for CalcoutRecord {
         }
     }
 
+    /// `writeValue` is the dset's `write` (`calcoutRecord.c:775-787`): the
+    /// soft OUT link is `devCalcoutSoft`'s, so a soft DTYP takes the soft
+    /// output path and any other DTYP its device's write.
     fn can_device_write(&self) -> bool {
-        // calcout has a soft OUT link, not device support
-        false
+        true
     }
 
     fn set_async_context(&mut self, name: crate::types::RecordName, db: AsyncDbHandle) {

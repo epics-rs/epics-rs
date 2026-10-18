@@ -2162,6 +2162,10 @@ pub(crate) struct CycleFacts {
     /// real I/O, and no SDIS read has released the guard since the entry
     /// read the put-notify queue.
     pub(crate) not_simulating: bool,
+    /// The device posts monitors itself
+    /// ([`crate::server::device_support::DeviceSupport::posts_from_device`]):
+    /// the cycle posts them after `write_begin_common`.
+    pub(crate) device_posts: bool,
 }
 
 /// What a record's TYPE can reach in a process cycle.
@@ -5104,6 +5108,12 @@ struct RecordCold {
     /// The database a [`Subroutine::Context`] routine reaches; set at
     /// creation beside `device_done`.
     db: crate::server::database::RecordDb,
+    /// The task delivering the bound device's I/O Intr wakes, wired only by
+    /// [`RecordInstance::wire_io_intr_pump`].
+    io_intr_pump: Option<crate::runtime::background::AbortHandle>,
+    /// The task posting the bound device's PROPERTY changes, wired only by
+    /// [`RecordInstance::wire_property_posts`].
+    property_drain: Option<crate::runtime::background::AbortHandle>,
     /// What a [`Subroutine::Context`] routine stored as C `prec->dpvt`. Not
     /// a [`Dpvt`](crate::server::device_support::Dpvt) variant: a boxed `dyn`
     /// there makes every soft-input read's `Dpvt` overwrite an outlined drop.
@@ -6457,6 +6467,14 @@ impl SourceRender {
     /// element, so an array source converts its element 0 (none, at NORD 0,
     /// is a failed read).
     pub(crate) fn dbr_string(self, value: EpicsValue) -> Option<PvString> {
+        if self.long_string
+            && let EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) = &value
+            && !b.is_empty()
+        {
+            return Some(PvString::from_bytes(
+                crate::server::database::char_view::long_string_field_bytes(b),
+            ));
+        }
         let value = if value.is_array() && !self.long_string {
             value.first_element()?
         } else {
@@ -6847,7 +6865,13 @@ impl RecordInstance {
         }
         #[cfg(test)]
         if self.plan_forced_general {
-            return (CyclePlan::General, CycleFacts::default());
+            return (
+                CyclePlan::General,
+                CycleFacts {
+                    not_simulating: false,
+                    ..self.cycle_plan.2
+                },
+            );
         }
         let facts = self.cycle_plan.2;
         debug_assert!(
@@ -6891,7 +6915,10 @@ impl RecordInstance {
             && self.common.sscn.is_unset()
             && self.parsed_sdis.is_constant()
             && self.siml_has_const_lset();
-        let facts = CycleFacts { not_simulating };
+        let facts = CycleFacts {
+            not_simulating,
+            device_posts: self.device.as_ref().is_some_and(|d| d.posts_from_device()),
+        };
         let plain = plan.is_plain_input()
             && not_simulating
             && self.common.dtyp.is_soft()
@@ -7480,6 +7507,8 @@ impl RecordInstance {
                 cell: std::sync::Weak::new(),
                 init_subroutines: None,
                 db: Default::default(),
+                io_intr_pump: None,
+                property_drain: None,
                 subroutine_pvt: None,
                 skipped_posted: SkippedLog::default(),
                 declared_overrides: HashMap::new(),
@@ -7682,6 +7711,9 @@ impl RecordInstance {
         if let Err(e) = self.record.init_record(0) {
             eprintln!("init_record(0) failed for {name}: {e}");
         }
+        if self.record.dset_init_in_pass0() {
+            crate::server::device_support::init_device_support(self);
+        }
         true
     }
 
@@ -7727,7 +7759,10 @@ impl RecordInstance {
         // tail (`prec->mlst = prec->val`) and the port's tail is inside
         // `init_record(1)`, so a driver `init` that defines VAL is still not
         // reflected in the trackers seeded a line earlier.
-        crate::server::device_support::init_device_support(self);
+        crate::server::database::seed_record_constants(self);
+        if !self.record.dset_init_in_pass0() {
+            crate::server::device_support::init_device_support(self);
+        }
         self.seed_metadata_cache();
         // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
         // the SNAM lookup, also inside pass 1. `false` is C's early return
@@ -9902,31 +9937,179 @@ impl RecordInstance {
         // *membership* reaches those; a Passive→"1 second" move calls neither.
         // `scanDelete` asks with the old SCAN still in place, `scanAdd` with
         // the new one, and a refusal there leaves the record Passive.
+        // Before `scanInit` the move is only stored: `buildScanLists` joins
+        // the record by its SCAN then. C's `recGblInitSimm` swap asks here as
+        // well, so `get_ioint_info(0)` runs twice and the record is filed on
+        // the list twice (recGbl.c:430-435, dbScan.c:1073): not copied.
+        let listed = self.scan_lists_built();
         let was_io_intr = old_scan == ScanType::IoIntr;
         let mut is_io_intr = new_scan == ScanType::IoIntr;
-        if was_io_intr && !is_io_intr {
+        if listed && was_io_intr && !is_io_intr {
             if let Some(dev) = self.device.as_mut() {
                 dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Delete);
+                let posts = dev.take_device_posts();
+                self.post_device_values(posts);
             }
         }
         self.common.scan = new_scan;
-        if is_io_intr && !was_io_intr {
-            if let Some(dev) = self.device.as_mut() {
-                if !dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Add) {
-                    self.common.scan = ScanType::Passive;
-                    is_io_intr = false;
+        if listed && is_io_intr && !was_io_intr {
+            if let Err(message) = self.scan_add_io_intr() {
+                if let Some(message) = message {
+                    // C passes `-1`, whose status slot `recGblRecordError`
+                    // leaves empty (recGbl.c:65-70).
+                    crate::server::recgbl::rec_gbl_record_error(
+                        "",
+                        &self.name.to_str_lossy(),
+                        message,
+                    );
                 }
+                self.common.scan = ScanType::Passive;
+                is_io_intr = false;
             }
         }
-        if was_io_intr != is_io_intr {
-            self.record.set_io_intr_scan(is_io_intr);
+        if was_io_intr != is_io_intr && !self.record.set_io_intr_scan(is_io_intr) {
+            // `scanAdd`'s `precord->scan = menuScanPassive` (dbScan.c:286-288).
+            self.common.scan = ScanType::Passive;
         }
         let new_scan = self.common.scan;
+        if old_scan == new_scan {
+            return CommonFieldPutResult::NoChange;
+        }
         CommonFieldPutResult::ScanChanged {
             old_scan,
             new_scan,
             phas: self.common.phas,
         }
+    }
+
+    /// Whether the record's database has built its scan lists. A record in
+    /// no database is still being loaded, where C's SCAN is only stored.
+    fn scan_lists_built(&self) -> bool {
+        self.cold
+            .db
+            .upgrade()
+            .is_some_and(|db| db.scan_control().lists_built())
+    }
+
+    /// C `scanAdd`'s I/O Intr arm (dbScan.c:268-293), for iocInit, a SCAN
+    /// put and `restoreScan` alike: the dset row's hook, `get_ioint_info(0)`,
+    /// then the list the device hands back, which the pump serves. `Err` is
+    /// C's `menuScanPassive` exit with its `recGblRecordError` text, `None`
+    /// for a hook that declined, which C demotes without a line. The
+    /// trailing space of the no-DSET text is C's.
+    pub(crate) fn scan_add_io_intr(&mut self) -> Result<(), Option<&'static str>> {
+        use crate::server::device_support::IoIntrCmd;
+        const NO_DSET: &str = "scanAdd: I/O Intr not valid (no DSET) ";
+        const NO_HOOK: &str = "scanAdd: I/O Intr not valid (no get_ioint_info)";
+        const NO_LIST: &str = "scanAdd: I/O Intr not valid";
+        let row = super::dev_sup_of(self.record.record_type(), self.common.dtyp.as_str());
+        if row.is_some_and(|row| !row.has_get_ioint_info()) {
+            return Err(Some(NO_HOOK));
+        }
+        // A soft device is served by the framework, so no device object
+        // says nothing about C's `precord->dset`; its devSup row does. A row
+        // with the hook but no object to answer it is `:290-293`'s NULL list.
+        let Some(dev) = self.device.as_mut() else {
+            return Err(Some(if row.is_none() { NO_DSET } else { NO_LIST }));
+        };
+        let added = dev.get_ioint_info(&mut *self.record, &mut self.common, IoIntrCmd::Add);
+        let posts = dev.take_device_posts();
+        self.post_device_values(posts);
+        if !added {
+            return Err(None);
+        }
+        if !self.wire_io_intr_pump() {
+            return Err(Some(NO_LIST));
+        }
+        Ok(())
+    }
+
+    /// Start the task that turns the bound device's wakes into processing,
+    /// the one place that starts it. A device hands its receiver out once
+    /// per object, so a fresh one is a newly bound dset and replaces the old
+    /// pump; leaving the list stops nothing, because the pump only processes
+    /// a record that is on it (C `scanIoRequest` walks the list's members).
+    /// Whether the record now has a live pump.
+    pub(crate) fn wire_io_intr_pump(&mut self) -> bool {
+        let pumped = |p: &Option<crate::runtime::background::AbortHandle>| {
+            p.as_ref().is_some_and(|p| !p.is_finished())
+        };
+        let Some(dev) = self.device.as_mut() else {
+            return pumped(&self.cold.io_intr_pump);
+        };
+        let Some(rx) = dev.io_intr_receiver() else {
+            return pumped(&self.cold.io_intr_pump);
+        };
+        let (Some(db), Some(cell)) = (self.cold.db.upgrade(), self.cold.cell.upgrade()) else {
+            return false;
+        };
+        let pump = crate::server::ioc_app::spawn_io_intr_pump(
+            db,
+            self.name.clone(),
+            cell,
+            rx,
+            self.common.callback_priority(),
+            dev.io_intr_processes_directly(),
+            dev.io_intr_scan_independent(),
+        );
+        if let Some(old) = self.cold.io_intr_pump.replace(pump.abort_handle()) {
+            old.abort();
+        }
+        true
+    }
+
+    /// What iocInit gives a dset before its record joins any list, for the
+    /// one a device-link put bound: the database's gates, its PROPERTY
+    /// drain, and the pump of a device that processes whatever the SCAN. An
+    /// I/O Intr record's pump follows from `restoreScan`'s join.
+    fn wire_bound_device(&mut self) {
+        if let (Some(dev), Some(db)) = (self.device.as_mut(), self.cold.db.upgrade()) {
+            dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
+            dev.bind_dev_sup_gate(db.scan_control().dev_sup_gate());
+        }
+        self.wire_property_posts();
+        if self
+            .device
+            .as_ref()
+            .is_some_and(|d| d.io_intr_scan_independent())
+        {
+            self.wire_io_intr_pump();
+        }
+    }
+
+    /// Start the task that posts the bound device's PROPERTY changes, the
+    /// one place that starts it: C's `registerInterruptUser(callbackEnum)`
+    /// belongs to whichever dset object is bound, iocInit's or a device-link
+    /// put's, and runs whatever the SCAN. A fresh receiver is a newly bound
+    /// dset and replaces the old drain. Whether the record now has a live one.
+    pub(crate) fn wire_property_posts(&mut self) -> bool {
+        let drained = |p: &Option<crate::runtime::background::AbortHandle>| {
+            p.as_ref().is_some_and(|p| !p.is_finished())
+        };
+        let Some(dev) = self.device.as_mut() else {
+            return drained(&self.cold.property_drain);
+        };
+        let Some(mut rx) = dev.property_post_receiver() else {
+            return drained(&self.cold.property_drain);
+        };
+        let Some(db) = self.cold.db.upgrade() else {
+            return false;
+        };
+        dev.bind_interrupt_gate(db.scan_control().interrupt_gate());
+        let rec_name = self.name.clone();
+        let drain =
+            crate::runtime::task::spawn_background(self.common.callback_priority(), async move {
+                // Each message is the setEnums field block plus the one field
+                // C posts on; DBE_PROPERTY on that field is what makes clients
+                // re-read the choices.
+                while let Some(post) = rx.recv().await {
+                    let _ = db.post_property(&rec_name, post);
+                }
+            });
+        if let Some(old) = self.cold.property_drain.replace(drain.abort_handle()) {
+            old.abort();
+        }
+        true
     }
 
     /// C `scanAdd`'s failure exits, `precord->scan = menuScanPassive`
@@ -10223,6 +10406,7 @@ impl RecordInstance {
         // C restarts a queued put-notify at a cycle's completion, not at this
         // store, so the token has no tail to reach.
         let _ = self.leave_pact();
+        self.wire_bound_device();
         self.finish_link_scan(prepared, true);
         Ok(passed)
     }
@@ -12938,6 +13122,21 @@ impl RecordInstance {
             (|_: &Self| Some(desc), |_: &Self| Some(value)),
             Some(desc),
         );
+    }
+
+    /// Post the `db_post_events` calls a device made itself
+    /// ([`crate::server::device_support::DevicePost`]), in order, as one
+    /// burst. The caller holds the record, as C's caller of the device did.
+    pub fn post_device_values(&mut self, posts: Vec<crate::server::device_support::DevicePost>) {
+        if posts.is_empty() {
+            return;
+        }
+        let mut burst = PostBurst::new();
+        for post in posts {
+            if let Some(desc) = self.field_desc(post.field) {
+                self.notify_field_value_in(&mut burst, desc, post.mask, post.value);
+            }
+        }
     }
 
     /// [`Self::notify_field_with_origin`] posting into the caller's `burst`:

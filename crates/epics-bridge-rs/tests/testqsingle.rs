@@ -17,7 +17,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(39): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(40): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -1960,5 +1960,46 @@ async fn a_dollar_link_arr_slice_serves_what_softiocpvx_serves() {
             .expect(name);
         let got = ch.get(&empty_request()).await.expect("get");
         assert_eq!(extract_value(&got), Some(&want), "{name}");
+    }
+}
+
+/// A long string whose failed device read left its NUL past `LEN`
+/// (devlsiStream.c): pvxs keeps a SIZV 41 VAL the `DBF_STRING`
+/// `cvt_dbaddr` made it, read to the buffer's NUL, and re-views a SIZV 100
+/// VAL as its `LEN` chars (`ioc/channel.cpp:58-67`).
+#[tokio::test]
+async fn a_long_string_get_reads_past_len_only_without_the_re_view() {
+    let (db, _) = epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .db_string(
+            r#"record(lsi, "A") { field(SIZV, "41") }
+            record(lsi, "B") { field(SIZV, "100") }"#,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for (name, read) in [("A", b"abcdef".to_vec()), ("B", vec![b'x'; 50])] {
+        let cell = db.get_record(name).unwrap();
+        let mut inst = cell.write();
+        let lsi = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<LsiRecord>())
+            .unwrap();
+        lsi.val.set_text(b"o");
+        let sizv = lsi.sizv as usize;
+        lsi.val.scan_in_place(sizv, |buf| {
+            buf[..read.len()].copy_from_slice(&read);
+            buf[read.len()] = 0;
+            None
+        });
+    }
+    for (name, want) in [("A", "abcdef"), ("B", "xx")] {
+        let ch = BridgeChannel::new(db.clone(), name.as_bytes())
+            .await
+            .expect(name);
+        let got = ch.get(&empty_request()).await.expect("get");
+        assert_eq!(extract_value(&got), Some(&text(want)), "pvget {name}");
     }
 }

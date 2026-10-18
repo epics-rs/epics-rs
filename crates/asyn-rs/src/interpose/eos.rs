@@ -202,6 +202,7 @@ impl OctetInterpose for EosInterpose {
             return Ok(OctetReadResult {
                 nbytes_transferred: 0,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             });
         }
         // C's `eosPvt` for the device this read addresses: its terminator, its
@@ -209,6 +210,7 @@ impl OctetInterpose for EosInterpose {
         // another device's bytes.
         let dev = self.device(user.addr);
         let mut n_read: usize = 0;
+        let mut taken_back = 0;
         let mut eom = EomReason::empty();
 
         loop {
@@ -231,15 +233,14 @@ impl OctetInterpose for EosInterpose {
                     if c == expected {
                         dev.eos_in_match += 1;
                         if dev.eos_in_match == eos_len {
-                            // Full EOS match — remove the EOS bytes from the
-                            // output count. Only the EOS bytes written into
-                            // *this* buffer can be removed: when a 2-byte EOS
-                            // straddles two read() calls, the leading byte was
-                            // already returned to the previous caller, so
-                            // `n_read` here may be smaller than `eos_len`.
-                            // An unguarded `n_read -= eos_len` underflows.
+                            // Full EOS match: C's `nRead -= eosInLen`
+                            // (:203). When the EOS straddles two reads its
+                            // lead byte went out in the previous one, and C's
+                            // count goes to (size_t)-1; that byte is
+                            // `taken_back`.
                             dev.eos_in_match = 0;
-                            n_read -= eos_len.min(n_read);
+                            taken_back = eos_len.saturating_sub(n_read);
+                            n_read -= eos_len - taken_back;
                             eom |= EomReason::EOS;
                             break;
                         }
@@ -326,6 +327,7 @@ impl OctetInterpose for EosInterpose {
         Ok(OctetReadResult {
             nbytes_transferred: n_read,
             eom_reason: eom,
+            taken_back,
         })
     }
 
@@ -465,6 +467,7 @@ mod tests {
             Ok(OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             })
         }
 
@@ -567,8 +570,8 @@ mod tests {
     fn test_two_char_eos_straddling_reads() {
         // A 2-byte EOS split across two read() calls: the first call
         // fills the user buffer ending on the EOS's leading byte, the
-        // second completes the match. `n_read -= eos.len()` would
-        // underflow (panic in debug) without the saturating guard.
+        // second completes the match and takes that byte back, C's
+        // nbytesTransferred of (size_t)-1 (asynInterposeEos.c:201-204).
         let mut interpose = EosInterpose::new(EosConfig {
             input_eos: vec![b'\r', b'\n'],
             output_eos: vec![],
@@ -583,7 +586,7 @@ mod tests {
 
         // Second read consumes the trailing "\n", completing the EOS.
         let r = interpose.read(&user, &mut buf, &mut base).unwrap();
-        assert_eq!(r.nbytes_transferred, 0);
+        assert_eq!((r.nbytes_transferred, r.taken_back), (0, 1));
         assert!(r.eom_reason.contains(EomReason::EOS));
     }
 
@@ -868,11 +871,13 @@ mod tests {
                         nbytes_transferred: n,
                         // Lower layer reports CNT (its buffer was full)
                         eom_reason: EomReason::CNT,
+                        taken_back: 0,
                     })
                 } else {
                     Ok(OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::empty(),
+                        taken_back: 0,
                     })
                 }
             }
@@ -919,6 +924,7 @@ mod tests {
                     nbytes_transferred: self.chunk.len(),
                     // No CNT/EOS — short read, EOS layer keeps reading.
                     eom_reason: EomReason::empty(),
+                    taken_back: 0,
                 });
             }
             Err(self.err.take().expect("base read called twice after error"))

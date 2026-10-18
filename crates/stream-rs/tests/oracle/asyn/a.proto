@@ -1,0 +1,6 @@
+InTerminator = CR;
+p { out "X"; in "%f"; }
+e3 { InTerminator = CR LF CR; out "X"; in "%f"; }
+s { InTerminator = CR LF; out "X"; in "%s"; }
+cd { disconnect; connect 1000; out "X"; in "%f"; }
+i { in "%f"; }

@@ -364,6 +364,9 @@ pub struct DeviceError;
 /// `createAsynUser` hands out (:1194).
 const ERROR_MESSAGE_SIZE: usize = 160;
 
+/// C `pasynUser->errorMessage`: at most `ERROR_MESSAGE_SIZE - 1` bytes.
+pub(crate) type ErrorMessage = FixedText<{ ERROR_MESSAGE_SIZE - 1 }>;
+
 /// C's `pasynUser` as the manager's device calls see it: the port the user is
 /// connected to (`userPvt->pport`, asynManager.c:1345-1352) beside the
 /// `errorMessage` buffer those calls write their diagnostic into.
@@ -396,7 +399,7 @@ pub struct DeviceUser {
     /// (asynManager.c:1349-1352), and `findDpCommon` then answers from the
     /// port's own `dpc` (:541-544).
     addr: i32,
-    error_message: FixedText<{ ERROR_MESSAGE_SIZE - 1 }>,
+    error_message: ErrorMessage,
 }
 
 impl Default for DeviceUser {
@@ -427,15 +430,26 @@ impl DeviceUser {
         self.error_message.as_str()
     }
 
-    /// C `connectDevice` (asynManager.c:1324-1357), in C's order: no port name,
-    /// then the registry lookup (`locatePort`), then a user that is already
-    /// connected to a device.
-    pub fn connect_device(&mut self, port_name: &str, addr: i32) -> Result<PortEntry, DeviceError> {
-        if port_name.is_empty() {
+    /// A layer below wrote `pasynUser->errorMessage`: a driver call or a
+    /// manager refusal on a request this user made.
+    pub(crate) fn set_error_message(&mut self, message: ErrorMessage) {
+        self.error_message = message;
+    }
+
+    /// C `connectDevice` (asynManager.c:1324-1357), in C's order: no port name
+    /// (C's NULL `portName`, `None` here), then the registry lookup
+    /// (`locatePort`), which an empty name fails like any other, then a user
+    /// that is already connected to a device.
+    pub fn connect_device(
+        &mut self,
+        port_name: Option<&str>,
+        addr: i32,
+    ) -> Result<PortEntry, DeviceError> {
+        let Some(port_name) = port_name else {
             return Err(self.fail(format_args!(
                 "asynManager:connectDevice no port name provided"
             )));
-        }
+        };
         let Some(entry) = crate::registry::get_port(port_name) else {
             return Err(self.fail(format_args!(
                 "asynManager:connectDevice port {port_name} not found"
@@ -537,7 +551,7 @@ impl DeviceUser {
     }
 
     fn fail(&mut self, message: std::fmt::Arguments<'_>) -> DeviceError {
-        self.error_message = FixedText::format(message);
+        self.error_message = ErrorMessage::format(message);
         DeviceError
     }
 }
@@ -623,28 +637,39 @@ mod tests {
             .unwrap();
 
         let mut user = DeviceUser::default();
-        assert!(user.connect_device("", 0).is_err());
+        assert!(user.connect_device(None, 0).is_err());
         assert_eq!(
             user.error_message(),
             "asynManager:connectDevice no port name provided"
         );
         assert!(user.device().is_none(), "a rejected connect binds nothing");
 
-        assert!(user.connect_device("devuser_no_such_port", 0).is_err());
+        // an empty name is a name locatePort does not find (asynManager.c:1337-1342)
+        assert!(user.connect_device(Some(""), 0).is_err());
+        assert_eq!(
+            user.error_message(),
+            "asynManager:connectDevice port  not found"
+        );
+        assert!(user.device().is_none());
+
+        assert!(
+            user.connect_device(Some("devuser_no_such_port"), 0)
+                .is_err()
+        );
         assert_eq!(
             user.error_message(),
             "asynManager:connectDevice port devuser_no_such_port not found"
         );
         assert!(user.device().is_none());
 
-        assert!(user.connect_device("devuser_port_1", 0).is_ok());
+        assert!(user.connect_device(Some("devuser_port_1"), 0).is_ok());
         assert_eq!(
             user.device()
                 .map(|entry| entry.handle.port_name().to_string()),
             Some("devuser_port_1".to_string())
         );
 
-        assert!(user.connect_device("devuser_port_1", 0).is_err());
+        assert!(user.connect_device(Some("devuser_port_1"), 0).is_err());
         assert_eq!(
             user.error_message(),
             "asynManager:connectDevice already connected to device"
@@ -689,7 +714,7 @@ mod tests {
         assert!(devices("devuser_multi").is_empty(), "nothing bound yet");
 
         let mut user = DeviceUser::default();
-        user.connect_device("devuser_multi", 3).unwrap();
+        user.connect_device(Some("devuser_multi"), 3).unwrap();
         assert_eq!(
             devices("devuser_multi"),
             vec![3],
@@ -697,7 +722,7 @@ mod tests {
         );
 
         let mut port_user = DeviceUser::default();
-        port_user.connect_device("devuser_multi", -1).unwrap();
+        port_user.connect_device(Some("devuser_multi"), -1).unwrap();
         assert_eq!(
             devices("devuser_multi"),
             vec![3],
@@ -705,7 +730,9 @@ mod tests {
         );
 
         let mut single_user = DeviceUser::default();
-        single_user.connect_device("devuser_single", 3).unwrap();
+        single_user
+            .connect_device(Some("devuser_single"), 3)
+            .unwrap();
         assert!(
             devices("devuser_single").is_empty(),
             "a single-device port has no device list to add to"
@@ -729,7 +756,7 @@ mod tests {
             .unwrap();
 
         let mut user = DeviceUser::default();
-        user.connect_device("devuser_port_2", 0).unwrap();
+        user.connect_device(Some("devuser_port_2"), 0).unwrap();
         assert_eq!(user.is_enabled(), Ok(true));
         assert_eq!(user.is_connected(), Ok(true));
         assert_eq!(

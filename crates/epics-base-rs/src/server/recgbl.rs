@@ -703,6 +703,9 @@ pub enum DevSupStatus {
     /// attached or it is not), so only the record's `process()` refusal, which
     /// C reaches through the same `!pdset` arm, uses it.
     MissingSup,
+    /// `S_dev_badInitRet` — the dset's `init_record` returned a status its
+    /// record has no arm for.
+    BadInitRet,
 }
 
 impl DevSupStatus {
@@ -712,6 +715,7 @@ impl DevSupStatus {
         match self {
             Self::NoDset => (514 << 16) | 3,
             Self::MissingSup => (514 << 16) | 5,
+            Self::BadInitRet => (514 << 16) | 11,
         }
     }
 

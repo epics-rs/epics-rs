@@ -14,7 +14,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_libcom_rs::runtime::task::{in_test_ioc_thread, test_ioc_thread};
 
 use super::io_intr::NoInterface;
-use super::{AsynRecord, ERR_SIZE, Errs, IoOutcome, IoTrace, MessageOrEmpty};
+use super::{AsynRecord, ERR_SIZE, Errs, IoOutcome, IoPlan, IoTrace};
 use crate::error::{AsynError, AsynStatus};
 
 thread_local! {
@@ -68,6 +68,7 @@ fn every_errs_report_formats_without_allocating() {
         rec.fill_io_trace(&mut trace);
         // The first trace line resolves the global rung and this thread's zone.
         rec.report_error(AsynStatus::Error, format_args!("warm"));
+        let plan = IoPlan::default();
         let before = thread_allocs();
 
         rec.report_error(
@@ -79,10 +80,12 @@ fn every_errs_report_formats_without_allocating() {
         rec.report_error(AsynStatus::Error, format_args!("{LONG}{LONG}"));
         let long = rec.errs;
         let mut out = IoOutcome::default();
+        out.note_error(e.message_display());
+        let tail = out.error_message(&plan);
         out.report_error(
             &trace,
             AsynStatus::Error,
-            format_args!("Overflow nread {} {}", 5, MessageOrEmpty(Some(&e))),
+            format_args!("Overflow nread {} {}", 5, tail.as_str()),
         );
         rec.set_errs(out.errs.unwrap());
         let overflow = rec.errs;

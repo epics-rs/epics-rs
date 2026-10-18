@@ -163,6 +163,11 @@ impl Record for BoRecord {
         "bo"
     }
 
+    /// devboStream.c reads and writes the `boRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// devBoSoft.c, devBoSoftRaw.c and devBoSoftCallback.c return `dbPutLink`'s status.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {
@@ -294,7 +299,7 @@ impl Record for BoRecord {
 
     /// C `boRecord.c:167-170,174-175` (R7.0.10) — the derived half of the init
     /// tail: convert VAL to RVAL through MASK, then `oraw = rval; orbv = rbv`.
-    fn init_record_tail(&mut self) {
+    fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         self.val_to_rval();
         self.oraw = self.rval;
         self.orbv = self.rbv;

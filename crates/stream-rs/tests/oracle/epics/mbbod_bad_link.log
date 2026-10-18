@@ -1,0 +1,20 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto nosuch P"
+Stream::initRecord rec: filename="l.proto" protocol="nosuch" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "nosuch")
+Protocol 'nosuch' not found in protocol file 'l.proto'
+while reading protocol 'nosuch' for 'rec'
+rec: Protocol parse error
+rec: Record initialization failed
+streamInitRecord(rec) done status=0x1f70012
+VAL 0 = 0x0
+SEVR "MAJOR"
+STAT "UDF"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 1 = 0x1

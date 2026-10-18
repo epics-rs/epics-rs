@@ -126,11 +126,13 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: len,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             } else {
                 Ok(OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             }
         }
@@ -230,6 +232,7 @@ mod tests {
                 Step::Ok(n) => Ok(OctetReadResult {
                     nbytes_transferred: deliver(buf, n),
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 }),
                 Step::ErrWith(n) => {
                     let n = deliver(buf, n);

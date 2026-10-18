@@ -221,7 +221,7 @@ impl Record for BusyRecord {
     /// after the constant DOL load two dozen lines above it, so a
     /// `field(DOL,"5")` busy reaches its first process with RVAL already
     /// holding MASK.
-    fn init_record_tail(&mut self) {
+    fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         self.convert_val_to_rval();
     }
 

@@ -18,7 +18,7 @@ use stream_rs::protocol::{self, codes};
 /// Where C's compiled code and the port's differ by design: the
 /// `StreamFormat` layout (C's x86_64 struct, padding and `info` pointer
 /// included), the field address (C's `DBADDR`), and the info and type
-/// the converters return (stand-ins here). What is left is the parser's:
+/// the converters return. What is left is the parser's:
 /// the commands, literal bytes, escapes, field names, format strings,
 /// conversion characters, flags, widths and precisions.
 #[derive(Clone, Copy)]
@@ -90,10 +90,11 @@ fn normalize(code: &[u8], layout: Layout) -> String {
                         let fs = StreamBuffer::from_bytes(&code[start..i]).expand();
                         let fs = String::from_utf8_lossy(fs.bytes()).into_owned();
                         i += 1;
-                        let (conv, flags, prec, width, infolen) = match layout {
+                        let (conv, type_, flags, prec, width, infolen) = match layout {
                             Layout::C => {
                                 let f = (
                                     code[i],
+                                    i32::from_ne_bytes(read(code, i + 4)),
                                     u16::from_ne_bytes(read(code, i + 8)),
                                     i64::from_ne_bytes(read(code, i + 16)),
                                     u64::from_ne_bytes(read(code, i + 24)),
@@ -105,15 +106,12 @@ fn normalize(code: &[u8], layout: Layout) -> String {
                             Layout::Rs => {
                                 let f = StreamFormat::decode(&read(code, i));
                                 i += StreamFormat::SIZE;
-                                (f.conv, f.flags, f.prec, f.width, f.infolen)
+                                (f.conv, f.type_, f.flags, f.prec, f.width, f.infolen)
                             }
                         };
-                        // The stand-ins write no info.
-                        if matches!(layout, Layout::C) {
-                            i += infolen as usize;
-                        }
+                        i += infolen as usize;
                         out.push_str(&format!(
-                            " format(\"{fs}\" {} flags={flags:#x} prec={prec} width={width})",
+                            " format(\"{fs}\" {} type={type_} flags={flags:#x} prec={prec} width={width})",
                             conv as char
                         ));
                     }

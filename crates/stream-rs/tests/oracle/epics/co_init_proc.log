@@ -1,0 +1,68 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto coi P"
+Stream::initRecord rec: filename="l.proto" protocol="coi" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "coi")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+Stream::initRecord rec: waiting for initDone
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="7", size=1)
+StreamCore::readCallback(rec) inputBuffer="7", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input=".5", size=2)
+StreamCore::readCallback(rec) inputBuffer="7.5", size 3
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "7.5"
+StreamCore::matchInput(rec): format = "%f"
+StreamCore::scanValue(rec, format=%f, double) input="7.5" value=7.50000
+Stream::scan() currentValueLength=3
+Stream::matchValue(rec): success, 3 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+Stream::protocolFinishHook rec: signalling init done
+Stream::initRecord rec: initDone
+Stream::initRecord rec: initialized. don't convert
+streamInitRecord(rec) done status=0
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %f
+Stream::formatValue(rec, format=%f, fieldaddr=(nil)
+Stream::formatValue(rec) format=%f type=DBF_DOUBLE
+streamPrintf(rec,format=%f)
+StreamCore::printValue(rec, %f, 1.00000): "W1.000000"
+StreamCore::evalOut: outputLine = "W1.000000<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(5000)
+Stream::process(rec): protocol started
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+recordProcessCallback(rec) processing record
+Stream::process(rec)
+Stream::process(rec) ready. don't convert
+recordProcessCallback(rec) processing record done
+VAL 1
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+OVAL 1
+MLST 1
+ALST 1

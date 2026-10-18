@@ -42,6 +42,7 @@ use crate::drivers::option_parse::{is_option_key, option_key};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackGuard};
 use crate::interpose::EomReason;
+use crate::manager::ErrorMessage;
 use crate::port_handle::PortHandle;
 use crate::request::{CellBody, PortCalls, RequestCell, RequestOp, RequestResult, Unrun};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
@@ -1084,6 +1085,8 @@ struct IoPlan {
     // overflow — the same reason C's check is independent of NRRD.
     in_len: usize,
     ifmt: i32,
+    /// The record user's `pasynUser->errorMessage` as the cycle starts.
+    error_message: ErrorMessage,
 }
 
 impl Default for IoPlan {
@@ -1107,6 +1110,7 @@ impl Default for IoPlan {
             octet_buf_size: 0,
             in_len: 0,
             ifmt: 0,
+            error_message: ErrorMessage::EMPTY,
         }
     }
 }
@@ -1137,9 +1141,22 @@ struct IoOutcome {
     /// C's repeated `recGblSetSevr` does. Applied to the record in
     /// [`AsynRecord::apply_io_outcome`] and committed by [`AsynRecord::check_alarms`].
     alarm: Option<(u16, AlarmSeverity)>,
+    /// The `pasynUser->errorMessage` the cycle's last failing call left, which
+    /// outlives the cycle on the record's user.
+    error_message: Option<ErrorMessage>,
 }
 
 impl IoOutcome {
+    fn note_error(&mut self, message: impl std::fmt::Display) {
+        self.error_message = Some(ErrorMessage::format(format_args!("{message}")));
+    }
+
+    /// `pasynUser->errorMessage` as it stands: this cycle's last failure, or
+    /// what an earlier one left. Nothing clears it.
+    fn error_message(&self, plan: &IoPlan) -> ErrorMessage {
+        self.error_message.unwrap_or(plan.error_message)
+    }
+
     /// C `reportError(pasynRec, status, format, ...)` (asynRecord.c:2028-2049)
     /// — the single formatter every `performIO` diagnostic passes through, and
     /// the only writer of `ERRS` on the I/O path.
@@ -1224,19 +1241,6 @@ impl IoOutcome {
 /// The status word C splices into the final octet read-error message
 /// (asynRecord.c:1594-1596): `asynTimeout` -> `timeout`, `asynOverflow` ->
 /// `overflow`, everything else -> `error`.
-/// C's `%s` of `pasynUser->errorMessage` after a transfer that may have raised
-/// no error: the error's text, or the empty string.
-struct MessageOrEmpty<'a>(Option<&'a AsynError>);
-
-impl std::fmt::Display for MessageOrEmpty<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(e) => e.message_display().fmt(f),
-            None => Ok(()),
-        }
-    }
-}
-
 fn c_read_status_word(e: &crate::error::AsynError) -> &'static str {
     use crate::error::AsynStatus;
     match e.status() {
@@ -1544,24 +1548,15 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
         // The `%s` tail is C's `pasynUser->errorMessage` — the driver's own
         // text, which `AsynError::message()` reads through the PartialWrite
         // carrier. (`Display` would prefix it with the Rust status debug, which
-        // C's ERRS never carries.) A short write that reported success has no
-        // driver message at all; C leaves the stale `errorMessage` there, so
-        // state what actually happened instead of pretending to a driver text.
-        match &err {
-            Some(e) => out.report_error(
-                &plan.trace,
-                e.status(),
-                format_args!("Write error, nout={nawt}, {}", e.message_display()),
-            ),
-            None => out.report_error(
-                &plan.trace,
-                AsynStatus::Success,
-                format_args!(
-                    "Write error, nout={nawt}, wrote {} of {} chars",
-                    nawt, plan.octet_out_len
-                ),
-            ),
-        }
+        // C's ERRS never carries.) A short write that reported success
+        // splices the stale `errorMessage`.
+        let tail = out.error_message(plan);
+        let status = err.as_ref().map_or(AsynStatus::Success, AsynError::status);
+        out.report_error(
+            &plan.trace,
+            status,
+            format_args!("Write error, nout={nawt}, {}", tail.as_str()),
+        );
     }
 }
 
@@ -1691,18 +1686,14 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 // overflow branches (asynRecord.c:1602-1621), alongside the
                 // MINOR alarm. The `%s` tail is the driver's message; an
                 // overflow that did not *fail* has none, and C then splices
-                // whatever is left in its long-lived `pasynUser` — the empty
-                // string for a record that has not yet seen an error. Take this
-                // cycle's error text when there is one and the empty string
-                // otherwise: the port does not carry a stale diagnostic across
-                // cycles.
-                let tail = MessageOrEmpty(err.as_ref());
+                // whatever is left in its long-lived `pasynUser`.
+                let tail = out.error_message(plan);
                 // C's `status` is the read's.
                 let status = err.as_ref().map_or(AsynStatus::Success, AsynError::status);
                 out.report_error(
                     &plan.trace,
                     status,
-                    format_args!("Overflow nread {nread} {tail}"),
+                    format_args!("Overflow nread {nread} {}", tail.as_str()),
                 );
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
             }
@@ -1823,6 +1814,9 @@ fn record_phase_result(
             out.report_queue_timeout(&plan.trace);
             return PhaseFlow::Aborted;
         }
+        // Every other failure, a discarded flush included, left its text on
+        // the user; C's queue timeout writes none (asynManager.c:649-703).
+        out.note_error(e.message_display());
         // The queue gate's refusal, ahead of the per-phase recorders for the same
         // reason: C's `queueRequest` returned `asynDisabled` / `asynDisconnected`
         // in `process()` (asynRecord.c:342-355) and `performIO` was never entered,
@@ -1905,14 +1899,14 @@ fn record_phase_result(
                 out.spr = Some(i32::from(*byte));
             }
             if err.is_some() || data.len() != 1 {
-                // C's `%s` tail is `pasynUser->errorMessage`; a short read that
-                // reported success leaves it as `resetError` left it — empty.
-                let detail = MessageOrEmpty(err.as_ref());
+                // C's `%s` tail is `pasynUser->errorMessage`, stale after a
+                // short read that reported success.
+                let detail = out.error_message(plan);
                 let status = err.as_ref().map_or(AsynStatus::Success, AsynError::status);
                 out.report_error(
                     &plan.trace,
                     status,
-                    format_args!("Error in GPIB Serial Poll read, {detail}"),
+                    format_args!("Error in GPIB Serial Poll read, {}", detail.as_str()),
                 );
                 raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
             }
@@ -3478,16 +3472,29 @@ impl AsynRecord {
 
     /// C `registerInterrupts`' report of its failure (asynRecord.c:617-653).
     fn report_register_refusal(&mut self, refusal: RegisterRefusal) {
+        println!("{}", self.register_refusal_line(refusal));
+    }
+
+    fn register_refusal_line(&mut self, refusal: RegisterRefusal) -> String {
         match refusal {
             RegisterRefusal::NoInterface(msg) => {
                 self.report_error(AsynStatus::Error, format_args!("{msg}"))
             }
-            RegisterRefusal::Refused(e) => println!(
-                "{} registerInterrupts {}",
-                self.record_name(),
-                e.message_display()
-            ),
+            RegisterRefusal::Refused(e) => {
+                self.device_user
+                    .set_error_message(ErrorMessage::format(format_args!(
+                        "{}",
+                        e.message_display()
+                    )))
+            }
         }
+        // Either way C prints the user's errorMessage, which "No asynInt32
+        // interface" never wrote: that arm reprints whatever the last call left.
+        format!(
+            "{} registerInterrupts {}",
+            self.record_name(),
+            self.device_user.error_message()
+        )
     }
 
     /// C `cancelIOInterruptScan` (asynRecord.c:794-806): a put that invalidates
@@ -3700,7 +3707,7 @@ impl AsynRecord {
         self.clear_exception_callback();
         self.device_user.disconnect();
 
-        match self.device_user.connect_device(&self.port, self.addr) {
+        match self.device_user.connect_device(Some(&self.port), self.addr) {
             Ok(entry) => {
                 // C asks for asynCommon before anything else and reports with
                 // `connectDevice`'s `asynSuccess` (asynRecord.c:1163-1171); bound
@@ -4190,6 +4197,8 @@ impl AsynRecord {
         plan.ui32mask = self.ui32mask;
         plan.f64out = self.f64out;
         plan.octet_buf_size = octet_buf_size;
+        plan.error_message =
+            ErrorMessage::format(format_args!("{}", self.device_user.error_message()));
         plan.in_len = in_len;
         plan.ifmt = self.ifmt;
     }
@@ -4228,6 +4237,9 @@ impl AsynRecord {
     /// stores into AINP/BINP/I32INP/.../NAWT/EOMR/NORD/ERRS); the inline
     /// [`Self::perform_io`] and the queued request's completion both feed it.
     fn apply_io_outcome(&mut self, out: IoOutcome) {
+        if let Some(message) = out.error_message {
+            self.device_user.set_error_message(message);
+        }
         if let Some(v) = out.nawt {
             self.nawt = v;
         }
@@ -4308,8 +4320,9 @@ impl AsynRecord {
                 self.io_pending = true;
                 ProcessOutcome::async_pending()
             }
-            Err(_) => {
+            Err(e) => {
                 let mut out = IoOutcome::default();
+                out.note_error(e);
                 out.report_queue_refused(&job.request.lock().plan.trace);
                 self.apply_io_outcome(out);
                 ProcessOutcome::complete()
@@ -5288,16 +5301,22 @@ impl Record for AsynRecord {
     /// `scanAdd` / `scanDelete`: register the driver interrupt callbacks when
     /// the record joins the I/O Intr scan list, cancel them when it leaves.
     ///
-    /// `registerInterrupts` failing is C's `return -1`, which makes `scanAdd`
-    /// report the error and leave the record Passive (dbScan.c:278-293). The
-    /// port's `setup_io_intr` runs the same demotion off
-    /// `AsynRecordDevice::io_intr_receiver`; for a *runtime* SCAN put
-    /// the failure text is what reaches the operator, in ERRS, exactly as C's
-    /// `reportError` puts it there (:617,:627,:637,:647).
-    fn set_io_intr_scan(&mut self, active: bool) {
-        if let Err(refusal) = self.io_intr.set_active(active) {
-            self.report_register_refusal(refusal);
-        }
+    /// `registerInterrupts` failing is C's `return -1`, on which `scanAdd`
+    /// leaves the record Passive (dbScan.c:286-288).
+    fn set_io_intr_scan(&mut self, active: bool) -> bool {
+        self.io_intr
+            .set_active(active)
+            .map_err(|refusal| self.report_register_refusal(refusal))
+            .is_ok()
+    }
+
+    /// The same `getIoIntInfo(0)` from iocInit's `scanAdd`, for a record loaded
+    /// with SCAN="I/O Intr".
+    fn io_intr_scan_add(&mut self) -> bool {
+        self.io_intr
+            .scan_add()
+            .map_err(|refusal| self.report_register_refusal(refusal))
+            .is_ok()
     }
 
     fn take_after_gate(&mut self) -> Option<epics_base_rs::server::record::AfterGate> {
@@ -6126,6 +6145,49 @@ mod tests {
             rec.device_user.error_message(),
             "asynManager:isEnabled asynUser not connected to device",
             "the record's user keeps the last diagnostic; nothing clears it"
+        );
+    }
+
+    /// asynRecord.c:651-653 prints `pasynUser->errorMessage` after any failed
+    /// `registerInterrupts`. getInterruptPvt writes it; "No asynInt32
+    /// interface" goes to ERRS only, so that line repeats what the last
+    /// manager or driver call left there.
+    #[test]
+    fn a_register_refusal_prints_the_users_last_error_message() {
+        use super::io_intr::NoInterface;
+        let mut rec = AsynRecord::default();
+        rec.trace_name = "R".into();
+        rec.port = "NO_SUCH_PORT_RI".to_string();
+        rec.init_record(1).unwrap();
+        let no_iface = || RegisterRefusal::NoInterface(NoInterface("asynInt32"));
+
+        assert_eq!(
+            rec.register_refusal_line(no_iface()),
+            "R registerInterrupts asynManager:isEnabled asynUser not connected to device"
+        );
+        assert_eq!(rec.errs, "No asynInt32 interface");
+
+        let pvt =
+            "asynManager:getInterruptPvt Driver does not support interrupts on interface asynInt32";
+        let refused = RegisterRefusal::Refused(AsynError::Status {
+            status: AsynStatus::Error,
+            message: pvt.into(),
+        });
+        assert_eq!(
+            rec.register_refusal_line(refused),
+            format!("R registerInterrupts {pvt}")
+        );
+        assert_eq!(
+            rec.register_refusal_line(no_iface()),
+            format!("R registerInterrupts {pvt}")
+        );
+
+        let mut out = IoOutcome::default();
+        out.note_error("driver read failed");
+        rec.apply_io_outcome(out);
+        assert_eq!(
+            rec.register_refusal_line(no_iface()),
+            "R registerInterrupts driver read failed"
         );
     }
 
@@ -10354,7 +10416,7 @@ mod tests {
         // not have — ERRS is the only place C tells the operator the response
         // was truncated. The trailing space is C's: the format is
         // "Overflow nread %d %s" and the `%s` (pasynUser->errorMessage) is empty
-        // when the read itself did not fail.
+        // while no call on this user has failed.
         assert_eq!(rec.errs, "Overflow nread 40 ");
         assert_eq!(
             read_alarm(&mut rec),
@@ -10403,6 +10465,21 @@ mod tests {
         let mut short = read_rec(sport, ASYN_FMT_ASCII, 80, 0);
         short.process().unwrap();
         assert_eq!(short.errs, "", "a read inside the buffer reports nothing");
+    }
+
+    /// The `%s` of an overflow that did not fail is `pasynUser->errorMessage`
+    /// (asynRecord.c:1602-1608), which keeps whatever an earlier call wrote.
+    #[test]
+    fn an_overflow_splices_the_users_stale_error_message() {
+        use crate::interpose::EomReason;
+
+        let port = "test_overflow_stale_message";
+        spawn_fill_port(port, 100, EomReason::CNT);
+        let mut rec = read_rec(port, ASYN_FMT_ASCII, 80, 0);
+        rec.device_user
+            .set_error_message(ErrorMessage::format(format_args!("earlier failure")));
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "Overflow nread 40 earlier failure");
     }
 
     /// The ASCII overflow boundary is `>=`: 39 bytes fit, 40 overflow.

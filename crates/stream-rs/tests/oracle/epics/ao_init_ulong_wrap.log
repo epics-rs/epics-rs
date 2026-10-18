@@ -1,0 +1,47 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=0
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "l.proto aoiu P"
+Stream::initRecord rec: filename="l.proto" protocol="aoiu" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("l.proto", "aoiu")
+Stream::initRecord rec: initialize the first time
+StreamCore::startProtocol(rec, startMode=StartInit)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::evalOut: outputLine = "I<0d><0a>"
+StreamCore::evalOut(rec): lockRequest(0)
+Stream::initRecord rec: waiting for initDone
+StreamCore::lockCallback(rec, StreamIoSuccess)
+StreamCore::writeCallback(rec, StreamIoSuccess)
+StreamCore::evalCommand(rec): activeCommand = in
+StreamCore::readCallback(rec, StreamIoSuccess input="1", size=1)
+StreamCore::readCallback(rec) inputBuffer="1", size 1
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) wait for more input
+StreamCore::readCallback(rec, StreamIoEnd input="8446744073709551613", size=19)
+StreamCore::readCallback(rec) inputBuffer="18446744073709551613", size 20
+StreamCore::readCallback(rec) inTerminator <0d><0a> not found
+StreamCore::readCallback(rec) end flag received
+StreamCore::readCallback(rec) input line: "18446744073709551613"
+StreamCore::matchInput(rec): format = "%u"
+StreamCore::scanValue(rec, format=%u, long) input="18446744073709551613" value=-3
+Stream::scan() currentValueLength=20
+Stream::matchValue(rec): success, 20 bytes consumed
+StreamCore::evalCommand(rec): activeCommand = end
+StreamCore::finishProtocol(rec, Success) bus owner
+Stream::protocolFinishHook(rec, Success)
+Stream::protocolFinishHook rec: signalling init done
+Stream::initRecord rec: initDone
+Stream::initRecord rec: initialized. convert
+streamInitRecord(rec) done status=0x2
+VAL 1.84467440737e+19
+SEVR "NO_ALARM"
+STAT "NO_ALARM"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+RVAL -3 = 0xfffffffd
+RBV -3 = 0xfffffffd
+OVAL 1.84467440737e+19

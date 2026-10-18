@@ -768,6 +768,45 @@ pub struct PropertyPost {
     pub post_field: String,
 }
 
+/// One `db_post_events(precord, &field, mask)` a device makes itself, outside
+/// the record's `monitor()`, with the value C's call copies into the event.
+///
+/// StreamDevice's output `readData` (`devaoStream.c:76-104`) posts from
+/// inside the protocol, and later formats of the same protocol can change the
+/// field before the post is delivered, so the value is read at the call.
+#[derive(Debug, Clone)]
+pub struct DevicePost {
+    pub field: &'static str,
+    pub mask: crate::server::recgbl::EventMask,
+    pub value: crate::types::EpicsValue,
+}
+
+impl DevicePost {
+    /// The posts `recGblResetAlarms` makes (`recGbl.c:202-217`) for a reset
+    /// that returned `reset`, `common` as it left it.
+    pub fn alarm_reset(
+        common: &CommonFields,
+        reset: &crate::server::recgbl::AlarmResetResult,
+    ) -> Vec<DevicePost> {
+        use crate::types::EpicsValue;
+        let mut posts = Vec::new();
+        crate::server::database::alarm_field_posts(common, reset).for_each(|desc, mask| {
+            let value = match desc.name {
+                "SEVR" => EpicsValue::Short(common.sevr as i16),
+                "STAT" => EpicsValue::Short(common.stat as i16),
+                "AMSG" => EpicsValue::String(String::from(&common.amsg).into()),
+                _ => EpicsValue::Short(common.acks as i16),
+            };
+            posts.push(DevicePost {
+                field: desc.name,
+                mask,
+                value,
+            });
+        });
+        posts
+    }
+}
+
 /// What a device's own I/O Intr callback decided about one pulse
 /// ([`DeviceSupport::io_intr_callback`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,6 +1022,20 @@ pub trait DeviceSupport: Send + Sync + 'static {
         &mut self,
     ) -> Option<crate::runtime::sync::mpsc::Receiver<PropertyPost>> {
         None
+    }
+
+    /// Whether this device posts monitors itself: after `init_common`,
+    /// `get_ioint_info` and `write_begin_common` the record's holder posts
+    /// [`Self::take_device_posts`] while it still holds the record, before
+    /// the record's own `monitor()`. A process cycle reads it when the
+    /// record's cycle plan is resolved, so `false` costs a cycle nothing.
+    fn posts_from_device(&self) -> bool {
+        false
+    }
+
+    /// The posts this device made in the call that just returned, in order.
+    fn take_device_posts(&mut self) -> Vec<DevicePost> {
+        Vec::new()
     }
 
     /// Whether this device drives record processing from its own callback
@@ -1260,6 +1313,8 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
     dev.set_record_info(&name, instance.common.scan);
     dev.apply_record_info(instance.info());
     instance.device = Some(dev);
+    // `CycleFacts::device_posts` is the device's.
+    instance.invalidate_plan();
 }
 
 /// The INIT half: C `pdset->common.init_record(prec)`, the call every record
@@ -1281,6 +1336,7 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         if let Some(saved) = saved.filter(|_| row.is_some_and(|r| r.has_init_record())) {
             instance.record.eoff_eslo_after_dset_init(saved);
         }
+        instance.record.after_dset_init();
         instance.dset_init = if instance.common.dtyp.is_soft() {
             instance.record.soft_dset_init()
         } else {
@@ -1291,6 +1347,8 @@ pub fn init_device_support(instance: &mut RecordInstance) {
     dev.bind_database(instance.device_done.database());
     dev.set_callback_priority(instance.common.callback_priority());
     let outcome = dev.init_common(&mut *instance.record, &mut instance.common);
+    instance.post_device_values(dev.take_device_posts());
+    instance.record.after_dset_init();
     if let Some(saved) = saved.filter(|_| dev.has_init_record()) {
         instance.record.eoff_eslo_after_dset_init(saved);
     }
@@ -1326,6 +1384,15 @@ pub fn init_device_support(instance: &mut RecordInstance) {
         // `DsetInit::Failed`, not an alarm.
         Err(_) => DsetInit::Failed,
     };
+    if status == DsetInit::Failed
+        && let Some(message) = instance.record.bad_init_ret_message()
+    {
+        crate::server::recgbl::rec_gbl_record_error(
+            &crate::server::recgbl::DevSupStatus::BadInitRet.text(),
+            &instance.name.to_str_lossy(),
+            message,
+        );
+    }
     instance.dset_init = if !dev.has_init_record() {
         DsetInit::Absent
     } else {

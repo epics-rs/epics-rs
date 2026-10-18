@@ -1,0 +1,10 @@
+AsynDriverInterface::disconnectRequest rec
+AsynDriverInterface::disconnectHandler rec is not yet disconnected
+AsynDriverInterface::exceptionHandler(rec, Connect)
+AsynDriverInterface::exceptionHandler(rec) P 0 disconnected. ioAction: Disconnect
+AsynDriverInterface::connectRequest rec
+AsynDriverInterface::connectToAsynPort(rec)
+AsynDriverInterface::exceptionHandler(rec, Connect)
+AsynDriverInterface::exceptionHandler(rec) P 0 connected. ioAction: Connect
+AsynDriverInterface::finish(rec) start
+AsynDriverInterface::finish(rec) done

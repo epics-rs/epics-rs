@@ -816,10 +816,11 @@ impl Acceptor {
                 // parent does not follow (C copies once, here too).
                 self.seed_child_trace(&child);
                 // C :389-398 — the octet callbacks carry the child port name,
-                // not the payload. The listener walks the interrupt list and
-                // calls EVERY node unconditionally: there is no addr test here
-                // (unlike asynOctetBase.c:202-210, which does test addr). A
-                // client landing in slot 3 must be announced to a listener that
+                // not the payload, with eomReason 0 (:394-395). The listener
+                // walks the interrupt list and calls EVERY node
+                // unconditionally: there is no addr test here (unlike
+                // asynOctetBase.c:202-210, which does test addr). A client
+                // landing in slot 3 must be announced to a listener that
                 // registered on addr 0, because "which slot" is the news.
                 self.interrupts.notify_octet(
                     OctetFanOut::EveryUser,
@@ -1568,6 +1569,7 @@ impl DrvAsynIPServerPort {
                 } else {
                     EomReason::empty()
                 },
+                taken_back: 0,
             }),
             Err(f) => Err(f.error),
         }
@@ -1701,9 +1703,7 @@ fn udp_recv_loop(
                 // C :326-335 — every registered octet callback gets the
                 // datagram, unconditionally (no addr test, exactly as for the
                 // TCP announcement at :387-398). A datagram is a whole message,
-                // so C passes ASYN_EOM_END; InterruptValue carries no eom
-                // because no consumer reads one (C's own octet consumer,
-                // devAsynOctet.c:477-478, ignores the eomReason argument).
+                // so C passes ASYN_EOM_END (:330-331).
                 //
                 // Fired with the cache lock released: a subscriber's callback
                 // runs inline here, and a callback that reads the port back
@@ -1716,6 +1716,7 @@ fn udp_recv_loop(
                         value: ParamValue::Octet(buf[..n].into()),
                         timestamp: SystemTime::now(),
                         iface: Some(InterfaceType::Octet),
+                        eom_reason: EomReason::END,
                         ..Default::default()
                     },
                 );
@@ -2900,11 +2901,15 @@ mod tests {
         let mut buf = [0u8; 64];
         // First read stops at the terminator — it does NOT run to the buffer
         // bound and swallow line2.
-        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
         assert_eq!(&buf[..n], b"line1");
         assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
         // Second read returns the buffered second line, no further socket read.
-        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf).unwrap();
+        let (n, eom) = crate::port::octet_read_chain(&mut sub, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
         assert_eq!(&buf[..n], b"line2");
         assert!(eom.contains(EomReason::EOS), "eom = {eom:?}");
 
@@ -3069,7 +3074,7 @@ mod tests {
             .local_addr()
             .unwrap();
 
-        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen: Arc<StdMutex<Vec<(String, EomReason)>>> = Arc::new(StdMutex::new(Vec::new()));
         let seen_cb = seen.clone();
         let _cb = srv
             .base()
@@ -3084,7 +3089,7 @@ mod tests {
                         seen_cb
                             .lock()
                             .unwrap()
-                            .push(String::from_utf8_lossy(s).into_owned());
+                            .push((String::from_utf8_lossy(s).into_owned(), iv.eom_reason));
                     }
                 },
             )
@@ -3104,7 +3109,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(seen.lock().unwrap().as_slice(), ["telemetry".to_string()]);
+        // A datagram is a whole message: ASYN_EOM_END (:330-331).
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [("telemetry".to_string(), EomReason::END)]
+        );
 
         srv.disconnect(&AsynUser::default()).unwrap();
     }

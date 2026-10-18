@@ -17,6 +17,11 @@ impl RecordDb {
     pub(crate) fn of(db: &PvDatabase) -> Self {
         Self(Arc::downgrade(&db.inner))
     }
+
+    /// The database, or `None` once it is gone.
+    pub(crate) fn upgrade(&self) -> Option<PvDatabase> {
+        self.0.upgrade().map(|inner| PvDatabase { inner })
+    }
 }
 
 /// Handed to a context subroutine for one call.
@@ -34,7 +39,7 @@ impl SubroutineContext<'_> {
 
     /// The record's database, or `None` once it is gone.
     pub fn db(&self) -> Option<PvDatabase> {
-        self.db.0.upgrade().map(|inner| PvDatabase { inner })
+        self.db.upgrade()
     }
 
     /// C `prec->dpvt` as the type the INAM routine stored, or `None` when it

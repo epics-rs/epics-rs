@@ -3328,11 +3328,13 @@ mod tests {
                         Ok(OctetReadResult {
                             nbytes_transferred: 1,
                             eom_reason: EomReason::CNT,
+                            taken_back: 0,
                         })
                     }
                     None => Ok(OctetReadResult {
                         nbytes_transferred: 0,
                         eom_reason: EomReason::empty(),
+                        taken_back: 0,
                     }),
                 }
             }
@@ -3461,6 +3463,7 @@ mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: 0,
                     eom_reason: EomReason::empty(),
+                    taken_back: 0,
                 })
             }
             fn write(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -3683,6 +3686,189 @@ mod tests {
     /// Build a minimal `CommandContext` for exercising registered
     /// handlers in-process. Mirrors the helper used in
     /// `epics-base-rs/src/server/iocsh/commands.rs::tests`.
+    /// A port whose every read is the message `x\r\n`, fanned out to its octet interrupt
+    /// users as C's stream drivers do, with C's EOS layer on top.
+    struct LinePort {
+        base: PortDriverBase,
+    }
+    impl PortDriver for LinePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, crate::interpose::EomReason)> {
+            buf[..3].copy_from_slice(b"x\r\n");
+            Ok((3, crate::interpose::EomReason::END))
+        }
+    }
+
+    fn line_port(mgr: &PortManager, name: &str) -> crate::port_handle::PortHandle {
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.octet_interrupt_process = true;
+        base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        mgr.register_port_unclaimed(LinePort { base }, &crate::registry::open_owner())
+            .unwrap();
+        mgr.find_port_handle(name).unwrap()
+    }
+
+    /// What `PortHandle::input_eos(0)` answers inside each octet interrupt
+    /// callback, which runs on the port thread inside the driver's read.
+    fn eos_in_callbacks(
+        handle: &crate::port_handle::PortHandle,
+    ) -> (
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        crate::interrupt::SyncCallbackSubscription,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, reader) = (seen.clone(), handle.clone());
+        let sub = handle
+            .interrupts()
+            .register_sync_callback(
+                crate::interrupt::InterruptFilter {
+                    addr: Some(0),
+                    iface: Some(crate::interfaces::InterfaceType::Octet),
+                    ..Default::default()
+                },
+                move |_| sink.lock().unwrap().push(reader.input_eos(0)),
+            )
+            .unwrap();
+        (seen, sub)
+    }
+
+    fn read_line(handle: &crate::port_handle::PortHandle) {
+        handle
+            .submit_blocking(
+                crate::request::RequestOp::OctetRead { buf_size: 16 },
+                AsynUser::new(0).with_timeout(std::time::Duration::from_secs(1)),
+            )
+            .expect("read");
+    }
+
+    /// The terminator a port was given is what an interrupt callback inside
+    /// the next read sees, though the driver is borrowed by that read.
+    #[test]
+    fn the_input_eos_set_is_read_inside_an_interrupt_callback() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eos_intr");
+        let (seen, _sub) = eos_in_callbacks(&handle);
+        handle
+            .set_input_eos_blocking(shell_eos_user(0), b"\n")
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [b"\n".to_vec()]);
+    }
+
+    /// A port whose read reports END hands its octet interrupt users END
+    /// (asynOctetBase.c:234-236), through the port thread and the EOS layer.
+    #[test]
+    fn an_end_read_reaches_the_interrupt_user_as_end() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eom_end");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = handle
+            .interrupts()
+            .register_sync_callback(
+                crate::interrupt::InterruptFilter {
+                    addr: Some(0),
+                    iface: Some(crate::interfaces::InterfaceType::Octet),
+                    ..Default::default()
+                },
+                move |iv| sink.lock().unwrap().push(iv.eom_reason),
+            )
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [crate::interpose::EomReason::END]);
+    }
+
+    /// `asynOctetSetInputEos` at run time reaches the next callback.
+    #[test]
+    fn a_runtime_set_input_eos_is_seen_by_the_next_callback() {
+        let mgr = Arc::new(PortManager::new());
+        let handle = line_port(&mgr, "eos_rt");
+        let (seen, _sub) = eos_in_callbacks(&handle);
+        read_line(&handle);
+        let ctx = make_ctx();
+        let cmds = build_asyn_commands(mgr.clone());
+        cmds.iter()
+            .find(|c| c.name == "asynOctetSetInputEos")
+            .unwrap()
+            .handler
+            .call(
+                &[
+                    ArgValue::String("eos_rt".into()),
+                    ArgValue::Int(0),
+                    ArgValue::String(r"\r\n".into()),
+                ],
+                &ctx,
+            )
+            .unwrap();
+        read_line(&handle);
+        assert_eq!(*seen.lock().unwrap(), [b"".to_vec(), b"\r\n".to_vec()]);
+    }
+
+    /// A device whose terminator is one register for all its addresses
+    /// (Prologix's `++eos`): a set at one address is what every address reads.
+    #[test]
+    fn an_input_eos_shared_by_every_address_is_seen_at_each() {
+        struct OneRegister {
+            base: PortDriverBase,
+            eos: Vec<u8>,
+        }
+        impl PortDriver for OneRegister {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+                self.eos = eos.to_vec();
+                Ok(())
+            }
+            fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+                self.eos.clone()
+            }
+        }
+        let mgr = Arc::new(PortManager::new());
+        mgr.register_port_unclaimed(
+            OneRegister {
+                base: PortDriverBase::new(
+                    "eos_one",
+                    4,
+                    PortFlags {
+                        multi_device: true,
+                        ..PortFlags::default()
+                    },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                eos: Vec::new(),
+            },
+            &crate::registry::open_owner(),
+        )
+        .unwrap();
+        let handle = mgr.find_port_handle("eos_one").unwrap();
+        handle
+            .set_input_eos_blocking(shell_eos_user(1), b"\n")
+            .unwrap();
+        for addr in [-1, 0, 1, 3] {
+            assert_eq!(handle.input_eos(addr), b"\n", "addr {addr}");
+        }
+    }
+
     fn make_ctx() -> CommandContext {
         use epics_base_rs::server::database::PvDatabase;
         let rt = tokio::runtime::Runtime::new().unwrap();

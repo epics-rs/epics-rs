@@ -14,4 +14,5 @@ StreamCore::evalOut: outputLine = "TO<0d><0a>"
 StreamCore::writeCallback(rec, StreamIoSuccess)
 StreamCore::evalCommand(rec): activeCommand = in
 StreamCore::readCallback(rec, StreamIoNoReply input="", size=0)
+rec: No reply within 100 ms to "TO<0d><0a>"
 StreamCore::finishProtocol(rec, ReplyTimeout) bus owner

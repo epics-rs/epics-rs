@@ -94,6 +94,11 @@ impl Record for StringoutRecord {
         "stringout"
     }
 
+    /// devstringoutStream.c reads and writes the `stringoutRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// devSoSoft.c and devSoSoftCallback.c return `dbPutLink`'s status.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {

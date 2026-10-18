@@ -444,7 +444,7 @@ impl Record for MbboDirectRecord {
     /// UDF set also leaves VAL and the bits both zero, so the unconditional
     /// form is the same derivation. No `convert()`: C does not translate VAL to
     /// RVAL at init on this record.
-    fn init_record_tail(&mut self) {
+    fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         self.val_to_bits();
         self.oraw = self.rval;
         self.orbv = self.rbv;

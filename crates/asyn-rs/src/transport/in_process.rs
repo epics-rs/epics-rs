@@ -293,6 +293,7 @@ mod tests {
                 alarm_status: 0,
                 alarm_severity: 0,
                 iface: None,
+                eom_reason: crate::interpose::EomReason::empty(),
             })
         };
         fire(1);

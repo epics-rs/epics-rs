@@ -177,6 +177,8 @@ pub struct ScanControl {
     /// Open from C `finishDevSup` on: when a dset's `init(after=1)` ran.
     /// Never closes, and opens before `gate` can.
     dev_sup: Arc<crate::runtime::interrupt_accept::InterruptGate>,
+    /// Set by C `scanInit`'s `buildScanLists`; never cleared.
+    lists_built: std::sync::atomic::AtomicBool,
 }
 
 const SCAN_CTL_PAUSE: u8 = 2;
@@ -189,6 +191,7 @@ impl ScanControl {
             claimed: std::sync::atomic::AtomicBool::new(false),
             gate: crate::runtime::interrupt_accept::InterruptGate::new(),
             dev_sup: crate::runtime::interrupt_accept::InterruptGate::new(),
+            lists_built: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -201,6 +204,19 @@ impl ScanControl {
     /// C `finishDevSup` (`iocInit.c:464`): every dset's `init(1)`.
     pub fn finish_dev_sup(&self) {
         self.dev_sup.set(true);
+    }
+
+    /// C `buildScanLists` (`dbScan.c:1055-1076`): from here a record's scan
+    /// moves join and leave the lists; before it, `scanInit` joins each record
+    /// by its SCAN then.
+    pub(crate) fn build_lists(&self) {
+        self.lists_built
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::build_lists`] has run.
+    pub(crate) fn lists_built(&self) -> bool {
+        self.lists_built.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The `interruptAccept` of the database this cell belongs to; what a

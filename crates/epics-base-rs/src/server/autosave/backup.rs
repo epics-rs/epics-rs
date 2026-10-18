@@ -425,7 +425,7 @@ async fn check_restore_file(file: &Path, settings: &SrSettings) -> bool {
             .or_else(|| header.iter().position(|&b| b == b'V'));
         if let Some(at) = tag {
             let version = if header.get(at + 1).is_some_and(u8::is_ascii_digit) {
-                crate::calc::engine::strtod::strtod(&header[at + 1..]).value
+                crate::runtime::stdlib::strtod(&header[at + 1..]).value
             } else {
                 0.0
             };

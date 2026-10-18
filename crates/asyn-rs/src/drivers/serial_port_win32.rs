@@ -344,6 +344,7 @@ impl OctetNext for SerialIoStateWin32 {
             } else {
                 EomReason::empty()
             },
+            taken_back: 0,
         })
     }
 

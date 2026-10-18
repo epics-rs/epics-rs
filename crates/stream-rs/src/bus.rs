@@ -49,12 +49,64 @@ impl StreamIoStatus {
     }
 }
 
+/// What a read hands its client: C's `(input, size)` of `readCallback`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadInput<'a> {
+    /// `size` bytes at `input`, none when there is no data (timeout, fault).
+    Bytes(&'a [u8]),
+    /// A negative `size`: that many bytes an earlier call delivered are taken
+    /// back, and `input` is not read. asyn's EOS layer sends -1 when a
+    /// two-byte terminator straddles reads (asynInterposeEos.c:201-204).
+    TakeBack(usize),
+}
+
+impl<'a> ReadInput<'a> {
+    /// C's signed `size`.
+    pub fn size(self) -> isize {
+        match self {
+            Self::Bytes(b) => b.len() as isize,
+            Self::TakeBack(n) => -(n as isize),
+        }
+    }
+
+    /// The bytes C's `StreamBuffer(input, size)` holds: none for a take-back.
+    pub fn bytes(self) -> &'a [u8] {
+        match self {
+            Self::Bytes(b) => b,
+            Self::TakeBack(_) => &[],
+        }
+    }
+
+    /// A copy that outlives the bus's buffer.
+    pub fn to_owned(self) -> OwnedReadInput {
+        match self {
+            Self::Bytes(b) => OwnedReadInput::Bytes(b.to_vec()),
+            Self::TakeBack(n) => OwnedReadInput::TakeBack(n),
+        }
+    }
+}
+
+/// [`ReadInput`] holding its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnedReadInput {
+    Bytes(Vec<u8>),
+    TakeBack(usize),
+}
+
+impl OwnedReadInput {
+    pub fn as_input(&self) -> ReadInput<'_> {
+        match self {
+            Self::Bytes(b) => ReadInput::Bytes(b),
+            Self::TakeBack(n) => ReadInput::TakeBack(*n),
+        }
+    }
+}
+
 /// `StreamBusInterface::Client`
 pub trait Client: Send + Sync {
     fn lock_callback(&self, status: StreamIoStatus);
     fn write_callback(&self, _status: StreamIoStatus) {}
-    /// `input` is empty when there is no data (timeout, fault).
-    fn read_callback(&self, _status: StreamIoStatus, _input: &[u8]) -> isize {
+    fn read_callback(&self, _status: StreamIoStatus, _input: ReadInput<'_>) -> isize {
         0
     }
     fn event_callback(&self, _status: StreamIoStatus) {}
@@ -63,6 +115,9 @@ pub trait Client: Send + Sync {
     fn priority(&self) -> i64 {
         0
     }
+    /// The IOC's `interruptAccept`, before which asynchronous input is
+    /// dropped (AsynDriverInterface.cc:1110).
+    fn interrupt_accept(&self) -> bool;
     /// `getInTerminator`: `None` when no terminator is defined.
     fn get_in_terminator(&self) -> Option<Vec<u8>>;
     /// `getOutTerminator`: `None` when no terminator is defined.
@@ -292,6 +347,9 @@ mod tests {
         fn lock_callback(&self, status: StreamIoStatus) {
             self.log.lock().push(format!("lock {}", status.to_str()));
         }
+        fn interrupt_accept(&self) -> bool {
+            true
+        }
         fn get_in_terminator(&self) -> Option<Vec<u8>> {
             None
         }
@@ -358,5 +416,15 @@ mod tests {
         assert!(!bus.bus_supports_event());
         bus.bus_release();
         assert!(!bus.bus_lock_request(100));
+    }
+
+    #[test]
+    fn a_take_back_is_cs_negative_size_and_no_bytes() {
+        let back = ReadInput::TakeBack(1);
+        assert_eq!((back.size(), back.bytes()), (-1, &[][..]));
+        assert_eq!(back.to_owned().as_input(), back);
+        let bytes = ReadInput::Bytes(b"\r");
+        assert_eq!((bytes.size(), bytes.bytes()), (1, &b"\r"[..]));
+        assert_eq!(bytes.to_owned().as_input(), bytes);
     }
 }

@@ -619,7 +619,7 @@ impl Record for ASubRecord {
         asub_output_event_fields()
     }
 
-    fn init_record_tail(&mut self) {
+    fn init_record_tail(&mut self, _: &mut crate::server::record::CommonFields) {
         // C `init_record`'s tail (`aSubRecord.c:164-171`).
         self.ovla = self.vala.clone();
         self.onva = self.neva;

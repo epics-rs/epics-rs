@@ -6,10 +6,12 @@ use std::path::Path;
 
 use crate::calc::engine::cvt::{fmt_f, fmt_g};
 use crate::calc::engine::string::{escaped_from_raw, raw_from_escaped};
-use crate::calc::engine::strtod::strtod;
-use crate::server::database::PvDatabase;
+use crate::runtime::stdlib::strtod;
+use crate::server::database::{ClientChannel, Connection, PvDatabase};
 use crate::server::record::record_instance::value_as_dbr_string;
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{
+    DBR_CHAR, DBR_DOUBLE, DBR_FLOAT, DBR_SHORT, DBR_STRING, DbFieldType, EpicsValue,
+};
 
 /// `save_restore.h` `BUF_SIZE`: what one `fgets` reads.
 const BUF_SIZE: usize = 200;
@@ -19,6 +21,8 @@ const MAX_STRING_SIZE: usize = 40;
 const FSMALL: f64 = 1.0e-6;
 const DSMALL: f64 = 1.0e-8;
 const ASVERSION: &str = "asVerify R5.3";
+/// `PEND_TIME`, what each `ca_pend_io` waits.
+const PEND_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 const ARRAY_MARKER: &[u8] = b"@array@";
 const ELEMENT: u8 = b'"';
 const ESCAPE: u8 = b'\\';
@@ -195,9 +199,9 @@ fn f64s(value: &EpicsValue, count: usize) -> Vec<f64> {
 }
 
 fn shorts(value: &EpicsValue, count: usize) -> Vec<i16> {
-    let v = match value {
-        EpicsValue::Enum(i) | EpicsValue::EnumWithChoices { index: i, .. } => vec![*i as i16],
-        EpicsValue::EnumArray(a) => a.iter().map(|&i| i as i16).collect(),
+    let v = match value.convert_to(DbFieldType::Short) {
+        EpicsValue::Short(i) => vec![i],
+        EpicsValue::ShortArray(a) => a.iter().copied().collect(),
         _ => Vec::new(),
     };
     padded(v, count)
@@ -219,7 +223,9 @@ fn strings(value: &EpicsValue, count: usize) -> Vec<Vec<u8>> {
     padded(v, count)
 }
 
-/// `DBR_CHAR` elements as the C string they hold.
+/// `DBR_CHAR` elements as the C string they hold, ending at the count when
+/// no NUL does: C's `strncmp`, `printf` and `strlen` run on past a buffer
+/// with no NUL into the file's side of it (verify.c:361, :384, :394-396).
 fn char_string(value: &EpicsValue) -> Vec<u8> {
     let bytes: Vec<u8> = match value {
         EpicsValue::CharArray(a) | EpicsValue::UCharArray(a) => a.iter().copied().collect(),
@@ -228,6 +234,24 @@ fn char_string(value: &EpicsValue) -> Vec<u8> {
     };
     let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
     bytes[..end].to_vec()
+}
+
+/// `ca_create_channel` then `ca_pend_io(PEND_TIME)` (verify.c:143-145): the
+/// channel when it connected in time.
+async fn connect(db: &PvDatabase, pv: &str) -> Option<std::sync::Arc<dyn ClientChannel>> {
+    let chid = db.ca_client().create_channel(pv).await?;
+    let connected = async {
+        while let Some(c) = chid.next_connection().await {
+            if c == Connection::Connected {
+                return true;
+            }
+        }
+        false
+    };
+    match crate::runtime::task::timeout(PEND_TIME, connected).await {
+        Ok(true) => Some(chid),
+        _ => None,
+    }
 }
 
 fn array_line(pv: &str, elements: impl Iterator<Item = String>) -> String {
@@ -348,7 +372,7 @@ pub async fn do_as_verify(
         }
         let pv = String::from_utf8_lossy(name_bytes).into_owned();
 
-        let Ok(live) = db.get_pv(&pv) else {
+        let Some(chid) = connect(db, &pv).await else {
             println!(
                 "asVerify: *** '{pv}' not connected.  Saved value='{}'",
                 String::from_utf8_lossy(&value)
@@ -360,13 +384,12 @@ pub async fn do_as_verify(
             continue;
         };
         num_pvs += 1;
-        let native = live.dbr_type();
+        let native = chid.native_type().expect("a connected channel has a type");
         let is_long_string = native == DbFieldType::Char && pv.ends_with('$');
-        let element_count = db
-            .restore_target(&pv)
-            .map(|t| t.elements as usize)
-            .unwrap_or(live.count() as usize)
-            .max(1);
+        let element_count = chid
+            .element_count()
+            .expect("a connected channel has a count")
+            .max(1) as usize;
         let is_scalar_in_file = !value.starts_with(ARRAY_MARKER);
         let is_scalar = is_scalar_in_file && element_count <= 1;
         let is_string_waveform =
@@ -375,6 +398,23 @@ pub async fn do_as_verify(
             Vec::new()
         } else {
             padded(read_array(&mut lines, &value), element_count)
+        };
+        // The type C's `ca_array_get` asks for (:157-159, :348-350), and its
+        // line when the get fails.
+        let (dbr, cant_get) = match native {
+            DbFieldType::Float => (DBR_FLOAT, "asVerify: "),
+            DbFieldType::Double => (DBR_DOUBLE, "asVerify: "),
+            DbFieldType::Enum => (DBR_SHORT, ""),
+            _ if is_long_string || is_string_waveform => (DBR_CHAR, ""),
+            _ => (DBR_STRING, ""),
+        };
+        let got = crate::runtime::task::timeout(PEND_TIME, chid.get(dbr, element_count as u32));
+        let live = match got.await {
+            Ok(Ok(snapshot)) => snapshot.value,
+            _ => {
+                println!("{cant_get}Can't get value from '{pv}'.");
+                EpicsValue::CharArray(Vec::new().into())
+            }
         };
         let prefix = |different: bool| if different { "*** " } else { "    " };
         let mismatch = |asverify: &str| {

@@ -40,6 +40,11 @@ bitflags! {
 pub struct OctetReadResult {
     /// Number of bytes actually transferred into the buffer.
     pub nbytes_transferred: usize,
+    /// Bytes an earlier read already returned that this read takes back: the
+    /// lead byte of a two-byte EOS split across reads. C's
+    /// `*nbytesTransferred` is `nbytes_transferred - taken_back`, which goes
+    /// negative there (asynInterposeEos.c:201-204). Only the EOS layer sets it.
+    pub taken_back: usize,
     /// Reason(s) the read terminated.
     pub eom_reason: EomReason,
 }
@@ -477,6 +482,7 @@ mod tests {
             Ok(OctetReadResult {
                 nbytes_transferred: n,
                 eom_reason: EomReason::CNT,
+                taken_back: 0,
             })
         }
 
@@ -758,5 +764,42 @@ mod tests {
         assert_eq!(write_from(&mut single, 0), b"Sx");
         assert_eq!(write_from(&mut single, 4), b"Sx");
         assert_eq!(write_from(&mut single, -1), b"Sx");
+    }
+
+    /// The EOS layer's read below every other layer: what each passes up is
+    /// what it got, `taken_back` included.
+    #[test]
+    fn every_layer_above_eos_passes_taken_back_up() {
+        struct TakesBack;
+        impl OctetNext for TakesBack {
+            fn read(&mut self, _: &AsynUser, _: &mut [u8]) -> AsynResult<OctetReadResult> {
+                Ok(OctetReadResult {
+                    nbytes_transferred: 0,
+                    eom_reason: EomReason::EOS,
+                    taken_back: 1,
+                })
+            }
+            fn write(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self, _: &mut AsynUser) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+        let layers: [fn() -> Box<dyn OctetInterpose>; 4] = [
+            || Box::new(com::ComInterpose::new()),
+            || Box::new(echo::EchoInterpose::new()),
+            || Box::new(delay::DelayInterpose::new(std::time::Duration::ZERO)),
+            || Box::new(flush::FlushTimeoutInterpose::new(std::time::Duration::ZERO)),
+        ];
+        for layer in layers {
+            let mut stack = OctetInterposeStack::new(false);
+            stack.install(-1, layer());
+            let mut buf = [0u8; 4];
+            let r = stack
+                .dispatch_read(&AsynUser::default(), &mut buf, &mut TakesBack)
+                .unwrap();
+            assert_eq!((r.nbytes_transferred, r.taken_back), (0, 1));
+        }
     }
 }

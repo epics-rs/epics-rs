@@ -1,0 +1,18 @@
+rec: l.proto p P
+active command=none flags=0x200048 GotValue ScanTried
+p {
+  extraInput    = error;
+  lockTimeout   = 5000; # ms
+  readTimeout   = 100; # ms
+  replyTimeout  = 1000; # ms
+  writeTimeout  = 100; # ms
+  pollPeriod    = 1000; # ms
+  maxInput      = 0; # bytes
+  inTerminator  = "\r\n";
+  outTerminator = "\r\n";
+  separator     = "";
+
+    out "GET";
+    in "%d";
+}
+

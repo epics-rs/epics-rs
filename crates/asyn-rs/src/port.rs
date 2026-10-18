@@ -1377,6 +1377,11 @@ impl PortDriverBase {
         if !changed {
             return false;
         }
+        // C `exceptionDisconnect` restarts the PORT's connect timer for any
+        // dpCommon while the port is down and auto-connect (asynManager.c:2182-2184).
+        if !connected && !self.is_connected() && self.is_auto_connect() {
+            self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
+        }
         self.announce_exception(AsynException::Connect, addr);
         true
     }
@@ -2511,6 +2516,9 @@ impl PortDriverBase {
                 // Untyped: a single cached value per (reason,addr) reaches
                 // every subscribing interface (the pre-per-interface path).
                 iface: None,
+                // C `paramList::octetCallback` passes ASYN_EOM_END
+                // (asynPortDriver.cpp:816-818); no other interface reads it.
+                eom_reason: EomReason::END,
             });
             Ok(true)
         })
@@ -2560,6 +2568,7 @@ impl PortDriverBase {
                 alarm_severity,
                 // Untyped (see `call_param_callbacks`).
                 iface: None,
+                eom_reason: EomReason::END,
             });
         }
         Ok(())
@@ -2619,6 +2628,7 @@ impl PortDriverBase {
             alarm_status: 0,
             alarm_severity: 0,
             iface: Some(iface),
+            eom_reason: EomReason::empty(),
         });
     }
 
@@ -3619,6 +3629,7 @@ impl OctetNext for DriverOctetLink<'_> {
                     value: ParamValue::Octet(raw.into()),
                     timestamp: base.get_time_stamp(),
                     iface: Some(InterfaceType::Octet),
+                    eom_reason,
                     ..Default::default()
                 },
             );
@@ -3626,6 +3637,7 @@ impl OctetNext for DriverOctetLink<'_> {
         Ok(OctetReadResult {
             nbytes_transferred,
             eom_reason,
+            taken_back: 0,
         })
     }
 
@@ -3679,9 +3691,8 @@ pub(crate) fn octet_read_chain(
     driver: &mut dyn PortDriver,
     user: &AsynUser,
     buf: &mut [u8],
-) -> AsynResult<(usize, EomReason)> {
+) -> AsynResult<OctetReadResult> {
     with_octet_chain(driver, |chain, link| chain.dispatch_read(user, buf, link))
-        .map(|r| (r.nbytes_transferred, r.eom_reason))
 }
 
 /// One octet write on the port, through the addressed device's chain
@@ -3837,7 +3848,9 @@ pub(crate) mod tests {
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
-        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+        let (n, eom) = octet_read_chain(&mut drv, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
 
         // The CALLER gets the EOS-terminated message, terminator stripped.
         assert_eq!(&buf[..n], b"abc");
@@ -3850,6 +3863,72 @@ pub(crate) mod tests {
             vec![b"ab".to_vec(), b"c\r\n".to_vec()],
             "each driver read fans out its raw chunk"
         );
+    }
+
+    /// The octet callback's eomReason is the driver read's own
+    /// (asynOctetBase.c:234-236): CNT when the read filled the buffer, none
+    /// when it did not.
+    #[test]
+    fn an_octet_interrupt_carries_the_driver_reads_eom() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::sync::{Arc, Mutex};
+
+        let mut drv = ChunkDriver::new(vec![b"abcd", b"ab"]);
+        let seen: Arc<Mutex<Vec<EomReason>>> = Arc::default();
+        let sink = seen.clone();
+        let _sub = drv
+            .base()
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv: &InterruptValue| {
+                sink.lock().unwrap().push(iv.eom_reason)
+            })
+            .unwrap();
+        let user = AsynUser::default();
+        let mut buf = [0u8; 4];
+        octet_read_chain(&mut drv, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
+        octet_read_chain(&mut drv, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), [EomReason::CNT, EomReason::empty()]);
+    }
+
+    /// `paramList::octetCallback` passes ASYN_EOM_END (asynPortDriver.cpp:
+    /// 816-818), from `call_param_callbacks` and `call_param_callback` alike.
+    #[test]
+    fn an_octet_param_callback_carries_end() {
+        use crate::interrupt::{InterruptFilter, InterruptValue};
+        use std::sync::{Arc, Mutex};
+
+        let gate = InterruptGate::new();
+        gate.set(true);
+        let mut base = PortDriverBase::new(
+            "octend",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.own_interrupts(gate);
+        let msg = base.create_param("MSG", ParamType::Octet).unwrap();
+        let seen: Arc<Mutex<Vec<EomReason>>> = Arc::default();
+        let sink = seen.clone();
+        let _sub = base
+            .interrupts
+            .register_sync_callback(
+                InterruptFilter {
+                    reason: Some(msg),
+                    ..Default::default()
+                },
+                move |iv: &InterruptValue| sink.lock().unwrap().push(iv.eom_reason),
+            )
+            .unwrap();
+        base.set_string_param(msg, 0, "a").unwrap();
+        base.call_param_callbacks(0).unwrap();
+        base.set_string_param(msg, 0, "b").unwrap();
+        base.call_param_callback(0, msg).unwrap();
+        assert_eq!(*seen.lock().unwrap(), [EomReason::END, EomReason::END]);
     }
 
     /// A device answer is bytes. C's octet callback hands the subscriber
@@ -3883,7 +3962,9 @@ pub(crate) mod tests {
 
         let user = AsynUser::default();
         let mut buf = [0u8; 32];
-        let (n, _eom) = octet_read_chain(&mut drv, &user, &mut buf).unwrap();
+        let (n, _eom) = octet_read_chain(&mut drv, &user, &mut buf)
+            .map(|r| (r.nbytes_transferred, r.eom_reason))
+            .unwrap();
 
         assert_eq!(&buf[..n], RAW, "the caller gets the device bytes");
         assert_eq!(
@@ -4608,6 +4689,7 @@ pub(crate) mod tests {
                 Ok(OctetReadResult {
                     nbytes_transferred: n,
                     eom_reason: EomReason::CNT,
+                    taken_back: 0,
                 })
             }
             fn write(&mut self, _u: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -5564,6 +5646,35 @@ pub(crate) mod tests {
         base.stamp_auto_connect_attempt(2, t0);
         assert!(!base.auto_connect_throttle_ok(2, t0));
         assert!(base.auto_connect_throttle_ok(2, t0 + Duration::from_secs(2)));
+    }
+
+    /// asynManager.c:2182-2184: a device's exceptionDisconnect restarts the
+    /// port's connect timer at .01 s when the port is down and auto-connect,
+    /// and leaves it alone while the port is up.
+    #[test]
+    fn a_device_disconnect_restarts_the_downed_ports_connect_timer() {
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new(
+            "devarm",
+            4,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        base.init_connected(true);
+        base.connect_addr(1);
+        base.connect_addr(2);
+        assert!(base.set_addr_connected(1, false));
+        assert!(base.connect_retry_at.is_none(), "the port is up");
+
+        base.set_connected(false);
+        let backoff = Instant::now() + Duration::from_secs(20);
+        base.connect_retry_at = Some(backoff);
+        assert!(base.set_addr_connected(2, false));
+        assert!(base.connect_retry_at.unwrap() < backoff);
     }
 
     #[test]

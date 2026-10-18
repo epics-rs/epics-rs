@@ -1,0 +1,32 @@
+drvStreamInit()
+StreamProtocolParser::path = /home/stevek/work/_tgt/monitor/trial/crates/stream-rs/tests/oracle/epics
+streamInitRecord(rec): SEVR=3
+streamInitRecord(rec): create new Stream object
+streamInitRecord(rec): calling initRecord
+Stream::initRecord rec: parse link string "lso.proto wd P"
+Stream::initRecord rec: filename="lso.proto" protocol="wd" bus="P" addr=0 params=""
+Stream::initRecord rec: attachBus("P", 0, "")
+Stream::initRecord rec: parse("lso.proto", "wd")
+Stream::initRecord rec: initialize the first time
+streamInitRecord(rec) done status=0x2
+Stream::process(rec)
+Stream::process(rec) start
+StreamCore::startProtocol(rec, startMode=StartNormal)
+StreamCore::evalCommand(rec): activeCommand = out
+StreamCore::formatOutput(rec): format = %d
+Stream::formatValue(rec, format=%d, fieldaddr=(nil)
+Stream::formatValue(rec) format=%d type=DBF_LONG
+Stream::formatValue(rec): writeData failed
+rec: Cannot format value with '%d'
+StreamCore::finishProtocol(rec, FormatError) not bus owner
+Stream::protocolFinishHook(rec, FormatError)
+Stream::process(rec): could not start protocol, status=CALC (12)
+VAL "hello"
+SEVR "INVALID"
+STAT "CALC"
+UDF 0 = 0x0
+PACT 0 = 0x0
+PROC 0 = 0x0
+LEN 6 = 0x6
+OVAL "hello"
+OLEN 6 = 0x6

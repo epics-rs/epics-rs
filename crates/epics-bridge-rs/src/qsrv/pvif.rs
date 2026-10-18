@@ -376,6 +376,11 @@ pub enum NtType {
     /// removes the dual meaning of a `CharArray` snapshot (byte array vs.
     /// string) by making the channel's intent explicit.
     LongString,
+    /// A long-string field with no room past `MAX_STRING_SIZE + 1`, which
+    /// pvxs leaves the `DBF_STRING` `cvt_dbaddr` made it
+    /// (`ioc/channel.cpp:58-60`): the same scalar string, read to the
+    /// buffer's NUL rather than over `LEN` elements.
+    LongStringField,
     /// A `$` channel, served as its text or its `DBR_CHAR` image. The
     /// snapshot carries the value `View::read` already made of it.
     Dollar(PvaDollar),
@@ -534,7 +539,14 @@ pub(crate) fn nt_type_for_channel(
         };
     }
     if instance.record.field_is_long_string(field_upper) {
-        return NtType::LongString;
+        let re_viewed =
+            epics_base_rs::server::database::char_view::char_view(instance, field_upper)
+                .is_some_and(|v| v.re_views_plain_channel());
+        return if re_viewed {
+            NtType::LongString
+        } else {
+            NtType::LongStringField
+        };
     }
     // `final_field_type == DBR_CHAR && isArray && format == "String"`. The
     // `DBR_CHAR` half is `DBR_CHAR`, not `DBR_UCHAR` — pvxs tests the signed
@@ -590,6 +602,8 @@ pub(crate) enum BareLeaf {
     /// A `DBR_CHAR` array whose channel format is `String` — pvxs
     /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:635-636`).
     LongString,
+    /// [`NtType::LongStringField`].
+    LongStringField,
     /// [`NtType::Dollar`].
     Dollar(PvaDollar),
     /// The channel's `dbChannelFinalElements()` is not 1
@@ -653,6 +667,7 @@ impl BareLeaf {
     pub(crate) fn from_nt(nt_type: NtType, scalar: ScalarType) -> Self {
         match nt_type {
             NtType::LongString => BareLeaf::LongString,
+            NtType::LongStringField => BareLeaf::LongStringField,
             NtType::Dollar(dollar) => BareLeaf::Dollar(dollar),
             NtType::ScalarArray => BareLeaf::Array(scalar),
             NtType::Scalar | NtType::Enum => BareLeaf::Scalar(scalar),
@@ -662,7 +677,9 @@ impl BareLeaf {
     /// The leaf's introspection.
     pub(crate) fn desc(self) -> FieldDesc {
         match self {
-            BareLeaf::LongString => FieldDesc::Scalar(ScalarType::String),
+            BareLeaf::LongString | BareLeaf::LongStringField => {
+                FieldDesc::Scalar(ScalarType::String)
+            }
             BareLeaf::Dollar(PvaDollar::Text) => FieldDesc::Scalar(ScalarType::String),
             BareLeaf::Dollar(PvaDollar::Chars) => FieldDesc::ScalarArray(ScalarType::Byte),
             BareLeaf::Array(t) => FieldDesc::ScalarArray(t),
@@ -681,6 +698,9 @@ impl BareLeaf {
     pub(crate) fn value(self, value: &EpicsValue) -> PvField {
         match self {
             BareLeaf::LongString => PvField::Scalar(ScalarValue::String(long_string_value(value))),
+            BareLeaf::LongStringField => {
+                PvField::Scalar(ScalarValue::String(long_string_field_value(value)))
+            }
             BareLeaf::Scalar(_) => PvField::Scalar(epics_to_scalar(value)),
             BareLeaf::Dollar(_) | BareLeaf::Array(_) => epics_to_pv_field(value),
         }
@@ -997,6 +1017,17 @@ pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
     }
 }
 
+/// [`long_string_value`] of a [`NtType::LongStringField`] channel: the
+/// buffer to its NUL, past `LEN` included.
+pub(crate) fn long_string_field_value(value: &EpicsValue) -> PvString {
+    match value {
+        EpicsValue::CharArray(bytes) => PvString::from_bytes(
+            epics_base_rs::server::database::char_view::long_string_field_bytes(bytes),
+        ),
+        other => long_string_value(other),
+    }
+}
+
 /// Convert a long-string Snapshot into a scalar-string NTScalar.
 ///
 /// pvxs serves a `form = "String"` `DBF_CHAR` view as a `pvString`
@@ -1004,9 +1035,12 @@ pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
 /// We decode the `CharArray` to a `String` and reuse the standard
 /// NTScalar builder, which emits the string-scalar metadata set
 /// (`display = {description, units}`, no numeric `control`/`valueAlarm`).
-fn snapshot_to_nt_long_string(snapshot: &Snapshot) -> PvStructure {
+fn snapshot_to_nt_long_string(
+    snapshot: &Snapshot,
+    text: fn(&EpicsValue) -> PvString,
+) -> PvStructure {
     let mut snap = snapshot.clone();
-    snap.value = EpicsValue::String(long_string_value(&snapshot.value));
+    snap.value = EpicsValue::String(text(&snapshot.value));
     snapshot_to_nt_scalar(&snap)
 }
 
@@ -1016,7 +1050,8 @@ pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStruc
         NtType::Scalar => snapshot_to_nt_scalar(snapshot),
         NtType::Enum => snapshot_to_nt_enum(snapshot),
         NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
-        NtType::LongString => snapshot_to_nt_long_string(snapshot),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot, long_string_value),
+        NtType::LongStringField => snapshot_to_nt_long_string(snapshot, long_string_field_value),
         NtType::Dollar(PvaDollar::Text) => snapshot_to_nt_scalar(snapshot),
         NtType::Dollar(PvaDollar::Chars) => snapshot_to_nt_scalar_array(snapshot),
     }
@@ -1226,7 +1261,7 @@ pub fn build_field_desc_for_nt(nt_type: NtType, scalar_type: ScalarType) -> Fiel
         // A long-string field is advertised as a scalar-string NTScalar,
         // independent of the bound field's `DBF_CHAR` storage type, so
         // the descriptor matches the `pvString` value the GET path emits.
-        NtType::LongString => build_nt_scalar_desc(ScalarType::String),
+        NtType::LongString | NtType::LongStringField => build_nt_scalar_desc(ScalarType::String),
         NtType::Dollar(PvaDollar::Text) => build_nt_scalar_desc(ScalarType::String),
         NtType::Dollar(PvaDollar::Chars) => build_nt_scalar_array_desc(ScalarType::Byte),
     }

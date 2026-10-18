@@ -61,9 +61,9 @@ pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
     MENU_PINI, MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
     binary_enum_str_state, binary_enum_string_form, multibit_enum_states, multibit_enum_str_state,
-    multibit_enum_string_form, multibit_state_string_index, resolve_enum_state_string,
-    resolve_menu_field_string, resolve_menu_field_string_db_load, resolve_put_string_enum,
-    shared_menu_choices,
+    multibit_enum_string_form, multibit_state_field, multibit_state_string_index,
+    resolve_enum_state_string, resolve_menu_field_string, resolve_menu_field_string_db_load,
+    resolve_put_string_enum, shared_menu_choices,
 };
 pub use menu_scan::{MenuScan, SCAN_1ST_PERIODIC, menu_scan};
 pub use pini::PiniMode;

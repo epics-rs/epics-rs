@@ -173,6 +173,11 @@ impl Record for AiRecord {
         "ai"
     }
 
+    /// devaiStream.c reads and writes the `aiRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// devAiSoft.c and devAiSoftRaw.c return `dbGetLink`'s status, `aiRecord.c:166` returns it.
     fn process_status_rule(&self) -> crate::server::record::ProcessStatusRule {
         crate::server::record::ProcessStatusRule::io(crate::server::record::SoftStatus {

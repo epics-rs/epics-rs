@@ -15,8 +15,8 @@
 //! walk, the C99 conversions, and the narrowing table sCalc applies on top.
 
 use super::error::CalcError;
-use super::strtod::strtod;
 use super::value::StackValue;
+use crate::runtime::stdlib::strtod;
 
 /// C's `strpbrk(s, "pwn$c[deEfgGiousxX")` set — every byte that can end a
 /// conversion specification, including the four sCalc then refuses.

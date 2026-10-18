@@ -1,0 +1,13 @@
+[package]
+name = "stream-pcre-sys"
+version.workspace = true
+edition.workspace = true
+description = "PCRE 8.45 (PCRE1), vendored and built 8-bit without UTF-8, for stream-rs's %/regexp/ converter"
+# PCRE's own licence (pcre/LICENCE); only the vendored C is in this package.
+license = "BSD-3-Clause"
+authors.workspace = true
+repository.workspace = true
+links = "pcre"
+
+[build-dependencies]
+cc = "1"

@@ -1188,14 +1188,15 @@ impl DbAddr {
 
 /// A char-buffered `DBF_STRING` (lsi/lso/printf VAL) read as `DBR_STRING`
 /// with one element requested: `get_array_info`'s `LEN` decides between no
-/// element and the one string (`dbAccess.c:963-1003`).
+/// element and the one string (`dbAccess.c:963-1003`), which is the whole
+/// buffer to its NUL.
 fn long_string_value(inst: &crate::server::record::RecordInstance, val: &EpicsValue) -> EpicsValue {
     match val {
         EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
             if long_string_len(inst) == 0 {
                 EpicsValue::StringArray(Vec::new().into())
             } else {
-                let text: Vec<u8> = b.iter().copied().take_while(|&c| c != 0).collect();
+                let text = crate::server::database::char_view::long_string_field_bytes(b);
                 EpicsValue::String(crate::types::codec::cap_dbr_string(
                     crate::types::PvString::from_bytes(text),
                 ))
@@ -8850,6 +8851,60 @@ mod tests {
             run_cmd(&ctx, "dbgf", &["LGL.VAL$"]),
             format!("DBF_CHAR[71]:       \n\"{digits}\"        \n")
         );
+    }
+
+    /// A plain long-string VAL is the SIZV-wide `DBF_STRING` read to its NUL,
+    /// which a device read that failed after scanning (devlsiStream.c) leaves
+    /// past LEN; `$` stays LEN elements. Oracle — streamApp R7.0.10.1-DEV,
+    /// `lsi` SIZV 41 read "o" then `%!9s` failing on "abcdef", SIZV 100 the
+    /// same on 50 `x`, stringin `S` INP `A.VAL`: `dbgf A.VAL` -> `"abcdef"`,
+    /// `A.LEN` 2, `A.VAL$` -> `DBF_CHAR[2]: "ab"`, `B.VAL` -> 39 `x`,
+    /// `S.VAL` -> `"abcdef"`.
+    #[test]
+    fn dbgf_reads_a_long_string_val_past_len_to_its_nul() {
+        use crate::server::records::lsi::LsiRecord;
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("past.db");
+        std::fs::write(
+            &path,
+            "record(lsi, \"A\") { field(SIZV, \"41\") }\n\
+             record(lsi, \"B\") { field(SIZV, \"100\") }\n\
+             record(stringin, \"S\") { field(INP, \"A.VAL\") }\n",
+        )
+        .unwrap();
+        run_cmd(&ctx, "dbLoadRecords", &[path.to_str().unwrap()]);
+        ctx.block_on(db.ioc_init());
+        for (name, read) in [("A", b"abcdef".to_vec()), ("B", vec![b'x'; 50])] {
+            let cell = db.get_record(name).unwrap();
+            let mut inst = cell.write();
+            let lsi = inst
+                .record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<LsiRecord>())
+                .unwrap();
+            lsi.val.set_text(b"o");
+            let sizv = lsi.sizv as usize;
+            let failed = lsi.val.scan_in_place(sizv, |buf| {
+                buf[..read.len()].copy_from_slice(&read);
+                buf[read.len()] = 0;
+                None
+            });
+            assert_eq!(failed, None);
+        }
+        run_cmd(&ctx, "dbpf", &["S.PROC", "1"]);
+        for (pv, want) in [
+            ("A", "DBF_STRING:         \"abcdef\"  \n".to_string()),
+            ("A.LEN", "DBF_ULONG:          2 = 0x2   \n".to_string()),
+            ("A.VAL$", "DBF_CHAR[2]:        \"ab\"      \n".to_string()),
+            (
+                "B",
+                format!("DBF_STRING:         \"{}\"         \n", "x".repeat(39)),
+            ),
+            ("S", "DBF_STRING:         \"abcdef\"  \n".to_string()),
+        ] {
+            assert_eq!(run_cmd(&ctx, "dbgf", &[pv]), want, "dbgf {pv}");
+        }
     }
 
     /// `dbpr <rec> 2` prints a pointer member as `PTR %p`

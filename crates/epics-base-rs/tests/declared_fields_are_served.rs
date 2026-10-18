@@ -371,8 +371,15 @@ fn every_declared_field_is_served() {
     );
 }
 
+/// A put to a state field as `dbPut` makes it: the store, then `special()`,
+/// whose `init_common` sets SDEF (`mbbiRecord.c:221`, `mbboRecord.c:286`).
+fn put_state(rec: &mut Box<dyn epics_base_rs::server::record::Record>, field: &str, v: EpicsValue) {
+    rec.put_field(field, v).unwrap();
+    rec.special(field, true).unwrap();
+}
+
 /// SDEF is the field that exposed the gap, and it is not a constant: it is C's
-/// "are any states defined" predicate (`mbbiRecord.c:93-105`), which is also the
+/// "are any states defined" predicate (`mbbiRecord.c:91-105`), which is also the
 /// predicate `mbbo`'s `cvt_dbaddr` re-types VAL on. Both records, and both ways
 /// a state table can come into existence — by a VALUE alone, or by a STRING
 /// alone.
@@ -387,8 +394,7 @@ fn sdef_reports_whether_any_state_is_defined() {
             "{record_type}: a bare record defines no states"
         );
 
-        rec.put_field("ZRST", EpicsValue::String("Off".into()))
-            .unwrap();
+        put_state(&mut rec, "ZRST", EpicsValue::String("Off".into()));
         assert_eq!(
             rec.get_field("SDEF"),
             Some(EpicsValue::Short(1)),
@@ -396,7 +402,7 @@ fn sdef_reports_whether_any_state_is_defined() {
         );
 
         let mut rec = create_record(record_type).unwrap();
-        rec.put_field("ONVL", EpicsValue::ULong(2)).unwrap();
+        put_state(&mut rec, "ONVL", EpicsValue::ULong(2));
         assert_eq!(
             rec.get_field("SDEF"),
             Some(EpicsValue::Short(1)),
@@ -405,19 +411,16 @@ fn sdef_reports_whether_any_state_is_defined() {
     }
 }
 
-/// Why SDEF is DERIVED rather than stored. C caches `prec->sdef` and recomputes
-/// it from `special()` after a write to any of the 32 state fields — a cache is
-/// only ever as good as that hand-written field list. Here the flag is a
-/// function OF those fields, so a put to the SIXTEENTH state string, the one
-/// furthest from any such list, cannot leave it stale.
+/// C recomputes `prec->sdef` from `special()` after a write to any of the 32
+/// state fields; the SIXTEENTH state string is the one furthest from the
+/// field list that does it.
 #[test]
 fn a_state_written_at_runtime_is_visible_in_sdef() {
     for record_type in ["mbbi", "mbbo"] {
         let mut rec = create_record(record_type).unwrap();
         assert_eq!(rec.get_field("SDEF"), Some(EpicsValue::Short(0)));
 
-        rec.put_field("FFST", EpicsValue::String("Fifteen".into()))
-            .unwrap();
+        put_state(&mut rec, "FFST", EpicsValue::String("Fifteen".into()));
 
         assert_eq!(
             rec.get_field("SDEF"),

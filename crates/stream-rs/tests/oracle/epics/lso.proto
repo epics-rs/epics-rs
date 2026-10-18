@@ -1,0 +1,7 @@
+Terminator = CR LF;
+w { out "S%s"; }
+rb { out "S%s"; in "%s"; }
+wd { out "S%d"; }
+rd { out "S%s"; in "%d"; }
+fw { out "S%s"; in "%!8s"; }
+i { out "S%s"; @init { out "Q"; in "%s"; } }

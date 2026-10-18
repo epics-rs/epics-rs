@@ -1,0 +1,2 @@
+hold { ReplyTimeout = 1000; out "X"; in "%f"; }
+wait { LockTimeout = 50; out "Y"; }

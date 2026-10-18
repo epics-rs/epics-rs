@@ -7,7 +7,6 @@ pub mod postfix;
 pub mod random;
 pub mod scanf;
 pub(crate) mod stack;
-pub mod strtod;
 pub mod token;
 
 pub mod checksum;

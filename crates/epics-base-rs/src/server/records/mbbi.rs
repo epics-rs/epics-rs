@@ -85,6 +85,8 @@ pub struct MbbiRecord {
     skip_convert: bool,
     /// `special()` re-labelled the state VAL sits on; the put drains it.
     label_post: bool,
+    /// SDEF, written by [`Self::init_common`] only.
+    sdef: bool,
 }
 
 impl Default for MbbiRecord {
@@ -158,6 +160,7 @@ impl Default for MbbiRecord {
             sdly: -1.0,
             skip_convert: false,
             label_post: false,
+            sdef: false,
         }
     }
 }
@@ -170,33 +173,37 @@ impl MbbiRecord {
         }
     }
 
-    fn raw_values(&self) -> [u32; 16] {
+    /// ZRVL..FFVL, C's `(&prec->zrvl)[i]`.
+    pub fn raw_values(&self) -> [u32; 16] {
         [
             self.zrvl, self.onvl, self.twvl, self.thvl, self.frvl, self.fvvl, self.sxvl, self.svvl,
             self.eivl, self.nivl, self.tevl, self.elvl, self.tvvl, self.ttvl, self.ftvl, self.ffvl,
         ]
     }
 
-    /// C `mbbiRecord.c::init_common` (93-105) — "check if any states are
+    /// C `mbbiRecord.c::init_common` (91-105) — "check if any states are
     /// defined": TRUE as soon as one of ZRVL..FFVL is non-zero or one of
-    /// ZRST..FFST is non-empty.
-    ///
-    /// DERIVED, never stored — the same call `MbboRecord::sdef` makes, and for
-    /// the same reason. C keeps `prec->sdef` as a struct member and recomputes it
-    /// from `init_common`: at init, and from `special()` after every write to any
-    /// of the 32 state fields. A cached copy of a pure function of 32 other
-    /// fields can go stale, and a `special()` that forgets one field is exactly
-    /// how it does. Computing it on demand makes the stale state unreachable
-    /// rather than merely unlikely, and leaves one definition of "are states
-    /// defined" for both records instead of two that can drift.
-    fn sdef(&self) -> bool {
+    /// ZRST..FFST is non-empty. C calls it from `init_record` AFTER the dset's
+    /// `init_record` (`:135`), so SDEF is 0 while the device initialises, and
+    /// from `special()` after a put to any of the 32 state fields (`:221`).
+    fn init_common(&mut self) {
         let rvs = self.raw_values();
-        let sts: [&PvString; 16] = [
+        let sts = self.state_strings();
+        self.sdef = (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty());
+    }
+
+    /// C's `prec->sdef`: 0 until `init_common` has run.
+    pub fn sdef(&self) -> bool {
+        self.sdef
+    }
+
+    /// ZRST..FFST, C's `(&prec->zrst)[i]`.
+    pub fn state_strings(&self) -> [&PvString; 16] {
+        [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
-        ];
-        (0..16).any(|i| rvs[i] != 0 || !sts[i].is_empty())
+        ]
     }
 
     fn raw_to_val(&self, raw: u32) -> u16 {
@@ -247,7 +254,6 @@ macro_rules! mbb_get_field {
             "VAL" => Some(EpicsValue::Enum($self.val)),
             // `field(SDEF,DBF_SHORT) { special(SPC_NOMOD) }`
             // (mbbiRecord.dbd.pod:628) — readable over CA, never writable.
-            // Derived, so it cannot disagree with the state table it reports on.
             "SDEF" => Some(EpicsValue::Short($self.sdef() as i16)),
             $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
@@ -345,6 +351,11 @@ impl Record for MbbiRecord {
         crate::server::record::CycleHooks::WRITE_POSTED
     }
 
+    /// `mbbiRecord.c:135`
+    fn after_dset_init(&mut self) {
+        self.init_common();
+    }
+
     /// `mbbiRecord.c:133-140` keeps the dset status for the return and seeds
     /// regardless of it, after the dset init has loaded RVAL.
     fn seed_deadband_tracking(&mut self, _dset_init: crate::server::device_support::DsetInit) {
@@ -366,6 +377,11 @@ impl Record for MbbiRecord {
 
     fn record_type(&self) -> &'static str {
         "mbbi"
+    }
+
+    /// devmbbiStream.c reads and writes the `mbbiRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     /// devMbbiSoft.c and devMbbiSoftRaw.c return `dbGetLink`'s status.
@@ -394,9 +410,8 @@ impl Record for MbbiRecord {
     /// label posts nothing, because no subscriber's rendering moved.
     ///
     /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
-    /// fall outside the index range and post nothing. What they DO reach is
-    /// `init_common`, whose `sdef` this port derives on demand
-    /// (`Self::sdef`) rather than caching, so that half needs no hook.
+    /// fall outside the index range and post nothing; they reach only
+    /// `init_common` (`Self::special`).
     fn take_cycle_posted_fields(&mut self) -> crate::server::record::CycleMarks {
         const VAL_POST_NAMED: [(&str, crate::server::record::CyclePostMask); 1] =
             [("VAL", crate::server::record::CyclePostMask::ValueLog)];
@@ -476,6 +491,9 @@ impl Record for MbbiRecord {
         if after && field.len() == 4 && field.as_bytes()[2..].eq_ignore_ascii_case(b"ST") {
             self.label_post =
                 crate::server::record::multibit_state_string_index(field) == Some(self.val);
+        }
+        if after && crate::server::record::multibit_state_field(field) {
+            self.init_common();
         }
         Ok(())
     }

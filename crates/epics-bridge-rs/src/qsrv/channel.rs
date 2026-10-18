@@ -719,7 +719,7 @@ impl BridgeChannel {
                 .ok_or_else(|| BridgeError::PutRejected(format!("{}: no $ view", self.pv_name)))?
         } else if matches!(
             self.nt_type,
-            NtType::LongString | NtType::Dollar(PvaDollar::Text)
+            NtType::LongString | NtType::LongStringField | NtType::Dollar(PvaDollar::Text)
         ) {
             // Long-string channel: the QSRV value is a scalar string
             // (`value.as<std::string>()` in pvxs, which renders a non-string

@@ -75,7 +75,7 @@ impl MbbiDirectRecord {
 }
 
 /// Bit field names B0..B1F — 32 entries, matching C `NUM_BITS 32`.
-pub(crate) const BIT_NAMES: [&str; 32] = [
+pub const BIT_NAMES: [&str; 32] = [
     "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "BA", "BB", "BC", "BD", "BE", "BF",
     "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19", "B1A", "B1B", "B1C",
     "B1D", "B1E", "B1F",
@@ -135,6 +135,11 @@ impl Record for MbbiDirectRecord {
 
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
+    }
+
+    /// devmbbiDirectStream.c reads and writes the `mbbiDirectRecord` members itself.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     /// devMbbiDirectSoft.c returns `dbGetLink`'s status; devMbbiDirectSoftRaw.c returns 0.

@@ -1,0 +1,4 @@
+AsynDriverInterface::readRequest(rec, 1000 msec reply, 100 msec read, expect 0 bytes, async=no)
+AsynDriverInterface::readRequest rec: queueRequest(..., priority=0, queueTimeout=1 sec) = asynSuccess [async=false] 
+AsynDriverInterface::readHandler(rec): ioAction=Read read(1 bytes, timeout=1 sec) returned status asynTimeout: received=0 bytes, eomReason=NONE, buffer=""
+AsynDriverInterface::readHandler(rec): no reply

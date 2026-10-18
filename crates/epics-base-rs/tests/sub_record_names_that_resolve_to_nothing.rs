@@ -176,3 +176,24 @@ record(aSub, "T:ERROR") { field(INAM, "initError") }
         "the whole stderr of the build"
     );
 }
+
+/// A constant SUBL is loaded into SNAM before the SNAM lookup
+/// (`aSubRecord.c:126`, then `:150-160`), so the name it loads is the one
+/// reported. softIoc R7.0.10 with `field(SUBL, {const:"nope"})` prints
+/// `as.SNAM ERROR function 'nope' not found` at iocInit.
+#[epics_macros_rs::epics_test]
+async fn a_constant_subl_is_looked_up_at_init() {
+    let capture = Captured::start();
+    let built = IocBuilder::new()
+        .db_string(
+            r#"record(aSub, "T:SUBL") { field(SUBL, {const:"nope"}) }"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await;
+    let out = capture.finish();
+    built.expect("an unresolved SNAM is reported, not fatal");
+
+    assert_eq!(out, "T:SUBL.SNAM ERROR function 'nope' not found\n");
+}

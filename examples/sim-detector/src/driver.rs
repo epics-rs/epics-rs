@@ -54,9 +54,12 @@ impl SimDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Simulated detector")?;
         base.set_string_param(ad.params.base.model, 0, "Basic simulator")?;
+        // simDetector.cpp:1095-1098: DRIVER_VERSION.REVISION.MODIFICATION
+        // (simDetector.h, ADSimDetector R2-11).
+        base.set_string_param(ad.params.base.driver_version, 0, "2.11.0")?;
+        base.set_string_param(ad.params.base.sdk_version, 0, "2.11.0")?;
         base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
-        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         // C `:1115` seeds the simDetectorConfig dataType argument.
         base.set_int32_param(ad.params.base.data_type, 0, data_type)?;
@@ -411,6 +414,31 @@ mod tests {
                 .abs()
                 < 1e-10
         );
+    }
+
+    /// simDetector.cpp:1095-1098: DriverVersion and SDKVersion both carry
+    /// DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION (simDetector.h).
+    #[test]
+    fn test_new_publishes_the_simdetector_version() {
+        let rt = create_sim_detector(
+            &asyn_rs::registry::claim_port("SIM_VER").unwrap(),
+            64,
+            64,
+            NDDataType::UInt8 as i32,
+            1_000_000,
+            NDArrayOutput::new(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        for reason in [
+            rt.ad_params.base.driver_version,
+            rt.ad_params.base.sdk_version,
+        ] {
+            assert_eq!(
+                h.get_string_param_blocking(reason, 0, 40).unwrap(),
+                b"2.11.0"
+            );
+        }
     }
 
     #[test]

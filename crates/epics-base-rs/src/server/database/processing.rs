@@ -8600,6 +8600,9 @@ impl PvDatabase {
                         .reprocess_generation
                         .fetch_add(1, Ordering::AcqRel);
                 }
+                ProcessAction::CheckLinks => {
+                    self.check_links_in_cycle(record_name, &mut rec.write());
+                }
                 ProcessAction::PostAfterEpilogue(marks) => {
                     super::field_io::post_cycle_marks(&mut rec.write(), marks);
                 }

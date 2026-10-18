@@ -2273,6 +2273,12 @@ pub enum ProcessAction {
     /// the same `process()` cycle that emits this.
     CancelReprocess,
 
+    /// C `checkLink` called from `process()` itself rather than at its top
+    /// (throttle, under `proc_flag`, `throttleRecord.c:289-293`):
+    /// re-read the [`Record::link_check`] links now, among the cycle's link
+    /// actions, and arm the recheck timer if one stays disconnected.
+    CheckLinks,
+
     /// Posts C's `process()` makes after its epilogue — after `monitor()`'s
     /// alarm commit and `recGblFwdLink`, or on a cycle that skipped both
     /// (scaler's autocount FREQ, `scalerRecord.c:530`). Run with the cycle's
@@ -2477,7 +2483,8 @@ impl CycleHooks {
     /// (`scanparmRecord.c:280`).
     pub const MONITOR_RESET: Self = Self(16384);
     /// [`Record::link_check`]: C `checkLinks` at the top of `process()`.
-    /// Outside [`Self::ALL`]: a type declares it.
+    /// Outside [`Self::ALL`]: a type declares it. A type that checks later
+    /// in `process()` returns [`ProcessAction::CheckLinks`] instead.
     pub const LINK_CHECK: Self = Self(32768);
     /// No hook acts: the stock record.
     pub const NONE: Self = Self(0);

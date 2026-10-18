@@ -9,9 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, count_arg, extract_plugin_args, gather_arg_defs, max_memory_arg,
-    max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
-    threads_arg,
+    PluginArgs, PluginManager, attr_arg_defs, count_arg, extract_plugin_args, gather_arg_defs,
+    max_memory_arg, max_threads_arg, plugin_arg_defs, plugin_arg_defs_with_count,
+    register_noop_commands, threads_arg,
 };
 use ad_core_rs::plugin::runtime::{
     ArraySource, create_plugin_runtime, create_plugin_runtime_multi_addr,
@@ -125,7 +125,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDStdArraysConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -139,9 +144,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -160,7 +168,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDStatsConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -175,9 +188,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
 
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -197,7 +213,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDROIConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -211,9 +232,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     threads_arg(args, 8),
                 );
                 handle.set_max_threads(max_threads_arg(args, 9));
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -326,7 +350,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs_with_count("maxOverlays"),
             "NDOverlayConfigure portName [queueSize] ...".to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -343,9 +372,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -459,7 +491,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             gather_arg_defs(),
             "NDGatherConfigure portName [queueSize] [blockingCallbacks] [maxPorts]".to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, _) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    ..
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -475,9 +512,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_ports,
                     threads_arg(args, 7),
                 );
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 Ok(CommandOutcome::Continue)
@@ -532,6 +572,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     n_data_blocks,
                     source,
                     queue_size,
+                    blocking_callbacks,
                 } = parse_attr_plot_args(args)?;
 
                 let claim = match claim_port_driver(&port_name) {
@@ -555,9 +596,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_addr,
                     threads_arg(args, 9),
                 );
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -681,7 +725,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             attr_arg_defs(),
             "NDAttrConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 // C arg index 5 is maxAttributes (NDPluginAttribute.cpp:245); a
                 // missing iocsh int arg defaults to 0, which C floors to 1.
                 let max_attributes = match args.get(5) {
@@ -702,9 +751,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_attributes,
                     threads_arg(args, 9),
                 );
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -724,7 +776,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs_with_count("maxROIs"),
             "NDROIStatConfigure portName [queueSize] ...",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -739,9 +796,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     threads_arg(args, 9),
                 );
                 handle.set_max_threads(max_threads_arg(args, 10));
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -808,7 +868,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDTimeSeriesConfigure portName [queueSize] [blockingCallbacks] NDArrayPort",
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -832,9 +897,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     max_signals + 1,
                     threads,
                 );
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -868,7 +936,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             "NDPvaConfigure portName queueSize blockingCallbacks NDArrayPort NDArrayAddr pvName"
                 .to_string(),
             move |args: &[ArgValue], ctx: &CommandContext| {
-                let (port_name, queue_size, source) = extract_plugin_args(args)?;
+                let PluginArgs {
+                    port_name,
+                    queue_size,
+                    blocking_callbacks,
+                    source,
+                } = extract_plugin_args(args)?;
                 let claim = match claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
@@ -908,9 +981,12 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     threads_arg(args, 9),
                 );
-                if let Err(e) =
-                    m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate())
-                {
+                if let Err(e) = m.add_plugin(
+                    claim,
+                    &handle,
+                    blocking_callbacks,
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     return Ok(ctx.cxx_error(e));
                 }
                 if let Err(e) = handle.connect_to_array_port(m.wiring()) {
@@ -993,7 +1069,12 @@ where
         arg_defs,
         format!("{cmd_name} portName [queueSize] ..."),
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let (port_name, queue_size, source) = extract_plugin_args(args)?;
+            let PluginArgs {
+                port_name,
+                queue_size,
+                blocking_callbacks,
+                source,
+            } = extract_plugin_args(args)?;
             let claim = match claim_port_driver(&port_name) {
                 Ok(claim) => claim,
                 Err(e) => return Ok(ctx.cxx_error(e)),
@@ -1017,7 +1098,12 @@ where
             if let Some(idx) = max_threads_idx {
                 handle.set_max_threads(max_threads_arg(args, idx));
             }
-            if let Err(e) = m.add_plugin(claim, &handle, ctx.db().scan_control().interrupt_gate()) {
+            if let Err(e) = m.add_plugin(
+                claim,
+                &handle,
+                blocking_callbacks,
+                ctx.db().scan_control().interrupt_gate(),
+            ) {
                 return Ok(ctx.cxx_error(e));
             }
             if let Err(e) = handle.connect_to_array_port(m.wiring()) {

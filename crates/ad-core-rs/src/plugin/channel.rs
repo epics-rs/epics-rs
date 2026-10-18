@@ -193,6 +193,10 @@ pub struct ArrayAdmission {
     /// array is ever processed. C gets this for free: `driverCallback` ends in
     /// `callParamCallbacks()` on every call, dropped or not (`:449`).
     counted_drop: tokio::sync::Notify,
+    /// Raised on every `trySend`, taken or refused, so the data loop can
+    /// republish QueueFree as C's `driverCallback` does after each one
+    /// (`:447-448`).
+    depth_moved: tokio::sync::Notify,
 }
 
 /// The three ways C++ `driverCallback` can dispose of an array before the
@@ -214,6 +218,7 @@ impl Default for ArrayAdmission {
             min_callback_time: AtomicU64::new(0.0f64.to_bits()),
             last_process: parking_lot::Mutex::new(None),
             counted_drop: tokio::sync::Notify::new(),
+            depth_moved: tokio::sync::Notify::new(),
         }
     }
 }
@@ -261,6 +266,12 @@ impl ArrayAdmission {
     /// leaves a permit, so no readback is lost.
     pub(crate) async fn counted_drop(&self) {
         self.counted_drop.notified().await;
+    }
+
+    /// Await the next `trySend`. Several coalesce into one wake, which loses
+    /// nothing: the loop reads the live depth.
+    pub(crate) async fn depth_moved(&self) {
+        self.depth_moved.notified().await;
     }
 }
 
@@ -337,9 +348,11 @@ fn try_send_arm(
                 counter: Some(counter),
                 done_tx: None,
             });
+            admission.depth_moved.notify_one();
             PublishOutcome::Delivered
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+            admission.depth_moved.notify_one();
             episode.arm();
             if !ignore_queue_full {
                 dropped_arrays.fetch_add(1, Ordering::AcqRel);

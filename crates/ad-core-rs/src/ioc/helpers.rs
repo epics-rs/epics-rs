@@ -126,11 +126,21 @@ pub fn attr_arg_defs() -> Vec<ArgDesc> {
     ]
 }
 
-/// Extract `portName`, `queueSize` and the `NDArrayPort`/`NDArrayAddr`
-/// source from C-compatible plugin args.
+/// The `NDPluginDriver` constructor arguments a plugin `*Configure` line
+/// leads with.
+pub struct PluginArgs {
+    pub port_name: String,
+    pub queue_size: usize,
+    /// Handed to [`PluginManager::add_plugin`](crate::ioc::PluginManager::add_plugin),
+    /// which is where every configure command publishes its plugin.
+    pub blocking_callbacks: i32,
+    pub source: ArraySource,
+}
+
+/// Extract the [`PluginArgs`] of C-compatible plugin args.
 ///
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`
-pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, ArraySource), String> {
+pub fn extract_plugin_args(args: &[ArgValue]) -> Result<PluginArgs, String> {
     let port_name = match &args[0] {
         ArgValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err("portName required".into()),
@@ -138,6 +148,11 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, ArraySou
     let queue_size = match args.get(1) {
         Some(ArgValue::Int(n)) => *n as usize,
         _ => 20,
+    };
+    // An absent iocsh int argument is 0.
+    let blocking_callbacks = match args.get(2) {
+        Some(ArgValue::Int(n)) => *n as i32,
+        _ => 0,
     };
     let port = match args.get(3) {
         Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
@@ -147,7 +162,12 @@ pub fn extract_plugin_args(args: &[ArgValue]) -> Result<(String, usize, ArraySou
         Some(ArgValue::Int(n)) => *n as i32,
         _ => 0,
     };
-    Ok((port_name, queue_size, ArraySource { port, addr }))
+    Ok(PluginArgs {
+        port_name,
+        queue_size,
+        blocking_callbacks,
+        source: ArraySource { port, addr },
+    })
 }
 
 /// The `maxThreads` argument of a plugin `*Configure` command, as written.

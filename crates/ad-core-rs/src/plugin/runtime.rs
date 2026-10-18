@@ -2364,8 +2364,8 @@ impl PluginPortDriver {
         base.set_int32_param(plugin_params.queue_use, 0, queue_size as i32)?;
         base.set_int32_param(plugin_params.max_threads, 0, PLUGIN_MAX_THREADS)?;
         base.set_int32_param(plugin_params.num_threads, 0, PLUGIN_NUM_THREADS)?;
-        // C `:160` passes its `blockingCallbacks` constructor argument; the
-        // port has no such argument and starts `blocking_mode` false.
+        // C `:160` sets its `blockingCallbacks` constructor argument here;
+        // `PluginManager::add_plugin` writes it once the port runs.
         base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
 
         base.set_string_param(plugin_params.plugin_type, 0, plugin_type_name)?;
@@ -3096,6 +3096,16 @@ impl PluginRuntimeHandle {
         );
     }
 
+    /// C `setIntegerParam(BlockingCallbacks, blockingCallbacks)`
+    /// (NDPluginDriver.cpp:160).
+    pub fn set_blocking_callbacks(&self, blocking_callbacks: i32) {
+        let _ = self.port_runtime.port_handle().write_int32_blocking(
+            self.plugin_params.blocking_callbacks,
+            0,
+            blocking_callbacks,
+        );
+    }
+
     pub fn port_name(&self) -> &str {
         &self.port_name
     }
@@ -3812,6 +3822,24 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         (guard.dropped_arrays_only_batch(), guard.port_handle.clone())
                     };
                     out.batch.flush(&port).await;
+                }
+                // C `driverCallback` republishes QueueFree after each
+                // `trySend` (`:447-448`). With a callback thread idle, C's
+                // queue hands the array straight to it and the depth does not
+                // move; the recv arm above then publishes. Only a backlog
+                // behind busy threads shows here.
+                _ = admission.depth_moved() => {
+                    if in_flight >= pool.size() {
+                        let max_cap = array_rx.max_capacity();
+                        let free = max_cap.saturating_sub(array_rx.pending()) as i32;
+                        if last_queue_free != Some(free) {
+                            last_queue_free = Some(free);
+                            let port = shared.lock().port_handle.clone();
+                            queue_status_batch(&plugin_params, max_cap, free)
+                                .flush(&port)
+                                .await;
+                        }
+                    }
                 }
                 param = param_rx.recv() => {
                     match param {
@@ -9144,6 +9172,61 @@ mod tests {
              reached the plugin ({dropped} counted dropped): the write moved the PV, not the queue"
         );
         assert_eq!(dropped, 0, "DroppedArrays should not have moved");
+    }
+
+    /// C `driverCallback` republishes QueueFree after every `trySend`, taken
+    /// or refused (NDPluginDriver.cpp:446-448), so a backlog behind a busy
+    /// callback thread counts QueueFree down to 0 and trips its LOLO.
+    #[test]
+    fn queue_free_follows_each_enqueue_behind_a_busy_thread() {
+        const DEPTH: i32 = 3;
+        let (processor, entered, gated) = GatedProcessor::new();
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("QFREE_ENQ").unwrap(),
+            processor,
+            1_000_000,
+            DEPTH as usize,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        let free = || {
+            port.read_int32_blocking(handle.plugin_params.queue_use, 0)
+                .unwrap()
+        };
+        enable_callbacks(&handle);
+
+        send_array(handle.array_sender(), make_test_array(0));
+        wait_until("the callback thread to hold frame 0", || {
+            entered.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(
+            free(),
+            DEPTH,
+            "a frame taken by an idle thread uses no slot"
+        );
+
+        send_array(handle.array_sender(), make_test_array(1));
+        wait_until("QueueFree after one queued frame", || free() == DEPTH - 1);
+        for id in 2..=DEPTH {
+            send_array(handle.array_sender(), make_test_array(id));
+        }
+        wait_until("QueueFree on a full queue", || free() == 0);
+        send_array(handle.array_sender(), make_test_array(DEPTH + 1));
+        param_fifo_drained(&handle);
+        assert_eq!(free(), 0);
+        assert_eq!(
+            port.read_int32_blocking(handle.plugin_params.dropped_arrays, 0)
+                .unwrap(),
+            1
+        );
+
+        gated.release();
+        wait_until("the backlog to drain", || {
+            gated.processed().len() == DEPTH as usize + 1
+        });
+        wait_until("QueueFree on the drained queue", || free() == DEPTH);
     }
 
     /// MinCallbackTime exists to relieve queue pressure, so a frame it gates

@@ -2,7 +2,7 @@
 //! command that installs it.
 //!
 //! The mapping is the parity-critical half of that command and it is pure:
-//! `&[ArgValue]` in, six fields out, no port manager, no IOC, no reactor. It
+//! `&[ArgValue]` in, seven fields out, no port manager, no IOC, no reactor. It
 //! lives here rather than in `crate::ioc` because that module is gated on
 //! `tokio_backend` — it stands an IOC up on `epics_ca_rs::server::ioc_app`,
 //! which the reactor-free backend does not have — and a gate sized for the
@@ -29,11 +29,12 @@ pub struct AttrPlotArgs {
     pub n_data_blocks: usize,
     pub source: ArraySource,
     pub queue_size: usize,
+    pub blocking_callbacks: i32,
 }
 
 /// Parse `NDAttrPlotConfig` positional args in C order
 /// (`NDPluginAttrPlot.cpp:308`): `port, n_attributes, cache_size,
-/// n_selected_blocks, in_port, in_addr, queue_size, ...`.
+/// n_selected_blocks, in_port, in_addr, queue_size, blockingCallbacks, ...`.
 ///
 /// A present integer is honoured exactly — including an explicit `0`, which is
 /// meaningful for `cache_size` (`0` = unlimited per-buffer cache). Fallbacks
@@ -63,6 +64,10 @@ pub fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
         n_data_blocks: usize_arg(3, 4),
         source: ArraySource { port, addr },
         queue_size: usize_arg(6, 20),
+        blocking_callbacks: match args.get(7) {
+            Some(ArgValue::Int(n)) => *n as i32,
+            _ => 0,
+        },
     })
 }
 

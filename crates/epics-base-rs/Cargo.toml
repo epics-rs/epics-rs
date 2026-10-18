@@ -137,6 +137,9 @@ linux-rt = ["epics-libcom-rs/linux-rt"]
 # unconditionally. `client_server.rs` is gated on this feature, so it
 # only compiles when the 12-arg signature is in effect.
 ca-server-tls-test = ["epics-ca-rs/experimental-rust-tls", "epics-ca-rs/cap-tokens"]
+# Test-only: `server::database::fresh_hold_hook`, a closure run at each
+# fresh lock-set hold, for tests that must act between two holds.
+test-hooks = []
 
 [[bench]]
 name = "record_bench"

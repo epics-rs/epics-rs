@@ -634,6 +634,55 @@ pub(crate) fn owe_cvt(cell: &Arc<RecordCell>) {
     }
 }
 
+/// Test-only: run a closure each time this thread takes a record's set
+/// fresh, i.e. after every point the set was free for another thread to
+/// take. A window between two holds that no sleep can hit deterministically
+/// is reached here by acting as that other thread would.
+#[cfg(feature = "test-hooks")]
+pub mod fresh_hold_hook {
+    use super::{LockSet, RecordCell};
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    type Hook = (Arc<RecordCell>, Box<dyn FnMut()>);
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Disarms the hook when dropped.
+    pub struct Armed(());
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            HOOK.with(|h| h.borrow_mut().take());
+        }
+    }
+
+    /// Run `f` on this thread at every fresh hold of `record`'s set, with
+    /// the set held and no member borrowed.
+    pub fn arm(record: Arc<RecordCell>, f: impl FnMut() + 'static) -> Armed {
+        HOOK.with(|h| *h.borrow_mut() = Some((record, Box::new(f))));
+        Armed(())
+    }
+
+    pub(super) fn fire(set: &'static LockSet) {
+        // Taken out for the call, so a fresh hold inside `f` does not re-enter.
+        let Some((record, mut f)) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        if std::ptr::eq(record.lock_record().set(), set) {
+            f();
+        }
+        HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if h.is_none() {
+                *h = Some((record, f));
+            }
+        });
+    }
+}
+
 /// C's `next_id` starts at 1 and `makeSet` uses the POST-increment
 /// (`dbLock.c:70`, `:87`), so C's first lock set is number 2. Matching it
 /// costs nothing and makes an A/B against a C IOC read straight across.
@@ -880,6 +929,8 @@ impl LockSet {
     /// [`Self::try_lock_fresh`] — where no borrow of any member can be live.
     #[inline(always)]
     fn admit_owed(&'static self) {
+        #[cfg(feature = "test-hooks")]
+        fresh_hold_hook::fire(self);
         if self.has_owed.load(Ordering::Acquire) {
             self.drain_owed();
         }

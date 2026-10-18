@@ -18,7 +18,7 @@
 //! pvxs equivalent: `ioc/pvalink.cpp` + `ioc/pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(38): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(39): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
@@ -2673,6 +2673,71 @@ mod tests {
         assert!(
             dest.read().common.rpro != 0,
             "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
+        );
+    }
+
+    /// pvxs `ScanTrack::scan` runs with the record locked
+    /// (`pvalink_channel.cpp:312`), so a record cannot go active between the
+    /// PACT test and the process it gates. Another thread that takes the set
+    /// whenever this scan lets it go, and leaves the record active, must find
+    /// no window: the scan processes it once, and it never meets
+    /// `dbProcess`'s PACT guard (LCNT).
+    #[tokio::test]
+    async fn non_atomic_scan_tests_pact_and_processes_under_one_hold() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let dest = db.get_record("DEST").unwrap();
+        // Off the bootstrap set onto its own, as `iocInit` leaves it, so
+        // every hold below is of the one set.
+        drop(db.lock_records(["DEST"]));
+
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            field: "INP".into(),
+            record: "DEST".into(),
+            monorder: 0,
+            atomic: false,
+            passive_only: false,
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                (mk("SRC"), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        // The first hold is the scan's own; any later one comes after the set
+        // was free, where the other thread goes.
+        let holds = std::rc::Rc::new(std::cell::Cell::new(0));
+        let armed = {
+            let (holds, dest) = (holds.clone(), dest.clone());
+            epics_base_rs::server::database::fresh_hold_hook::arm(dest.clone(), move || {
+                holds.set(holds.get() + 1);
+                if holds.get() == 2 {
+                    dest.write().enter_pact();
+                }
+            })
+        };
+        scan_once(&mk("SRC"), &scan_targets, &db_slot).await;
+        drop(armed);
+
+        assert_eq!(
+            dest.read().common.lcnt,
+            0,
+            "the scan met dbProcess's PACT guard"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            holds.get(),
+            1,
+            "DEST's set was free between test and process"
         );
     }
 

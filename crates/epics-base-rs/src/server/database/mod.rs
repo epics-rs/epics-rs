@@ -47,6 +47,8 @@ pub use processing::{
     InputLinkTexts, PostItem, PostRule, ProcStack, ProcessCallback, TokenWatch,
 };
 pub(crate) use processing::{NotifiedRead, ReadPolicy};
+#[cfg(feature = "test-hooks")]
+pub use record_lock::fresh_hold_hook;
 pub(crate) use record_lock::{
     CycleHints, FrameGate, InFrame, InitPass, LockRecord, SetGuard, owe_cvt,
 };

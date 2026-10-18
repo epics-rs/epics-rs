@@ -3,6 +3,10 @@
 //! callback the flush fired has run, for a port registered before the open
 //! edge and for one registered while the gate is already open.
 
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed
+// on the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest
+// run -p asyn-rs --test boot_flush_is_its_owner_gates_job`, 2/2).
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

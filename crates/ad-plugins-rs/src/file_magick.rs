@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -473,6 +474,8 @@ impl MagickFileProcessor {
 
 impl NDPluginProcess for MagickFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
@@ -564,8 +567,15 @@ mod tests {
     #[test]
     fn test_register_params_leaves_the_magick_controls_undefined() {
         // NDFileMagick.cpp's constructor sets only PluginType.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("MAGICK_INIT", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "MAGICK_INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = MagickFileProcessor::new();
         proc.register_params(&mut base).unwrap();
         for name in ["MAGICK_QUALITY", "MAGICK_BIT_DEPTH", "MAGICK_COMPRESS_TYPE"] {
@@ -648,8 +658,15 @@ mod tests {
     #[test]
     fn a_setting_write_during_a_busy_write_returns_at_once() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("magick_settings_write", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "magick_settings_write",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = MagickFileProcessor::new();
         proc.register_params(&mut base).unwrap();
         let mut w = |idx: Option<usize>, v| {

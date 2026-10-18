@@ -12,6 +12,7 @@ use std::time::Duration;
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -50,6 +51,8 @@ async fn a_put_on_a_non_blocking_port_writes_the_driver_once() {
             can_block: false,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) = create_port_runtime_unclaimed(

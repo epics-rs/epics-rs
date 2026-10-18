@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -635,6 +636,8 @@ impl Default for TiffFileProcessor {
 
 impl NDPluginProcess for TiffFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
@@ -706,6 +709,7 @@ mod tests {
     // decoder (the `tiff` crate), not with our own reader.
     use ad_core_rs::params::ndarray_driver::NDArrayDriverParams;
     use ad_core_rs::plugin::runtime::WriteVerdict;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tiff::decoder::Decoder;
@@ -865,6 +869,8 @@ mod tests {
 
     impl NDPluginProcess for Downstream {
         const ASYN_FLAGS: PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.0.lock().push(Seen::Frame(array.unique_id));
             ProcessResult::sink(vec![])
@@ -1331,7 +1337,13 @@ mod tests {
     /// staging the plugin's attribute set must not take the writer lock.
     #[test]
     fn a_setting_write_during_a_busy_write_returns_at_once() {
-        let mut base = PortDriverBase::new("TIFFBUSY", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TIFFBUSY",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
         let mut proc = TiffFileProcessor::new();
         proc.register_params(&mut base).unwrap();
@@ -1542,7 +1554,13 @@ mod tests {
         writer.write_file(&Arc::new(arr)).unwrap();
         writer.close_file().unwrap();
 
-        let mut base = PortDriverBase::new("TIFFTEST", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TIFFTEST",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let _nd_params = NDArrayDriverParams::create(&mut base).unwrap();
 
         let mut proc = TiffFileProcessor::new();

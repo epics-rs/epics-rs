@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::services::PortServices;
@@ -74,7 +75,13 @@ fn fixture_of<D: PortDriver>(
     flags: PortFlags,
     driver: impl FnOnce(PortDriverBase) -> D,
 ) -> Fixture {
-    let mut base = PortDriverBase::new(port, 1, flags);
+    let mut base = PortDriverBase::new(
+        port,
+        1,
+        flags,
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("VAL", ParamType::Float64).unwrap();
     base.create_param("MSG", ParamType::Octet).unwrap();
     base.create_param("ARR", ParamType::Float64Array).unwrap();

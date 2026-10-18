@@ -31,6 +31,7 @@
 //! [`connect`]: NullOctetPort::connect
 
 use crate::error::AsynResult;
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -59,6 +60,11 @@ impl NullOctetPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // The C oracle's `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`
+            // (drvAsynIPPort.c:1091-1109), confirmed against its OCTETIV=OPTIONIV=1
+            // and GPIBIV=I32IV=UI32IV=F64IV=0.
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         // Disconnected link, noAutoConnect — the two properties that make CNCT
         // and AUCT deterministically 0.
@@ -76,27 +82,11 @@ impl PortDriver for NullOctetPort {
         &mut self.base
     }
 
-    // CAPS CONFIRMED against C, field-by-field.
-    //
-    // The interface set a port advertises decides the asyn record readback
-    // fields (OCTETIV/OPTIONIV/GPIBIV/I32IV/UI32IV/F64IV from `findInterface`).
-    // Observed on the C fat softIoc with a registered-disconnected octet port
-    // (`drvAsynIPPortConfigure("ORACLEASYN","localhost:1",0,1,0)`, noAutoConnect):
-    // drvAsynIPPort advertises exactly asynCommon + asynOption + asynOctet
-    // (drvAsynIPPort.c:1091-1109), so C reads OCTETIV=1, OPTIONIV=1, and
-    // GPIBIV=I32IV=UI32IV=F64IV=0. `octet_transport_capabilities()`
-    // ({OctetRead, OctetWrite, Option, Flush, Connect}) yields byte-exact those
-    // readbacks — CNCT/AUCT/ENBL/PCNCT/REASON also matched. This is the pinned,
-    // confirmed set, not a guess.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
-    }
-
     /// A null port has no transport to open, so a connect request leaves the
     /// link disconnected rather than latching CNCT=1. Combined with
     /// `auto_connect = false`, this keeps the connection state deterministically
     /// `0` regardless of who asks. (Final connect semantics are pinned by main
-    /// after C observation — see the `capabilities` note.)
+    /// after C observation — see the interface mask in `new`.)
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         Ok(())
     }

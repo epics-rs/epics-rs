@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::{PortHandle, QueueOutcome};
 use asyn_rs::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
@@ -56,7 +57,13 @@ fn port(name: &str, can_block: bool) -> PortRuntimeHandle {
         ..PortFlags::default()
     };
     let driver = Counter {
-        base: PortDriverBase::new(name, 1, flags),
+        base: PortDriverBase::new(
+            name,
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ),
         n: 0,
     };
     create_port_runtime_unclaimed(driver, RuntimeConfig::default())

@@ -452,7 +452,9 @@ impl PortHandle {
             multi_device: false,
             max_addr: 1,
             get_address: crate::port::port_get_address,
-            interfaces: crate::interfaces::default_capabilities().into(),
+            interfaces: crate::interfaces::InterfaceMask::UNMIGRATED_ALL
+                .capabilities()
+                .into(),
             trace,
             sync_lock: actor.sync_lock,
         }
@@ -1941,6 +1943,7 @@ fn string_param_result(result: &StringParamSlot) -> AsynResult<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::port_actor::PortActor;
 
@@ -1950,7 +1953,13 @@ mod tests {
 
     impl TestDriver {
         fn new() -> Self {
-            let mut base = PortDriverBase::new("handle_test", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "handle_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -2108,6 +2117,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.set_addr_enabled(1, false).unwrap();
         let handle = make_handle(Log {
@@ -2172,6 +2183,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.set_auto_connect_addr(1, false);
             base.set_addr_connected(1, false);
@@ -2199,6 +2212,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.set_auto_connect_addr(1, false);
@@ -2399,6 +2414,8 @@ mod tests {
                         can_block: true,
                         ..PortFlags::default()
                     },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
                 ),
                 entered: entered_tx,
                 release: std::sync::Mutex::new(release_rx),
@@ -2483,6 +2500,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         // The port comes back on its own retry timer (asynManager.c:3283-3314).
         base.seconds_between_port_connect = Duration::from_millis(20);
@@ -2732,7 +2751,13 @@ mod tests {
             destructible: true,
             ..PortFlags::default()
         };
-        let base = PortDriverBase::new("lock_port", 1, flags);
+        let base = PortDriverBase::new(
+            "lock_port",
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let dir = tempfile::tempdir().expect("fixture root");
         let trace_path = dir.path().join("lock_port_trace.txt");
         base.trace
@@ -3017,7 +3042,13 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let mut base = PortDriverBase::new("enbl_prop", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "enbl_prop",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -3101,6 +3132,8 @@ mod tests {
             "gpib_vtable",
             32,
             PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         )));
         handle.set_interfaces(vec![Capability::Gpib]);
         assert!(handle.has_interface(InterfaceType::Gpib), "findInterface");
@@ -3150,7 +3183,13 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let mut base = PortDriverBase::new("auct_prop", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "auct_prop",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let exc_mgr = Arc::new(ExceptionManager::new());
         base.bind_exception_sink(exc_mgr.clone());
@@ -3209,7 +3248,13 @@ mod tests {
     fn slow_port(delay: Duration) -> (PortHandle, Arc<std::sync::atomic::AtomicUsize>) {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handle = make_handle(SlowDriver {
-            base: PortDriverBase::new("handle_test", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "handle_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             delay,
             reads: reads.clone(),
         });
@@ -3224,7 +3269,13 @@ mod tests {
             ..PortFlags::default()
         };
         let mut handle = make_handle(SlowDriver {
-            base: PortDriverBase::new("handle_test", 1, flags),
+            base: PortDriverBase::new(
+                "handle_test",
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             delay,
             reads: reads.clone(),
         });
@@ -3250,7 +3301,13 @@ mod tests {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new("qlp", 1, flags);
+        let mut base = PortDriverBase::new(
+            "qlp",
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(false);
         base.init_auto_connect(false);
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3307,7 +3364,13 @@ mod tests {
     /// call on a port that is down still reaches the driver.
     #[test]
     fn a_syncio_call_on_a_synchronous_port_skips_the_connect_gate() {
-        let mut base = PortDriverBase::new("qlp", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "qlp",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(false);
         base.init_auto_connect(false);
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3654,7 +3717,13 @@ mod tests {
                 Ok(n)
             }
         }
-        let mut base = PortDriverBase::new("handle_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "handle_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // reason 0..=5, in the order pushed below.
         base.create_param("I64", ParamType::Int64).unwrap();
         base.create_param("I8A", ParamType::Int8Array).unwrap();
@@ -3940,7 +4009,13 @@ mod tests {
     ) -> (PortHandle, Arc<std::sync::atomic::AtomicUsize>) {
         let disconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handle = make_handle(Counted {
-            base: PortDriverBase::new(name, max_addr, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                max_addr,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             disconnects: disconnects.clone(),
         });
         handle.connect_blocking().unwrap();

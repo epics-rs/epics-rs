@@ -26,6 +26,7 @@
 //! Posting the waveform per frame would make a `camonitor` on `AP_Data` fire
 //! at the detector frame rate.
 
+use asyn_rs::port::InterfaceMask;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -426,6 +427,8 @@ impl AttrPlotState {
 
 impl NDPluginProcess for AttrPlotProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let mut state = self.state.lock();
 
@@ -547,6 +550,8 @@ mod tests {
             "ATTRPLOT_ADP53",
             blocks.max(n_attributes),
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
         );
         proc.register_params(&mut base).unwrap();
         proc
@@ -635,6 +640,8 @@ mod tests {
             "ATTRPLOT_V",
             8,
             asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
         );
         proc.register_params(&mut base).unwrap();
         let select = proc.state.lock().params.data_select.unwrap();

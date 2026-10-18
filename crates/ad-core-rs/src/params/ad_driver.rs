@@ -134,13 +134,20 @@ impl ADDriverParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::PortFlags;
 
     /// Each parameter is created once, where C creates it: a second
     /// `createParam` of a name is refused (asynPortDriver.cpp:999-1003).
     #[test]
     fn ad_driver_params_create_each_name_once() {
-        let mut base = PortDriverBase::new("adonce", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "adonce",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         assert_eq!(params.acquire, params.base.acquire);
         assert_eq!(params.wait_for_plugins, params.base.wait_for_plugins);
@@ -149,7 +156,13 @@ mod tests {
 
     #[test]
     fn test_create_ad_driver_params() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ACQUIRE").is_some());
         assert!(base.find_param("GAIN").is_some());
@@ -161,7 +174,13 @@ mod tests {
 
     #[test]
     fn test_ad_driver_param_count() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let _ = ADDriverParams::create(&mut base).unwrap();
         // base params (~50) + ad-specific (~38) = ~88
         assert!(base.params.len() >= 80);
@@ -169,7 +188,13 @@ mod tests {
 
     #[test]
     fn test_ad_driver_inherits_base() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (params, _) = ADDriverParams::create(&mut base).unwrap();
         // Should be able to access base params through the base field
         assert!(base.find_param("ARRAY_COUNTER").is_some());

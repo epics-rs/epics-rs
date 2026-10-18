@@ -19,6 +19,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::claim_port;
@@ -859,7 +860,13 @@ impl<P: ControllerParams> ControllerPort<P> {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(port, num_axes.max(1) as usize, flags);
+        let mut base = PortDriverBase::new(
+            port,
+            num_axes.max(1) as usize,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         for &(name, param_type) in BASE_PARAMS {
             base.create_param(name, param_type)?;
         }

@@ -44,6 +44,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interpose::EomReason;
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime;
@@ -520,7 +521,13 @@ impl ModbusHalfBuilt {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         ModbusParams::create(&mut base, data_type)?;
         Ok(Self { base })
     }
@@ -649,7 +656,13 @@ impl ModbusPortDriver {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(port_name, engine.config().length.max(1), flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            engine.config().length.max(1),
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let ModbusParams {
             reason_to_datatype,
             read_reason,
@@ -2878,7 +2891,13 @@ mod tests {
         let shared = Arc::new(std::sync::Mutex::new(TagLog::default()));
         let (runtime, _jh) = create_port_runtime_unclaimed(
             TaggedOctetPort {
-                base: PortDriverBase::new("MB_OCTET_TAGGED", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "MB_OCTET_TAGGED",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 shared: Arc::clone(&shared),
             },
             RuntimeConfig::default(),
@@ -2966,7 +2985,13 @@ mod tests {
     fn a_port_read_timeout_reaches_the_records_as_a_timeout() {
         let (runtime, _jh) = create_port_runtime_unclaimed(
             TimingOutOctetPort {
-                base: PortDriverBase::new("MB_OCTET_SILENT", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "MB_OCTET_SILENT",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
             },
             RuntimeConfig::default(),
         )
@@ -3052,7 +3077,13 @@ mod tests {
         let fresh = rtu_response(&[0x01, 0x03, 0x02, 0x11, 0x11]);
         let pending = Arc::new(Mutex::new(std::collections::VecDeque::from(vec![stale])));
         let driver = BufferedOctetPort {
-            base: PortDriverBase::new("MB_OCTET_STALE", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "MB_OCTET_STALE",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             pending,
             replies: std::collections::VecDeque::from(vec![fresh]),
             written: Arc::new(Mutex::new(Vec::new())),
@@ -3164,7 +3195,13 @@ mod tests {
         let chunks = Arc::new(std::sync::Mutex::new(vec![a.to_vec(), b.to_vec()]));
         let (runtime, _jh) = create_port_runtime_unclaimed(
             SplitReplyPort {
-                base: PortDriverBase::new("MB_OCTET_SPLIT", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "MB_OCTET_SPLIT",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 chunks,
             },
             RuntimeConfig::default(),
@@ -3230,7 +3267,13 @@ mod tests {
         ] {
             let (runtime, _jh) = create_port_runtime_unclaimed(
                 RefusingPort {
-                    base: PortDriverBase::new("MB_OCTET_REFUSING", 1, PortFlags::default()),
+                    base: PortDriverBase::new(
+                        "MB_OCTET_REFUSING",
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_ALL,
+                    ),
                     status,
                 },
                 RuntimeConfig::default(),
@@ -3312,7 +3355,13 @@ mod tests {
         let reads = Arc::new(Mutex::new(0usize));
         let (runtime, _jh) = create_port_runtime_unclaimed(
             CountedReplyPort {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 chunks: Arc::new(Mutex::new(chunks.into())),
                 reads: Arc::clone(&reads),
             },
@@ -4199,7 +4248,13 @@ mod tests {
                 },
             );
             let octet = BufferedOctetPort {
-                base: PortDriverBase::new("OCTET_DUPLINE", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "OCTET_DUPLINE",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 replies: Default::default(),
                 written: Arc::new(Mutex::new(Vec::new())),
@@ -4319,7 +4374,16 @@ mod tests {
                     vec![C::OctetRead, C::OctetWrite, C::Option],
                 ),
             ] {
-                let driver = Declared(PortDriverBase::new(octet, 1, PortFlags::default()), caps);
+                let driver = Declared(
+                    PortDriverBase::new(
+                        octet,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_ALL,
+                    ),
+                    caps,
+                );
                 let (rt, _jh) = create_port_runtime_unclaimed(driver, RuntimeConfig::default())
                     .expect("octet runtime must start");
                 asyn_rs::asyn_record::register_port(
@@ -4414,7 +4478,13 @@ mod tests {
         let requests: WriteLog = Arc::new(Mutex::new(Vec::new()));
         let reply = rtu_response(&[0x01, 0x03, 0x08, 0, 1, 0, 2, 0, 3, 0, 4]);
         let octet = BufferedOctetPort {
-            base: PortDriverBase::new("OCTET_LATESTART", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "OCTET_LATESTART",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             pending: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             replies: (0..64).map(|_| reply.clone()).collect(),
             written: Arc::clone(&requests),

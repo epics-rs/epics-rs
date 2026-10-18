@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -479,6 +480,8 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 
 impl NDPluginProcess for PosPluginProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     /// NDPosPlugin.cpp:203.
     const READ_ATTRIBUTES: bool = false;
 
@@ -851,7 +854,13 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = PosPluginProcessor::new(PosMode::Discard);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -1238,7 +1247,13 @@ mod tests {
     fn filename_loads_inside_the_write_as_c_write_octet_does() {
         use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let (file, valid, qty) = {
             let p = &proc.state.lock().params;
@@ -1316,7 +1331,13 @@ mod tests {
 
     fn pos_port() -> (PosPluginProcessor, asyn_rs::port::PortDriverBase) {
         let mut proc = PosPluginProcessor::new(PosMode::Keep);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         (proc, base)
     }

@@ -1,6 +1,7 @@
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use asyn_rs::port::InterfaceMask;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -50,6 +51,8 @@ impl Default for ScatterProcessor {
 
 impl NDPluginProcess for ScatterProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::scatter(array)
     }

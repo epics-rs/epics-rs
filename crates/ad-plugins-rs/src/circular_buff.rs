@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -554,6 +555,8 @@ impl CircularBuffProcessor {
 
 impl NDPluginProcess for CircularBuffProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginCircularBuff::writeInt32` drops the base class status
     /// (`status = (asynStatus) callParamCallbacks();`, NDPluginCircularBuff.cpp:303): a refused NDPluginDriver write keeps
@@ -909,7 +912,13 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = CircularBuffProcessor::new(2, 1, TriggerCondition::default(), 100);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -931,8 +940,15 @@ mod tests {
     fn test_register_params_seeds_the_c_constructor_values() {
         // Every value NDPluginCircularBuff.cpp:432-449 sets, for the IOC's
         // 100/100 buffer; the triggers and calc stay undefined.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("CB_INIT", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "CB_INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = CircularBuffProcessor::new(100, 100, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
         let idx = |name: &str| base.find_param(name).unwrap();
@@ -960,8 +976,15 @@ mod tests {
 
     #[test]
     fn test_register_params_reads_the_buffer_it_seeds_from() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("CB_INIT2", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "CB_INIT2",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = CircularBuffProcessor::new(5, 7, TriggerCondition::default(), 10);
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| {
@@ -1519,7 +1542,13 @@ mod tests {
     /// is 9) and its param base.
     fn cb_port() -> (CircularBuffProcessor, asyn_rs::port::PortDriverBase) {
         let mut proc = CircularBuffProcessor::new(3, 1, TriggerCondition::default(), 10);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         (proc, base)
     }
@@ -1920,7 +1949,13 @@ mod tests {
 
         // C latches Triggered inside the write (:271), so validate sets it.
         let latched = |p: &CircularBuffProcessor, value: i32| {
-            let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+            let mut base = asyn_rs::port::PortDriverBase::new(
+                "T",
+                1,
+                Default::default(),
+                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            );
             p.validate_int32(
                 20,
                 0,

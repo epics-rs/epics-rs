@@ -7,6 +7,7 @@
 // itself, which the backend does not remove.
 #![allow(clippy::needless_range_loop)]
 
+use asyn_rs::port::InterfaceMask;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -62,7 +63,17 @@ fn test_driver_to_stats_pipeline() {
         .unwrap();
     params_applied(&stats_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 1, 64, 64, 10_000_000, ASYN_CANBLOCK).unwrap();
+    let mut driver = ADDriverBase::new(
+        "SIM1",
+        1,
+        64,
+        64,
+        10_000_000,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+    )
+    .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.
     driver
         .port_base
@@ -121,7 +132,17 @@ fn test_driver_to_std_arrays_pipeline() {
         .unwrap();
     params_applied(&image_handle);
 
-    let mut driver = ADDriverBase::new("SIM1", 1, 32, 32, 10_000_000, ASYN_CANBLOCK).unwrap();
+    let mut driver = ADDriverBase::new(
+        "SIM1",
+        1,
+        32,
+        32,
+        10_000_000,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+    )
+    .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.
     driver
         .port_base
@@ -210,6 +231,8 @@ fn test_rewire_ndarray_port_at_runtime() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -376,6 +399,8 @@ fn test_rewire_through_real_roi_plugin() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -512,6 +537,8 @@ fn test_roi_param_change_enables_output() {
     }
     impl NDPluginProcess for TrackingProcessor {
         const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(
             &self,
             array: &Arc<ad_core_rs::ndarray::NDArray>,
@@ -862,6 +889,8 @@ fn test_std_arrays_leaves_the_array_sizes_unset() {
         48,
         1_000_000,
         ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
     )
     .unwrap();
     // The ArrayCallbacks record's PINI; the driver leaves it undefined.

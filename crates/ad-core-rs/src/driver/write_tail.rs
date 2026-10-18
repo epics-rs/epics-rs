@@ -141,6 +141,7 @@ mod tests {
 
     use asyn_rs::error::AsynError;
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use asyn_rs::services::PortServices;
     use asyn_rs::trace::TraceFile;
@@ -162,7 +163,13 @@ mod tests {
     }
 
     fn drv(port: &str, max_addr: usize) -> Drv {
-        let mut base = PortDriverBase::new(port, max_addr, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port,
+            max_addr,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let int = base.create_param("INT", ParamType::Int32).unwrap();
         let float = base.create_param("FLOAT", ParamType::Float64).unwrap();
         Drv { base, int, float }

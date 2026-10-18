@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
@@ -183,7 +184,13 @@ impl MqttDriver {
             can_block: false,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
 
         // Create connection status param (0=disconnected, 1=connected)
         let connected_param = base

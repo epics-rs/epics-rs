@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::color::NDColorMode;
@@ -491,6 +492,8 @@ impl TransformProcessor {
 
 impl NDPluginProcess for TransformProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         // C reads the transform type under the port lock and releases it
         // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
@@ -583,7 +586,13 @@ mod tests {
     fn a_refused_base_write_stays_refused() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = TransformProcessor::new(TransformType::None);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -606,9 +615,16 @@ mod tests {
     fn test_register_params_seeds_the_processor_transform() {
         // The param reads the type the processor applies; the IOC builds
         // TransformNone as NDPluginTransform.cpp:609 seeds it.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
         for t in [TransformType::None, TransformType::Rot90CW] {
-            let mut base = PortDriverBase::new("TRANS_INIT", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "TRANS_INIT",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             let mut proc = TransformProcessor::new(t);
             ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
             proc.register_params(&mut base).unwrap();

@@ -5,6 +5,7 @@ pub mod types;
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::PortClaim;
@@ -44,7 +45,16 @@ impl XrtDetector {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
         // ASYN_CANBLOCK=0: no C driver; acquisition runs on its own thread like simDetector.
-        let mut ad = ADDriverBase::new(port_name, 1, size_x, size_y, max_memory, ASYN_NONE)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            size_x,
+            size_y,
+            max_memory,
+            ASYN_NONE,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )?;
         let xrt_params = XrtDetectorParams::create(&mut ad.port_base)?;
         let motor_param_set = xrt_params.motor_params();
 

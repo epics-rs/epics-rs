@@ -119,10 +119,17 @@ fn notify_with_a_ring_and_an_enum_client_allocates_and_frees_nothing() {
 #[test]
 fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
-    let mut base = PortDriverBase::new("flushAlloc", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "flushAlloc",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
@@ -180,9 +187,16 @@ fn a_flush_with_an_octet_and_an_array_changed_allocates_nothing() {
 #[test]
 fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() {
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
-    let mut pl = PortDriverBase::new("ALLOCSET", 1, PortFlags::default());
+    let mut pl = PortDriverBase::new(
+        "ALLOCSET",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let msg = pl.create_param("MSG", ParamType::Octet).unwrap();
     pl.set_string_param(msg, 0, "first value").unwrap();
 
@@ -209,9 +223,16 @@ fn an_octet_set_allocates_once_for_a_new_value_and_never_for_an_unchanged_one() 
 #[test]
 fn setting_and_flushing_256_params_allocates_nothing() {
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
-    let mut pl = PortDriverBase::new("ALLOCSET", 1, PortFlags::default());
+    let mut pl = PortDriverBase::new(
+        "ALLOCSET",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let ids: Vec<usize> = (0..256)
         .map(|i| pl.create_param(&format!("P{i}"), ParamType::Int32).unwrap())
         .collect();
@@ -239,10 +260,17 @@ fn setting_and_flushing_256_params_allocates_nothing() {
 #[test]
 fn a_flush_into_per_reason_mailboxes_neither_allocates_nor_frees() {
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
-    let mut base = PortDriverBase::new("mbxFlush", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "mbxFlush",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();
@@ -376,10 +404,17 @@ async fn a_mailbox_registered_for_a_large_array_delivers_it_whole() {
 #[test]
 fn a_flush_with_an_async_subscriber_neither_allocates_nor_frees() {
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
     use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
 
-    let mut base = PortDriverBase::new("asyncFlush", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "asyncFlush",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
     let msg = base.create_param("MSG", ParamType::Octet).unwrap();
     let wave = base.create_param("WAVE", ParamType::Int32Array).unwrap();

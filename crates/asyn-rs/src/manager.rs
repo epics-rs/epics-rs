@@ -546,6 +546,7 @@ impl DeviceUser {
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -556,7 +557,13 @@ mod tests {
     impl DummyDriver {
         fn new(name: &str) -> Self {
             Self {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
             }
         }
     }
@@ -1001,6 +1008,7 @@ mod tests {
 mod register_port_line_tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
 
     struct P(PortDriverBase);
@@ -1014,7 +1022,13 @@ mod register_port_line_tests {
     }
 
     fn port(name: &str) -> P {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         P(base)
     }

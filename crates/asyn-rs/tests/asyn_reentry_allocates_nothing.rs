@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::register_port;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -127,6 +128,8 @@ async fn a_blocking_port_reentry_allocates_nothing() {
             can_block: true,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     let (rt, _jh) =
         create_port_runtime_unclaimed(Device { base }, RuntimeConfig::default()).unwrap();

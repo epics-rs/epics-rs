@@ -19,6 +19,7 @@
 // record-layer cases keep compiling in that configuration.
 #![cfg(feature = "ioc")]
 
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,8 +69,15 @@ fn status(drv: &NDArrayDriverBase) -> i32 {
 /// rather than reporting the file as loaded.
 #[test]
 fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
-    let mut drv =
-        NDArrayDriverBase::new("ADATTR_NOCLIENT", 1, 1 << 20, ASYN_CANBLOCK).expect("driver");
+    let mut drv = NDArrayDriverBase::new(
+        "ADATTR_NOCLIENT",
+        1,
+        1 << 20,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+    )
+    .expect("driver");
 
     assert!(
         load_attributes(&mut drv, &attributes_xml()).is_err(),
@@ -101,7 +109,15 @@ async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     }
     let client = Arc::new(CaClient::new().await.expect("CA client"));
 
-    let mut drv = NDArrayDriverBase::new("ADATTR_FED", 1, 1 << 20, ASYN_CANBLOCK).expect("driver");
+    let mut drv = NDArrayDriverBase::new(
+        "ADATTR_FED",
+        1,
+        1 << 20,
+        ASYN_CANBLOCK,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+        InterfaceMask::UNMIGRATED_SUBCLASS,
+    )
+    .expect("driver");
     drv.set_ca_client(client, tokio::runtime::Handle::current());
 
     load_attributes(&mut drv, &attributes_xml()).expect("a fed EPICS_PV attribute loads clean");

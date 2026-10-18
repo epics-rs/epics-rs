@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime, port_runtime_unavailable};
@@ -37,7 +38,9 @@ use epics_libcom_rs::runtime::task::{MandatoryThread, StackSizeClass, StackSpec,
 use asyn_rs::port_handle::PortHandle;
 
 use crate::attributes::NDAttributeList;
-use crate::driver::ndarray_driver::PendingParam;
+use crate::driver::ndarray_driver::{
+    ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS, PendingParam,
+};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverPool, NDArrayPool, PublishedArray};
 use crate::params::ndarray_driver::NDArrayDriverParams;
@@ -1091,12 +1094,31 @@ impl<P: NDPluginProcess> ValidateWrite for P {
     }
 }
 
+/// The interfaces `NDPluginDriver` ORs into its plugin's before
+/// `asynNDArrayDriver` adds its own (NDPluginDriver.cpp:91).
+pub const PLUGIN_DRIVER_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interrupts `NDPluginDriver` ORs into its plugin's (NDPluginDriver.cpp:92).
+pub const PLUGIN_DRIVER_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT32_ARRAY);
+
 pub trait NDPluginProcess: Send + Sync + 'static {
     /// The `asynFlags` C's plugin hands its `NDPluginDriver` constructor:
     /// only a can-block port gets a port thread, at the `*Configure` line's
     /// priority and stackSize (asynManager.c:2074). No default, as C's
     /// constructor argument has none.
     const ASYN_FLAGS: PortFlags;
+
+    /// The `interfaceMask` / `interruptMask` C's plugin hands its
+    /// `NDPluginDriver` constructor, which ORs in its own (NDPluginDriver.cpp:91).
+    const INTERFACE_MASK: InterfaceMask;
+    const INTERRUPT_MASK: InterfaceMask;
 
     /// Process one array. Return output arrays and param updates.
     ///
@@ -2306,7 +2328,13 @@ impl PluginPortDriver {
         max_memory: usize,
         wiring: Arc<WiringRegistry>,
     ) -> AsynResult<(Self, Arc<P>, PluginPool)> {
-        let mut base = PortDriverBase::new(port_name, max_addr, P::ASYN_FLAGS);
+        let mut base = PortDriverBase::new(
+            port_name,
+            max_addr,
+            P::ASYN_FLAGS,
+            P::INTERFACE_MASK | PLUGIN_DRIVER_INTERFACES | ND_ARRAY_DRIVER_INTERFACES,
+            P::INTERRUPT_MASK | PLUGIN_DRIVER_INTERRUPTS | ND_ARRAY_DRIVER_INTERRUPTS,
+        );
 
         let (ndarray_params, owner) = NDArrayDriverParams::create(&mut base)?;
         // C `asynNDArrayDriver` builds every plugin its own pool,
@@ -4426,6 +4454,8 @@ mod tests {
 
     impl NDPluginProcess for PassthroughProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4453,6 +4483,8 @@ mod tests {
 
     impl NDPluginProcess for ValidatingProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4564,6 +4596,28 @@ mod tests {
             }
             ParamChangeResult::empty()
         }
+    }
+
+    /// A plugin port registers NDPluginDriver's and asynNDArrayDriver's
+    /// interfaces (NDPluginDriver.cpp:91, asynNDArrayDriver.cpp:866): asynRecord
+    /// finds no asynOption or asynUInt32Digital there.
+    #[test]
+    fn a_plugin_port_registers_c_s_interfaces() {
+        use asyn_rs::interfaces::InterfaceType;
+        let (handle, _jh) = create_plugin_runtime(
+            &asyn_rs::asyn_record::claim_port("PLUGIN_IFACES").unwrap(),
+            PassthroughProcessor,
+            1_000_000,
+            10,
+            "",
+            test_wiring(),
+            DEFAULT_PLUGIN_THREADS,
+        );
+        let port = handle.port_runtime().port_handle();
+        assert!(!port.has_interface(InterfaceType::Option));
+        assert!(!port.has_interface(InterfaceType::UInt32Digital));
+        assert!(port.has_interface(InterfaceType::Int32Array));
+        assert!(port.has_interface(InterfaceType::GenericPointer));
     }
 
     /// A plugin is an asynNDArrayDriver (NDPluginDriver.h:57), so its
@@ -4678,6 +4732,8 @@ mod tests {
 
     impl NDPluginProcess for ServingProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -4714,6 +4770,8 @@ mod tests {
 
     impl NDPluginProcess for SinkProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4854,6 +4912,8 @@ mod tests {
 
     impl NDPluginProcess for CodecPlugin {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
             if !self.produce {
                 return ProcessResult::forward(array, vec![]);
@@ -4931,6 +4991,8 @@ mod tests {
 
     impl NDPluginProcess for StampProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(
                 array,
@@ -4996,6 +5058,8 @@ mod tests {
 
     impl NDPluginProcess for MistypedStamp {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![ParamUpdate::float64(self.stamp, 1.5)])
         }
@@ -5172,6 +5236,8 @@ mod tests {
         struct Restamp;
         impl NDPluginProcess for Restamp {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut out = NDArray::clone(array);
                 out.timestamp = crate::timestamp::EpicsTimestamp { sec: 9, nsec: 9 };
@@ -5624,6 +5690,8 @@ mod tests {
 
     impl NDPluginProcess for Countdown {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -5725,6 +5793,8 @@ mod tests {
         }
         impl NDPluginProcess for Poster {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let count = *self.count.lock();
                 let mut post = PortPost::of(self.attributes.as_ref());
@@ -5796,6 +5866,8 @@ mod tests {
         struct EvenOnly;
         impl NDPluginProcess for EvenOnly {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut result = ProcessResult::forward(array, vec![]);
                 result.counted = array.unique_id % 2 == 0;
@@ -5841,6 +5913,8 @@ mod tests {
 
     impl NDPluginProcess for ArraySide {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::forward(array, vec![])
         }
@@ -6339,6 +6413,8 @@ mod tests {
         struct Posting;
         impl NDPluginProcess for Posting {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut result = ProcessResult::forward(array, vec![]);
                 result
@@ -6400,6 +6476,8 @@ mod tests {
         struct Allocating;
         impl NDPluginProcess for Allocating {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
                 let out = pool.alloc(array.dims.clone(), NDDataType::UInt8).unwrap();
                 ProcessResult::arrays(vec![Arc::new(out)])
@@ -6448,6 +6526,8 @@ mod tests {
         }
         impl NDPluginProcess for Gated {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn bind_array_callbacks(&mut self, array_callbacks: ArrayCallbacks) {
                 self.array_callbacks = Some(array_callbacks);
             }
@@ -6610,6 +6690,8 @@ mod tests {
         struct Gathering;
         impl NDPluginProcess for Gathering {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::forward(array, vec![])
             }
@@ -6777,6 +6859,8 @@ mod tests {
         struct OddOnly;
         impl NDPluginProcess for OddOnly {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -6980,6 +7064,8 @@ mod tests {
     struct PoolLess(usize);
     impl NDPluginProcess for PoolLess {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::arrays(vec![Arc::new(NDArray::new(
                 vec![NDDimension::new(self.0)],
@@ -7068,6 +7154,8 @@ mod tests {
     struct Resized(Arc<std::sync::atomic::AtomicUsize>);
     impl NDPluginProcess for Resized {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             ProcessResult::arrays(vec![Arc::new(NDArray::new(
                 vec![NDDimension::new(self.0.load(Ordering::Acquire))],
@@ -7137,6 +7225,8 @@ mod tests {
     struct RefusedThenSmall;
     impl NDPluginProcess for RefusedThenSmall {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let out = |n| Arc::new(NDArray::new(vec![NDDimension::new(n)], NDDataType::UInt8));
             ProcessResult::arrays(vec![out(100), out(4)])
@@ -7181,6 +7271,8 @@ mod tests {
     struct OversizedPost;
     impl NDPluginProcess for OversizedPost {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut result = ProcessResult::sink(vec![]);
             result.addressed = vec![(
@@ -7342,6 +7434,8 @@ mod tests {
         struct ParamTracker;
         impl NDPluginProcess for ParamTracker {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -7390,6 +7484,8 @@ mod tests {
         struct Echo;
         impl NDPluginProcess for Echo {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 ProcessResult::arrays(vec![Arc::clone(array)])
             }
@@ -7593,6 +7689,8 @@ mod tests {
 
     impl NDPluginProcess for OverlapProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let mut inside = self.probe.inside.lock();
             *inside += 1;
@@ -7687,6 +7785,8 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     impl NDPluginProcess for StackProbe {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, _array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             let bytes = epics_libcom_rs::runtime::task::current_thread_stack_bytes();
             self.callback.lock().push(bytes.expect("stack readback"));
@@ -8505,6 +8605,8 @@ mod tests {
         struct CompressProcessor;
         impl NDPluginProcess for CompressProcessor {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
                 let mut out = NDArray::clone(array);
                 out.codec = Some(crate::codec::Codec {
@@ -8704,6 +8806,8 @@ mod tests {
         struct SlowProcessor;
         impl NDPluginProcess for SlowProcessor {
             const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+            const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+            const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
             fn process_array(&self, _a: &Arc<NDArray>, _p: &NDArrayPool) -> ProcessResult {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 ProcessResult::empty()
@@ -8956,6 +9060,8 @@ mod tests {
 
     impl NDPluginProcess for GatedProcessor {
         const ASYN_FLAGS: PortFlags = ASYN_CANBLOCK;
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
         fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
             self.entered.fetch_add(1, Ordering::AcqRel);
             let mut open = self.open.lock();

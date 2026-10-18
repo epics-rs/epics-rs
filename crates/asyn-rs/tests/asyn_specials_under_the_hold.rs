@@ -12,6 +12,7 @@ use std::time::Duration;
 use asyn_rs::asyn_record::AsynRecord;
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::{get_port, register_port};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -91,6 +92,8 @@ async fn drvinfo_put_resolves_on_a_blocking_port_under_the_exemption() {
             can_block: true,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("P0", ParamType::Int32).unwrap();
     base.create_param("P1", ParamType::Int32).unwrap();

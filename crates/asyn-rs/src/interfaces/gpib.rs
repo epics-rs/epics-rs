@@ -215,8 +215,8 @@ pub fn addressed_request(menu: i32, addr: i32) -> GpibAddressedRequest {
 /// (asynGpib.c:562-631): `asynCommon` + `asynOctet` + `asynGpib` + `asynInt32`.
 /// One owner for that C fact — drvVxi11 and drvPrologixGPIB both obtain their
 /// interfaces from this one call (drvVxi11.c:1761, drvPrologixGPIB.c:592), and
-/// a driver that registers more (vxi11 adds `asynOption`, drvVxi11.c:1777) says
-/// so at its own `capabilities`.
+/// a driver that registers more (vxi11 adds `asynOption`, drvVxi11.c:1777) ORs
+/// it in at its own constructor.
 ///
 /// `asynInt32` is in the set even though no GPIB driver implements it: asynGpib
 /// registers an all-NULL vtable (`asynInt32 int32 = {0,0,0,0,0}`,
@@ -225,12 +225,14 @@ pub fn addressed_request(menu: i32, addr: i32) -> GpibAddressedRequest {
 /// (asynGpib.c:620), so asynRecord's I32IV reads 1 on a GPIB port while an
 /// actual read reports [`int32_read_not_supported`] and an actual write
 /// [`int32_write_not_supported`].
-pub fn gpib_port_capabilities() -> Vec<super::Capability> {
-    use super::Capability::*;
-    vec![
-        OctetRead, OctetWrite, Gpib, Int32Read, Int32Write, Flush, Connect,
-    ]
-}
+pub const GPIB_PORT_INTERFACES: super::InterfaceMask = super::InterfaceMask::COMMON
+    .or(super::InterfaceMask::OCTET)
+    .or(super::InterfaceMask::GPIB)
+    .or(super::InterfaceMask::INT32);
+
+/// asynGpib's interrupt sources: asynOctet and asynInt32 (asynGpib.c:603, :619).
+pub const GPIB_PORT_INTERRUPTS: super::InterfaceMask =
+    super::InterfaceMask::OCTET.or(super::InterfaceMask::INT32);
 
 /// C's asynInt32Base default WRITE for a port that registered `asynInt32` with a
 /// NULL vtable — `writeDefault` (asynInt32Base.c:52-68) sets `errorMessage` to

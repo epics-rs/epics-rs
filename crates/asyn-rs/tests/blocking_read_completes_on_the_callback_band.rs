@@ -13,6 +13,7 @@ use std::time::Duration;
 use asyn_rs::adapter::universal_asyn_factory;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -89,6 +90,8 @@ fn port(name: &str, can_block: bool, calls: &Calls) -> PortRuntimeHandle {
             can_block,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     base.create_param("MSG", ParamType::Octet).unwrap();

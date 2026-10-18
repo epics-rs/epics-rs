@@ -1,6 +1,7 @@
 pub mod params;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::PortClaim;
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -21,7 +22,13 @@ pub struct PointDetector {
 
 impl PointDetector {
     pub fn new(port_name: &str, mode: DetectorMode) -> AsynResult<Self> {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = PointDetectorParams::create(&mut base)?;
 
         // Set defaults

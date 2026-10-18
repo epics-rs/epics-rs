@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
@@ -244,7 +245,13 @@ impl HscDriver {
             can_block: false,
             destructible: true,
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = HscParams::create(&mut base)?;
 
         // Initialize all params to 0

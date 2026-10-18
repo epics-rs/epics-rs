@@ -6121,6 +6121,7 @@ mod tests {
     /// left, as it does for every connect failure.
     #[test]
     fn a_shut_down_port_fails_the_asyn_common_lookup() {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -6140,7 +6141,13 @@ mod tests {
             ..PortFlags::default()
         };
         let (rt, _jh) = create_port_runtime_unclaimed(
-            Port(PortDriverBase::new(name, 1, flags)),
+            Port(PortDriverBase::new(
+                name,
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -6239,6 +6246,7 @@ mod tests {
     /// and healthy.
     #[test]
     fn a_noio_process_enters_the_port_queue() {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -6253,7 +6261,13 @@ mod tests {
         }
 
         let attach = |name: &'static str, connected: bool| {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.init_connected(connected);
             base.init_auto_connect(false);
             let (rt, _jh) = create_port_runtime_unclaimed(Link(base), RuntimeConfig::default())
@@ -6363,6 +6377,7 @@ mod tests {
     fn connect_device_entry_clears_the_previous_attempts_errs() {
         use crate::interrupt::InterruptManager;
         use crate::param::ParamType;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -6378,7 +6393,13 @@ mod tests {
         }
 
         let port_name = "r10_47_reason0";
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // The port's first parameter — reason 0.
         assert_eq!(
             base.params.create_param("FIRST", ParamType::Int32).unwrap(),
@@ -6424,6 +6445,7 @@ mod tests {
     #[test]
     fn hostinfo_put_and_option_readback_run_on_a_disconnected_port() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -6498,7 +6520,13 @@ mod tests {
         let port_name = "r12_47_dead_line";
         let log = Arc::new(Mutex::new(Log::default()));
         let host = Arc::new(Mutex::new("oldhost:5000".to_string()));
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // The port is down and nothing will bring it back: C's `autoConnectDevice`
         // is not consulted for a waived request, and must not be needed for one.
         base.init_auto_connect(false);
@@ -6632,6 +6660,7 @@ mod tests {
     fn an_unknown_option_put_reaches_the_driver_and_refreshes_the_readbacks() {
         use crate::error::{AsynError, AsynStatus};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -6689,7 +6718,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(LoggingDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 sets: sets.clone(),
             }),
             rx,
@@ -6754,6 +6789,7 @@ mod tests {
     #[test]
     fn trace_file_open_failure_errs_text_is_the_c_text() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -6775,6 +6811,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -6800,6 +6838,7 @@ mod tests {
         );
     }
 
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
 
     /// R10-55. The bus traffic a GPIB spy port saw — C's asynGpibPort, reduced
@@ -6826,7 +6865,13 @@ mod tests {
     impl GpibSpyPort {
         fn new(name: &str, calls: Arc<Mutex<GpibCalls>>) -> Self {
             Self {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 calls,
                 poll_byte: None,
                 fail: None,
@@ -6852,7 +6897,7 @@ mod tests {
             &mut self.base
         }
         fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-            crate::interfaces::gpib::gpib_port_capabilities()
+            crate::interfaces::gpib::GPIB_PORT_INTERFACES.capabilities()
         }
         fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, cmd: u8) -> AsynResult<()> {
             self.calls.lock().unwrap().universal.push(cmd);
@@ -7018,7 +7063,13 @@ mod tests {
 
         let port_name = "r10_55_no_gpib";
         let (rt, _jh) = create_port_runtime_unclaimed(
-            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OctetTransport(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -7178,6 +7229,7 @@ mod tests {
     #[test]
     fn monitor_status_refreshes_tsiz_and_flags_a_foreign_trace_file() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7199,6 +7251,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -7246,6 +7300,7 @@ mod tests {
     #[test]
     fn test_register_and_get_port() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7257,6 +7312,8 @@ mod tests {
                     "test_asyn_rec",
                     1,
                     PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
                 ))
             }
         }
@@ -7303,6 +7360,7 @@ mod tests {
     #[test]
     fn the_exception_callback_is_counted_on_the_bound_device() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7324,7 +7382,13 @@ mod tests {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
-            Box::new(MdDriver(PortDriverBase::new(port_name, 2, flags))),
+            Box::new(MdDriver(PortDriverBase::new(
+                port_name,
+                2,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ))),
             rx,
         );
         let actor_link = actor.link();
@@ -7367,6 +7431,7 @@ mod tests {
     #[test]
     fn trace_controls_route_to_device_on_multi_device_port() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7389,7 +7454,13 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
-            Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
+            Box::new(MdDriver(PortDriverBase::new(
+                port_name,
+                4,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ))),
             rx,
         );
         let actor_link = actor.link();
@@ -7437,6 +7508,7 @@ mod tests {
     #[test]
     fn dp_common_state_is_per_device_only_on_a_multi_device_port() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7463,7 +7535,13 @@ mod tests {
             let interrupts = Arc::new(InterruptManager::new());
             let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
-                Box::new(DpDriver(PortDriverBase::new(port_name, max_addr, flags))),
+                Box::new(DpDriver(PortDriverBase::new(
+                    port_name,
+                    max_addr,
+                    flags,
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ))),
                 rx,
             );
             let actor_link = actor.link();
@@ -7656,6 +7734,7 @@ mod tests {
     #[test]
     fn read_trace_state_imports_info_mask_on_connect() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7674,7 +7753,13 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
-            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            Box::new(D(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ))),
             rx,
         );
         let actor_link = actor.link();
@@ -7712,6 +7797,7 @@ mod tests {
     fn external_trace_info_mask_reflected_after_process() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -7730,7 +7816,13 @@ mod tests {
         let interrupts = Arc::new(InterruptManager::new());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
-            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            Box::new(D(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ))),
             rx,
         );
         let actor_link = actor.link();
@@ -7781,6 +7873,7 @@ mod tests {
     fn octet_read_updates_only_ifmt_selected_field() {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -7817,6 +7910,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -7879,6 +7974,7 @@ mod tests {
     fn escaped_record_fields_are_cut_at_their_c_buffer_size() {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -7924,6 +8020,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -7980,6 +8078,7 @@ mod tests {
         use crate::error::{AsynError, AsynStatus};
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8023,6 +8122,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -8120,6 +8221,7 @@ mod tests {
     fn register_and_option_errors_use_the_c_errs_text() {
         use crate::error::{AsynError, AsynStatus};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8205,6 +8307,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -8292,6 +8396,7 @@ mod tests {
     fn option_and_eos_puts_fall_through_to_a_driver_re_read() {
         use crate::error::{AsynError, AsynStatus};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -8365,6 +8470,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -8419,6 +8526,7 @@ mod tests {
         use crate::error::{AsynError, AsynStatus};
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8466,6 +8574,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -8515,6 +8625,7 @@ mod tests {
         use crate::error::{AsynError, AsynStatus};
         use crate::interpose::{EomReason, PartialOctetRead};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8565,7 +8676,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(StatusDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 n: 0,
             }),
             rx,
@@ -8618,6 +8735,7 @@ mod tests {
         use crate::error::{AsynError, AsynStatus};
         use crate::interpose::{EomReason, PartialOctetRead};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8662,6 +8780,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -8730,6 +8850,7 @@ mod tests {
     #[test]
     fn cnct_drives_the_transport_and_pcnct_the_attachment() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -8767,7 +8888,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(CountingDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 connects: connects.clone(),
                 disconnects: disconnects.clone(),
             }),
@@ -8876,6 +9003,7 @@ mod tests {
     fn a_gate_refused_request_reports_the_refusal_and_runs_no_callback() {
         use crate::error::{AsynError, AsynStatus};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8963,7 +9091,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(GateDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 log: log.clone(),
                 connects: connects.clone(),
             }),
@@ -9098,6 +9232,7 @@ mod tests {
     #[test]
     fn report_error_prints_the_c_trace_lines() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use epics_base_rs::server::database::PvDatabase;
@@ -9116,7 +9251,13 @@ mod tests {
         let port_name = "as15_P";
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
-            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            Box::new(D(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ))),
             rx,
         );
         let actor_link = actor.link();
@@ -9221,6 +9362,7 @@ mod tests {
     impl JammedPort {
         fn new(name: &str) -> Self {
             use crate::interrupt::InterruptManager;
+            use crate::port::InterfaceMask;
             use crate::port::{PortDriver, PortDriverBase, PortFlags};
             use crate::port_actor::PortActor;
             use std::sync::mpsc;
@@ -9267,7 +9409,13 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             };
-            let mut base = PortDriverBase::new(name, 1, flags);
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.seconds_between_port_connect = Duration::from_millis(20);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut actor = PortActor::new(
@@ -9475,6 +9623,7 @@ mod tests {
     fn octet_write_reports_the_transferred_count_on_both_arms() {
         use crate::error::{AsynError, AsynStatus};
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -9517,7 +9666,13 @@ mod tests {
             let (tx, rx) = mpsc::unbounded_channel();
             let actor = PortActor::new(
                 Box::new(ShortWriteDriver {
-                    base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                    base: PortDriverBase::new(
+                        port_name,
+                        1,
+                        PortFlags::default(),
+                        InterfaceMask::UNMIGRATED_ALL,
+                        InterfaceMask::UNMIGRATED_ALL,
+                    ),
                     accept,
                     fail,
                 }),
@@ -9594,6 +9749,7 @@ mod tests {
         use crate::error::{AsynError, AsynStatus};
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -9650,6 +9806,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -9729,6 +9887,7 @@ mod tests {
     ) -> Arc<Mutex<Option<usize>>> {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -9766,7 +9925,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(FillDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 fill,
                 eom,
                 requested: requested.clone(),
@@ -9843,6 +10008,7 @@ mod tests {
     #[test]
     fn tmot_zero_reaches_the_driver_as_a_zero_timeout() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -9877,7 +10043,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TimeoutSpy {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 seen: seen.clone(),
             }),
             rx,
@@ -9911,6 +10083,7 @@ mod tests {
     #[test]
     fn tmot_negative_reaches_the_driver_as_wait_forever() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -9943,7 +10116,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(TimeoutSpy {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 seen: seen.clone(),
             }),
             rx,
@@ -10000,6 +10179,7 @@ mod tests {
     fn spawn_phase_log_port(port_name: &'static str) -> Arc<Mutex<Vec<&'static str>>> {
         use crate::interpose::EomReason;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::user::AsynUser;
@@ -10046,7 +10226,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(PhaseLogDriver {
-                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 log: log.clone(),
             }),
             rx,
@@ -10643,6 +10829,7 @@ mod tests {
     fn canblock_int32_entry(value: i32) -> crate::registry::PortEntry {
         use crate::interrupt::InterruptManager;
         use crate::param::ParamType;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -10660,7 +10847,13 @@ mod tests {
             }
         }
 
-        let mut base = PortDriverBase::new("ASYNIO", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ASYNIO",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         base.set_int32_param(val, 0, value).unwrap();
 
@@ -10778,6 +10971,7 @@ mod tests {
     #[test]
     fn a_special_put_queues_while_an_earlier_one_is_outstanding() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use epics_base_rs::server::database::PvDatabase;
@@ -10808,7 +11002,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(BlockingReadDriver {
-                base: PortDriverBase::new("ASYNSPQ", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "ASYNSPQ",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 entered: entered.clone(),
                 release: release.clone(),
             }),
@@ -10878,6 +11078,7 @@ mod tests {
     async fn aqr_after_driver_dequeue_runs_to_completion() {
         use crate::interrupt::InterruptManager;
         use crate::param::ParamType;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -10911,7 +11112,13 @@ mod tests {
 
         let entered = Arc::new(AtomicBool::new(false));
         let release = Arc::new(Barrier::new(2));
-        let mut base = PortDriverBase::new("ASYNAQR", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ASYNAQR",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = BlockingReadDriver {
             base,
@@ -11006,6 +11213,7 @@ mod tests {
     async fn trace_change_posts_readback_fields_immediately() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -11029,6 +11237,8 @@ mod tests {
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -11129,6 +11339,7 @@ mod tests {
     async fn trace_puts_and_trace_exceptions_post_as_the_oracle_does() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::{TraceIoMask, TraceManager};
@@ -11197,6 +11408,8 @@ A.TMSK 1
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -11322,6 +11535,7 @@ A.TMSK 1
     async fn special_callbacks_post_after_the_put_as_the_oracle_does() {
         use crate::interfaces::Capability;
         use crate::interpose::eos::EosInterpose;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use epics_base_rs::server::database::PvDatabase;
@@ -11489,6 +11703,8 @@ A.OEOS
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.install_octet_interpose(Box::new(EosInterpose::default()));
             base.set_connected(false);
@@ -11611,6 +11827,7 @@ A.OEOS
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn special_readback_runs_in_the_same_port_callback() {
         use crate::interfaces::Capability;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use epics_base_rs::server::database::PvDatabase;
@@ -11660,6 +11877,8 @@ A.OEOS
                 can_block: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let driver = Gated {
             base,
@@ -11731,6 +11950,7 @@ A.OEOS
     async fn unchanged_trace_field_is_not_reposted() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::{TraceIoMask, TraceManager};
@@ -11756,6 +11976,8 @@ A.OEOS
                 port_name,
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );
@@ -11886,6 +12108,7 @@ A.OEOS
     async fn every_errs_write_posts_and_an_unchanged_one_does_not() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -11907,7 +12130,13 @@ A.OEOS
         // A port whose link is down and will not come back: every option put the
         // record makes is refused by the queue gate ("port X not connected").
         let port_name = "test_errs_post";
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(false);
         base.init_auto_connect(false);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -12002,6 +12231,7 @@ A.OEOS
     async fn errs_settles_on_the_last_report_of_the_cycle() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -12023,7 +12253,13 @@ A.OEOS
         }
 
         let port_name = "test_errs_post_order";
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(false);
         base.init_auto_connect(false);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -12154,6 +12390,7 @@ A.OEOS
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_device_posts_every_readback_it_refreshes() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -12190,7 +12427,13 @@ A.OEOS
         }
 
         let port_name = "r14_47_connect_posts";
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // See `connect_device_reads_the_eos_back_from_the_driver`: an EOS is
         // only settable on a port carrying C's `asynInterposeEos` (R18-71).
         base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -12274,6 +12517,7 @@ A.OEOS
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_steady_reading_still_posts_ainp_every_scan() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -12305,7 +12549,13 @@ A.OEOS
         }
 
         let port_name = "r18_86_steady";
-        let base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
         let actor_link = actor.link();
@@ -12382,6 +12632,7 @@ A.OEOS
     async fn any_port_exception_refreshes_the_connect_state_immediately() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -12406,7 +12657,13 @@ A.OEOS
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(exceptions.clone());
 
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -12482,6 +12739,7 @@ A.OEOS
     async fn a_refresh_queued_behind_the_cycle_posts_no_stale_connect_state() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::trace::TraceManager;
@@ -12505,7 +12763,13 @@ A.OEOS
         let exceptions = Arc::new(ExceptionManager::new());
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(exceptions.clone());
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -12610,6 +12874,7 @@ A.OEOS
     fn a_port_exception_refreshes_the_connect_state_on_the_next_process() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -12629,7 +12894,13 @@ A.OEOS
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(exceptions.clone());
 
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -12673,6 +12944,7 @@ A.OEOS
     fn an_own_setter_refreshes_the_status_once() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -12691,7 +12963,13 @@ A.OEOS
         let exceptions = Arc::new(ExceptionManager::new());
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(exceptions.clone());
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -12748,6 +13026,7 @@ A.OEOS
     #[test]
     fn a_trace_mask_write_keeps_every_bit() {
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -12764,7 +13043,13 @@ A.OEOS
 
         let port_name = "test_tmsk_driver_bit";
         let trace = Arc::new(TraceManager::new());
-        let base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
         let actor_link = actor.link();
@@ -12812,6 +13097,7 @@ A.OEOS
     fn the_bad_tail_stops_exceptions_from_the_old_port() {
         use crate::exception::ExceptionManager;
         use crate::interrupt::InterruptManager;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use tokio::sync::mpsc;
@@ -12830,7 +13116,13 @@ A.OEOS
         let exceptions = Arc::new(ExceptionManager::new());
         let trace = Arc::new(TraceManager::new());
         trace.set_exception_sink(exceptions.clone());
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.bind_exception_sink(exceptions.clone());
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(PlainDriver(base)), rx);
@@ -12941,6 +13233,7 @@ A.OEOS
     #[test]
     fn connect_device_reads_the_ports_interface_registry() {
         use crate::interfaces::octet_transport_capabilities;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -12961,7 +13254,13 @@ A.OEOS
 
         let port_name = "r9_53_octet_transport";
         let (rt, _jh) = create_port_runtime_unclaimed(
-            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OctetTransport(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -13017,6 +13316,7 @@ A.OEOS
     #[test]
     fn an_option_put_reaches_the_driver_with_the_records_tmot() {
         use crate::interfaces::{Capability, octet_transport_capabilities};
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
         use std::sync::Mutex as StdMutex;
@@ -13048,7 +13348,13 @@ A.OEOS
 
         let port_name = "r9_55_option_user";
         let (rt, _jh) = create_port_runtime_unclaimed(
-            OptionSpy(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OptionSpy(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -13082,6 +13388,7 @@ A.OEOS
     #[test]
     fn option_and_eos_are_refused_on_a_port_that_lacks_the_interface() {
         use crate::interfaces::Capability;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13102,7 +13409,13 @@ A.OEOS
 
         let port_name = "r9_53_no_option";
         let (rt, _jh) = create_port_runtime_unclaimed(
-            OctetNoOption(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OctetNoOption(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -13286,6 +13599,7 @@ A.OEOS
     /// refuses every other key — a driver that reports its rate as free text, and
     /// the ordinary case of a port that does not implement a key at all.
     fn register_baud_text_port(port_name: &'static str, baud_text: &'static str) {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13313,7 +13627,13 @@ A.OEOS
 
         let (rt, jh) = create_port_runtime_unclaimed(
             BaudTextPort(
-                PortDriverBase::new(port_name, 1, PortFlags::default()),
+                PortDriverBase::new(
+                    port_name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 baud_text,
             ),
             RuntimeConfig::default(),
@@ -13385,6 +13705,7 @@ A.OEOS
     /// Register an octet transport (asynOctet + asynOption + asynCommon — no
     /// asynDrvUser, exactly what drvAsynIPPort / drvAsynSerialPort register).
     fn register_octet_transport(port_name: &'static str) {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13402,7 +13723,13 @@ A.OEOS
         }
 
         let (rt, jh) = create_port_runtime_unclaimed(
-            OctetTransport(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OctetTransport(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -13420,6 +13747,7 @@ A.OEOS
     /// asynDrvUser and can resolve a drvInfo string).
     fn register_param_port(port_name: &'static str, param: &str) {
         use crate::param::ParamType;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13433,7 +13761,13 @@ A.OEOS
             }
         }
 
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // Reason 0 is taken by a filler param so the resolved reason is non-zero
         // and cannot be confused with the forced-zero case.
         base.params
@@ -13503,6 +13837,7 @@ A.OEOS
     /// (:1277-1280) — still fills in.
     #[test]
     fn connect_device_reads_the_eos_back_from_the_driver() {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13520,7 +13855,13 @@ A.OEOS
         }
 
         for (port_name, connected) in [("w10_d3_eos_up", true), ("w10_d3_eos_down", false)] {
-            let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.init_auto_connect(false);
             base.init_connected(connected);
             // A port that accepts an EOS at all is one C configured with
@@ -13630,6 +13971,7 @@ A.OEOS
     #[test]
     fn an_eos_put_without_asyn_octet_reads_back_blank() {
         use crate::interfaces::Capability;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13646,7 +13988,13 @@ A.OEOS
             }
         }
         let port_name = "as10_no_octet";
-        let base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (rt, jh) =
             create_port_runtime_unclaimed(Int32Only(base), RuntimeConfig::default()).unwrap();
         std::mem::forget(jh);
@@ -13678,6 +14026,7 @@ A.OEOS
     /// driver's text alone.
     #[test]
     fn cnct_reports_the_c_texts() {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -13703,7 +14052,13 @@ A.OEOS
             }
         }
         let start = |port_name: &'static str, connected: bool| {
-            let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.set_connected(connected);
             base.init_auto_connect(false);
             let (rt, jh) =
@@ -13818,7 +14173,13 @@ A.OEOS
             }
         }
         let port_name = "drv_user_rides";
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            crate::port::InterfaceMask::UNMIGRATED_ALL,
+            crate::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         base.params
             .create_param("START_", ParamType::Int32)
             .unwrap();
@@ -13975,7 +14336,13 @@ A.OEOS
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (rt, _jh) = create_port_runtime_unclaimed(
             IoIntrDriver {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 reads: reads.clone(),
             },
             RuntimeConfig::default(),
@@ -14399,7 +14766,13 @@ A.OEOS
 
         let port_name = "r11_46_no_int32";
         let (rt, _jh) = create_port_runtime_unclaimed(
-            OctetOnly(PortDriverBase::new(port_name, 1, PortFlags::default())),
+            OctetOnly(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use asyn_rs::asyn_record::register_port;
 use asyn_rs::interrupt::{InterruptFilter, InterruptValue};
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime_unclaimed;
@@ -67,7 +68,13 @@ fn entry(s: &str, value: i32) -> EnumEntry {
 #[epics_base_rs::epics_test]
 async fn enum_table_fires_with_a_ring_client_allocate_nothing_on_the_notify_thread() {
     const N: usize = 256;
-    let mut base = PortDriverBase::new("enumAlloc", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "enumAlloc",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("MODE", ParamType::Enum).unwrap();
     base.set_enum_choices_param(0, 0, vec![entry("OFF", 0), entry("ON", 1)].into())
         .unwrap();

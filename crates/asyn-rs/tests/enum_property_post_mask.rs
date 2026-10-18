@@ -35,6 +35,7 @@ use std::time::Duration;
 use asyn_rs::asyn_record::register_port;
 use asyn_rs::interrupt::InterruptValue;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -60,7 +61,13 @@ struct EnumPort {
 
 impl EnumPort {
     fn new(name: &str, choices: Vec<EnumEntry>) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices.into()).unwrap();
         Self { base }

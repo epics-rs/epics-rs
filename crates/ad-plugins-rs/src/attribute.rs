@@ -12,6 +12,7 @@ use ad_core_rs::plugin::runtime::{
 };
 use asyn_rs::error::AsynError;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -120,6 +121,8 @@ impl AttributeProcessor {
 
 impl NDPluginProcess for AttributeProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
         let mut channels = self.channels.lock();
@@ -262,7 +265,13 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = AttributeProcessor::new(8);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -296,8 +305,15 @@ mod tests {
 
     #[test]
     fn test_register_params_seeds_every_channel() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("ATTR_INIT", 3, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ATTR_INIT",
+            3,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = AttributeProcessor::new(3);
         proc.register_params(&mut base).unwrap();
         let p = *proc.params();
@@ -347,9 +363,16 @@ mod tests {
     #[test]
     fn reset_zeros_every_channel_inside_the_write_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
+        use asyn_rs::port::InterfaceMask;
         let mut proc = AttributeProcessor::new(2);
         proc.set_attr_name("Count");
-        let mut base = PortDriverBase::new("T", 2, Default::default());
+        let mut base = PortDriverBase::new(
+            "T",
+            2,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
         proc.process_array(&Arc::new(make_array_with_attr("Count", 100.0, 1)), &pool);

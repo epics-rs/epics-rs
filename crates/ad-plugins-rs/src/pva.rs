@@ -12,6 +12,7 @@
 // runtime the test builds itself in order to await `publish`; the backend
 // removes no reactor a test owns.
 
+use asyn_rs::port::InterfaceMask;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -68,6 +69,8 @@ impl Default for PvaProcessor {
 
 impl NDPluginProcess for PvaProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 

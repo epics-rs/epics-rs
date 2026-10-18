@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asyn_rs::error::{AsynError, AsynStatus};
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -33,7 +34,13 @@ struct Params {
 
 /// ADAcquire's rule without the plugin wait: busy follows acquire.
 fn det(name: &str, runs: Arc<AtomicUsize>) -> (PortDriverBase, Params) {
-    let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let acquire = base.create_param("ACQUIRE", ParamType::Int32).unwrap();
     let busy = base.create_param("ACQUIRE_BUSY", ParamType::Int32).unwrap();
     let other = base.create_param("OTHER", ParamType::Int32).unwrap();
@@ -110,7 +117,13 @@ fn a_reason_without_a_rule_stores_plainly() {
 
 #[test]
 fn a_failing_rule_does_not_stop_the_store() {
-    let mut base = PortDriverBase::new("RULEFAIL", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "RULEFAIL",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let acquire = base.create_param("ACQUIRE", ParamType::Int32).unwrap();
     base.set_int32_rule(
         acquire,

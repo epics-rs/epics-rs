@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::{EomReason, OctetNext, OctetReadResult};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
@@ -1088,6 +1089,9 @@ impl DrvAsynSerialPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOption and asynOctet (drvAsynSerialPort.c:1095-1126).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
@@ -1223,12 +1227,6 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvAsynSerialPort registers asynCommon, asynOption and asynOctet
-    /// (drvAsynSerialPort.c:1095-1126).
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -2040,6 +2038,20 @@ mod tests {
         assert!(drv.base().flags.can_block);
         // `new` is parse-only: no EOS interpose (DRV-45).
         assert_eq!(drv.base().interpose_octet.len(), 0);
+    }
+
+    /// drvAsynSerialPort.c:1095-1126: asynCommon, asynOption and asynOctet,
+    /// whose `interruptProcess = 1` makes asynOctet an interrupt source.
+    #[test]
+    fn the_port_registers_drv_asyn_serial_port_s_interfaces() {
+        let drv = DrvAsynSerialPort::new("serial_masks", "/dev/ttyUSB0").unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::OCTET
+            )
+        );
     }
 
     /// C drvAsynSerialPort.c:1126 enables EOS by default in Configure

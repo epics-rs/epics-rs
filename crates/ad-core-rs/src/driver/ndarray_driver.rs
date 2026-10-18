@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamValue;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::trace::TraceMask;
@@ -1393,15 +1394,42 @@ pub struct NDArrayDriverBase {
     pub owner: Arc<ArrayOwner>,
 }
 
+/// The interfaces `asynNDArrayDriver` ORs into its subclass's
+/// (asynNDArrayDriver.cpp:866).
+pub const ND_ARRAY_DRIVER_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interrupts `asynNDArrayDriver` ORs into its subclass's
+/// (asynNDArrayDriver.cpp:867).
+pub const ND_ARRAY_DRIVER_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::GENERIC_POINTER);
+
 impl NDArrayDriverBase {
+    /// `interface_mask` / `interrupt_mask` are the subclass's own, as C's
+    /// constructor arguments.
     pub fn new(
         port_name: &str,
         max_addr: usize,
         max_memory: usize,
         asyn_flags: PortFlags,
+        interface_mask: InterfaceMask,
+        interrupt_mask: InterfaceMask,
     ) -> AsynResult<Self> {
         // C takes `maxAddr` and `asynFlags` from the driver (asynNDArrayDriver.cpp:862-868).
-        let mut port_base = PortDriverBase::new(port_name, max_addr, asyn_flags);
+        let mut port_base = PortDriverBase::new(
+            port_name,
+            max_addr,
+            asyn_flags,
+            interface_mask | ND_ARRAY_DRIVER_INTERFACES,
+            interrupt_mask | ND_ARRAY_DRIVER_INTERRUPTS,
+        );
 
         let (params, owner) = NDArrayDriverParams::create(&mut port_base)?;
         let pool = DriverPool::for_driver(max_memory, &owner);
@@ -1781,13 +1809,29 @@ pub(crate) mod tests {
     #[test]
     fn max_addr_comes_from_the_caller() {
         // asynNDArrayDriver.cpp:862-868 hands maxAddr to asynPortDriver.
-        let drv = NDArrayDriverBase::new("TEST", 3, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "TEST",
+            3,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         assert_eq!(drv.port_base.max_addr, 3);
     }
 
     #[test]
     fn test_constructor_seeds_the_c_read_only_block() {
-        let drv = NDArrayDriverBase::new("TEST", 1, 4_194_304, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            4_194_304,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
         assert_fresh_pool_stats(&drv.port_base, &drv.params);
         // C `:655-660` via the NumQueuedArrays seed.
@@ -1802,7 +1846,15 @@ pub(crate) mod tests {
     #[test]
     fn an_ndarray_driver_port_drives_acquire_busy() {
         // C ADCSimDetector is an asynNDArrayDriver, not an ADDriver.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let (acquire, busy, wait, queued) = (
             drv.params.acquire,
             drv.params.acquire_busy,
@@ -1845,7 +1897,15 @@ pub(crate) mod tests {
                 &mut self.0.port_base
             }
         }
-        let mut drv = NDArrayDriverBase::new("NDQUEUEDIDLE", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "NDQUEUEDIDLE",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen_cb = seen.clone();
@@ -1891,7 +1951,15 @@ pub(crate) mod tests {
                 &mut self.0.port_base
             }
         }
-        let drv = NDArrayDriverBase::new("NDQUEUEDUPD", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "NDQUEUEDUPD",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let p = drv.params;
         let queued = drv.owner.queued().clone();
         let claim = PortRegistry::new().claim("NDQUEUEDUPD").unwrap();
@@ -1950,7 +2018,15 @@ pub(crate) mod tests {
                 &mut self.0.port_base
             }
         }
-        let drv = NDArrayDriverBase::new("NDPOOLLIMIT", 1, 64, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "NDPOOLLIMIT",
+            1,
+            64,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let pool = drv.pool.clone();
         let owner = drv.owner.clone();
         let claim = PortRegistry::new().claim("NDPOOLLIMIT").unwrap();
@@ -1993,7 +2069,15 @@ pub(crate) mod tests {
                 &mut self.0.port_base
             }
         }
-        let drv = NDArrayDriverBase::new("NDQUEUEDDROP", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "NDQUEUEDDROP",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let counter = Arc::downgrade(drv.owner.queued());
         let owner = Arc::downgrade(&drv.owner);
         let claim = PortRegistry::new().claim("NDQUEUEDDROP").unwrap();
@@ -2025,7 +2109,15 @@ pub(crate) mod tests {
         // touching NDAttributesStatus, so an IOC that never loads one reads
         // "File not found" — including after the PINI="YES" write that
         // NDArrayBase.template:793 performs at iocInit.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.read_nd_attributes_file().unwrap();
         assert_eq!(drv.attributes().len(), 0);
         assert_eq!(
@@ -2040,7 +2132,15 @@ pub(crate) mod tests {
     fn test_new_leaves_array_callbacks_to_the_database() {
         // asynNDArrayDriver never sets NDArrayCallbacks, so the init readback
         // fails and the record's VAL stands.
-        let drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         assert!(
             drv.port_base
                 .get_int32_param(drv.params.array_callbacks, 0)
@@ -2050,7 +2150,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_prepare_array() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let arr = drv
             .pool
             .alloc(
@@ -2072,7 +2180,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_prepare_updates_size_info() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let arr = drv
             .pool
             .alloc(
@@ -2102,7 +2218,15 @@ pub(crate) mod tests {
     fn test_create_file_name_empty_template_yields_empty() {
         // C parity (B9): an empty FILE_TEMPLATE is passed through epicsSnprintf
         // verbatim, producing an empty string — no fabricated default.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
@@ -2122,7 +2246,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_create_file_name_standard_template() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
@@ -2152,7 +2284,15 @@ pub(crate) mod tests {
         // seeded with set_string_param, bypassing writeOctet) is normalized
         // before the template runs. Without it the "%s%s_%3.3d.dat" default
         // produces "/tmpimg_042.dat".
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let tmp = std::env::temp_dir();
         let no_sep = tmp
             .to_string_lossy()
@@ -2199,7 +2339,15 @@ pub(crate) mod tests {
     fn test_r6_64_check_path_empty_path_touches_nothing() {
         // C checkPath() returns early for an empty FilePath (:104), leaving both
         // FilePath and FilePathExists alone.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_int32_param(drv.params.file_path_exists, 0, 1)
             .unwrap();
@@ -2261,7 +2409,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_check_path_exists() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // The platform temp dir exists on every OS; a hard-coded `/tmp`
         // does not exist on Windows, so `check_path`'s `is_dir()` reported
         // it missing and the assertion failed there. Mirrors the
@@ -2275,7 +2431,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_check_path_not_exists() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz")
             .unwrap();
@@ -2286,7 +2450,15 @@ pub(crate) mod tests {
     fn test_prepare_array_publishes_dims_type_timestamps() {
         // G7: prepare_array must publish N_DIMENSIONS, ARRAY_DIMENSIONS,
         // DATA_TYPE, COLOR_MODE, TIME_STAMP, EPICS_TS_SEC/NSEC.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let mut arr = drv
             .pool
             .alloc(
@@ -2349,7 +2521,15 @@ pub(crate) mod tests {
         // G5/G6: prepare_array publishes CODEC, COMPRESSED_SIZE, BAYER_PATTERN.
         use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let mut arr = drv
             .pool
             .alloc(
@@ -2394,7 +2574,15 @@ pub(crate) mod tests {
 
     #[test]
     fn test_connect_downstream() {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_int32_param(drv.params.array_callbacks, 0, 1)
             .unwrap();
@@ -2448,7 +2636,15 @@ pub(crate) mod tests {
     #[test]
     fn test_read_nd_attributes_file_inline_xml() {
         // G9: readNDAttributesFile parses inline XML (NDAttributesFile schema).
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Gain" type="param" source="GAIN" description="detector gain"/>
             <Attribute name="Comment" type="const" source="hello"/>
@@ -2482,7 +2678,15 @@ pub(crate) mod tests {
     }
 
     fn load_with_macros(xml: &str, macros: &str) -> NDArrayDriverBase {
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(drv.params.attributes_macros, 0, macros)
             .unwrap();
@@ -2571,7 +2775,15 @@ pub(crate) mod tests {
         // An EPICS_PV attribute evaluates Undefined for the life of the IOC
         // (no CA feeder exists), so NDAttributesStatus must not read
         // "Attributes file OK" — that is what made the gap invisible.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(
                 drv.params.attributes_file,
@@ -2617,7 +2829,15 @@ pub(crate) mod tests {
         // C returns asynError on any dbrtype outside its nine names
         // (asynNDArrayDriver.cpp:421-436); the port must not accept a typo and
         // publish the attribute as the native type instead.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(
                 drv.params.attributes_file,
@@ -2678,7 +2898,15 @@ pub(crate) mod tests {
         // G10: a PARAM attribute loaded from NDAttributesFile XML must
         // re-evaluate from the driver's asyn parameter library on
         // update_attributes(), not stay frozen at its Undefined load value.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
             <Attribute name="Maker" type="PARAM" source="MANUFACTURER" datatype="STRING"/>
@@ -2720,7 +2948,15 @@ pub(crate) mod tests {
         // the attribute, so it stays NDAttrUndefined. (The port previously
         // derived the type from the param's runtime type and published an
         // Int32 value.)
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER"/>
         </Attributes>"#;
@@ -2747,7 +2983,15 @@ pub(crate) mod tests {
         // an Int32 param — so the attribute is not refreshed (stays Undefined)
         // rather than coercing the Int32 into a Float64. With the matching
         // datatype="INT" the same param publishes Int32(value).
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="AsDouble" type="PARAM" source="ARRAY_COUNTER" datatype="DOUBLE"/>
             <Attribute name="AsInt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
@@ -2773,7 +3017,15 @@ pub(crate) mod tests {
     fn test_function_attribute_reevaluates_from_registry() {
         // G10: a FUNCTION attribute loaded from XML must call its registered
         // function on update_attributes().
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // Register a function whose return value changes on each call.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let c = counter.clone();
@@ -2816,7 +3068,15 @@ pub(crate) mod tests {
     fn test_function_attribute_missing_function_is_undefined() {
         // G10: a FUNCTION attribute naming an unregistered function evaluates
         // to Undefined (C++ functAttribute::updateValue returns asynError).
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let xml = r#"<Attributes>
             <Attribute name="Missing" type="FUNCTION" source="no_such_fn"/>
         </Attributes>"#;
@@ -2833,7 +3093,15 @@ pub(crate) mod tests {
         // G9: an empty ND_ATTRIBUTES_FILE clears the attribute list. The
         // status it leaves behind is asserted by
         // `test_empty_attributes_file_keeps_the_constructor_status`.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.owner
             .attributes()
             .lock()
@@ -2851,7 +3119,15 @@ pub(crate) mod tests {
     #[test]
     fn test_read_nd_attributes_file_missing_file() {
         // G9: a non-existent file path yields FILE_NOT_FOUND status.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         drv.port_base
             .set_string_param(drv.params.attributes_file, 0, "/nonexistent_attrs_xyz.xml")
             .unwrap();
@@ -2871,7 +3147,15 @@ pub(crate) mod tests {
         use asyn_rs::services::PortServices;
         use asyn_rs::user::UserTrace;
         let port = "NDWRONGTYPE";
-        let mut drv = NDArrayDriverBase::new(port, 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            port,
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let manager = PortServices::global().trace().clone();
         let log = std::env::temp_dir().join(format!("nd-wrong-type-{}.log", std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
@@ -2915,7 +3199,15 @@ pub(crate) mod tests {
                 &mut self.0.port_base
             }
         }
-        let drv = NDArrayDriverBase::new("NDOCTETLINE", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let drv = NDArrayDriverBase::new(
+            "NDOCTETLINE",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let file_name = drv.params.file_name;
         let claim = PortRegistry::new().claim("NDOCTETLINE").unwrap();
         let (runtime, _actor) =
@@ -2950,7 +3242,15 @@ pub(crate) mod tests {
     #[test]
     fn test_write_octet_file_path_creates_dir() {
         // G9: writeOctet on FILE_PATH runs checkPath then createFilePath.
-        let mut drv = NDArrayDriverBase::new("TEST", 1, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut drv = NDArrayDriverBase::new(
+            "TEST",
+            1,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let base = std::env::temp_dir().join(format!(
             "ad_core_rs_wo_{}",
             std::time::SystemTime::now()

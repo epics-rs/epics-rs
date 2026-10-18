@@ -2762,7 +2762,13 @@ mod tests {
     /// A controller wired to a port with the NDFile params, at the given
     /// LazyOpen and FileWriteMode.
     fn write_port(lazy: i32, mode: i32) -> FilePluginController<MockWriter> {
-        let mut base = asyn_rs::port::PortDriverBase::new("F", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "F",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let mut c = FilePluginController::new(MockWriter::new(true));
         c.register_params(&mut base).unwrap();
@@ -3120,7 +3126,13 @@ mod tests {
     #[test]
     fn a_frame_during_a_busy_write_file_is_not_blocked() {
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let mut base = asyn_rs::port::PortDriverBase::new("F", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "F",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         crate::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let mut c = FilePluginController::new(GateWriter(Arc::clone(&gate)));
         c.register_params(&mut base).unwrap();

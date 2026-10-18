@@ -249,6 +249,10 @@ pub(crate) struct Gated {
 
 impl ad_core_rs::plugin::runtime::NDPluginProcess for Gated {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: asyn_rs::port::InterfaceMask =
+        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: asyn_rs::port::InterfaceMask =
+        asyn_rs::port::InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(
         &self,
         array: &std::sync::Arc<ad_core_rs::ndarray::NDArray>,

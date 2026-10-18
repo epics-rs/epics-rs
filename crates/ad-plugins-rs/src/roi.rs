@@ -6,6 +6,7 @@ use ad_core_rs::plugin::runtime::{
     ArraySource, NDPluginProcess, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
 
@@ -494,6 +495,8 @@ impl NDPluginProcess for ROIProcessor {
         destructible: true,
         ..ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE
     };
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginROI::writeInt32` keeps the base class status and adds its
     /// own line (`"%s:%s: function=%d %s, value=%d\n"`, NDPluginROI.cpp:271-273).
@@ -676,8 +679,13 @@ pub fn create_roi_runtime(
     );
     // Recreate param layout on a scratch PortDriverBase to get matching reasons.
     let params = {
-        let mut base =
-            asyn_rs::port::PortDriverBase::new("_scratch_", 1, asyn_rs::port::PortFlags::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_scratch_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         let mut p = ROIParams::default();
@@ -746,7 +754,13 @@ mod tests {
     fn a_refused_base_write_stays_refused_with_c_line() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = ROIProcessor::new(ROIConfig::default());
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let threads = base
             .create_param("NUM_THREADS", asyn_rs::param::ParamType::Int32)
             .unwrap();
@@ -1244,6 +1258,7 @@ mod tests {
         // was rotated one slot — the operator's ROI limits described the wrong axes.
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
         use ad_core_rs::color::NDColorMode;
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         // RGB1: dims = [color=3, x=8, y=5]; xDim=1, yDim=2, colorDim=0.
@@ -1263,7 +1278,13 @@ mod tests {
         ));
 
         let mut proc = ROIProcessor::new(ROIConfig::default());
-        let mut base = PortDriverBase::new("R9_67", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "R9_67",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         let reasons = [
@@ -1333,6 +1354,7 @@ mod tests {
     /// (int)pDim->offset); ... Size ... Bin` — enabled axes only.
     #[test]
     fn process_posts_the_clamped_geometry_as_c_process_callbacks_does() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
         let mut config = ROIConfig::default();
         config.dims[0] = ROIDimConfig {
@@ -1349,7 +1371,13 @@ mod tests {
         };
         config.dims[2].enable = false;
         let mut proc = ROIProcessor::new(config);
-        let mut base = PortDriverBase::new("ROI", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ROI",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);

@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use asyn_rs::asyn_record::register_port;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::create_port_runtime_unclaimed;
@@ -52,7 +53,13 @@ struct TsPort {
 
 impl TsPort {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }
     }

@@ -29,7 +29,13 @@ impl PortDriver for SeededPort {
 
 #[test]
 fn the_boot_flush_posts_a_seeded_scalar_and_no_seeded_array() {
-    let mut base = PortDriverBase::new("BOOTARR", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "BOOTARR",
+        1,
+        PortFlags::default(),
+        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+    );
     let val = base.create_param("VAL", ParamType::Float64).unwrap();
     let arr = base.create_param("ARR", ParamType::Float64Array).unwrap();
     base.set_float64_param(val, 0, 4.0).unwrap();

@@ -5,6 +5,7 @@
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::ndarray::NDArray;
@@ -41,6 +42,8 @@ impl Default for StdArraysProcessor {
 
 impl NDPluginProcess for StdArraysProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // The frame goes on as it is; the runtime files it in `latest_data`.
         ProcessResult::forward(array, vec![])

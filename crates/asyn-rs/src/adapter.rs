@@ -6299,6 +6299,7 @@ mod tests {
     use crate::error::AsynResult;
     use crate::interrupt::{InterruptManager, InterruptValue};
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::port_actor::PortActor;
     use std::sync::Arc;
@@ -6308,7 +6309,13 @@ mod tests {
     }
     impl TestPort {
         fn new() -> Self {
-            let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self { base }
         }
@@ -6331,7 +6338,13 @@ mod tests {
     }
     impl BoundedPort {
         fn new(low32: i32, high32: i32) -> Self {
-            let mut base = PortDriverBase::new("test_bounds", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "test_bounds",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
                 base,
@@ -8251,7 +8264,13 @@ mod tests {
             }
         }
 
-        let mut base = PortDriverBase::new("test_enum", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test_enum",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("MODE", ParamType::Enum).unwrap();
         base.set_enum_choices_param(0, 0, choices).unwrap();
         let driver = EnumPort { base };
@@ -8816,7 +8835,13 @@ mod tests {
             }
         }
         fn adapter_with_cap(cap: usize) -> AsynDeviceSupport {
-            let mut base = PortDriverBase::new("capport", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "capport",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             let driver = CapPort { base, cap };
             let interrupts = Arc::new(InterruptManager::new());
@@ -8918,7 +8943,13 @@ mod tests {
         use epics_base_rs::server::records::longout::LongoutRecord;
 
         let seen = Seen::default();
-        let mut base = PortDriverBase::new("progport", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "progport",
+            1,
+            PortFlags::default(),
+            crate::port::InterfaceMask::UNMIGRATED_ALL,
+            crate::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("START_", ParamType::Int32).unwrap();
         let driver = ProgPort {
             base,
@@ -8982,7 +9013,13 @@ mod tests {
         }
 
         let (rt, _jh) = create_port_runtime_unclaimed(
-            Transport(PortDriverBase::new("r11_48_dev", 1, PortFlags::default())),
+            Transport(PortDriverBase::new(
+                "r11_48_dev",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -9044,6 +9081,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -9124,6 +9163,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let (rt, _jh) =
@@ -9208,6 +9249,8 @@ mod tests {
                     can_block,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Float64).unwrap();
             let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9364,6 +9407,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             let msg = base.create_param("MSG", ParamType::Octet).unwrap();
             let arr = base.create_param("ARR", ParamType::Int32Array).unwrap();
@@ -9521,7 +9566,13 @@ mod tests {
         fn bind(iface_type: &str, init: impl FnOnce(&mut AsynDeviceSupport)) -> Binds {
             let binds: Binds = Arc::new(std::sync::Mutex::new(Vec::new()));
             let driver = OnDemandPort {
-                base: PortDriverBase::new("ondemand", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "ondemand",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 binds: Arc::clone(&binds),
             };
             let interrupts = Arc::new(InterruptManager::new());
@@ -9929,7 +9980,13 @@ mod tests {
     }
 
     fn draw_port_adapter(iface: &str, param: ParamType) -> AsynDeviceSupport {
-        let mut base = PortDriverBase::new("draw", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "draw",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", param).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(DrawPort { base }), rx);
@@ -10077,7 +10134,13 @@ mod tests {
     /// An asynOctet adapter on an asynPortDriver string parameter holding
     /// `text`.
     fn octet_param_adapter(text: &[u8], scan: ScanType) -> AsynDeviceSupport {
-        let mut base = PortDriverBase::new("octparam", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "octparam",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let fw = base.create_param("FW", ParamType::Octet).unwrap();
         base.params.set_string(fw, 0, text).unwrap();
         let interrupts = Arc::new(InterruptManager::new());
@@ -10757,7 +10820,13 @@ mod tests {
         }
         impl F64Port {
             fn new() -> Self {
-                let mut base = PortDriverBase::new("test_f64", 1, PortFlags::default());
+                let mut base = PortDriverBase::new(
+                    "test_f64",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                );
                 base.create_param("VAL", ParamType::Float64).unwrap();
                 Self { base }
             }
@@ -11221,7 +11290,13 @@ mod tests {
     ) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let port = BinaryWritePort {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             writes: writes.clone(),
             fail,
         };
@@ -11479,7 +11554,13 @@ mod tests {
     fn spawn_float32_array_port(name: &str) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<f32>>>>) {
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let port = Float32ArrayPort {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             writes: writes.clone(),
         };
         let interrupts = Arc::new(InterruptManager::new());
@@ -11690,7 +11771,13 @@ mod tests {
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sequence = Arc::new(std::sync::Mutex::new(Vec::new()));
         let port = CmdResponsePort {
-            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             writes: writes.clone(),
             sequence: sequence.clone(),
             reply: reply.to_vec(),
@@ -11883,6 +11970,8 @@ mod tests {
                 "octet_partial",
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             ))),
             rx,
         );

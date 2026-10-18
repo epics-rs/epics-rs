@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
@@ -49,7 +50,13 @@ impl PortDriver for Derived {
 type Seen = Arc<Mutex<Vec<Vec<u8>>>>;
 
 fn base(name: &str, seen: Seen) -> (PortDriverBase, usize, usize) {
-    let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let file = base.create_param("FILE", ParamType::Octet).unwrap();
     let other = base.create_param("OTHER", ParamType::Octet).unwrap();
     base.set_write_octet_rule(

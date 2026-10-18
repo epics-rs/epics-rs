@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,6 +42,8 @@ impl GatherProcessor {
 
 impl NDPluginProcess for GatherProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         self.count.fetch_add(1, Ordering::Relaxed);
         ProcessResult::forward(array, vec![])

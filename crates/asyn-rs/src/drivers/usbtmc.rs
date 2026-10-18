@@ -44,6 +44,7 @@
 //! scaffold convention as [`super::ftdi`].
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -260,6 +261,14 @@ impl DrvAsynUsbtmcPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOctet, asynInt32 (the status-byte / remote-local
+            // parameters) and asynDrvUser (SRQ, STATUS_BYTE, … resolve to
+            // reasons), no asynOption (drvAsynUSBTMC.c:1285-1324).
+            InterfaceMask::COMMON
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT32
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32,
         );
         base.init_auto_connect(!config.no_auto_connect());
         Ok(Self {
@@ -313,18 +322,6 @@ impl PortDriver for DrvAsynUsbtmcPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvAsynUSBTMC registers asynCommon, asynOctet and asynInt32
-    /// (drvAsynUSBTMC.c:1285-1322) — asynInt32 carries the status-byte /
-    /// remote-local parameters. It registers no asynOption.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        use crate::interfaces::Capability::*;
-        // C drvAsynUSBTMC registers asynDrvUser (drvAsynUSBTMC.c:1319-1324) —
-        // its drvInfo strings (SRQ, STATUS_BYTE, …) resolve to reasons.
-        vec![
-            OctetRead, OctetWrite, Int32Read, Int32Write, DrvUser, Flush, Connect,
-        ]
     }
 
     /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
@@ -438,6 +435,18 @@ impl PortDriver for DrvAsynUsbtmcPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// drvAsynUSBTMC.c:1285-1324: asynCommon, asynOctet, asynInt32 and
+    /// asynDrvUser, with asynInt32 the SRQ interrupt source (:1312-1317).
+    #[test]
+    fn the_port_registers_drv_asyn_usbtmc_s_interfaces() {
+        use InterfaceMask as M;
+        let drv = DrvAsynUsbtmcPort::configure("usbtmc_masks", 0, 0, "", 0, 0).unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (M::COMMON | M::OCTET | M::INT32 | M::DRV_USER, M::INT32)
+        );
+    }
 
     #[test]
     fn bulk_out_header_matches_c_layout() {

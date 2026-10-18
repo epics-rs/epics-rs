@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::registry::PortClaim;
@@ -37,8 +38,16 @@ impl SimDetector {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
         // maxAddr 1, ASYN_CANBLOCK=0: simDetector.cpp:1031-1036.
-        let mut ad =
-            ADDriverBase::new(port_name, 1, max_size_x, max_size_y, max_memory, ASYN_NONE)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_NONE,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )?;
         let sim_params = SimDetectorParams::create(&mut ad.port_base)?;
 
         // Set default values matching C++ constructor

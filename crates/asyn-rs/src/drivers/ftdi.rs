@@ -26,6 +26,7 @@
 //! without `libusb`.
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -145,6 +146,9 @@ impl DrvAsynFtdiPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOption and asynOctet (drvAsynFTDIPort.cpp:579-616).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         base.init_auto_connect(!no_auto_connect);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
@@ -196,12 +200,6 @@ impl PortDriver for DrvAsynFtdiPort {
         &mut self.base
     }
 
-    /// C drvAsynFTDIPort registers asynCommon, asynOption and asynOctet
-    /// (drvAsynFTDIPort.cpp:579-613).
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
-    }
-
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
         if !Self::has_hw_support() {
             return Err(AsynError::Status {
@@ -229,6 +227,22 @@ impl PortDriver for DrvAsynFtdiPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// drvAsynFTDIPort.cpp:579-616: asynCommon, asynOption and asynOctet,
+    /// whose `interruptProcess = 1` makes asynOctet an interrupt source.
+    #[test]
+    fn the_port_registers_drv_asyn_ftdi_port_s_interfaces() {
+        let drv =
+            DrvAsynFtdiPort::configure("ftdi_masks", 0x0403, 0x6001, 9600, 1, 0, true, false, 0)
+                .unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::OCTET
+            )
+        );
+    }
 
     #[test]
     fn mode_bit0_clear_selects_uart() {

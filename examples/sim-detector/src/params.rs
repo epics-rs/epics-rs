@@ -299,11 +299,18 @@ impl SimConfigSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
     #[test]
     fn test_create_params() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = SimDetectorParams::create(&mut base).unwrap();
         assert!(base.find_param("SIM_GAIN_X").is_some());
         assert!(base.find_param("SIM_MODE").is_some());

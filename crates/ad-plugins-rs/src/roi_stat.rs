@@ -14,6 +14,7 @@ use ad_core_rs::plugin::runtime::{
 };
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
@@ -329,6 +330,8 @@ fn roi_stats_of<T: StatsElem>(
 
 impl NDPluginProcess for ROIStatProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginROIStat::writeInt32` keeps the base class clamp but replaces its
     /// errorMessage with its own, carrying `getAddress`'s status
@@ -775,7 +778,13 @@ mod tests {
     fn a_refused_base_write_carries_c_error_message() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = ROIStatProcessor::new(vec![], 0);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -850,8 +859,15 @@ mod tests {
             assert!(port.read_int32_blocking(reason, 0).is_err());
         }
         // The port handle has no blocking octet read; Name goes through the base.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("RS_NAME", 2, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "RS_NAME",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = ROIStatProcessor::new(vec![ROIStatROI::default(); 2], 2048);
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
@@ -1178,6 +1194,7 @@ mod tests {
 
     #[test]
     fn test_adp16_geometry_writeback_uses_clamped_values() {
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let arr = make_2d_array(4, 4, |_, _| 10.0);
@@ -1188,7 +1205,13 @@ mod tests {
             bgd_width: 0,
         }];
         let mut proc = ROIStatProcessor::new(rois, 0);
-        let mut base = PortDriverBase::new("roistat_adp16", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "roistat_adp16",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         let p = *proc.params_handle().lock();

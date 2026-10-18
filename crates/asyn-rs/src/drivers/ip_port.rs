@@ -15,6 +15,7 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
 use crate::interpose::com::{ComInterpose, ComPortOptions};
 use crate::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::trace::TraceMask;
 use crate::user::AsynUser;
@@ -1597,6 +1598,11 @@ impl DrvAsynIPPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon, asynOption and asynOctet, no register interface
+            // (drvAsynIPPort.c:1091-1109): a record with IFACE=Int32/UInt32/
+            // Float64 gets C's `No asyn<X> interface` (asynRecord.c:1336-1358).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         base.init_auto_connect(true);
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
@@ -1932,14 +1938,6 @@ impl PortDriver for DrvAsynIPPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvAsynIPPort registers asynCommon, asynOption and asynOctet
-    /// (drvAsynIPPort.c:1091-1109) — no register interface. A record with
-    /// IFACE=Int32/UInt32/Float64 on this port gets C's `No asyn<X> interface`
-    /// (asynRecord.c:1336-1358), not a silent parameter-cache read.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -2334,6 +2332,20 @@ mod tests {
         assert!(!drv.base().is_connected());
         assert!(drv.base().is_auto_connect());
         assert!(drv.base().flags.can_block);
+    }
+
+    /// drvAsynIPPort.c:1091-1109: asynCommon, asynOption and asynOctet, whose
+    /// `interruptProcess = 1` makes asynOctet an interrupt source.
+    #[test]
+    fn the_port_registers_drv_asyn_ip_port_s_interfaces() {
+        let drv = DrvAsynIPPort::new("iptest", "localhost:5025").unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+                InterfaceMask::OCTET
+            )
+        );
     }
 
     /// `new_configured(..., noAutoConnect=1, noProcessEos=0)` — the differential

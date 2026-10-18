@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 // Not gated on `parallel`: `should_parallelize` is the whole decision now
@@ -954,6 +955,8 @@ impl ProcessProcessor {
 
 impl NDPluginProcess for ProcessProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginProcess::writeInt32` drops the base class status
     /// (`status = (asynStatus) callParamCallbacks(addr);`, NDPluginProcess.cpp:318): a refused NDPluginDriver write keeps
@@ -1297,7 +1300,13 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = ProcessProcessor::new(ProcessConfig::default());
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -1319,8 +1328,15 @@ mod tests {
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
         // NDPluginProcess.cpp:420-422; the controls stay undefined.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("PROC_INIT", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "PROC_INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = ProcessProcessor::new(ProcessConfig::default());
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
@@ -1888,6 +1904,7 @@ mod tests {
         // (NDPluginProcess.cpp:287): a caput of 0 to SaveBackground runs the same
         // release-and-resave sequence. The port gated on `value != 0`.
         use ad_core_rs::plugin::runtime::{SideParam, WriteVerdict};
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let mut proc = ProcessProcessor::new(ProcessConfig {
@@ -1895,7 +1912,13 @@ mod tests {
             ..Default::default()
         });
 
-        let mut base = PortDriverBase::new("R9_68", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "R9_68",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let pool = NDArrayPool::new(1_000_000);
         let _ = proc.process_array(&Arc::new(make_array(&[4, 5, 6])), &pool);
@@ -1939,7 +1962,13 @@ mod tests {
     fn auto_offset_scale_is_cleared_by_the_frame_as_c_process_callbacks_does() {
         use ad_core_rs::plugin::runtime::{ParamUpdate, WriteVerdict};
         let mut proc = ProcessProcessor::new(ProcessConfig::default());
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let reason = proc.params.auto_offset_scale.unwrap();
         let pool = NDArrayPool::new(1_000_000);
@@ -2548,6 +2577,7 @@ mod tests {
     #[test]
     fn pass_through_still_posts_the_readbacks_and_caches_the_output() {
         use ad_core_rs::plugin::runtime::ParamUpdate;
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let mut proc = ProcessProcessor::new(ProcessConfig {
@@ -2556,7 +2586,13 @@ mod tests {
             enable_background: true,
             ..Default::default()
         });
-        let mut base = PortDriverBase::new("R132", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "R132",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
 
         let pool = NDArrayPool::new(1_000_000);

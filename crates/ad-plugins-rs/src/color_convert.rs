@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -1014,6 +1015,8 @@ impl ColorConvertProcessor {
 
 impl NDPluginProcess for ColorConvertProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     /// NDPluginColorConvert.cpp:548.
     const READ_ATTRIBUTES: bool = false;
 
@@ -1564,9 +1567,16 @@ mod tests {
     fn test_register_params_seeds_the_processor_color_mode_out() {
         // NDPluginColorConvert.cpp:661 seeds ColorModeOut; FalseColor stays
         // undefined.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
         for target_mode in [NDColorMode::Mono, NDColorMode::RGB1] {
-            let mut base = PortDriverBase::new("CC_INIT", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "CC_INIT",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             let mut proc = ColorConvertProcessor::new(ColorConvertConfig {
                 target_mode,
                 bayer_pattern: NDBayerPattern::RGGB,

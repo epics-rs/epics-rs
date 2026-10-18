@@ -39,6 +39,7 @@ use ad_core_rs::plugin::runtime::{
 };
 use ad_core_rs::timestamp::EpicsTimestamp;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use parking_lot::Mutex;
 
@@ -557,6 +558,8 @@ impl TimeSeriesState {
 
 impl NDPluginProcess for TimeSeriesProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginTimeSeries::writeInt32` (NDPluginTimeSeries.cpp:441-490):
     /// its branch runs inside the write, before `callParamCallbacks`. It keeps
@@ -814,7 +817,13 @@ mod tests {
     #[test]
     fn a_refused_base_write_carries_c_error_message() {
         let proc = TimeSeriesProcessor::new(1);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -845,6 +854,7 @@ mod tests {
             WriteVerdict::Accept(1)
         );
     }
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriverBase, PortFlags};
 
     // ---- averaged_value: divide first, then narrow (CBUG-B25) ----
@@ -909,7 +919,13 @@ mod tests {
     #[test]
     fn test_register_params_seeds_only_what_the_c_constructor_sets() {
         let mut proc = TimeSeriesProcessor::new(2);
-        let mut base = PortDriverBase::new("TS_INIT", 3, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TS_INIT",
+            3,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let int = |name: &str| base.get_int32_param(base.find_param(name).unwrap(), 0);
         let dbl = |name: &str| base.get_float64_param(base.find_param(name).unwrap(), 0);
@@ -929,7 +945,13 @@ mod tests {
 
     fn make_proc(max_signals: usize, port: &str) -> TimeSeriesProcessor {
         let mut proc = TimeSeriesProcessor::new(max_signals);
-        let mut base = PortDriverBase::new(port, max_signals + 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port,
+            max_signals + 1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         proc
     }
@@ -1000,7 +1022,13 @@ mod tests {
     #[test]
     fn test_stop_write_posts_with_the_next_unique_id() {
         let (proc, _) = filled_fixed_u16("TST_TS_STOP");
-        let mut base = PortDriverBase::new("TST_TS_STOP_B", 3, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TST_TS_STOP_B",
+            3,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (acquire, series) = {
             let st = proc.state.lock();
             (st.p.ts_acquire, st.p.ts_time_series)
@@ -1051,7 +1079,13 @@ mod tests {
     #[test]
     fn test_num_points_and_acquire_mode_writes_carry_the_axis() {
         let proc = make_proc(1, "TST_TS_NPTS");
-        let mut base = PortDriverBase::new("TST_TS_NPTS_B", 2, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TST_TS_NPTS_B",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = proc.state.lock().p.clone();
         proc.state.lock().averaging_time_actual = 1.0;
         let out = proc.validate_int32(
@@ -1099,7 +1133,13 @@ mod tests {
     #[test]
     fn test_averaging_time_write_carries_num_average() {
         let proc = make_proc(1, "TST_TS_AVG");
-        let base = PortDriverBase::new("TST_TS_AVG_B", 2, PortFlags::default());
+        let base = PortDriverBase::new(
+            "TST_TS_AVG_B",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p = proc.state.lock().p.clone();
         let out = proc.validate_float64(
             p.ts_time_per_point,
@@ -1137,7 +1177,13 @@ mod tests {
     #[test]
     fn test_a_base_param_write_is_not_settled() {
         let proc = make_proc(1, "TST_TS_BASE");
-        let mut base = PortDriverBase::new("TST_TS_BASE_B", 2, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "TST_TS_BASE_B",
+            2,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         // make_proc numbers the TS params from 0; this is none of them.
         const BASE: usize = 1000;
         let out = proc.validate_int32(

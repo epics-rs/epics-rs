@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -65,6 +66,8 @@ fn the_port_thread_takes_register_port_s_stack_size() {
                 can_block: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let device = Device {
             base,
@@ -95,7 +98,13 @@ fn the_port_thread_takes_register_port_s_stack_size() {
 fn a_synchronous_port_s_stack_size_is_not_read() {
     let stack = Arc::new(AtomicUsize::new(0));
     let device = Device {
-        base: PortDriverBase::new("STACK_SYNC", 1, PortFlags::default()),
+        base: PortDriverBase::new(
+            "STACK_SYNC",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        ),
         stack: Arc::clone(&stack),
     };
     let config = RuntimeConfig {

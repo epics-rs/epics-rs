@@ -11,6 +11,7 @@ use std::time::Duration;
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -92,6 +93,8 @@ async fn a_blocking_write_completes_once_on_the_record_s_band() {
             can_block: true,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) = create_port_runtime_unclaimed(

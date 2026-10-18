@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
@@ -199,7 +200,13 @@ impl QxbpmDriver {
             can_block: false,
             destructible: true,
         };
-        let mut base = PortDriverBase::new(port_name, 1, flags);
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let params = QxbpmParams::create(&mut base)?;
 
         // Initialize all params to 0

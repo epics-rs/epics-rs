@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 
 use ad_core_rs::error::ADResult;
@@ -687,6 +688,8 @@ impl OverlayProcessor {
 
 impl NDPluginProcess for OverlayProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_MULTIDEVICE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginOverlay::writeInt32` drops the base class status
     /// (`NDPluginDriver::writeInt32(pasynUser, value);`, NDPluginOverlay.cpp:508): a refused NDPluginDriver write keeps
@@ -876,7 +879,13 @@ mod tests {
     fn a_refused_base_write_succeeds_as_c_write_int32_does() {
         use ad_core_rs::plugin::runtime::WriteVerdict;
         let proc = OverlayProcessor::new(8, vec![]);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         let clamp = WriteVerdict::Refuse {
             keep: 1,
             message: String::new(),
@@ -978,10 +987,17 @@ mod tests {
     #[test]
     fn test_r6_72_param_write_above_255_is_not_clamped() {
         use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let mut proc = OverlayProcessor::new(8, vec![]);
-        let mut base = PortDriverBase::new("R6_72", 9, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "R6_72",
+            9,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
 
         let red = proc.params.red.expect("OVERLAY_RED registered");
@@ -1680,8 +1696,13 @@ mod tests {
         OverlayParamIndices,
     ) {
         let mut p = OverlayProcessor::new(8, vec![]);
-        let mut base =
-            asyn_rs::port::PortDriverBase::new("OV_TEST", 8, asyn_rs::port::PortFlags::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "OV_TEST",
+            8,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         p.register_params(&mut base).unwrap();
         let params = OverlayParamIndices {
             position_x: base.find_param("OVERLAY_POSITION_X"),
@@ -1701,8 +1722,13 @@ mod tests {
         // same number of addresses, so the last overlay is at maxOverlays-1
         // and an address past that reaches no slot.
         let mut p = OverlayProcessor::new(3, vec![]);
-        let mut base =
-            asyn_rs::port::PortDriverBase::new("OV_MAX", 3, asyn_rs::port::PortFlags::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "OV_MAX",
+            3,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         p.register_params(&mut base).unwrap();
         let use_overlay = p.params.use_overlay.unwrap();
         for (addr, want_slots) in [(2, 3), (3, 3)] {

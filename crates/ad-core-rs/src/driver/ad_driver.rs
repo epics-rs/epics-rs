@@ -8,11 +8,13 @@
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
 use crate::driver::ndarray_driver::{
-    ArrayOwner, handle_write_int32, init_read_only_params, trace_write_int32,
+    ArrayOwner, ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS, handle_write_int32,
+    init_read_only_params, trace_write_int32,
 };
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
@@ -30,7 +32,24 @@ pub struct ADDriverBase {
     pub owner: Arc<ArrayOwner>,
 }
 
+/// The interfaces `ADDriver` ORs into its subclass's before
+/// `asynNDArrayDriver` adds its own (ADDriver.cpp:131).
+pub const AD_DRIVER_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::GENERIC_POINTER)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interrupts `ADDriver` ORs into its subclass's (ADDriver.cpp:132).
+pub const AD_DRIVER_INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::GENERIC_POINTER);
+
 impl ADDriverBase {
+    /// `interface_mask` / `interrupt_mask` are the detector's own, as C's
+    /// `ADDriver` constructor arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port_name: &str,
         max_addr: usize,
@@ -38,9 +57,17 @@ impl ADDriverBase {
         max_size_y: i32,
         max_memory: usize,
         asyn_flags: PortFlags,
+        interface_mask: InterfaceMask,
+        interrupt_mask: InterfaceMask,
     ) -> AsynResult<Self> {
         // C takes `maxAddr` and `asynFlags` from the detector (ADDriver.cpp:126-133).
-        let mut port_base = PortDriverBase::new(port_name, max_addr, asyn_flags);
+        let mut port_base = PortDriverBase::new(
+            port_name,
+            max_addr,
+            asyn_flags,
+            interface_mask | AD_DRIVER_INTERFACES | ND_ARRAY_DRIVER_INTERFACES,
+            interrupt_mask | AD_DRIVER_INTERRUPTS | ND_ARRAY_DRIVER_INTERRUPTS,
+        );
 
         let (params, owner) = ADDriverParams::create(&mut port_base)?;
         let pool = DriverPool::for_driver(max_memory, &owner);
@@ -338,7 +365,17 @@ mod tests {
         // `asynNDArrayDriver::asynNDArrayDriver`, so the whole of
         // asynNDArrayDriver.cpp:954-1005 must be readable on a detector port
         // too, not just the six seeds this constructor used to repeat.
-        let ad = ADDriverBase::new("TEST", 1, 1024, 768, 50_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "TEST",
+            1,
+            1024,
+            768,
+            50_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         assert_c_read_only_block(&ad.port_base, &ad.params.base, "TEST");
         assert_fresh_pool_stats(&ad.port_base, &ad.params.base);
         // Neither constructor sets NDCodec; only a published array does.
@@ -408,7 +445,17 @@ mod tests {
 
     fn own_shutter() -> OwnShutter {
         OwnShutter {
-            ad: ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap(),
+            ad: ADDriverBase::new(
+                "TEST",
+                1,
+                8,
+                8,
+                1_000_000,
+                ASYN_CANBLOCK,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+            )
+            .unwrap(),
             shutter: Vec::new(),
             nd_writes: Vec::new(),
         }
@@ -428,9 +475,58 @@ mod tests {
         assert_eq!(d.nd_writes, vec![p.base.pool_poll_stats]);
     }
 
+    /// An AD port registers ADDriver's and asynNDArrayDriver's interfaces
+    /// (ADDriver.cpp:131, asynNDArrayDriver.cpp:866): no asynOption, no
+    /// asynUInt32Digital, so asynRecord's OPTIONIV and UI32IV read 0.
+    #[test]
+    fn an_ad_port_registers_c_s_interfaces() {
+        use asyn_rs::interfaces::InterfaceType;
+        let d = BaseShutter(
+            ADDriverBase::new(
+                "TEST",
+                1,
+                8,
+                8,
+                1_000_000,
+                ASYN_CANBLOCK,
+                InterfaceMask::NONE,
+                InterfaceMask::NONE,
+            )
+            .unwrap(),
+        );
+        let mut types: Vec<_> = asyn_rs::port::PortDriver::capabilities(&d)
+            .iter()
+            .map(|c| c.interface_type())
+            .collect();
+        types.sort_by_key(|t| t.asyn_name());
+        types.dedup();
+        assert_eq!(
+            types,
+            [
+                InterfaceType::Common,
+                InterfaceType::DrvUser,
+                InterfaceType::Float64,
+                InterfaceType::GenericPointer,
+                InterfaceType::Int32,
+                InterfaceType::Int32Array,
+                InterfaceType::Octet,
+            ]
+        );
+    }
+
     #[test]
     fn first_ad_param_splits_the_ndarray_params_from_the_detector_params() {
-        let ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let p = &ad.params;
         assert!(p.base.pool_poll_stats < p.first_ad_param);
         assert!(p.base.array_callbacks < p.first_ad_param);
@@ -451,8 +547,19 @@ mod tests {
 
     #[test]
     fn ad_write_int32_shutter_control_defaults_to_add_driver_set_shutter() {
-        let mut d =
-            BaseShutter(ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap());
+        let mut d = BaseShutter(
+            ADDriverBase::new(
+                "TEST",
+                1,
+                8,
+                8,
+                1_000_000,
+                ASYN_CANBLOCK,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+            )
+            .unwrap(),
+        );
         let p = d.0.params;
         d.0.port_base
             .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
@@ -553,7 +660,19 @@ mod tests {
             multi_device: true,
             ..ASYN_CANBLOCK
         };
-        let mut d = BaseShutter(ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, flags).unwrap());
+        let mut d = BaseShutter(
+            ADDriverBase::new(
+                "TEST",
+                1,
+                8,
+                8,
+                1_000_000,
+                flags,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+                InterfaceMask::UNMIGRATED_SUBCLASS,
+            )
+            .unwrap(),
+        );
         let status = d.ad_write_int32(&AsynUser::new(image_mode).with_addr(1), 3);
         assert_eq!(status.unwrap_err().c_status_code(), 3);
         assert_ne!(d.0.port_base.get_int32_param(image_mode, 0).ok(), Some(3));
@@ -562,13 +681,33 @@ mod tests {
     #[test]
     fn max_addr_comes_from_the_caller() {
         // eiger passes MAX_ASYN_ADDRESS, mythen is multi-device: ADDriver.cpp:126.
-        let ad = ADDriverBase::new("TEST", 4, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "TEST",
+            4,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         assert_eq!(ad.port_base.max_addr, 4);
     }
 
     #[test]
     fn test_new_sets_initial_params() {
-        let ad = ADDriverBase::new("TEST", 1, 1024, 768, 50_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "TEST",
+            1,
+            1024,
+            768,
+            50_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // C++ ADDriver.cpp:180-191 — the full set of parameters the constructor
         // seeds, and nothing more.
         assert_eq!(
@@ -625,7 +764,17 @@ mod tests {
         // Period and ADShutterMode all carry PINI="YES" DB defaults (and are
         // restored by autosave), so the constructor must NOT seed them.
         // ADStatusMessage is seeded, but to "" (:189) — not "Idle".
-        let ad = ADDriverBase::new("TEST", 1, 1024, 768, 50_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "TEST",
+            1,
+            1024,
+            768,
+            50_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
 
         for (name, idx) in [
             ("SizeX", ad.params.size_x),
@@ -689,7 +838,17 @@ mod tests {
     #[test]
     fn test_attributes_file_write_reaches_the_prepared_array() {
         use crate::attributes::NDAttrValue;
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
         ad.port_base
             .set_int32_param(ad.params.base.array_callbacks, 0, 1)
@@ -722,7 +881,17 @@ mod tests {
 
     #[test]
     fn test_prepare_array_increments_counter() {
-        let mut ad = ADDriverBase::new("TEST", 1, 256, 256, 50_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            256,
+            256,
+            50_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let arr = ad
             .pool
             .alloc(
@@ -746,7 +915,17 @@ mod tests {
     fn test_prepare_array_skips_output_when_callbacks_disabled() {
         use crate::plugin::channel::ndarray_channel;
 
-        let mut ad = ADDriverBase::new("TEST", 1, 64, 64, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            64,
+            64,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let (sender, _receiver) = ndarray_channel("DOWNSTREAM", 10);
         ad.connect_downstream(sender);
 
@@ -783,7 +962,17 @@ mod tests {
 
     #[test]
     fn test_publish_sets_generic_pointer() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
         ad.port_base
             .set_int32_param(ad.params.base.array_callbacks, 0, 1)
@@ -814,7 +1003,17 @@ mod tests {
         // C parity: ADShutterModeDetector is an empty break in the base driver;
         // detector drivers override setShutter themselves. The base must NOT
         // touch SHUTTER_CONTROL or SHUTTER_STATUS.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
             .unwrap();
@@ -834,7 +1033,17 @@ mod tests {
 
     #[test]
     fn set_shutter_with_shutter_mode_unset_reads_it_as_none() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.set_shutter(true);
         assert!(
             ad.port_base
@@ -846,7 +1055,17 @@ mod tests {
 
     #[test]
     fn test_shutter_control_epics_mode() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
             .unwrap();
@@ -873,7 +1092,17 @@ mod tests {
     #[test]
     fn test_shutter_epics_mode_sleeps_open_minus_close() {
         // C parity: EPICS mode sleeps (shutterOpenDelay - shutterCloseDelay).
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_int32_param(ad.params.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
             .unwrap();
@@ -902,7 +1131,17 @@ mod tests {
 
     #[test]
     fn every_acquire_store_drives_acquire_busy() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let acquire = ad.params.acquire;
         ad.port_base.set_int32_param(acquire, 0, 1).unwrap();
         assert_eq!(busy(&ad), 1);
@@ -924,7 +1163,17 @@ mod tests {
                 &mut self.0.port_base
             }
         }
-        let ad = ADDriverBase::new("ADRULEPORT", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let ad = ADDriverBase::new(
+            "ADRULEPORT",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let (acquire, acquire_busy) = (ad.params.acquire, ad.params.acquire_busy);
         let claim = PortRegistry::new().claim("ADRULEPORT").unwrap();
         let (runtime, _actor) =
@@ -944,7 +1193,17 @@ mod tests {
 
     #[test]
     fn wait_for_plugins_holds_acquire_busy_until_the_queue_drains_after_stop() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let (acquire, queued) = (ad.params.acquire, ad.params.base.num_queued_arrays);
         ad.port_base
             .set_int32_param(ad.params.wait_for_plugins, 0, 1)
@@ -969,7 +1228,17 @@ mod tests {
 
     #[test]
     fn a_stop_with_an_empty_queue_clears_acquire_busy_under_wait_for_plugins() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_int32_param(ad.params.wait_for_plugins, 0, 1)
             .unwrap();
@@ -986,7 +1255,17 @@ mod tests {
     fn test_set_acquire_drives_acquire_busy() {
         // G8: ADAcquire=1 sets AcquireBusy=1; ADAcquire=0 (no WaitForPlugins)
         // immediately clears AcquireBusy.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.set_acquire(1).unwrap();
         assert_eq!(
             ad.port_base.get_int32_param(ad.params.acquire, 0).unwrap(),
@@ -1011,7 +1290,17 @@ mod tests {
     fn test_set_acquire_wait_for_plugins_gating() {
         // G8: with WaitForPlugins set and queued arrays outstanding, ADAcquire=0
         // does NOT clear AcquireBusy until NDNumQueuedArrays drains to 0.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_int32_param(ad.params.wait_for_plugins, 0, 1)
             .unwrap();
@@ -1041,7 +1330,17 @@ mod tests {
     #[test]
     fn test_write_int32_pool_empty_free_list() {
         // G3: writing POOL_EMPTY_FREELIST empties the free list.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 10_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            10_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let arr = ad
             .pool
             .alloc(
@@ -1062,7 +1361,17 @@ mod tests {
     #[test]
     fn test_write_int32_pool_pre_alloc() {
         // G3: writing POOL_PRE_ALLOC_BUFFERS pre-allocates from the last array.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 10_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            10_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let arr = ad
             .pool
             .alloc(
@@ -1094,7 +1403,17 @@ mod tests {
     /// `pArrays[0]` through its pool, as C's tasks write `this->pArrays[0]`.
     #[test]
     fn an_array_stored_through_the_pool_is_the_pre_alloc_template() {
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 10_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            10_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let task_pool = ad.pool.clone();
         let arr = task_pool
             .alloc(
@@ -1125,7 +1444,17 @@ mod tests {
     #[test]
     fn test_write_int32_pool_unrecognized() {
         // G3: a non-pool parameter is not handled.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         let handled = ad.write_int32_pool(ad.params.gain, 1).unwrap();
         assert!(!handled);
     }
@@ -1134,7 +1463,17 @@ mod tests {
     fn test_gain_and_temperature() {
         // The constructor leaves both to the database (ADDriver.cpp:174-179);
         // once written, they read back through the parameter library.
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         ad.port_base
             .set_float64_param(ad.params.gain, 0, 1.0)
             .unwrap();
@@ -1157,7 +1496,17 @@ mod tests {
     fn test_connect_downstream() {
         use crate::plugin::channel::ndarray_channel;
 
-        let mut ad = ADDriverBase::new("TEST", 1, 8, 8, 1_000_000, ASYN_CANBLOCK).unwrap();
+        let mut ad = ADDriverBase::new(
+            "TEST",
+            1,
+            8,
+            8,
+            1_000_000,
+            ASYN_CANBLOCK,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+        )
+        .unwrap();
         // The ArrayCallbacks record's PINI; the driver leaves it undefined.
         ad.port_base
             .set_int32_param(ad.params.base.array_callbacks, 0, 1)

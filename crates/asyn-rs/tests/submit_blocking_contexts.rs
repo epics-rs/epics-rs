@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::RequestOp;
@@ -74,7 +75,13 @@ struct PlainDriver {
 
 impl PlainDriver {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base }
     }
@@ -170,7 +177,13 @@ fn submit_blocking_from_own_actor_thread_returns_error() {
     let self_handle = Arc::new(parking_lot::Mutex::new(None));
     let got_error = Arc::new(AtomicBool::new(false));
 
-    let mut base = PortDriverBase::new("ctx_b", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "ctx_b",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("VAL", ParamType::Int32).unwrap();
     let driver = SelfCallingDriver {
         base,

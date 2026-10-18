@@ -2618,6 +2618,7 @@ mod tests {
     use super::*;
     use crate::interrupt::InterruptFilter;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2628,7 +2629,13 @@ mod tests {
 
     impl TestDriver {
         fn new() -> Self {
-            let mut base = PortDriverBase::new("actor_test", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "actor_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();
@@ -2773,7 +2780,13 @@ mod tests {
     fn addr_port(max_addr: usize) -> AddrPort {
         use crate::interrupt::{InterruptFilter, InterruptValue};
         use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
-        let mut base = PortDriverBase::new("addr_test", max_addr, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "addr_test",
+            max_addr,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(InterruptGate::opened());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -3038,7 +3051,13 @@ mod tests {
 
         let write_eos = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let read_eos = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut eos_base = PortDriverBase::new("eos_test", 1, PortFlags::default());
+        let mut eos_base = PortDriverBase::new(
+            "eos_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         eos_base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let tx = spawn_actor(EosObserver {
             base: eos_base,
@@ -3150,7 +3169,13 @@ mod tests {
         let write_calls = Arc::new(AtomicUsize::new(0));
         let sequence = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let drv = FlushTracker {
-            base: PortDriverBase::new("flush_test", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "flush_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             flush_calls: flush_calls.clone(),
             write_calls: write_calls.clone(),
             sequence: sequence.clone(),
@@ -3209,7 +3234,13 @@ mod tests {
             }
         }
         let drv = EomDriver {
-            base: PortDriverBase::new("eom_test", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "eom_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
         };
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -3248,7 +3279,13 @@ mod tests {
             }
         }
         let drv = FillDriver {
-            base: PortDriverBase::new("fill_test", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "fill_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
         };
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
@@ -3566,7 +3603,13 @@ mod tests {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new("throttle_test", 1, flags);
+        let mut base = PortDriverBase::new(
+            "throttle_test",
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_connected(false);
         base.init_auto_connect(true);
@@ -3655,7 +3698,13 @@ mod tests {
 
         let connect_calls = Arc::new(AtomicUsize::new(0));
         let options = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut base = PortDriverBase::new("waived_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "waived_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(false);
         base.init_auto_connect(true);
         let tx = spawn_actor(WaivedDriver {
@@ -3744,7 +3793,13 @@ mod tests {
         }
 
         let connect_calls = Arc::new(AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("disconnect_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "disconnect_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_connected(true);
         base.init_auto_connect(true);
         let tx = spawn_actor(DisconnectDriver {
@@ -3807,7 +3862,13 @@ mod tests {
             can_block: true,
             ..PortFlags::default()
         };
-        let mut base = PortDriverBase::new("addr_ac", 1, flags);
+        let mut base = PortDriverBase::new(
+            "addr_ac",
+            1,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
         base.init_connected(false);
@@ -3878,6 +3939,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.params.set_int32(0, 1, 7).unwrap();
@@ -3993,7 +4056,13 @@ mod tests {
 
         let connect_calls = Arc::new(AtomicUsize::new(0));
         let link_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let mut base = PortDriverBase::new("retry_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "retry_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.init_auto_connect(true);
         // Shorten C's 20 s back-off (asynManager.c:48) so the second attempt
@@ -4088,6 +4157,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.init_auto_connect(true);
             base.set_connected(false);
@@ -4194,6 +4265,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         services.bind(&mut base);
         let trace = services.trace();
@@ -4268,7 +4341,13 @@ mod tests {
     /// that drops must stay down until something explicitly connects it.
     #[test]
     fn disconnect_does_not_arm_retry_when_auto_connect_is_off() {
-        let mut base = PortDriverBase::new("no_auto", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "no_auto",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_auto_connect(false);
         base.init_connected(true);
         assert!(base.set_connected(false));
@@ -4278,7 +4357,13 @@ mod tests {
         );
 
         // ...and with auto-connect on, the same edge arms it.
-        let mut base = PortDriverBase::new("auto", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "auto",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_auto_connect(true);
         base.init_connected(true);
         assert!(base.set_connected(false));
@@ -4299,6 +4384,8 @@ mod tests {
                 can_block,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.create_param("VAL", ParamType::Int32).unwrap();
         base.params.set_int32(0, 0, 7).unwrap();
@@ -4549,6 +4636,8 @@ mod tests {
                 can_block: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let tx = spawn_actor(InterposeDriver { base });
 
@@ -4630,7 +4719,13 @@ mod tests {
         // (`init_connected` does not stamp a transition).
         let spawn = |enabled: bool, defunct: bool, comes_up: bool| {
             let calls = Arc::new(AtomicUsize::new(0));
-            let mut base = PortDriverBase::new("enable_test", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "enable_test",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.init_connected(false);
             base.init_auto_connect(true);
@@ -4740,7 +4835,13 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("status_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "status_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         // Down, enabled, auto-connect, and with no throttle window running
         // (`init_connected` stamps no transition) — so the *first* attempt any
@@ -5042,6 +5143,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
@@ -5093,7 +5196,13 @@ mod tests {
     /// batch's callbacks carry it, and so does a later unstamped flush.
     #[test]
     fn a_stamped_batch_sets_the_port_time_stamp_before_its_callbacks() {
-        let mut base = PortDriverBase::new("stamp_pub", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "stamp_pub",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
@@ -5138,7 +5247,13 @@ mod tests {
     fn a_status_publish_delivers_the_alarm_without_touching_the_value() {
         // Post-`iocInit` precondition: the scan facility has opened the
         // interruptAccept gate. See `TestDriver::new` in `port.rs`.
-        let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "status_pub",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
@@ -5212,7 +5327,13 @@ mod tests {
     /// so a disconnected port takes the set too.
     #[test]
     fn a_set_alone_is_read_at_once_and_posted_by_the_next_callback() {
-        let mut base = PortDriverBase::new("set_alone", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "set_alone",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.interrupts = crate::interrupt::InterruptManager::owned_by(
             epics_libcom_rs::runtime::interrupt_accept::InterruptGate::opened(),
         );
@@ -5369,6 +5490,8 @@ mod tests {
                     can_block: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.init_auto_connect(true);
             base.init_connected(false);
@@ -5502,7 +5625,13 @@ mod tests {
 
         for (connected, enabled) in [(false, true), (true, false), (false, false)] {
             let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut base = PortDriverBase::new("rep", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "rep",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.init_auto_connect(false);
             base.set_connected(connected);
             base.set_enabled(enabled).unwrap();
@@ -5536,7 +5665,13 @@ mod tests {
         // A destroyed port: C prints "<name> destroyed" and never reaches the
         // driver's interfaces (asynManager.c:1041-1043).
         let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("gone", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "gone",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         shut_down(&mut base);
         let tx = spawn_actor(ReportSpy {
             base,
@@ -5577,6 +5712,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.init_auto_connect(port_auto_connect);
             base.device_state(0);
@@ -5634,7 +5771,13 @@ mod tests {
         }
 
         let build = |caps: Vec<Capability>| {
-            let mut base = PortDriverBase::new("drv_rep", 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                "drv_rep",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
             let mut drv = Drv(base, caps);
@@ -5746,7 +5889,13 @@ mod tests {
         }
 
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("disabled_port", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "disabled_port",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.init_auto_connect(false);
         base.set_connected(false);
         base.set_enabled(false).unwrap(); // C `asynEnable(port, 0)`
@@ -6186,7 +6335,13 @@ mod tests {
 
         let concurrent = Arc::new(AtomicUsize::new(0));
         let max_concurrent = Arc::new(AtomicUsize::new(0));
-        let mut base = PortDriverBase::new("serial_actor", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "serial_actor",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         let driver = CountingDriver {
             base,
@@ -6289,7 +6444,13 @@ mod tests {
 
         let mgr = PortManager::new();
         mgr.register_port_unclaimed(
-            TraceSpy(PortDriverBase::new("trace_link", 1, PortFlags::default())),
+            TraceSpy(PortDriverBase::new(
+                "trace_link",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             &crate::registry::open_owner(),
         )
         .unwrap();

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use asyn_rs::drivers::ip_port::DrvAsynIPPort;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::PortRegistry;
 use asyn_rs::runtime::port::PortRuntimeHandle;
@@ -39,7 +40,13 @@ struct TeardownDriver {
 
 impl TeardownDriver {
     fn new(name: &str, torn_down: Sender<&'static str>) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("VAL", ParamType::Int32).unwrap();
         Self { base, torn_down }
     }

@@ -44,7 +44,13 @@ fn axisless_port(name: &str, num_axes: usize) -> asyn_rs::port_handle::PortHandl
         }
     }
     let claim = asyn_rs::registry::claim_port(name).unwrap();
-    let driver = Axisless(PortDriverBase::new(name, num_axes, PortFlags::default()));
+    let driver = Axisless(PortDriverBase::new(
+        name,
+        num_axes,
+        PortFlags::default(),
+        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+    ));
     let (runtime, _actor) = asyn_rs::runtime::port::create_port_runtime(
         &claim,
         driver,

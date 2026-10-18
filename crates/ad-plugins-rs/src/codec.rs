@@ -5,6 +5,7 @@
 // its `build.rs` began deriving `tokio_backend`; nothing here builds a
 // CA server, and the reactor these obtain comes from `#[tokio::test]`
 // itself, which the backend does not remove.
+use asyn_rs::port::InterfaceMask;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -1789,6 +1790,8 @@ impl CodecOutcome {
 
 impl NDPluginProcess for CodecProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // C reads the codec selection under the port lock and releases it
         // around every codec call (`NDPluginCodec.cpp:556`, `:596`), so the
@@ -2102,8 +2105,15 @@ mod tests {
     fn test_register_params_seeds_the_c_constructor_values() {
         // Every value NDPluginCodec.cpp:1104-1113 sets; Mode and BloscShuffle
         // stay undefined.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("CODEC_INIT", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "CODEC_INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = CodecProcessor::new(CodecMode::Decompress);
         proc.register_params(&mut base).unwrap();
         let idx = |name: &str| base.find_param(name).unwrap();
@@ -3092,7 +3102,13 @@ mod tests {
         use ad_core_rs::plugin::runtime::WriteVerdict::Accept;
 
         let mut proc = CodecProcessor::new(CodecMode::Decompress);
-        let mut base = asyn_rs::port::PortDriverBase::new("CODECV", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "CODECV",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let threads = base
             .create_param("NUM_THREADS", asyn_rs::param::ParamType::Int32)

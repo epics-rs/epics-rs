@@ -369,6 +369,7 @@ impl SyncIOHandle {
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -382,7 +383,13 @@ mod tests {
         }
 
         fn named(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("INT_VAL", ParamType::Int32).unwrap();
             base.create_param("FLOAT_VAL", ParamType::Float64).unwrap();
             base.create_param("STR_VAL", ParamType::Octet).unwrap();
@@ -487,7 +494,13 @@ mod tests {
 
         let seq = Arc::new(Mutex::new(Vec::new()));
         let drv = Sequenced {
-            base: PortDriverBase::new("wr_seq", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "wr_seq",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
             seq: Arc::clone(&seq),
         };
         let (rt, _jh) = create_port_runtime_unclaimed(drv, RuntimeConfig::default())
@@ -524,6 +537,8 @@ mod tests {
                 "syncnodrvuser",
                 1,
                 PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             )),
             RuntimeConfig::default(),
         )
@@ -627,7 +642,13 @@ mod tests {
                 self.1.clone()
             }
         }
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("V", ParamType::Int32).unwrap();
         PortManager::new()
             .register_port_unclaimed(Declared(base, caps), &crate::registry::open_owner())
@@ -846,7 +867,13 @@ mod tests {
         }
 
         let (handle, _jh) = create_port_runtime_unclaimed(
-            PartialThenTimeout(PortDriverBase::new("syncpartial", 1, PortFlags::default())),
+            PartialThenTimeout(PortDriverBase::new(
+                "syncpartial",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");

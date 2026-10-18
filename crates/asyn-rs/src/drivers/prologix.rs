@@ -53,6 +53,7 @@ use std::time::Duration;
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interpose::EomReason;
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 
@@ -179,6 +180,10 @@ impl DrvAsynPrologixPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // Every interface it has comes from `pasynGpib->registerPort`
+            // (drvPrologixGPIB.c:592); no asynOption.
+            crate::interfaces::gpib::GPIB_PORT_INTERFACES,
+            crate::interfaces::gpib::GPIB_PORT_INTERRUPTS,
         );
         base.init_auto_connect(!no_auto_connect);
         Ok(Self {
@@ -388,13 +393,6 @@ impl PortDriver for DrvAsynPrologixPort {
     }
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvPrologixGPIB takes every interface it has from
-    /// `pasynGpib->registerPort` (drvPrologixGPIB.c:592) — asynCommon +
-    /// asynOctet + asynGpib + asynInt32 — and registers no asynOption.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::gpib::gpib_port_capabilities()
     }
 
     /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
@@ -1159,6 +1157,16 @@ mod tests {
     /// asynOctet + asynGpib + asynInt32, and no asynOption. The asynInt32 is
     /// asynGpib's SRQ interrupt source with a NULL vtable (asynGpib.c:140), so
     /// reading or writing it lands in the asynInt32Base defaults and fails.
+    #[test]
+    fn prologix_masks_are_asyn_gpib_s() {
+        use crate::interfaces::gpib::{GPIB_PORT_INTERFACES, GPIB_PORT_INTERRUPTS};
+        let drv = DrvAsynPrologixPort::new("p_masks", "127.0.0.1:1234", false).unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (GPIB_PORT_INTERFACES, GPIB_PORT_INTERRUPTS)
+        );
+    }
+
     #[test]
     fn prologix_registers_the_gpib_port_interfaces() {
         use crate::interfaces::Capability;

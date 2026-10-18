@@ -2175,6 +2175,7 @@ mod tests {
     use crate::error::AsynResult;
     use crate::exception::AsynException;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::user::AsynUser;
     use std::sync::Mutex;
@@ -2211,7 +2212,13 @@ mod tests {
     }
     impl DummyDriver {
         fn new(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
                 base,
@@ -2266,6 +2273,8 @@ mod tests {
                     multi_device: true,
                     ..PortFlags::default()
                 },
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
             );
             base.create_param("VAL", ParamType::Int32).unwrap();
             Self {
@@ -2286,7 +2295,13 @@ mod tests {
     impl OctetDriver {
         fn new(name: &str, input: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Self {
             Self {
-                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 input: input.to_vec(),
                 pos: 0,
                 written,
@@ -3072,7 +3087,13 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         mgr.register_port_unclaimed(
             RecordingDriver {
-                base: PortDriverBase::new("eos_port", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "eos_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 rec: rec.clone(),
             },
             &crate::registry::open_owner(),
@@ -3182,6 +3203,8 @@ mod tests {
                         multi_device: true,
                         ..PortFlags::default()
                     },
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
                 ),
             },
             &crate::registry::open_owner(),
@@ -3354,7 +3377,13 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         mgr.register_port_unclaimed(
             InterposedDriver {
-                base: PortDriverBase::new("echo_port", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "echo_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 link: EchoingLink {
                     sizes: sizes.clone(),
                     echo: VecDeque::new(),
@@ -3463,7 +3492,13 @@ mod tests {
         let mgr = Arc::new(PortManager::new());
         mgr.register_port_unclaimed(
             InterposedDriver {
-                base: PortDriverBase::new("delay_port", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "delay_port",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 link: CountingLink {
                     sizes: sizes.clone(),
                 },
@@ -3616,7 +3651,13 @@ mod tests {
         let reports = Arc::new(AtomicUsize::new(0));
         let (runtime, _actor) = crate::runtime::port::create_port_runtime_unclaimed(
             Reporting {
-                base: PortDriverBase::new(PORT, 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    PORT,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 reports: reports.clone(),
             },
             crate::runtime::config::RuntimeConfig::default(),

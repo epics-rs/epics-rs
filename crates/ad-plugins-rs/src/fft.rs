@@ -1,3 +1,4 @@
+use asyn_rs::port::InterfaceMask;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -693,6 +694,8 @@ impl Default for FFTProcessor {
 
 impl NDPluginProcess for FFTProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
@@ -1516,8 +1519,13 @@ mod tests {
     /// Register the FFT params on a scratch port and return the processor.
     fn fft_proc_with_params(config: FFTConfig) -> FFTProcessor {
         let mut proc = FFTProcessor::with_config(config);
-        let mut base =
-            asyn_rs::port::PortDriverBase::new("FFT_TEST", 1, asyn_rs::port::PortFlags::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "FFT_TEST",
+            1,
+            asyn_rs::port::PortFlags::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         proc
     }

@@ -121,6 +121,7 @@ mod tests {
     use crate::interrupt::{AsyncRecvError, InterruptValue};
     use crate::manager::PortManager;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::protocol::EventPayload;
     use crate::protocol::command::PortCommand;
@@ -138,7 +139,13 @@ mod tests {
         // (C registerPort parity), so tests sharing one name would
         // collide when run in a single process (`cargo test`).
         fn new(name: &str) -> Self {
-            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             base.create_param("MSG", ParamType::Octet).unwrap();

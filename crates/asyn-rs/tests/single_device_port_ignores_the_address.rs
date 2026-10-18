@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::RequestOp;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -33,7 +34,13 @@ impl PortDriver for Plain {
 #[epics_base_rs::epics_test]
 async fn an_io_intr_record_at_any_address_follows_list_0() {
     let db = Arc::new(PvDatabase::new());
-    let mut base = PortDriverBase::new("SDANYADDR", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "SDANYADDR",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("I32", ParamType::Int32).unwrap();
     let (runtime, _actor) =
         create_port_runtime_unclaimed(Plain { base }, RuntimeConfig::default()).unwrap();

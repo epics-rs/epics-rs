@@ -1106,6 +1106,7 @@ fn test_fast_bumpless_edge_falls_back_to_oval_without_reader() {
 fn test_fast_set_output_port_wires_reader_from_asyn_port() {
     use asyn_rs::manager::PortManager;
     use asyn_rs::param::ParamType;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
     use asyn_rs::sync_io::SyncIOHandle;
     use std::time::Duration;
@@ -1126,7 +1127,13 @@ fn test_fast_set_output_port_wires_reader_from_asyn_port() {
     }
 
     let claim = asyn_rs::manager::claim_port_driver("EPID_OUT_PORT").unwrap();
-    let mut base = PortDriverBase::new("EPID_OUT_PORT", 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        "EPID_OUT_PORT",
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     let reason = base.create_param("OUTPUT", ParamType::Float64).unwrap();
     // Preload the output port's present value (the real DAC output).
     base.set_float64_param(reason, 0, 33.0).unwrap();

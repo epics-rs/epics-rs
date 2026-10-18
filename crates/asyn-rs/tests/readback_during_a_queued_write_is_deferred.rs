@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -81,6 +82,8 @@ fn port(name: &str, db: &PvDatabase) -> PortRuntimeHandle {
             can_block: true,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     for (param, ty) in [
         ("I32", ParamType::Int32),

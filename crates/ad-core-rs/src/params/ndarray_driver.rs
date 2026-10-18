@@ -216,11 +216,18 @@ impl NDArrayDriverParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asyn_rs::port::InterfaceMask;
     use asyn_rs::port::PortFlags;
 
     #[test]
     fn test_create_ndarray_driver_params() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let (params, _) = NDArrayDriverParams::create(&mut base).unwrap();
         assert!(base.find_param("ARRAY_COUNTER").is_some());
         assert!(base.find_param("FILE_PATH").is_some());
@@ -235,7 +242,13 @@ mod tests {
 
     #[test]
     fn test_ndarray_driver_param_count() {
-        let mut base = PortDriverBase::new("test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let _ = NDArrayDriverParams::create(&mut base).unwrap();
         // Should have created ~50 params
         assert!(base.params.len() >= 45);

@@ -71,6 +71,7 @@ use crate::interfaces::InterfaceType;
 use crate::interpose::{EomReason, OctetReadResult};
 use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::ParamValue;
+use crate::port::InterfaceMask;
 use crate::port::{ExceptionAnnouncer, PortDriver, PortDriverBase, PortFlags};
 use crate::port_handle::WeakPortHandle;
 use crate::trace::{TraceManager, TraceMask};
@@ -993,6 +994,16 @@ impl DrvAsynIPServerPort {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynCommon and asynOctet, plus asynInt32 — the per-connection file
+            // descriptor — only when the socket is not SOCK_DGRAM, and no
+            // asynOption (drvAsynIPServerPort.c:643-690).
+            match config.protocol {
+                IpServerProtocol::Tcp => {
+                    InterfaceMask::COMMON | InterfaceMask::INT32 | InterfaceMask::OCTET
+                }
+                IpServerProtocol::Udp => InterfaceMask::COMMON | InterfaceMask::OCTET,
+            },
+            InterfaceMask::OCTET,
         );
         base.init_auto_connect(true);
         let mut slots = Vec::with_capacity(max);
@@ -1342,20 +1353,6 @@ impl PortDriver for DrvAsynIPServerPort {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvAsynIPServerPort registers asynCommon and asynOctet, plus asynInt32
-    /// only when the socket is not SOCK_DGRAM (drvAsynIPServerPort.c:643-685) —
-    /// the Int32 interface carries the per-connection file descriptor. It
-    /// registers no asynOption.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        use crate::interfaces::Capability::*;
-        let mut caps = vec![OctetRead, OctetWrite, Flush, Connect];
-        if self.config.protocol == IpServerProtocol::Tcp {
-            caps.push(Int32Read);
-            caps.push(Int32Write);
-        }
-        caps
     }
 
     /// asynInt32Base's getBounds, `*low = *high = 0` (asynInt32Base.c:99): C
@@ -1792,6 +1789,11 @@ impl DrvAsynIPSubport {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // C creates each accepted connection as a plain drvAsynIPPort
+            // (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:711;
+            // drvAsynIPPort.c:1091-1109).
+            InterfaceMask::COMMON | InterfaceMask::OPTION | InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
         );
         // The child does not own its link — the slot does, and the parent's accept
         // loop assigns and clears it without this port's actor ever running. Bind
@@ -1851,13 +1853,6 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C creates each accepted connection as a plain drvAsynIPPort
-    /// (`drvAsynIPPortConfigure`, drvAsynIPServerPort.c:711) — so a subport has
-    /// the byte-transport interface set: asynCommon + asynOption + asynOctet.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        crate::interfaces::octet_transport_capabilities()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -2143,6 +2138,27 @@ mod tests {
             read_timeout: None,
         };
         assert!(DrvAsynIPServerPort::with_config("one_client", ok).is_ok());
+    }
+
+    /// drvAsynIPServerPort.c:655-690: asynCommon, asynInt32 on a TCP listener
+    /// only, and asynOctet as an interrupt source; each client is a
+    /// `drvAsynIPPortConfigure`d port (:711, drvAsynIPPort.c:1091-1109).
+    #[test]
+    fn the_ports_register_drv_asyn_ip_server_port_s_interfaces() {
+        use InterfaceMask as M;
+        let masks = |b: &PortDriverBase| (b.interface_mask(), b.interrupt_mask());
+        let tcp = DrvAsynIPServerPort::new("srv_tcp_masks", "127.0.0.1:0").unwrap();
+        assert_eq!(
+            masks(tcp.base()),
+            (M::COMMON | M::INT32 | M::OCTET, M::OCTET)
+        );
+        let udp = DrvAsynIPServerPort::new("srv_udp_masks", "127.0.0.1:0 udp").unwrap();
+        assert_eq!(masks(udp.base()), (M::COMMON | M::OCTET, M::OCTET));
+        let client = tcp.make_subport(0).unwrap();
+        assert_eq!(
+            masks(client.base()),
+            (M::COMMON | M::OPTION | M::OCTET, M::OCTET)
+        );
     }
 
     #[test]

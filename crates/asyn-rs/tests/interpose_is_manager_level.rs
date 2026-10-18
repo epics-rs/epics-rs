@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::interpose::EomReason;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::RequestOp;
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
@@ -42,7 +43,13 @@ struct RawDeviceDriver {
 
 impl RawDeviceDriver {
     fn new(port: &str, inbound: &[u8], writes: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
-        let mut base = PortDriverBase::new(port, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.install_octet_interpose(Box::new(asyn_rs::interpose::eos::EosInterpose::default()));
         Self {
             base,

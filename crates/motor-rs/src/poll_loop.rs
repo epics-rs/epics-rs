@@ -2245,7 +2245,13 @@ pub(crate) mod drv_motor_asyn_stand_in {
     ) -> PortHandle {
         let claim = claim_port(port).unwrap();
         let driver = Port {
-            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+                asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            ),
             motor,
             axis,
             speeds: StoredSpeeds::default(),

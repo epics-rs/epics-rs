@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use asyn_rs::asyn_record::register_port;
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
@@ -38,7 +39,13 @@ impl PortDriver for IntPort {
 
 /// A port that is created but not yet registered: ownerless.
 fn unregistered(name: &str) -> PortHandle {
-    let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        name,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("VAL", ParamType::Int32).unwrap();
     let (runtime, _join) =
         create_port_runtime_unclaimed(IntPort { base }, RuntimeConfig::default())

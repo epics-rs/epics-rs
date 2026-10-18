@@ -498,6 +498,7 @@ pub fn port_runtime_unavailable(port_name: &str, err: &AsynError) -> ! {
 mod tests {
     use super::*;
     use crate::param::ParamType;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriverBase, PortFlags};
 
     struct TestPort {
@@ -510,7 +511,13 @@ mod tests {
         }
 
         fn with_flags(name: &str, flags: PortFlags) -> Self {
-            let mut base = PortDriverBase::new(name, 1, flags);
+            let mut base = PortDriverBase::new(
+                name,
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            );
             base.create_param("VAL", ParamType::Int32).unwrap();
             base.create_param("F64", ParamType::Float64).unwrap();
             Self { base }

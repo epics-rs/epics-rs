@@ -23,6 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::exception::ExceptionManager;
+use crate::port::InterfaceMask;
 use crate::port::PortDriverBase;
 use crate::trace::TraceManager;
 
@@ -127,7 +128,13 @@ mod tests {
             multi_device: true,
             ..Default::default()
         };
-        let mut base = PortDriverBase::new("SVC_MULTI", 4, flags);
+        let mut base = PortDriverBase::new(
+            "SVC_MULTI",
+            4,
+            flags,
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         services.bind(&mut base);
         let trace = services.trace();
         trace.set_device_trace_mask("SVC_MULTI", 2, TraceMask::FLOW);
@@ -140,7 +147,13 @@ mod tests {
     /// created, as C's do on its already registered port.
     #[test]
     fn a_base_traces_before_its_port_is_created() {
-        let base = PortDriverBase::new("SVC_UNBOUND", 1, Default::default());
+        let base = PortDriverBase::new(
+            "SVC_UNBOUND",
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         assert!(Arc::ptr_eq(&base.trace, PortServices::global().trace()));
         assert!(
             base.trace

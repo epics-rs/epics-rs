@@ -128,6 +128,7 @@ fn blocking_port_record() -> (AsynRecord, epics_base_rs::server::database::PvDat
     use epics_base_rs::server::database::PvDatabase;
 
     use crate::error::AsynResult;
+    use crate::port::InterfaceMask;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::port_actor::PortActor;
     use crate::port_handle::PortHandle;
@@ -154,7 +155,13 @@ fn blocking_port_record() -> (AsynRecord, epics_base_rs::server::database::PvDat
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let actor = PortActor::new(
         Box::new(Device {
-            base: PortDriverBase::new("ALLOCIO", 1, PortFlags::default()),
+            base: PortDriverBase::new(
+                "ALLOCIO",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            ),
         }),
         rx,
     );
@@ -285,6 +292,7 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
 
         use epics_base_rs::server::database::PvDatabase;
 
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::port_handle::PortHandle;
@@ -304,7 +312,13 @@ fn a_special_put_on_a_blocking_port_queues_without_allocating() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(Device {
-                base: PortDriverBase::new("ALLOCSP", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "ALLOCSP",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
             }),
             rx,
         );
@@ -363,6 +377,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
 
         use epics_base_rs::server::database::PvDatabase;
 
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::port_handle::PortHandle;
@@ -379,7 +394,13 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
             }
         }
 
-        let mut base = PortDriverBase::new("ALLOCRF", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "ALLOCRF",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.set_enabled(false).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(Box::new(Device { base }), rx);
@@ -419,6 +440,7 @@ fn a_special_put_refused_by_its_port_reports_without_allocating() {
 #[test]
 fn a_connect_to_a_shut_down_port_reports_without_allocating() {
     test_ioc_thread(|| {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 
@@ -438,7 +460,13 @@ fn a_connect_to_a_shut_down_port_reports_without_allocating() {
             ..PortFlags::default()
         };
         let (rt, _jh) = create_port_runtime_unclaimed(
-            Port(PortDriverBase::new(name, 1, flags)),
+            Port(PortDriverBase::new(
+                name,
+                1,
+                flags,
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_ALL,
+            )),
             RuntimeConfig::default(),
         )
         .expect("the port runtime thread must start");
@@ -513,6 +541,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
         use std::time::{Duration, Instant};
 
         use crate::error::AsynResult;
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_actor::PortActor;
         use crate::port_handle::PortHandle;
@@ -559,7 +588,13 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let actor = PortActor::new(
             Box::new(Gated {
-                base: PortDriverBase::new("QTIMER", 1, PortFlags::default()),
+                base: PortDriverBase::new(
+                    "QTIMER",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_ALL,
+                ),
                 entered: entered_tx,
                 release: Mutex::new(release_rx),
             }),
@@ -636,6 +671,7 @@ fn a_queued_cell_times_out_while_the_driver_blocks() {
 #[test]
 fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
     test_ioc_thread(|| {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
         use crate::port_handle::PortHandle;
 
@@ -659,6 +695,8 @@ fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
                 multi_device: true,
                 ..PortFlags::default()
             },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
         );
         let (rt, _jh) = crate::runtime::create_port_runtime_unclaimed(
             Blocking { base },
@@ -700,9 +738,16 @@ fn enable_and_auto_connect_allocate_nothing_on_a_blocking_port() {
 #[test]
 fn a_dequeue_shares_the_port_name() {
     test_ioc_thread(|| {
+        use crate::port::InterfaceMask;
         use crate::port::{PortDriverBase, PortFlags};
 
-        let base = PortDriverBase::new("NAMESHARE", 1, PortFlags::default());
+        let base = PortDriverBase::new(
+            "NAMESHARE",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let before = thread_allocs();
         let gate = base.queue_gate();
         assert_eq!(thread_allocs() - before, 0, "queue_gate copied the name");

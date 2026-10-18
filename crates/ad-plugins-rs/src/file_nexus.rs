@@ -12,6 +12,7 @@
 //!     /data → same dataset
 //! ```
 
+use asyn_rs::port::InterfaceMask;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -998,6 +999,8 @@ impl Default for NexusFileProcessor {
 
 impl NDPluginProcess for NexusFileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     fn posts_before_write(&self, reason: usize, value: i32) -> bool {
         self.ctrl.lock().posts_before_write(reason, value)
@@ -1371,6 +1374,7 @@ mod tests {
     #[test]
     fn a_template_write_stores_it_without_waiting_on_a_file_write() {
         use ad_core_rs::plugin::runtime::SideParam;
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let dir = std::env::temp_dir();
@@ -1384,7 +1388,13 @@ mod tests {
         )
         .unwrap();
 
-        let mut base = PortDriverBase::new("nexus_tmpl_test", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "nexus_tmpl_test",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let mut proc = NexusFileProcessor::new();
         proc.register_params(&mut base).unwrap();
 

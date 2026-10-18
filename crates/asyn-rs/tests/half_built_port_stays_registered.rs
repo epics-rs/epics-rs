@@ -7,6 +7,7 @@
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::manager::claim_port_driver;
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::registry::{get_port, open_owner};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime};
@@ -47,7 +48,13 @@ fn configure(port: &str) -> Result<(), AsynError> {
         status: AsynStatus::Error,
         message: e.to_string(),
     })?;
-    let mut base = PortDriverBase::new(port, 1, PortFlags::default());
+    let mut base = PortDriverBase::new(
+        port,
+        1,
+        PortFlags::default(),
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
+    );
     base.create_param("VAL", ParamType::Int32)?;
     let driver = HalfBuilt { base, init: false };
     let (runtime, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default())?;

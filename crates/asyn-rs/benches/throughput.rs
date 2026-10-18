@@ -6,6 +6,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::sync_io::SyncIOHandle;
@@ -18,7 +19,13 @@ struct BenchPort {
 
 impl BenchPort {
     fn new(name: &str) -> Self {
-        let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         base.create_param("INT_VAL", ParamType::Int32).unwrap();
         base.create_param("F64_VAL", ParamType::Float64).unwrap();
         base.create_param("OCT_VAL", ParamType::Octet).unwrap();

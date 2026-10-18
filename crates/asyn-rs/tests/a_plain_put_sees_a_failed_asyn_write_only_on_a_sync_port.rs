@@ -12,6 +12,7 @@ use std::time::Duration;
 use asyn_rs::adapter::{AsynDeviceSupport, AsynLink};
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::{RuntimeConfig, create_port_runtime_unclaimed};
 use asyn_rs::user::AsynUser;
@@ -66,6 +67,8 @@ async fn ioc_gated(port: &str, can_block: bool, gate: Gate) -> PvDatabase {
             can_block,
             ..PortFlags::default()
         },
+        InterfaceMask::UNMIGRATED_ALL,
+        InterfaceMask::UNMIGRATED_ALL,
     );
     base.create_param("VAL", ParamType::Float64).unwrap();
     let (runtime, _actor) =

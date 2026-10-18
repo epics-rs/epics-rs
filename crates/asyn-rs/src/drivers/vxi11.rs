@@ -57,6 +57,7 @@
 //! as [`super::ftdi`] and [`super::usbtmc`].
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
+use crate::port::InterfaceMask;
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
 use std::collections::BTreeMap;
@@ -281,6 +282,10 @@ impl DrvVxi11Port {
                 can_block: true,
                 ..PortFlags::default()
             },
+            // asynGpib's set (drvVxi11.c:1761) plus the asynOption it
+            // registers itself (:1777). No register interface.
+            crate::interfaces::gpib::GPIB_PORT_INTERFACES | InterfaceMask::OPTION,
+            crate::interfaces::gpib::GPIB_PORT_INTERRUPTS,
         );
         base.init_auto_connect(!no_auto_connect);
         Ok(Self {
@@ -324,15 +329,6 @@ impl PortDriver for DrvVxi11Port {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
-    }
-
-    /// C drvVxi11 takes asynCommon + asynOctet + asynGpib + asynInt32 from
-    /// `pasynGpib->registerPort` (drvVxi11.c:1761) and registers asynOption
-    /// itself (:1777). No register interface.
-    fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
-        let mut caps = crate::interfaces::gpib::gpib_port_capabilities();
-        caps.push(crate::interfaces::Capability::Option);
-        caps
     }
 
     /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
@@ -470,6 +466,20 @@ mod tests {
     /// asynOption itself (:1777). The asynInt32 it gets is asynGpib's SRQ
     /// interrupt source with a NULL vtable (asynGpib.c:140), so a read or a
     /// write of it lands in the asynInt32Base defaults and fails.
+    /// asynGpib's set plus the asynOption drvVxi11.c:1777 registers itself.
+    #[test]
+    fn vxi11_masks_are_asyn_gpib_s_and_option() {
+        use crate::interfaces::gpib::{GPIB_PORT_INTERFACES, GPIB_PORT_INTERRUPTS};
+        let drv = DrvVxi11Port::configure("v_masks", "192.0.2.1", 0, "", "gpib0", 0, true).unwrap();
+        assert_eq!(
+            (drv.base().interface_mask(), drv.base().interrupt_mask()),
+            (
+                GPIB_PORT_INTERFACES | InterfaceMask::OPTION,
+                GPIB_PORT_INTERRUPTS
+            )
+        );
+    }
+
     #[test]
     fn vxi11_registers_the_gpib_port_interfaces() {
         use crate::interfaces::Capability;

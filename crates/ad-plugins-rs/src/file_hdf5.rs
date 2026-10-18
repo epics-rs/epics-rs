@@ -18,6 +18,7 @@ use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamChangeValue, ParamUpdate, PluginAttributes,
     PluginParamSnapshot, PortPost, ProcessResult, WriteOutcome, WritePort, WriteVerdict,
 };
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::trace::TraceMask;
 use parking_lot::Mutex;
@@ -4359,6 +4360,8 @@ const POS_INDEX_PARAMS: [&str; MAX_EXTRA_DIMS] = [
 
 impl NDPluginProcess for Hdf5FileProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
         // Made before the controller lock: its reads wait on the actor,
         // which takes that lock in its writes.
@@ -4670,8 +4673,15 @@ mod tests {
     #[test]
     fn test_register_params_seeds_the_c_constructor_values() {
         // Every value NDFileHDF5.cpp:2321-2384 sets, written out from the C.
+        use asyn_rs::port::InterfaceMask;
         use asyn_rs::port::{PortDriverBase, PortFlags};
-        let mut base = PortDriverBase::new("H5INIT", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "H5INIT",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let _nd = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let mut proc = Hdf5FileProcessor::new();
         proc.register_params(&mut base).unwrap();
@@ -4791,7 +4801,13 @@ mod tests {
 
     fn hdf5_port() -> (Hdf5FileProcessor, asyn_rs::port::PortDriverBase) {
         let mut proc = Hdf5FileProcessor::new();
-        let mut base = asyn_rs::port::PortDriverBase::new("HDF5V", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "HDF5V",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         proc.register_params(&mut base).unwrap();
         (proc, base)

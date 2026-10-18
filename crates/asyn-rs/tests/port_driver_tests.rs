@@ -21,6 +21,7 @@ use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interrupt::InterruptFilter;
 use asyn_rs::manager::PortManager;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
 
@@ -43,7 +44,13 @@ struct TestScopeDriver {
 
 impl TestScopeDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p_run = base.create_param("Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("MaxPoints", ParamType::Int32).unwrap();
         let _p_update_time = base.create_param("UpdateTime", ParamType::Float64).unwrap();
@@ -179,7 +186,13 @@ struct EchoDriver {
 
 impl EchoDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p_msg = base.create_param("MSG", ParamType::Octet).unwrap();
         Self { base, p_msg }
     }
@@ -214,7 +227,13 @@ struct ErrorDriver {
 
 impl ErrorDriver {
     fn new(port_name: &str) -> Self {
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
         let p_val = base.create_param("VAL", ParamType::Int32).unwrap();
         let p_status = base.create_param("STATUS", ParamType::Int32).unwrap();
         base.set_int32_param(p_val, 0, 0).unwrap();

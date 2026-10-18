@@ -17,6 +17,7 @@
 //! - **Median**: median of a `(2*mx+1) x (2*my+1)` kernel around the pixel
 //!   (the `Median` values are half-extents, matching C++ `medianCoordinate`).
 
+use asyn_rs::port::InterfaceMask;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -277,6 +278,8 @@ impl BadPixelProcessor {
 
 impl NDPluginProcess for BadPixelProcessor {
     const ASYN_FLAGS: asyn_rs::port::PortFlags = ad_core_rs::plugin::runtime::ASYN_NONE;
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UNMIGRATED_SUBCLASS;
 
     /// C `NDPluginBadPixel::writeOctet` reads the file inside the write and
     /// returns `readBadPixelFile`'s status (NDPluginBadPixel.cpp:319-322).
@@ -393,7 +396,13 @@ mod tests {
     fn file_name_reads_inside_the_write_as_c_write_octet_does() {
         use ad_core_rs::plugin::runtime::{NDPluginProcess, WriteVerdict};
         let mut proc = BadPixelProcessor::new(vec![]);
-        let mut base = asyn_rs::port::PortDriverBase::new("T", 1, Default::default());
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "T",
+            1,
+            Default::default(),
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+            asyn_rs::port::InterfaceMask::UNMIGRATED_ALL,
+        );
         proc.register_params(&mut base).unwrap();
         let file = proc.file_name_idx.unwrap();
         let dir = std::env::temp_dir().join(format!("badpix-{}", std::process::id()));

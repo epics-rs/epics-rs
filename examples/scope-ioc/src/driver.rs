@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::{EnumEntry, ParamType, ParamValue};
+use asyn_rs::port::InterfaceMask;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::request::ParamSetValue;
 use asyn_rs::user::AsynUser;
@@ -88,7 +89,13 @@ impl ScopeSimulator {
     pub fn new(port_name: &str, notify: Arc<Notify>) -> Self {
         // testAsynPortDriver registers with ASYN_DESTRUCTIBLE alone: it never
         // blocks (testAsynPortDriver.cpp:54).
-        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            port_name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_ALL,
+        );
 
         let p_run = base.create_param("P_Run", ParamType::Int32).unwrap();
         let p_max_points = base.create_param("P_MaxPoints", ParamType::Int32).unwrap();

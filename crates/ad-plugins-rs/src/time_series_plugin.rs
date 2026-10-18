@@ -566,7 +566,7 @@ impl NDPluginProcess for TimeSeriesProcessor {
     fn validate_int32(
         &self,
         reason: usize,
-        _addr: i32,
+        addr: i32,
         value: i32,
         verdict: WriteVerdict<i32>,
         params: &mut WritePort<'_>,
@@ -585,6 +585,9 @@ impl NDPluginProcess for TimeSeriesProcessor {
         let p = &state.p;
         let mut posts = Vec::new();
         let updates = if reason == p.ts_num_points {
+            // C sizes the buffers from any value; 0 overruns them on the next
+            // point and a negative one fails the calloc. That C bug is not
+            // copied (the template's DRVL is 1).
             state.num_time_points = value.max(1) as usize;
             state.allocate_arrays()
         } else if reason == p.ts_acquire_mode {
@@ -597,7 +600,10 @@ impl NDPluginProcess for TimeSeriesProcessor {
             updates.extend(state.create_axis_array());
             updates
         } else if reason == p.ts_acquire {
-            state.acquiring = value != 0;
+            // processCallbacks reads the address-0 value (:425).
+            if addr == 0 {
+                state.acquiring = value != 0;
+            }
             if value != 0 {
                 state.acquire_reset()
             } else {
@@ -647,14 +653,20 @@ impl NDPluginProcess for TimeSeriesProcessor {
     }
 
     fn process_array(&self, array: &Arc<NDArray>, _pool: &NDArrayPool) -> ProcessResult {
+        let mut state = self.state.lock();
+        state.epics_ts = array.timestamp;
+
         // C processCallbacks: this plugin only handles 1-D or 2-D arrays.
         let ndims = array.dims.len();
         if !(1..=2).contains(&ndims) {
-            return ProcessResult::empty();
+            let mut result = ProcessResult::empty();
+            result.trace.push((
+                asyn_rs::trace::TraceMask::ERROR,
+                "NDPluginTimeSeries::processCallbacks: error, number of array dimensions must be 1 or 2\n"
+                    .into(),
+            ));
+            return result;
         }
-
-        let mut state = self.state.lock();
-        state.epics_ts = array.timestamp;
 
         let mut updates: Vec<ParamUpdate> = Vec::new();
         let mut posts = Vec::new();
@@ -730,13 +742,8 @@ impl NDPluginProcess for TimeSeriesProcessor {
         // NDPluginTimeSeries.cpp:87 and acquireReset (:143) set only these two.
         base.set_int32_param(state.p.ts_num_points, 0, state.num_time_points as i32)?;
         base.set_int32_param(state.p.ts_current_point, 0, 0)?;
-
-        // Initial Fixed-mode time axis (C constructor allocateArrays -> createAxisArray).
-        let axis: Vec<f64> = (0..state.num_time_points)
-            .map(|i| i as f64 * state.averaging_time_actual)
-            .collect();
-        base.params
-            .set_float64_array(state.p.ts_time_axis, 0, axis)?;
+        // The constructor's createAxisArray (:160) stores nothing: C keeps no
+        // array params, and its callback fires before any record subscribes.
         Ok(())
     }
 }
@@ -914,6 +921,8 @@ mod tests {
         for name in ["TS_AVERAGING_TIME", "TS_TIME_PER_POINT"] {
             assert!(dbl(name).is_err(), "{name}");
         }
+        let axis = base.find_param("TS_TIME_AXIS").unwrap();
+        assert!(base.params.get_float64_array(axis, 0).unwrap().is_empty());
     }
 
     // ---- process_array end-to-end ----
@@ -1009,6 +1018,32 @@ mod tests {
         assert_eq!(side_array(&out, series, 1), Some(vec![10.0, 20.0, 30.0]));
         assert_eq!(out.addressed.0.len(), 3);
         assert!(out.addressed.0.iter().all(|(_, a)| a.unique_id == 1));
+    }
+
+    /// processCallbacks gates on TSAcquire at address 0 (:425); a write at
+    /// another address stores there and resets, but does not start a run.
+    #[test]
+    fn test_acquire_write_off_address_zero_does_not_gate_frames() {
+        let proc = make_proc(2, "TST_TS_ADDR");
+        let mut base = PortDriverBase::new("TST_TS_ADDR_B", 3, PortFlags::default());
+        let acquire = proc.state.lock().p.ts_acquire;
+        let out = proc.validate_int32(
+            acquire,
+            1,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
+        assert!(out.settled);
+        assert!(!proc.state.lock().acquiring);
+        proc.validate_int32(
+            acquire,
+            0,
+            1,
+            WriteVerdict::Accept(1),
+            &mut ad_core_rs::plugin::runtime::WritePort::new(&mut base),
+        );
+        assert!(proc.state.lock().acquiring);
     }
 
     /// C writeInt32 :457 and :459: NumPoints reallocates and AcquireMode
@@ -1291,7 +1326,7 @@ mod tests {
         proc.state.lock().acquiring = true;
         let pool = NDArrayPool::new(1_000_000);
         // 3-D array: C rejects (ndims must be 1 or 2).
-        let arr = NDArray::with_data(
+        let mut arr = NDArray::with_data(
             vec![
                 NDDimension::new(2),
                 NDDimension::new(2),
@@ -1299,8 +1334,20 @@ mod tests {
             ],
             NDDataBuffer::F64(vec![0.0; 8]),
         );
+        let stamp = EpicsTimestamp { sec: 7, nsec: 9 };
+        arr.timestamp = stamp;
         let res = proc.process_array(&Arc::new(arr), &pool);
+        // beginProcessCallbacks stamped the port before the refusal.
+        assert_eq!(proc.state.lock().epics_ts, stamp);
         assert!(res.param_updates.is_empty());
+        assert_eq!(
+            res.trace,
+            vec![(
+                asyn_rs::trace::TraceMask::ERROR,
+                "NDPluginTimeSeries::processCallbacks: error, number of array dimensions must be 1 or 2\n"
+                    .to_string()
+            )]
+        );
         assert_eq!(proc.state.lock().current_time_point, 0);
     }
 

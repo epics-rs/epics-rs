@@ -826,7 +826,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     source,
                     m.wiring().clone(),
                     // C maxAddr = maxSignals + 1 (the 2-D array callback
-                    // address is reserved at addr == maxSignals).
+                    // address is reserved at addr == maxSignals). C adds 1
+                    // before its `maxSignals < 1` clamp, so maxSignals 0 leaves
+                    // no address for that callback; that C bug is not copied.
                     max_signals + 1,
                     threads,
                 );

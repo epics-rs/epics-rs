@@ -112,6 +112,9 @@ pub trait CellBody: Send + Sync + 'static {
 pub struct RequestCell {
     queue: Arc<CellQueue>,
     token: CancelToken,
+    /// The block identity of every request this cell queues and every call its
+    /// body makes — one per cell, as C's is one per `asynUser`.
+    block_token: u64,
     slot: Mutex<Slot>,
     body: Arc<dyn CellBody>,
 }
@@ -296,6 +299,10 @@ impl RequestCell {
         self.lock().request
     }
 
+    pub(crate) fn block_token(&self) -> u64 {
+        self.block_token
+    }
+
     fn lock(&self) -> parking_lot::MutexGuard<'_, Slot> {
         self.slot.lock()
     }
@@ -438,6 +445,7 @@ impl CellQueue {
         Arc::new(RequestCell {
             queue: Arc::clone(self),
             token: CancelToken::new(),
+            block_token: crate::user::next_block_token(),
             slot: Mutex::new(Slot {
                 request: CellRequest {
                     reason: 0,

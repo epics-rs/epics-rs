@@ -193,7 +193,6 @@ pub(crate) struct ActorMessage {
     /// Where the message sorts ahead of `seq`. Set only by
     /// [`PortActor::enqueue_message`], which knows the port.
     rank: Rank,
-    pub block_token: Option<u64>,
 }
 
 impl ActorMessage {
@@ -223,7 +222,6 @@ impl ActorMessage {
             CDispatch::ConnectQueue => QueuePriority::Connect,
             CDispatch::Direct | CDispatch::Queued => user.priority,
         };
-        let block_token = user.block_token;
         Self {
             op,
             user,
@@ -232,7 +230,6 @@ impl ActorMessage {
             seq: next_seq(),
             priority,
             rank: Rank::Arrival,
-            block_token,
         }
     }
 
@@ -241,9 +238,10 @@ impl ActorMessage {
     /// is for.
     fn from_cell(cell: Arc<RequestCell>, seq: u64) -> Self {
         let request = cell.request();
-        let user = AsynUser::new(request.reason)
+        let mut user = AsynUser::new(request.reason)
             .with_addr(request.addr)
             .with_priority(request.priority);
+        user.block_token = Some(cell.block_token());
         Self {
             user,
             cancel: cell.token().clone(),
@@ -251,7 +249,6 @@ impl ActorMessage {
             seq,
             priority: request.priority,
             rank: Rank::Arrival,
-            block_token: None,
             op: RequestOp::Cell(cell),
         }
     }
@@ -1302,7 +1299,15 @@ impl PortActor {
     /// device block can never be mistaken for a port-wide one.
     fn admits(&self, msg: &ActorMessage) -> bool {
         self.block_holders
-            .admits(msg.block_token, self.dp_key(msg.user.addr))
+            .admits(msg.user.block_token, self.dp_key(msg.user.addr))
+    }
+
+    /// The block identity a BlockProcess/UnblockProcess holds or releases.
+    fn block_identity(user: &AsynUser) -> AsynResult<u64> {
+        user.block_token.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "blockProcessCallback: the user has no block identity".into(),
+        })
     }
 
     /// The ops the block holder (`pblockProcessHolder`) cannot stall — everything
@@ -2123,17 +2128,10 @@ impl PortActor {
                 Ok(RequestResult::bounds_read(low, high))
             }
             RequestOp::BlockProcess { all_devices } => {
-                // Block-token contract: the block identity is
-                // `user.block_token` when set, else it falls back to
-                // `user.reason`. CALLER CONTRACT: any caller that
-                // relies on block/unblock exclusivity MUST set a
-                // distinct `block_token` — two callers that share a
-                // `reason` and both omit `block_token` would collide
-                // on the same fallback token, so one could
-                // unblock/nest the other's lock. `block` /
-                // `unblock` / and any owner-gated op must use the
-                // SAME token; mismatched tokens are rejected below.
-                let token = user.block_token.unwrap_or(user.reason as u64);
+                // The holder is `user.block_token`, the value admission
+                // reads: C's `pblockProcessHolder = puserPvt`
+                // (asynManager.c:1709-1712).
+                let token = Self::block_identity(user)?;
                 let dp = self.dp_key(user.addr);
                 match self.block_holders.holder(*all_devices, dp) {
                     Some((existing, count)) => {
@@ -2175,7 +2173,7 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::UnblockProcess { all_devices } => {
-                let token = user.block_token.unwrap_or(user.reason as u64);
+                let token = Self::block_identity(user)?;
                 let dp = self.dp_key(user.addr);
                 if let Some((owner, count)) = self.block_holders.holder(*all_devices, dp) {
                     if owner != token {
@@ -2361,11 +2359,11 @@ impl PortActor {
                 Ok(result)
             }
             RequestOp::Cell(cell) => {
-                cell.run(&mut ActorCalls(self));
+                cell.run(&mut ActorCalls(self, user.block_token));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::CellInline(cell) => {
-                cell.run_inline(&mut ActorCalls(self));
+                cell.run_inline(&mut ActorCalls(self, user.block_token));
                 Ok(RequestResult::write_ok())
             }
             RequestOp::WithDriver(call) => match call.take() {
@@ -2397,7 +2395,7 @@ impl PortActor {
                 }
                 let result = match call.take() {
                     Some(f) => {
-                        f(&mut ActorCalls(self));
+                        f(&mut ActorCalls(self, user.block_token));
                         Ok(RequestResult::write_ok())
                     }
                     None => Err(AsynError::Status {
@@ -2493,11 +2491,14 @@ impl PortActor {
 
 /// The port a [`RequestOp::Cell`] runs against: each call is dispatched on
 /// the actor thread with no queue and no gate, as C's callback calls the
-/// driver's interfaces directly while it owns the port.
-struct ActorCalls<'a>(&'a mut PortActor);
+/// driver's interfaces directly while it owns the port. Each call is made as
+/// the running request's user — C's callback passes its own `pasynUser` —
+/// so a block it takes is held by that request's block identity.
+struct ActorCalls<'a>(&'a mut PortActor, Option<u64>);
 
 impl PortCalls for ActorCalls<'_> {
     fn call(&mut self, op: &RequestOp, mut user: AsynUser) -> AsynResult<RequestResult> {
+        user.block_token = self.1;
         self.0.link_user(&mut user);
         self.0.dispatch_io(&mut user, op)
     }
@@ -3312,7 +3313,6 @@ mod tests {
                 seq,
                 priority: QueuePriority::Medium,
                 rank: Rank::Band(QueuePriority::Medium),
-                block_token: None,
             }
         };
         let mut heap = BinaryHeap::new();
@@ -3466,7 +3466,6 @@ mod tests {
                 seq,
                 priority,
                 rank: Rank::Band(priority),
-                block_token: None,
             }
         };
         let mut heap = BinaryHeap::new();

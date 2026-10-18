@@ -156,8 +156,10 @@ pub struct AsynUser {
     /// C `pasynUser->drvUser`, from the record's `drvUserCreate`
     /// ([`crate::port::DrvUserInfo::drv_user`]).
     pub drv_user: Option<crate::port::DrvUser>,
-    /// Token for BlockProcess ownership. When a port is blocked, only requests
-    /// with a matching block_token (or UnblockProcess) are dequeued.
+    /// This user's identity as a block holder — C keys `pblockProcessHolder`
+    /// on the `asynUser` itself (asynManager.c:1709-1712). BlockProcess,
+    /// UnblockProcess and the drain-loop admission all read this one value; a
+    /// user without one cannot block. Take a fresh one from [`next_block_token`].
     pub block_token: Option<u64>,
     /// The port this user is connected to, and that port's trace config.
     ///
@@ -217,6 +219,14 @@ impl UserTrace {
             args,
         );
     }
+}
+
+static BLOCK_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A block identity no other caller of this function holds — what C gets from
+/// each `createAsynUser` being its own allocation.
+pub fn next_block_token() -> u64 {
+    BLOCK_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A queue-wait deadline that arms a timer. C starts one only for

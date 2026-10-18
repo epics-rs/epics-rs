@@ -649,9 +649,10 @@ impl PortHandle {
     ) -> AsynResult<QueueOutcome> {
         self.gate.check(user.connect_check(self.multi_device))?;
         if !self.can_block {
-            let user = AsynUser::new(user.reason)
+            let mut user = AsynUser::new(user.reason)
                 .with_addr(user.addr)
                 .with_priority(user.priority);
+            user.block_token = Some(cell.block_token());
             self.submit_blocking(RequestOp::CellInline(Arc::clone(cell)), user)?;
             return Ok(QueueOutcome::Ran);
         }
@@ -2083,6 +2084,69 @@ mod tests {
         let cell = handle.new_cell(Arc::new(Ran(tx)));
         handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    /// C's block holder is the `asynUser` (asynManager.c:1709-1712), and the
+    /// drain loop admits that user's next `queueRequest` while it holds
+    /// (:889-892): a cell that blocked runs again ahead of another user's
+    /// request, which waits for the unblock.
+    #[test]
+    fn a_cell_that_blocked_is_admitted_while_another_user_is_held() {
+        use crate::request::{CellBody, Unrun};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc as std_mpsc;
+
+        struct Holder {
+            runs: AtomicU32,
+            tx: std_mpsc::Sender<&'static str>,
+        }
+        impl CellBody for Holder {
+            fn process(&self, port: &mut dyn PortCalls) {
+                let (op, said) = match self.runs.fetch_add(1, Ordering::SeqCst) {
+                    0 => (RequestOp::BlockProcess { all_devices: true }, "blocked"),
+                    _ => (RequestOp::UnblockProcess { all_devices: true }, "unblocked"),
+                };
+                port.call(&op, AsynUser::new(0)).unwrap();
+                self.tx.send(said).unwrap();
+            }
+            fn unrun(&self, why: Unrun) {
+                panic!("the holder did not run: {why:?}");
+            }
+            fn done(self: Arc<Self>) {}
+        }
+
+        let mut driver = TestDriver::new();
+        driver.base.flags.can_block = true;
+        driver.base.params.set_int32(0, 0, 5).unwrap();
+        let mut handle = make_handle(driver);
+        handle.set_can_block(true);
+        let (tx, rx) = std_mpsc::channel();
+        let cell = handle.new_cell(Arc::new(Holder {
+            runs: AtomicU32::new(0),
+            tx: tx.clone(),
+        }));
+        handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("blocked"));
+
+        let other = handle.clone();
+        std::thread::spawn(move || {
+            other
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap();
+            tx.send("other").unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "another user's request ran while the cell held the block"
+        );
+
+        handle.queue_request(&cell, &AsynUser::new(0)).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok("unblocked"),
+            "the holder's own next request was not admitted"
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok("other"));
     }
 
     /// C `queueRequest` runs `processUser` inline on a port without

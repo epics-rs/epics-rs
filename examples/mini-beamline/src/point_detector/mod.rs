@@ -26,8 +26,9 @@ impl PointDetector {
             port_name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_ALL,
+            // rs-only example port: there is no C driver for it.
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
         );
         let params = PointDetectorParams::create(&mut base)?;
 
@@ -127,6 +128,19 @@ pub fn create_point_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The port serves Int32 and Float64 params and names them through
+    /// drvUser; PortDriverBase adds Common as asynPortDriver does.
+    #[test]
+    fn test_port_masks_are_the_interfaces_it_serves() {
+        let det = PointDetector::new("PD_MASKS", DetectorMode::PinHole).unwrap();
+        let served = InterfaceMask::INT32 | InterfaceMask::FLOAT64;
+        assert_eq!(det.base.interrupt_mask(), served);
+        assert_eq!(
+            det.base.interface_mask(),
+            served | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
+    }
 
     #[test]
     fn test_create_pinhole() {

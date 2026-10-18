@@ -47,8 +47,10 @@ impl MovingDotDetector {
             max_size_y,
             max_memory,
             ASYN_NONE,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
+            // rs-only example port with no C driver: its params are all
+            // covered by ADDriver's and asynNDArrayDriver's own masks.
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let dot_params = MovingDotParams::create(&mut ad.port_base)?;
 
@@ -279,6 +281,24 @@ pub fn create_moving_dot_with_config(
 mod tests {
     use super::*;
     use ad_core_rs::plugin::channel::NDArrayOutput;
+
+    /// No masks beyond ADDriver.cpp:131-132 and asynNDArrayDriver.cpp:866-867.
+    #[test]
+    fn test_port_carries_only_the_addriver_masks() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
+        let det = MovingDotDetector::new("DOT_MASKS", 8, 8, 1_000_000, acq_tx, dirty).unwrap();
+        let interrupts = InterfaceMask::INT32
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::OCTET
+            | InterfaceMask::INT32_ARRAY
+            | InterfaceMask::GENERIC_POINTER;
+        assert_eq!(det.ad.port_base.interrupt_mask(), interrupts);
+        assert_eq!(
+            det.ad.port_base.interface_mask(),
+            interrupts | InterfaceMask::DRV_USER | InterfaceMask::COMMON
+        );
+    }
 
     #[test]
     fn test_create_moving_dot() {

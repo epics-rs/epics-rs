@@ -805,6 +805,22 @@ pub trait DeviceSupport: Send + Sync + 'static {
         true
     }
 
+    /// Whether the C dset this ports fills ai/ao's `special_linconv` slot.
+    /// The presence alone matters: `aiRecord.c:188-191` rebases EOFF to EGUL
+    /// before the call, so a dset whose routine does nothing still moves EOFF.
+    fn has_special_linconv(&self) -> bool {
+        false
+    }
+
+    /// C `special_linconv(prec, after)`: recompute ESLO/EOFF from EGUL/EGUF.
+    /// Called on both `special()` passes of a LINR/EGUF/EGUL put while LINR is
+    /// LINEAR, and only when [`Self::has_special_linconv`] says the slot is
+    /// filled. The record never calls it from `init_record`; a dset that wants
+    /// the slope at init computes it in its own [`Self::init`], as C does.
+    fn special_linconv(&mut self, _record: &mut dyn Record, _after: bool) -> CaResult<()> {
+        Ok(())
+    }
+
     /// C's `dsxt->add_record` for a device that extends its dset (`devExtend`):
     /// bind the per-link state from the link this object was built with. A
     /// device-link put runs it on the fresh object before the record's hold
@@ -1174,10 +1190,18 @@ pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn D
 /// No-op for a record that has no device attached — C reaches this line only
 /// past `if (!pdset) return S_dev_noDSET`.
 pub fn init_device_support(instance: &mut RecordInstance) {
+    let saved = instance.record.eoff_eslo_before_dset_init();
     if let Some(soft) = instance.common.dtyp.soft() {
         instance.record.init_soft_dset(soft);
     }
     let Some(mut dev) = instance.device.take() else {
+        let row = crate::server::record::dev_sup_of(
+            instance.record.record_type(),
+            instance.common.dtyp.as_str(),
+        );
+        if let Some(saved) = saved.filter(|_| row.is_some_and(|r| r.has_init_record())) {
+            instance.record.eoff_eslo_after_dset_init(saved);
+        }
         instance.dset_init = if instance.common.dtyp.is_soft() {
             instance.record.soft_dset_init()
         } else {
@@ -1187,7 +1211,11 @@ pub fn init_device_support(instance: &mut RecordInstance) {
     };
     dev.bind_database(instance.device_done.database());
     dev.set_callback_priority(instance.common.callback_priority());
-    let status = match dev.init(&mut *instance.record) {
+    let outcome = dev.init(&mut *instance.record);
+    if let Some(saved) = saved.filter(|_| dev.has_init_record()) {
+        instance.record.eoff_eslo_after_dset_init(saved);
+    }
+    let status = match outcome {
         Ok(DeviceInitOutcome::Ok(udf)) => {
             apply_init_udf(instance, udf);
             // The record's own `if (status == 0)` arm, after the dset's write;

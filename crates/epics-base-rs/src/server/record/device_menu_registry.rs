@@ -67,6 +67,11 @@ impl DevSup {
         self.link_type == DbLinkType::Constant || self.dset.extends
     }
 
+    /// The dset's `init_record` (slot 2) is non-NULL.
+    pub fn has_init_record(&self) -> bool {
+        self.dset.funcs.contains(&2)
+    }
+
     /// The dset's `get_ioint_info` (slot 3) is non-NULL.
     pub fn has_get_ioint_info(&self) -> bool {
         self.dset.funcs.contains(&3)

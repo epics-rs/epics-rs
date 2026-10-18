@@ -514,22 +514,24 @@ impl Record for AoRecord {
         Ok(())
     }
 
+    fn eoff_eslo_before_dset_init(&mut self) -> Option<(f64, f64)> {
+        let saved = (self.eoff, self.eslo);
+        // "for old device support that doesn't know about eoff"
+        if self.eslo == 1.0 && self.eoff == 0.0 {
+            self.eoff = self.egul;
+        }
+        Some(saved)
+    }
+
+    fn eoff_eslo_after_dset_init(&mut self, (eoff, eslo): (f64, f64)) {
+        if self.linr == 1 {
+            self.eoff = eoff;
+            self.eslo = eslo;
+        }
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            // Legacy compatibility: if eslo==1.0 && eoff==0.0, set eoff from egul
-            let saved_eoff = self.eoff;
-            let saved_eslo = self.eslo;
-
-            if self.eslo == 1.0 && self.eoff == 0.0 {
-                self.eoff = self.egul;
-            }
-
-            // For SLOPE mode, restore user-configured eoff/eslo
-            if self.linr == 1 {
-                self.eoff = saved_eoff;
-                self.eslo = saved_eslo;
-            }
-
             // C `aoRecord.c:120`: `prec->init = TRUE;`
             self.init = ConvertPhase::Initial;
         }

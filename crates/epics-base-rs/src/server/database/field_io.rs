@@ -842,6 +842,9 @@ fn special_after_put(
     if status.is_ok() {
         status = snam_special_after_put(db, instance, field);
     }
+    if status.is_ok() {
+        status = linconv_special(instance, field, true, burst);
+    }
     out.extend(instance.record.take_special_actions());
     // C's `prec->udf = FALSE` written from inside `special()` — histogram's
     // `clear_histogram` (`histogramRecord.c:361`) is the only one. Drained here
@@ -920,6 +923,53 @@ fn special_after_put(
     } else {
         crate::server::record::CommonFieldPutResult::NoChange
     })
+}
+
+/// The dset half of ai/ao `special(SPC_LINCONV)` (`aiRecord.c:187-198`,
+/// `aoRecord.c:254-265`), run on both passes like the record half: while LINR
+/// is LINEAR and the dset fills `special_linconv`, EOFF is rebased to EGUL, the
+/// dset recomputes ESLO/EOFF, and each one that moved is posted.
+fn linconv_special(
+    instance: &mut RecordInstance,
+    field: &str,
+    after: bool,
+    burst: &mut PostBurst,
+) -> CaResult<()> {
+    use crate::server::recgbl::EventMask;
+    use crate::server::record::{Special, declared_field};
+    const MENU_CONVERT_LINEAR: i16 = 2;
+
+    let linconv = declared_field(instance.record.record_type(), field)
+        .is_some_and(|desc| desc.special == Special::LinConv);
+    let linear = matches!(
+        instance.record.get_field("LINR"),
+        Some(EpicsValue::Short(MENU_CONVERT_LINEAR))
+    );
+    if !linconv || !linear {
+        return Ok(());
+    }
+    let Some(device) = instance.device.as_mut().filter(|d| d.has_special_linconv()) else {
+        return Ok(());
+    };
+    let record = &mut *instance.record;
+    let read = |record: &dyn crate::server::record::Record, f: &str| {
+        record.get_field(f).and_then(|v| v.to_f64())
+    };
+    let old = [read(record, "EOFF"), read(record, "ESLO")];
+    if let Some(egul) = read(record, "EGUL") {
+        record.put_field("EOFF", EpicsValue::Double(egul))?;
+    }
+    let status = device.special_linconv(record, after);
+    let moved = [
+        read(record, "EOFF") != old[0],
+        read(record, "ESLO") != old[1],
+    ];
+    for (f, moved) in ["EOFF", "ESLO"].into_iter().zip(moved) {
+        if moved {
+            instance.notify_field_in(burst, f, EventMask::VALUE | EventMask::LOG);
+        }
+    }
+    status
 }
 
 /// C `dbPutSpecial(paddr, 0)` — the before-put pass, run while the record lock
@@ -2889,7 +2939,8 @@ impl PvDatabase {
                 .and_then(|()| check_no_mod_in_db_put(&instance, field, at, tail)),
             PutVia::DbPutField { common, .. } => gate_link(&mut instance, field, common, at, tail),
         }
-        .and_then(|()| instance.record.special(field, false));
+        .and_then(|()| instance.record.special(field, false))
+        .and_then(|()| linconv_special(&mut instance, field, false, &mut burst));
         if let Err(e) = pass0 {
             self.remove_put_link(&instance, field, before);
             set_refused_processes(&mut via, rec, &instance, field);

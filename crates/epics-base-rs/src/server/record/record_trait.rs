@@ -5204,6 +5204,19 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// ai/ao `init_record` just before `pdset->common.init_record`
+    /// (`aiRecord.c:115-119`): the legacy EOFF rebase, returning EOFF/ESLO as
+    /// they were before it. `None` for the record types with no such step.
+    fn eoff_eslo_before_dset_init(&mut self) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// ai/ao `init_record` right after a dset `init_record` returns, whatever
+    /// its status (`aiRecord.c:121-126`): a SLOPE record takes back the
+    /// EOFF/ESLO [`Self::eoff_eslo_before_dset_init`] saved. A dset with no
+    /// `init_record` never reaches it.
+    fn eoff_eslo_after_dset_init(&mut self, _saved: (f64, f64)) {}
+
     /// Post-init finalisation hook with mutable access to the
     /// framework's UDF flag. Called once after both `init_record`
     /// passes complete. Default implementation is a no-op.
